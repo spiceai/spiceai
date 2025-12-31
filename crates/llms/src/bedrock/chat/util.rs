@@ -16,11 +16,11 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_openai::error::{ApiError, OpenAIError};
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionNamedToolChoice, ChatCompletionStreamResponseDelta, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage, FinishReason,
-    FunctionCall, FunctionName, FunctionObject, PromptTokensDetails, Role,
+    ChatCompletionNamedToolChoice, ChatCompletionStreamResponseDelta,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage, FinishReason,
+    FunctionCall, FunctionName, FunctionObject, PromptTokensDetails, Role, ToolChoiceOptions,
 };
 use aws_sdk_bedrockruntime::error::SdkError;
 use aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver;
@@ -107,7 +107,6 @@ pub(super) fn extract_from_content_block(
                 (None, None),
                 Some(ChatCompletionMessageToolCall {
                     id: tool_use_id.clone(),
-                    r#type: ChatCompletionToolType::Function,
                     function: FunctionCall {
                         name: name.clone(),
                         arguments: serde_json::to_string(&document_to_value(input.clone()))
@@ -121,17 +120,17 @@ pub(super) fn extract_from_content_block(
 }
 
 pub(super) fn tool_config(
-    tools: Option<Vec<ChatCompletionTool>>,
+    tools: Option<Vec<ChatCompletionTools>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
 ) -> Option<ToolConfiguration> {
     let tool_choice = match tool_choice {
-        Some(ChatCompletionToolChoiceOption::Auto) => {
+        Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)) => {
             Some(ToolChoice::Auto(AutoToolChoiceBuilder::default().build()))
         }
-        Some(ChatCompletionToolChoiceOption::Required) => {
+        Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required)) => {
             Some(ToolChoice::Any(AnyToolChoiceBuilder::default().build()))
         }
-        Some(ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
+        Some(ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
             function: FunctionName { name },
             ..
         })) => SpecificToolChoice::builder()
@@ -139,17 +138,20 @@ pub(super) fn tool_config(
             .build()
             .ok()
             .map(ToolChoice::Tool),
-        _ => None, // None, ChatCompletionToolChoiceOption::None, or Unknown.
+        _ => None, // None, Mode(None), AllowedTools, Custom, or Unknown.
     };
     let tools = tools?
         .into_iter()
         .filter_map(|t| {
+            let ChatCompletionTools::Function(tool) = t else {
+                return None;
+            };
             let FunctionObject {
                 name,
                 description,
                 parameters,
                 ..
-            } = t.function;
+            } = tool.function;
             Some(Tool::ToolSpec(
                 ToolSpecification::builder()
                     .name(name)

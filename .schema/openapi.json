@@ -1947,6 +1947,38 @@
           }
         }
       },
+      "ChatCompletionAllowedTools": {
+        "type": "object",
+        "required": [
+          "mode",
+          "tools"
+        ],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/ToolChoiceAllowedMode",
+            "description": "Constrains the tools available to the model to a pre-defined set.\n\n`auto` allows the model to pick from among the allowed tools and generate a\nmessage.\n\n`required` requires the model to call one or more of the allowed tools."
+          },
+          "tools": {
+            "type": "array",
+            "items": {},
+            "description": "A list of tool definitions that the model should be allowed to call.\n\nFor the Chat Completions API, the list of tool definitions might look like:\n```json\n[\n  { \"type\": \"function\", \"function\": { \"name\": \"get_weather\" } },\n  { \"type\": \"function\", \"function\": { \"name\": \"get_time\" } }\n]\n```"
+          }
+        }
+      },
+      "ChatCompletionAllowedToolsChoice": {
+        "type": "object",
+        "required": [
+          "allowed_tools"
+        ],
+        "properties": {
+          "allowed_tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionAllowedTools"
+            }
+          }
+        }
+      },
       "ChatCompletionAudio": {
         "type": "object",
         "required": [
@@ -1956,11 +1988,11 @@
         "properties": {
           "format": {
             "$ref": "#/components/schemas/ChatCompletionAudioFormat",
-            "description": "Specifies the output audio format. Must be one of `wav`, `mp3`, `flac`, `opus`, or `pcm16`."
+            "description": "Specifies the output audio format. Must be one of `wav`, `aac`, `mp3`, `flac`, `opus`, or `pcm16`."
           },
           "voice": {
             "$ref": "#/components/schemas/ChatCompletionAudioVoice",
-            "description": "The voice the model uses to respond. Supported voices are `ash`, `ballad`, `coral`, `sage`, and `verse` (also supported but not recommended are `alloy`, `echo`, and `shimmer`; these voices are less expressive)."
+            "description": "The voice the model uses to respond. Supported voices are\n`alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, and `shimmer`."
           }
         }
       },
@@ -1968,6 +2000,7 @@
         "type": "string",
         "enum": [
           "wav",
+          "aac",
           "mp3",
           "flac",
           "opus",
@@ -1975,16 +2008,78 @@
         ]
       },
       "ChatCompletionAudioVoice": {
-        "type": "string",
-        "enum": [
-          "alloy",
-          "ash",
-          "ballad",
-          "coral",
-          "echo",
-          "sage",
-          "shimmer",
-          "verse"
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "alloy"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "ash"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "ballad"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "coral"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "echo"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "fable"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "nova"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "onyx"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "sage"
+            ]
+          },
+          {
+            "type": "string",
+            "enum": [
+              "shimmer"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "other"
+            ],
+            "properties": {
+              "other": {
+                "type": "string"
+              }
+            }
+          }
         ]
       },
       "ChatCompletionFunctionCall": {
@@ -2047,14 +2142,29 @@
           "parameters": {
             "description": "The parameters the functions accepts, described as a JSON Schema object. See the [guide](https://platform.openai.com/docs/guides/text-generation/function-calling) for examples, and the [JSON Schema reference](https://json-schema.org/understanding-json-schema/) for documentation about the format.\n\nOmitting `parameters` defines a function with an empty parameter list."
           }
-        },
-        "deprecated": true
+        }
+      },
+      "ChatCompletionMessageCustomToolCall": {
+        "type": "object",
+        "required": [
+          "id",
+          "custom_tool"
+        ],
+        "properties": {
+          "custom_tool": {
+            "$ref": "#/components/schemas/CustomTool",
+            "description": "The custom tool that the model called."
+          },
+          "id": {
+            "type": "string",
+            "description": "The ID of the tool call."
+          }
+        }
       },
       "ChatCompletionMessageToolCall": {
         "type": "object",
         "required": [
           "id",
-          "type",
           "function"
         ],
         "properties": {
@@ -2065,35 +2175,75 @@
           "id": {
             "type": "string",
             "description": "The ID of the tool call."
-          },
-          "type": {
-            "$ref": "#/components/schemas/ChatCompletionToolType",
-            "description": "The type of the tool. Currently, only `function` is supported."
           }
         }
       },
-      "ChatCompletionModalities": {
-        "type": "string",
-        "description": "Output types that you would like the model to generate for this request.\n\nMost models are capable of generating text, which is the default: `[\"text\"]`\n\nThe `gpt-4o-audio-preview` model can also be used to [generate\naudio](https://platform.openai.com/docs/guides/audio). To request that this model generate both text and audio responses, you can use: `[\"text\", \"audio\"]`",
-        "enum": [
-          "text",
-          "audio"
+      "ChatCompletionMessageToolCalls": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionMessageToolCall"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "function"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionMessageCustomToolCall"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "custom"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
         ]
       },
       "ChatCompletionNamedToolChoice": {
         "type": "object",
         "description": "Specifies a tool the model should use. Use to force the model to call a specific function.",
         "required": [
-          "type",
           "function"
         ],
         "properties": {
           "function": {
             "$ref": "#/components/schemas/FunctionName"
-          },
-          "type": {
-            "$ref": "#/components/schemas/ChatCompletionToolType",
-            "description": "The type of the tool. Currently, only `function` is supported."
+          }
+        }
+      },
+      "ChatCompletionNamedToolChoiceCustom": {
+        "type": "object",
+        "required": [
+          "custom"
+        ],
+        "properties": {
+          "custom": {
+            "$ref": "#/components/schemas/CustomName"
           }
         }
       },
@@ -2153,7 +2303,7 @@
               "null"
             ],
             "items": {
-              "$ref": "#/components/schemas/ChatCompletionMessageToolCall"
+              "$ref": "#/components/schemas/ChatCompletionMessageToolCalls"
             }
           }
         }
@@ -2258,8 +2408,33 @@
           {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartText"
+              "$ref": "#/components/schemas/ChatCompletionRequestDeveloperMessageContentPart"
             }
+          }
+        ]
+      },
+      "ChatCompletionRequestDeveloperMessageContentPart": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartText"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         ]
       },
@@ -2421,6 +2596,17 @@
         "properties": {
           "input_audio": {
             "$ref": "#/components/schemas/InputAudio"
+          }
+        }
+      },
+      "ChatCompletionRequestMessageContentPartFile": {
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "properties": {
+          "file": {
+            "$ref": "#/components/schemas/FileObject"
           }
         }
       },
@@ -2672,6 +2858,27 @@
                 }
               }
             ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionRequestMessageContentPartFile"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "file"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         ]
       },
@@ -2682,6 +2889,15 @@
           "role"
         ],
         "properties": {
+          "annotations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionResponseMessageAnnotation"
+            }
+          },
           "audio": {
             "oneOf": [
               {
@@ -2728,11 +2944,33 @@
               "null"
             ],
             "items": {
-              "$ref": "#/components/schemas/ChatCompletionMessageToolCall"
+              "$ref": "#/components/schemas/ChatCompletionMessageToolCalls"
             },
             "description": "The tool calls generated by the model, such as function calls."
           }
         }
+      },
+      "ChatCompletionResponseMessageAnnotation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "url_citation",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "url_citation"
+                ]
+              },
+              "url_citation": {
+                "$ref": "#/components/schemas/UrlCitation"
+              }
+            }
+          }
+        ]
       },
       "ChatCompletionResponseMessageAudio": {
         "type": "object",
@@ -2749,7 +2987,7 @@
           },
           "expires_at": {
             "type": "integer",
-            "format": "int32",
+            "format": "int64",
             "description": "The Unix timestamp (in seconds) for when this audio response will no longer be accessible on the server for use in multi-turn conversations.",
             "minimum": 0
           },
@@ -2766,13 +3004,20 @@
       "ChatCompletionStreamOptions": {
         "type": "object",
         "description": "Options for streaming response. Only set this when you set `stream: true`.",
-        "required": [
-          "include_usage"
-        ],
         "properties": {
+          "include_obfuscation": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "When true, stream obfuscation will be enabled. Stream obfuscation adds\nrandom characters to an `obfuscation` field on streaming delta events to\nnormalize payload sizes as a mitigation to certain side-channel attacks.\nThese obfuscation fields are included by default, but add a small amount\nof overhead to the data stream. You can set `include_obfuscation` to\nfalse to optimize for bandwidth if you trust the network links between\nyour application and the OpenAI API."
+          },
           "include_usage": {
-            "type": "boolean",
-            "description": "If set, an additional chunk will be streamed before the `data: [DONE]` message. The `usage` field on this chunk shows the token usage statistics for the entire request, and the `choices` field will always be an empty array. All other chunks will also include a `usage` field, but with a null value."
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "If set, an additional chunk will be streamed before the `data: [DONE]`\nmessage. The `usage` field on this chunk shows the token usage statistics\nfor the entire request, and the `choices` field will always be an empty\narray.\n\nAll other chunks will also include a `usage` field, but with a null\nvalue. **NOTE:** If the stream is interrupted, you may not receive the\nfinal usage chunk which contains the total token usage for the request."
           }
         }
       },
@@ -2817,56 +3062,151 @@
       "ChatCompletionTool": {
         "type": "object",
         "required": [
-          "type",
           "function"
         ],
         "properties": {
           "function": {
             "$ref": "#/components/schemas/FunctionObject"
-          },
-          "type": {
-            "$ref": "#/components/schemas/ChatCompletionToolType"
           }
         }
       },
       "ChatCompletionToolChoiceOption": {
         "oneOf": [
           {
-            "type": "string",
-            "enum": [
-              "none"
-            ]
-          },
-          {
-            "type": "string",
-            "enum": [
-              "auto"
-            ]
-          },
-          {
-            "type": "string",
-            "enum": [
-              "required"
-            ]
-          },
-          {
-            "type": "object",
-            "required": [
-              "named"
-            ],
-            "properties": {
-              "named": {
-                "$ref": "#/components/schemas/ChatCompletionNamedToolChoice"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionAllowedToolsChoice"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "allowed_tools"
+                    ]
+                  }
+                }
               }
-            }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionNamedToolChoice"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "function"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionNamedToolChoiceCustom"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "custom"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ToolChoiceOptions"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "mode"
+                    ]
+                  }
+                }
+              }
+            ]
           }
         ],
         "description": "Controls which (if any) tool is called by the model.\n`none` means the model will not call any tool and instead generates a message.\n`auto` means the model can pick between generating a message or calling one or more tools.\n`required` means the model must call one or more tools.\nSpecifying a particular tool via `{\"type\": \"function\", \"function\": {\"name\": \"my_function\"}}` forces the model to call that tool.\n\n`none` is the default when no tools are present. `auto` is the default if tools are present."
       },
-      "ChatCompletionToolType": {
-        "type": "string",
-        "enum": [
-          "function"
+      "ChatCompletionTools": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatCompletionTool",
+                "description": "A function tool that can be used to generate a response."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "function"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A function tool that can be used to generate a response."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CustomToolChatCompletions",
+                "description": "A custom tool that processes input using a specified format."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "custom"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A custom tool that processes input using a specified format."
+          }
         ]
       },
       "CompletionTokensDetails": {
@@ -3009,7 +3349,7 @@
               },
               {
                 "$ref": "#/components/schemas/ChatCompletionAudio",
-                "description": "Parameters for audio output. Required when audio output is requested with `modalities: [\"audio\"]`. [Learn more](https://platform.openai.com/docs/guides/audio)."
+                "description": "Parameters for audio output. Required when audio output is requested with\n`modalities: [\"audio\"]`. [Learn more](https://platform.openai.com/docs/guides/audio)."
               }
             ]
           },
@@ -3019,7 +3359,7 @@
               "null"
             ],
             "format": "float",
-            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim."
+            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on\ntheir existing frequency in the text so far, decreasing the model's\nlikelihood to repeat the same line verbatim."
           },
           "function_call": {
             "oneOf": [
@@ -3049,7 +3389,10 @@
               "null"
             ],
             "description": "Modify the likelihood of specified tokens appearing in the completion.\n\nAccepts a json object that maps tokens (specified by their token ID in the tokenizer) to an associated bias value from -100 to 100.\nMathematically, the bias is added to the logits generated by the model prior to sampling.\nThe exact effect will vary per model, but values between -1 and 1 should decrease or increase likelihood of selection;\nvalues like -100 or 100 should result in a ban or exclusive selection of the relevant token.",
-            "additionalProperties": {},
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int32"
+            },
             "propertyNames": {
               "type": "string"
             }
@@ -3059,7 +3402,7 @@
               "boolean",
               "null"
             ],
-            "description": "Whether to return log probabilities of the output tokens or not. If true, returns the log probabilities of each output token returned in the `content` of `message`."
+            "description": "Whether to return log probabilities of the output tokens or not. If true,\nreturns the log probabilities of each output token returned in the `content` of `message`."
           },
           "max_completion_tokens": {
             "type": [
@@ -3067,7 +3410,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and [reasoning tokens](https://platform.openai.com/docs/guides/reasoning).",
+            "description": "An upper bound for the number of tokens that can be generated for a completion, including\nvisible output tokens and [reasoning tokens](https://platform.openai.com/docs/guides/reasoning).",
             "minimum": 0
           },
           "max_tokens": {
@@ -3076,7 +3419,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "The maximum number of [tokens](https://platform.openai.com/tokenizer) that can be generated in the chat completion.\n\nThis value can be used to control [costs](https://openai.com/api/pricing/) for text generated via API.\nThis value is now deprecated in favor of `max_completion_tokens`, and is\nnot compatible with [o1 series models](https://platform.openai.com/docs/guides/reasoning).",
+            "description": "The maximum number of [tokens](https://platform.openai.com/tokenizer) that can be generated in\nthe chat completion. This value can be used to control [costs](https://openai.com/api/pricing/) for text generated via API.\nThis value is now deprecated in favor of `max_completion_tokens`, and is\nnot compatible with [o-series models](https://platform.openai.com/docs/guides/reasoning).",
             "deprecated": true,
             "minimum": 0
           },
@@ -3085,10 +3428,18 @@
             "items": {
               "$ref": "#/components/schemas/ChatCompletionRequestMessage"
             },
-            "description": "A list of messages comprising the conversation so far. Depending on the [model](https://platform.openai.com/docs/models) you use, different message types (modalities) are supported, like [text](https://platform.openai.com/docs/guides/text-generation), [images](https://platform.openai.com/docs/guides/vision), and [audio](https://platform.openai.com/docs/guides/audio)."
+            "description": "A list of messages comprising the conversation so far. Depending on the\n[model](https://platform.openai.com/docs/models) you use, different message types (modalities)\nare supported, like [text](https://platform.openai.com/docs/guides/text-generation),\n[images](https://platform.openai.com/docs/guides/vision), and\n[audio](https://platform.openai.com/docs/guides/audio)."
           },
           "metadata": {
-            "description": "Developer-defined tags and values used for filtering completions in the [dashboard](https://platform.openai.com/chat-completions)."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Metadata",
+                "description": "Developer-defined tags and values used for filtering completions in the [dashboard](https://platform.openai.com/chat-completions)."
+              }
+            ]
           },
           "modalities": {
             "type": [
@@ -3096,12 +3447,13 @@
               "null"
             ],
             "items": {
-              "$ref": "#/components/schemas/ChatCompletionModalities"
-            }
+              "$ref": "#/components/schemas/ResponseModalities"
+            },
+            "description": "Output types that you would like the model to generate. Most models are capable of generating\ntext, which is the default:\n\n`[\"text\"]`\nThe `gpt-4o-audio-preview` model can also be used to\n[generate audio](https://platform.openai.com/docs/guides/audio). To request that this model\ngenerate both text and audio responses, you can use:\n\n`[\"text\", \"audio\"]`"
           },
           "model": {
             "type": "string",
-            "description": "ID of the model to use.\nSee the [model endpoint compatibility](https://platform.openai.com/docs/models#model-endpoint-compatibility) table for details on which models work with the Chat API."
+            "description": "Model ID used to generate the response, like `gpt-4o` or `o3`. OpenAI\noffers a wide range of models with different capabilities, performance\ncharacteristics, and price points. Refer to the\n[model guide](https://platform.openai.com/docs/models)\nto browse and compare available models."
           },
           "n": {
             "type": [
@@ -3109,7 +3461,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "How many chat completion choices to generate for each input message. Note that you will be charged based on the number of generated tokens across all of the choices. Keep `n` as `1` to minimize costs.",
+            "description": "How many chat completion choices to generate for each input message. Note that you will be\ncharged based on the number of generated tokens across all of the choices. Keep `n` as `1` to\nminimize costs.",
             "minimum": 0
           },
           "parallel_tool_calls": {
@@ -3117,7 +3469,7 @@
               "boolean",
               "null"
             ],
-            "description": "Whether to enable [parallel function calling](https://platform.openai.com/docs/guides/function-calling/parallel-function-calling) during tool use."
+            "description": "Whether to enable [parallel function calling](https://platform.openai.com/docs/guides/function-calling#configuring-parallel-function-calling)\nduring tool use."
           },
           "prediction": {
             "oneOf": [
@@ -3126,7 +3478,7 @@
               },
               {
                 "$ref": "#/components/schemas/PredictionContent",
-                "description": "Configuration for a [Predicted Output](https://platform.openai.com/docs/guides/predicted-outputs),which can greatly improve response times when large parts of the model response are known ahead of time. This is most common when you are regenerating a file with only minor changes to most of the content."
+                "description": "Configuration for a [Predicted Output](https://platform.openai.com/docs/guides/predicted-outputs),\nwhich can greatly improve response times when large parts of the model\nresponse are known ahead of time. This is most common when you are\nregenerating a file with only minor changes to most of the content."
               }
             ]
           },
@@ -3136,7 +3488,14 @@
               "null"
             ],
             "format": "float",
-            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far, increasing the model's likelihood to talk about new topics."
+            "description": "Number between -2.0 and 2.0. Positive values penalize new tokens based on\nwhether they appear in the text so far, increasing the model's likelihood\nto talk about new topics."
+          },
+          "prompt_cache_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Used by OpenAI to cache responses for similar requests to optimize your cache hit rates. Replaces\nthe `user` field. [Learn more](https://platform.openai.com/docs/guides/prompt-caching)."
           },
           "reasoning_effort": {
             "oneOf": [
@@ -3145,7 +3504,7 @@
               },
               {
                 "$ref": "#/components/schemas/ReasoningEffort",
-                "description": "**o1 models only**\n\nConstrains effort on reasoning for\n[reasoning models](https://platform.openai.com/docs/guides/reasoning).\n\nCurrently supported values are `low`, `medium`, and `high`. Reducing\n\nreasoning effort can result in faster responses and fewer tokens\nused on reasoning in a response."
+                "description": "Constrains effort on reasoning for\n[reasoning models](https://platform.openai.com/docs/guides/reasoning).\nCurrently supported values are `minimal`, `low`, `medium`, and `high`. Reducing\nreasoning effort can result in faster responses and fewer tokens used\non reasoning in a response.\nNote: The `gpt-5-pro` model defaults to (and only supports) `high` reasoning effort."
               }
             ]
           },
@@ -3156,9 +3515,16 @@
               },
               {
                 "$ref": "#/components/schemas/ResponseFormat",
-                "description": "An object specifying the format that the model must output. Compatible with [GPT-4o](https://platform.openai.com/docs/models/gpt-4o), [GPT-4o mini](https://platform.openai.com/docs/models/gpt-4o-mini), [GPT-4 Turbo](https://platform.openai.com/docs/models/gpt-4-and-gpt-4-turbo) and all GPT-3.5 Turbo models newer than `gpt-3.5-turbo-1106`.\n\nSetting to `{ \"type\": \"json_schema\", \"json_schema\": {...} }` enables Structured Outputs which guarantees the model will match your supplied JSON schema. Learn more in the [Structured Outputs guide](https://platform.openai.com/docs/guides/structured-outputs).\n\nSetting to `{ \"type\": \"json_object\" }` enables JSON mode, which guarantees the message the model generates is valid JSON.\n\n**Important:** when using JSON mode, you **must** also instruct the model to produce JSON yourself via a system or user message. Without this, the model may generate an unending stream of whitespace until the generation reaches the token limit, resulting in a long-running and seemingly \"stuck\" request. Also note that the message content may be partially cut off if `finish_reason=\"length\"`, which indicates the generation exceeded `max_tokens` or the conversation exceeded the max context length."
+                "description": "An object specifying the format that the model must output.\n\nSetting to `{ \"type\": \"json_schema\", \"json_schema\": {...} }` enables\nStructured Outputs which ensures the model will match your supplied JSON\nschema. Learn more in the [Structured Outputs guide](https://platform.openai.com/docs/guides/structured-outputs).\n\nSetting to `{ \"type\": \"json_object\" }` enables the older JSON mode, which\nensures the message the model generates is valid JSON. Using `json_schema`\nis preferred for models that support it."
               }
             ]
+          },
+          "safety_identifier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A stable identifier used to help detect users of your application that may be violating OpenAI's\nusage policies.\n\nThe IDs should be a string that uniquely identifies each user. We recommend hashing their username\nor email address, in order to avoid sending us any identifying information. [Learn\nmore](https://platform.openai.com/docs/guides/safety-best-practices#safety-identifiers)."
           },
           "seed": {
             "type": [
@@ -3166,7 +3532,8 @@
               "null"
             ],
             "format": "int64",
-            "description": " This feature is in Beta.\nIf specified, our system will make a best effort to sample deterministically, such that repeated requests\nwith the same `seed` and parameters should return the same result.\nDeterminism is not guaranteed, and you should refer to the `system_fingerprint` response parameter to monitor changes in the backend."
+            "description": "This feature is in Beta.\n\nIf specified, our system will make a best effort to sample deterministically, such that\nrepeated requests with the same `seed` and parameters should return the same result.\n\nDeterminism is not guaranteed, and you should refer to the `system_fingerprint` response\nparameter to monitor changes in the backend.",
+            "deprecated": true
           },
           "service_tier": {
             "oneOf": [
@@ -3175,7 +3542,7 @@
               },
               {
                 "$ref": "#/components/schemas/ServiceTier",
-                "description": "Specifies the latency tier to use for processing the request. This parameter is relevant for customers subscribed to the scale tier service:\n- If set to 'auto', the system will utilize scale tier credits until they are exhausted.\n- If set to 'default', the request will be processed using the default service tier with a lower uptime SLA and no latency guarentee.\n- When not set, the default behavior is 'auto'.\n\nWhen this parameter is set, the response body will include the `service_tier` utilized."
+                "description": "Specifies the processing type used for serving the request.\n- If set to 'auto', then the request will be processed with the service tier configured in the Project settings. Unless otherwise configured, the Project will use 'default'.\n- If set to 'default', then the request will be processed with the standard pricing and performance for the selected model.\n- If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)' or '[priority](https://openai.com/api-priority-processing/)', then the request will be processed with the corresponding service tier.\n- When not set, the default behavior is 'auto'.\n\nWhen the `service_tier` parameter is set, the response body will include the `service_tier` value based on the processing mode actually used to serve the request. This response value may be different from the value set in the parameter."
               }
             ]
           },
@@ -3185,8 +3552,8 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/Stop",
-                "description": "Up to 4 sequences where the API will stop generating further tokens."
+                "$ref": "#/components/schemas/StopConfiguration",
+                "description": "Not supported with latest reasoning models `o3` and `o4-mini`.\n\nUp to 4 sequences where the API will stop generating further tokens. The\nreturned text will not contain the stop sequence."
               }
             ]
           },
@@ -3195,14 +3562,14 @@
               "boolean",
               "null"
             ],
-            "description": "Whether or not to store the output of this chat completion request\n\nfor use in our [model distillation](https://platform.openai.com/docs/guides/distillation) or [evals](https://platform.openai.com/docs/guides/evals) products."
+            "description": "Whether or not to store the output of this chat completion request for\nuse in our [model distillation](https://platform.openai.com/docs/guides/distillation) or\n[evals](https://platform.openai.com/docs/guides/evals) products.\n\nSupports text and image inputs. Note: image inputs over 8MB will be dropped."
           },
           "stream": {
             "type": [
               "boolean",
               "null"
             ],
-            "description": "If set, partial message deltas will be sent, like in ChatGPT.\nTokens will be sent as data-only [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format)\nas they become available, with the stream terminated by a `data: [DONE]` message. [Example Python code](https://cookbook.openai.com/examples/how_to_stream_completions)."
+            "description": "If set to true, the model response data will be streamed to the client\nas it is generated using [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format).\nSee the [Streaming section below](https://platform.openai.com/docs/api-reference/chat/streaming)\nfor more information, along with the [streaming responses](https://platform.openai.com/docs/guides/streaming-responses)\nguide for more information on how to handle the streaming events."
           },
           "stream_options": {
             "oneOf": [
@@ -3228,7 +3595,8 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ChatCompletionToolChoiceOption"
+                "$ref": "#/components/schemas/ChatCompletionToolChoiceOption",
+                "description": "Controls which (if any) tool is called by the model.\n`none` means the model will not call any tool and instead generates a message.\n`auto` means the model can pick between generating a message or calling one or more tools.\n`required` means the model must call one or more tools.\nSpecifying a particular tool via `{\"type\": \"function\", \"function\": {\"name\": \"my_function\"}}` forces\nthe model to call that tool.\n`none` is the default when no tools are present. `auto` is the default if tools are present."
               }
             ]
           },
@@ -3238,9 +3606,9 @@
               "null"
             ],
             "items": {
-              "$ref": "#/components/schemas/ChatCompletionTool"
+              "$ref": "#/components/schemas/ChatCompletionTools"
             },
-            "description": "A list of tools the model may call. Currently, only functions are supported as a tool.\nUse this to provide a list of functions the model may generate JSON inputs for. A max of 128 functions are supported."
+            "description": "A list of tools the model may call. You can provide either\n[custom tools](https://platform.openai.com/docs/guides/function-calling#custom-tools) or\n[function tools](https://platform.openai.com/docs/guides/function-calling)."
           },
           "top_logprobs": {
             "type": [
@@ -3248,7 +3616,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "An integer between 0 and 20 specifying the number of most likely tokens to return at each token position, each with an associated log probability. `logprobs` must be set to `true` if this parameter is used.",
+            "description": "An integer between 0 and 20 specifying the number of most likely tokens to\nreturn at each token position, each with an associated log probability.\n`logprobs` must be set to `true` if this parameter is used.",
             "minimum": 0
           },
           "top_p": {
@@ -3264,7 +3632,19 @@
               "string",
               "null"
             ],
-            "description": "A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](https://platform.openai.com/docs/guides/safety-best-practices#end-user-ids)."
+            "description": "This field is being replaced by `safety_identifier` and `prompt_cache_key`. Use `prompt_cache_key`\ninstead to maintain caching optimizations.\nA stable identifier for your end-users.\nUsed to boost cache hit rates by better bucketing similar requests and  to help OpenAI detect and\nprevent abuse. [Learn more](https://platform.openai.com/docs/guides/safety-best-practices#safety-identifiers).",
+            "deprecated": true
+          },
+          "verbosity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Verbosity",
+                "description": "Constrains the verbosity of the model's response. Lower values will result in\nmore concise responses, while higher values will result in more verbose responses.\nCurrently supported values are `low`, `medium`, and `high`."
+              }
+            ]
           },
           "web_search_options": {
             "oneOf": [
@@ -3321,7 +3701,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ServiceTierResponse",
+                "$ref": "#/components/schemas/ServiceTier",
                 "description": "The service tier used for processing the request. This field is only included if the `service_tier` parameter is specified in the request."
               }
             ]
@@ -3331,7 +3711,8 @@
               "string",
               "null"
             ],
-            "description": "This fingerprint represents the backend configuration that the model runs with.\n\nCan be used in conjunction with the `seed` request parameter to understand when backend changes have been made that might impact determinism."
+            "description": "This fingerprint represents the backend configuration that the model runs with.\n\nCan be used in conjunction with the `seed` request parameter to understand when backend changes have been made that might impact determinism.",
+            "deprecated": true
           },
           "usage": {
             "oneOf": [
@@ -3368,24 +3749,24 @@
               },
               {
                 "$ref": "#/components/schemas/EncodingFormat",
-                "description": "The format to return the embeddings in. Can be either `float` or [`base64`](https://pypi.org/project/pybase64/). Defaults to float"
+                "description": "The format to return the embeddings in. Can be either `float` or [`base64`](https://pypi.org/project/pybase64/)."
               }
             ]
           },
           "input": {
             "$ref": "#/components/schemas/EmbeddingInput",
-            "description": "Input text to embed, encoded as a string or array of tokens. To embed multiple inputs in a single request, pass an array of strings or array of token arrays. The input must not exceed the max input tokens for the model (8192 tokens for `text-embedding-ada-002`), cannot be an empty string, and any array must be 2048 dimensions or less. [Example Python code](https://cookbook.openai.com/examples/how_to_count_tokens_with_tiktoken) for counting tokens."
+            "description": "Input text to embed, encoded as a string or array of tokens. To embed multiple inputs in a single\nrequest, pass an array of strings or array of token arrays. The input must not exceed the max\ninput tokens for the model (8192 tokens for all embedding models), cannot be an empty string, and\nany array must be 2048 dimensions or less. [Example Python\ncode](https://cookbook.openai.com/examples/how_to_count_tokens_with_tiktoken) for counting tokens.\nIn addition to the per-input token limit, all embedding  models enforce a maximum of 300,000\ntokens summed across all inputs in a  single request."
           },
           "model": {
             "type": "string",
-            "description": "ID of the model to use. You can use the\n[List models](https://platform.openai.com/docs/api-reference/models/list)\nAPI to see all of your available models, or see our\n[Model overview](https://platform.openai.com/docs/models/overview)\nfor descriptions of them."
+            "description": "ID of the model to use. You can use the [List models](https://platform.openai.com/docs/api-reference/models/list)\nAPI to see all of your available models, or see our [Model overview](https://platform.openai.com/docs/models)\nfor descriptions of them."
           },
           "user": {
             "type": [
               "string",
               "null"
             ],
-            "description": "A unique identifier representing your end-user, which will help OpenAI\n to monitor and detect abuse. [Learn more](https://platform.openai.com/docs/usage-policies/end-user-ids)."
+            "description": "A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse.\n[Learn more](https://platform.openai.com/docs/guides/safety-best-practices#end-user-ids)."
           }
         }
       },
@@ -3417,6 +3798,125 @@
             "description": "The usage information for the request."
           }
         }
+      },
+      "CustomGrammarFormatParam": {
+        "type": "object",
+        "required": [
+          "definition",
+          "syntax"
+        ],
+        "properties": {
+          "definition": {
+            "type": "string",
+            "description": "The grammar definition."
+          },
+          "syntax": {
+            "$ref": "#/components/schemas/GrammarSyntax",
+            "description": "The syntax of the grammar definition. One of `lark` or `regex`."
+          }
+        }
+      },
+      "CustomName": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the custom tool to call."
+          }
+        }
+      },
+      "CustomTool": {
+        "type": "object",
+        "required": [
+          "name",
+          "input"
+        ],
+        "properties": {
+          "input": {
+            "type": "string",
+            "description": "The input for the custom tool call generated by the model."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the custom tool to call."
+          }
+        }
+      },
+      "CustomToolChatCompletions": {
+        "type": "object",
+        "required": [
+          "custom"
+        ],
+        "properties": {
+          "custom": {
+            "$ref": "#/components/schemas/CustomToolProperties"
+          }
+        }
+      },
+      "CustomToolProperties": {
+        "type": "object",
+        "required": [
+          "name",
+          "format"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description of the custom tool, used to provide more context."
+          },
+          "format": {
+            "$ref": "#/components/schemas/CustomToolPropertiesFormat",
+            "description": "The input format for the custom tool. Default is unconstrained text."
+          },
+          "name": {
+            "type": "string",
+            "description": "The name of the custom tool, used to identify it in tool calls."
+          }
+        }
+      },
+      "CustomToolPropertiesFormat": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Unconstrained free-form text.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A grammar defined by the user.",
+            "required": [
+              "grammar",
+              "type"
+            ],
+            "properties": {
+              "grammar": {
+                "$ref": "#/components/schemas/CustomGrammarFormatParam"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "grammar"
+                ]
+              }
+            }
+          }
+        ]
       },
       "DatasetFilter": {
         "type": "object",
@@ -3648,6 +4148,32 @@
           }
         }
       },
+      "FileObject": {
+        "type": "object",
+        "properties": {
+          "file_data": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The base64 encoded file data, used when passing the file to the model\nas a string."
+          },
+          "file_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The ID of an uploaded file to use as input."
+          },
+          "filename": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name of the file, used when passing the file to the model as a\nstring."
+          }
+        }
+      },
       "FinishReason": {
         "type": "string",
         "enum": [
@@ -3746,6 +4272,13 @@
             }
           }
         }
+      },
+      "GrammarSyntax": {
+        "type": "string",
+        "enum": [
+          "lark",
+          "regex"
+        ]
       },
       "IcebergError": {
         "type": "object",
@@ -4207,10 +4740,12 @@
       "ReasoningEffort": {
         "type": "string",
         "enum": [
+          "none",
           "minimal",
           "low",
           "medium",
-          "high"
+          "high",
+          "xhigh"
         ]
       },
       "RefreshMode": {
@@ -4360,16 +4895,24 @@
             "description": "The name of the response format. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 64."
           },
           "schema": {
-            "description": "The schema for the response format, described as a JSON Schema object."
+            "description": "The schema for the response format, described as a JSON Schema object.\nLearn how to build JSON schemas [here](https://json-schema.org/)."
           },
           "strict": {
             "type": [
               "boolean",
               "null"
             ],
-            "description": "Whether to enable strict schema adherence when generating the output. If set to true, the model will always follow the exact schema defined in the `schema` field. Only a subset of JSON Schema is supported when `strict` is `true`. To learn more, read the [Structured Outputs guide](https://platform.openai.com/docs/guides/structured-outputs)."
+            "description": "Whether to enable strict schema adherence when generating the output.\nIf set to true, the model will always follow the exact schema defined\nin the `schema` field. Only a subset of JSON Schema is supported when\n`strict` is `true`. To learn more, read the [Structured Outputs\nguide](https://platform.openai.com/docs/guides/structured-outputs)."
           }
         }
+      },
+      "ResponseModalities": {
+        "type": "string",
+        "description": "Output types that you would like the model to generate for this request.\n\nMost models are capable of generating text, which is the default: `[\"text\"]`\n\nThe `gpt-4o-audio-preview` model can also be used to [generate\naudio](https://platform.openai.com/docs/guides/audio). To request that this model generate both text and audio responses, you can use: `[\"text\", \"audio\"]`",
+        "enum": [
+          "text",
+          "audio"
+        ]
       },
       "Role": {
         "type": "string",
@@ -4490,15 +5033,6 @@
           "priority"
         ]
       },
-      "ServiceTierResponse": {
-        "type": "string",
-        "enum": [
-          "scale",
-          "default",
-          "flex",
-          "priority"
-        ]
-      },
       "SpicepodSummary": {
         "type": "object",
         "required": [
@@ -4531,7 +5065,7 @@
           }
         }
       },
-      "Stop": {
+      "StopConfiguration": {
         "oneOf": [
           {
             "type": "string"
@@ -4542,6 +5076,21 @@
               "type": "string"
             }
           }
+        ]
+      },
+      "ToolChoiceAllowedMode": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "required"
+        ]
+      },
+      "ToolChoiceOptions": {
+        "type": "string",
+        "enum": [
+          "none",
+          "auto",
+          "required"
         ]
       },
       "TopLogprobs": {
@@ -4573,6 +5122,46 @@
             "description": "The token."
           }
         }
+      },
+      "UrlCitation": {
+        "type": "object",
+        "required": [
+          "end_index",
+          "start_index",
+          "title",
+          "url"
+        ],
+        "properties": {
+          "end_index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The index of the last character of the URL citation in the message.",
+            "minimum": 0
+          },
+          "start_index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The index of the first character of the URL citation in the message.",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string",
+            "description": "The title of the web resource."
+          },
+          "url": {
+            "type": "string",
+            "description": "The URL of the web resource."
+          }
+        }
+      },
+      "Verbosity": {
+        "type": "string",
+        "description": "Constrains the verbosity of the model's response. Lower values will result in more concise responses, while higher values will result in more verbose responses. Currently supported values are `low`, `medium`, and `high`.",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ]
       },
       "WebSearchContextSize": {
         "type": "string",

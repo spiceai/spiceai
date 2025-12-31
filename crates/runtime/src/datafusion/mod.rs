@@ -45,7 +45,6 @@ use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
 
-#[cfg(feature = "cluster")]
 use {
     crate::cluster::ResolvedClusterConfig,
     ballista_executor::executor::Executor,
@@ -243,11 +242,9 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableExecutorHandle {},
 
@@ -361,11 +358,8 @@ pub struct DataFusion {
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 
     pub temp_directory: Option<String>,
-    #[cfg(feature = "cluster")]
     pub cluster_config: Arc<ResolvedClusterConfig>,
-    #[cfg(feature = "cluster")]
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
-    #[cfg(feature = "cluster")]
     pub executor: RwLock<Option<Arc<Executor>>>,
 }
 
@@ -1943,7 +1937,6 @@ impl DataFusion {
         }
     }
 
-    #[cfg(feature = "cluster")]
     pub fn bind_scheduler_server(
         &self,
         server: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
@@ -1956,7 +1949,6 @@ impl DataFusion {
         Ok(())
     }
 
-    #[cfg(feature = "cluster")]
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
         let mut executor_handle = self
             .executor

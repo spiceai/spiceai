@@ -22,7 +22,6 @@ limitations under the License.
 pub mod duckdb;
 pub mod hash_join_optimization;
 
-#[cfg(feature = "cluster")]
 pub mod cluster;
 
 pub use hash_join_optimization::EmptyHashJoinExecPhysicalOptimization;

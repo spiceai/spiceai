@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::ValueEnum;
+use clap::{ArgAction, ValueEnum};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-#[cfg(feature = "cluster")]
 use url::Url;
 
 #[derive(Debug, Clone, clap::Parser)]
@@ -41,7 +40,6 @@ pub struct Config {
     pub flight_bind_address: SocketAddr,
 
     /// All cluster related arguments
-    #[cfg(feature = "cluster")]
     #[clap(flatten)]
     pub cluster: ClusterConfig,
 }
@@ -58,7 +56,6 @@ impl Config {
         Self {
             http_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8090),
             flight_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051),
-            #[cfg(feature = "cluster")]
             cluster: ClusterConfig::default(),
         }
     }
@@ -82,7 +79,6 @@ impl Default for Config {
     }
 }
 
-#[cfg(feature = "cluster")]
 #[derive(Debug, Clone, clap::Parser)]
 pub struct ClusterConfig {
     /// Configure cluster node role: scheduler or executor
@@ -117,6 +113,10 @@ pub struct ClusterConfig {
     #[arg(long = "node-mtls-key-file", value_name = "NODE_MTLS_KEY_FILE")]
     pub node_mtls_key_file: Option<String>,
 
+    /// Allow insecure cluster communication without mTLS. WARNING: Only use this flag in development or testing environments and never in production.
+    #[arg(long = "allow-insecure-connections", default_value_t = false, action = ArgAction::SetTrue)]
+    pub allow_insecure_connections: bool,
+
     /// The URL of the scheduler service. Required for executors to join a cluster.
     /// If set, --role executor is implied and can be omitted.
     #[arg(long = "scheduler-address", value_name = "SCHEDULER_ADDRESS")]
@@ -129,7 +129,6 @@ pub struct ClusterConfig {
     pub node_advertise_address: Option<String>,
 }
 
-#[cfg(feature = "cluster")]
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -138,13 +137,13 @@ impl Default for ClusterConfig {
             node_mtls_ca_certificate_file: None,
             node_mtls_certificate_file: None,
             node_mtls_key_file: None,
+            allow_insecure_connections: false,
             scheduler_address: None,
             node_advertise_address: None,
         }
     }
 }
 
-#[cfg(feature = "cluster")]
 impl ClusterConfig {
     #[must_use]
     pub fn with_role(mut self, role: ClusterRole) -> Self {

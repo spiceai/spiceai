@@ -3,10 +3,15 @@ name: OSS Upstream Merge
 on:
   workflow_dispatch:
     inputs:
-      run_conflict_resolution:
-        description: 'Attempt automated conflict resolution when needed'
+      conflict_resolution_mode:
+        description: 'Automated conflict resolution mode'
         required: false
-        default: 'true'
+        type: choice
+        default: 'as-needed'
+        options:
+          - 'as-needed'
+          - 'never'
+          - 'always'
       custom_merge_branch_suffix:
         description: 'Optional suffix to append to the automation branch'
         required: false
@@ -30,7 +35,7 @@ jobs:
       UPSTREAM_REPO: https://github.com/spiceai/spiceai.git
       MERGE_LABEL: kind/upstream-merge
       REPORT_FILE: merge_conflict_report.md
-      RUN_CONFLICT_RESOLUTION: 'true'
+      CONFLICT_RESOLUTION_MODE: 'as-needed'
     steps:
       - name: Configure authentication token
         shell: bash
@@ -49,11 +54,11 @@ jobs:
 
       - name: Resolve workflow inputs
         run: |
-          run_conflict="${{ github.event.inputs.run_conflict_resolution }}"
-          if [ -z "$run_conflict" ]; then
-            run_conflict="true"
+          resolution_mode="${{ github.event.inputs.conflict_resolution_mode }}"
+          if [ -z "$resolution_mode" ]; then
+            resolution_mode="as-needed"
           fi
-          echo "RUN_CONFLICT_RESOLUTION=$run_conflict" >> $GITHUB_ENV
+          echo "CONFLICT_RESOLUTION_MODE=$resolution_mode" >> $GITHUB_ENV
 
           suffix="${{ github.event.inputs.custom_merge_branch_suffix }}"
           if [ -z "$suffix" ]; then
@@ -130,24 +135,81 @@ jobs:
             echo "conflicts=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install uv
-        if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
-        uses: astral-sh/setup-uv@v6
+      - name: Install OpenAI Codex CLI
+        if: (steps.merge.outputs.conflicts == 'true' && env.CONFLICT_RESOLUTION_MODE != 'never') || env.CONFLICT_RESOLUTION_MODE == 'always'
+        run: |
+          npm install -g @openai/codex
 
       - name: Attempt automated conflict resolution
-        if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
+        if: (steps.merge.outputs.conflicts == 'true' && env.CONFLICT_RESOLUTION_MODE != 'never') || env.CONFLICT_RESOLUTION_MODE == 'always'
         id: llm
         timeout-minutes: 15
         env:
           OPENAI_API_KEY: ${{ secrets.SPICE_OPENAI_API_KEY }}
-          LLM_MODEL: ${{ vars.UPSTREAM_MERGE_LLM_MODEL }}
-          LLM_REPORT_PATH: ${{ env.REPORT_FILE }}
         run: |
-          uv run --with openai python scripts/automation/auto_resolve_conflicts.py
+          MODEL="${{ vars.UPSTREAM_MERGE_LLM_MODEL }}"
+
+          CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+          if [ -z "$CONFLICT_FILES" ]; then
+            echo "No conflicts detected"
+            echo "status=no_conflicts" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          FILES_LIST=$(echo "$CONFLICT_FILES" | tr '\n' ', ' | sed 's/, $//')
+          echo "Attempting to resolve conflicts in: $FILES_LIST"
+
+          PROMPT="Resolve the merge conflicts in the following files: $FILES_LIST. Each file contains git conflict markers (<<<<<<< HEAD, =======, >>>>>>>). For each file, analyze both versions and produce a clean merged result that preserves the intent of both changes. Write the resolved content directly to each file, removing all conflict markers."
+
+          codex --model "$MODEL" --approval-mode full-auto --quiet "$PROMPT" || true
+
+          # Check results and stage resolved files
+          FAILED_COUNT=0
+          REPORT_FILE="${{ env.REPORT_FILE }}"
+          {
+            echo "# Automated conflict resolution report"
+            echo ""
+            echo "- Model: $MODEL"
+            echo "- Outcome: PLACEHOLDER"
+            echo ""
+            echo "## File details"
+            echo ""
+          } > "$REPORT_FILE"
+
+          echo "$CONFLICT_FILES" | while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            echo "### \`$file\`" >> "$REPORT_FILE"
+            echo "" >> "$REPORT_FILE"
+            if grep -q "<<<<<<< HEAD\|=======\|>>>>>>>" "$file" 2>/dev/null; then
+              echo "- Status: ❌ Manual follow-up required" >> "$REPORT_FILE"
+              # Write to a temp file to communicate count to outer shell
+              echo "1" >> /tmp/failed_count
+            else
+              git add "$file"
+              echo "- Status: ✅ Resolved" >> "$REPORT_FILE"
+            fi
+            echo "" >> "$REPORT_FILE"
+          done
+
+          # Count failures from temp file (while loop runs in subshell)
+          if [ -f /tmp/failed_count ]; then
+            FAILED_COUNT=$(wc -l < /tmp/failed_count | tr -d ' ')
+            rm -f /tmp/failed_count
+          fi
+
+          if [ "$FAILED_COUNT" -eq 0 ]; then
+            sed 's/- Outcome: PLACEHOLDER/- Outcome: All conflicts resolved/' "$REPORT_FILE" > "$REPORT_FILE.tmp"
+            mv "$REPORT_FILE.tmp" "$REPORT_FILE"
+            echo "status=resolved" >> $GITHUB_OUTPUT
+          else
+            sed 's/- Outcome: PLACEHOLDER/- Outcome: Conflicts remain after attempted resolution/' "$REPORT_FILE" > "$REPORT_FILE.tmp"
+            mv "$REPORT_FILE.tmp" "$REPORT_FILE"
+            echo "status=partial" >> $GITHUB_OUTPUT
+          fi
 
       - name: Mark unresolved files for commit
         id: mark_conflicts
-        if: steps.merge.outputs.conflicts == 'true' && (env.RUN_CONFLICT_RESOLUTION != 'true' || steps.llm.outputs.status != 'resolved')
+        if: steps.merge.outputs.conflicts == 'true' && (env.CONFLICT_RESOLUTION_MODE == 'never' || steps.llm.outputs.status != 'resolved')
         run: |
           CONFLICT_FILES=$(git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' || true)
           git diff --name-only --diff-filter=U | grep '^\.github/workflows/' | xargs -r git restore  --theirs
@@ -186,7 +248,21 @@ jobs:
         if: steps.check_pr.outputs.has_open == 'false' && steps.repo_changes.outputs.has_changes == 'true'
         run: |
           if git status --porcelain | grep -q .; then
-            git commit --no-edit
+            git add -A
+            
+            # Build a descriptive commit message
+            UPSTREAM_SHORT=$(echo "$UPSTREAM_SHA" | cut -c1-7)
+            COMMIT_MSG="Merge upstream/${DEFAULT_BRANCH} (${UPSTREAM_SHORT})"
+            
+            if [ "${{ steps.merge.outputs.conflicts }}" = "true" ]; then
+              if [ "${{ steps.llm.outputs.status }}" = "resolved" ]; then
+                COMMIT_MSG="${COMMIT_MSG}"$'\n\n'"Conflicts auto-resolved using OpenAI Codex."
+              else
+                COMMIT_MSG="${COMMIT_MSG}"$'\n\n'"Contains unresolved conflicts requiring manual review."
+              fi
+            fi
+            
+            git commit -m "$COMMIT_MSG"
           fi
 
       - name: Build PR body
