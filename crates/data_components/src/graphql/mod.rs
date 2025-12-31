@@ -130,7 +130,21 @@ pub fn is_retriable_error(error: &Error) -> bool {
             status.is_server_error()
         }
         Error::ReqwestInternal { source } => {
-            source.is_timeout() || source.is_connect() || source.is_request()
+            // Check for network/connection errors
+            source.is_timeout()
+                || source.is_connect()
+                || source.is_request()
+                || source.is_body()  // Body decode errors (e.g., "error decoding response body")
+                // Also check if the underlying status code is a retriable server error
+                || matches!(
+                    source.status(),
+                    Some(
+                        StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                            | StatusCode::REQUEST_TIMEOUT
+                    )
+                )
         }
         Error::RateLimited { .. } => true,
         _ => false,
