@@ -67,7 +67,6 @@ pub(crate) static OPENAI_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
             "stream_options",
             "temperature",
             "top_p",
-            "tools",
             "tool_choice",
             "parallel_tool_calls",
             "user",
@@ -262,7 +261,6 @@ impl ChatWrapper {
                 }
                 "temperature" => set_default_w_warning!(req, temperature, value, self.public_name),
                 "top_p" => set_default_w_warning!(req, top_p, value, self.public_name),
-                "tools" => set_default_w_warning!(req, tools, value, self.public_name),
                 "tool_choice" => set_default_w_warning!(req, tool_choice, value, self.public_name),
                 "parallel_tool_calls" => {
                     set_default_w_warning!(req, parallel_tool_calls, value, self.public_name);
