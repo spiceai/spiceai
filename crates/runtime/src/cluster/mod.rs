@@ -216,21 +216,32 @@ impl ResolvedClusterConfig {
             format!("{inferred_scheme}://{host}:{bind_port}")
         });
 
-        // Resolve scheduler address URL, inferring scheme if omitted
+        // Resolve scheduler address URL, inferring scheme if omitted and default port if not provided
         let scheduler_address_url = config
             .scheduler_address
             .as_ref()
             .map(|addr| {
                 // Check if scheme is already present
-                if addr.starts_with("http://") || addr.starts_with("https://") {
+                let url = if addr.starts_with("http://") || addr.starts_with("https://") {
                     Url::parse(addr)
                 } else {
                     // Infer scheme from TLS config
                     Url::parse(&format!("{inferred_scheme}://{addr}"))
+                }?;
+
+                // If no port is specified, use the default cluster port (50052)
+                if url.port().is_none() {
+                    let mut url_with_port = url;
+                    url_with_port
+                        .set_port(Some(50052))
+                        .map_err(|()| url::ParseError::InvalidPort)?;
+                    Ok(url_with_port)
+                } else {
+                    Ok(url)
                 }
             })
             .transpose()
-            .map_err(|e| {
+            .map_err(|e: url::ParseError| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("Invalid --scheduler-address URL: {e}"),
