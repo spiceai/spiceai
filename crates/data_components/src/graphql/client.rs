@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
-use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
 use url::Url;
 
@@ -732,7 +733,8 @@ impl GraphQLQuery {
         )
     }
 
-    pub fn limit_reached(&mut self, limit: Option<usize>, record_count: usize) -> bool {
+    #[must_use]
+    pub fn limit_reached(&self, limit: Option<usize>, record_count: usize) -> bool {
         if let Some(limit) = limit {
             record_count >= limit
         } else {
@@ -824,7 +826,7 @@ impl GraphQLClient {
 
     pub(crate) async fn execute(
         &self,
-        query: &mut GraphQLQuery,
+        query: &GraphQLQuery,
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
@@ -1105,7 +1107,7 @@ impl GraphQLClient {
     #[must_use]
     pub fn execute_paginated(
         self: Arc<Self>,
-        mut query: GraphQLQuery,
+        query: GraphQLQuery,
         gql_schema: SchemaRef,
         table_schema: SchemaRef,
         limit: Option<usize>,
@@ -1124,7 +1126,7 @@ impl GraphQLClient {
             // Execute initial page with retry
             let mut result = Self::execute_with_retry(
                 &self,
-                &mut query,
+                &query,
                 Some(Arc::clone(&gql_schema)),
                 limit,
                 None,
@@ -1183,7 +1185,7 @@ impl GraphQLClient {
                 // Execute subsequent pages with retry
                 result = Self::execute_with_retry(
                     &self,
-                    &mut query,
+                    &query,
                     Some(Arc::clone(&gql_schema)),
                     limit,
                     Some(next_cursor_val),
@@ -1211,71 +1213,41 @@ impl GraphQLClient {
 
     /// Executes a GraphQL query with page-level retry for transient errors.
     ///
-    /// This function wraps `execute()` with retry logic using Fibonacci backoff
-    /// from the `util::fibonacci_backoff` module. It will retry up to `PAGE_RETRY_MAX_ATTEMPTS`
-    /// times for retriable errors (e.g., 502, 503, 504, timeouts, rate limits).
-    ///
     /// Note: Rate limit handling (waiting until reset time) is done proactively by the
-    /// `RateLimiter` trait via `check_rate_limit()` before each request, not reactively here.
+    /// `RateLimiter` trait via `check_rate_limit()` before each request.
     async fn execute_with_retry(
         client: &Arc<Self>,
-        query: &mut GraphQLQuery,
+        query: &GraphQLQuery,
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
     ) -> Result<GraphQLQueryResult> {
-        let mut backoff = FibonacciBackoffBuilder::new()
+        let backoff = FibonacciBackoffBuilder::new()
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
             .build();
 
-        let mut attempt = 0u32;
+        retry(backoff, || {
+            let schema = schema.clone();
+            let cursor = cursor.clone();
+            let error_checker = error_checker.clone();
 
-        loop {
-            attempt += 1;
-
-            match client
-                .execute(
-                    query,
-                    schema.clone(),
-                    limit,
-                    cursor.clone(),
-                    error_checker.clone(),
-                    query_cost,
-                )
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if !is_retriable_error(&e) {
-                        // Non-retriable error, fail immediately
-                        return Err(e);
-                    }
-
-                    // Use Fibonacci backoff strategy for retriable errors
-                    if let Some(delay) = backoff.next_backoff() {
-                        tracing::warn!(
-                            "Page fetch failed (retry {}/{}; total attempt {}), retrying in {:?}: {}",
-                            attempt.saturating_sub(1),
-                            PAGE_RETRY_MAX_ATTEMPTS,
-                            attempt,
-                            delay,
-                            e
-                        );
-                        tokio::time::sleep(delay).await;
-                    } else {
-                        // Max retries exhausted
-                        tracing::error!(
-                            "Page fetch failed after {} attempts, giving up: {}",
-                            attempt,
-                            e
-                        );
-                        return Err(e);
-                    }
-                }
+            async move {
+                client
+                    .execute(query, schema, limit, cursor, error_checker, query_cost)
+                    .await
+                    .map_err(|e| {
+                        if is_retriable_error(&e) {
+                            tracing::warn!("Page fetch failed, will retry: {e}");
+                            RetryError::transient(e)
+                        } else {
+                            RetryError::permanent(e)
+                        }
+                    })
             }
-        }
+        })
+        .await
     }
 }
 

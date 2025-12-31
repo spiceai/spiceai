@@ -444,23 +444,27 @@ mod tests {
 
         // Verify the FibonacciBackoff produces expected Fibonacci delays
         // This mirrors the configuration used in execute_with_retry
-        // Fibonacci intervals: [1000, 1000, 2000, 3000, 5000, 8000, ...]
+        // Fibonacci intervals array: [1000, 1000, 2000, 3000, 5000, 8000, ...] (indices 0, 1, 2, 3, ...)
+        // next_backoff() increments num_retries first, then uses it as index:
+        //   Call 1: num_retries=1, index 1 -> 1000ms
+        //   Call 2: num_retries=2, index 2 -> 2000ms
+        //   Call 3: num_retries=3, index 3 -> 3000ms
         let mut backoff = FibonacciBackoffBuilder::new()
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
             .randomization_factor(0.0) // No randomization for predictable testing
             .build();
 
-        // Attempt 1: 1s (first Fibonacci interval)
+        // Call 1: num_retries=1, index 1 -> 1000ms (1s)
         let delay_1 = backoff.next_backoff().expect("should have delay");
         assert_eq!(delay_1, Duration::from_secs(1));
 
-        // Attempt 2: 1s (second Fibonacci interval)
+        // Call 2: num_retries=2, index 2 -> 2000ms (2s)
         let delay_2 = backoff.next_backoff().expect("should have delay");
-        assert_eq!(delay_2, Duration::from_secs(1));
+        assert_eq!(delay_2, Duration::from_secs(2));
 
-        // Attempt 3: 2s (third Fibonacci interval)
+        // Call 3: num_retries=3, index 3 -> 3000ms (3s)
         let delay_3 = backoff.next_backoff().expect("should have delay");
-        assert_eq!(delay_3, Duration::from_secs(2));
+        assert_eq!(delay_3, Duration::from_secs(3));
 
         // After max_retries (3), should return None
         assert!(
