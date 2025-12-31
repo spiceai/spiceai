@@ -122,9 +122,24 @@ impl bb8::ManageConnection for SMBConnectionManager {
 
     fn is_valid(
         &self,
-        _conn: &mut Self::Connection,
+        conn: &mut Self::Connection,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        Box::pin(async move { Ok(()) })
+        let server = self.server.clone();
+        let share = self.share.clone();
+
+        Box::pin(async move {
+            // Lightweight health check: verify the tree (share) connection is still valid
+            let unc_string = format!(r"\\{server}\{share}");
+            let target_path =
+                UncPath::from_str(&unc_string).map_err(|e| object_store::Error::Generic {
+                    store: STORE_NAME,
+                    source: format!("Invalid UNC path {unc_string}: {e}").into(),
+                })?;
+
+            // get_tree will return the cached tree if still valid, or error if connection is broken
+            conn.get_tree(&target_path).await.map_err(handle_error)?;
+            Ok(())
+        })
     }
 
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
