@@ -1211,12 +1211,12 @@ impl GraphQLClient {
 
     /// Executes a GraphQL query with page-level retry for transient errors.
     ///
-    /// This function wraps `execute()` with retry logic using exponential backoff
-    /// from the `util::retry_strategy` module. It will retry up to `PAGE_RETRY_MAX_ATTEMPTS`
+    /// This function wraps `execute()` with retry logic using Fibonacci backoff
+    /// from the `util::fibonacci_backoff` module. It will retry up to `PAGE_RETRY_MAX_ATTEMPTS`
     /// times for retriable errors (e.g., 502, 503, 504, timeouts).
     ///
     /// For rate limit errors with a known reset time, it waits until the rate limit resets
-    /// instead of using exponential backoff.
+    /// instead of using backoff.
     async fn execute_with_retry(
         client: &Arc<Self>,
         query: &mut GraphQLQuery,
