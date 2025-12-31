@@ -163,10 +163,10 @@ impl ResolvedClusterConfig {
 
         // Validate cluster role requirements
         if is_cluster_role {
-            if tls_config.is_none() && !config.insecure {
+            if tls_config.is_none() && !config.allow_insecure_connections {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Cluster mode requires mTLS configuration or the --insecure flag. Provide --node-mtls-ca-certificate-file, --node-mtls-certificate-file, and --node-mtls-key-file, or use --insecure.",
+                    "Cluster mode requires mTLS configuration or the --allow-insecure-connections flag. Provide --node-mtls-ca-certificate-file, --node-mtls-certificate-file, and --node-mtls-key-file, or use --allow-insecure-connections.",
                 ));
             }
             if config.node_advertise_address.is_none() {
@@ -258,8 +258,8 @@ impl ResolvedClusterConfig {
 
     /// Returns whether this node allows insecure cluster communication.
     #[must_use]
-    pub fn insecure(&self) -> bool {
-        self.config.insecure
+    pub fn allow_insecure_connections(&self) -> bool {
+        self.config.allow_insecure_connections
     }
 
     /// Returns the client TLS config for connecting to other cluster nodes.

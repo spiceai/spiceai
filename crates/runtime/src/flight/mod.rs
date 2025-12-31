@@ -412,17 +412,14 @@ pub enum Error {
     ))]
     AddressAlreadyInUse { addr: String },
 
-    #[cfg(feature = "cluster")]
     #[snafu(display(
         "The cluster scheduler is not initialized, preventing the flight service from starting."
     ))]
     ClusterSchedulerNotInitialized {},
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Unable to start internal cluster server: {source}"))]
     UnableToStartClusterServer { source: tonic::transport::Error },
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("The flight service has an insecure configuration: {message}"))]
     InsecureConfiguration { message: String },
 }
@@ -453,7 +450,6 @@ pub async fn start(
     rate_limits: Arc<RateLimits>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
-    #[cfg(feature = "cluster")]
     if matches!(
         rt.df.cluster_config.effective_role(),
         Some(crate::config::ClusterRole::Executor)

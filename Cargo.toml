@@ -286,7 +286,7 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.30"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = "0.3.0"
+turso = { version = "0.3.2", default-features = false, features = ["experimental_indexes"] }
 twox-hash = "2.1.2"
 url = "2.5"
 util = { path = "crates/util" }
@@ -381,9 +381,5 @@ arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" } # spiceai-56
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" } # spiceai-56
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "37d844b382204821a5a5e082e1248edb7d35bdf0" }      # spiceai-56
-
-# Note: Turso's bindings/rust/src/lib.rs defines #[global_allocator] which conflicts with spiced's allocator
-# We need to fork and remove the global allocator or patch it out
-turso = { git = "https://github.com/spiceai/turso", rev = "5c4d14d298869fe5ea296163b3241d6963a2e87d" }
 
 object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }

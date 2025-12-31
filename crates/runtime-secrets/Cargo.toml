@@ -22,11 +22,6 @@ spicepod = { path = "../spicepod" }
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 percent-encoding.workspace = true
-flight_client = { optional = true, path = "../flight_client" }
-arrow-flight = { optional = true, workspace = true }
-runtime-proto = { optional = true, path = "../runtime-proto" }
-prost = { optional = true, workspace = true }
-tonic = { workspace = true, optional = true }
 futures.workspace = true
 
 # Optional dependencies for feature-gated secret stores
@@ -53,4 +48,3 @@ aws-secrets-manager = [
 ]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 keyring-secret-store = ["dep:keyring"]
-cluster = ["dep:runtime-proto", "dep:tonic"]
