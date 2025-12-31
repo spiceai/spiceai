@@ -19,7 +19,10 @@ use runtime_rate_control::RateController;
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 
-use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
+use super::{
+    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_INITIAL_DELAY, PAGE_RETRY_MAX_ATTEMPTS,
+    ReqwestInternalSnafu, Result, is_retriable_error,
+};
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
@@ -1117,17 +1120,18 @@ impl GraphQLClient {
             // Track pagination iterations to prevent infinite loops
             let mut pagination_count = 0;
 
-            let mut result = self
-                .execute(
-                    &mut query,
-                    Some(Arc::clone(&gql_schema)),
-                    limit,
-                    None,
-                    error_checker.clone(),
-                    query_cost,
-                )
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            // Execute initial page with retry
+            let mut result = Self::execute_with_retry(
+                &self,
+                &mut query,
+                Some(Arc::clone(&gql_schema)),
+                limit,
+                None,
+                error_checker.clone(),
+                query_cost,
+            )
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             let mut limit = limit;
 
             for batch in result.records {
@@ -1175,17 +1179,18 @@ impl GraphQLClient {
 
                 previous_cursor = Some(next_cursor_val.clone());
 
-                result = self
-                    .execute(
-                        &mut query,
-                        Some(Arc::clone(&gql_schema)),
-                        limit,
-                        Some(next_cursor_val),
-                        error_checker.clone(),
-                        query_cost,
-                    )
-                    .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                // Execute subsequent pages with retry
+                result = Self::execute_with_retry(
+                    &self,
+                    &mut query,
+                    Some(Arc::clone(&gql_schema)),
+                    limit,
+                    Some(next_cursor_val),
+                    error_checker.clone(),
+                    query_cost,
+                )
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
                 for batch in result.records {
                     tx.send(Ok(batch)).await.map_err(|_| {
@@ -1201,6 +1206,65 @@ impl GraphQLClient {
         });
 
         builder.build()
+    }
+
+    /// Executes a GraphQL query with page-level retry for transient errors.
+    ///
+    /// This function wraps `execute()` with retry logic using exponential backoff.
+    /// It will retry up to `PAGE_RETRY_MAX_ATTEMPTS` times for retriable errors
+    /// (e.g., 502, 503, 504, timeouts).
+    async fn execute_with_retry(
+        client: &Arc<Self>,
+        query: &mut GraphQLQuery,
+        schema: Option<SchemaRef>,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+    ) -> Result<GraphQLQueryResult> {
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+
+            match client
+                .execute(
+                    query,
+                    schema.clone(),
+                    limit,
+                    cursor.clone(),
+                    error_checker.clone(),
+                    query_cost,
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    if is_retriable_error(&e) && attempt < PAGE_RETRY_MAX_ATTEMPTS {
+                        let delay = PAGE_RETRY_INITIAL_DELAY * 2u32.pow(attempt - 1);
+                        tracing::warn!(
+                            "Page fetch failed (attempt {}/{}), retrying in {:?}: {}",
+                            attempt,
+                            PAGE_RETRY_MAX_ATTEMPTS,
+                            delay,
+                            e
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+
+                    // Non-retriable error or max attempts reached
+                    if attempt >= PAGE_RETRY_MAX_ATTEMPTS {
+                        tracing::error!(
+                            "Page fetch failed after {} attempts, giving up: {}",
+                            attempt,
+                            e
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 
