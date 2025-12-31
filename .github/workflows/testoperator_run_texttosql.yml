@@ -117,9 +117,9 @@ jobs:
         env:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          MINIO_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
