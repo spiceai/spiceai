@@ -38,7 +38,6 @@ pub struct Config {
     pub flight_bind_address: SocketAddr,
 
     /// All cluster related arguments
-    #[cfg(feature = "cluster")]
     #[clap(flatten)]
     pub cluster: ClusterConfig,
 }
@@ -55,7 +54,6 @@ impl Config {
         Self {
             http_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8090),
             flight_bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051),
-            #[cfg(feature = "cluster")]
             cluster: ClusterConfig::default(),
         }
     }
@@ -79,7 +77,6 @@ impl Default for Config {
     }
 }
 
-#[cfg(feature = "cluster")]
 #[derive(Debug, Clone, clap::Parser)]
 pub struct ClusterConfig {
     /// Configure cluster node role: scheduler or executor
@@ -134,7 +131,6 @@ pub struct ClusterConfig {
     pub node_advertise_address: Option<String>,
 }
 
-#[cfg(feature = "cluster")]
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -150,7 +146,6 @@ impl Default for ClusterConfig {
     }
 }
 
-#[cfg(feature = "cluster")]
 impl ClusterConfig {
     #[must_use]
     pub fn with_role(mut self, role: ClusterRole) -> Self {

@@ -14365,7 +14365,6 @@ dependencies = [
 name = "runtime-secrets"
 version = "1.11.0-unstable"
 dependencies = [
- "arrow-flight",
  "async-trait",
  "aws-config",
  "aws-sdk-credential-bridge",
@@ -14373,22 +14372,18 @@ dependencies = [
  "aws-sdk-sts",
  "base64 0.22.1",
  "dotenvy",
- "flight_client",
  "futures",
  "indexmap 2.12.1",
  "keyring",
  "logos",
  "percent-encoding",
- "prost 0.13.5",
  "rand 0.9.2",
  "reqwest",
- "runtime-proto",
  "secrecy",
  "serde_json",
  "snafu",
  "spicepod",
  "tokio",
- "tonic 0.13.1",
  "tracing",
 ]
 
