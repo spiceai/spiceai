@@ -497,11 +497,13 @@ mod tests {
 
     #[test]
     fn test_max_attempts_boundary() {
-        // Verify that PAGE_RETRY_MAX_ATTEMPTS is used correctly
-        // With MAX_ATTEMPTS = 3:
+        // Verify that PAGE_RETRY_MAX_ATTEMPTS is used correctly.
+        // PAGE_RETRY_MAX_ATTEMPTS represents the maximum number of retry attempts,
+        // excluding the initial attempt. With PAGE_RETRY_MAX_ATTEMPTS = 3:
         // - Attempt 1: initial try
-        // - Attempt 2: first retry (if attempt 1 < 3)
-        // - Attempt 3: second retry (if attempt 2 < 3), then give up
+        // - Attempt 2: first retry (after first failure)
+        // - Attempt 3: second retry (after second failure)
+        // - Attempt 4: third retry (after third failure), then give up
 
         // Test using runtime values to avoid constant assertion warnings
         let max_attempts = PAGE_RETRY_MAX_ATTEMPTS;
