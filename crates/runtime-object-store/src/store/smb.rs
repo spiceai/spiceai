@@ -402,8 +402,8 @@ impl SMBObjectStore {
                     queue.extend(dirs);
                 }
                 Err(e) => {
-                    let display = config.display_path(&dir_path);
-                    tracing::warn!("Failed to list SMB directory {display}: {e}");
+                    let display_url = config.display_path(&dir_path);
+                    tracing::warn!("Failed to list SMB directory {display_url}: {e}");
                 }
             }
         }
