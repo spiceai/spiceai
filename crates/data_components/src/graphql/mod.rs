@@ -465,29 +465,28 @@ mod tests {
     }
 
     #[test]
-    fn test_exponential_backoff_with_retry_strategy() {
-        use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
+    fn test_fibonacci_backoff_with_retry_strategy() {
+        use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
-        // Verify the RetryBackoff produces expected exponential delays
+        // Verify the FibonacciBackoff produces expected Fibonacci delays
         // This mirrors the configuration used in execute_with_retry
-        let mut backoff = RetryBackoffBuilder::new()
-            .method(BackoffMethod::Exponential)
-            .base_interval(Duration::from_secs(1))
+        // Fibonacci intervals: [1000, 1000, 2000, 3000, 5000, 8000, ...]
+        let mut backoff = FibonacciBackoffBuilder::new()
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
             .randomization_factor(0.0) // No randomization for predictable testing
             .build();
 
-        // Attempt 1: 1s * 2^0 = 1s
+        // Attempt 1: 1s (first Fibonacci interval)
         let delay_1 = backoff.next_backoff().expect("should have delay");
         assert_eq!(delay_1, Duration::from_secs(1));
 
-        // Attempt 2: 1s * 2^1 = 2s
+        // Attempt 2: 1s (second Fibonacci interval)
         let delay_2 = backoff.next_backoff().expect("should have delay");
-        assert_eq!(delay_2, Duration::from_secs(2));
+        assert_eq!(delay_2, Duration::from_secs(1));
 
-        // Attempt 3: 1s * 2^2 = 4s
+        // Attempt 3: 2s (third Fibonacci interval)
         let delay_3 = backoff.next_backoff().expect("should have delay");
-        assert_eq!(delay_3, Duration::from_secs(4));
+        assert_eq!(delay_3, Duration::from_secs(2));
 
         // After max_retries (3), should return None
         assert!(

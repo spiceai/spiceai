@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc, time::Duration};
-use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
+use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
 use url::Url;
 
@@ -1226,12 +1226,8 @@ impl GraphQLClient {
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
     ) -> Result<GraphQLQueryResult> {
-        let mut backoff = RetryBackoffBuilder::new()
-            .method(BackoffMethod::Exponential)
-            .base_interval(Duration::from_secs(1))
+        let mut backoff = FibonacciBackoffBuilder::new()
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
-            .max_duration(Some(Duration::from_secs(300))) // Cap at 5 minutes
-            .randomization_factor(0.1) // Small jitter to avoid thundering herd
             .build();
 
         let mut attempt = 0u32;
