@@ -3,10 +3,15 @@ name: OSS Upstream Merge
 on:
   workflow_dispatch:
     inputs:
-      run_conflict_resolution:
-        description: 'Attempt automated conflict resolution when needed'
+      conflict_resolution_mode:
+        description: 'Automated conflict resolution mode'
         required: false
-        default: 'true'
+        type: choice
+        default: 'as-needed'
+        options:
+          - 'as-needed'
+          - 'never'
+          - 'always'
       custom_merge_branch_suffix:
         description: 'Optional suffix to append to the automation branch'
         required: false
@@ -30,7 +35,7 @@ jobs:
       UPSTREAM_REPO: https://github.com/spiceai/spiceai.git
       MERGE_LABEL: kind/upstream-merge
       REPORT_FILE: merge_conflict_report.md
-      RUN_CONFLICT_RESOLUTION: 'true'
+      CONFLICT_RESOLUTION_MODE: 'as-needed'
     steps:
       - name: Configure authentication token
         shell: bash
@@ -49,11 +54,11 @@ jobs:
 
       - name: Resolve workflow inputs
         run: |
-          run_conflict="${{ github.event.inputs.run_conflict_resolution }}"
-          if [ -z "$run_conflict" ]; then
-            run_conflict="true"
+          resolution_mode="${{ github.event.inputs.conflict_resolution_mode }}"
+          if [ -z "$resolution_mode" ]; then
+            resolution_mode="as-needed"
           fi
-          echo "RUN_CONFLICT_RESOLUTION=$run_conflict" >> $GITHUB_ENV
+          echo "CONFLICT_RESOLUTION_MODE=$resolution_mode" >> $GITHUB_ENV
 
           suffix="${{ github.event.inputs.custom_merge_branch_suffix }}"
           if [ -z "$suffix" ]; then
@@ -131,12 +136,12 @@ jobs:
           fi
 
       - name: Install OpenAI Codex CLI
-        if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
+        if: (steps.merge.outputs.conflicts == 'true' && env.CONFLICT_RESOLUTION_MODE != 'never') || env.CONFLICT_RESOLUTION_MODE == 'always'
         run: |
           npm install -g @openai/codex
 
       - name: Attempt automated conflict resolution
-        if: steps.merge.outputs.conflicts == 'true' && env.RUN_CONFLICT_RESOLUTION == 'true'
+        if: (steps.merge.outputs.conflicts == 'true' && env.CONFLICT_RESOLUTION_MODE != 'never') || env.CONFLICT_RESOLUTION_MODE == 'always'
         id: llm
         timeout-minutes: 15
         env:
@@ -204,7 +209,7 @@ jobs:
 
       - name: Mark unresolved files for commit
         id: mark_conflicts
-        if: steps.merge.outputs.conflicts == 'true' && (env.RUN_CONFLICT_RESOLUTION != 'true' || steps.llm.outputs.status != 'resolved')
+        if: steps.merge.outputs.conflicts == 'true' && (env.CONFLICT_RESOLUTION_MODE == 'never' || steps.llm.outputs.status != 'resolved')
         run: |
           CONFLICT_FILES=$(git diff --name-only --diff-filter=U | grep -v '^\.github/workflows/' || true)
           git diff --name-only --diff-filter=U | grep '^\.github/workflows/' | xargs -r git restore  --theirs
