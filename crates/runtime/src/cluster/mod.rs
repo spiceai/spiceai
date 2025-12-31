@@ -127,6 +127,8 @@ pub struct ResolvedClusterConfig {
     tls_config: Option<ClusterTlsConfig>,
     /// Pre-computed scheduler URL string for Ballista configuration.
     scheduler_url: Option<String>,
+    /// Resolved scheduler address URL (with scheme inferred if omitted).
+    scheduler_address_url: Option<Url>,
 }
 
 impl ResolvedClusterConfig {
@@ -161,37 +163,85 @@ impl ResolvedClusterConfig {
         // Determine effective cluster role (explicit or implicit from scheduler_address)
         let is_cluster_role = config.role.is_some() || config.scheduler_address.is_some();
 
-        // Validate cluster role requirements
+        // Validate all cluster role requirements at once
         if is_cluster_role {
+            let mut missing_flags = Vec::new();
+
             if tls_config.is_none() && !config.allow_insecure_connections {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Cluster mode requires mTLS configuration or the --allow-insecure-connections flag. Provide --node-mtls-ca-certificate-file, --node-mtls-certificate-file, and --node-mtls-key-file, or use --allow-insecure-connections.",
-                ));
+                missing_flags.push("--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file (or --allow-insecure-connections)");
             }
             if config.node_advertise_address.is_none() {
+                missing_flags.push("--node-advertise-address");
+            }
+
+            if !missing_flags.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Multi-node clusters require --node-advertise-address. Set this to the hostname or IP address other cluster nodes can use to reach this node.",
+                    format!(
+                        "Cluster mode requires the following flags: {}",
+                        missing_flags.join(", ")
+                    ),
                 ));
             }
         }
 
-        // Pre-compute scheduler URL from advertise address
-        let scheme = if tls_config.is_some() {
+        // Determine the scheme based on TLS config or insecure flag
+        let inferred_scheme = if tls_config.is_some() {
             "https"
         } else {
             "http"
         };
-        let scheduler_url = config
-            .node_advertise_address
+
+        // Pre-compute scheduler URL from advertise address
+        let bind_port = config.node_bind_address.port();
+        let scheduler_url = config.node_advertise_address.as_ref().map(|addr| {
+            // Extract just the host, ignoring any port - always use bind_port
+            let host = if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+                // Full socket address - strip the port with deprecation warning
+                tracing::warn!("Port in --node-advertise-address will be ignored. Using port {bind_port} from --node-bind-address.");
+                socket_addr.ip().to_string()
+            } else if let Some((host_part, port_part)) = addr.rsplit_once(':') {
+                // Check if this looks like host:port
+                if port_part.parse::<u16>().is_ok() && !host_part.is_empty() {
+                    tracing::warn!("Port in --node-advertise-address will be ignored. Using port {bind_port} from --node-bind-address.");
+                    host_part.trim_matches(['[', ']']).to_string()
+                } else {
+                    // Not a valid port, use as-is (e.g. IPv6 without brackets)
+                    addr.clone()
+                }
+            } else {
+                // No colon - just a hostname
+                addr.clone()
+            };
+            format!("{inferred_scheme}://{host}:{bind_port}")
+        });
+
+        // Resolve scheduler address URL, inferring scheme if omitted
+        let scheduler_address_url = config
+            .scheduler_address
             .as_ref()
-            .map(|addr| format!("{scheme}://{addr}"));
+            .map(|addr| {
+                // Check if scheme is already present
+                if addr.starts_with("http://") || addr.starts_with("https://") {
+                    Url::parse(addr)
+                } else {
+                    // Infer scheme from TLS config
+                    Url::parse(&format!("{inferred_scheme}://{addr}"))
+                }
+            })
+            .transpose()
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid --scheduler-address URL: {e}"),
+                )
+            })?;
 
         Ok(Self {
             config,
             tls_config,
             scheduler_url,
+            scheduler_address_url,
         })
     }
 
@@ -224,9 +274,10 @@ impl ResolvedClusterConfig {
     }
 
     /// Returns the scheduler URL (for executors).
+    /// The scheme is inferred from TLS configuration if omitted in the original input.
     #[must_use]
     pub fn scheduler_address(&self) -> Option<&Url> {
-        self.config.scheduler_address.as_ref()
+        self.scheduler_address_url.as_ref()
     }
 
     /// Returns the scheduler URL as a string for use in Ballista configuration.
@@ -266,15 +317,6 @@ impl ResolvedClusterConfig {
     #[must_use]
     pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
         self.tls_config.as_ref().map(|t| &t.client_tls_config)
-    }
-
-    /// Creates a new `ResolvedClusterConfig` from a `ClusterConfig`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the TLS configuration is invalid or files cannot be read.
-    pub fn from_config_and_app(config: ClusterConfig, _app: Option<&App>) -> std::io::Result<Self> {
-        Self::try_new(config)
     }
 }
 
@@ -363,23 +405,26 @@ pub async fn initialize_cluster_executor(
         .max_encoding_message_size(usize::MAX)
         .max_decoding_message_size(usize::MAX);
 
-    // Try to bind the same flight port Spice usually does, but if we cannot, bind a different
-    // port to allow for easy local deployments
-    let bind_addr = if let Ok(flight_bind_addr) = TcpListener::bind(rt.config.flight_bind_address)
+    // Use the configured node_bind_address for the executor flight server.
+    // Fall back to dynamic port assignment if binding fails (e.g., port already in use).
+    let cluster_bind_addr = rt.df.cluster_config.node_bind_address();
+    let bind_addr = if let Ok(bound_addr) = TcpListener::bind(cluster_bind_addr)
         .await
         .and_then(|l| l.local_addr())
     {
-        flight_bind_addr
-    } else if let Ok(dynamic_addr) = TcpListener::bind("127.0.0.1:0")
+        bound_addr
+    } else if let Ok(dynamic_addr) = TcpListener::bind((cluster_bind_addr.ip(), 0))
         .await
         .and_then(|l| l.local_addr())
     {
+        tracing::warn!(
+            "Unable to bind executor flight server to {cluster_bind_addr}, using dynamic port {dynamic_addr}"
+        );
         dynamic_addr
     } else {
         return Err(FailedToStartClusterExecutor {
             source: format!(
-                "Unable to bind Flight service to configured address ({}) or fallback",
-                rt.config.flight_bind_address
+                "Unable to bind executor Flight service to configured address ({cluster_bind_addr}) or fallback"
             )
             .into(),
         });
@@ -400,26 +445,31 @@ pub async fn initialize_cluster_executor(
     let (advertise_host, advertise_port) = if let Some(advertise_addr) =
         rt.df.cluster_config.node_advertise_address()
     {
-        // Parse the advertise address (format: "host:port" or "[ipv6]:port")
-        if let Ok(socket_addr) = advertise_addr.parse::<SocketAddr>() {
-            (socket_addr.ip().to_string(), socket_addr.port())
+        // Extract just the host, ignoring any port - always use bind_addr port
+        let host = if let Ok(socket_addr) = advertise_addr.parse::<SocketAddr>() {
+            // Full socket address - strip the port with deprecation warning
+            tracing::warn!(
+                "Port in --node-advertise-address will be ignored. Using port {} from --node-bind-address.",
+                bind_addr.port()
+            );
+            socket_addr.ip().to_string()
         } else if let Some((host_part, port_part)) = advertise_addr.rsplit_once(':') {
-            let port = port_part
-                .parse::<u16>()
-                .map_err(|_| FailedToStartClusterExecutor {
-                    source: format!("Invalid port in --node-advertise-address: {advertise_addr}")
-                        .into(),
-                })?;
-            let host = host_part.trim_matches(['[', ']']).to_string();
-            (host, port)
+            // Check if this looks like host:port
+            if port_part.parse::<u16>().is_ok() && !host_part.is_empty() {
+                tracing::warn!(
+                    "Port in --node-advertise-address will be ignored. Using port {} from --node-bind-address.",
+                    bind_addr.port()
+                );
+                host_part.trim_matches(['[', ']']).to_string()
+            } else {
+                // Not a valid port, use as-is (e.g. IPv6 without brackets)
+                advertise_addr.to_string()
+            }
         } else {
-            return Err(FailedToStartClusterExecutor {
-                    source: format!(
-                        "Invalid --node-advertise-address format: {advertise_addr}. Expected 'host:port' (IPv6 must be in [addr]:port form)"
-                    )
-                    .into(),
-                });
-        }
+            // No colon - just a hostname
+            advertise_addr.to_string()
+        };
+        (host, bind_addr.port())
     } else {
         // Fall back to hostname and bind_addr port
         let hostname =
