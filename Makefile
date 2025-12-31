@@ -250,10 +250,12 @@ install-with-odbc:
 
 .PHONY: install-testoperator-dev
 install-testoperator-dev: build-testoperator-dev
+	mkdir -p ~/.spice/bin
 	install -m 755 target/debug/testoperator ~/.spice/bin/testoperator
 
 .PHONY: install-testoperator
 install-testoperator: build-testoperator
+	mkdir -p ~/.spice/bin
 	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
 
 .PHONY: install-cli
