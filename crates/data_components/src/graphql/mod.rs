@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::sync::Arc;
 
 use arrow::error::ArrowError;
 use client::GraphQLQuery;
@@ -66,12 +63,6 @@ pub enum Error {
 
     #[snafu(display("{message}"))]
     RateLimited { message: String },
-
-    #[snafu(display("{message}. Rate limit resets at {reset_at:?}"))]
-    RateLimitedUntil {
-        message: String,
-        reset_at: SystemTime,
-    },
 
     #[snafu(display("Query response transformation failed. {source}"))]
     ResultTransformError {
@@ -152,26 +143,8 @@ pub fn is_retriable_error(error: &Error) -> bool {
                     )
                 )
         }
-        Error::RateLimited { .. } | Error::RateLimitedUntil { .. } => true,
+        Error::RateLimited { .. } => true,
         _ => false,
-    }
-}
-
-/// Returns the wait duration if the error is a rate-limited error with a known reset time.
-/// Returns `None` for non-rate-limited errors or rate-limited errors without a reset time.
-#[must_use]
-pub fn rate_limit_wait_duration(error: &Error) -> Option<Duration> {
-    match error {
-        Error::RateLimitedUntil { reset_at, .. } => {
-            let now = SystemTime::now();
-            if *reset_at > now {
-                reset_at.duration_since(now).ok()
-            } else {
-                // Reset time has passed, no need to wait
-                None
-            }
-        }
-        _ => None,
     }
 }
 

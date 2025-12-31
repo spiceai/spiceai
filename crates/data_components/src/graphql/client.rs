@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 
 use super::{
     ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
-    is_retriable_error, rate_limit_wait_duration,
+    is_retriable_error,
 };
 use arrow::{
     array::RecordBatch,
@@ -37,7 +37,7 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
-use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc, time::Duration};
+use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
 use url::Url;
@@ -1213,10 +1213,10 @@ impl GraphQLClient {
     ///
     /// This function wraps `execute()` with retry logic using Fibonacci backoff
     /// from the `util::fibonacci_backoff` module. It will retry up to `PAGE_RETRY_MAX_ATTEMPTS`
-    /// times for retriable errors (e.g., 502, 503, 504, timeouts).
+    /// times for retriable errors (e.g., 502, 503, 504, timeouts, rate limits).
     ///
-    /// For rate limit errors with a known reset time, it waits until the rate limit resets
-    /// instead of using backoff.
+    /// Note: Rate limit handling (waiting until reset time) is done proactively by the
+    /// `RateLimiter` trait via `check_rate_limit()` before each request, not reactively here.
     async fn execute_with_retry(
         client: &Arc<Self>,
         query: &mut GraphQLQuery,
@@ -1253,22 +1253,7 @@ impl GraphQLClient {
                         return Err(e);
                     }
 
-                    // For rate limit errors with a known reset time, wait until reset
-                    if let Some(rate_limit_delay) = rate_limit_wait_duration(&e) {
-                        // Add a small buffer (5 seconds) to account for clock skew
-                        let delay_with_buffer = rate_limit_delay + Duration::from_secs(5);
-                        tracing::warn!(
-                            "Rate limit exceeded (attempt {}/{}), waiting {:?} until rate limit resets: {}",
-                            attempt,
-                            PAGE_RETRY_MAX_ATTEMPTS,
-                            delay_with_buffer,
-                            e
-                        );
-                        tokio::time::sleep(delay_with_buffer).await;
-                        continue;
-                    }
-
-                    // Use backoff strategy for other retriable errors
+                    // Use Fibonacci backoff strategy for retriable errors
                     if let Some(delay) = backoff.next_backoff() {
                         tracing::warn!(
                             "Page fetch failed (attempt {}/{}), retrying in {:?}: {}",
