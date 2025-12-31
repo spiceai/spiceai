@@ -2415,9 +2415,14 @@ impl CayenneTableProvider {
                     .filter_map(|bytes| {
                         if bytes.len() >= 8 {
                             // RowConverter uses big-endian for i64 with sign bit flipped
-                            // But we can also check if this is a raw i64
-                            Some(i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8])))
+                            let mut arr = [0_u8; 8];
+                            arr.copy_from_slice(&bytes[..8]);
+                            Some(i64::from_be_bytes(arr))
                         } else {
+                            tracing::warn!(
+                                "Skipping invalid Int64 deletion key with length {} (expected at least 8 bytes)",
+                                bytes.len()
+                            );
                             None
                         }
                     })

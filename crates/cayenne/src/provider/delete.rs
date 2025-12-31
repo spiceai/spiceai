@@ -998,10 +998,11 @@ impl CayenneDeletionSink {
             super::table::PkDeletionStrategy::Int64Pk => {
                 // Int64 PK deletion - extract PK values directly
                 // Note: column indices are offset by 1 because __row_id is at index 0
-                let filtered_concat = arrow::compute::concat_batches(
-                    &filtered_batches[0].schema(),
-                    &filtered_batches,
-                )?;
+                let first_batch = filtered_batches
+                    .first()
+                    .ok_or("Expected at least one batch after filtering (checked above)")?;
+                let filtered_concat =
+                    arrow::compute::concat_batches(&first_batch.schema(), &filtered_batches)?;
 
                 let pk_column_index = self
                     .pk_column_indices
@@ -1743,10 +1744,10 @@ pub fn detect_deletion_type_and_read(
                             let row_id = values[i];
                             if let Ok(row_id_u32) = u32::try_from(row_id) {
                                 deleted_row_ids.insert(row_id_u32);
+                            } else if first_overflow_id.is_none() {
+                                first_overflow_id = Some(row_id);
+                                overflow_count += 1;
                             } else {
-                                if first_overflow_id.is_none() {
-                                    first_overflow_id = Some(row_id);
-                                }
                                 overflow_count += 1;
                             }
                         }
