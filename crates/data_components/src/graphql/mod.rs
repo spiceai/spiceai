@@ -127,11 +127,18 @@ pub fn is_retriable_error(error: &Error) -> bool {
             status.is_server_error()
         }
         Error::ReqwestInternal { source } => {
-            // Check for network/connection errors
+            // Check for transient network/connection errors:
+            // - is_timeout(): Connection or request timeouts
+            // - is_connect(): Failed to establish connection
+            // - is_request(): Error during request construction/sending
+            // - is_body(): Error reading response body
+            // - is_decode(): Error decoding response body (e.g., gzip/brotli decompression
+            //   failures, HTTP/2 stream errors - "error decoding response body")
             source.is_timeout()
                 || source.is_connect()
                 || source.is_request()
-                || source.is_body()  // Body decode errors (e.g., "error decoding response body")
+                || source.is_body()
+                || source.is_decode()
                 // Also check if the underlying status code is a retriable server error
                 || matches!(
                     source.status(),
