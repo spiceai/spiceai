@@ -13,27 +13,19 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{
-    any::Any,
-    sync::{Arc, atomic::AtomicU8},
-};
+use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
     S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
-    partition::{BelongsWith, PartitionedIndexName},
     vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
 };
 
-use super::{Error, S3VectorIdentifier, SpillIndex, compute_query::ComputeQueryVector};
-use arrow::{
-    array::RecordBatch,
-    datatypes::{DataType, Field, Schema, SchemaRef},
-    json::ReaderBuilder,
-};
+use super::{Error, S3VectorIdentifier, compute_query::ComputeQueryVector};
+use arrow::{array::RecordBatch, datatypes::SchemaRef, json::ReaderBuilder};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{Constraints, HashMap, exec_err, project_schema},
+    common::{Constraints, HashMap, project_schema},
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -41,11 +33,8 @@ use datafusion::{
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        empty::EmptyExec,
         execution_plan::{Boundedness, EmissionType},
-        limit::GlobalLimitExec,
         stream::RecordBatchReceiverStream,
-        union::UnionExec,
     },
     prelude::Expr,
 };
@@ -73,176 +62,6 @@ pub struct S3VectorsQueryTable {
     table: S3VectorsTable,
     compute_vector: Arc<dyn ComputeQueryVector>,
     query: String,
-    column_name: String,
-    partition_by: Vec<Expr>,
-}
-
-#[expect(clippy::too_many_arguments)]
-fn create_spill_plan_query(
-    client: &Arc<dyn S3Vectors + Send + Sync>,
-    bucket_name: &str,
-    index_name: &str,
-    table: &S3VectorsQueryTable,
-    projection: Option<&Vec<usize>>,
-    filters: &[Expr],
-    limit: Option<usize>,
-    query_vector: &[f32],
-    all_index_names: &[String],
-) -> Option<Arc<dyn ExecutionPlan>> {
-    let virtual_index_names =
-        SpillIndex::get_all_indexes_for_virtual_index(index_name, all_index_names);
-
-    if virtual_index_names.len() > 1 {
-        let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        for spill_index_name in virtual_index_names {
-            let index_table_identifier = S3VectorIdentifier::Index {
-                bucket_name: bucket_name.to_string(),
-                index_name: spill_index_name.clone(),
-            };
-
-            let index_table = S3VectorsTable {
-                client: Arc::clone(client),
-                schema: Arc::clone(&table.table.schema),
-                constraints: table.table.constraints.clone(),
-                idx: Arc::new(index_table_identifier),
-                spill_index: Arc::new(AtomicU8::new(0)),
-                dimension: table.table.dimension,
-                columns: table.table.columns.clone(),
-                distance_metric: table.table.distance_metric.clone(),
-            };
-
-            let query_table = S3VectorsQueryTable::new(
-                index_table,
-                Arc::clone(&table.compute_vector),
-                table.query.clone(),
-                table.column_name.clone(),
-                vec![],
-            );
-
-            let limit_i32: i32 = match limit {
-                Some(l) => {
-                    // Safe conversion: check against i32::MAX first, then compare with limit
-                    let l_i32 = i32::try_from(l).unwrap_or(i32::MAX);
-                    if l_i32 > S3_VECTOR_MAX_TOPK {
-                        tracing::warn!(
-                            "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
-                        );
-                        S3_VECTOR_MAX_TOPK
-                    } else {
-                        l_i32
-                    }
-                }
-                None => S3_VECTOR_MAX_TOPK,
-            };
-            let index_plan = Arc::new(S3VectorsQueryExec::new(
-                &query_table,
-                projection,
-                i64::from(limit_i32),
-                query_vector.to_owned(),
-                filters.to_vec(),
-            ));
-            index_plans.push(index_plan);
-        }
-
-        let union_plan = Arc::new(UnionExec::new(index_plans));
-        let limit_plan = Arc::new(GlobalLimitExec::new(union_plan, 0, limit));
-
-        Some(limit_plan)
-    } else {
-        None
-    }
-}
-
-#[expect(clippy::too_many_arguments)]
-async fn create_partition_plan_query(
-    client: &Arc<dyn S3Vectors + Send + Sync>,
-    bucket_name: &str,
-    index_name: &str,
-    table: &S3VectorsQueryTable,
-    projection: Option<&Vec<usize>>,
-    filters: &[Expr],
-    limit: Option<usize>,
-    state: &dyn Session,
-    all_index_names: &[String],
-) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-    let index_names: Vec<_> = all_index_names
-        .iter()
-        .filter_map(|idx_name| {
-            let Ok(partitioned_index_name) =
-                PartitionedIndexName::from_index_name(idx_name)
-            else {
-                return None;
-            };
-
-            if matches!(
-                partitioned_index_name.belongs_with(
-                    index_name,
-                    &table.column_name,
-                    &table.partition_by
-                ),
-                BelongsWith::ThisDataset
-            ) {
-                Some(idx_name.clone())
-            } else {
-                tracing::debug!(
-                    "S3 index {idx_name} returned but does not belong with this dataset: {index_name}",
-                );
-                None
-            }
-        })
-        .collect();
-
-    if index_names.is_empty() {
-        return Ok(Arc::new(EmptyExec::new(project_schema(
-            &table.schema(),
-            projection,
-        )?)));
-    }
-
-    let mut index_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-    for index_name in index_names {
-        let index_table_identifier = S3VectorIdentifier::Index {
-            bucket_name: bucket_name.to_string(),
-            index_name,
-        };
-
-        let index_table = S3VectorsTable {
-            client: Arc::clone(client),
-            schema: Arc::clone(&table.table.schema),
-            constraints: table.table.constraints.clone(),
-            idx: Arc::new(index_table_identifier),
-            spill_index: Arc::new(AtomicU8::new(0)),
-            dimension: table.table.dimension,
-            columns: table.table.columns.clone(),
-            distance_metric: table.table.distance_metric.clone(),
-        };
-
-        let query_table = S3VectorsQueryTable::new(
-            index_table,
-            Arc::clone(&table.compute_vector),
-            table.query.clone(),
-            table.column_name.clone(),
-            vec![],
-        );
-
-        let index_plan = query_table.scan(state, projection, filters, limit).await?;
-        index_plans.push(index_plan);
-    }
-
-    let union_plan = match index_plans.len() {
-        0 => {
-            return Ok(Arc::new(EmptyExec::new(project_schema(
-                &table.schema(),
-                projection,
-            )?)));
-        }
-        1 => return Ok(Arc::clone(&index_plans[0])),
-        _ => Arc::new(UnionExec::new(index_plans)),
-    };
-
-    let limit_plan = Arc::new(GlobalLimitExec::new(union_plan, 0, limit));
-
-    Ok(limit_plan)
 }
 
 impl S3VectorsQueryTable {
@@ -251,15 +70,11 @@ impl S3VectorsQueryTable {
         table: S3VectorsTable,
         compute_vector: Arc<dyn ComputeQueryVector>,
         query: String,
-        column_name: String,
-        partition_by: Vec<Expr>,
     ) -> Self {
         Self {
             table,
             compute_vector,
             query,
-            column_name,
-            partition_by,
         }
     }
 }
@@ -271,21 +86,7 @@ impl TableProvider for S3VectorsQueryTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        let mut base_fields = self
-            .table
-            .schema
-            .fields()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        base_fields.push(Arc::new(Field::new(
-            S3_VECTOR_DISTANCE_NAME,
-            DataType::Float64,
-            false,
-        )));
-
-        Arc::new(Schema::new(base_fields))
+        self.table.query_provider_schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -300,31 +101,12 @@ impl TableProvider for S3VectorsQueryTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        // Filters can only possibly be pushed down for columns in underlying metadata (i.e. not derived columns like `S3_VECTOR_DISTANCE_NAME`).
-        let columns: Vec<_> = self
-            .table
-            .schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .filter(|c| self.table.is_filterable_column(c.as_str()))
-            .collect();
-
-        Ok(filters
-            .iter()
-            .map(|f| {
-                if s3_vectors_metadata_filter::supports_filter_expr(columns.as_slice(), f) {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
+        Ok(self.table.query_provider_supports_filters_pushdown(filters))
     }
 
     async fn scan(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
@@ -335,78 +117,24 @@ impl TableProvider for S3VectorsQueryTable {
             .await
             .map_err(DataFusionError::External)?;
 
-        let current_index = self.table.current_index();
-        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
-
-        let all_index_names = super::fetch_all_index_names(
-            &self.table.client,
-            bucket_name.as_deref(),
-            index_name.as_deref(),
-        )
-        .await?;
-
-        if let (Some(bucket_name), Some(index_name), Some(all_index_names)) =
-            (bucket_name, index_name, all_index_names.as_ref())
-            && let Some(plan) = create_spill_plan_query(
-                &self.table.client,
-                &bucket_name,
-                &index_name,
-                self,
-                projection,
-                filters,
-                limit,
-                &query_vector,
-                all_index_names,
-            )
-        {
-            return Ok(plan);
-        }
-
-        if self.partition_by.is_empty() {
-            let limit_i32: i32 = match limit {
-                Some(l) => {
-                    // Safe conversion: check against i32::MAX first, then compare with limit
-                    let l_i32 = i32::try_from(l).unwrap_or(i32::MAX);
-                    if l_i32 > S3_VECTOR_MAX_TOPK {
-                        tracing::warn!(
-                            "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
-                        );
-                        S3_VECTOR_MAX_TOPK
-                    } else {
-                        l_i32
-                    }
-                }
-                None => S3_VECTOR_MAX_TOPK,
-            };
-            return Ok(Arc::new(S3VectorsQueryExec::new(
-                self,
-                projection,
-                i64::from(limit_i32),
-                query_vector.clone(),
-                filters.to_vec(),
-            )));
-        }
-
-        let current_index = self.table.current_index();
-        let (_, bucket_name, index_name) = current_index.index_identifier_variables();
-        let (Some(bucket_name), Some(index_name)) = (bucket_name, index_name) else {
-            return exec_err!("No bucket name or index name for bucket query");
+        let limit_i32: i32 = match limit.map(i32::try_from) {
+            Some(Ok(l)) if l > S3_VECTOR_MAX_TOPK => {
+                tracing::warn!(
+                    "S3VectorsQueryTable: limit {l} exceeds maximum of {S3_VECTOR_MAX_TOPK}, truncating."
+                );
+                S3_VECTOR_MAX_TOPK
+            }
+            Some(Ok(l)) => l,
+            // No limit, or failed conversion
+            None | Some(Err(_)) => S3_VECTOR_MAX_TOPK,
         };
-
-        let all_index_names = all_index_names.unwrap_or_default();
-
-        create_partition_plan_query(
-            &self.table.client,
-            &bucket_name,
-            &index_name,
-            self,
+        return Ok(Arc::new(S3VectorsQueryExec::new(
+            &self.table,
             projection,
-            filters,
-            limit,
-            state,
-            &all_index_names,
-        )
-        .await
+            i64::from(limit_i32),
+            query_vector,
+            filters.to_vec(),
+        )));
     }
 }
 
@@ -416,7 +144,7 @@ impl std::fmt::Debug for S3VectorsQueryExec {
     }
 }
 
-struct S3VectorsQueryExec {
+pub(super) struct S3VectorsQueryExec {
     idx: S3VectorIdentifier,
     client: Arc<dyn S3Vectors + Send + Sync>,
     plan_properties: PlanProperties,
@@ -427,38 +155,35 @@ struct S3VectorsQueryExec {
 
 impl DisplayAs for S3VectorsQueryExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "S3VectorsQueryExec: ")?;
+        write!(f, "S3VectorsQueryExec ({}): ", self.idx)?;
         if let Ok(Some(filter)) = convert_datafusion_filters_to_s3_vectors(&self.filters) {
             write!(f, "filter={filter} ")?;
         }
-        write!(f, "limit={}", self.limit)?;
-        Ok(())
+        write!(f, "limit={}", self.limit)
     }
 }
 
 impl S3VectorsQueryExec {
     pub fn new(
-        table: &S3VectorsQueryTable,
+        table: &S3VectorsTable,
         projection: Option<&Vec<usize>>,
         limit: i64,
         query: Vec<f32>,
         filters: Vec<Expr>,
     ) -> Self {
+        let schema = table.query_provider_schema();
         let projected_schema =
-            project_schema(&table.schema(), projection).unwrap_or_else(|_| table.schema());
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(projected_schema),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-
-        let idx = table.table.current_index();
+            project_schema(&schema, projection).unwrap_or_else(|_| Arc::clone(&schema));
 
         Self {
-            idx,
-            client: Arc::clone(&table.table.client),
-            plan_properties: properties,
+            idx: Arc::unwrap_or_clone(Arc::clone(&table.idx)),
+            client: Arc::clone(&table.client),
+            plan_properties: PlanProperties::new(
+                EquivalenceProperties::new(projected_schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ),
             query,
             limit: i32::try_from(limit).unwrap_or(i32::MAX),
             filters,
@@ -778,14 +503,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::s3_vectors::MetadataColumns;
+    use crate::s3_vectors::spill::query_provider::S3VectorsSpillQueryTable;
 
     use super::*;
 
-    use arrow::datatypes::{DataType, Field};
-    use datafusion::{
-        prelude::{SessionContext, col},
-        scalar::ScalarValue,
-    };
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::limit::GlobalLimitExec;
+    use datafusion::physical_plan::union::UnionExec;
+    use datafusion::prelude::SessionContext;
     use s3_vectors::{DateTime, DistanceMetric, IndexSummary, mock::MockClient};
 
     #[derive(Debug)]
@@ -887,20 +612,14 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: virtual_index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            "test_column".to_string(),
-            vec![],
-        );
+        let query_table =
+            S3VectorsSpillQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
         let plan = query_table
@@ -995,20 +714,14 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: "virtual-index-01".to_string(), // Access via spill name
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            "test_column".to_string(),
-            vec![],
-        );
+        let query_table =
+            S3VectorsSpillQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
         let plan = query_table
@@ -1029,136 +742,6 @@ mod tests {
 
         // There should be 3 indexes (main + 2 spills), so 3 input plans to the UnionExec
         assert_eq!(union_plan.children().len(), 3);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn scan_plan_with_partitioned_index_spilling() -> Result<(), Box<dyn std::error::Error>> {
-        let mock_client = Arc::new(MockClient::new());
-        let bucket_name = "test-bucket";
-        let base_index_name = "base-index";
-        let column_name = "my-col";
-
-        let partition_by = &[col(column_name)];
-
-        let mut indexes = vec![];
-        let mut vectors_map = HashMap::new();
-
-        // Create 2 partitions, each with spilling
-        for i in 1..=2 {
-            let partition_value = ScalarValue::Int32(Some(i));
-            let partition_index_name = PartitionedIndexName::new(
-                base_index_name,
-                column_name,
-                partition_by,
-                &partition_value,
-            )?
-            .to_index_name();
-
-            // Main partition index
-            indexes.push(
-                IndexSummary::builder()
-                    .vector_bucket_name(bucket_name)
-                    .set_index_arn(Some("arn".to_string()))
-                    .creation_time(DateTime::from_secs(1))
-                    .index_name(partition_index_name.clone())
-                    .build()?,
-            );
-            vectors_map.insert(partition_index_name.clone(), vec![]);
-
-            // Spill indexes for this partition
-            for j in 1..=2 {
-                let spill_index_name = format!("{partition_index_name}.{j:02}");
-                indexes.push(
-                    IndexSummary::builder()
-                        .vector_bucket_name(bucket_name)
-                        .set_index_arn(Some("arn".to_string()))
-                        .creation_time(DateTime::from_secs(1))
-                        .index_name(spill_index_name.clone())
-                        .build()?,
-                );
-                vectors_map.insert(spill_index_name, vec![]);
-            }
-        }
-
-        indexes.push(
-            IndexSummary::builder()
-                .vector_bucket_name(bucket_name)
-                .set_index_arn(Some("arn".to_string()))
-                .creation_time(DateTime::from_secs(1))
-                .index_name("another-index")
-                .build()?,
-        ); // add unrelated index
-
-        mock_client
-            .data
-            .lock()
-            .expect("lock")
-            .indexes
-            .insert(bucket_name.to_string(), indexes);
-
-        for (index, vectors) in vectors_map {
-            mock_client
-                .data
-                .lock()
-                .expect("lock")
-                .vectors
-                .insert(index, vectors);
-        }
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
-            Field::new(
-                S3_VECTOR_EMBEDDING_NAME,
-                DataType::new_list(DataType::Float32, true),
-                false,
-            ),
-            Field::new(S3_VECTOR_DISTANCE_NAME, DataType::Float64, false),
-            Field::new(column_name, DataType::Int32, true),
-        ]));
-
-        let s3_table = S3VectorsTable {
-            client: mock_client,
-            schema,
-            constraints: Constraints::default(),
-            idx: Arc::new(S3VectorIdentifier::Index {
-                bucket_name: bucket_name.to_string(),
-                index_name: base_index_name.to_string(),
-            }),
-            spill_index: Arc::new(AtomicU8::new(0)),
-            dimension: 0,
-            columns: MetadataColumns::none(),
-            distance_metric: DistanceMetric::Cosine,
-        };
-
-        let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            column_name.to_string(),
-            vec![col(column_name)],
-        );
-
-        let session_state = SessionContext::new().state();
-        let plan = query_table
-            .scan(&session_state, None, &[], None)
-            .await
-            .expect("scan");
-
-        let limit_plan = plan
-            .as_any()
-            .downcast_ref::<GlobalLimitExec>()
-            .expect("downcast");
-        let union_plan = limit_plan
-            .input()
-            .as_any()
-            .downcast_ref::<UnionExec>()
-            .expect("downcast");
-
-        // There should be 2 partitions, each with 3 indexes (main + 2 spills), so 2 input plans to the UnionExec
-        assert_eq!(union_plan.children().len(), 2);
 
         Ok(())
     }
@@ -1210,20 +793,14 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 0,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            "test_column".to_string(),
-            vec![],
-        );
+        let query_table =
+            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
         let plan = query_table
@@ -1293,20 +870,14 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            "test_column".to_string(),
-            vec![],
-        );
+        let query_table =
+            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
 
@@ -1371,20 +942,14 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            "test_column".to_string(),
-            vec![],
-        );
+        let query_table =
+            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
 
@@ -1448,20 +1013,14 @@ mod tests {
                 bucket_name: bucket_name.to_string(),
                 index_name: index_name.to_string(),
             }),
-            spill_index: Arc::new(AtomicU8::new(0)),
             dimension: 3,
             columns: MetadataColumns::none(),
             distance_metric: DistanceMetric::Cosine,
         };
 
         let compute_vector = Arc::new(MockComputeVector::new(vec![1.0, 2.0, 3.0]));
-        let query_table = S3VectorsQueryTable::new(
-            s3_table,
-            compute_vector,
-            "test query".to_string(),
-            "test_column".to_string(),
-            vec![],
-        );
+        let query_table =
+            S3VectorsQueryTable::new(s3_table, compute_vector, "test query".to_string());
 
         let session_state = SessionContext::new().state();
 

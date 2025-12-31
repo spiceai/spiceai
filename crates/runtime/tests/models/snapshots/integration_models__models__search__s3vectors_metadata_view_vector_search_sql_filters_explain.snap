@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/search.rs
 description: "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs_view, 'secondary', answer) where subject!='math' order by score desc, id LIMIT 4"
+snapshot_kind: text
 ---
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                            |
@@ -15,6 +16,6 @@ description: "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs_
 |               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                    |
 |               |           BytesProcessedExec                                                                                                                                                                                    |
 |               |             CooperativeExec                                                                                                                                                                                     |
-|               |               S3VectorsQueryExec: filter={subject:{$ne:"math"}} limit=100                                                                                                                                       |
+|               |               S3VectorsQueryExec (INDEX_NAME_1): filter={subject:{$ne:"math"}} limit=100                                                                                                                        |
 |               |                                                                                                                                                                                                                 |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
