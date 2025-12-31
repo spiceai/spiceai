@@ -357,6 +357,9 @@ impl SpiceToolCatalog for McpToolCatalog {
     fn name(&self) -> &str {
         self.name.as_str()
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         let tools = self.list_tools().await.unwrap_or_default();
         tools

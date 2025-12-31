@@ -14,7 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod list_provider;
+pub mod query_provider;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
+
+use s3_vectors::S3Vectors;
 use snafu::prelude::*;
+
+use crate::s3_vectors::{S3VectorIdentifier, S3VectorsTable, list_index_names};
 
 /// The separator used between the base index name and spill sequence number.
 const SPILL_SEPARATOR: &str = "-";
@@ -52,7 +62,11 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl SpillIndex {
-    fn format_name(base_name: &str, sequence: u8) -> String {
+    fn format_name(&self) -> String {
+        let Self {
+            base_name,
+            sequence,
+        } = self;
         format!("{base_name}{SPILL_SEPARATOR}{sequence:02}")
     }
 
@@ -108,10 +122,7 @@ impl SpillIndex {
         // Sort by sequence number for consistent ordering
         spill_indexes.sort_by(|a, b| a.sequence.cmp(&b.sequence));
 
-        spill_indexes
-            .into_iter()
-            .map(|i| Self::format_name(&i.base_name, i.sequence))
-            .collect()
+        spill_indexes.into_iter().map(|i| i.format_name()).collect()
     }
 
     /// Gets all index names (main + spills) that belong to a virtual index.
@@ -141,17 +152,98 @@ impl SpillIndex {
     }
 }
 
+/// Find the last spill number for a given virtual index.
+pub async fn get_last_spill_index_for_virtual_index(
+    client: &Arc<dyn S3Vectors + Send + Sync>,
+    bucket_name: &str,
+    virtual_index_name: &str,
+) -> Result<u8, super::Error> {
+    let all_indexes = list_index_names(client, bucket_name, virtual_index_name).await?;
+    Ok(all_indexes
+        .iter()
+        .filter_map(|i| SpillIndex::parse(i).ok().flatten())
+        .max_by_key(|s| s.sequence)
+        .map(|s| s.sequence)
+        .unwrap_or_default())
+}
+
+/// Returns the current index identifier, accounting for spilling.
+#[must_use]
+pub fn current_index(idx: &S3VectorIdentifier, spill_index: &Arc<AtomicU8>) -> S3VectorIdentifier {
+    let spill_num = spill_index.load(Ordering::SeqCst);
+    if spill_num == 0 {
+        idx.clone()
+    } else {
+        match idx {
+            S3VectorIdentifier::Index {
+                bucket_name,
+                index_name,
+            } => S3VectorIdentifier::Index {
+                bucket_name: bucket_name.clone(),
+                index_name: format!("{index_name}.{spill_num:02}"),
+            },
+            S3VectorIdentifier::IndexArn(_) => idx.clone(),
+        }
+    }
+}
+
+/// Returns the next index identifier, incrementing the spill index
+///
+/// # Errors
+/// Returns an error if there is no next index
+pub fn next_index(
+    idx: &S3VectorIdentifier,
+    spill_index: &Arc<AtomicU8>,
+) -> Result<S3VectorIdentifier, super::Error> {
+    if spill_index
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+            if x >= MAX_SPILL_SEQUENCE {
+                None
+            } else {
+                Some(x + 1)
+            }
+        })
+        .is_err()
+    {
+        return Err(super::Error::MaxSpillAttemptsReached);
+    }
+
+    Ok(current_index(idx, spill_index))
+}
+
+pub(super) async fn all_spill_tables(
+    table: &S3VectorsTable,
+    spill_index: &Arc<AtomicU8>,
+) -> Result<Vec<S3VectorsTable>, super::Error> {
+    let current_index = current_index(&table.idx, spill_index);
+    let (_, Some(bucket_name), Some(index_name)) = current_index.index_identifier_variables()
+    else {
+        // This should never happen
+        return Ok(vec![]);
+    };
+
+    let spill_index_name = match SpillIndex::parse(&index_name) {
+        Ok(Some(name)) => name.base_name,
+        _ => index_name.clone(),
+    };
+    let all_index_names = list_index_names(&table.client, &bucket_name, &spill_index_name).await?;
+
+    Ok(
+        SpillIndex::get_all_indexes_for_virtual_index(&index_name, &all_index_names)
+            .iter()
+            .map(|spill_index_name| {
+                table.clone().with_new_id(S3VectorIdentifier::Index {
+                    bucket_name: bucket_name.to_string(),
+                    index_name: spill_index_name.clone(),
+                })
+            })
+            .collect::<Vec<S3VectorsTable>>(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_format_name() {
-        assert_eq!(SpillIndex::format_name("myindex", 0), "myindex-00");
-        assert_eq!(SpillIndex::format_name("myindex", 1), "myindex-01");
-        assert_eq!(SpillIndex::format_name("myindex", 42), "myindex-42");
-        assert_eq!(SpillIndex::format_name("myindex", 99), "myindex-99");
-    }
 
     #[test]
     fn test_parse_valid_spill_index() {

@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 use datafusion::{
+    common::exec_err,
+    error::DataFusionError,
     logical_expr::{Case, expr::ScalarFunction},
     prelude::Expr,
     scalar::ScalarValue,
@@ -44,6 +46,14 @@ const _: () = {
             == _S3_VECTOR_INDEX_NAME_MAX_LENGTH
     );
 };
+
+pub mod list_provider;
+pub use list_provider::S3VectorsPartitionedListTable;
+
+pub mod query_provider;
+pub use query_provider::S3VectorsPartitionedQueryTable;
+
+use crate::s3_vectors::{S3VectorIdentifier, S3VectorsTable, list_index_names};
 
 static PARTS_SEPARATOR: &str = ".";
 
@@ -144,6 +154,25 @@ impl PartitionedIndexName {
         })
     }
 
+    // Checks if a given index name is valid and belongs to the partitioned index (base on the encoding scheme of the column and parition [`Expr`]).
+    //
+    // Does not delineate between an invalid `index_name` and one that is not apart of the partition.
+    #[must_use]
+    pub fn check_index_name_belongs(
+        index_name: &str,
+        base_index_name: &str,
+        column_name: &str,
+        partition_by: &[Expr],
+    ) -> bool {
+        let Ok(partitioned_index) = Self::from_index_name(index_name) else {
+            return false;
+        };
+        matches!(
+            partitioned_index.belongs_with(base_index_name, column_name, partition_by),
+            BelongsWith::ThisDataset
+        )
+    }
+
     /// Determines if the partitions come from the same dataset
     #[must_use]
     pub fn belongs_with(
@@ -169,6 +198,41 @@ impl PartitionedIndexName {
             BelongsWith::ThisDataset
         }
     }
+}
+
+pub async fn all_indexes_in_partition(
+    table: &S3VectorsTable,
+    column_name: &str,
+    partition_by: &[Expr],
+) -> Result<Vec<S3VectorsTable>, DataFusionError> {
+    let (_, Some(bucket_name), Some(index_name)) = table.idx.index_identifier_variables() else {
+        return exec_err!("No bucket name or index name for bucket query");
+    };
+
+    // Filter out any index that has `index_name` as prefix, but is not apart of this partitioning.
+    let vector_tables: Vec<S3VectorsTable> =
+        list_index_names(&table.client, &bucket_name, &index_name)
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+            .into_iter()
+            .filter_map(|idx_name| {
+                if !PartitionedIndexName::check_index_name_belongs(
+                    &idx_name,
+                    &index_name,
+                    column_name,
+                    partition_by,
+                ) {
+                    return None;
+                }
+                Some(table.clone().with_new_id(S3VectorIdentifier::Index {
+                    bucket_name: bucket_name.clone(),
+                    index_name: idx_name,
+                }))
+            })
+            .collect();
+
+    Ok(vector_tables)
 }
 
 fn sanitize_column(s: &str) -> String {
