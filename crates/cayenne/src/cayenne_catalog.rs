@@ -63,6 +63,18 @@ impl MetastoreImpl {
         }
     }
 
+    /// Helper to execute a batch of SQL statements atomically.
+    ///
+    /// For `SQLite`, this runs all statements in a single transaction.
+    /// The entire batch succeeds or fails as a unit.
+    pub(crate) async fn execute_batch_helper(&self, sql: &str) -> CatalogResult<()> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.execute_batch(sql).await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.execute_batch(sql).await,
+        }
+    }
+
     /// Helper to query multiple rows from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_helper<F, T>(
         &self,
@@ -580,6 +592,35 @@ impl MetadataCatalog for CayenneCatalog {
             .map_err(|e| CatalogError::FailedToGetTableDeleteFiles {
                 source: Box::new(e),
             })?;
+        Ok(())
+    }
+
+    async fn commit_compaction(&self, table_id: i64, new_snapshot_id: &str) -> CatalogResult<()> {
+        // Execute both operations atomically using a transaction batch.
+        // SQLite's execute_batch runs all statements in a single transaction,
+        // ensuring atomicity: either both succeed or neither takes effect.
+        //
+        // Order matters for crash safety:
+        // 1. Clear delete files first - they reference the old snapshot's data
+        // 2. Update snapshot pointer - commits the new snapshot as active
+        //
+        // If interrupted between these, the old snapshot remains active with
+        // no delete files, which is safe (just loses the pending deletions,
+        // but data is not corrupted).
+        let batch_sql = format!(
+            "BEGIN TRANSACTION; \
+             DELETE FROM cayenne_delete_file WHERE table_id = {table_id}; \
+             UPDATE cayenne_table SET current_snapshot_id = '{new_snapshot_id}' WHERE table_id = {table_id}; \
+             COMMIT;"
+        );
+
+        self.metastore
+            .execute_batch_helper(&batch_sql)
+            .await
+            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+                source: Box::new(e),
+            })?;
+
         Ok(())
     }
 

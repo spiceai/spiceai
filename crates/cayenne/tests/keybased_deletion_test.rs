@@ -726,10 +726,10 @@ async fn test_composite_pk_persistence_after_delete_impl(fixture: TestFixture) -
 
 test_with_backends!(test_composite_pk_persistence_after_delete_impl);
 
-// Edge Case 15: String PK - insert after delete (reusing PK)
-// Note: In key-based deletion strategies, deleted PKs remain marked as deleted
-// until compaction. Inserting a new row with a previously deleted PK will
-// result in that row also being filtered out. This is expected behavior.
+// Edge Case 15: String PK - insert after delete (reusing PK) - UPSERT BEHAVIOR
+// With the compaction-on-upsert fix, inserting a row with a previously deleted PK
+// will trigger mini-compaction to apply deletions before adding new data.
+// This ensures the new row is visible (proper upsert semantics).
 async fn test_string_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) -> TestResult<()> {
     let (table, ctx, schema) = setup_string_pk_table(&fixture, "string_pk_reuse").await?;
 
@@ -747,7 +747,7 @@ async fn test_string_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) -
     delete_records(&table, col("code").eq(lit("KEY2"))).await?;
 
     // Insert new row with same PK (KEY2 with different data)
-    // NOTE: This row will be filtered out because pk=KEY2 is in the deletion vector
+    // With the fix, this triggers mini-compaction and the new row IS visible
     let batch2 = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -758,12 +758,11 @@ async fn test_string_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) -
     )?;
     insert_batch(&table, batch2).await?;
 
-    // With key-based deletion, the reinserted row with pk=KEY2 is still filtered out
-    // because the deletion vector marks KEY2 as deleted (regardless of which file it's in)
+    // The new row with pk=KEY2 should be visible after upsert
     assert_eq!(
         get_row_count(&ctx, "string_pk_reuse").await?,
-        2,
-        "Row with reused PK should be filtered out by deletion vector"
+        3,
+        "Upserted row with reused PK should be visible after mini-compaction"
     );
 
     // Insert with a new PK to verify inserts still work
@@ -779,11 +778,11 @@ async fn test_string_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) -
 
     assert_eq!(
         get_row_count(&ctx, "string_pk_reuse").await?,
-        3,
+        4,
         "New row with fresh PK should appear"
     );
 
-    // Verify the data: should have KEY1, KEY3, KEY4 (not KEY2)
+    // Verify the data: should have KEY1, KEY2, KEY3, KEY4 with KEY2 being the new version
     let df = ctx
         .sql("SELECT code FROM string_pk_reuse ORDER BY code")
         .await?;
@@ -796,9 +795,21 @@ async fn test_string_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) -
 
     assert_eq!(
         codes,
-        vec!["KEY1", "KEY3", "KEY4"],
-        "Should have KEY1, KEY3, KEY4 (KEY2 is deleted)"
+        vec!["KEY1", "KEY2", "KEY3", "KEY4"],
+        "Should have all 4 keys including upserted KEY2"
     );
+
+    // Verify KEY2 has the new value (999)
+    let df = ctx
+        .sql("SELECT value FROM string_pk_reuse WHERE code = 'KEY2'")
+        .await?;
+    let results = df.collect().await?;
+    let value = results
+        .first()
+        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+        .and_then(|a| a.values().first())
+        .copied();
+    assert_eq!(value, Some(999), "Upserted row should have new value");
 
     Ok(())
 }

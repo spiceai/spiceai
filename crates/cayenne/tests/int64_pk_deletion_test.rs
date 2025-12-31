@@ -623,10 +623,10 @@ async fn test_int64_pk_partial_batch_impl(fixture: TestFixture) -> TestResult<()
 test_with_backends!(test_int64_pk_partial_batch_impl);
 
 // =============================================================================
-// Edge Case 13: Insert after delete (reusing PKs)
-// Note: In key-based deletion strategies, deleted PKs remain marked as deleted
-// until compaction. Inserting a new row with a previously deleted PK will
-// result in that row also being filtered out. This is expected behavior.
+// Edge Case 13: Insert after delete (reusing PKs) - UPSERT BEHAVIOR
+// With the compaction-on-upsert fix, inserting a row with a previously deleted PK
+// will trigger mini-compaction to apply deletions before adding new data.
+// This ensures the new row is visible (proper upsert semantics).
 // =============================================================================
 
 async fn test_int64_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) -> TestResult<()> {
@@ -647,7 +647,7 @@ async fn test_int64_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) ->
     delete_records(&table, col("id").eq(lit(2i64))).await?;
 
     // Insert new row with same PK (id=2 with different data)
-    // NOTE: This row will be filtered out because pk=2 is in the deletion vector
+    // With the fix, this triggers mini-compaction and the new row IS visible
     let batch2 = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -658,12 +658,11 @@ async fn test_int64_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) ->
     )?;
     insert_batch(&table, batch2).await?;
 
-    // With key-based deletion, the reinserted row with pk=2 is still filtered out
-    // because the deletion vector marks pk=2 as deleted (regardless of which file it's in)
+    // The new row with pk=2 should be visible after upsert
     assert_eq!(
         get_row_count(&ctx, "reuse_pk_test").await?,
-        2,
-        "Row with reused PK should be filtered out by deletion vector"
+        3,
+        "Upserted row with reused PK should be visible after mini-compaction"
     );
 
     // Insert with a new PK to verify inserts still work
@@ -679,13 +678,25 @@ async fn test_int64_pk_insert_after_delete_same_pk_impl(fixture: TestFixture) ->
 
     assert_eq!(
         get_row_count(&ctx, "reuse_pk_test").await?,
-        3,
+        4,
         "New row with fresh PK should appear"
     );
 
-    // Verify the data: should have ids 1, 3, 4 (not 2)
+    // Verify the data: should have ids 1, 2, 3, 4 with 2 being the new version
     let ids = get_ids(&ctx, "reuse_pk_test").await?;
-    assert_eq!(ids, vec![1, 3, 4], "Should have ids 1, 3, 4 (2 is deleted)");
+    assert_eq!(ids, vec![1, 2, 3, 4], "Should have all 4 ids including upserted id=2");
+
+    // Verify id=2 has the new value (999)
+    let df = ctx
+        .sql("SELECT value FROM reuse_pk_test WHERE id = 2")
+        .await?;
+    let results = df.collect().await?;
+    let value = results
+        .first()
+        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+        .and_then(|a| a.values().first())
+        .copied();
+    assert_eq!(value, Some(999), "Upserted row should have new value");
 
     Ok(())
 }

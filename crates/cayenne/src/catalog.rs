@@ -196,6 +196,28 @@ pub trait MetadataCatalog: Send + Sync {
     /// applied to the data files.
     async fn clear_delete_files(&self, table_id: i64) -> CatalogResult<()>;
 
+    /// Atomically update snapshot and clear delete files in a single transaction.
+    ///
+    /// This ensures ACID compliance during compaction: the snapshot update and
+    /// deletion of obsolete delete files happen together or not at all.
+    /// This prevents data inconsistency if the operation is interrupted.
+    ///
+    /// # Atomicity Guarantee
+    ///
+    /// If this operation fails or is interrupted:
+    /// - The old snapshot remains active
+    /// - All delete files remain intact
+    /// - The system remains in a consistent state
+    ///
+    /// On success:
+    /// - The new snapshot is active
+    /// - All delete files for the table are removed (they were applied during compaction)
+    async fn commit_compaction(
+        &self,
+        table_id: i64,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()>;
+
     /// Add a partition to a table.
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64>;
 
