@@ -22,6 +22,7 @@ on:
           - 'throughput'
           - 'append'
           - 'http-consistency'
+          - 'text-to-sql'
       update_snapshots:
         description: 'Update snapshots?'
         required: false
@@ -248,6 +249,16 @@ jobs:
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF100
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - Text to SQL
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/text_to_sql \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:

@@ -58,6 +58,7 @@ pub enum Workflow {
     Load,
     Append,
     DataConsistency,
+    TextToSql,
 }
 
 impl From<Workflow> for TestType {
@@ -68,6 +69,7 @@ impl From<Workflow> for TestType {
             Workflow::Load => TestType::Load,
             Workflow::Append => TestType::Append,
             Workflow::DataConsistency => TestType::DataConsistency,
+            Workflow::TextToSql => TestType::TextToSql,
         }
     }
 }
@@ -92,6 +94,8 @@ pub struct DispatchTests {
     pub load: Vec<LoadArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub append: Vec<AppendArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub text_to_sql: Vec<TextToSqlArgs>,
 }
 
 /// Benchmark and throughput workflow arguments, defined in the test files
@@ -264,6 +268,19 @@ pub enum RunnerType {
     Dev,
     #[serde(rename = "spiceai-dev-large-runners")]
     DevLarge,
+}
+
+/// Payload sent to the GitHub Actions workflow request. Should match inputs in `.github/workflows/testoperator_run_texttosql.yml`.
+/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TextToSqlArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+    pub model_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queryset_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queryset: Option<String>,
 }
 
 /// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects
