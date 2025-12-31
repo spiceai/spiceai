@@ -183,7 +183,20 @@ impl SMBClientConfig {
         if subpath.is_empty() {
             return Ok(base);
         }
-        let smb_path = subpath.replace('/', r"\");
+
+        // Strip the share name from the subpath if present (DataFusion includes the full URL path
+        // which contains the share as the first segment, but the base UNC path already includes it)
+        let normalized = subpath.trim_start_matches('/');
+        let path_without_share = normalized
+            .strip_prefix(&self.share)
+            .map(|s| s.trim_start_matches('/'))
+            .unwrap_or(normalized);
+
+        if path_without_share.is_empty() {
+            return Ok(base);
+        }
+
+        let smb_path = path_without_share.replace('/', r"\");
         let unc_string = format!(r"{base}\{smb_path}");
         UncPath::from_str(&unc_string).map_err(|e| object_store::Error::Generic {
             store: STORE_NAME,
@@ -198,6 +211,25 @@ impl SMBClientConfig {
             username: self.username.clone(),
             password: self.password.clone(),
             timeout: self.timeout,
+        }
+    }
+
+    /// Returns a user-friendly SMB URL representation of the path.
+    /// Used for logging to show the format the user originally provided.
+    fn display_path(&self, subpath: &str) -> String {
+        let normalized = subpath.trim_start_matches('/');
+        let path_without_share = normalized
+            .strip_prefix(&self.share)
+            .map(|s| s.trim_start_matches('/'))
+            .unwrap_or(normalized);
+
+        if path_without_share.is_empty() {
+            format!("smb://{}/{}", self.server, self.share)
+        } else {
+            format!(
+                "smb://{}/{}/{}",
+                self.server, self.share, path_without_share
+            )
         }
     }
 }
@@ -290,16 +322,17 @@ impl SMBObjectStore {
             attributes: FileAttributes::default(),
         };
 
+        let display_path = config.display_path(dir_path);
         let resource = match client.create_file(&unc_path, &dir_open_args).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Failed to open directory {unc_path}: {e}");
+                tracing::warn!("Failed to open SMB directory {display_path}: {e}");
                 return Ok(Vec::new());
             }
         };
 
         let Resource::Directory(directory) = resource else {
-            tracing::warn!("Expected directory but got different resource type for {unc_path}");
+            tracing::warn!("Expected directory but got different resource type for {display_path}");
             return Ok(Vec::new());
         };
 
@@ -308,7 +341,7 @@ impl SMBObjectStore {
             match Directory::query::<FileBothDirectoryInformation>(&dir_arc, "*").await {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("Failed to query directory {unc_path}: {e}");
+                    tracing::warn!("Failed to query SMB directory {display_path}: {e}");
                     let _ = dir_arc.close().await;
                     return Ok(Vec::new());
                 }
@@ -369,7 +402,8 @@ impl SMBObjectStore {
                     queue.extend(dirs);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to list directory {dir_path}: {e}");
+                    let display = config.display_path(&dir_path);
+                    tracing::warn!("Failed to list SMB directory {display}: {e}");
                 }
             }
         }
@@ -624,5 +658,51 @@ mod tests {
         assert_eq!(entry.name, "test.txt");
         assert!(!entry.is_dir);
         assert_eq!(entry.size, 1024);
+    }
+
+    #[test]
+    fn test_unc_path_strips_share_prefix() {
+        let config = SMBClientConfig::new(
+            "192.168.1.100".to_string(),
+            "myshare".to_string(),
+            "user".to_string(),
+            "pass".to_string(),
+            None,
+        );
+
+        // When subpath includes the share name (as DataFusion does), it should be stripped
+        let path = config
+            .unc_path_with_subpath("myshare/data/file.parquet")
+            .expect("valid path");
+        assert_eq!(
+            path.to_string(),
+            r"\\192.168.1.100\myshare\data\file.parquet"
+        );
+
+        // Without share prefix, path should be used as-is
+        let path2 = config
+            .unc_path_with_subpath("data/file.parquet")
+            .expect("valid path");
+        assert_eq!(
+            path2.to_string(),
+            r"\\192.168.1.100\myshare\data\file.parquet"
+        );
+
+        // Empty subpath should return base UNC path
+        let path3 = config.unc_path_with_subpath("").expect("valid path");
+        assert_eq!(path3.to_string(), r"\\192.168.1.100\myshare");
+
+        // Share name only should return base UNC path
+        let path4 = config.unc_path_with_subpath("myshare").expect("valid path");
+        assert_eq!(path4.to_string(), r"\\192.168.1.100\myshare");
+
+        // With leading slash
+        let path5 = config
+            .unc_path_with_subpath("/myshare/data/file.parquet")
+            .expect("valid path");
+        assert_eq!(
+            path5.to_string(),
+            r"\\192.168.1.100\myshare\data\file.parquet"
+        );
     }
 }

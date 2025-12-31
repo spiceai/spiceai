@@ -114,7 +114,3 @@ spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 turso = ["runtime/turso"]
-
-# NFS is only supported on non-Windows platforms (libnfs doesn't build on Windows)
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-runtime = { path = "../../crates/runtime", features = ["nfs"] }
