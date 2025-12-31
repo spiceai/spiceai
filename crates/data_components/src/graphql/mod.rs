@@ -345,8 +345,7 @@ mod tests {
             };
             assert!(
                 is_retriable_error(&error),
-                "JsonDecodeError with status {} should be retriable",
-                status
+                "JsonDecodeError with status {status} should be retriable"
             );
         }
     }
@@ -374,7 +373,7 @@ mod tests {
             Error::JsonDecodeError {
                 status: StatusCode::GATEWAY_TIMEOUT,
                 error: "parse error".to_string(),
-                response_preview: "".to_string(),
+                response_preview: String::new(),
             },
             Error::RateLimited {
                 message: "Rate limit exceeded".to_string(),
@@ -469,10 +468,12 @@ mod tests {
         // - Attempt 2: first retry (if attempt 1 < 3)
         // - Attempt 3: second retry (if attempt 2 < 3), then give up
 
-        assert!(1 < PAGE_RETRY_MAX_ATTEMPTS, "Attempt 1 should allow retry");
-        assert!(2 < PAGE_RETRY_MAX_ATTEMPTS, "Attempt 2 should allow retry");
+        // Test using runtime values to avoid constant assertion warnings
+        let max_attempts = PAGE_RETRY_MAX_ATTEMPTS;
+        assert!(1 < max_attempts, "Attempt 1 should allow retry");
+        assert!(2 < max_attempts, "Attempt 2 should allow retry");
         assert!(
-            !(3 < PAGE_RETRY_MAX_ATTEMPTS),
+            !(3 < max_attempts),
             "Attempt 3 should NOT allow retry (max reached)"
         );
     }
