@@ -21,8 +21,6 @@ use test_framework::TestType;
 
 use super::dataset::{QueryOverridesArg, QuerySetArg};
 
-use super::HttpTestArgs;
-
 #[derive(Parser, Debug, Clone)]
 pub struct DispatchArgs {
     /// A positional argument for the directory to scan, or test file
@@ -60,8 +58,7 @@ pub enum Workflow {
     Load,
     Append,
     DataConsistency,
-    HttpConsistency,
-    HttpOverhead,
+    TextToSql,
 }
 
 impl From<Workflow> for TestType {
@@ -72,8 +69,7 @@ impl From<Workflow> for TestType {
             Workflow::Load => TestType::Load,
             Workflow::Append => TestType::Append,
             Workflow::DataConsistency => TestType::DataConsistency,
-            Workflow::HttpConsistency => TestType::HttpConsistency,
-            Workflow::HttpOverhead => TestType::HttpOverhead,
+            Workflow::TextToSql => TestType::TextToSql,
         }
     }
 }
@@ -99,9 +95,7 @@ pub struct DispatchTests {
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub append: Vec<AppendArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
-    pub http_consistency: Vec<HttpConsistencyArgs>,
-    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
-    pub http_overhead: Vec<HttpOverheadArgs>,
+    pub text_to_sql: Vec<TextToSqlArgs>,
 }
 
 /// Benchmark and throughput workflow arguments, defined in the test files
@@ -276,49 +270,17 @@ pub enum RunnerType {
     DevLarge,
 }
 
-/// Payload sent to the GitHub Actions workflow request for HTTP consistency tests
-/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpConsistencyArgs {
-    #[serde(flatten)]
-    pub http_args: HttpTestArgs,
-
-    pub buckets: usize,
-    pub spicepod_path: PathBuf,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<u64>,
-}
-
-/// Payload sent to the GitHub Actions workflow request for HTTP overhead tests
-/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpOverheadArgs {
-    #[serde(flatten)]
-    pub http_args: HttpTestArgs,
-    pub spicepod_path: PathBuf,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<u64>,
-
-    pub base: OverheadBaseModel,
-    pub base_component: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_payload_file: Option<PathBuf>,
-}
-
+/// Payload sent to the GitHub Actions workflow request. Should match inputs in `.github/workflows/testoperator_run_texttosql.yml`.
+/// `spiced_commit` is not an eligible argument in the test files, as it is controlled by the environment.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OverheadBaseModel {
-    #[serde(rename = "openai")]
-    OpenAI,
-    Anthropic,
-    Xai,
+pub struct TextToSqlArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+    pub model_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queryset_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queryset: Option<String>,
 }
 
 /// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects
@@ -386,8 +348,6 @@ tests:
 
         // Verify empty sections default to empty vectors
         assert_eq!(test_file.tests.throughput.len(), 0);
-        assert_eq!(test_file.tests.http_consistency.len(), 0);
-        assert_eq!(test_file.tests.http_overhead.len(), 0);
     }
 
     #[test]
@@ -469,8 +429,6 @@ tests:
         // Verify other sections are empty
         assert_eq!(test_file.tests.bench.len(), 0);
         assert_eq!(test_file.tests.throughput.len(), 0);
-        assert_eq!(test_file.tests.http_consistency.len(), 0);
-        assert_eq!(test_file.tests.http_overhead.len(), 0);
     }
 
     #[test]
@@ -486,7 +444,5 @@ tests: {}
         assert_eq!(test_file.tests.bench.len(), 0);
         assert_eq!(test_file.tests.throughput.len(), 0);
         assert_eq!(test_file.tests.load.len(), 0);
-        assert_eq!(test_file.tests.http_consistency.len(), 0);
-        assert_eq!(test_file.tests.http_overhead.len(), 0);
     }
 }

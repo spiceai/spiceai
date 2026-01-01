@@ -18,9 +18,6 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
-mod http;
-pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
-
 mod dataset;
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs, QuerySetLoader};
 
@@ -37,6 +34,9 @@ pub use evals::EvalsTestArgs;
 
 mod search;
 pub use search::SearchTestArgs;
+
+mod text_to_sql;
+pub use text_to_sql::TextToSqlArgs;
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -60,10 +60,6 @@ pub enum TestCommands {
     Bench(DatasetTestArgs),
     /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
-    /// Run an HTTP consistency test
-    HttpConsistency(HttpConsistencyTestArgs),
-    /// Run an HTTP overhead test
-    HttpOverhead(HttpOverheadTestArgs),
     /// Run a models evaluations test
     Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
@@ -71,6 +67,8 @@ pub enum TestCommands {
     Search(SearchTestArgs),
     /// Execute benchmark queries against a pre-existing spiced instance
     Query(QueryArgs),
+    /// Run a text-to-sql test
+    TextToSql(TextToSqlArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

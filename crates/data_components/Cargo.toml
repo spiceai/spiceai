@@ -161,7 +161,7 @@ arrow-array = { workspace = true }
 aws-smithy-types = { workspace = true }
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-ctor = "0.6.1"
+ctor = "0.6.3"
 iceberg_test_utils = { version = "0.7.0", features = ["tests"] }
 insta.workspace = true
 object_store = { workspace = true }

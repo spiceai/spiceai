@@ -28,6 +28,14 @@ build-dev:
 	export DEV=true; make -C bin/spice
 	export DEV=true; make -C bin/spiced
 
+.PHONY: build-testoperator-dev
+build-testoperator-dev:
+	cargo build -p testoperator --all-features
+
+.PHONY: build-testoperator
+build-testoperator:
+	cargo build --release -p testoperator --all-features
+
 .PHONY: ci
 ci:
 	make -C bin/spice
@@ -78,7 +86,7 @@ lint: lint-go lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -93,7 +101,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -113,7 +121,7 @@ lint-rust:
 lint-rust-fix:
 	cargo fmt --all
 	## All except metal, cuda
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -128,7 +136,7 @@ lint-rust-fix:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,cluster --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -239,6 +247,16 @@ install-with-models-cuda:
 .PHONY: install-with-odbc
 install-with-odbc:
 	make install SPICED_NON_DEFAULT_FEATURES="odbc"
+
+.PHONY: install-testoperator-dev
+install-testoperator-dev: build-testoperator-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/testoperator ~/.spice/bin/testoperator
+
+.PHONY: install-testoperator
+install-testoperator: build-testoperator
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
 
 .PHONY: install-cli
 install-cli: build-cli

@@ -33,7 +33,3 @@ chrono.workspace = true
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 object_store.workspace = true
 tokio.workspace = true
-
-[features]
-cluster = ["datafusion-optimizer-rules/cluster"]
-default = []
