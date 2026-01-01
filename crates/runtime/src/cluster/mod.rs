@@ -385,11 +385,40 @@ pub async fn initialize_cluster_executor(
         config
     });
 
-    let work_dir = rt
-        .df
-        .temp_directory
-        .clone()
-        .unwrap_or(env::temp_dir().to_string_lossy().to_string());
+    // Generate executor_id early so we can use it for both the app definition request and executor registration
+    let executor_id = Uuid::new_v4().to_string();
+
+    // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
+    // This ensures shuffle files are written to the configured directory.
+    let mut cluster_client =
+        create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
+
+    let app_definition_request = GetAppDefinitionRequest {
+        executor_id: executor_id.clone(),
+    };
+
+    let response = cluster_client
+        .get_app_definition(app_definition_request)
+        .await
+        .map_err(|status| FailedToStartClusterExecutor {
+            source: format!("Failed to get app definition from scheduler: {status}").into(),
+        })?;
+
+    let app_json = response.into_inner().app_json;
+
+    let app_def: App = serde_json::from_str(&app_json)
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
+
+    // Extract temp_directory from the app definition for the executor's work_dir
+    let work_dir = app_def
+        .runtime
+        .query
+        .as_ref()
+        .and_then(|q| q.temp_directory.clone())
+        .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string());
+
+    let app_def = Arc::new(app_def);
 
     let scheduler_endpoint = create_grpc_client_endpoint(scheduler_url.to_string())
         .boxed()
@@ -492,7 +521,6 @@ pub async fn initialize_cluster_executor(
         (hostname, bind_addr.port())
     };
 
-    let executor_id = Uuid::new_v4().to_string();
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service - use advertise address for scheduler to contact this executor
@@ -546,8 +574,8 @@ pub async fn initialize_cluster_executor(
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
 
-        // Initialize secrets first so they're available for object store configuration
-        executor_bind_app(&rt, executor_id, client_tls_config).await?;
+        // Bind the already-fetched app and initialize secrets for object store configuration
+        executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
 
         executor_bind_object_stores(Arc::clone(&rt)).await?;
 
@@ -685,11 +713,13 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
     }
 }
 
-/// - Initializes relevant `App` runtime components retrieved from the scheduler node
+/// - Binds the pre-fetched `App` to the runtime
 /// - Initializes and binds `SchedulerRPCSecretStore`
+/// - Loads catalogs, embeddings, models, and tools
 async fn executor_bind_app(
     rt: &Arc<Runtime>,
     executor_id: String,
+    app_def: Arc<App>,
     client_tls_config: Option<ClientTlsConfig>,
 ) -> crate::Result<()> {
     let Some(scheduler_url) = rt.df.cluster_config.scheduler_address() else {
@@ -699,29 +729,10 @@ async fn executor_bind_app(
                 .into(),
         });
     };
-    let mut cluster_client =
-        create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
 
-    let app_definition_request = GetAppDefinitionRequest {
-        executor_id: executor_id.clone(),
-    };
+    *rt.app.write().await = Some(app_def);
 
-    let response = cluster_client
-        .get_app_definition(app_definition_request)
-        .await
-        .map_err(|status| FailedToStartClusterExecutor {
-            source: format!("Failed to get app definition from scheduler: {status}").into(),
-        })?;
-
-    let app_json = response.into_inner().app_json;
-
-    let app_def: App = serde_json::from_str(&app_json)
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
-
-    *rt.app.write().await = Some(Arc::new(app_def));
-
-    // Create a new cluster client for secrets
+    // Create a cluster client for secrets
     let secrets_cluster_client =
         create_cluster_service_client(scheduler_url, client_tls_config).await?;
 
