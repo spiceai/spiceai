@@ -19,8 +19,10 @@ limitations under the License.
 //! This module provides shared functionality to reduce code duplication across
 //! network filesystem connectors.
 
+use std::ops::Range;
+
 use chrono::{DateTime, Utc};
-use object_store::{ObjectMeta, path::Path};
+use object_store::{GetRange, ListResult, ObjectMeta, path::Path};
 
 /// Create a generic object store error for a given store type.
 #[inline]
@@ -130,9 +132,90 @@ pub fn process_directory_entries(
     (files, dirs)
 }
 
+/// Process directory entries for a shallow listing (`list_with_delimiter`).
+/// Returns a `ListResult` with objects (files) and `common_prefixes` (directories).
+pub fn process_directory_entries_shallow(
+    prefix: &str,
+    entries: impl IntoIterator<Item = DirEntry>,
+) -> ListResult {
+    let mut objects = Vec::new();
+    let mut common_prefixes = Vec::new();
+
+    for entry in entries {
+        if should_skip_entry(&entry.name) {
+            continue;
+        }
+
+        let full_path = build_full_path(prefix, &entry.name);
+
+        if entry.is_dir {
+            // Directory paths are stored without trailing slashes (Path normalizes them)
+            common_prefixes.push(Path::from(full_path));
+        } else {
+            objects.push(entry_to_object_meta(full_path, &entry));
+        }
+    }
+
+    ListResult {
+        common_prefixes,
+        objects,
+    }
+}
+
+/// Resolve a `GetRange` option to a concrete byte range given the total file size.
+///
+/// Returns `(start, end, bytes_to_read)` where:
+/// - `start` is the starting byte offset (0-indexed)
+/// - `end` is the ending byte offset (exclusive)
+/// - `bytes_to_read` is `end - start`
+///
+/// Handles all `GetRange` variants:
+/// - `Bounded(range)`: Use the specified range directly
+/// - `Offset(n)`: Read from byte `n` to end of file
+/// - `Suffix(n)`: Read the last `n` bytes of the file
+#[must_use]
+pub fn resolve_range(range: Option<&GetRange>, file_size: u64) -> (u64, u64, u64) {
+    match range {
+        Some(GetRange::Bounded(r)) => {
+            let end = r.end.min(file_size);
+            let start = r.start.min(end);
+            (start, end, end.saturating_sub(start))
+        }
+        Some(GetRange::Offset(offset)) => {
+            let start = (*offset).min(file_size);
+            (start, file_size, file_size.saturating_sub(start))
+        }
+        Some(GetRange::Suffix(n)) => {
+            let start = file_size.saturating_sub(*n);
+            (start, file_size, file_size.saturating_sub(start))
+        }
+        None => (0, file_size, file_size),
+    }
+}
+
+/// Build a byte `Range` from resolved start and end offsets.
+#[inline]
+#[must_use]
+pub fn build_byte_range(start: u64, end: u64) -> Range<u64> {
+    Range { start, end }
+}
+
+/// Create an `ObjectMeta` from basic file information.
+#[must_use]
+pub fn build_object_meta(location: Path, size: u64, last_modified: DateTime<Utc>) -> ObjectMeta {
+    ObjectMeta {
+        location,
+        size,
+        last_modified,
+        e_tag: None,
+        version: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use insta::assert_debug_snapshot;
 
     #[test]
     fn test_build_full_path() {
@@ -147,6 +230,54 @@ mod tests {
         assert!(should_skip_entry(".."));
         assert!(!should_skip_entry("file.txt"));
         assert!(!should_skip_entry(".hidden"));
+    }
+
+    #[test]
+    fn test_resolve_range_none() {
+        let (start, end, to_read) = resolve_range(None, 1000);
+        assert_eq!((start, end, to_read), (0, 1000, 1000));
+    }
+
+    #[test]
+    fn test_resolve_range_bounded() {
+        let range = GetRange::Bounded(100..500);
+        let (start, end, to_read) = resolve_range(Some(&range), 1000);
+        assert_eq!((start, end, to_read), (100, 500, 400));
+    }
+
+    #[test]
+    fn test_resolve_range_bounded_past_end() {
+        let range = GetRange::Bounded(800..1500);
+        let (start, end, to_read) = resolve_range(Some(&range), 1000);
+        assert_eq!((start, end, to_read), (800, 1000, 200));
+    }
+
+    #[test]
+    fn test_resolve_range_offset() {
+        let range = GetRange::Offset(500);
+        let (start, end, to_read) = resolve_range(Some(&range), 1000);
+        assert_eq!((start, end, to_read), (500, 1000, 500));
+    }
+
+    #[test]
+    fn test_resolve_range_offset_past_end() {
+        let range = GetRange::Offset(1500);
+        let (start, end, to_read) = resolve_range(Some(&range), 1000);
+        assert_eq!((start, end, to_read), (1000, 1000, 0));
+    }
+
+    #[test]
+    fn test_resolve_range_suffix() {
+        let range = GetRange::Suffix(100);
+        let (start, end, to_read) = resolve_range(Some(&range), 1000);
+        assert_eq!((start, end, to_read), (900, 1000, 100));
+    }
+
+    #[test]
+    fn test_resolve_range_suffix_larger_than_file() {
+        let range = GetRange::Suffix(2000);
+        let (start, end, to_read) = resolve_range(Some(&range), 1000);
+        assert_eq!((start, end, to_read), (0, 1000, 1000));
     }
 
     #[test]
@@ -167,5 +298,47 @@ mod tests {
 
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0], "parent/subdir");
+    }
+
+    #[test]
+    fn test_process_directory_entries_shallow() {
+        let timestamp =
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp for test");
+        let entries = vec![
+            DirEntry::file("file1.txt".to_string(), 100, timestamp),
+            DirEntry::directory("subdir".to_string()),
+            DirEntry::file("file2.csv".to_string(), 2048, timestamp),
+            DirEntry::directory(".".to_string()),
+            DirEntry::directory("..".to_string()),
+        ];
+
+        let result = process_directory_entries_shallow("data", entries);
+
+        assert_debug_snapshot!(result);
+    }
+
+    #[test]
+    fn test_build_object_meta() {
+        let timestamp =
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp for test");
+        let meta = build_object_meta(Path::from("test/file.parquet"), 4096, timestamp);
+
+        assert_debug_snapshot!(meta);
+    }
+
+    #[test]
+    fn test_dir_entry_constructors() {
+        let timestamp =
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp for test");
+        let file = DirEntry::file("data.csv".to_string(), 1024, timestamp);
+        let dir = DirEntry::directory("subdir".to_string());
+
+        assert_eq!(file.name, "data.csv");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 1024);
+
+        assert_eq!(dir.name, "subdir");
+        assert!(dir.is_dir);
+        assert_eq!(dir.size, 0);
     }
 }
