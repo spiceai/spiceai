@@ -2,17 +2,17 @@
 source: crates/runtime/tests/github/mod.rs
 expression: pretty_batches
 ---
-+------------------------------------+---------------------------------------------------+
-| name                               | path                                              |
-+------------------------------------+---------------------------------------------------+
-| ai benchmark (nsql)                | .github/workflows/ai_benchmark_nsql.yml           |
-| search benchmark tests             | .github/workflows/benchmarks_search.yml           |
-| build_and_release                  | .github/workflows/build_and_release.yml           |
-| build_and_release_cuda             | .github/workflows/build_and_release_cuda.yml      |
-| CI                                 | .github/workflows/ci.yml                          |
-| CodeQL                             | .github/workflows/codeql-analysis.yml             |
-| E2E Test CI                        | .github/workflows/e2e_test_ci.yml                 |
-| E2E Test CI (models)               | .github/workflows/e2e_test_ci_models.yml          |
-| E2E Test Release Installation      | .github/workflows/e2e_test_release_install.yml    |
-| E2E Test Release Installation (AI) | .github/workflows/e2e_test_release_install_ai.yml |
-+------------------------------------+---------------------------------------------------+
++-------------------------------+-------------------------------------------------+
+| name                          | path                                            |
++-------------------------------+-------------------------------------------------+
+| spiced_docker                 | .github/workflows/spiced_docker.yml             |
+| Check for forbidden licenses  | .github/workflows/license_check.yml             |
+| CodeQL                        | .github/workflows/codeql-analysis.yml           |
+| build_and_release             | .github/workflows/build_and_release.yml         |
+| pr                            | .github/workflows/pr.yml                        |
+| E2E Test CI                   | .github/workflows/e2e_test_ci.yml               |
+| E2E Test Release Installation | .github/workflows/e2e_test_release_install.yml  |
+| Generate Acknowledgements     | .github/workflows/generate_acknowledgements.yml |
+| check all features            | .github/workflows/features.yml                  |
+| Test types support            | .github/workflows/types_check.yml               |
++-------------------------------+-------------------------------------------------+

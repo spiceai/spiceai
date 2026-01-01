@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{
-    ChatCompletionStreamOptions, CreateChatCompletionRequest, CreateChatCompletionResponse,
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCalls, ChatCompletionStreamOptions, CreateChatCompletionRequest,
+    CreateChatCompletionResponse,
 };
 use jsonpath_rust::JsonPath;
 use llms::{accumulate::accumulate, chat::Chat};
@@ -61,6 +62,15 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                     Box::pin(async {
                         create::create_anthropic(None)
                             .map_err(|e| anyhow::anyhow!("failed to create anthropic model: {e}"))
+                    })
+                }),
+            ),
+            (
+                "google",
+                Box::new(|| {
+                    Box::pin(async {
+                        create::create_google("gemini-2.0-flash")
+                            .map_err(|e| anyhow::anyhow!("failed to create google model: {e}"))
                     })
                 }),
             ),
@@ -184,7 +194,8 @@ async fn run_test(
         let mut req = req;
         req.stream = Some(true);
         req.stream_options = Some(ChatCompletionStreamOptions {
-            include_usage: true,
+            include_usage: Some(true),
+            include_obfuscation: None,
         });
         accumulate(model.chat_stream(req).await.unwrap_or_else(|e| {
             panic!("For test {test_name}/{model_name}, chat_stream failed. Error: {e:#?}")
@@ -221,7 +232,8 @@ async fn test_basic(
         "local_phi3",
         "hf_phi3",
         "bedrock",
-        "perplexity"
+        "perplexity",
+        "google"
     )]
     model_name: &str,
     #[values(false, true)] as_stream: bool,
@@ -261,7 +273,8 @@ async fn test_usage(
         "local_phi3",
         "hf_phi3",
         "bedrock",
-        "perplexity"
+        "perplexity",
+        "google"
     )]
     model_name: &str,
     #[values(false, true)] as_stream: bool,
@@ -312,7 +325,7 @@ async fn test_usage(
 #[rstest]
 #[tokio::test]
 async fn test_system_prompt(
-    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3")] model_name: &str,
+    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3", "google")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -353,7 +366,16 @@ async fn test_system_prompt(
 #[rstest]
 #[tokio::test]
 async fn test_supports_basic_message_roles(
-    #[values("anthropic", "openai", "xai", "local_phi3", "hf_phi3", "bedrock")] model_name: &str,
+    #[values(
+        "anthropic",
+        "openai",
+        "xai",
+        "local_phi3",
+        "hf_phi3",
+        "bedrock",
+        "google"
+    )]
+    model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -393,7 +415,7 @@ async fn test_supports_basic_message_roles(
 #[rstest]
 #[tokio::test]
 async fn test_supports_all_message_roles(
-    #[values("anthropic", "openai", "xai", "bedrock")] model_name: &str,
+    #[values("anthropic", "openai", "xai", "bedrock", "google")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     let req: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -456,7 +478,7 @@ async fn test_supports_all_message_roles(
 #[rstest]
 #[tokio::test]
 async fn test_tool_use(
-    #[values("anthropic", "openai", "xai", "bedrock")] model_name: &str,
+    #[values("anthropic", "openai", "google", "xai", "bedrock")] model_name: &str,
     #[values(false, true)] as_stream: bool,
 ) {
     // serde_json::from_value(
@@ -517,21 +539,23 @@ async fn test_tool_use(
     };
 
     // JSON Parse the function arguments to ensure robust to ordering.
-    let args: serde_json::Value = serde_json::from_str(
-        resp.choices
-            .first()
-            .expect("no choices in response")
-            .message
-            .tool_calls
-            .as_ref()
-            .expect("no tool calls in message")
-            .first()
-            .expect("no tool calls")
-            .function
-            .arguments
-            .as_str(),
-    )
-    .expect("failed to parse tool call arguments");
+    let tool_calls = resp
+        .choices
+        .first()
+        .expect("no choices in response")
+        .message
+        .tool_calls
+        .as_ref()
+        .expect("no tool calls in message");
+
+    let first_tool_call = tool_calls.first().expect("no tool calls");
+    let function = match first_tool_call {
+        ChatCompletionMessageToolCalls::Function(f) => &f.function,
+        ChatCompletionMessageToolCalls::Custom(_) => panic!("unexpected custom tool call"),
+    };
+
+    let args: serde_json::Value = serde_json::from_str(function.arguments.as_str())
+        .expect("failed to parse tool call arguments");
 
     insta::assert_json_snapshot!(format!("tool_use_{model_name}_valid_function_args"), args);
 }

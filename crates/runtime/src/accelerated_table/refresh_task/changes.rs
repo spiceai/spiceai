@@ -239,6 +239,7 @@ impl RefreshTask {
             Box::pin(stream::once(async move { Ok(selected_batch) })),
         ));
 
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
         let insert_plan = self
             .accelerator
             .insert_into(
@@ -249,7 +250,6 @@ impl RefreshTask {
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-
         collect(insert_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)
@@ -286,12 +286,12 @@ impl RefreshTask {
             all_where_exprs.extend(delete_where_exprs);
         }
 
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
         let delete_plan = deletion_provider
             .delete_from(&session_state, &all_where_exprs)
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-
         collect(delete_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)
@@ -451,6 +451,11 @@ enum StreamErrorType {
 /// Returns `true` if the error is transient and the stream can continue normally.
 /// These errors are generally nonfatal and often indicate that the consumer should retry or continue polling.
 fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) -> StreamErrorType {
+    #[cfg(any(feature = "debezium", feature = "kafka"))]
+    if matches!(err, cdc::StreamError::Kafka(KafkaError::EmptyBatch)) {
+        return StreamErrorType::Transient;
+    }
+
     #[cfg(any(feature = "debezium", feature = "kafka"))]
     if let cdc::StreamError::Kafka(KafkaError::UnableToReceiveMessage { source }) = err {
         match source {

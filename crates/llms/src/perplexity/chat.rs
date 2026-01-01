@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
     },
 };
@@ -37,7 +37,7 @@ impl Chat for PerplexitySonar {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let resp = self.search_stream(PerplexityRequest::from(req)).await;
+        let resp = self.search_stream(PerplexityRequest::from(req)).await?;
 
         Ok(Box::pin(resp.map_ok(|c| c.response)))
     }

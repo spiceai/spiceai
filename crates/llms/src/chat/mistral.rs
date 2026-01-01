@@ -20,13 +20,13 @@ use crate::streaming_utils::create_stream_response_with_timestamp;
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
         ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionToolChoiceOption,
-        ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role, Stop,
+        ChatCompletionStreamResponseDelta, ChatCompletionToolChoiceOption, ChatCompletionTools,
+        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
+        FunctionCallStream, FunctionType, Role, StopConfiguration, ToolChoiceOptions,
     },
 };
 use async_stream::stream;
@@ -64,8 +64,10 @@ pub struct MistralLlama {
 fn to_openai_response(
     resp: &ChatCompletionResponse,
 ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-    let resp_str = serde_json::to_string(resp)?;
-    serde_json::from_str(&resp_str).map_err(OpenAIError::from)
+    let resp_str = serde_json::to_string(resp)
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to serialize response: {e}")))?;
+    serde_json::from_str(&resp_str)
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to deserialize response: {e}")))
 }
 
 impl MistralLlama {
@@ -441,8 +443,8 @@ impl MistralLlama {
             frequency_penalty: req.frequency_penalty,
             presence_penalty: req.presence_penalty,
             stop_toks: req.stop.map(|s| match s {
-                Stop::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
-                Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
+                StopConfiguration::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
+                StopConfiguration::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
             max_len: req.max_completion_tokens.map(|x| x as usize),
             logits_bias: None,
@@ -683,7 +685,7 @@ fn stream_from_response(
 }
 
 /// Convert a [`CompletionChunkResponse`] to a [`CreateChatCompletionStreamResponse`].
-#[expect(clippy::cast_possible_truncation)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 fn chunk_to_openai_stream(
     c: ChatCompletionChunkResponse,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
@@ -719,13 +721,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
         ..
     } = choice;
     let role: Role = serde_json::from_str(&format!("\"{}\"", delta.role))
-        .map_err(OpenAIError::JSONDeserialize)?;
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to parse role: {e}")))?;
 
     let finish_reason: Option<FinishReason> = finish_reason
         .as_ref()
         .map(|f| serde_json::from_str(&format!("\"{f}\"")))
         .transpose()
-        .map_err(OpenAIError::JSONDeserialize)?;
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to parse finish_reason: {e}")))?;
 
     Ok(ChatChoiceStream {
         index: *index as u32,
@@ -747,12 +749,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
 
 fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> ToolChoice {
     match x {
-        ChatCompletionToolChoiceOption::None => ToolChoice::None,
-        ChatCompletionToolChoiceOption::Auto => ToolChoice::Auto,
-        ChatCompletionToolChoiceOption::Required => {
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => ToolChoice::Auto,
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => {
             unimplemented!("`mistral_rs::core` does not yet have `ToolChoice::Required`")
         }
-        ChatCompletionToolChoiceOption::Named(t) => ToolChoice::Tool(convert_named_tool(t)),
+        ChatCompletionToolChoiceOption::Function(t) => ToolChoice::Tool(convert_named_tool(t)),
+        // None, AllowedTools, or Custom not supported
+        _ => ToolChoice::None,
     }
 }
 
@@ -769,17 +772,27 @@ fn convert_named_tool(x: &ChatCompletionNamedToolChoice) -> Tool {
     }
 }
 
-fn convert_tool(x: &ChatCompletionTool) -> Tool {
-    Tool {
-        tp: ToolType::Function,
-        function: Function {
-            description: x.function.description.clone(),
-            name: x.function.name.clone(),
-            parameters: x
-                .function
-                .parameters
-                .clone()
-                .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
+fn convert_tool(x: &ChatCompletionTools) -> Tool {
+    match x {
+        ChatCompletionTools::Function(tool) => Tool {
+            tp: ToolType::Function,
+            function: Function {
+                description: tool.function.description.clone(),
+                name: tool.function.name.clone(),
+                parameters: tool
+                    .function
+                    .parameters
+                    .clone()
+                    .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
+            },
+        },
+        ChatCompletionTools::Custom(_) => Tool {
+            tp: ToolType::Function,
+            function: Function {
+                description: None,
+                name: String::new(),
+                parameters: None,
+            },
         },
     }
 }
@@ -791,7 +804,7 @@ fn parse_tool_call_response(
     ChatCompletionMessageToolCallChunk {
         id: Some(r.id.clone()),
         index,
-        r#type: Some(ChatCompletionToolType::Function),
+        r#type: Some(FunctionType::Function),
         function: Some(FunctionCallStream {
             name: Some(r.function.name.clone()),
             arguments: Some(r.function.arguments.clone()),

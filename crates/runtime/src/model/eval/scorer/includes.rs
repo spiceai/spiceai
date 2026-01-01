@@ -71,7 +71,9 @@ mod tests {
     use super::Includes;
     use super::Scorer;
     use super::{DatasetInput, DatasetOutput};
-    use async_openai::types::{ChatChoice, ChatCompletionResponseMessage, FinishReason, Role};
+    use async_openai::types::chat::{
+        ChatChoice, ChatCompletionResponseMessage, FinishReason, Role,
+    };
     use paste::paste;
 
     /// Macro to define test cases for Includes scorer with `AssistantResponse` variant.
@@ -110,6 +112,7 @@ mod tests {
                                 function_call: None,
                                 tool_calls: None,
                                 refusal: None,
+                                annotations: None,
                                 audio: None,
                             },
                             finish_reason: Some(FinishReason::Stop),
@@ -126,6 +129,7 @@ mod tests {
                                 role: Role::Assistant,
                                 function_call: None,
                                 tool_calls: None,
+                                annotations: None,
                                 refusal: None,
                                 audio: None,
                             },

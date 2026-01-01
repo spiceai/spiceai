@@ -105,7 +105,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             .with_disable_caching(args.disable_caching)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))
             .with_http_client(args.http_clients),
-    )?;
+    )
+    .await?;
 
     let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)

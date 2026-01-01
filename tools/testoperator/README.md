@@ -297,6 +297,27 @@ Running search tests with the testoperator is still experimental, and uses stati
 
 `testoperator run search [OPTIONS]`
 
+### Running Text-to-SQL tests
+
+Running text to sql tests with the testoperator is still experimental.
+
+```bash
+testoperator run text-to-sql [OPTIONS]
+```
+Where options are:
+- `--model <MODEL NAME>`: The language model (named in spicepod) to perform text-to-sql.
+- `--queryset-file <FILE_PATH>`: File path to a JSONL of test questions and expected SQL (see `--queryset` for format). Cannot be used in conjunction with `--queryset`
+- `--queryset`: inline JSON array of test questions and expected SQL. Example:
+  ```bash
+    testoperator run text-to-sql --queryset '[ 
+      {"question": "how many sales have I made", "sql": "select count(1) from sales"},
+      {"question": "Who has the most sales?", "sql": "select sold_by from sales group by sold_by order by count(1) desc limit 1"}
+    ]'
+    --model foo
+  ```
+- `--sample-data-enabled`: Whether to use the `sample_data_enabled` HTTP parameter in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `sample_data_enabled`.
+- `--return-sql`: Whether to use the `Accept: application/sql` HTTP header in the `v1/nsql` endpoint. Options: true, false, both. When both, runs `queryset` for both options for `Accept`. 
+
 ### Running Append Tests
 
 Append tests with the testoperator are similar to load tests, but operate with a changing data source over time to test the behavior of append-mode acceleration. Append tests support the same options as load tests. Append test sources are only supported for the file connector, but are supported for any `tpch`, `tpcds` or `clickbench` source.

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::component::metrics::MetricsProvider;
@@ -38,8 +39,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use std::time::Duration;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -67,6 +67,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct Debezium {
     kafka_config: KafkaConfig,
+    batching: (usize, Duration),
 }
 
 impl Debezium {
@@ -150,7 +151,24 @@ impl Debezium {
             metrics_store: Some(Arc::new(KafkaMetrics::new())),
         };
 
-        Ok(Self { kafka_config })
+        let batch_max_size = params
+            .get("batch_max_size")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10000);
+
+        let batch_max_duration = params
+            .get("batch_max_duration")
+            .expose()
+            .ok()
+            .and_then(|v| fundu::parse_duration(v).ok())
+            .unwrap_or(Duration::from_secs(1));
+
+        Ok(Self {
+            kafka_config,
+            batching: (batch_max_size, batch_max_duration),
+        })
     }
 }
 
@@ -206,6 +224,12 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'."),
     ParameterSpec::runtime("kafka_consumer_group_id")
         .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated."),
+    ParameterSpec::runtime("batch_max_size")
+        .description("Maximum number of change events to batch together before processing")
+        .default("10000"),
+    ParameterSpec::runtime("batch_max_duration")
+        .description("Maximum time to wait for a batch to fill before processing")
+        .default("1s"),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -289,6 +313,20 @@ impl DataConnector for Debezium {
         let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
         {
             Some(metadata) => {
+                if let Some(config_consumer_group_id) = &self.kafka_config.consumer_group_id {
+                    ensure!(
+                        config_consumer_group_id == &metadata.consumer_group_id,
+                        super::InvalidConfigurationNoSourceSnafu {
+                            dataconnector: "debezium",
+                            message: format!(
+                                "Locally accelerated data belongs to a different Kafka consumer group (was '{}', now '{config_consumer_group_id}'). Remove the acceleration file or rename the dataset to proceed.",
+                                metadata.consumer_group_id
+                            ),
+                            connector_component: ConnectorComponent::from(dataset),
+                        }
+                    );
+                }
+
                 let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
                     &metadata.consumer_group_id,
                     &self.kafka_config,
@@ -350,6 +388,7 @@ impl DataConnector for Debezium {
             refresh_schema,
             metadata.primary_keys,
             kafka_consumer,
+            self.batching,
         ));
 
         Ok(debezium_kafka)

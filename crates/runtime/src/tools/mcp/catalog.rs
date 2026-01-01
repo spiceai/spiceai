@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::{ChatCompletionTool, ChatCompletionToolType, FunctionObject};
+use async_openai::types::chat::{ChatCompletionTool, FunctionObject};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::{
@@ -357,6 +357,9 @@ impl SpiceToolCatalog for McpToolCatalog {
     fn name(&self) -> &str {
         self.name.as_str()
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         let tools = self.list_tools().await.unwrap_or_default();
         tools
@@ -376,7 +379,6 @@ impl SpiceToolCatalog for McpToolCatalog {
         tools
             .into_iter()
             .map(|t| ChatCompletionTool {
-                r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
                     strict: None,
                     name: t.name.to_string(),

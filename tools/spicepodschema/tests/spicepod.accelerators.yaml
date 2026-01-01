@@ -1,0 +1,138 @@
+# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
+#
+# Test file for Data Accelerators (Acceleration Engines)
+# Tests different acceleration engines with their runtime parameters
+#
+version: v1
+kind: Spicepod
+name: schema-test-accelerators
+
+datasets:
+  # ===========================================================================
+  # Arrow Accelerator
+  # Runtime params: file_watcher
+  # ===========================================================================
+  - name: accel_arrow
+    from: postgres:public.small_table
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: testdb
+      pg_user: postgres
+      pg_pass: secret
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: full
+      params:
+        file_watcher: "true"
+
+  # ===========================================================================
+  # DuckDB Accelerator
+  # Runtime params: file_watcher, partition_mode, connection_pool_size,
+  #                 on_refresh_recompute_statistics, partitioned_write_buffer,
+  #                 optimizer_duckdb_aggregate_pushdown
+  # ===========================================================================
+  - name: accel_duckdb
+    from: postgres:public.medium_table
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: testdb
+      pg_user: postgres
+      pg_pass: secret
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: full
+      params:
+        duckdb_file: ./data/accel.duckdb
+        file_watcher: "true"
+        partition_mode: auto
+        connection_pool_size: "5"
+        on_refresh_recompute_statistics: "true"
+        partitioned_write_buffer: "1000"
+        optimizer_duckdb_aggregate_pushdown: "true"
+
+  # DuckDB in memory mode
+  - name: accel_duckdb_memory
+    from: postgres:public.small_table_2
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: testdb
+      pg_user: postgres
+      pg_pass: secret
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: memory
+      refresh_mode: full
+
+  # ===========================================================================
+  # SQLite Accelerator
+  # Runtime params: busy_timeout, file_watcher
+  # ===========================================================================
+  - name: accel_sqlite
+    from: postgres:public.another_table
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: testdb
+      pg_user: postgres
+      pg_pass: secret
+    acceleration:
+      enabled: true
+      engine: sqlite
+      mode: file
+      refresh_mode: full
+      params:
+        sqlite_file: ./data/accel.sqlite
+        busy_timeout: "5000"
+        file_watcher: "true"
+
+  # ===========================================================================
+  # PostgreSQL Accelerator
+  # Runtime params: file_watcher, connection_pool_size
+  # ===========================================================================
+  - name: accel_postgres
+    from: duckdb:source.parquet
+    params:
+      duckdb_open: data/source.db
+    acceleration:
+      enabled: true
+      engine: postgres
+      refresh_mode: full
+      params:
+        pg_host: localhost
+        pg_port: "5432"
+        pg_db: accel_db
+        pg_user: postgres
+        pg_pass: secret
+        pg_connection_pool_min_idle: "2"
+        file_watcher: "false"
+        connection_pool_size: "15"
+
+  # ===========================================================================
+  # Cayenne Accelerator (if enabled)
+  # Runtime params: file_watcher
+  # ===========================================================================
+  - name: accel_cayenne
+    from: postgres:public.large_table
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: testdb
+      pg_user: postgres
+      pg_pass: secret
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      params:
+        cayenne_file_path: ./data/accel.cayenne
+        cayenne_metastore: sqlite
+        file_watcher: "true"
+        cayenne_footer_cache_mb: "256"

@@ -15,24 +15,25 @@ limitations under the License.
 */
 #![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
 #![allow(clippy::missing_errors_doc)]
-use std::pin::Pin;
 use std::time::SystemTime;
 
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use async_openai::error::{ApiError, OpenAIError};
-use async_openai::types::{
-    ChatChoice, ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
-    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage,
-    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
-    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
-    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionToolChoiceOption,
-    ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionResponse, FinishReason, FunctionCall, FunctionName, Role, Stop,
+use async_openai::traits::RequestOptionsBuilder;
+use async_openai::types::chat::{
+    ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+    ChatCompletionNamedToolChoice, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
+    ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
+    ChatCompletionResponseStream, ChatCompletionToolChoiceOption, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, FunctionCall,
+    FunctionName, Role, StopConfiguration, ToolChoiceOptions,
 };
 use serde_json::json;
 
@@ -41,10 +42,10 @@ use super::types::{
     AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
     MessageParam, MessageRole, MetadataParam, ResponseContentBlock, StopReason, TextBlockParam,
     ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam, default_max_tokens,
+    tool_from_completion_tools,
 };
-use super::types_stream::{AnthropicStreamError, MessageCreateStreamResponse, transform_stream};
+use super::types_stream::transform_stream;
 use async_trait::async_trait;
-use futures::Stream;
 
 #[async_trait]
 impl Chat for Anthropic {
@@ -59,11 +60,12 @@ impl Chat for Anthropic {
         let mut anth_req = MessageCreateParams::try_from((self.model.clone(), req))?;
         anth_req.stream = Some(true);
 
-        let stream: Pin<
-            Box<
-                dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send,
-            >,
-        > = self.client.post_stream("/messages", anth_req).await;
+        let stream = self
+            .client
+            .chat()
+            .path("/messages")?
+            .create_stream_byot(anth_req)
+            .await?;
 
         Ok(transform_stream(stream))
     }
@@ -74,7 +76,13 @@ impl Chat for Anthropic {
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let anth_req = MessageCreateParams::try_from((self.model.clone(), req))?;
 
-        let inner_resp: MessageCreateResponse = self.client.post("/messages", anth_req).await?;
+        let inner_resp: MessageCreateResponse = self
+            .client
+            .chat()
+            .path("/messages")
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
+            .create_byot(anth_req)
+            .await?;
 
         CreateChatCompletionResponse::try_from(inner_resp)
     }
@@ -133,7 +141,7 @@ fn create_completion_message(
     let mut content = String::new();
 
     // Convert tool calls and add message text to `content`
-    let tool_calls: Vec<ChatCompletionMessageToolCall> = blocks
+    let tool_calls: Vec<ChatCompletionMessageToolCalls> = blocks
         .iter()
         .filter_map(|b| match b {
             ResponseContentBlock::ToolUse(t) => {
@@ -147,14 +155,15 @@ fn create_completion_message(
                         .into()));
                     }
                 };
-                Some(Ok(ChatCompletionMessageToolCall {
-                    id: t.id.clone(),
-                    r#type: ChatCompletionToolType::Function,
-                    function: FunctionCall {
-                        name: t.name.clone(),
-                        arguments,
+                Some(Ok(ChatCompletionMessageToolCalls::Function(
+                    ChatCompletionMessageToolCall {
+                        id: t.id.clone(),
+                        function: FunctionCall {
+                            name: t.name.clone(),
+                            arguments,
+                        },
                     },
-                }))
+                )))
             }
             ResponseContentBlock::Text(TextBlockParam { text, .. }) => {
                 content.push_str(text);
@@ -166,6 +175,7 @@ fn create_completion_message(
     Ok(ChatCompletionResponseMessage {
         tool_calls: Some(tool_calls),
         refusal: None,
+        annotations: None,
         function_call: None,
         audio: None,
         role: match role {
@@ -236,6 +246,9 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
                         ChatCompletionRequestUserMessageContentPart::InputAudio(_) => Err(
                             OpenAIError::InvalidArgument("Input Audio not supported".to_string()),
                         ),
+                        ChatCompletionRequestUserMessageContentPart::File(_) => Err(
+                            OpenAIError::InvalidArgument("File content not supported".to_string()),
+                        ),
                     })
                     .collect::<Result<Vec<_>, OpenAIError>>()?;
 
@@ -278,32 +291,47 @@ fn assistant_messages_to_content_blocks(
     let tool_blocks = match tool_calls {
         Some(calls) => calls
             .iter()
-            .map(|call| {
-                let input = if call.function.arguments.is_empty() {
-                    Ok(json!(
-                        {
-                            "$schema": "http://json-schema.org/draft-07/schema#",
-                            "properties": {},
-                            "required": [],
-                            "title": "",
-                            "type": "object"
-                        }
-                    ))
-                } else {
-                    serde_json::from_str(&call.function.arguments)
-                };
-                Ok(ContentBlock::ToolUse(ToolUseBlockParam::new(
-                    call.id.clone(),
-                    input.map_err(|e| {
-                        OpenAIError::ApiError(ApiError {
-                            message: e.to_string(),
-                            r#type: Some("AnthropicConversionError".to_string()),
-                            param: None,
-                            code: None,
-                        })
-                    })?,
-                    call.function.name.clone(),
-                )))
+            .filter_map(|tool_call_enum| {
+                // Extract the function call from the enum wrapper
+                match tool_call_enum {
+                    ChatCompletionMessageToolCalls::Function(call) => {
+                        let input = if call.function.arguments.is_empty() {
+                            Ok(json!(
+                                {
+                                    "$schema": "http://json-schema.org/draft-07/schema#",
+                                    "properties": {},
+                                    "required": [],
+                                    "title": "",
+                                    "type": "object"
+                                }
+                            ))
+                        } else {
+                            serde_json::from_str(&call.function.arguments)
+                        };
+                        Some(
+                            input
+                                .map(|i| {
+                                    ContentBlock::ToolUse(ToolUseBlockParam::new(
+                                        call.id.clone(),
+                                        i,
+                                        call.function.name.clone(),
+                                    ))
+                                })
+                                .map_err(|e| {
+                                    OpenAIError::ApiError(ApiError {
+                                        message: e.to_string(),
+                                        r#type: Some("AnthropicConversionError".to_string()),
+                                        param: None,
+                                        code: None,
+                                    })
+                                }),
+                        )
+                    }
+                    ChatCompletionMessageToolCalls::Custom(_) => {
+                        // Custom tool calls are not supported for Anthropic
+                        None
+                    }
+                }
             })
             .collect::<Result<_, OpenAIError>>()?,
         None => vec![],
@@ -337,35 +365,45 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
             stream: value.stream,
             metadata: value
                 .metadata
-                .and_then(|m| m.get("user_id").cloned())
+                .and_then(|m| {
+                    // Metadata is a newtype around serde_json::Value - access it as a JSON object
+                    serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
+                        serde_json::to_value(&m).ok()?,
+                    )
+                    .ok()
+                    .and_then(|obj| obj.get("user_id").cloned())
+                })
                 .map(|id| MetadataParam {
                     user_id: id.as_str().map(String::from),
                 }),
             model,
             stop_sequences: value.stop.map(|s| match s {
-                Stop::String(s) => vec![s],
-                Stop::StringArray(a) => a,
+                StopConfiguration::String(s) => vec![s],
+                StopConfiguration::StringArray(a) => a,
             }),
             system: system_message_from_messages(&value.messages),
             messages,
 
             tool_choice: match value.tool_choice {
-                Some(ChatCompletionToolChoiceOption::Auto) => Some(ToolChoiceParam::auto(
-                    !value.parallel_tool_calls.unwrap_or_default(),
-                )),
-                None | Some(ChatCompletionToolChoiceOption::None) => None,
-                Some(ChatCompletionToolChoiceOption::Required) => Some(ToolChoiceParam::any(
-                    !value.parallel_tool_calls.unwrap_or_default(),
-                )),
-                Some(ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
+                Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)) => Some(
+                    ToolChoiceParam::auto(!value.parallel_tool_calls.unwrap_or_default()),
+                ),
+                Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required)) => Some(
+                    ToolChoiceParam::any(!value.parallel_tool_calls.unwrap_or_default()),
+                ),
+                Some(ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
                     function: FunctionName { name },
                     ..
                 })) => Some(ToolChoiceParam::tool(
                     name,
                     !value.parallel_tool_calls.unwrap_or_default(),
                 )),
+                // AllowedTools or Custom not supported, None and ToolChoiceOptions::None both map to None
+                _ => None,
             },
-            tools: value.tools.map(|t| t.iter().map(Into::into).collect()),
+            tools: value
+                .tools
+                .map(|t| t.iter().filter_map(tool_from_completion_tools).collect()),
         })
     }
 }

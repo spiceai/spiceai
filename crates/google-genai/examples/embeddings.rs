@@ -38,9 +38,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Generating embeddings for {} texts...\n", texts.len());
 
     for (i, text) in texts.iter().enumerate() {
-        let request = EmbedContentRequest::new(Content::user(*text))
-            .with_output_dimensionality(768)
-            .with_task_type(TaskType::RetrievalQuery);
+        let request = EmbedContentRequest::new(
+            "models/text-embedding-004".to_string(),
+            Content::user(*text),
+        )
+        .with_output_dimensionality(768)
+        .with_task_type(TaskType::RetrievalQuery);
 
         let response = client.embed_content("text-embedding-004", request).await?;
 

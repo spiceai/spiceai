@@ -544,7 +544,6 @@ impl TableProvider for SearchQueryProvider {
                     .map(|f| ident(f.name().clone())),
             )?
             .build()?;
-
         state.create_physical_plan(&final_plan).await
     }
 }

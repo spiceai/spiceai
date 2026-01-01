@@ -46,9 +46,8 @@ pub mod error_code;
 mod metrics;
 mod tracker;
 
-#[cfg(feature = "cluster")]
 use {
-    crate::config::ClusterMode,
+    crate::config::ClusterRole,
     crate::datafusion::builder::default_extension_planners,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
@@ -60,14 +59,12 @@ use {
 use datafusion::execution::SessionState;
 
 use async_stream::stream;
-#[cfg(feature = "cluster")]
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
-#[cfg(feature = "cluster")]
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
@@ -75,7 +72,6 @@ use crate::datafusion::{
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
-#[cfg(feature = "cluster")]
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
@@ -162,47 +158,34 @@ macro_rules! handle_error {
 }
 
 impl Query {
-    #[cfg(not(feature = "cluster"))]
-    #[expect(clippy::unnecessary_wraps)]
     fn get_session_state(&self) -> Result<SessionState> {
-        Ok(self.df.ctx.state())
-    }
-
-    #[cfg(feature = "cluster")]
-    fn get_session_state(&self) -> Result<SessionState> {
-        if !matches!(self.df.cluster_config.mode(), Some(ClusterMode::Scheduler)) {
+        if !matches!(self.df.cluster_config.role(), Some(ClusterRole::Scheduler)) {
             return Ok(self.df.ctx.state());
         }
 
         let Some(scheduler_url) = self.df.cluster_config.scheduler_url_string() else {
             return Err(Error::UnableToExecuteQuery {
                 source: datafusion::error::DataFusionError::Configuration(
-                    "Scheduler mode requires --cluster-advertise-address".to_string(),
+                    "Scheduler mode requires --node-advertise-address".to_string(),
                 ),
             });
         };
 
-        // TLS is always required for cluster mode
-        let client_tls_config = self
-            .df
-            .cluster_config
-            .client_tls_config()
-            .cloned()
-            .ok_or_else(|| Error::UnableToExecuteQuery {
-                source: datafusion::error::DataFusionError::Configuration(
-                    "Cluster mode requires mTLS configuration".to_string(),
-                ),
-            })?;
+        let client_tls_config = self.df.cluster_config.client_tls_config().cloned();
+        let tls_enabled = client_tls_config.is_some();
 
-        let cfg = self
+        let mut cfg = self
             .df
             .ctx
             .copied_config()
             .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec())
-            .with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
-                ep.tls_config(client_tls_config.clone()).boxed()
-            }))
-            .with_ballista_use_tls(true);
+            .with_ballista_use_tls(tls_enabled);
+
+        if let Some(tls_config) = client_tls_config {
+            cfg = cfg.with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
+                ep.tls_config(tls_config.clone()).boxed()
+            }));
+        }
 
         let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
             BallistaQueryPlanner::with_local_planner(
@@ -222,7 +205,6 @@ impl Query {
             .map_err(|e| Error::UnableToExecuteQuery { source: e })
     }
 
-    #[cfg(feature = "cluster")]
     fn should_distribute_plan(plan: &LogicalPlan) -> datafusion::common::Result<bool> {
         let mut should_distribute = true;
 
@@ -443,12 +425,8 @@ impl Query {
             });
 
             // Special handling in cluster mode - execute DescribeTable and runtime.* queries locally
-            #[cfg(feature = "cluster")]
             let should_distribute =
                 Self::should_distribute_plan(&plan).context(UnableToExecuteQuerySnafu)?;
-
-            #[cfg(not(feature = "cluster"))]
-            let should_distribute = false;
 
             let session_for_execution = if should_distribute {
                 session

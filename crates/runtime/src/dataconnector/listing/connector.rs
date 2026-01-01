@@ -40,8 +40,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use datafusion::physical_plan::empty::EmptyExec;
-#[cfg(feature = "vortex")]
-use datafusion_datasource::file_format::FileFormatFactory;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::{PartitionedFile, metadata::MetadataColumn};
@@ -49,8 +47,10 @@ use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
 use url::Url;
-#[cfg(feature = "vortex")]
-use vortex_datafusion::VortexFormatFactory;
+#[cfg(not(windows))]
+use {
+    datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
+};
 
 use crate::Runtime;
 use crate::accelerated_table::AcceleratedTable;
@@ -211,6 +211,13 @@ impl TableProvider for LocationPruningListingTable {
         let Some(locations) = extract_location_predicates(filters) else {
             return self.inner.scan(state, projection, filters, limit).await;
         };
+
+        // Ensure the query runtime uses the same object store configuration (endpoint/region)
+        // as the listing table, even when we bypass listing.
+        state.runtime_env().register_object_store(
+            self.object_store_url().as_ref(),
+            Arc::clone(&self.object_store),
+        );
 
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
 
@@ -541,7 +548,7 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
             )),
-            #[cfg(feature = "vortex")]
+            #[cfg(not(windows))]
             (Some("vortex"), _) | (None, Some("vortex")) => Ok((
                 Some(VortexFormatFactory::new().default()),
                 extension.unwrap_or(".vortex".to_string()),

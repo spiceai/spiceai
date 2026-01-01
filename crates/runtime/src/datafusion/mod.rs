@@ -45,7 +45,6 @@ use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
 
-#[cfg(feature = "cluster")]
 use {
     crate::cluster::ResolvedClusterConfig,
     ballista_executor::executor::Executor,
@@ -243,11 +242,9 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableExecutorHandle {},
 
@@ -270,7 +267,7 @@ pub enum Error {
     AppendRequiresTimeColumn { from: String },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name} ({connector}): `refresh_mode: caching` is only supported with the HTTP/HTTPS data connector. See https://spiceai.org/docs/features/data-acceleration/refresh-modes/caching"
+        "Failed to create an accelerated table for dataset {dataset_name} ({connector}): `refresh_mode: caching` is only supported with the HTTP/HTTPS or localpod data connectors. See https://spiceai.org/docs/features/data-acceleration/refresh-modes/caching"
     ))]
     InvalidCachingRefreshMode {
         dataset_name: String,
@@ -361,11 +358,8 @@ pub struct DataFusion {
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 
     pub temp_directory: Option<String>,
-    #[cfg(feature = "cluster")]
     pub cluster_config: Arc<ResolvedClusterConfig>,
-    #[cfg(feature = "cluster")]
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
-    #[cfg(feature = "cluster")]
     pub executor: RwLock<Option<Arc<Executor>>>,
 }
 
@@ -1026,8 +1020,9 @@ impl DataFusion {
             let connector = dataset.source();
             let is_http_connector =
                 connector.eq_ignore_ascii_case("http") || connector.eq_ignore_ascii_case("https");
+            let is_localpod_connector = connector.eq_ignore_ascii_case(LOCALPOD_DATACONNECTOR);
             ensure!(
-                is_http_connector,
+                is_http_connector || is_localpod_connector,
                 InvalidCachingRefreshModeSnafu {
                     dataset_name: dataset.name.to_string(),
                     connector: connector.to_string(),
@@ -1211,6 +1206,7 @@ impl DataFusion {
                 acceleration_settings.snapshot_behavior.clone(),
                 Some(snapshot_path),
                 acceleration_settings.snapshots_trigger_threshold,
+                acceleration_settings.snapshots_create_interval,
             );
         }
 
@@ -1287,7 +1283,7 @@ impl DataFusion {
     ///
     /// This will not work if:
     /// - The parent table is not an accelerated table.
-    /// - The parent or child acceleration is not configured as `RefreshMode::Full`.
+    /// - The parent and child acceleration modes don't match (both must be Full or both must be Caching).
     ///
     /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
     pub async fn attempt_to_synchronize_accelerated_table(
@@ -1941,7 +1937,6 @@ impl DataFusion {
         }
     }
 
-    #[cfg(feature = "cluster")]
     pub fn bind_scheduler_server(
         &self,
         server: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
@@ -1954,7 +1949,6 @@ impl DataFusion {
         Ok(())
     }
 
-    #[cfg(feature = "cluster")]
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
         let mut executor_handle = self
             .executor

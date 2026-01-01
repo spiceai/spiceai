@@ -33,6 +33,8 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
     ScalarAttributeType,
 };
+use serde_json::json;
+use spicepod::semantic::Column;
 use std::env;
 
 const TABLE_NAME: &str = "spice_integration_test_v2";
@@ -49,6 +51,7 @@ async fn dynamodb_schema() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -90,6 +93,7 @@ async fn dynamodb_scan_no_filter() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -123,6 +127,7 @@ async fn dynamodb_query_no_filter() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -162,6 +167,7 @@ async fn dynamodb_query_with_filter() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -201,6 +207,7 @@ async fn dynamodb_aggregation() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -238,6 +245,7 @@ async fn dynamodb_nulls() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -277,6 +285,7 @@ async fn dynamodb_not_nulls() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -316,6 +325,7 @@ async fn dynamodb_temporal() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -355,6 +365,7 @@ async fn dynamodb_timestamp_filter_pushdown() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -394,6 +405,7 @@ async fn dynamodb_collections() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -433,6 +445,7 @@ async fn dynamodb_timestamp_filter() -> Result<(), anyhow::Error> {
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -471,6 +484,7 @@ async fn dynamodb_nested_projection_no_nested_filter() -> Result<(), anyhow::Err
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -510,6 +524,7 @@ async fn dynamodb_nested_projection_with_nested_filter() -> Result<(), anyhow::E
                 .with_dataset(get_test_dataset(
                     &format!("dynamodb:{TABLE_NAME}"),
                     "test_dynamodb",
+                    None,
                 ))
                 .build();
 
@@ -540,6 +555,93 @@ async fn dynamodb_nested_projection_with_nested_filter() -> Result<(), anyhow::E
         .await
 }
 
+#[tokio::test]
+async fn dynamodb_json_nesting_simple() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let mut metadata = HashMap::new();
+            metadata.insert("json_object".to_string(), json!("*"));
+
+            let mut dataset =
+                get_test_dataset(&format!("dynamodb:{TABLE_NAME}"), "test_dynamodb", None);
+            dataset.columns = vec![
+                Column::new("id"),
+                Column::new("data_json").with_metadata(metadata),
+            ];
+
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(&rt, r"SELECT * FROM test_dynamodb", "json_nesting_simple")
+                .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn dynamodb_json_nesting_with_unnest() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let mut metadata = HashMap::new();
+            metadata.insert("json_object".to_string(), json!("*"));
+
+            let mut dataset = get_test_dataset(
+                &format!("dynamodb:{TABLE_NAME}"),
+                "test_dynamodb",
+                Some(vec![("unnest_depth".to_string(), "1".to_string())]),
+            );
+            dataset.columns = vec![
+                Column::new("id"),
+                Column::new("CUSTOM_FIELD_NAME").with_metadata(metadata),
+            ];
+
+            let app = AppBuilder::new("dynamodb_federated")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_and_snapshot_query(
+                &rt,
+                r"SELECT * FROM test_dynamodb",
+                "json_nesting_with_unnest",
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
 async fn run_and_snapshot_query(
     rt: &Runtime,
     query: &str,
@@ -564,31 +666,37 @@ async fn run_and_snapshot_query(
     Ok(())
 }
 
-fn get_test_dataset(from: &str, name: &str) -> Dataset {
+fn get_test_dataset(
+    from: &str,
+    name: &str,
+    extra_params: Option<Vec<(String, String)>>,
+) -> Dataset {
+    let mut params: Vec<(String, String)> = vec![
+        (
+            "dynamodb_aws_region".to_string(),
+            "ap-northeast-2".to_string(),
+        ),
+        (
+            "dynamodb_aws_access_key_id".to_string(),
+            "${ env:AWS_DYNAMODB_KEY }".to_string(),
+        ),
+        (
+            "dynamodb_aws_secret_access_key".to_string(),
+            "${ env:AWS_DYNAMODB_SECRET }".to_string(),
+        ),
+        ("unnest_depth".to_string(), "1".to_string()),
+        (
+            "time_format".to_string(),
+            "2006-01-02T15:04:05.000Z07:00".to_string(),
+        ),
+    ];
+
+    if let Some(extra) = extra_params {
+        params.extend(extra);
+    }
+
     let mut dataset = Dataset::new(from, name);
-    dataset.params = Some(Params::from_string_map(
-        vec![
-            (
-                "dynamodb_aws_region".to_string(),
-                "ap-northeast-2".to_string(),
-            ),
-            (
-                "dynamodb_aws_access_key_id".to_string(),
-                "${ env:AWS_DYNAMODB_KEY }".to_string(),
-            ),
-            (
-                "dynamodb_aws_secret_access_key".to_string(),
-                "${ env:AWS_DYNAMODB_SECRET }".to_string(),
-            ),
-            ("unnest_depth".to_string(), "1".to_string()),
-            (
-                "time_format".to_string(),
-                "2006-01-02T15:04:05.000Z07:00".to_string(),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    ));
+    dataset.params = Some(Params::from_string_map(params.into_iter().collect()));
     dataset
 }
 

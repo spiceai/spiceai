@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::{array::StringArray, util::pretty::pretty_format_batches};
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{Client, header::HeaderMap};

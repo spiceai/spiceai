@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::CreateEmbeddingResponse;
+use async_openai::types::embeddings::CreateEmbeddingResponse;
 
 use crate::Sizeable;
 

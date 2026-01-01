@@ -43,7 +43,7 @@ spice datasets
 			return
 		}
 
-		datasets, err := api.GetDatasetsWithStatus(rtcontext)
+		datasets, err := api.GetData[api.Dataset](rtcontext, "/v1/datasets?status=true")
 		if err != nil {
 			slog.Error("listing dataset statuses", "error", err)
 		}
