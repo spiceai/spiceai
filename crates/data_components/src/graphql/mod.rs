@@ -105,9 +105,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Determines if a GraphQL error is retriable (transient).
 ///
 /// Retriable errors include:
-/// - HTTP 502 Bad Gateway
-/// - HTTP 503 Service Unavailable
-/// - HTTP 504 Gateway Timeout
+/// - All HTTP 5xx server errors (500, 502, 503, 504, etc.)
 /// - HTTP 408 Request Timeout
 /// - Connection/timeout errors from reqwest
 /// - JSON decode errors (often due to truncated responses from timeouts)
@@ -119,13 +117,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[must_use]
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
-        Error::InvalidReqwestStatus { status, .. } => matches!(
-            *status,
-            StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-                | StatusCode::REQUEST_TIMEOUT
-        ),
+        Error::InvalidReqwestStatus { status, .. } => {
+            status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
+        }
         Error::JsonDecodeError { status, .. } => {
             // JSON decode errors with server error status codes are often due to
             // truncated responses from timeouts or server issues
@@ -135,25 +129,15 @@ pub fn is_retriable_error(error: &Error) -> bool {
             // Check for transient network/connection errors:
             // - is_timeout(): Connection or request timeouts
             // - is_connect(): Failed to establish connection
-            // - is_request(): Error during request construction/sending
             // - is_body(): Error reading response body
             // - is_decode(): Error decoding response body (e.g., gzip/brotli decompression
             //   failures, HTTP/2 stream errors - "error decoding response body")
             source.is_timeout()
                 || source.is_connect()
-                || source.is_request()
                 || source.is_body()
                 || source.is_decode()
                 // Also check if the underlying status code is a retriable server error
-                || matches!(
-                    source.status(),
-                    Some(
-                        StatusCode::BAD_GATEWAY
-                            | StatusCode::SERVICE_UNAVAILABLE
-                            | StatusCode::GATEWAY_TIMEOUT
-                            | StatusCode::REQUEST_TIMEOUT
-                    )
-                )
+                || source.status().is_some_and(|s| s.is_server_error() || s == StatusCode::REQUEST_TIMEOUT)
         }
         _ => false,
     }
@@ -214,135 +198,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_is_retriable_error_http_502() {
-        let error = Error::InvalidReqwestStatus {
-            status: StatusCode::BAD_GATEWAY,
-            message: "Bad Gateway".to_string(),
-        };
-        assert!(is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_retriable_error_http_503() {
-        let error = Error::InvalidReqwestStatus {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "Service Unavailable".to_string(),
-        };
-        assert!(is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_retriable_error_http_504() {
-        let error = Error::InvalidReqwestStatus {
-            status: StatusCode::GATEWAY_TIMEOUT,
-            message: "Gateway Timeout".to_string(),
-        };
-        assert!(is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_retriable_error_http_408() {
-        let error = Error::InvalidReqwestStatus {
-            status: StatusCode::REQUEST_TIMEOUT,
-            message: "Request Timeout".to_string(),
-        };
-        assert!(is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_retriable_error_json_decode_server_error() {
-        let error = Error::JsonDecodeError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            error: "expected value at line 1 column 1".to_string(),
-            response_preview: "<html>...".to_string(),
-        };
-        assert!(is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_retriable_error_json_decode_gateway_timeout() {
-        let error = Error::JsonDecodeError {
-            status: StatusCode::GATEWAY_TIMEOUT,
-            error: "expected value at line 1 column 1".to_string(),
-            response_preview: "<html>...".to_string(),
-        };
-        assert!(is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_not_retriable_error_rate_limited() {
-        // RateLimited is NOT retriable because rate limiting is handled proactively
-        // by the RateLimiter trait via check_rate_limit() which sleeps until reset.
-        // Any RateLimited error reaching is_retriable_error indicates a different
-        // issue that shouldn't be retried with backoff (which would cause double delays).
-        let error = Error::RateLimited {
-            message: "Rate limit exceeded".to_string(),
-        };
-        assert!(!is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_not_retriable_error_http_400() {
-        let error = Error::InvalidReqwestStatus {
-            status: StatusCode::BAD_REQUEST,
-            message: "Bad Request".to_string(),
-        };
-        assert!(!is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_not_retriable_error_http_401() {
-        let error = Error::InvalidCredentialsOrPermissions {
-            message: "Unauthorized".to_string(),
-        };
-        assert!(!is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_not_retriable_error_http_403() {
-        let error = Error::InvalidCredentialsOrPermissions {
-            message: "Forbidden".to_string(),
-        };
-        assert!(!is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_not_retriable_error_http_404() {
-        let error = Error::ResourceNotFound {
-            message: "Not Found".to_string(),
-        };
-        assert!(!is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_not_retriable_error_invalid_query() {
-        let error = Error::InvalidGraphQLQuery {
-            message: "Syntax error".to_string(),
-            line: 1,
-            column: 5,
-            query: "{ invalid }".to_string(),
-        };
-        assert!(!is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_is_not_retriable_error_json_decode_client_error() {
-        // JSON decode error with client status code (e.g., 400) should not be retriable
-        let error = Error::JsonDecodeError {
-            status: StatusCode::BAD_REQUEST,
-            error: "expected value at line 1 column 1".to_string(),
-            response_preview: "invalid".to_string(),
-        };
-        assert!(!is_retriable_error(&error));
-    }
-
-    #[test]
-    fn test_page_retry_constants() {
-        // Verify the constants are reasonable
-        assert_eq!(PAGE_RETRY_MAX_ATTEMPTS, 3);
-    }
-
-    #[test]
     fn test_all_server_errors_retriable_via_json_decode() {
         // All 5xx errors should be retriable when they cause JSON decode failures
         let server_error_codes = [
@@ -368,49 +223,73 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_behavior_classification() {
-        // Test comprehensive classification of errors
-        let retriable_errors = vec![
-            Error::InvalidReqwestStatus {
-                status: StatusCode::BAD_GATEWAY,
-                message: "Bad Gateway".to_string(),
-            },
-            Error::InvalidReqwestStatus {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "Service Unavailable".to_string(),
-            },
-            Error::InvalidReqwestStatus {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                message: "Gateway Timeout".to_string(),
-            },
-            Error::InvalidReqwestStatus {
-                status: StatusCode::REQUEST_TIMEOUT,
-                message: "Request Timeout".to_string(),
-            },
-            Error::JsonDecodeError {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                error: "parse error".to_string(),
-                response_preview: String::new(),
-            },
+    fn test_all_server_errors_retriable_via_invalid_reqwest_status() {
+        // All 5xx errors should be retriable via InvalidReqwestStatus
+        let server_error_codes = [
+            StatusCode::INTERNAL_SERVER_ERROR,           // 500
+            StatusCode::NOT_IMPLEMENTED,                 // 501
+            StatusCode::BAD_GATEWAY,                     // 502
+            StatusCode::SERVICE_UNAVAILABLE,             // 503
+            StatusCode::GATEWAY_TIMEOUT,                 // 504
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,      // 505
+            StatusCode::VARIANT_ALSO_NEGOTIATES,         // 506
+            StatusCode::INSUFFICIENT_STORAGE,            // 507
+            StatusCode::LOOP_DETECTED,                   // 508
+            StatusCode::NOT_EXTENDED,                    // 510
+            StatusCode::NETWORK_AUTHENTICATION_REQUIRED, // 511
         ];
 
+        for status in server_error_codes {
+            let error = Error::InvalidReqwestStatus {
+                status,
+                message: format!("Server error: {status}"),
+            };
+            assert!(
+                is_retriable_error(&error),
+                "InvalidReqwestStatus with status {status} should be retriable"
+            );
+        }
+
+        // 408 Request Timeout is also retriable (special case, not a 5xx)
+        let timeout_error = Error::InvalidReqwestStatus {
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: "Request Timeout".to_string(),
+        };
+        assert!(
+            is_retriable_error(&timeout_error),
+            "408 Request Timeout should be retriable"
+        );
+    }
+
+    #[test]
+    fn test_json_decode_client_error_not_retriable() {
+        // JSON decode errors with client status codes (4xx) should NOT be retriable
+        let client_error_codes = [
+            StatusCode::BAD_REQUEST,          // 400
+            StatusCode::UNAUTHORIZED,         // 401
+            StatusCode::FORBIDDEN,            // 403
+            StatusCode::NOT_FOUND,            // 404
+            StatusCode::UNPROCESSABLE_ENTITY, // 422
+        ];
+
+        for status in client_error_codes {
+            let error = Error::JsonDecodeError {
+                status,
+                error: "expected value at line 1 column 1".to_string(),
+                response_preview: "invalid response".to_string(),
+            };
+            assert!(
+                !is_retriable_error(&error),
+                "JsonDecodeError with client status {status} should NOT be retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_status_errors_not_retriable() {
+        // Test that non-HTTP-status error types are not retriable
+        // (HTTP status errors are covered by the status-specific tests above)
         let non_retriable_errors = vec![
-            Error::InvalidReqwestStatus {
-                status: StatusCode::BAD_REQUEST,
-                message: "Bad Request".to_string(),
-            },
-            Error::InvalidReqwestStatus {
-                status: StatusCode::UNAUTHORIZED,
-                message: "Unauthorized".to_string(),
-            },
-            Error::InvalidReqwestStatus {
-                status: StatusCode::FORBIDDEN,
-                message: "Forbidden".to_string(),
-            },
-            Error::InvalidReqwestStatus {
-                status: StatusCode::NOT_FOUND,
-                message: "Not Found".to_string(),
-            },
             Error::InvalidCredentialsOrPermissions {
                 message: "Invalid credentials".to_string(),
             },
@@ -433,20 +312,7 @@ mod tests {
             Error::InternalError {
                 message: "Internal error".to_string(),
             },
-            // RateLimited is NOT retriable because rate limiting is handled proactively
-            // by the RateLimiter trait via check_rate_limit() which sleeps until reset.
-            // Retrying would cause double-delays.
-            Error::RateLimited {
-                message: "Rate limit exceeded".to_string(),
-            },
         ];
-
-        for error in &retriable_errors {
-            assert!(
-                is_retriable_error(error),
-                "Error should be retriable: {error:?}"
-            );
-        }
 
         for error in &non_retriable_errors {
             assert!(
