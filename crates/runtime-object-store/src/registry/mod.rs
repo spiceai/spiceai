@@ -35,7 +35,7 @@ use url::{Url, form_urlencoded::parse};
 use crate::store::ftp::FTPObjectStore;
 #[cfg(feature = "nfs")]
 use crate::store::nfs::NFSObjectStore;
-#[cfg(feature = "ftp")]
+#[cfg(feature = "sftp")]
 use crate::store::sftp::SFTPObjectStore;
 #[cfg(feature = "smb")]
 use crate::store::smb::SMBObjectStore;
@@ -224,7 +224,7 @@ impl SpiceObjectStoreRegistry {
         )) as Arc<dyn ObjectStore>)
     }
 
-    #[cfg(feature = "ftp")]
+    #[cfg(feature = "sftp")]
     fn prepare_sftp_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let Some(host) = url.host() else {
             return Err(DataFusionError::Configuration(
@@ -554,7 +554,7 @@ impl SpiceObjectStoreRegistry {
             return Self::prepare_ftp_object_store(url);
         }
 
-        #[cfg(feature = "ftp")]
+        #[cfg(feature = "sftp")]
         if url.as_str().starts_with("sftp://") {
             return Self::prepare_sftp_object_store(url);
         }

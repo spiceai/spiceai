@@ -21,6 +21,8 @@ use reqwest::header::HeaderMap;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
+const GITHUB_RATE_LIMIT_BUFFER: i32 = 100;
+
 #[derive(Debug)]
 pub struct GitHubRateLimiter {
     // Track API response headers rate limits
@@ -149,7 +151,7 @@ impl RateLimiter for GitHubRateLimiter {
                 }
                 RateLimitInfo::Primary(primary) => {
                     // GitHub GraphQL requests consume more than 1 rate-limit unit, so add some buffer to ensure the proper handling
-                    if primary.remaining <= 5 {
+                    if primary.remaining <= GITHUB_RATE_LIMIT_BUFFER {
                         let now = Utc::now();
                         if now < primary.reset_time {
                             let wait_duration = (primary.reset_time - now)
