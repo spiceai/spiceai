@@ -13,17 +13,8 @@ on:
 
   workflow_dispatch:
     inputs:
-      platform_option:
-        description: 'Which platform to build for? (Default is ALL)'
-        required: false
-        type: choice
-        options:
-          - 'all'
-          - 'Linux x64'
-          - 'Linux aarch64'
-        default: 'all'
       publish:
-        description: 'Publish multi-arch manifest to GHCR'
+        description: 'Publish Docker image to GHCR'
         required: false
         type: boolean
         default: false
@@ -32,59 +23,13 @@ permissions:
   contents: read
   packages: write
 jobs:
-  setup-matrix:
-    name: Setup strategy matrix
-    runs-on: spiceai-dev-runners
-    outputs:
-      matrix: ${{ steps.setup-matrix.outputs.result }}
-
-    steps:
-      - name: Set up matrix
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        id: setup-matrix
-        with:
-          script: |
-            const isManualDispatch = context.eventName === 'workflow_dispatch';
-
-            const matrix = [
-              {
-                name: "Linux x64",
-                runner: "spiceai-dev-runners",
-                target_os: "linux",
-                target_arch: "x86_64",
-                docker_platform: "linux/amd64",
-              },
-              {
-                name: "Linux aarch64",
-                runner: "hosted-linux-arm-runner",
-                target_os: "linux",
-                target_arch: "aarch64",
-                docker_platform: "linux/arm64",
-              }
-            ];
-
-            if (isManualDispatch) {
-              const platform_option = context.payload.inputs.platform_option;
-              if (platform_option === 'all') {
-                return matrix;
-              }
-              return matrix.filter(m => m.name === platform_option);
-            }
-
-            return matrix;
-
   build-binary:
-    name: Build ${{ matrix.target.name }} testoperator
-    runs-on: ${{ matrix.target.runner }}
-    needs: setup-matrix
+    name: Build testoperator
+    runs-on: spiceai-dev-runners
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true
-
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -104,13 +49,9 @@ jobs:
         run: ./target/release/testoperator --version
 
   build-docker:
-    name: Build ${{ matrix.target.name }} Docker image
-    needs: [setup-matrix, build-binary]
+    name: Build Docker image
+    needs: build-binary
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -118,7 +59,7 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
-          name: testoperator-${{ matrix.target.target_os }}
+          name: testoperator-linux
           path: ./build
 
       - name: List artifacts
@@ -137,43 +78,15 @@ jobs:
       - name: Copy Dockerfile to build context
         run: cp tools/testoperator/Dockerfile ./build/Dockerfile
 
-      - name: Build and push image
+      - name: Build image
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: ./build
           file: ./build/Dockerfile
-          platforms: ${{ matrix.target.docker_platform }}
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }}-${{ matrix.target.target_arch }}
-          cache-from: type=gha,scope=testoperator-${{ matrix.target.target_arch }}
-          cache-to: type=gha,scope=testoperator-${{ matrix.target.target_arch }},mode=max
-
-  publish-manifest:
-    name: Publish multi-arch manifest
-    needs: [setup-matrix, build-docker]
-    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create and push manifest
-        run: |
-          # Build list of images from the matrix
-          IMAGES=""
-          for arch in $(echo '${{ needs.setup-matrix.outputs.matrix }}' | jq -r '.[].target_arch'); do
-            IMAGES="$IMAGES ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }}-${arch}"
-          done
-          
-          docker buildx imagetools create \
-            -t ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }} \
-            -t ghcr.io/${{ github.repository_owner }}/testoperator:latest \
-            $IMAGES
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/testoperator:latest
+          cache-from: type=gha,scope=testoperator
+          cache-to: type=gha,scope=testoperator,mode=max
