@@ -462,18 +462,8 @@ pub async fn start(
     }
 
     let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
-
-    let decoding_message_size = app
-        .as_ref()
-        .and_then(|a| a.runtime.flight.clone())
-        .and_then(|f| f.max_message_size_bytes().transpose())
-        .transpose()
-        .map_err(|e| Error::InsecureConfiguration {
-            message: format!(
-                "Failed to parse spicepod value 'runtime.flight.max_message_size': {e}"
-            ),
-        })?
-        .unwrap_or(flight_client::MAX_DECODING_MESSAGE_SIZE);
+    let spice_flight_service = FlightServiceServer::new(service)
+        .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
 
     let spice_flight_service =
         FlightServiceServer::new(service).max_decoding_message_size(decoding_message_size);
