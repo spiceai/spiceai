@@ -131,14 +131,19 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Copy Dockerfile to build context
+        run: cp tools/testoperator/Dockerfile ./build/Dockerfile
+
       - name: Build and push image
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: ./build
-          file: tools/testoperator/Dockerfile
+          file: ./build/Dockerfile
           platforms: ${{ matrix.target.docker_platform }}
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }}-${{ matrix.target.target_arch }}
+          cache-from: type=gha,scope=testoperator-${{ matrix.target.target_arch }}
+          cache-to: type=gha,scope=testoperator-${{ matrix.target.target_arch }},mode=max
 
   publish-manifest:
     name: Publish multi-arch manifest
@@ -159,8 +164,13 @@ jobs:
 
       - name: Create and push manifest
         run: |
+          # Build list of images from the matrix
+          IMAGES=""
+          for arch in $(echo '${{ needs.setup-matrix.outputs.matrix }}' | jq -r '.[].target_arch'); do
+            IMAGES="$IMAGES ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }}-${arch}"
+          done
+          
           docker buildx imagetools create \
             -t ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }} \
             -t ghcr.io/${{ github.repository_owner }}/testoperator:latest \
-            ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }}-x86_64 \
-            ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }}-aarch64
+            $IMAGES
