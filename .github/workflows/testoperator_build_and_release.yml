@@ -28,6 +28,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  packages: write
 jobs:
   setup-matrix:
     name: Setup strategy matrix
