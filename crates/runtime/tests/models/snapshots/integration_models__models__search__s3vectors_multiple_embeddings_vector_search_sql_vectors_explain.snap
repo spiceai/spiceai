@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/search.rs
 description: "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;"
+snapshot_kind: text
 ---
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                                                                                              |
@@ -20,7 +21,7 @@ description: "SELECT id, answer, array_length(answer_embedding), trunc(score, 3)
 |               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                                                            |
 |               |                     BytesProcessedExec                                                                                                                                                                                                                            |
 |               |                       CooperativeExec                                                                                                                                                                                                                             |
-|               |                         S3VectorsQueryExec: limit=100                                                                                                                                                                                                             |
+|               |                         S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                                                                                                                                              |
 |               |             SchemaCastScanExec                                                                                                                                                                                                                                    |
 |               |               BytesProcessedExec                                                                                                                                                                                                                                  |
 |               |                 DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                                                                                                                 |

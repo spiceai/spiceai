@@ -505,6 +505,11 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config)
+    }
+
+    #[must_use]
     pub fn secrets(&self) -> Arc<RwLock<secrets::Secrets>> {
         Arc::clone(&self.secrets)
     }

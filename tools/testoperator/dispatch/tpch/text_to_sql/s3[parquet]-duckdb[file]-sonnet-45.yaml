@@ -1,0 +1,6 @@
+tests:
+  text_to_sql:
+    spicepod_path: test/spicepods/models/nsql_bench_texttosql.yaml
+    runner_type: spiceai-dev-runners
+    model_name: claude-sonnet-4-5
+    queryset_file: test/nsql_bench/data/tpch_nsql_texttosql.jsonl
