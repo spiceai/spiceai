@@ -18,7 +18,6 @@ use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings}
 use crate::models::openai::get_openai_embeddings;
 #[cfg(feature = "s3_vectors")]
 use crate::models::s3_vectors::basic_vector_search_tests;
-use crate::models::s3_vectors::replace_s3_vector_index_names;
 use crate::models::{
     create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
 };
