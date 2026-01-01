@@ -15,6 +15,6 @@ description: "SELECT id, trunc(score, 3) as score  FROM vector_search(qs, 'secon
 |               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                          |
 |               |           BytesProcessedExec                                                                                                          |
 |               |             CooperativeExec                                                                                                           |
-|               |               S3VectorsQueryExec (spice-ci-tests-s3-vectors/cayenne-dataset-hybrid-single-column-8): limit=100                        |
+|               |               S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                            |
 |               |                                                                                                                                       |
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------+
