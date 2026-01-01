@@ -465,9 +465,6 @@ pub async fn start(
     let spice_flight_service = FlightServiceServer::new(service)
         .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
 
-    let spice_flight_service =
-        FlightServiceServer::new(service).max_decoding_message_size(decoding_message_size);
-
     let mut server = Server::builder();
 
     if let Some(ref tls_config) = tls_config {
