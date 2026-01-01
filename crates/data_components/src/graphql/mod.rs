@@ -111,6 +111,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - HTTP 408 Request Timeout
 /// - Connection/timeout errors from reqwest
 /// - JSON decode errors (often due to truncated responses from timeouts)
+///
+/// Note: `Error::RateLimited` is NOT retriable here because rate limiting is handled
+/// proactively by the `RateLimiter` trait via `check_rate_limit()`, which sleeps until
+/// the rate limit reset time. Any `RateLimited` error reaching this point indicates
+/// an unexpected issue that shouldn't be retried with additional backoff delays.
 #[must_use]
 pub fn is_retriable_error(error: &Error) -> bool {
     match error {
@@ -150,7 +155,6 @@ pub fn is_retriable_error(error: &Error) -> bool {
                     )
                 )
         }
-        Error::RateLimited { .. } => true,
         _ => false,
     }
 }
@@ -266,11 +270,15 @@ mod tests {
     }
 
     #[test]
-    fn test_is_retriable_error_rate_limited() {
+    fn test_is_not_retriable_error_rate_limited() {
+        // RateLimited is NOT retriable because rate limiting is handled proactively
+        // by the RateLimiter trait via check_rate_limit() which sleeps until reset.
+        // Any RateLimited error reaching is_retriable_error indicates a different
+        // issue that shouldn't be retried with backoff (which would cause double delays).
         let error = Error::RateLimited {
             message: "Rate limit exceeded".to_string(),
         };
-        assert!(is_retriable_error(&error));
+        assert!(!is_retriable_error(&error));
     }
 
     #[test]
@@ -384,9 +392,6 @@ mod tests {
                 error: "parse error".to_string(),
                 response_preview: String::new(),
             },
-            Error::RateLimited {
-                message: "Rate limit exceeded".to_string(),
-            },
         ];
 
         let non_retriable_errors = vec![
@@ -427,6 +432,12 @@ mod tests {
             },
             Error::InternalError {
                 message: "Internal error".to_string(),
+            },
+            // RateLimited is NOT retriable because rate limiting is handled proactively
+            // by the RateLimiter trait via check_rate_limit() which sleeps until reset.
+            // Retrying would cause double-delays.
+            Error::RateLimited {
+                message: "Rate limit exceeded".to_string(),
             },
         ];
 
