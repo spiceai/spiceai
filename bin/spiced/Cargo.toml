@@ -67,6 +67,7 @@ default = [
     "snowflake",
     "spark",
     "ftp",
+    "sftp",
     "debezium",
     "kafka",
     "anonymous_telemetry",
@@ -104,6 +105,7 @@ oracle = ["runtime/oracle"]
 postgres = ["runtime/postgres"]
 postgres-write = ["runtime/postgres-write"]
 release = []
+sftp = ["runtime/sftp"]
 sharepoint = ["runtime/sharepoint"]
 smb = ["runtime/smb"]
 snapshots = ["runtime/snapshots"]
