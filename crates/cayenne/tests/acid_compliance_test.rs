@@ -19,7 +19,7 @@ limitations under the License.
 //! These tests validate that Cayenne provides proper ACID guarantees:
 //!
 //! **Atomicity**: Operations complete fully or not at all
-//! **Consistency**: Data remains consistent across all operations  
+//! **Consistency**: Data remains consistent across all operations
 //! **Isolation**: Concurrent operations don't interfere (single-table focus)
 //! **Durability**: Committed data persists across restarts
 //!
@@ -457,7 +457,6 @@ async fn test_acid_multiple_upserts_impl(fixture: TestFixture) -> TestResult<()>
 
 async fn test_acid_durability_reopen_impl(fixture: TestFixture) -> TestResult<()> {
     let table_name = "acid_durability";
-    let schema = create_int64_pk_schema();
 
     // Create and populate table
     {

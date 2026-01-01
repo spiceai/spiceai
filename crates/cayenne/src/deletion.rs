@@ -359,6 +359,8 @@ fn build_delete_file(
         delete_count: delete_count_i64,
         file_size_bytes: file_size_i64,
         deletion_type,
+        // Sequence number is set by the caller after getting the current sequence from catalog
+        sequence_number: table.current_sequence_number,
     })
 }
 
@@ -402,6 +404,7 @@ mod tests {
             current_snapshot_id: Uuid::now_v7().to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
+            current_sequence_number: 0,
         }
     }
 

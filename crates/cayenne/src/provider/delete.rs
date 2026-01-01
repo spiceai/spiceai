@@ -55,7 +55,7 @@ use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
 use roaring::RoaringBitmap;
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// Execution plan that filters out deleted rows based on deletion vectors.
@@ -338,14 +338,24 @@ impl datafusion_execution::RecordBatchStream for DeletionFilterStream {
 /// - **Survives reorganization**: Row keys are based on content, not position
 /// - **Parallel-friendly**: No need to coalesce partitions
 ///
+/// # Sequence-Based Ordering
+///
+/// Insert records track PKs that were deleted and then re-inserted (upserted).
+/// A row is only filtered out if its key is in `deleted_row_keys` AND either:
+/// - It's not in `insert_records`, OR
+/// - Its `insert_sequence < delete_sequence` for that key
+/// This allows upsert semantics without full table compaction.
+///
 /// # Zero-Copy Design
 ///
 /// The deleted row keys are wrapped in `Arc` to enable zero-copy sharing across
 /// concurrent scans.
 pub struct KeyBasedDeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
-    /// Set of deleted row keys (primary key bytes from `RowConverter`)
-    deleted_row_keys: Arc<HashSet<Box<[u8]>>>,
+    /// Map of deleted row keys (primary key bytes from `RowConverter`) to delete sequence
+    deleted_row_keys: Arc<HashMap<Box<[u8]>, i64>>,
+    /// Map of insert records: PK bytes -> insert sequence number (for upserted PKs)
+    insert_records: Arc<HashMap<Box<[u8]>, i64>>,
     /// Indices of primary key columns in the schema
     pk_column_indices: Vec<usize>,
     /// `RowConverter` for converting PK columns to bytes
@@ -358,12 +368,14 @@ impl KeyBasedDeletionFilterExec {
     ///
     /// # Arguments
     /// * `input` - The input execution plan to filter
-    /// * `deleted_row_keys` - Set of deleted row keys (PK bytes)
+    /// * `deleted_row_keys` - Map of deleted row keys (PK bytes) to delete sequence
+    /// * `insert_records` - Map of insert records (PK bytes -> insert sequence)
     /// * `pk_column_indices` - Indices of primary key columns in the schema
     /// * `row_converter` - `RowConverter` configured for the PK columns
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        deleted_row_keys: Arc<HashSet<Box<[u8]>>>,
+        deleted_row_keys: Arc<HashMap<Box<[u8]>, i64>>,
+        insert_records: Arc<HashMap<Box<[u8]>, i64>>,
         pk_column_indices: Vec<usize>,
         row_converter: Arc<RowConverter>,
     ) -> Self {
@@ -371,6 +383,7 @@ impl KeyBasedDeletionFilterExec {
         Self {
             input,
             deleted_row_keys,
+            insert_records,
             pk_column_indices,
             row_converter,
             properties,
@@ -423,6 +436,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.deleted_row_keys),
+            Arc::clone(&self.insert_records),
             self.pk_column_indices.clone(),
             Arc::clone(&self.row_converter),
         )))
@@ -435,6 +449,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
         let deleted_row_keys = Arc::clone(&self.deleted_row_keys);
+        let insert_records = Arc::clone(&self.insert_records);
         let pk_column_indices = self.pk_column_indices.clone();
         let row_converter = Arc::clone(&self.row_converter);
         let schema = input_stream.schema();
@@ -442,6 +457,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         Ok(Box::pin(KeyBasedDeletionFilterStream {
             input: input_stream,
             deleted_row_keys,
+            insert_records,
             pk_column_indices,
             row_converter,
             schema,
@@ -450,9 +466,14 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
 }
 
 /// Stream that filters out deleted rows based on primary key matching.
+///
+/// A row is deleted only if its key is in `deleted_row_keys` AND either:
+/// - It's not in `insert_records`, OR
+/// - Its `insert_sequence < delete_sequence` for that key
 pub struct KeyBasedDeletionFilterStream {
     input: SendableRecordBatchStream,
-    deleted_row_keys: Arc<HashSet<Box<[u8]>>>,
+    deleted_row_keys: Arc<HashMap<Box<[u8]>, i64>>,
+    insert_records: Arc<HashMap<Box<[u8]>, i64>>,
     pk_column_indices: Vec<usize>,
     row_converter: Arc<RowConverter>,
     schema: arrow_schema::SchemaRef,
@@ -470,7 +491,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                 std::task::Poll::Ready(Some(Ok(batch))) => {
                     let batch_size = batch.num_rows();
 
-                    // Fast path: empty deleted keys set
+                    // Fast path: empty deleted keys map
                     if self.deleted_row_keys.is_empty() {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
@@ -492,11 +513,27 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         }
                     };
 
-                    // Build keep mask by checking each row's key against deleted set
+                    // Build keep mask by checking each row's key against deleted map
+                    // A row is deleted only if:
+                    // 1. Key is in deleted map, AND
+                    // 2. Either key is not in insert_records, OR insert_seq < delete_seq
                     let mut keep_mask = Vec::with_capacity(batch_size);
                     for row in &rows {
-                        let is_deleted = self.deleted_row_keys.contains(row.as_ref());
-                        keep_mask.push(!is_deleted);
+                        let key: &[u8] = row.as_ref();
+                        let keep = if let Some(&delete_seq) = self.deleted_row_keys.get(key) {
+                            // Key is in deletions - check if it was re-inserted with higher sequence
+                            if let Some(&insert_seq) = self.insert_records.get(key) {
+                                // Keep if insert happened after delete
+                                insert_seq > delete_seq
+                            } else {
+                                // No re-insert, row is deleted
+                                false
+                            }
+                        } else {
+                            // Not in deletions, keep the row
+                            true
+                        };
+                        keep_mask.push(keep);
                     }
 
                     // Count how many rows we're keeping
@@ -569,12 +606,22 @@ impl datafusion_execution::RecordBatchStream for KeyBasedDeletionFilterStream {
 ///
 /// - **No serialization**: Direct i64 comparison vs byte array conversion
 /// - **Smaller memory footprint**: 8 bytes per deleted key vs variable-length bytes
-/// - **Faster lookup**: Native `HashSet<i64>` vs `HashSet<Box<[u8]>>`
+/// - **Faster lookup**: Native `HashMap<i64, i64>` vs `HashMap<Box<[u8]>, i64>`
 /// - **Zero-copy**: Uses Arrow `Int64Array` directly
+///
+/// # Sequence-Based Ordering
+///
+/// Insert records track PKs that were deleted and then re-inserted (upserted).
+/// A row is only filtered out if its PK is in `deleted_pk_values` AND either:
+/// - It's not in `insert_records`, OR
+/// - Its `insert_sequence < delete_sequence` for that PK
+/// This allows upsert semantics without full table compaction.
 pub struct Int64PkDeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
-    /// Set of deleted primary key values
-    deleted_pk_values: Arc<HashSet<i64>>,
+    /// Map of deleted primary key values to their delete sequence number
+    deleted_pk_values: Arc<HashMap<i64, i64>>,
+    /// Map of insert records: PK -> insert sequence number (for upserted PKs)
+    insert_records: Arc<HashMap<i64, i64>>,
     /// Index of the primary key column in the schema
     pk_column_index: usize,
     properties: datafusion_physical_plan::PlanProperties,
@@ -585,17 +632,20 @@ impl Int64PkDeletionFilterExec {
     ///
     /// # Arguments
     /// * `input` - The input execution plan to filter
-    /// * `deleted_pk_values` - Set of deleted primary key values
+    /// * `deleted_pk_values` - Map of deleted primary key values to delete sequence
+    /// * `insert_records` - Map of insert records (PK -> insert sequence)
     /// * `pk_column_index` - Index of the primary key column in the schema
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        deleted_pk_values: Arc<HashSet<i64>>,
+        deleted_pk_values: Arc<HashMap<i64, i64>>,
+        insert_records: Arc<HashMap<i64, i64>>,
         pk_column_index: usize,
     ) -> Self {
         let properties = input.properties().clone();
         Self {
             input,
             deleted_pk_values,
+            insert_records,
             pk_column_index,
             properties,
         }
@@ -648,6 +698,7 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
             Arc::clone(&self.deleted_pk_values),
+            Arc::clone(&self.insert_records),
             self.pk_column_index,
         )))
     }
@@ -659,12 +710,14 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
         let deleted_pk_values = Arc::clone(&self.deleted_pk_values);
+        let insert_records = Arc::clone(&self.insert_records);
         let pk_column_index = self.pk_column_index;
         let schema = input_stream.schema();
 
         Ok(Box::pin(Int64PkDeletionFilterStream {
             input: input_stream,
             deleted_pk_values,
+            insert_records,
             pk_column_index,
             schema,
         }))
@@ -672,9 +725,14 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
 }
 
 /// Stream that filters out deleted rows based on Int64 primary key matching.
+///
+/// A row is deleted only if its PK is in `deleted_pk_values` AND either:
+/// - It's not in `insert_records`, OR
+/// - Its `insert_sequence < delete_sequence` for that PK
 struct Int64PkDeletionFilterStream {
     input: SendableRecordBatchStream,
-    deleted_pk_values: Arc<HashSet<i64>>,
+    deleted_pk_values: Arc<HashMap<i64, i64>>,
+    insert_records: Arc<HashMap<i64, i64>>,
     pk_column_index: usize,
     schema: arrow_schema::SchemaRef,
 }
@@ -693,7 +751,7 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                 std::task::Poll::Ready(Some(Ok(batch))) => {
                     let batch_size = batch.num_rows();
 
-                    // Fast path: empty deleted keys set
+                    // Fast path: empty deleted keys map
                     if self.deleted_pk_values.is_empty() {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
@@ -712,12 +770,27 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                                 ))
                             })?;
 
-                    // Build keep mask by checking each row's PK value against deleted set
+                    // Build keep mask by checking each row's PK value against deleted map
+                    // A row is deleted only if:
+                    // 1. PK is in deleted map, AND
+                    // 2. Either PK is not in insert_records, OR insert_seq < delete_seq
                     let mut keep_mask = Vec::with_capacity(batch_size);
                     for i in 0..batch_size {
                         let pk_value = pk_array.value(i);
-                        let is_deleted = self.deleted_pk_values.contains(&pk_value);
-                        keep_mask.push(!is_deleted);
+                        let keep = if let Some(&delete_seq) = self.deleted_pk_values.get(&pk_value) {
+                            // PK is in deletions - check if it was re-inserted with higher sequence
+                            if let Some(&insert_seq) = self.insert_records.get(&pk_value) {
+                                // Keep if insert happened after delete
+                                insert_seq > delete_seq
+                            } else {
+                                // No re-insert, row is deleted
+                                false
+                            }
+                        } else {
+                            // Not in deletions, keep the row
+                            true
+                        };
+                        keep_mask.push(keep);
                     }
 
                     // Count how many rows we're keeping
@@ -793,12 +866,12 @@ pub struct CayenneDeletionSink {
     /// Uses Arc-wrapped `RoaringBitmap` for zero-copy sharing across concurrent operations.
     cached_deleted_row_ids: Arc<RwLock<Arc<RoaringBitmap>>>,
     /// Reference to the cached Int64 PK deletion vectors.
-    /// Uses Arc-wrapped `HashSet<i64>` for direct PK lookup.
-    cached_deleted_pk_i64: Arc<RwLock<Arc<HashSet<i64>>>>,
+    /// Uses Arc-wrapped `HashMap<i64, i64>` for direct PK lookup (PK -> delete sequence).
+    cached_deleted_pk_i64: Arc<RwLock<Arc<HashMap<i64, i64>>>>,
     /// Reference to the cached key-based deletion vectors.
-    /// Uses Arc-wrapped `HashSet` for zero-copy sharing.
+    /// Uses Arc-wrapped `HashMap<Box<[u8]>, i64>` for zero-copy sharing (PK bytes -> delete sequence).
     #[expect(clippy::type_complexity)]
-    cached_deleted_row_keys: Arc<RwLock<Arc<HashSet<Box<[u8]>>>>>,
+    cached_deleted_row_keys: Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>,
     /// Deletion strategy for this table.
     pk_deletion_strategy: super::table::PkDeletionStrategy,
     /// `RowConverter` for converting primary key columns to byte representation.
@@ -806,6 +879,8 @@ pub struct CayenneDeletionSink {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
+    /// Additional listing tables from protected snapshots that should also be scanned for deletions.
+    protected_snapshot_tables: Vec<Arc<ListingTable>>,
 }
 
 impl CayenneDeletionSink {
@@ -819,11 +894,12 @@ impl CayenneDeletionSink {
         schema: SchemaRef,
         filters: &[Expr],
         cached_deleted_row_ids: Arc<RwLock<Arc<RoaringBitmap>>>,
-        cached_deleted_pk_i64: Arc<RwLock<Arc<HashSet<i64>>>>,
-        cached_deleted_row_keys: Arc<RwLock<Arc<HashSet<Box<[u8]>>>>>,
+        cached_deleted_pk_i64: Arc<RwLock<Arc<HashMap<i64, i64>>>>,
+        cached_deleted_row_keys: Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>,
         pk_deletion_strategy: super::table::PkDeletionStrategy,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
+        protected_snapshot_tables: Vec<Arc<ListingTable>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -837,18 +913,24 @@ impl CayenneDeletionSink {
             pk_deletion_strategy,
             pk_row_converter,
             pk_column_indices,
+            protected_snapshot_tables,
         }
     }
 
-    async fn delete_all_rows(
+    async fn delete_all_rows_from_tables(
         &self,
         ctx: &SessionContext,
-        listing_table: Arc<ListingTable>,
+        tables: &[Arc<ListingTable>],
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
-        let batches = collect(scan_plan, ctx.task_ctx()).await?;
+        // Collect batches from all tables
+        let mut all_batches = Vec::new();
+        for table in tables {
+            let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+            let batches = collect(scan_plan, ctx.task_ctx()).await?;
+            all_batches.extend(batches);
+        }
 
-        if batches.is_empty() {
+        if all_batches.is_empty() {
             return Ok(0);
         }
 
@@ -856,7 +938,8 @@ impl CayenneDeletionSink {
         match self.pk_deletion_strategy {
             super::table::PkDeletionStrategy::Int64Pk => {
                 // Int64 PK deletion - extract PK values directly
-                let concatenated_batch = arrow::compute::concat_batches(&self.schema, &batches)?;
+                let concatenated_batch =
+                    arrow::compute::concat_batches(&self.schema, &all_batches)?;
                 let pk_values = self.extract_int64_pk_values(&concatenated_batch)?;
                 self.persist_int64_pk_deletions(pk_values).await
             }
@@ -864,7 +947,7 @@ impl CayenneDeletionSink {
                 // RowConverter-based deletion for composite/non-integer PKs
                 if let Some(ref row_converter) = self.pk_row_converter {
                     let concatenated_batch =
-                        arrow::compute::concat_batches(&self.schema, &batches)?;
+                        arrow::compute::concat_batches(&self.schema, &all_batches)?;
                     let row_keys = self.extract_row_keys(&concatenated_batch, row_converter)?;
                     self.persist_key_based_deletions(row_keys).await
                 } else {
@@ -873,7 +956,7 @@ impl CayenneDeletionSink {
             }
             super::table::PkDeletionStrategy::PositionBased => {
                 // Position-based deletion for tables without primary key
-                let total_rows: usize = batches
+                let total_rows: usize = all_batches
                     .iter()
                     .map(arrow::array::RecordBatch::num_rows)
                     .sum();
@@ -882,6 +965,15 @@ impl CayenneDeletionSink {
                 self.persist_position_based_deletions(row_ids).await
             }
         }
+    }
+
+    #[expect(dead_code)]
+    async fn delete_all_rows(
+        &self,
+        ctx: &SessionContext,
+        listing_table: Arc<ListingTable>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.delete_all_rows_from_tables(ctx, &[listing_table]).await
     }
 
     /// Extract Int64 primary key values from a batch.
@@ -934,24 +1026,29 @@ impl CayenneDeletionSink {
         Ok(row_keys)
     }
 
-    async fn delete_filtered_rows(
+    async fn delete_filtered_rows_from_tables(
         &self,
         ctx: &SessionContext,
-        listing_table: Arc<ListingTable>,
+        tables: &[Arc<ListingTable>],
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         use arrow::array::{Array, AsArray, Int64Array};
         use arrow::datatypes::{DataType, Field};
 
-        let scan_plan = listing_table.scan(&ctx.state(), None, &[], None).await?;
-        let batches = collect(scan_plan, ctx.task_ctx()).await?;
+        // Collect batches from all tables
+        let mut all_batches = Vec::new();
+        for table in tables {
+            let scan_plan = table.scan(&ctx.state(), None, &[], None).await?;
+            let batches = collect(scan_plan, ctx.task_ctx()).await?;
+            all_batches.extend(batches);
+        }
 
         // If no data, nothing to delete
-        if batches.is_empty() {
+        if all_batches.is_empty() {
             return Ok(0);
         }
 
         // Flatten all batches into one for simpler processing
-        let concatenated_batch = arrow::compute::concat_batches(&self.schema, &batches)?;
+        let concatenated_batch = arrow::compute::concat_batches(&self.schema, &all_batches)?;
         let total_rows = concatenated_batch.num_rows();
 
         // Create a batch with row_id column added (needed for filtering)
@@ -1068,6 +1165,16 @@ impl CayenneDeletionSink {
         }
     }
 
+    #[expect(dead_code)]
+    async fn delete_filtered_rows(
+        &self,
+        ctx: &SessionContext,
+        listing_table: Arc<ListingTable>,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.delete_filtered_rows_from_tables(ctx, &[listing_table])
+            .await
+    }
+
     async fn persist_position_based_deletions(
         &self,
         row_ids: Vec<i64>,
@@ -1165,7 +1272,33 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
-        let writer = DeletionVectorWriter::new(&self.table_metadata);
+        // Count how many keys are NEW deletions (not already in the cache).
+        // This gives an accurate count of newly deleted rows for the return value.
+        let new_deletion_count = {
+            let guard = self
+                .cached_deleted_row_keys
+                .read()
+                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+            filtered_row_keys
+                .iter()
+                .filter(|key| !guard.contains_key(key.as_ref()))
+                .count()
+        };
+
+        // Get a fresh sequence number from the catalog for this deletion operation.
+        // This ensures each delete has a unique, monotonically increasing sequence number
+        // that's higher than any previous operation.
+        let delete_sequence = self
+            .catalog
+            .increment_sequence_number(self.table_metadata.table_id)
+            .await
+            .map_err(catalog_error_to_box)?;
+
+        // Create a temporary metadata with the fresh sequence number
+        let mut temp_metadata = self.table_metadata.clone();
+        temp_metadata.current_sequence_number = delete_sequence;
+
+        let writer = DeletionVectorWriter::new(&temp_metadata);
         let mut results = writer
             .write(vec![DeletionVectorWriteSpec::new_key_based(
                 filtered_row_keys,
@@ -1190,26 +1323,31 @@ impl CayenneDeletionSink {
             }
         };
 
-        // Update the cached deletion keys
+        // Update the cached deletion keys with sequence number
         {
             let mut guard = self
                 .cached_deleted_row_keys
                 .write()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
 
-            let mut updated_set = (**guard).clone();
+            let mut updated_map = (**guard).clone();
             for key in written_row_keys {
-                updated_set.insert(key.clone());
+                // Update with max sequence if key already exists
+                updated_map
+                    .entry(key.clone())
+                    .and_modify(|seq| *seq = (*seq).max(delete_sequence))
+                    .or_insert(delete_sequence);
             }
 
-            *guard = Arc::new(updated_set);
+            *guard = Arc::new(updated_map);
         }
 
-        let deleted_count = convert_to_u64_box(written_row_keys.len(), "deleted row count")?;
+        let deleted_count = convert_to_u64_box(new_deletion_count, "deleted row count")?;
 
         tracing::debug!(
-            "Key-based deletion vector written and cache updated: {} key(s) at {:?}",
+            "Key-based deletion vector written and cache updated: {} key(s) (seq={}) at {:?}",
             deleted_count,
+            delete_sequence,
             result.path
         );
 
@@ -1226,6 +1364,28 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
+        // Count how many PKs are NEW deletions (not already in the cache).
+        // This gives an accurate count of newly deleted rows for the return value.
+        let new_deletion_count = {
+            let guard = self
+                .cached_deleted_pk_i64
+                .read()
+                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
+            filtered_pk_values
+                .iter()
+                .filter(|pk| !guard.contains_key(*pk))
+                .count()
+        };
+
+        // Get a fresh sequence number from the catalog for this deletion operation.
+        // This ensures each delete has a unique, monotonically increasing sequence number
+        // that's higher than any previous operation.
+        let delete_sequence = self
+            .catalog
+            .increment_sequence_number(self.table_metadata.table_id)
+            .await
+            .map_err(catalog_error_to_box)?;
+
         // For Int64 PK deletions, we store them as key-based deletions
         // where each key is the 8-byte big-endian representation of the i64 value.
         // This allows efficient storage and lookup.
@@ -1234,7 +1394,11 @@ impl CayenneDeletionSink {
             .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
             .collect();
 
-        let writer = DeletionVectorWriter::new(&self.table_metadata);
+        // Create a temporary metadata with the fresh sequence number
+        let mut temp_metadata = self.table_metadata.clone();
+        temp_metadata.current_sequence_number = delete_sequence;
+
+        let writer = DeletionVectorWriter::new(&temp_metadata);
         let mut results = writer
             .write(vec![DeletionVectorWriteSpec::new_key_based(row_keys)])
             .await
@@ -1249,26 +1413,31 @@ impl CayenneDeletionSink {
             .await
             .map_err(catalog_error_to_box)?;
 
-        // Update the cached Int64 PK deletion set
+        // Update the cached Int64 PK deletion map with sequence number
         {
             let mut guard = self
                 .cached_deleted_pk_i64
                 .write()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
 
-            let mut updated_set = (**guard).clone();
+            let mut updated_map = (**guard).clone();
             for &pk_value in &filtered_pk_values {
-                updated_set.insert(pk_value);
+                // Update with max sequence if key already exists
+                updated_map
+                    .entry(pk_value)
+                    .and_modify(|seq| *seq = (*seq).max(delete_sequence))
+                    .or_insert(delete_sequence);
             }
 
-            *guard = Arc::new(updated_set);
+            *guard = Arc::new(updated_map);
         }
 
-        let deleted_count = convert_to_u64_box(filtered_pk_values.len(), "deleted row count")?;
+        let deleted_count = convert_to_u64_box(new_deletion_count, "deleted row count")?;
 
         tracing::debug!(
-            "Int64 PK deletion vector written and cache updated: {} key(s) at {:?}",
+            "Int64 PK deletion vector written and cache updated: {} key(s) (seq={}) at {:?}",
             deleted_count,
+            delete_sequence,
             result.path
         );
 
@@ -1279,28 +1448,13 @@ impl CayenneDeletionSink {
         &self,
         pk_values: Vec<i64>,
     ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
-        if pk_values.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Read existing Int64 PK deletions from the cache
-        let existing_pk_values = {
-            let guard = self
-                .cached_deleted_pk_i64
-                .read()
-                .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
-            Arc::clone(&guard)
-        };
-
-        if existing_pk_values.is_empty() {
-            return Ok(pk_values);
-        }
-
-        // Filter out PK values that are already deleted
-        Ok(pk_values
-            .into_iter()
-            .filter(|pk| !existing_pk_values.contains(pk))
-            .collect())
+        // For sequence-based ordering, we MUST write new deletion files even for
+        // PKs that were already deleted, because the new deletion has a higher
+        // sequence number. This ensures proper ordering: data written after the
+        // first delete but before the second delete will be properly filtered.
+        //
+        // We only deduplicate within the current batch (in DeletionVectorWriter).
+        Ok(pk_values)
     }
 
     async fn filter_existing_position_deletions(
@@ -1352,38 +1506,13 @@ impl CayenneDeletionSink {
         &self,
         row_keys: Vec<Box<[u8]>>,
     ) -> Result<Vec<Box<[u8]>>, Box<dyn std::error::Error + Send + Sync>> {
-        if row_keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let delete_files = self
-            .catalog
-            .get_table_delete_files(self.table_metadata.table_id)
-            .await
-            .map_err(catalog_error_to_box)?;
-
-        if delete_files.is_empty() {
-            return Ok(row_keys);
-        }
-
-        let delete_files_for_read = delete_files.clone();
-        let existing_row_keys = tokio::task::spawn_blocking(move || {
-            read_key_based_deletion_vectors(delete_files_for_read)
-        })
-        .await
-        .map_err(|source| catalog_error_to_box(CatalogError::TaskJoin { source }))?
-        .map_err(|err| {
-            catalog_error_to_box(CatalogError::InvalidOperation {
-                message: "Failed to read existing key-based deletion vectors".to_string(),
-                source: Box::new(err),
-            })
-        })?;
-
-        // Filter out row_keys that already exist in deletion vectors
-        Ok(row_keys
-            .into_iter()
-            .filter(|key| !existing_row_keys.contains(key))
-            .collect())
+        // For sequence-based ordering, we MUST write new deletion files even for
+        // PKs that were already deleted, because the new deletion has a higher
+        // sequence number. This ensures proper ordering: data written after the
+        // first delete but before the second delete will be properly filtered.
+        //
+        // We only deduplicate within the current batch (in DeletionVectorWriter).
+        Ok(row_keys)
     }
 }
 
@@ -1404,11 +1533,17 @@ impl DeletionSink for CayenneDeletionSink {
             Arc::clone(&guard)
         };
 
-        if self.filters.is_empty() {
-            return self.delete_all_rows(&ctx, Arc::clone(&listing_table)).await;
+        // Collect all tables to scan: main listing table + protected snapshots
+        let mut all_tables = vec![Arc::clone(&listing_table)];
+        for protected_table in &self.protected_snapshot_tables {
+            all_tables.push(Arc::clone(protected_table));
         }
 
-        self.delete_filtered_rows(&ctx, listing_table).await
+        if self.filters.is_empty() {
+            return self.delete_all_rows_from_tables(&ctx, &all_tables).await;
+        }
+
+        self.delete_filtered_rows_from_tables(&ctx, &all_tables).await
     }
 }
 
@@ -1640,20 +1775,21 @@ pub fn read_key_based_deletion_vectors(
 ///
 /// # Returns
 ///
-/// A tuple of `(position_based_row_ids, key_based_row_keys)`.
+/// A tuple of `(position_based_row_ids, key_based_row_keys_with_sequence)`.
+/// The key-based map contains PK bytes -> max delete sequence number for that PK.
 ///
 /// # Errors
 ///
 /// Returns an error if any deletion vector file cannot be read or parsed.
 pub fn detect_deletion_type_and_read(
     delete_files: Vec<crate::metadata::DeleteFile>,
-) -> datafusion_common::Result<(RoaringBitmap, HashSet<Box<[u8]>>)> {
+) -> datafusion_common::Result<(RoaringBitmap, HashMap<Box<[u8]>, i64>)> {
     use arrow::array::{Array, BinaryArray};
     use arrow::datatypes::DataType;
     use arrow::ipc::reader::FileReader;
 
     let mut deleted_row_ids = RoaringBitmap::new();
-    let mut deleted_row_keys = HashSet::new();
+    let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
     let file_count = delete_files.len();
 
     tracing::debug!(
@@ -1689,6 +1825,9 @@ pub fn detect_deletion_type_and_read(
         let first_field = schema.field(0);
         let is_key_based = matches!(first_field.data_type(), DataType::Binary);
 
+        // Get the sequence number for this delete file (for sequence-based ordering)
+        let file_sequence = delete_file.sequence_number;
+
         for batch_result in reader {
             let batch = batch_result.map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -1710,8 +1849,12 @@ pub fn detect_deletion_type_and_read(
 
                 for i in 0..row_key_array.len() {
                     if !row_key_array.is_null(i) {
-                        let key = row_key_array.value(i);
-                        deleted_row_keys.insert(key.to_vec().into_boxed_slice());
+                        let key = row_key_array.value(i).to_vec().into_boxed_slice();
+                        // Track max delete sequence for each PK
+                        deleted_row_keys
+                            .entry(key)
+                            .and_modify(|seq| *seq = (*seq).max(file_sequence))
+                            .or_insert(file_sequence);
                     }
                 }
             } else {

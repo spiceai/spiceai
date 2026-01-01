@@ -25,6 +25,7 @@ use super::metastore::{
     ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreValue, QueryParams, QueryRowParams,
 };
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -155,15 +156,6 @@ impl CayenneCatalog {
             .strip_prefix("sqlite://")
             .or_else(|| self.connection_string.strip_prefix("libsql://"))
             .unwrap_or(&self.connection_string)
-    }
-
-    /// Generate a unique directory path for a new virtual file (`ListingTable`).
-    ///
-    /// Returns a relative path like `file_000001/` that will be combined with
-    /// the table's base path to create the full `ListingTable` directory.
-    #[expect(dead_code)]
-    fn generate_file_path(file_id: i64) -> String {
-        format!("file_{file_id:06}/")
     }
 
     /// Perform catalog shutdown maintenance tasks.
@@ -379,7 +371,8 @@ impl MetadataCatalog for CayenneCatalog {
                     sql: r"
                     SELECT table_id, table_uuid,
                            table_name, path, path_is_relative, schema_json, primary_key_json,
-                           current_snapshot_id, partition_column, vortex_config_json
+                           current_snapshot_id, partition_column, vortex_config_json,
+                           current_sequence_number
                     FROM cayenne_table
                     WHERE table_name = ?1
                     LIMIT 1
@@ -397,6 +390,7 @@ impl MetadataCatalog for CayenneCatalog {
                     let current_snapshot_id = row.get_string(7)?;
                     let partition_column = row.get_optional_string(8)?;
                     let vortex_config_json = row.get_optional_string(9)?;
+                    let current_sequence_number = row.get_optional_i64(10)?.unwrap_or(0);
 
                     // Deserialize schema using Arrow IPC format
                     let schema = {
@@ -456,6 +450,7 @@ impl MetadataCatalog for CayenneCatalog {
                         current_snapshot_id,
                         partition_column,
                         vortex_config,
+                        current_sequence_number,
                     })
                 },
             )
@@ -488,9 +483,9 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: r"
                 INSERT INTO cayenne_delete_file (
                     table_id, path, path_is_relative,
-                    format, delete_count, file_size_bytes, source_data_file_path
+                    format, delete_count, file_size_bytes, source_data_file_path, sequence_number
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
                 )
             ",
                 params: vec![
@@ -504,6 +499,7 @@ impl MetadataCatalog for CayenneCatalog {
                         .source_data_file_path
                         .clone()
                         .map_or(MetastoreValue::Null, MetastoreValue::Text),
+                    MetastoreValue::Integer(delete_file.sequence_number),
                 ],
             })
             .await;
@@ -555,7 +551,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: "SELECT delete_file_id, table_id, path, path_is_relative, 
-                        format, delete_count, file_size_bytes, source_data_file_path 
+                        format, delete_count, file_size_bytes, source_data_file_path, sequence_number 
                  FROM cayenne_delete_file 
                  WHERE table_id = ?1",
                     params: vec![MetastoreValue::Integer(table_id)],
@@ -573,6 +569,7 @@ impl MetadataCatalog for CayenneCatalog {
                         // The actual deletion type is determined when reading the file
                         // based on the schema (row_id = position-based, row_key = key-based)
                         deletion_type: crate::metadata::DeletionType::default(),
+                        sequence_number: row.get_optional_i64(8)?.unwrap_or(0),
                     })
                 },
             )
@@ -595,14 +592,251 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(())
     }
 
+    async fn increment_sequence_number(&self, table_id: i64) -> CatalogResult<i64> {
+        // Atomically increment and return the new sequence number
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + 1 WHERE table_id = ?1",
+                params: vec![MetastoreValue::Integer(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to increment sequence number".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // Retrieve the new sequence number
+        self.get_sequence_number(table_id).await
+    }
+
+    async fn get_sequence_number(&self, table_id: i64) -> CatalogResult<i64> {
+        self.metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT current_sequence_number FROM cayenne_table WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Integer(table_id)],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to get sequence number".to_string(),
+                source: Box::new(e),
+            })
+    }
+
+    async fn add_insert_record(
+        &self,
+        table_id: i64,
+        pk_bytes: Vec<u8>,
+        sequence_number: i64,
+    ) -> CatalogResult<()> {
+        // Use INSERT OR REPLACE to update sequence if PK already exists
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
+                params: vec![
+                    MetastoreValue::Integer(table_id),
+                    MetastoreValue::Blob(pk_bytes),
+                    MetastoreValue::Integer(sequence_number),
+                ],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to add insert record entry".to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(())
+    }
+
+    async fn add_insert_records_batch(
+        &self,
+        table_id: i64,
+        pk_bytes_list: Vec<Vec<u8>>,
+        sequence_number: i64,
+    ) -> CatalogResult<()> {
+        if pk_bytes_list.is_empty() {
+            return Ok(());
+        }
+
+        // Build a batch insert with all PKs
+        // Using INSERT OR REPLACE to update sequence if PK already exists
+        let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
+        let mut params = Vec::with_capacity(pk_bytes_list.len() * 3);
+
+        for (i, pk_bytes) in pk_bytes_list.into_iter().enumerate() {
+            let base = i * 3 + 1; // SQLite params are 1-indexed
+            values_parts.push(format!("(?{}, ?{}, ?{})", base, base + 1, base + 2));
+            params.push(MetastoreValue::Integer(table_id));
+            params.push(MetastoreValue::Blob(pk_bytes));
+            params.push(MetastoreValue::Integer(sequence_number));
+        }
+
+        let sql = format!(
+            "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES {}",
+            values_parts.join(", ")
+        );
+
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: &sql,
+                params,
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to add insert record entries in batch".to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(())
+    }
+
+    async fn get_insert_records(
+        &self,
+        table_id: i64,
+    ) -> CatalogResult<std::collections::HashMap<Box<[u8]>, i64>> {
+        let results: Vec<(Vec<u8>, i64)> = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT pk_bytes, sequence_number FROM cayenne_insert_record WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Integer(table_id)],
+                },
+                |row| {
+                    let pk_bytes = row.get_blob(0)?;
+                    let sequence_number = row.get_i64(1)?;
+                    Ok((pk_bytes, sequence_number))
+                },
+            )
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to get insert records".to_string(),
+                source: Box::new(e),
+            })?;
+
+        Ok(results
+            .into_iter()
+            .map(|(pk, seq)| (pk.into_boxed_slice(), seq))
+            .collect())
+    }
+
+    async fn clear_insert_records(&self, table_id: i64) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
+                params: vec![MetastoreValue::Integer(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to clear insert records".to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(())
+    }
+
+    async fn set_snapshot_sequence(
+        &self,
+        table_id: i64,
+        snapshot_id: &str,
+        sequence_number: i64,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                params: vec![
+                    MetastoreValue::Integer(table_id),
+                    MetastoreValue::Text(snapshot_id.to_string()),
+                    MetastoreValue::Integer(sequence_number),
+                ],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to set snapshot sequence".to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(())
+    }
+
+    async fn get_snapshot_sequence(
+        &self,
+        table_id: i64,
+        snapshot_id: &str,
+    ) -> CatalogResult<Option<i64>> {
+        let results: Vec<i64> = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT sequence_number FROM cayenne_snapshot_sequence WHERE table_id = ?1 AND snapshot_id = ?2",
+                    params: vec![
+                        MetastoreValue::Integer(table_id),
+                        MetastoreValue::Text(snapshot_id.to_string()),
+                    ],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to get snapshot sequence".to_string(),
+                source: Box::new(e),
+            })?;
+
+        Ok(results.into_iter().next())
+    }
+
+    async fn get_all_snapshot_sequences(
+        &self,
+        table_id: i64,
+    ) -> CatalogResult<HashMap<String, i64>> {
+        let results: Vec<(String, i64)> = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT snapshot_id, sequence_number FROM cayenne_snapshot_sequence WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Integer(table_id)],
+                },
+                |row| {
+                    let snapshot_id = row.get_string(0)?;
+                    let seq = row.get_i64(1)?;
+                    Ok((snapshot_id, seq))
+                },
+            )
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to get all snapshot sequences".to_string(),
+                source: Box::new(e),
+            })?;
+
+        Ok(results.into_iter().collect())
+    }
+
+    async fn clear_snapshot_sequence(
+        &self,
+        table_id: i64,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_sequence WHERE table_id = ?1 AND snapshot_id = ?2",
+                params: vec![
+                    MetastoreValue::Integer(table_id),
+                    MetastoreValue::Text(snapshot_id.to_string()),
+                ],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to clear snapshot sequence for {snapshot_id}"),
+                source: Box::new(e),
+            })
+    }
+
     async fn commit_compaction(&self, table_id: i64, new_snapshot_id: &str) -> CatalogResult<()> {
-        // Execute both operations atomically using a transaction batch.
+        // Execute all operations atomically using a transaction batch.
         // SQLite's execute_batch runs all statements in a single transaction,
-        // ensuring atomicity: either both succeed or neither takes effect.
+        // ensuring atomicity: either all succeed or none takes effect.
         //
         // Order matters for crash safety:
         // 1. Clear delete files first - they reference the old snapshot's data
-        // 2. Update snapshot pointer - commits the new snapshot as active
+        // 2. Clear insert records - they correspond to the cleared delete files
+        // 3. Update snapshot pointer - commits the new snapshot as active
         //
         // If interrupted between these, the old snapshot remains active with
         // no delete files, which is safe (just loses the pending deletions,
@@ -610,6 +844,7 @@ impl MetadataCatalog for CayenneCatalog {
         let batch_sql = format!(
             "BEGIN TRANSACTION; \
              DELETE FROM cayenne_delete_file WHERE table_id = {table_id}; \
+             DELETE FROM cayenne_insert_record WHERE table_id = {table_id}; \
              UPDATE cayenne_table SET current_snapshot_id = '{new_snapshot_id}' WHERE table_id = {table_id}; \
              COMMIT;"
         );
@@ -963,6 +1198,7 @@ mod tests {
                     delete_count: 10,
                     file_size_bytes: 512,
                     deletion_type: DeletionType::default(),
+                    sequence_number: 1, // Test sequence number
                 };
 
                 catalog_clone.add_delete_file(delete_file).await

@@ -28,6 +28,7 @@ use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
+use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::SchemaRef;
@@ -55,7 +56,7 @@ use object_store::path::Path as ObjectStorePath;
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex::compressor::CompactCompressor;
@@ -124,14 +125,30 @@ pub struct CayenneTableProvider {
     ///
     /// This is the most efficient deletion strategy - direct i64 comparison without
     /// any serialization overhead. 8 bytes per deleted key.
-    cached_deleted_pk_i64: Arc<RwLock<Arc<HashSet<i64>>>>,
+    /// Maps PK -> delete_sequence_number for sequence-based ordering.
+    cached_deleted_pk_i64: Arc<RwLock<Arc<std::collections::HashMap<i64, i64>>>>,
     /// Cached deletion vectors (deleted row keys) for key-based deletion.
     /// Used for tables with composite or non-integer primary keys.
     ///
     /// Keys are the byte representation of primary key columns via Arrow's `RowConverter`.
-    /// This approach is position-independent and survives data reorganization.
+    /// Maps PK bytes -> delete_sequence_number for sequence-based ordering.
     #[expect(clippy::type_complexity)]
-    cached_deleted_row_keys: Arc<RwLock<Arc<HashSet<Box<[u8]>>>>>,
+    cached_deleted_row_keys: Arc<RwLock<Arc<std::collections::HashMap<Box<[u8]>, i64>>>>,
+    /// Cached insert records for Int64 primary key-based deletion.
+    /// Used for tables with a single-column Int64 primary key.
+    ///
+    /// Insert records track PKs that were re-inserted after being deleted (upserted).
+    /// Maps PK -> insert_sequence_number.
+    /// During scan: delete applies only if delete_sequence > insert_sequence for that PK.
+    cached_insert_records_pk_i64: Arc<RwLock<Arc<std::collections::HashMap<i64, i64>>>>,
+    /// Cached insert records (row keys) for key-based deletion.
+    /// Used for tables with composite or non-integer primary keys.
+    ///
+    /// Insert records track PKs that were re-inserted after being deleted (upserted).
+    /// Maps PK bytes -> insert_sequence_number.
+    /// During scan: delete applies only if delete_sequence > insert_sequence for that PK.
+    #[expect(clippy::type_complexity)]
+    cached_insert_records_row_keys: Arc<RwLock<Arc<std::collections::HashMap<Box<[u8]>, i64>>>>,
     /// Strategy for primary key-based deletion filtering.
     /// Determines which cache and filter exec to use at query time.
     pk_deletion_strategy: PkDeletionStrategy,
@@ -159,6 +176,15 @@ pub struct CayenneTableProvider {
     /// Uses `RwLock` for concurrent reads during normal operations with occasional
     /// writes on compaction. The lock is held briefly for string operations.
     current_snapshot_id: Arc<RwLock<String>>,
+    /// Protected snapshot IDs that should skip deletion filtering.
+    ///
+    /// When data is inserted while pending deletions exist, the new data is written
+    /// to a new snapshot that is "protected" - deletions that existed at the time
+    /// of insert should not apply to this snapshot's data.
+    ///
+    /// Maps snapshot_id -> minimum_sequence (all deletes with seq <= min_seq don't apply).
+    /// At scan time, data from these snapshots is scanned without deletion filtering.
+    protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
@@ -442,6 +468,23 @@ impl CayenneTableProvider {
             }
         })?;
 
+        let listing_options = Self::create_listing_options(vortex_config);
+
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(listing_options)
+            .with_schema(schema);
+
+        let listing_table =
+            ListingTable::try_new(config).map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to create listing table.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        Ok(Arc::new(listing_table))
+    }
+
+    /// Create listing options for Vortex format with the given configuration.
+    fn create_listing_options(vortex_config: &crate::metadata::VortexConfig) -> ListingOptions {
         // Create a configured Vortex session with selected encodings
         let vortex_session = VortexSession::default();
 
@@ -462,20 +505,7 @@ impl CayenneTableProvider {
         };
 
         let format = Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts));
-        let listing_options =
-            ListingOptions::new(format).with_session_config_options(&SessionConfig::default());
-
-        let config = ListingTableConfig::new(table_url)
-            .with_listing_options(listing_options)
-            .with_schema(schema);
-
-        let listing_table =
-            ListingTable::try_new(config).map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to create listing table.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        Ok(Arc::new(listing_table))
+        ListingOptions::new(format).with_session_config_options(&SessionConfig::default())
     }
 
     /// Construct the snapshot directory URL string.
@@ -762,12 +792,30 @@ impl CayenneTableProvider {
             (PkDeletionStrategy::PositionBased, None, Vec::new())
         };
 
-        // Load deletion vectors once at initialization to avoid repeated SQLite queries on every scan
+        // Load deletion vectors and insert records once at initialization
+        // to avoid repeated SQLite queries on every scan
         let table_id = table_metadata.table_id;
         let catalog_for_load = Arc::clone(&catalog);
-        let (deleted_row_ids, deleted_pk_i64, deleted_row_keys) =
-            Self::load_deletion_vectors_all(table_id, catalog_for_load, pk_deletion_strategy)
-                .await?;
+        let (
+            deleted_row_ids,
+            deleted_pk_i64,
+            deleted_row_keys,
+            insert_records_pk_i64,
+            insert_records_row_keys,
+        ) = Self::load_deletion_vectors_all(table_id, catalog_for_load, pk_deletion_strategy)
+            .await?;
+
+        // Load protected snapshots from catalog.
+        // Protected snapshots are those with sequence > max_delete_sequence.
+        // They contain data written after deletions and should skip deletion filtering.
+        let protected_snapshots = Self::load_protected_snapshots(
+            Arc::clone(&catalog),
+            table_id,
+            &deleted_pk_i64,
+            &deleted_row_keys,
+            pk_deletion_strategy,
+        )
+        .await?;
 
         Ok(Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
@@ -780,11 +828,14 @@ impl CayenneTableProvider {
             cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(deleted_row_ids))),
             cached_deleted_pk_i64: Arc::new(RwLock::new(Arc::new(deleted_pk_i64))),
             cached_deleted_row_keys: Arc::new(RwLock::new(Arc::new(deleted_row_keys))),
+            cached_insert_records_pk_i64: Arc::new(RwLock::new(Arc::new(insert_records_pk_i64))),
+            cached_insert_records_row_keys: Arc::new(RwLock::new(Arc::new(insert_records_row_keys))),
             pk_deletion_strategy,
             pk_row_converter,
             pk_column_indices,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
+            protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
         })
     }
 
@@ -902,45 +953,63 @@ impl CayenneTableProvider {
         let _write_guard = self.write_lock.lock().await;
 
         // Check for pending deletions based on the deletion strategy.
-        // All strategies require compaction when there are pending deletions to ensure
-        // correctness for upserts - we must apply deletions before adding new data to avoid:
-        // - Position-based: Row ID conflicts when new files are added
-        // - Key-based: New rows with the same key being incorrectly filtered out
-        let has_pending_deletions =
-            match self.pk_deletion_strategy {
-                PkDeletionStrategy::PositionBased => {
-                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
-                        CatalogError::LockPoisoned {
-                            operation: "check position-based deletion cache".to_string(),
-                        }
-                    })?;
-                    !guard.is_empty()
-                }
-                PkDeletionStrategy::Int64Pk => {
-                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
-                        CatalogError::LockPoisoned {
-                            operation: "check Int64 PK deletion cache".to_string(),
-                        }
-                    })?;
-                    !guard.is_empty()
-                }
-                PkDeletionStrategy::RowConverterBased => {
-                    let guard = self.cached_deleted_row_keys.read().map_err(|_| {
-                        CatalogError::LockPoisoned {
-                            operation: "check key-based deletion cache".to_string(),
-                        }
-                    })?;
-                    !guard.is_empty()
-                }
-            };
+        // Position-based: Requires compaction - row IDs would conflict when new files are added
+        // PK-based (Int64Pk, RowConverterBased): Use anti-deletions to avoid compaction
+        let has_pending_deletions = match self.pk_deletion_strategy {
+            PkDeletionStrategy::PositionBased => {
+                let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                    CatalogError::LockPoisoned {
+                        operation: "check position-based deletion cache".to_string(),
+                    }
+                })?;
+                !guard.is_empty()
+            }
+            PkDeletionStrategy::Int64Pk => {
+                let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                    CatalogError::LockPoisoned {
+                        operation: "check Int64 PK deletion cache".to_string(),
+                    }
+                })?;
+                !guard.is_empty()
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                    CatalogError::LockPoisoned {
+                        operation: "check key-based deletion cache".to_string(),
+                    }
+                })?;
+                !guard.is_empty()
+            }
+        };
 
-        if has_pending_deletions {
+        // For position-based strategy, we still need compaction because row IDs change
+        // when new files are added.
+        if has_pending_deletions && self.pk_deletion_strategy == PkDeletionStrategy::PositionBased
+        {
             tracing::info!(
-                "Table {} has pending {:?} deletions, performing merge-insert with compaction",
-                self.table_metadata.table_name,
-                self.pk_deletion_strategy
+                "Table {} has pending position-based deletions, performing merge-insert with compaction",
+                self.table_metadata.table_name
             );
             return self.merge_insert_stream_with_compaction(stream).await;
+        }
+
+        // For PK-based strategies with pending deletions, we need to write to a NEW snapshot
+        // with a higher sequence number. This ensures proper Iceberg-style ordering:
+        // - Deletions apply to snapshots with sequence <= delete_sequence
+        // - New data in snapshots with sequence > delete_sequence is visible
+        if has_pending_deletions {
+            let new_sequence = self
+                .catalog
+                .increment_sequence_number(self.table_metadata.table_id)
+                .await?;
+            tracing::info!(
+                "Table {} has pending PK-based deletions, inserting to new snapshot with seq={}",
+                self.table_metadata.table_name,
+                new_sequence
+            );
+            return self
+                .insert_to_new_snapshot_with_sequence(stream, new_sequence)
+                .await;
         }
 
         let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
@@ -1020,6 +1089,152 @@ impl CayenneTableProvider {
 
         // Write lock is released here, allowing the next insert to proceed
         Ok(total_rows)
+    }
+
+    /// Insert data to a NEW snapshot with a specific sequence number.
+    ///
+    /// This is used when inserting while pending PK-based deletions exist.
+    /// By writing to a new snapshot with a higher sequence number, we ensure:
+    /// - Old data in previous snapshots is filtered by deletions (delete_seq >= old_snapshot_seq)
+    /// - New data in this snapshot is visible (new_snapshot_seq > delete_seq)
+    ///
+    /// This achieves Iceberg-style sequence ordering without rewriting existing files.
+    async fn insert_to_new_snapshot_with_sequence(
+        &self,
+        stream: SendableRecordBatchStream,
+        sequence_number: i64,
+    ) -> CatalogResult<u64> {
+        let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
+
+        // Generate a new snapshot ID
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+        // Write data to the new snapshot
+        let (total_rows, chunk_count) = self
+            .chunk_and_write_parallel_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
+            .await?;
+
+        tracing::debug!(
+            "Insert to new snapshot {} completed, wrote {} rows to Vortex in {} chunk(s)",
+            new_snapshot_id,
+            total_rows,
+            chunk_count
+        );
+
+        // Record the snapshot's sequence number in the catalog
+        self.catalog
+            .set_snapshot_sequence(
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+                sequence_number,
+            )
+            .await?;
+
+        // Get the maximum delete sequence from current deletions.
+        // This snapshot is protected from deletions with seq <= max_delete_seq.
+        let max_delete_seq = self.get_max_delete_sequence()?;
+
+        // Add to protected snapshots so scan applies only NEWER deletions (seq > max_delete_seq)
+        // We do NOT clear old protected snapshots because they may contain data that's still valid.
+        // Each protected snapshot applies its own partial deletion filter based on when it was created.
+        {
+            let mut guard = self.protected_snapshots.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "add protected snapshot".to_string(),
+                }
+            })?;
+            guard.insert(new_snapshot_id.clone(), max_delete_seq);
+        }
+
+        // Update the listing table to include both old and new snapshot data
+        self.update_to_merged_snapshot(&new_snapshot_id).await?;
+
+        Ok(total_rows)
+    }
+
+    /// Get the maximum delete sequence number from the cached deletions.
+    fn get_max_delete_sequence(&self) -> CatalogResult<i64> {
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                    CatalogError::LockPoisoned {
+                        operation: "read Int64 PK deletions for max sequence".to_string(),
+                    }
+                })?;
+                Ok(guard.values().max().copied().unwrap_or(0))
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                    CatalogError::LockPoisoned {
+                        operation: "read row key deletions for max sequence".to_string(),
+                    }
+                })?;
+                Ok(guard.values().max().copied().unwrap_or(0))
+            }
+            PkDeletionStrategy::PositionBased => Ok(0),
+        }
+    }
+
+    /// Update the table to use a new snapshot that includes data from both
+    /// the previous snapshot and the new snapshot.
+    ///
+    /// IMPORTANT: We do NOT merge into a single multi-path ListingTable because
+    /// we need to apply deletion filters differently to old vs new data.
+    /// Instead, we track the new snapshot as "protected" and handle it at scan time.
+    ///
+    /// At scan time, the `scan()` method will:
+    /// 1. Scan the main listing table (old data) with deletion filter
+    /// 2. Scan protected snapshots without deletion filter
+    /// 3. UNION the results
+    ///
+    /// CRITICAL: We do NOT update current_snapshot in the catalog here.
+    /// The current_snapshot must remain pointing to the base snapshot (old data).
+    /// The new snapshot is tracked ONLY via cayenne_snapshot_sequence table,
+    /// which is loaded via load_protected_snapshots on table reopen.
+    async fn update_to_merged_snapshot(&self, _new_snapshot_id: &str) -> CatalogResult<()> {
+        // The main listing table stays as-is (pointing to old snapshot)
+        // The new snapshot is tracked in protected_snapshots and handled at scan time
+        //
+        // We do NOT call catalog.set_current_snapshot() because:
+        // - current_snapshot should always point to the "base" data (old snapshot)
+        // - Protected snapshots are tracked in cayenne_snapshot_sequence table
+        // - On reopen, load_protected_snapshots finds snapshots with seq > max_delete_seq
+        //
+        // If we updated current_snapshot to the new snapshot, we would lose
+        // the reference to the old data, causing 0 rows to be returned.
+
+        Ok(())
+    }
+
+    /// Create a ListingTable that reads from multiple directories.
+    fn create_multi_path_listing_table(
+        urls: &[&str],
+        schema: SchemaRef,
+        vortex_config: &crate::metadata::VortexConfig,
+    ) -> CatalogResult<Arc<ListingTable>> {
+        let listing_urls: Vec<ListingTableUrl> = urls
+            .iter()
+            .map(|url| {
+                ListingTableUrl::parse(url).map_err(|e| CatalogError::InvalidOperation {
+                    message: format!("Failed to parse listing table URL: {url}"),
+                    source: Box::new(e),
+                })
+            })
+            .collect::<CatalogResult<Vec<_>>>()?;
+
+        let listing_options = Self::create_listing_options(vortex_config);
+        let config = ListingTableConfig::new_with_multi_paths(listing_urls)
+            .with_listing_options(listing_options)
+            .with_schema(schema);
+
+        let listing_table = ListingTable::try_new(config).map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: "Failed to create multi-path listing table".to_string(),
+                source: Box::new(e),
+            }
+        })?;
+
+        Ok(Arc::new(listing_table))
     }
 
     /// Process stream in chunks and write them in parallel with bounded concurrency.
@@ -1543,12 +1758,15 @@ impl CayenneTableProvider {
             cached_deleted_row_ids: Arc::clone(&self.cached_deleted_row_ids),
             cached_deleted_pk_i64: Arc::clone(&self.cached_deleted_pk_i64),
             cached_deleted_row_keys: Arc::clone(&self.cached_deleted_row_keys),
+            cached_insert_records_pk_i64: Arc::clone(&self.cached_insert_records_pk_i64),
+            cached_insert_records_row_keys: Arc::clone(&self.cached_insert_records_row_keys),
             pk_deletion_strategy: self.pk_deletion_strategy,
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             object_store_config: self.object_store_config.clone(),
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
+            protected_snapshots: Arc::clone(&self.protected_snapshots),
         }
     }
 
@@ -1835,6 +2053,7 @@ impl CayenneTableProvider {
             self.pk_deletion_strategy,
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
+            Vec::new(), // Retention filters don't need to scan protected snapshots
         );
 
         let deleted_count =
@@ -1887,7 +2106,252 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Clear all cached deletion vectors (position-based, Int64 PK, and key-based).
+    /// Process incoming batches and add insert records for PKs that are being re-inserted.
+    ///
+    /// This method implements upsert semantics using sequence-based ordering:
+    /// 1. Collects all incoming batches
+    /// 2. Gets a new sequence number from the catalog
+    /// 3. Extracts PKs from the data
+    /// 4. For PKs that are in the deletion set, adds insert records with the new sequence
+    /// 5. Returns a stream of the batches for normal insert processing
+    ///
+    /// Insert records are stored in the catalog and cached in memory. During scan,
+    /// a row is deleted only if its PK is in the deletion set AND (not in insert_records
+    /// OR insert_seq < delete_seq).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if processing fails.
+    ///
+    /// NOTE: Currently unused because we use compaction for all strategies when there
+    /// are pending deletions. Kept for potential future optimization with per-file
+    /// sequence tracking.
+    #[allow(dead_code)]
+    async fn add_insert_records_for_incoming_pks(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> CatalogResult<SendableRecordBatchStream> {
+        use futures::TryStreamExt;
+
+        // Collect all batches from the stream
+        let batches: Vec<RecordBatch> =
+            stream
+                .try_collect()
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to collect batches for insert record processing".to_string(),
+                    source: Box::new(e),
+                })?;
+
+        if batches.is_empty() {
+            let schema = Arc::clone(&self.table_metadata.schema);
+            let empty_stream: futures::stream::Iter<std::vec::IntoIter<datafusion_common::Result<RecordBatch>>> =
+                futures::stream::iter(Vec::new());
+            return Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    schema,
+                    empty_stream,
+                ),
+            ));
+        }
+
+        // Get a new sequence number for this insert operation
+        let insert_sequence = self
+            .catalog
+            .increment_sequence_number(self.table_metadata.table_id)
+            .await?;
+
+        // Extract PKs and add insert records based on strategy
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                self.add_insert_records_int64(&batches, insert_sequence)
+                    .await?;
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                self.add_insert_records_row_converter(&batches, insert_sequence)
+                    .await?;
+            }
+            PkDeletionStrategy::PositionBased => {
+                // Should not reach here - position-based uses compaction
+                unreachable!("Position-based strategy should use compaction, not insert records");
+            }
+        }
+
+        // Return the batches as a stream for normal insert processing
+        let schema = Arc::clone(&self.table_metadata.schema);
+        let batch_results: Vec<datafusion_common::Result<RecordBatch>> =
+            batches.into_iter().map(Ok).collect();
+        let batch_stream = futures::stream::iter(batch_results);
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batch_stream),
+        ))
+    }
+
+    /// Add insert records for Int64 PK strategy.
+    ///
+    /// Extracts ALL Int64 PKs from incoming batches and adds insert records with the current
+    /// sequence number. This is required for sequence-based ordering where we need to know
+    /// when each PK was inserted to compare against deletion sequences.
+    #[allow(dead_code)]
+    async fn add_insert_records_int64(
+        &self,
+        batches: &[RecordBatch],
+        insert_sequence: i64,
+    ) -> CatalogResult<()> {
+        use arrow::array::Int64Array;
+
+        let pk_column_index = *self.pk_column_indices.first().ok_or_else(|| {
+            CatalogError::InvalidOperation {
+                message: "Int64 PK strategy requires exactly one PK column index".to_string(),
+                source: Box::new(std::io::Error::other("missing pk column")),
+            }
+        })?;
+
+        // Extract ALL PKs from incoming batches
+        let mut pks_to_record: Vec<i64> = Vec::new();
+
+        for batch in batches {
+            let pk_column = batch.column(pk_column_index);
+            let pk_array = pk_column.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                CatalogError::InvalidOperation {
+                    message: "Failed to downcast PK column to Int64Array".to_string(),
+                    source: Box::new(std::io::Error::other("invalid pk type")),
+                }
+            })?;
+
+            for value in pk_array.values() {
+                pks_to_record.push(*value);
+            }
+        }
+
+        if pks_to_record.is_empty() {
+            tracing::debug!(
+                "No PKs in incoming data for table {}",
+                self.table_metadata.table_name
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Adding {} insert records (seq={}) for table {} (Int64 PK strategy)",
+            pks_to_record.len(),
+            insert_sequence,
+            self.table_metadata.table_name
+        );
+
+        // Convert to bytes for catalog storage
+        let pk_bytes_list: Vec<Vec<u8>> = pks_to_record
+            .iter()
+            .map(|pk| pk.to_be_bytes().to_vec())
+            .collect();
+
+        // Add to catalog with sequence number
+        self.catalog
+            .add_insert_records_batch(self.table_metadata.table_id, pk_bytes_list, insert_sequence)
+            .await?;
+
+        // Update in-memory cache
+        {
+            let mut guard = self.cached_insert_records_pk_i64.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "update Int64 insert records cache".to_string(),
+                }
+            })?;
+            let mut new_map = (**guard).clone();
+            for pk in pks_to_record {
+                new_map.insert(pk, insert_sequence);
+            }
+            *guard = Arc::new(new_map);
+        }
+
+        Ok(())
+    }
+
+    /// Add insert records for `RowConverter`-based PK strategy.
+    ///
+    /// Converts ALL PK columns to byte representation and adds insert records with the current
+    /// sequence number. This is required for sequence-based ordering where we need to know
+    /// when each PK was inserted to compare against deletion sequences.
+    #[allow(dead_code)]
+    async fn add_insert_records_row_converter(
+        &self,
+        batches: &[RecordBatch],
+        insert_sequence: i64,
+    ) -> CatalogResult<()> {
+        let row_converter =
+            self.pk_row_converter
+                .as_ref()
+                .ok_or_else(|| CatalogError::InvalidOperation {
+                    message: "RowConverter not available for RowConverterBased strategy".to_string(),
+                    source: Box::new(std::io::Error::other("missing row converter")),
+                })?;
+
+        // Extract ALL PKs from incoming batches
+        let mut keys_to_record: Vec<Box<[u8]>> = Vec::new();
+
+        for batch in batches {
+            // Extract PK columns
+            let pk_columns: Vec<ArrayRef> = self
+                .pk_column_indices
+                .iter()
+                .map(|&idx| Arc::clone(batch.column(idx)))
+                .collect();
+
+            // Convert to row format
+            let rows = row_converter
+                .convert_columns(&pk_columns)
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to convert PK columns to row format".to_string(),
+                    source: Box::new(e),
+                })?;
+
+            for row in rows.iter() {
+                let key: Box<[u8]> = row.as_ref().into();
+                keys_to_record.push(key);
+            }
+        }
+
+        if keys_to_record.is_empty() {
+            tracing::debug!(
+                "No PKs in incoming data for table {}",
+                self.table_metadata.table_name
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Adding {} insert records (seq={}) for table {} (RowConverter strategy)",
+            keys_to_record.len(),
+            insert_sequence,
+            self.table_metadata.table_name
+        );
+
+        // Convert to Vec<Vec<u8>> for catalog storage
+        let pk_bytes_list: Vec<Vec<u8>> = keys_to_record.iter().map(|k| k.to_vec()).collect();
+
+        // Add to catalog with sequence number
+        self.catalog
+            .add_insert_records_batch(self.table_metadata.table_id, pk_bytes_list, insert_sequence)
+            .await?;
+
+        // Update in-memory cache
+        {
+            let mut guard = self.cached_insert_records_row_keys.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "update key-based insert records cache".to_string(),
+                }
+            })?;
+            let mut new_map = (**guard).clone();
+            for key in keys_to_record {
+                new_map.insert(key, insert_sequence);
+            }
+            *guard = Arc::new(new_map);
+        }
+
+        Ok(())
+    }
+
+    /// Clear all cached deletion vectors and insert records.
     ///
     /// This should be called after compaction operations that have applied all deletions
     /// and written a clean snapshot.
@@ -1915,7 +2379,7 @@ impl CayenneTableProvider {
                     .map_err(|_| CatalogError::LockPoisoned {
                         operation: "clear Int64 PK deletion cache".to_string(),
                     })?;
-            *guard = Arc::new(HashSet::new());
+            *guard = Arc::new(HashMap::new());
         }
 
         // Clear key-based cache
@@ -1926,11 +2390,33 @@ impl CayenneTableProvider {
                     .map_err(|_| CatalogError::LockPoisoned {
                         operation: "clear key-based deletion cache".to_string(),
                     })?;
-            *guard = Arc::new(HashSet::new());
+            *guard = Arc::new(HashMap::new());
+        }
+
+        // Clear Int64 insert records cache
+        {
+            let mut guard =
+                self.cached_insert_records_pk_i64
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "clear Int64 insert records cache".to_string(),
+                    })?;
+            *guard = Arc::new(HashMap::new());
+        }
+
+        // Clear key-based insert records cache
+        {
+            let mut guard =
+                self.cached_insert_records_row_keys
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "clear key-based insert records cache".to_string(),
+                    })?;
+            *guard = Arc::new(HashMap::new());
         }
 
         tracing::debug!(
-            "Cleared all deletion caches for table {}",
+            "Cleared all deletion and insert records caches for table {}",
             self.table_metadata.table_name
         );
 
@@ -2064,6 +2550,14 @@ impl CayenneTableProvider {
                     })?;
                     Arc::clone(&guard)
                 };
+                let insert_records_pk_values = {
+                    let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
                 let pk_column_index = self.pk_column_indices.first().copied().ok_or_else(|| {
                     datafusion_common::DataFusionError::Internal(
                         "Int64 PK strategy requires exactly one PK column index".to_string(),
@@ -2072,12 +2566,21 @@ impl CayenneTableProvider {
                 Arc::new(Int64PkDeletionFilterExec::new(
                     existing_scan,
                     deleted_pk_values,
+                    insert_records_pk_values,
                     pk_column_index,
                 ))
             }
             PkDeletionStrategy::RowConverterBased => {
                 let deleted_row_keys = {
                     let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let insert_records_row_keys = {
+                    let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
                         datafusion_common::DataFusionError::Execution(
                             DELETION_CACHE_LOCK_POISONED.to_string(),
                         )
@@ -2092,6 +2595,7 @@ impl CayenneTableProvider {
                 Arc::new(KeyBasedDeletionFilterExec::new(
                     existing_scan,
                     deleted_row_keys,
+                    insert_records_row_keys,
                     self.pk_column_indices.clone(),
                     Arc::clone(row_converter),
                 ))
@@ -2314,6 +2818,14 @@ impl CayenneTableProvider {
                     })?;
                     Arc::clone(&guard)
                 };
+                let insert_records_pk_values = {
+                    let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "read Int64 insert records cache".to_string(),
+                        }
+                    })?;
+                    Arc::clone(&guard)
+                };
                 // For Int64 PK, we only have one PK column
                 let pk_column_index = self.pk_column_indices.first().copied().ok_or_else(|| {
                     CatalogError::InvalidOperation {
@@ -2325,6 +2837,7 @@ impl CayenneTableProvider {
                 Arc::new(Int64PkDeletionFilterExec::new(
                     existing_scan,
                     deleted_pk_values,
+                    insert_records_pk_values,
                     pk_column_index,
                 ))
             }
@@ -2333,6 +2846,14 @@ impl CayenneTableProvider {
                     let guard = self.cached_deleted_row_keys.read().map_err(|_| {
                         CatalogError::LockPoisoned {
                             operation: "read key-based deletion cache".to_string(),
+                        }
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let insert_records_row_keys = {
+                    let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "read key-based insert records cache".to_string(),
                         }
                     })?;
                     Arc::clone(&guard)
@@ -2349,6 +2870,7 @@ impl CayenneTableProvider {
                 Arc::new(KeyBasedDeletionFilterExec::new(
                     existing_scan,
                     deleted_row_keys,
+                    insert_records_row_keys,
                     self.pk_column_indices.clone(),
                     Arc::clone(row_converter),
                 ))
@@ -2640,17 +3162,30 @@ impl CayenneTableProvider {
     /// This method queries the catalog for delete files and loads them into memory,
     /// routing to the appropriate cache based on the PK deletion strategy:
     /// - `PositionBased`: Load into `RoaringBitmap` (row positions)
-    /// - `Int64Pk`: Load into `HashSet<i64>` (direct PK values)
-    /// - `RowConverterBased`: Load into `HashSet<Box<[u8]>>` (serialized PK bytes)
+    /// - `Int64Pk`: Load into `HashMap<i64, i64>` (PK -> max delete sequence)
+    /// - `RowConverterBased`: Load into `HashMap<Box<[u8]>, i64>` (serialized PK bytes -> max delete sequence)
+    ///
+    /// Also loads insert records for sequence-based ordering of upserts.
     ///
     /// # Returns
     ///
-    /// A tuple of `(position_based_row_ids, int64_pk_values, key_based_row_keys)`.
+    /// A tuple of:
+    /// - `position_based_row_ids`: `RoaringBitmap` for position-based deletions
+    /// - `deleted_pk_i64`: `HashMap<i64, i64>` mapping PK -> max delete sequence
+    /// - `deleted_row_keys`: `HashMap<Box<[u8]>, i64>` mapping PK bytes -> max delete sequence
+    /// - `insert_records_pk_i64`: `HashMap<i64, i64>` mapping PK -> insert sequence
+    /// - `insert_records_row_keys`: `HashMap<Box<[u8]>, i64>` mapping PK bytes -> insert sequence
     async fn load_deletion_vectors_all(
         table_id: i64,
         catalog: Arc<dyn MetadataCatalog>,
         strategy: PkDeletionStrategy,
-    ) -> CatalogResult<(RoaringBitmap, HashSet<i64>, HashSet<Box<[u8]>>)> {
+    ) -> CatalogResult<(
+        RoaringBitmap,
+        HashMap<i64, i64>,
+        HashMap<Box<[u8]>, i64>,
+        HashMap<i64, i64>,
+        HashMap<Box<[u8]>, i64>,
+    )> {
         use super::delete::detect_deletion_type_and_read;
 
         // Query catalog for delete files
@@ -2662,11 +3197,70 @@ impl CayenneTableProvider {
                 source: Box::new(e),
             })?;
 
+        // Load insert records from catalog (only for PK-based strategies)
+        let insert_records_bytes = if strategy == PkDeletionStrategy::PositionBased {
+            HashMap::new()
+        } else {
+            catalog
+                .get_insert_records(table_id)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to load insert records from catalog.".to_string(),
+                    source: Box::new(e),
+                })?
+        };
+
+        if delete_files.is_empty() && insert_records_bytes.is_empty() {
+            return Ok((
+                RoaringBitmap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ));
+        }
+
+        // Parse insert records based on strategy
+        let (insert_records_pk_i64, insert_records_row_keys) = match strategy {
+            PkDeletionStrategy::PositionBased => (HashMap::new(), HashMap::new()),
+            PkDeletionStrategy::Int64Pk => {
+                // Convert insert record bytes to i64
+                let int64_pks: HashMap<i64, i64> = insert_records_bytes
+                    .iter()
+                    .filter_map(|(bytes, &seq)| {
+                        if bytes.len() >= 8 {
+                            let mut arr = [0_u8; 8];
+                            arr.copy_from_slice(&bytes[..8]);
+                            Some((i64::from_be_bytes(arr), seq))
+                        } else {
+                            tracing::warn!(
+                                "Skipping invalid Int64 insert record key with length {} (expected at least 8 bytes)",
+                                bytes.len()
+                            );
+                            None
+                        }
+                    })
+                    .collect();
+                (int64_pks, HashMap::new())
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                // Use the byte keys directly
+                (HashMap::new(), insert_records_bytes)
+            }
+        };
+
         if delete_files.is_empty() {
-            return Ok((RoaringBitmap::new(), HashSet::new(), HashSet::new()));
+            return Ok((
+                RoaringBitmap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                insert_records_pk_i64,
+                insert_records_row_keys,
+            ));
         }
 
         // Read deletion vector files in a blocking task, detecting type from schema
+        // Returns (RoaringBitmap, HashMap<Box<[u8]>, i64>) where the map is PK -> max delete sequence
         let (deleted_row_ids, deleted_row_keys) =
             task::spawn_blocking(move || detect_deletion_type_and_read(delete_files))
                 .await
@@ -2685,20 +3279,19 @@ impl CayenneTableProvider {
         let (position_ids, int64_pks, row_keys) = match strategy {
             PkDeletionStrategy::PositionBased => {
                 // Position-based uses RoaringBitmap
-                (deleted_row_ids, HashSet::new(), HashSet::new())
+                (deleted_row_ids, HashMap::new(), HashMap::new())
             }
             PkDeletionStrategy::Int64Pk => {
                 // Int64 PK - convert row_keys (which contain Int64 bytes) to i64
-                // For now, load from row_keys and convert, or use separate read path
                 // TODO: Optimize to store Int64 PK values directly in deletion files
-                let int64_pks: HashSet<i64> = deleted_row_keys
+                let int64_pks: HashMap<i64, i64> = deleted_row_keys
                     .iter()
-                    .filter_map(|bytes| {
+                    .filter_map(|(bytes, &seq)| {
                         if bytes.len() >= 8 {
                             // RowConverter uses big-endian for i64 with sign bit flipped
                             let mut arr = [0_u8; 8];
                             arr.copy_from_slice(&bytes[..8]);
-                            Some(i64::from_be_bytes(arr))
+                            Some((i64::from_be_bytes(arr), seq))
                         } else {
                             tracing::warn!(
                                 "Skipping invalid Int64 deletion key with length {} (expected at least 8 bytes)",
@@ -2708,22 +3301,84 @@ impl CayenneTableProvider {
                         }
                     })
                     .collect();
-                (RoaringBitmap::new(), int64_pks, HashSet::new())
+                (RoaringBitmap::new(), int64_pks, HashMap::new())
             }
             PkDeletionStrategy::RowConverterBased => {
                 // RowConverter-based uses the byte keys directly
-                (RoaringBitmap::new(), HashSet::new(), deleted_row_keys)
+                (RoaringBitmap::new(), HashMap::new(), deleted_row_keys)
             }
         };
 
         tracing::debug!(
-            "Cached deletion vectors for table_id {table_id}: {} position-based, {} int64-pk, {} key-based",
+            "Cached deletion vectors for table_id {table_id}: {} position-based, {} int64-pk, {} key-based, {} int64-insert, {} key-insert",
             position_ids.len(),
             int64_pks.len(),
             row_keys.len(),
+            insert_records_pk_i64.len(),
+            insert_records_row_keys.len(),
         );
 
-        Ok((position_ids, int64_pks, row_keys))
+        Ok((
+            position_ids,
+            int64_pks,
+            row_keys,
+            insert_records_pk_i64,
+            insert_records_row_keys,
+        ))
+    }
+
+    /// Load protected snapshots from the catalog.
+    ///
+    /// Protected snapshots are those with sequence > max_delete_sequence.
+    /// They contain data written after deletions and should skip deletion filtering.
+    async fn load_protected_snapshots(
+        catalog: Arc<dyn MetadataCatalog>,
+        table_id: i64,
+        deleted_pk_i64: &HashMap<i64, i64>,
+        deleted_row_keys: &HashMap<Box<[u8]>, i64>,
+        strategy: PkDeletionStrategy,
+    ) -> CatalogResult<HashMap<String, i64>> {
+        // Check if there are any pending deletions
+        let has_deletions = match strategy {
+            PkDeletionStrategy::Int64Pk => !deleted_pk_i64.is_empty(),
+            PkDeletionStrategy::RowConverterBased => !deleted_row_keys.is_empty(),
+            PkDeletionStrategy::PositionBased => false, // Position-based uses compaction, not protected snapshots
+        };
+
+        if !has_deletions {
+            // No deletions, no protected snapshots needed
+            return Ok(HashMap::new());
+        }
+
+        // Get the maximum delete sequence from the current deletions
+        let max_delete_seq = match strategy {
+            PkDeletionStrategy::Int64Pk => deleted_pk_i64.values().max().copied().unwrap_or(0),
+            PkDeletionStrategy::RowConverterBased => {
+                deleted_row_keys.values().max().copied().unwrap_or(0)
+            }
+            PkDeletionStrategy::PositionBased => 0,
+        };
+
+        // Get all snapshot sequences from catalog
+        let snapshot_sequences = catalog.get_all_snapshot_sequences(table_id).await?;
+
+        // Filter to only protected snapshots (those with seq > max_delete_seq)
+        let protected: HashMap<String, i64> = snapshot_sequences
+            .into_iter()
+            .filter(|(_snapshot_id, seq)| *seq > max_delete_seq)
+            .map(|(snapshot_id, _seq)| (snapshot_id, max_delete_seq)) // Store max_delete_seq for reference
+            .collect();
+
+        if !protected.is_empty() {
+            tracing::debug!(
+                "Loaded {} protected snapshot(s) for table_id {} with max_delete_seq={}",
+                protected.len(),
+                table_id,
+                max_delete_seq
+            );
+        }
+
+        Ok(protected)
     }
 
     /// Creates a projection that strips additional columns added for deletion filtering.
@@ -2752,6 +3407,240 @@ impl CayenneTableProvider {
 
         let projection = ProjectionExec::try_new(projection_expr, input)?;
         Ok(Arc::new(CayenneAccelerationExec::new(Arc::new(projection))))
+    }
+
+    /// Scan protected snapshots with partial deletion filtering.
+    ///
+    /// Protected snapshots skip deletions that existed when they were created
+    /// (deletions with seq <= max_delete_seq_at_creation), but newer deletions
+    /// (seq > max_delete_seq_at_creation) are still applied.
+    async fn scan_protected_snapshots(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        pk_indices_in_projection: &[usize],
+    ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
+        let protected_snapshots = {
+            let guard = self.protected_snapshots.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Protected snapshots lock poisoned".to_string(),
+                )
+            })?;
+            guard.clone()
+        };
+
+        if protected_snapshots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut plans = Vec::with_capacity(protected_snapshots.len());
+
+        for (snapshot_id, max_delete_seq_at_creation) in protected_snapshots {
+            // Create listing table for this snapshot
+            let snapshot_url = Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &snapshot_id,
+            );
+
+            let listing_table = Self::create_listing_table(
+                &snapshot_url,
+                Arc::clone(&self.table_metadata.schema),
+                &self.vortex_config,
+            )
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
+                ))
+            })?;
+
+            let plan = listing_table.scan(state, projection, filters, limit).await?;
+
+            // Apply partial deletion filter - only deletions with seq > max_delete_seq_at_creation
+            let filtered_plan = self.apply_partial_deletion_filter(
+                plan,
+                pk_indices_in_projection,
+                max_delete_seq_at_creation,
+            )?;
+
+            plans.push(filtered_plan);
+        }
+
+        Ok(plans)
+    }
+
+    /// Apply partial deletion filter - only deletions with seq > threshold are applied.
+    ///
+    /// This is used for protected snapshots which should skip deletions that existed
+    /// when they were created, but still honor newer deletions.
+    fn apply_partial_deletion_filter(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        pk_indices_in_projection: &[usize],
+        min_delete_seq_to_apply: i64,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                let all_deleted_pks = {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+
+                // Filter to only include deletions with seq > min_delete_seq_to_apply
+                let filtered_deletions: HashMap<i64, i64> = all_deleted_pks
+                    .iter()
+                    .filter(|(_pk, &seq)| seq > min_delete_seq_to_apply)
+                    .map(|(&pk, &seq)| (pk, seq))
+                    .collect();
+
+                if filtered_deletions.is_empty() {
+                    // No deletions to apply, return plan as-is
+                    return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
+                }
+
+                let pk_column_index =
+                    pk_indices_in_projection.first().copied().ok_or_else(|| {
+                        datafusion_common::DataFusionError::Internal(
+                            "Int64 PK strategy requires exactly one PK column index".to_string(),
+                        )
+                    })?;
+
+                let empty_insert_records = Arc::new(HashMap::new());
+                Ok(Arc::new(Int64PkDeletionFilterExec::new(
+                    plan,
+                    Arc::new(filtered_deletions),
+                    empty_insert_records,
+                    pk_column_index,
+                )))
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                // Similar logic for RowConverter-based strategy
+                if let Some(ref row_converter) = self.pk_row_converter {
+                    let all_deleted_keys = {
+                        let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
+
+                    // Filter to only include deletions with seq > min_delete_seq_to_apply
+                    let filtered_deletions: HashMap<Box<[u8]>, i64> = all_deleted_keys
+                        .iter()
+                        .filter(|(_key, &seq)| seq > min_delete_seq_to_apply)
+                        .map(|(key, &seq)| (key.clone(), seq))
+                        .collect();
+
+                    if filtered_deletions.is_empty() {
+                        return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
+                    }
+
+                    let empty_insert_records = Arc::new(HashMap::new());
+                    Ok(Arc::new(KeyBasedDeletionFilterExec::new(
+                        plan,
+                        Arc::new(filtered_deletions),
+                        empty_insert_records,
+                        self.pk_column_indices.clone(),
+                        Arc::clone(row_converter),
+                    )))
+                } else {
+                    Ok(Arc::new(CayenneAccelerationExec::new(plan)))
+                }
+            }
+            PkDeletionStrategy::PositionBased => {
+                // Position-based doesn't use protected snapshots
+                Ok(Arc::new(CayenneAccelerationExec::new(plan)))
+            }
+        }
+    }
+
+    /// Apply deletion filter to a plan based on the current deletion strategy.
+    fn apply_deletion_filter(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        pk_indices_in_projection: &[usize],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                let deleted_pk_values = {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                // Don't use insert_records for protected snapshot approach
+                // The protected snapshots already handle new data without filtering
+                let empty_insert_records = Arc::new(HashMap::new());
+
+                if !deleted_pk_values.is_empty() {
+                    let pk_column_index =
+                        pk_indices_in_projection.first().copied().ok_or_else(|| {
+                            datafusion_common::DataFusionError::Internal(
+                                "Int64 PK strategy requires exactly one PK column index"
+                                    .to_string(),
+                            )
+                        })?;
+
+                    return Ok(Arc::new(Int64PkDeletionFilterExec::new(
+                        plan,
+                        deleted_pk_values,
+                        empty_insert_records,
+                        pk_column_index,
+                    )));
+                }
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                if let Some(ref row_converter) = self.pk_row_converter {
+                    let deleted_row_keys = {
+                        let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
+                    // Don't use insert_records for protected snapshot approach
+                    let empty_insert_records: Arc<HashMap<Box<[u8]>, i64>> =
+                        Arc::new(HashMap::new());
+
+                    if !deleted_row_keys.is_empty() {
+                        return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
+                            plan,
+                            deleted_row_keys,
+                            empty_insert_records,
+                            pk_indices_in_projection.to_vec(),
+                            Arc::clone(row_converter),
+                        )));
+                    }
+                }
+            }
+            PkDeletionStrategy::PositionBased => {
+                let deleted_row_ids = {
+                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+
+                if !deleted_row_ids.is_empty() {
+                    return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
+                }
+            }
+        }
+
+        // No deletions to apply
+        Ok(Arc::new(CayenneAccelerationExec::new(plan)))
     }
 }
 
@@ -2861,11 +3750,50 @@ impl TableProvider for CayenneTableProvider {
             })?;
             Arc::clone(&guard)
         };
-        let plan = listing_table
+        let main_plan = listing_table
             .scan(state, effective_projection.as_ref(), filters, limit)
             .await?;
 
-        // Apply deletion filter based on strategy
+        // Check for protected snapshots that need to be scanned with partial deletion filter
+        let protected_snapshot_plans = self
+            .scan_protected_snapshots(
+                state,
+                effective_projection.as_ref(),
+                filters,
+                limit,
+                &pk_indices_in_projection,
+            )
+            .await?;
+
+        // If there are protected snapshots, we need to:
+        // 1. Apply deletion filter to main plan
+        // 2. UNION with unfiltered protected snapshot plans
+        let plan = if !protected_snapshot_plans.is_empty() {
+            // Apply deletion filter to main plan only
+            let filtered_main_plan = self.apply_deletion_filter(
+                main_plan,
+                &pk_indices_in_projection,
+            )?;
+
+            // UNION the filtered main plan with unfiltered protected snapshot plans
+            use datafusion_physical_plan::union::UnionExec;
+            let mut all_plans = vec![filtered_main_plan];
+            all_plans.extend(protected_snapshot_plans);
+            let union_plan = Arc::new(UnionExec::new(all_plans));
+
+            // Strip extra PK columns if needed
+            if need_projection_strip {
+                if let Some(orig_proj) = projection {
+                    return self.create_projection_strip(union_plan, orig_proj.len());
+                }
+            }
+
+            return Ok(union_plan);
+        } else {
+            main_plan
+        };
+
+        // Apply deletion filter based on strategy (original logic for when no protected snapshots)
         match self.pk_deletion_strategy {
             PkDeletionStrategy::Int64Pk => {
                 // Optimized Int64 PK deletion - direct HashSet<i64> lookup
@@ -2877,11 +3805,20 @@ impl TableProvider for CayenneTableProvider {
                     })?;
                     Arc::clone(&guard)
                 };
+                let insert_records_pk_values = {
+                    let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
 
                 if !deleted_pk_values.is_empty() {
                     tracing::debug!(
-                        "Applying Int64 PK deletion filter ({} deleted keys) to scan of table {}",
+                        "Applying Int64 PK deletion filter ({} deleted keys, {} insert records) to scan of table {}",
                         deleted_pk_values.len(),
+                        insert_records_pk_values.len(),
                         self.table_metadata.table_name
                     );
 
@@ -2897,6 +3834,7 @@ impl TableProvider for CayenneTableProvider {
                     let deletion_filter = Arc::new(Int64PkDeletionFilterExec::new(
                         plan,
                         deleted_pk_values,
+                        insert_records_pk_values,
                         pk_column_index,
                     ));
 
@@ -2921,17 +3859,27 @@ impl TableProvider for CayenneTableProvider {
                         })?;
                         Arc::clone(&guard)
                     };
+                    let insert_records_row_keys = {
+                        let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
 
                     if !deleted_row_keys.is_empty() {
                         tracing::debug!(
-                            "Applying RowConverter-based deletion filter ({} deleted keys) to scan of table {}",
+                            "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
                             deleted_row_keys.len(),
+                            insert_records_row_keys.len(),
                             self.table_metadata.table_name
                         );
 
                         let deletion_filter = Arc::new(KeyBasedDeletionFilterExec::new(
                             plan,
                             deleted_row_keys,
+                            insert_records_row_keys,
                             pk_indices_in_projection.clone(),
                             Arc::clone(row_converter),
                         ));
@@ -3262,6 +4210,40 @@ impl DeletionTableProvider for CayenneTableProvider {
         _state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // Collect protected snapshot listing tables for deletion scanning
+        let protected_snapshot_tables = {
+            let protected_snapshots = {
+                let guard = self.protected_snapshots.read().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        "Protected snapshots lock poisoned".to_string(),
+                    )
+                })?;
+                guard.clone()
+            };
+
+            let mut tables = Vec::with_capacity(protected_snapshots.len());
+            for (snapshot_id, _) in protected_snapshots {
+                let snapshot_url = Self::snapshot_dir_url(
+                    &self.table_metadata.path,
+                    self.table_metadata.table_id,
+                    &snapshot_id,
+                );
+
+                let listing_table = Self::create_listing_table(
+                    &snapshot_url,
+                    Arc::clone(&self.table_metadata.schema),
+                    &self.vortex_config,
+                )
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
+                    ))
+                })?;
+                tables.push(listing_table);
+            }
+            tables
+        };
+
         Ok(Arc::new(DeletionExec::new(
             Arc::new(CayenneDeletionSink::new(
                 self.table_metadata.clone(),
@@ -3275,6 +4257,7 @@ impl DeletionTableProvider for CayenneTableProvider {
                 self.pk_deletion_strategy,
                 self.pk_row_converter.as_ref().map(Arc::clone),
                 self.pk_column_indices.clone(),
+                protected_snapshot_tables,
             )),
             &self.table_metadata.schema,
         )))

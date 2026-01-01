@@ -43,6 +43,17 @@ pub struct TableMetadata {
     pub partition_column: Option<String>,
     /// Vortex encoding configuration for this table
     pub vortex_config: VortexConfig,
+    /// Current sequence number for ordering operations (Iceberg-style).
+    ///
+    /// Monotonically increasing counter used to order deletes and inserts.
+    /// When data is inserted, it gets the current sequence number.
+    /// When a delete is written, it also gets the current sequence number.
+    /// A delete only applies to data with `data_sequence < delete_sequence`.
+    ///
+    /// This enables upsert semantics: if a PK is deleted and then re-inserted,
+    /// the new insert has a higher sequence than the delete, so the delete
+    /// doesn't apply to the new data.
+    pub current_sequence_number: i64,
 }
 
 /// Represents a data file containing table rows.
@@ -74,6 +85,10 @@ pub struct DataFile {
     pub file_size_bytes: i64,
     /// Starting row ID for this file (for row ID assignment)
     pub row_id_start: i64,
+    /// Sequence number when this data file was written.
+    /// Used for ordering deletions: a deletion only applies to data files with
+    /// sequence_number <= the delete file's sequence_number.
+    pub sequence_number: i64,
 }
 
 /// The type of deletion vector: position-based or key-based.
@@ -112,6 +127,14 @@ pub struct DeleteFile {
     /// The type of deletion vector (position-based or key-based).
     /// Inferred from the file schema when read, or set when writing.
     pub deletion_type: DeletionType,
+    /// Sequence number for ordering deletes (Iceberg-style).
+    ///
+    /// A delete only applies to data files whose `data_sequence_number` is
+    /// strictly less than this delete's `sequence_number`. This enables
+    /// upsert semantics without anti-deletion tracking:
+    /// - New inserts get higher sequence numbers
+    /// - Old deletes don't apply to new data with the same PK
+    pub sequence_number: i64,
 }
 
 /// Metadata about a partition in a table.
