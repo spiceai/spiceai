@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn test_process_directory_entries_shallow() {
         let timestamp =
-            chrono::DateTime::from_timestamp(1700000000, 0).expect("valid timestamp for test");
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp for test");
         let entries = vec![
             DirEntry::file("file1.txt".to_string(), 100, timestamp),
             DirEntry::directory("subdir".to_string()),
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn test_build_object_meta() {
         let timestamp =
-            chrono::DateTime::from_timestamp(1700000000, 0).expect("valid timestamp for test");
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp for test");
         let meta = build_object_meta(Path::from("test/file.parquet"), 4096, timestamp);
 
         assert_debug_snapshot!(meta);
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn test_dir_entry_constructors() {
         let timestamp =
-            chrono::DateTime::from_timestamp(1700000000, 0).expect("valid timestamp for test");
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp for test");
         let file = DirEntry::file("data.csv".to_string(), 1024, timestamp);
         let dir = DirEntry::directory("subdir".to_string());
 

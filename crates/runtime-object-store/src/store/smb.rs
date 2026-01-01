@@ -290,7 +290,8 @@ impl SMBInner {
             source: format!(
                 "Failed to get connection from pool for SMB share smb://{}/{}. Details: {e}",
                 self.config.server, self.config.share
-            ).into(),
+            )
+            .into(),
         })
     }
 }
@@ -439,8 +440,11 @@ impl SMBObjectStore {
         &self,
         prefix: Option<String>,
     ) -> object_store::Result<Vec<ObjectMeta>> {
-        let conn = self.inner.get_connection().await.map_err(|e| {
-            object_store::Error::Generic {
+        let conn = self
+            .inner
+            .get_connection()
+            .await
+            .map_err(|e| object_store::Error::Generic {
                 store: STORE_NAME,
                 source: format!(
                     "Failed to connect to SMB share smb://{}/{}. Verify the server is accessible, \
@@ -448,8 +452,7 @@ impl SMBObjectStore {
                     self.inner.config.server, self.inner.config.share
                 )
                 .into(),
-            }
-        })?;
+            })?;
 
         let config = Arc::clone(&self.inner.config);
         let prefix_str = prefix.unwrap_or_default();
@@ -709,7 +712,7 @@ mod tests {
         // 11644473600 seconds between 1601 and 1970 (Unix epoch)
         // For 2024-01-01 00:00:00 UTC: Unix timestamp = 1704067200
         // FILETIME = (1704067200 + 11644473600) * 10_000_000
-        let unix_ts = 1704067200u64; // 2024-01-01 00:00:00 UTC
+        let unix_ts = 1_704_067_200_u64; // 2024-01-01 00:00:00 UTC
         let filetime = (unix_ts + 11_644_473_600) * 10_000_000;
         let dt = filetime_to_datetime(filetime);
         assert_eq!(dt.format("%Y-%m-%d").to_string(), "2024-01-01");
@@ -740,7 +743,7 @@ mod tests {
         let entry = DirEntry::file(
             "test.txt".to_string(),
             1024,
-            DateTime::<Utc>::from_timestamp(1700000000, 0).expect("valid timestamp"),
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("valid timestamp"),
         );
         assert_eq!(entry.name, "test.txt");
         assert!(!entry.is_dir);

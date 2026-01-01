@@ -647,7 +647,7 @@ mod tests {
             port: "21".to_string(),
             timeout: Some(Duration::from_secs(30)),
         };
-        let cloned = config.clone();
+        let cloned = config;
         assert_eq!(cloned.host, "localhost");
         assert_eq!(cloned.port, "21");
     }
