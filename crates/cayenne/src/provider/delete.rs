@@ -777,7 +777,8 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     let mut keep_mask = Vec::with_capacity(batch_size);
                     for i in 0..batch_size {
                         let pk_value = pk_array.value(i);
-                        let keep = if let Some(&delete_seq) = self.deleted_pk_values.get(&pk_value) {
+                        let keep = if let Some(&delete_seq) = self.deleted_pk_values.get(&pk_value)
+                        {
                             // PK is in deletions - check if it was re-inserted with higher sequence
                             if let Some(&insert_seq) = self.insert_records.get(&pk_value) {
                                 // Keep if insert happened after delete
@@ -973,7 +974,8 @@ impl CayenneDeletionSink {
         ctx: &SessionContext,
         listing_table: Arc<ListingTable>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        self.delete_all_rows_from_tables(ctx, &[listing_table]).await
+        self.delete_all_rows_from_tables(ctx, &[listing_table])
+            .await
     }
 
     /// Extract Int64 primary key values from a batch.
@@ -1543,7 +1545,8 @@ impl DeletionSink for CayenneDeletionSink {
             return self.delete_all_rows_from_tables(&ctx, &all_tables).await;
         }
 
-        self.delete_filtered_rows_from_tables(&ctx, &all_tables).await
+        self.delete_filtered_rows_from_tables(&ctx, &all_tables)
+            .await
     }
 }
 

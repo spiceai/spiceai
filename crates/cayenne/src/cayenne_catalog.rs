@@ -678,10 +678,7 @@ impl MetadataCatalog for CayenneCatalog {
         );
 
         self.metastore
-            .execute_helper(ExecuteParams {
-                sql: &sql,
-                params,
-            })
+            .execute_helper(ExecuteParams { sql: &sql, params })
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: "Failed to add insert record entries in batch".to_string(),
@@ -808,11 +805,7 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(results.into_iter().collect())
     }
 
-    async fn clear_snapshot_sequence(
-        &self,
-        table_id: i64,
-        snapshot_id: &str,
-    ) -> CatalogResult<()> {
+    async fn clear_snapshot_sequence(&self, table_id: i64, snapshot_id: &str) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_snapshot_sequence WHERE table_id = ?1 AND snapshot_id = ?2",
