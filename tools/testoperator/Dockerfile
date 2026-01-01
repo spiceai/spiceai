@@ -10,8 +10,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
-COPY ${TESTOPERATOR_BIN} /usr/local/bin/testoperator
-RUN chmod +x /usr/local/bin/testoperator
+COPY --chmod=0755 ${TESTOPERATOR_BIN} /usr/local/bin/testoperator
 
 WORKDIR /app
 
