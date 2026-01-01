@@ -115,6 +115,11 @@ async fn wrap_table_as_index_s3(
     let start = std::time::Instant::now();
 
     let partition_by = get_partition_expressions(ctx, &inner_table_provider, vector_store)?;
+    if let Some(partition_expr) = partition_by.first() {
+        tracing::debug!("[S3Vectors][table={tbl}] partitioned by expression: {partition_expr:?}");
+    } else {
+        tracing::debug!("[S3Vectors][table={tbl}] No partitioning");
+    }
 
     let embedding_columns: Vec<_> = columns
         .iter()
@@ -157,6 +162,10 @@ async fn wrap_table_as_index_s3(
         if let Some(ref chunking) = config.chunking
             && chunking.enabled
         {
+            tracing::debug!(
+                "[S3Vectors][table={tbl}] Chunking column {}",
+                vector_index.embedded_column
+            );
             provider = construct_s3_chunked_vector_index(
                 provider,
                 embedding_models,

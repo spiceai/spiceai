@@ -22,7 +22,7 @@ pub mod ftp;
 pub mod github;
 #[cfg(feature = "nfs")]
 pub mod nfs;
-#[cfg(feature = "ftp")]
+#[cfg(feature = "sftp")]
 pub mod sftp;
 #[cfg(feature = "smb")]
 pub mod smb;

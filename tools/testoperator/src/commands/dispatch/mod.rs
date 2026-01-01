@@ -103,6 +103,17 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ));
                 }
             }
+            TestType::TextToSql => {
+                for text_to_sql in &test_file.tests.text_to_sql {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: text_to_sql.clone(),
+                            spiced_commit: args.spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
             _ => {
                 println!("Test type {test_type} not supported for dispatching");
             }

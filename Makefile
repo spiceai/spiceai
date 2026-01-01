@@ -28,6 +28,14 @@ build-dev:
 	export DEV=true; make -C bin/spice
 	export DEV=true; make -C bin/spiced
 
+.PHONY: build-testoperator-dev
+build-testoperator-dev:
+	cargo build -p testoperator --all-features
+
+.PHONY: build-testoperator
+build-testoperator:
+	cargo build --release -p testoperator --all-features
+
 .PHONY: ci
 ci:
 	make -C bin/spice
@@ -239,6 +247,16 @@ install-with-models-cuda:
 .PHONY: install-with-odbc
 install-with-odbc:
 	make install SPICED_NON_DEFAULT_FEATURES="odbc"
+
+.PHONY: install-testoperator-dev
+install-testoperator-dev: build-testoperator-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/testoperator ~/.spice/bin/testoperator
+
+.PHONY: install-testoperator
+install-testoperator: build-testoperator
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
 
 .PHONY: install-cli
 install-cli: build-cli

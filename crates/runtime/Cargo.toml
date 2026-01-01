@@ -281,6 +281,7 @@ s3_vectors = [
     "dep:s3_vectors",
     "search/s3_vectors",
 ]
+sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 smb = ["runtime-object-store/smb"]
 snapshots = ["runtime-acceleration/snapshots"]
