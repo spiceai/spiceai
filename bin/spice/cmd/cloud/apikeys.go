@@ -114,11 +114,14 @@ spice cloud api-keys regenerate --app myorg/myapp --key 0
 			os.Exit(1)
 		}
 
-		keyDesc := "primary"
-		if result.RegeneratedKey == 2 {
+		var keyDesc string
+		switch result.RegeneratedKey {
+		case 2:
 			keyDesc = "secondary"
-		} else if result.RegeneratedKey == 0 {
+		case 0:
 			keyDesc = "both"
+		default:
+			keyDesc = "primary"
 		}
 
 		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Successfully regenerated %s API key(s)", keyDesc)))

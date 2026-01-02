@@ -103,7 +103,7 @@ spice cloud rollback 12345 --yes
 			cmd.Println()
 			cmd.Print("Enter number (1-", len(deployments), ") or deployment ID: ")
 			var input string
-			fmt.Scanln(&input)
+			_, _ = fmt.Scanln(&input)
 
 			// Check if it's an index
 			if idx, err := strconv.Atoi(input); err == nil && idx >= 1 && idx <= len(deployments) {
@@ -143,7 +143,7 @@ spice cloud rollback 12345 --yes
 			cmd.Print("\nProceed? [y/N]: ")
 
 			var response string
-			fmt.Scanln(&response)
+			_, _ = fmt.Scanln(&response)
 			if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
 				cmd.Println("Cancelled.")
 				return

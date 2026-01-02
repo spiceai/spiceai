@@ -257,7 +257,7 @@ spice cloud secrets rm API_KEY --app myorg/myapp
 		if !yes {
 			cmd.Printf("Remove secret '%s' from %s? [y/N]: ", name, appName)
 			var response string
-			fmt.Scanln(&response)
+			_, _ = fmt.Scanln(&response)
 			if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
 				cmd.Println("Cancelled.")
 				return
