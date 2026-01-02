@@ -48,3 +48,7 @@ default = []
 [[bench]]
 name = "cache_throughput"
 harness = false
+
+[[bench]]
+name = "hash_algorithms"
+harness = false

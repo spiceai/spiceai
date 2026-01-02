@@ -42,6 +42,7 @@ pub mod key;
 pub mod result;
 
 pub use lru_cache::LruCache;
+pub use metrics::CacheMetrics;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::get_logical_plan_input_tables;
