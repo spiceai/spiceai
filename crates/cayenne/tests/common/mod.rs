@@ -114,6 +114,7 @@ macro_rules! test_with_backends {
 }
 
 /// Helper to run a test function with a specific backend
+#[expect(dead_code)]
 pub async fn run_with_backend<F, Fut>(
     backend: BackendType,
     test_fn: F,
