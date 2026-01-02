@@ -17,7 +17,7 @@ inputs:
   os:
     description: 'Operating system to install MinIO for'
     required: false
-    default: 'linux' # 'linux', 'windows', 'macos'
+    default: 'linux' # 'linux', 'windows', 'darwin'
     type: string
 
 runs:
@@ -33,7 +33,7 @@ runs:
 
     - name: Install MinIO on macOS
       shell: bash
-      if: ${{ inputs.os == 'macos' }}
+      if: ${{ inputs.os == 'darwin' }}
       run: |
         brew update
         brew install wget
