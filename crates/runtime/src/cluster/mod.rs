@@ -69,14 +69,16 @@ type SchedulerEndpointOverride =
 
 pub mod datafusion;
 mod discovery;
+pub mod lease;
 mod polling;
 mod servers;
 mod service;
 
 pub use discovery::start_executor_discovery_loop;
+pub use lease::LeaseManager;
 pub use polling::start_executor_poll_loop;
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-pub use service::{ClusterServiceImpl, ExecutorServiceImpl};
+pub use service::{ClusterServiceImpl, ExecutorLeaseServiceImpl, ExecutorServiceImpl};
 
 /// mTLS configuration for cluster communications.
 ///
@@ -617,6 +619,13 @@ pub async fn initialize_cluster_executor(
 
     rt.df
         .bind_executor_grpc(Arc::clone(&executor_server))
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
+
+    // Create and bind the lease manager for task slot reservation
+    let lease_manager = lease::LeaseManager::new_without_handler(concurrent_tasks);
+    rt.df
+        .bind_lease_manager(Arc::clone(&lease_manager))
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 

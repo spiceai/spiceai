@@ -378,6 +378,7 @@ impl DataFusionBuilder {
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
             executor_grpc: RwLock::new(None),
+            lease_manager: RwLock::new(None),
         }
     }
 }

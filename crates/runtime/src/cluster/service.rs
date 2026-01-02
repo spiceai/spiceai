@@ -21,10 +21,13 @@ limitations under the License.
 
 use app::App;
 use runtime_proto::cluster_service_server::ClusterService;
+use runtime_proto::executor_lease_service_server::ExecutorLeaseService;
 use runtime_proto::executor_service_server::ExecutorService;
 use runtime_proto::{
     DescribeExecutorRequest, DescribeExecutorResponse, ExpandSecretRequest, ExpandSecretResponse,
-    GetAppDefinitionRequest, GetAppDefinitionResponse, PollExecutorRequest, PollExecutorResponse,
+    GetAppDefinitionRequest, GetAppDefinitionResponse, GetCapacityRequest, GetCapacityResponse,
+    PollExecutorRequest, PollExecutorResponse, ReleaseLeaseRequest, ReleaseLeaseResponse,
+    RenewLeaseRequest, RenewLeaseResponse, ReserveSlotsRequest, ReserveSlotsResponse,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -34,6 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
+use super::lease::{LeaseManager, ReleaseResult, RenewalResult, ReservationResult};
 use crate::datafusion::DataFusion;
 use ballista_executor::executor_server::TERMINATING;
 use prost::Message;
@@ -237,6 +241,188 @@ impl ExecutorService for ExecutorServiceImpl {
             terminating: TERMINATING.load(Ordering::Acquire),
             timestamp_millis,
             task_statuses: encoded,
+        }))
+    }
+}
+
+/// Executor lease service for task slot reservation.
+///
+/// This service allows schedulers to reserve task slots on the executor
+/// before dispatching tasks, enabling better capacity management.
+pub struct ExecutorLeaseServiceImpl {
+    lease_manager: Arc<LeaseManager>,
+}
+
+impl ExecutorLeaseServiceImpl {
+    /// Creates a new executor lease service implementation.
+    #[must_use]
+    pub fn new(lease_manager: Arc<LeaseManager>) -> Self {
+        Self { lease_manager }
+    }
+}
+
+#[tonic::async_trait]
+impl ExecutorLeaseService for ExecutorLeaseServiceImpl {
+    async fn reserve_slots(
+        &self,
+        request: Request<ReserveSlotsRequest>,
+    ) -> Result<Response<ReserveSlotsResponse>, Status> {
+        let request = request.into_inner();
+
+        if request.request_id.is_empty() {
+            return Err(Status::invalid_argument("request_id is required"));
+        }
+        if request.scheduler_id.is_empty() {
+            return Err(Status::invalid_argument("scheduler_id is required"));
+        }
+
+        tracing::trace!(
+            request_id = %request.request_id,
+            scheduler_id = %request.scheduler_id,
+            slots = request.slots,
+            ttl_ms = request.ttl_ms,
+            "ExecutorLeaseService::reserve_slots"
+        );
+
+        let result = self
+            .lease_manager
+            .reserve_slots(
+                &request.request_id,
+                &request.scheduler_id,
+                request.slots,
+                request.ttl_ms,
+            )
+            .await;
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "TTL is clamped to max 5 minutes, fits in u64"
+        )]
+        let response = match result {
+            ReservationResult::Granted {
+                lease_id,
+                slots_granted,
+                ttl,
+            }
+            | ReservationResult::Duplicate {
+                lease_id,
+                slots_granted,
+                ttl,
+            } => ReserveSlotsResponse {
+                granted: true,
+                lease_id: lease_id.to_string(),
+                slots_granted,
+                ttl_ms: ttl.as_millis() as u64,
+                rejection_reason: String::new(),
+            },
+            ReservationResult::Denied { reason } => ReserveSlotsResponse {
+                granted: false,
+                lease_id: String::new(),
+                slots_granted: 0,
+                ttl_ms: 0,
+                rejection_reason: reason,
+            },
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn renew_lease(
+        &self,
+        request: Request<RenewLeaseRequest>,
+    ) -> Result<Response<RenewLeaseResponse>, Status> {
+        let request = request.into_inner();
+
+        if request.lease_id.is_empty() {
+            return Err(Status::invalid_argument("lease_id is required"));
+        }
+        if request.scheduler_id.is_empty() {
+            return Err(Status::invalid_argument("scheduler_id is required"));
+        }
+
+        tracing::trace!(
+            lease_id = %request.lease_id,
+            scheduler_id = %request.scheduler_id,
+            ttl_ms = request.ttl_ms,
+            "ExecutorLeaseService::renew_lease"
+        );
+
+        let result = self
+            .lease_manager
+            .renew_lease(&request.lease_id, &request.scheduler_id, request.ttl_ms)
+            .await;
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "TTL is clamped to max 5 minutes, fits in u64"
+        )]
+        let response = match result {
+            RenewalResult::Renewed { new_ttl } => RenewLeaseResponse {
+                renewed: true,
+                ttl_ms: new_ttl.as_millis() as u64,
+                rejection_reason: String::new(),
+            },
+            RenewalResult::Failed { reason } => RenewLeaseResponse {
+                renewed: false,
+                ttl_ms: 0,
+                rejection_reason: reason,
+            },
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn release_lease(
+        &self,
+        request: Request<ReleaseLeaseRequest>,
+    ) -> Result<Response<ReleaseLeaseResponse>, Status> {
+        let request = request.into_inner();
+
+        if request.lease_id.is_empty() {
+            return Err(Status::invalid_argument("lease_id is required"));
+        }
+        if request.scheduler_id.is_empty() {
+            return Err(Status::invalid_argument("scheduler_id is required"));
+        }
+
+        tracing::trace!(
+            lease_id = %request.lease_id,
+            scheduler_id = %request.scheduler_id,
+            "ExecutorLeaseService::release_lease"
+        );
+
+        let result = self
+            .lease_manager
+            .release_lease(&request.lease_id, &request.scheduler_id)
+            .await;
+
+        let response = match result {
+            ReleaseResult::Released { slots_released } => ReleaseLeaseResponse {
+                released: true,
+                slots_released,
+            },
+            ReleaseResult::Failed { reason: _ } => ReleaseLeaseResponse {
+                released: false,
+                slots_released: 0,
+            },
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn get_capacity(
+        &self,
+        _request: Request<GetCapacityRequest>,
+    ) -> Result<Response<GetCapacityResponse>, Status> {
+        tracing::trace!("ExecutorLeaseService::get_capacity");
+
+        let capacity = self.lease_manager.get_capacity().await;
+
+        Ok(Response::new(GetCapacityResponse {
+            total_slots: capacity.total_slots,
+            available_slots: capacity.available_slots,
+            reserved_slots: capacity.reserved_slots,
+            in_use_slots: capacity.in_use_slots,
         }))
     }
 }

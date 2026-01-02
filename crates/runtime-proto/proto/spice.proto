@@ -27,6 +27,19 @@ service ExecutorService {
     rpc PollExecutor(PollExecutorRequest) returns (PollExecutorResponse);
 }
 
+// Executor lease service for task slot reservation.
+// Exposed by executors so schedulers can reserve capacity before dispatching tasks.
+service ExecutorLeaseService {
+    // Reserve task slots on this executor. Idempotent via request_id.
+    rpc ReserveSlots(ReserveSlotsRequest) returns (ReserveSlotsResponse);
+    // Renew an existing lease to extend its TTL.
+    rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+    // Release a lease, returning slots to the available pool.
+    rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
+    // Get the executor's current capacity (total and available slots).
+    rpc GetCapacity(GetCapacityRequest) returns (GetCapacityResponse);
+}
+
 // Request message for DescribeExecutor RPC.
 message DescribeExecutorRequest {}
 
@@ -85,6 +98,83 @@ message ExpandSecretRequest {
 message ExpandSecretResponse {
     string key = 1;
     string value = 2;
+}
+
+// Request message for ReserveSlots RPC.
+message ReserveSlotsRequest {
+    // Unique identifier for this request (for idempotency).
+    string request_id = 1;
+    // Scheduler ID requesting the slots.
+    string scheduler_id = 2;
+    // Number of slots to reserve.
+    uint32 slots = 3;
+    // Requested TTL in milliseconds. Server may grant a different TTL.
+    uint64 ttl_ms = 4;
+}
+
+// Response message for ReserveSlots RPC.
+message ReserveSlotsResponse {
+    // Whether the reservation was successful.
+    bool granted = 1;
+    // Lease ID if granted (empty if not granted).
+    string lease_id = 2;
+    // Actual TTL granted in milliseconds.
+    uint64 ttl_ms = 3;
+    // Number of slots granted (may be less than requested).
+    uint32 slots_granted = 4;
+    // Reason for rejection if not granted.
+    string rejection_reason = 5;
+}
+
+// Request message for RenewLease RPC.
+message RenewLeaseRequest {
+    // Lease ID to renew.
+    string lease_id = 1;
+    // Scheduler ID (must match original lease holder).
+    string scheduler_id = 2;
+    // Requested TTL extension in milliseconds.
+    uint64 ttl_ms = 3;
+}
+
+// Response message for RenewLease RPC.
+message RenewLeaseResponse {
+    // Whether the renewal was successful.
+    bool renewed = 1;
+    // New TTL in milliseconds (from now).
+    uint64 ttl_ms = 2;
+    // Reason for rejection if not renewed.
+    string rejection_reason = 3;
+}
+
+// Request message for ReleaseLease RPC.
+message ReleaseLeaseRequest {
+    // Lease ID to release.
+    string lease_id = 1;
+    // Scheduler ID (must match original lease holder).
+    string scheduler_id = 2;
+}
+
+// Response message for ReleaseLease RPC.
+message ReleaseLeaseResponse {
+    // Whether the release was successful.
+    bool released = 1;
+    // Number of slots returned to the pool.
+    uint32 slots_released = 2;
+}
+
+// Request message for GetCapacity RPC.
+message GetCapacityRequest {}
+
+// Response message for GetCapacity RPC.
+message GetCapacityResponse {
+    // Total task slots on this executor.
+    uint32 total_slots = 1;
+    // Currently available (unreserved) slots.
+    uint32 available_slots = 2;
+    // Number of slots currently reserved via leases.
+    uint32 reserved_slots = 3;
+    // Number of slots currently in use (executing tasks).
+    uint32 in_use_slots = 4;
 }
 
 // Physical plan

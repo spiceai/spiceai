@@ -753,6 +753,17 @@ impl Runtime {
         let cloned_tls_config = tls_config.clone();
         let flight_future: std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
             if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+                let lease_manager = self
+                    .df
+                    .lease_manager
+                    .read()
+                    .map_err(|_| Error::FailedToStartClusterExecutor {
+                        source: "Unable to acquire lease_manager lock".to_string().into(),
+                    })?
+                    .clone()
+                    .ok_or_else(|| Error::FailedToStartClusterExecutor {
+                        source: "LeaseManager not initialized".to_string().into(),
+                    })?;
                 Box::pin(
                     self.start_runtime_task(
                         FLIGHT_SERVER,
@@ -761,6 +772,7 @@ impl Runtime {
                             cluster::start_executor_flight_server(
                                 config.flight_bind_address,
                                 Arc::clone(&self_ref),
+                                lease_manager,
                                 Some(flight_shutdown),
                             )
                             .await

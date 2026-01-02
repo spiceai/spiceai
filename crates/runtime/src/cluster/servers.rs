@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use super::ClusterTlsConfig;
-use crate::cluster::{ClusterServiceImpl, ExecutorServiceImpl};
+use super::lease::LeaseManager;
+use crate::cluster::{ClusterServiceImpl, ExecutorLeaseServiceImpl, ExecutorServiceImpl};
 use crate::flight::{Error, is_address_in_use_error};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::executor_grpc_server::ExecutorGrpcServer;
@@ -25,6 +26,7 @@ use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_executor::executor_server::register_executor_with_scheduler;
 use ballista_executor::flight_service::BallistaFlightService;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
+use runtime_proto::executor_lease_service_server::ExecutorLeaseServiceServer;
 use runtime_proto::executor_service_server::ExecutorServiceServer;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -128,6 +130,7 @@ pub async fn start_internal_cluster_server(
 pub async fn start_executor_flight_server(
     bind_address: std::net::SocketAddr,
     rt: Arc<Runtime>,
+    lease_manager: Arc<LeaseManager>,
     shutdown_signal: Option<CancellationToken>,
 ) -> ClusterServerResult<()> {
     let tls_config = rt.df.cluster_config.tls_config();
@@ -148,10 +151,13 @@ pub async fn start_executor_flight_server(
         );
     }
 
-    // Executor: serve BallistaFlightService for receiving query fragments
-    // and ExecutorService for scheduler-driven discovery.
+    // Executor: serve BallistaFlightService for receiving query fragments,
+    // ExecutorService for scheduler-driven discovery, and ExecutorLeaseService
+    // for task slot reservation.
     let executor_service = ExecutorServiceImpl::new(Arc::clone(&rt.df));
     let executor_service_server = ExecutorServiceServer::new(executor_service);
+    let executor_lease_service = ExecutorLeaseServiceImpl::new(Arc::clone(&lease_manager));
+    let executor_lease_service_server = ExecutorLeaseServiceServer::new(executor_lease_service);
     let executor_grpc = rt
         .df
         .executor_grpc
@@ -172,6 +178,7 @@ pub async fn start_executor_flight_server(
             .max_encoding_message_size(usize::MAX),
         )
         .add_service(executor_service_server)
+        .add_service(executor_lease_service_server)
         .add_service(executor_grpc_server);
 
     // Use the executor's bound address if it was dynamically assigned during registration.

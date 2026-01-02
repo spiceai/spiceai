@@ -368,6 +368,7 @@ pub struct DataFusion {
     pub executor: RwLock<Option<Arc<Executor>>>,
     pub executor_grpc:
         RwLock<Option<Arc<BallistaExecutorServer<LogicalPlanNode, PhysicalPlanNode>>>>,
+    pub lease_manager: RwLock<Option<Arc<crate::cluster::lease::LeaseManager>>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1974,6 +1975,18 @@ impl DataFusion {
             .try_write()
             .map_err(|_| Error::UnableToLockWritableExecutorGrpcHandle {})?;
         *executor_grpc_handle = Some(executor_grpc);
+        Ok(())
+    }
+
+    pub fn bind_lease_manager(
+        &self,
+        lease_manager: Arc<crate::cluster::lease::LeaseManager>,
+    ) -> Result<()> {
+        let mut lease_manager_handle = self
+            .lease_manager
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableExecutorHandle {})?;
+        *lease_manager_handle = Some(lease_manager);
         Ok(())
     }
 }
