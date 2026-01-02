@@ -20,6 +20,7 @@ use crate::concrete;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, exec_err};
 use datafusion::config::ConfigOptions;
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -118,32 +119,131 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
                     return Ok(Transformed::no(p));
                 };
 
-                let projection_expr = projection.expr().to_vec();
+                let projection_key: PlanNodeKey = p.as_ref().into();
+                let projection_expr = Arc::new(projection.expr().to_vec());
                 let expected_schema = projection.input().schema();
+                let expected_fields = || {
+                    expected_schema
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, field)| format!("{idx}:{}", field.name()))
+                        .collect::<Vec<_>>()
+                };
+                let projection_columns = || {
+                    projection_expr
+                        .iter()
+                        .map(|projection_expr| {
+                            if let Some(col) =
+                                projection_expr.expr.as_any().downcast_ref::<Column>()
+                            {
+                                format!(
+                                    "{}:{} as {}",
+                                    col.index(),
+                                    col.name(),
+                                    projection_expr.alias
+                                )
+                            } else {
+                                format!("{:?} as {}", projection_expr.expr, projection_expr.alias)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
 
                 // Take the projection and apply it on top of the union inputs. Specifically, on top
                 // of the repartition exec emitted by `DistributeFileScanOptimizer`
-                for leaf in union_exec.children() {
+                let union_children = union_exec.children().len();
+                for (leaf_idx, leaf) in union_exec.children().iter().enumerate() {
+                    let leaf_key: PlanNodeKey = leaf.as_ref().into();
                     // Verify the leaf schema matches the projection's input schema
                     // to ensure the column indices in projection_expr are valid.
                     // Without this check, we could get "project index N out of bounds" errors
                     // when the leaf has fewer columns than the projection expressions expect.
                     if leaf.schema() != expected_schema {
+                        let expected_fields = expected_fields();
+                        let projection_columns = projection_columns();
+                        let leaf_fields = leaf
+                            .schema()
+                            .fields()
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, field)| format!("{idx}:{}", field.name()))
+                            .collect::<Vec<_>>();
                         tracing::debug!(
                             expected_fields = expected_schema.fields().len(),
                             leaf_fields = leaf.schema().fields().len(),
+                            projection_key = ?projection_key,
+                            leaf_key = ?leaf_key,
+                            leaf_index = leaf_idx,
+                            union_children = union_exec.children().len(),
+                            projection_columns = %projection_columns.join(","),
+                            expected_field_names = %expected_fields.join(","),
+                            leaf_field_names = %leaf_fields.join(","),
                             "Skipping projection pushdown: union child schema differs from projection input schema"
                         );
                         return Ok(Transformed::no(p));
                     }
 
-                    let leaf_key: PlanNodeKey = leaf.as_ref().into();
+                    if tracing::enabled!(tracing::Level::TRACE) {
+                        let expected_fields = expected_fields();
+                        let projection_columns = projection_columns();
+                        let leaf_fields = leaf
+                            .schema()
+                            .fields()
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, field)| format!("{idx}:{}", field.name()))
+                            .collect::<Vec<_>>();
+                        tracing::trace!(
+                            projection_key = ?projection_key,
+                            leaf_key = ?leaf_key,
+                            leaf_index = leaf_idx,
+                            union_children = union_exec.children().len(),
+                            projection_columns = %projection_columns.join(","),
+                            expected_field_names = %expected_fields.join(","),
+                            leaf_field_names = %leaf_fields.join(","),
+                            "Union projection pushdown: projection input and leaf schema fields"
+                        );
+                    }
 
                     // Decorate the projection atop the union input
-                    let projection = Arc::new(ProjectionExec::try_new(
-                        projection_expr.clone(),
+                    let projection_expr_for_exec = if leaf_idx + 1 == union_children {
+                        Arc::unwrap_or_clone(Arc::clone(&projection_expr))
+                    } else {
+                        projection_expr.as_ref().clone()
+                    };
+                    let leaf_projection = match ProjectionExec::try_new(
+                        projection_expr_for_exec,
                         Arc::clone(leaf),
-                    )?);
+                    ) {
+                        Ok(projection) => Arc::new(projection),
+                        Err(err) => {
+                            let expected_fields = expected_fields();
+                            let projection_columns = projection_columns();
+                            let leaf_fields = leaf
+                                .schema()
+                                .fields()
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, field)| format!("{idx}:{}", field.name()))
+                                .collect::<Vec<_>>();
+                            tracing::debug!(
+                                expected_fields = expected_schema.fields().len(),
+                                leaf_fields = leaf.schema().fields().len(),
+                                projection_key = ?projection_key,
+                                leaf_key = ?leaf_key,
+                                leaf_index = leaf_idx,
+                                union_children = union_exec.children().len(),
+                                projection_columns = %projection_columns.join(","),
+                                expected_field_names = %expected_fields.join(","),
+                                leaf_field_names = %leaf_fields.join(","),
+                                projection_expr = ?projection_expr.as_ref(),
+                                error = %err,
+                                "Skipping projection pushdown: failed to build projection for union child"
+                            );
+                            return Ok(Transformed::no(p));
+                        }
+                    };
 
                     // Find the downstream repartition or coalesce
                     let maybe_repartition =
@@ -155,13 +255,13 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
                     let rewrite_leaf: Arc<dyn ExecutionPlan> =
                         if let Some(repartition) = maybe_repartition {
                             Arc::new(RepartitionExec::try_new(
-                                projection,
+                                leaf_projection,
                                 repartition.output_partitioning().clone(),
                             )?)
                         } else if maybe_coalesce.is_some() {
-                            Arc::new(CoalescePartitionsExec::new(projection))
+                            Arc::new(CoalescePartitionsExec::new(leaf_projection))
                         } else {
-                            projection
+                            leaf_projection
                         };
 
                     replacements.insert(leaf_key, rewrite_leaf);
