@@ -78,6 +78,7 @@ impl SpiceTest<NotStarted> {
             .await
             .context("Failed to create Spice client")?;
         let http_client = spiced_instance.http_client()?;
+        let http_base_url = spiced_instance.http_base_url().to_string();
 
         Ok(SpiceTest {
             name: self.name,
@@ -89,7 +90,13 @@ impl SpiceTest<NotStarted> {
             results_snapshot_predicate: self.results_snapshot_predicate,
             state: Running {
                 workers: vec![
-                    TextToSqlWorker::new(http_client, spice_client, self.state.config).start(),
+                    TextToSqlWorker::new(
+                        http_client,
+                        http_base_url,
+                        spice_client,
+                        self.state.config,
+                    )
+                    .start(),
                 ],
             },
         })

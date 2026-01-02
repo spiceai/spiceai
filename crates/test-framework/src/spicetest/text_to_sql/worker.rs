@@ -27,8 +27,6 @@ use reqwest::Client;
 use serde_json::json;
 use tokio::task::JoinHandle;
 
-use crate::constants::HTTP_BASE_URL;
-
 #[derive(Debug, Clone)]
 pub struct TextToSqlRequest {
     pub id: String,
@@ -98,6 +96,7 @@ pub struct TextToSqlResult {
 
 pub(crate) struct TextToSqlWorker {
     http_client: Client,
+    http_base_url: String,
     spice_client: spiceai::Client,
     config: TextToSqlConfig,
 }
@@ -105,11 +104,13 @@ pub(crate) struct TextToSqlWorker {
 impl TextToSqlWorker {
     pub fn new(
         http_client: Client,
+        http_base_url: impl Into<String>,
         spice_client: spiceai::Client,
         config: TextToSqlConfig,
     ) -> Self {
         Self {
             http_client,
+            http_base_url: http_base_url.into(),
             spice_client,
             config,
         }
@@ -126,7 +127,7 @@ impl TextToSqlWorker {
             for (index, request) in self.config.requests.into_iter().enumerate() {
                 let start = Instant::now();
 
-                let url = format!("{HTTP_BASE_URL}/v1/nsql");
+                let url = format!("{}/v1/nsql", self.http_base_url);
                 let body = json!({
                     "query": request.question,
                     "model": request.model,
