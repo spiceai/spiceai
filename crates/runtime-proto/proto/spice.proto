@@ -17,6 +17,23 @@ service ClusterService {
     rpc ExpandSecret(ExpandSecretRequest) returns (ExpandSecretResponse);
 }
 
+// Executor lease service for task slot reservation.
+// Allows schedulers to reserve task slots on executors before dispatching work.
+service ExecutorLeaseService {
+    // Reserve task slots on this executor.
+    // Supports idempotency via request_id.
+    rpc ReserveSlots(ReserveSlotsRequest) returns (ReserveSlotsResponse);
+
+    // Renew an existing lease to extend its expiry time.
+    rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+
+    // Release a lease, returning its slots to the available pool.
+    rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
+
+    // Get the current capacity of this executor.
+    rpc GetCapacity(GetCapacityRequest) returns (GetCapacityResponse);
+}
+
 // Request message for GetAppDefinition RPC.
 message GetAppDefinitionRequest {
     string executor_id = 1;
@@ -46,3 +63,70 @@ message SchemaCastScanExecNode {
 }
 
 message BytesProcessedExecNode {}
+
+// Request message for ReserveSlots RPC.
+message ReserveSlotsRequest {
+    // Unique request ID for idempotency.
+    string request_id = 1;
+    // ID of the scheduler requesting the reservation.
+    string scheduler_id = 2;
+    // Number of task slots to reserve.
+    uint32 slots = 3;
+    // Lease duration in milliseconds.
+    uint64 lease_duration_ms = 4;
+}
+
+// Response message for ReserveSlots RPC.
+message ReserveSlotsResponse {
+    // Unique lease identifier.
+    string lease_id = 1;
+    // Actual number of slots reserved (may be less than requested).
+    uint32 slots_reserved = 2;
+    // Absolute expiry time as milliseconds since UNIX epoch.
+    uint64 expires_at_ms = 3;
+}
+
+// Request message for RenewLease RPC.
+message RenewLeaseRequest {
+    // ID of the lease to renew.
+    string lease_id = 1;
+    // ID of the scheduler that owns the lease.
+    string scheduler_id = 2;
+    // New lease duration in milliseconds.
+    uint64 lease_duration_ms = 3;
+}
+
+// Response message for RenewLease RPC.
+message RenewLeaseResponse {
+    // New expiry time as milliseconds since UNIX epoch.
+    uint64 expires_at_ms = 1;
+}
+
+// Request message for ReleaseLease RPC.
+message ReleaseLeaseRequest {
+    // ID of the lease to release.
+    string lease_id = 1;
+    // ID of the scheduler that owns the lease.
+    string scheduler_id = 2;
+}
+
+// Response message for ReleaseLease RPC.
+message ReleaseLeaseResponse {
+    // Number of slots that were released.
+    uint32 slots_released = 1;
+}
+
+// Request message for GetCapacity RPC.
+message GetCapacityRequest {}
+
+// Response message for GetCapacity RPC.
+message GetCapacityResponse {
+    // Total configured task slots on this executor.
+    uint32 total_slots = 1;
+    // Slots available for new leases.
+    uint32 available_slots = 2;
+    // Slots currently leased (reserved).
+    uint32 leased_slots = 3;
+    // Slots currently in use (running tasks).
+    uint32 in_use_slots = 4;
+}

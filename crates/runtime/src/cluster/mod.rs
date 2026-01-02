@@ -67,11 +67,17 @@ type SchedulerEndpointOverride =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
 
 pub mod datafusion;
+pub mod lease;
+pub mod scheduler_lease;
 mod servers;
 mod service;
 
+pub use lease::LeaseManager;
+pub use scheduler_lease::{
+    ActiveLease, ExecutorCapacity, SchedulerLeaseClient, SchedulerLeaseConfig,
+};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-pub use service::ClusterServiceImpl;
+pub use service::{ClusterServiceImpl, ExecutorLeaseServiceImpl};
 
 /// mTLS configuration for cluster communications.
 ///
