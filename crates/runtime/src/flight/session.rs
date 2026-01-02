@@ -272,7 +272,16 @@ impl SessionStore {
     pub fn session_count(&self) -> usize {
         // MAX_SESSIONS is 10,000 which fits in usize on all platforms,
         // but we use try_from for explicit safety and better code quality
-        usize::try_from(self.sessions.entry_count()).unwrap_or(usize::MAX)
+        match usize::try_from(self.sessions.entry_count()) {
+            Ok(count) => count,
+            Err(_) => {
+                tracing::warn!(
+                    "Flight SQL session count {} exceeded usize::MAX; returning 0 sessions",
+                    self.sessions.entry_count()
+                );
+                0
+            }
+        }
     }
 }
 

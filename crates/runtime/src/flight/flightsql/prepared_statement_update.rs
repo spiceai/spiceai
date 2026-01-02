@@ -27,7 +27,7 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio_stream::{StreamExt, adapters::Peekable};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -41,6 +41,15 @@ use crate::{
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::prepared_statement_query::{PreparedStatement, decode_param_values, error_to_status};
+
+/// Static schema for affected_rows result to avoid allocation on each request.
+static AFFECTED_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![Field::new(
+        "affected_rows",
+        DataType::Int64,
+        false,
+    )]))
+});
 
 /// Get a `FlightInfo` for executing a prepared UPDATE/INSERT/DELETE statement.
 ///
@@ -160,16 +169,10 @@ pub(crate) async fn do_get(
         0
     };
 
-    // Return the affected rows count as a RecordBatch
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "affected_rows",
-        DataType::Int64,
-        false,
-    )]));
-
+    // Return the affected rows count as a RecordBatch using the static schema
     let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(Int64Array::from(vec![affected_rows as i64]))],
+        Arc::clone(&AFFECTED_ROWS_SCHEMA),
+        vec![Arc::new(Int64Array::from(vec![affected_rows]))],
     )
     .map_err(|e| Status::internal(format!("Failed to create result batch: {e}")))?;
 
