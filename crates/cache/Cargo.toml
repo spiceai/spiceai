@@ -11,6 +11,10 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
+async-compression = { version = "=0.4.19", features = [
+    "tokio",
+    "zstd",
+], default-features = false }
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
@@ -22,7 +26,6 @@ fundu = { workspace = true }
 futures.workspace = true
 moka = { workspace = true, features = ["future"] }
 parking_lot.workspace = true
-pingora-lru.workspace = true
 opentelemetry.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }

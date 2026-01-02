@@ -86,6 +86,7 @@ jsonwebtoken = "9.3.0"
 llms = { path = "../llms" }
 mediatype = "0.21.0"
 model_components = { path = "../model_components" }
+moka.workspace = true
 mongodb = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
