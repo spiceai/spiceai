@@ -32,19 +32,13 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - name: Install MinIO
-        uses: ./.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          os: darwin # Since `runs-on: 'spiceai-macos'`
-
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:
           install_to_system_path: 'false'
           upload_artifact: 'true'
+          force_rebuild: 'true'
+          download_from_minio: 'false'
 
   build-spiced:
     name: Build spiced
