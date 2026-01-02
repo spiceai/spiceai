@@ -148,14 +148,6 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
-      - name: Dispatch Testoperator - Scheduled NAS Bench
-        run: |
-          testoperator dispatch ./tools/testoperator/dispatch/nas --workflow nas
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ matrix.branch }}
-
   dispatch-input:
     name: Dispatch tests - Input
     runs-on: spiceai-dev-runners
@@ -265,16 +257,6 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
-      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - NAS
-        if: ${{ github.event.inputs.workflow_type == 'nas' }}
-        run: |
-          testoperator dispatch ./tools/testoperator/dispatch/nas \
-            --workflow ${{ github.event.inputs.workflow_type }} \
-            --update-snapshots ${{ github.event.inputs.update_snapshots }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ github.event.ref }}
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - Text to SQL
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/text_to_sql \
