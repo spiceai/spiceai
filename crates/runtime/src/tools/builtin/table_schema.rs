@@ -175,7 +175,7 @@ impl TableSchemaTool {
                         }
                     };
 
-                    table_schemas.push((t.to_string(), schema));
+                    table_schemas.push((t.clone(), schema));
                 }
 
                 Ok(table_schemas)

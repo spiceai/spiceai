@@ -258,7 +258,7 @@ async fn zipkin_task_history_otel_exporter(
         return Ok(None);
     }
 
-    let collector_endpoint: String = zipkin_endpoint.to_string();
+    let collector_endpoint: String = zipkin_endpoint.clone();
 
     Ok(Some(
         ZipkinExporter::builder()

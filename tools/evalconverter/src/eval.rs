@@ -151,7 +151,7 @@ impl EvalSpecification {
 
                 Ok(Eval {
                     id: id.clone(),
-                    name: name.to_string(),
+                    name: name.clone(),
                     class: def.class.clone(),
                     args: def.args.clone(),
                 })

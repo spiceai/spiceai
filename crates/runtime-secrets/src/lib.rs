@@ -280,7 +280,7 @@ fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType>
             if let Some(params) = store.params.as_ref() {
                 let params = params.as_string_map();
                 if let Some(path) = params.get("file_path") {
-                    return Ok(SecretStoreType::EnvCustomPath(path.to_string()));
+                    return Ok(SecretStoreType::EnvCustomPath(path.clone()));
                 }
             }
             Ok(SecretStoreType::Env)

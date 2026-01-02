@@ -356,7 +356,7 @@ impl TableProvider for WorkflowRunsTableProvider {
                 projection_expr.push((
                     Arc::new(physical_expr::expressions::Column::new(col_name, *idx))
                         as Arc<dyn PhysicalExpr>,
-                    col_name.to_string(),
+                    col_name.clone(),
                 ));
             }
 

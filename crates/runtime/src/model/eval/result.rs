@@ -64,7 +64,7 @@ pub(super) async fn write_result_to_table(
         .finish()
         .boxed()
         .context(FailedToWriteEvalResultsSnafu {
-            eval_run_id: id.to_string(),
+            eval_run_id: id.clone(),
         })?;
 
     df.write_data(
@@ -78,7 +78,7 @@ pub(super) async fn write_result_to_table(
     .await
     .boxed()
     .context(FailedToWriteEvalResultsSnafu {
-        eval_run_id: id.to_string(),
+        eval_run_id: id.clone(),
     })
 }
 

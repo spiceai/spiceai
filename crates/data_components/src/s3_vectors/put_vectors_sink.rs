@@ -253,14 +253,14 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             // Validate metadata key
             if name.is_empty() {
                 return Err(Error::InvalidMetadataKey {
-                    key: (*name).to_string(),
+                    key: (*name).clone(),
                     row,
                     reason: "Metadata key cannot be empty".to_string(),
                 });
             }
             if name.len() > 256 {
                 return Err(Error::InvalidMetadataKey {
-                    key: (*name).to_string(),
+                    key: (*name).clone(),
                     row,
                     reason: format!(
                         "Metadata key exceeds maximum length of 256 characters (got {})",
@@ -271,7 +271,7 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
             // Metadata keys should not contain control characters or special chars
             if name.chars().any(|c| c.is_control() || c == '\0') {
                 return Err(Error::InvalidMetadataKey {
-                    key: (*name).to_string(),
+                    key: (*name).clone(),
                     row,
                     reason: "Metadata key contains invalid characters".to_string(),
                 });
@@ -279,7 +279,7 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
 
             let col = record_batch.column(*index);
             let value = metadata_from_row(row, data_type, col)?;
-            metadata.insert((*name).to_string(), value);
+            metadata.insert((*name).clone(), value);
         }
 
         let metadata = if metadata.is_empty() {

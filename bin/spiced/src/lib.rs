@@ -563,7 +563,7 @@ fn apply_overrides(
 
     for (path, value) in overrides {
         let yaml_value =
-            serde_yaml::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
+            serde_yaml::from_str(value).unwrap_or_else(|_| Value::String(value.clone()));
         match apply_override(&mut yaml, path, yaml_value) {
             Ok(()) => (),
             Err(e) => {

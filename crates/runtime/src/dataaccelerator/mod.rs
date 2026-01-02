@@ -635,7 +635,7 @@ pub(crate) fn get_primary_keys_from_constraints(
                 Some(
                     col_indexes
                         .iter()
-                        .map(|&col_index| schema.field(col_index).name().to_string()),
+                        .map(|&col_index| schema.field(col_index).name().clone()),
                 )
             } else {
                 None

@@ -434,7 +434,7 @@ async fn create_iceberg_provider(
 
     props.insert(
         GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
-        metadata_location.to_string(),
+        metadata_location.clone(),
     );
 
     if let Some(catalog_id) = table.catalog_id.clone() {
@@ -557,7 +557,7 @@ fn get_metadata_location(table: &Table) -> Result<String, Error> {
     const METADATA_LOCATION: &str = "metadata_location";
     match &table.parameters {
         Some(properties) => match properties.get(METADATA_LOCATION) {
-            Some(location) => Ok(location.to_string()),
+            Some(location) => Ok(location.clone()),
             None => Err(Error::MissingMetadataLocation {
                 table: table.name().to_string(),
                 message: format!("No property '{METADATA_LOCATION}' found"),
