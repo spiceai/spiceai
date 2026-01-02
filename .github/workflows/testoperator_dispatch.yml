@@ -23,6 +23,7 @@ on:
           - 'append'
           - 'http-consistency'
           - 'nas'
+          - 'text-to-sql'
       update_snapshots:
         description: 'Update snapshots?'
         required: false
@@ -268,6 +269,9 @@ jobs:
         if: ${{ github.event.inputs.workflow_type == 'nas' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/nas \
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - Text to SQL
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/text_to_sql \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:

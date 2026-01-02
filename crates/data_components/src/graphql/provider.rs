@@ -79,18 +79,18 @@ impl GraphQLTableProviderBuilder {
 
     pub async fn build(self, query_string: &str) -> Result<GraphQLTableProvider> {
         let query_string: Arc<str> = Arc::from(query_string);
-        let mut query = GraphQLQuery::try_from(Arc::clone(&query_string))?;
+        let query = GraphQLQuery::try_from(Arc::clone(&query_string))?;
 
         if self.client.json_pointer.is_none() && query.json_pointer.is_none() {
             return Err(super::Error::NoJsonPointerFound {});
         }
 
         // Health check on GraphQL resource existence
-        if let Some(mut health_check_query) = self.health_check_query {
+        if let Some(health_check_query) = self.health_check_query {
             let _ = self
                 .client
                 .execute(
-                    &mut health_check_query,
+                    &health_check_query,
                     None,
                     None,
                     None,
@@ -103,7 +103,7 @@ impl GraphQLTableProviderBuilder {
         let result = self
             .client
             .execute(
-                &mut query,
+                &query,
                 None,
                 None,
                 None,

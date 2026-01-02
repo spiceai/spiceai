@@ -19,7 +19,10 @@ use runtime_rate_control::RateController;
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 
-use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
+use super::{
+    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
+    is_retriable_error,
+};
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
@@ -35,6 +38,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
 use url::Url;
 
@@ -728,7 +733,8 @@ impl GraphQLQuery {
         )
     }
 
-    pub fn limit_reached(&mut self, limit: Option<usize>, record_count: usize) -> bool {
+    #[must_use]
+    pub fn limit_reached(&self, limit: Option<usize>, record_count: usize) -> bool {
         if let Some(limit) = limit {
             record_count >= limit
         } else {
@@ -820,7 +826,7 @@ impl GraphQLClient {
 
     pub(crate) async fn execute(
         &self,
-        query: &mut GraphQLQuery,
+        query: &GraphQLQuery,
         schema: Option<SchemaRef>,
         limit: Option<usize>,
         cursor: Option<String>,
@@ -1101,7 +1107,7 @@ impl GraphQLClient {
     #[must_use]
     pub fn execute_paginated(
         self: Arc<Self>,
-        mut query: GraphQLQuery,
+        query: GraphQLQuery,
         gql_schema: SchemaRef,
         table_schema: SchemaRef,
         limit: Option<usize>,
@@ -1117,17 +1123,18 @@ impl GraphQLClient {
             // Track pagination iterations to prevent infinite loops
             let mut pagination_count = 0;
 
-            let mut result = self
-                .execute(
-                    &mut query,
-                    Some(Arc::clone(&gql_schema)),
-                    limit,
-                    None,
-                    error_checker.clone(),
-                    query_cost,
-                )
-                .await
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            // Execute initial page with retry
+            let mut result = Self::execute_with_retry(
+                &self,
+                &query,
+                Some(Arc::clone(&gql_schema)),
+                limit,
+                None,
+                error_checker.clone(),
+                query_cost,
+            )
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
             let mut limit = limit;
 
             for batch in result.records {
@@ -1175,17 +1182,18 @@ impl GraphQLClient {
 
                 previous_cursor = Some(next_cursor_val.clone());
 
-                result = self
-                    .execute(
-                        &mut query,
-                        Some(Arc::clone(&gql_schema)),
-                        limit,
-                        Some(next_cursor_val),
-                        error_checker.clone(),
-                        query_cost,
-                    )
-                    .await
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                // Execute subsequent pages with retry
+                result = Self::execute_with_retry(
+                    &self,
+                    &query,
+                    Some(Arc::clone(&gql_schema)),
+                    limit,
+                    Some(next_cursor_val),
+                    error_checker.clone(),
+                    query_cost,
+                )
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
                 for batch in result.records {
                     tx.send(Ok(batch)).await.map_err(|_| {
@@ -1201,6 +1209,45 @@ impl GraphQLClient {
         });
 
         builder.build()
+    }
+
+    /// Executes a GraphQL query with page-level retry for transient errors.
+    ///
+    /// Note: Rate limit handling (waiting until reset time) is done proactively by the
+    /// `RateLimiter` trait via `check_rate_limit()` before each request.
+    async fn execute_with_retry(
+        client: &Arc<Self>,
+        query: &GraphQLQuery,
+        schema: Option<SchemaRef>,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+    ) -> Result<GraphQLQueryResult> {
+        let backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
+            .build();
+
+        retry(backoff, || {
+            let schema = schema.clone();
+            let cursor = cursor.clone();
+            let error_checker = error_checker.clone();
+
+            async move {
+                client
+                    .execute(query, schema, limit, cursor, error_checker, query_cost)
+                    .await
+                    .map_err(|e| {
+                        if is_retriable_error(&e) {
+                            tracing::warn!("Page fetch failed, will retry: {e}");
+                            RetryError::transient(e)
+                        } else {
+                            RetryError::permanent(e)
+                        }
+                    })
+            }
+        })
+        .await
     }
 }
 

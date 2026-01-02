@@ -47,6 +47,7 @@ use spiced_tracing::LogVerbosity;
 use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
+use util::in_tracing_context;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -231,7 +232,7 @@ pub async fn run(args: Args) -> Result<()> {
     let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
     let resolved_cluster_config =
-        ResolvedClusterConfig::from_config_and_app(args.runtime.cluster.clone(), app.as_deref());
+        in_tracing_context(|| ResolvedClusterConfig::try_new(args.runtime.cluster.clone()));
 
     let mut builder = Runtime::builder()
         .with_app_opt(app.clone())

@@ -1,0 +1,92 @@
+name: testoperator_build_and_release
+
+on:
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'tools/testoperator/**'
+      - 'crates/test-framework/**'
+      - 'Cargo.lock'
+      - '.github/workflows/testoperator_build_and_release.yml'
+      - '.github/actions/build-testoperator/**'
+
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish Docker image to GHCR'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build-binary:
+    name: Build testoperator
+    runs-on: spiceai-dev-runners
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Build testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          install_to_system_path: 'false'
+          upload_artifact: 'true'
+          force_rebuild: 'true'
+          download_from_minio: 'true'
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Print version
+        run: ./target/release/testoperator --version
+
+  build-docker:
+    name: Build Docker image
+    needs: build-binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Download binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        with:
+          name: testoperator-linux
+          path: ./build
+
+      - name: List artifacts
+        run: ls -lR ./build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy Dockerfile to build context
+        run: cp tools/testoperator/Dockerfile ./build/Dockerfile
+
+      - name: Build image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: ./build
+          file: ./build/Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/testoperator:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/testoperator:latest
+          cache-from: type=gha,scope=testoperator
+          cache-to: type=gha,scope=testoperator,mode=max
