@@ -11,6 +11,7 @@ version = "0.1.0"
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
+arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -67,3 +68,7 @@ tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 [[bench]]
 harness = false
 name = "metastore_operations"
+
+[[bench]]
+harness = false
+name = "deletion_strategies"
