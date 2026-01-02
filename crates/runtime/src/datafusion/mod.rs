@@ -97,6 +97,7 @@ pub mod builder;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
+pub mod flight_session_extension;
 pub mod managed_runtime;
 pub mod param_utils;
 pub mod refresh_sql;
@@ -104,7 +105,7 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
-mod sql_validator;
+pub(crate) mod sql_validator;
 pub mod udf;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";

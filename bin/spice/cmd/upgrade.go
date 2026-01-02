@@ -68,14 +68,14 @@ spice upgrade v1.8.3
 		// Special handling for version-specific upgrades: install both runtime and CLI without restart
 		if targetVersion != "" {
 			slog.Info(fmt.Sprintf("Upgrading to Spice version %s...", targetVersion))
-			
+
 			// Determine flavor from current installation
 			flavor := constants.FlavorCore
 			models, accelerated := rtcontext.ModelsFlavorInstalled()
 			if models {
 				flavor = constants.FlavorAI
 			}
-			
+
 			// Install runtime first (sets version lock)
 			err = rtcontext.InstallSpecificRuntime(targetVersion, flavor, accelerated)
 			if err != nil {
@@ -83,11 +83,11 @@ spice upgrade v1.8.3
 				os.Exit(1)
 			}
 			slog.Info(fmt.Sprintf("Runtime upgraded to %s successfully.", targetVersion))
-			
+
 			// Then upgrade CLI - note: returns false on success (ready to restart)
 			// But we won't restart - we'll just exit with success
 			upgradeCli(false, targetVersion, true, rtcontext)
-			
+
 			slog.Info(fmt.Sprintf("Spice upgraded to %s successfully.", targetVersion))
 			return
 		}

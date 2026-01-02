@@ -81,6 +81,7 @@ mod odbc;
 mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
+mod prepared_statements;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;

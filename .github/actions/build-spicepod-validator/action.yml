@@ -123,11 +123,16 @@ runs:
         minio_endpoint: ${{ inputs.minio_endpoint }}
         os: ${{ steps.detect-os.outputs.os }}
 
+    - name: Set up make
+      if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
+      uses: ./.github/actions/setup-make
+      with:
+        os: ${{ steps.detect-os.outputs.os }}
+
     - name: Build spicepod-validator
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
       shell: bash
-      run: |
-        cargo build -p spicepod-validator --release
+      run: make build-validator
       env:
         RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
         AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}

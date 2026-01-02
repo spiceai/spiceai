@@ -69,11 +69,16 @@ mod get_schema;
 mod handshake;
 mod metrics;
 mod middleware;
+mod session;
+mod session_auth;
 mod util;
+
+pub use session::SessionStore;
 
 pub struct Service {
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+    session_store: SessionStore,
 }
 
 impl Service {
@@ -84,6 +89,7 @@ impl Service {
             // Pre-allocate for typical workloads (avoid reallocation)
             channel_map: Arc::new(RwLock::new(HashMap::with_capacity(64))),
             basic_auth,
+            session_store: SessionStore::new(),
         }
     }
 }
@@ -103,7 +109,12 @@ impl FlightService for Service {
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
         let _start = track_flight_request("do_handshake", None).await;
-        let response = handshake::handle(request.metadata(), self.basic_auth.as_ref()).await?;
+        let response = handshake::handle(
+            request.metadata(),
+            self.basic_auth.as_ref(),
+            &self.session_store,
+        )
+        .await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
 
@@ -287,7 +298,7 @@ impl Service {
     }
 }
 
-fn record_batches_to_flight_stream(
+pub(crate) fn record_batches_to_flight_stream(
     record_batches: Vec<RecordBatch>,
 ) -> impl Stream<Item = Result<FlightData, Status>> {
     FlightDataEncoderBuilder::new()
@@ -437,7 +448,13 @@ pub(crate) fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
     false
 }
 
-/// Starts flight service
+/// Starts the Flight server.
+///
+/// # Errors
+///
+/// Returns an error if the server fails to bind to the specified address or if there are issues
+/// with TLS setup.
+///
 /// # Panics
 /// If running in clustered mode, will panic unless TLS is configured or user manually overrides
 /// this safety check, as RPC will transmit sensitive information to executors.
@@ -462,6 +479,7 @@ pub async fn start(
     }
 
     let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let session_store = service.session_store.clone();
 
     let flight_message_size = app
         .as_ref()
@@ -488,15 +506,25 @@ pub async fn start(
         server = server_with_tls_config(server, tls_config).context(UnableToConfigureTlsSnafu)?;
     }
 
+    // Wrap the auth in session-awareness to accept session IDs as bearer tokens
+    let session_aware_auth = session_auth::with_session_awareness(
+        endpoint_auth.flight_basic_auth,
+        session_store.clone(),
+    );
     let auth_layer = tower::ServiceBuilder::new()
-        .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
+        .layer(BasicAuthLayer::new(session_aware_auth))
         .into_inner();
 
     // Create the OpenTelemetry MetricsService
     let otel_service = create_metrics_service(rt.datafusion());
 
     let mut server = server
-        .layer(RequestContextLayer::new(app, rt.datafusion(), rt.secrets()))
+        .layer(RequestContextLayer::new(
+            app,
+            rt.datafusion(),
+            session_store,
+            rt.secrets(),
+        ))
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))

@@ -1,0 +1,12 @@
+---
+source: crates/runtime/tests/prepared_statements/mod.rs
+description: EXPLAIN PREPARE my_query AS SELECT 1 + 10 AS result
+---
++---------------------+-------------------------------------------------------------------------------+
+| plan_type           | plan                                                                          |
++---------------------+-------------------------------------------------------------------------------+
+| logical_plan        | Prepare: "my_query" []                                                        |
+|                     |   Projection: Int64(11) AS result                                             |
+|                     |     EmptyRelation: rows=1                                                     |
+| physical_plan_error | This feature is not implemented: Unsupported logical plan: Statement(Prepare) |
++---------------------+-------------------------------------------------------------------------------+
