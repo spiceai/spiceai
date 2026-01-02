@@ -47,8 +47,8 @@ use tonic::transport::Channel;
 pub mod arrow_flight_factory;
 pub mod tls;
 
-pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
-pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+pub const MAX_ENCODING_MESSAGE_SIZE: usize = 102 * 1024 * 1024;
+pub const MAX_DECODING_MESSAGE_SIZE: usize = 103 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct TonicStatusError(Box<tonic::Status>);
