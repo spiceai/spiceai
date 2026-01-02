@@ -33,7 +33,6 @@ limitations under the License.
 use std::sync::Arc;
 
 use runtime_auth::{AuthVerdict, FlightBasicAuth, error::Error};
-use spicepod::component::runtime::ApiKey;
 
 use super::SessionStore;
 
@@ -107,6 +106,7 @@ mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
     use runtime_auth::api_key::ApiKeyAuth;
+    use spicepod::component::runtime::ApiKey;
 
     #[test]
     fn test_session_aware_auth() {

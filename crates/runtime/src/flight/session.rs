@@ -84,7 +84,7 @@ impl std::fmt::Debug for SessionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionStore")
             .field("session_count", &self.sessions.entry_count())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -272,15 +272,14 @@ impl SessionStore {
     pub fn session_count(&self) -> usize {
         // MAX_SESSIONS is 10,000 which fits in usize on all platforms,
         // but we use try_from for explicit safety and better code quality
-        match usize::try_from(self.sessions.entry_count()) {
-            Ok(count) => count,
-            Err(_) => {
-                tracing::warn!(
-                    "Flight SQL session count {} exceeded usize::MAX; returning 0 sessions",
-                    self.sessions.entry_count()
-                );
-                0
-            }
+        if let Ok(count) = usize::try_from(self.sessions.entry_count()) {
+            count
+        } else {
+            tracing::warn!(
+                "Flight SQL session count {} exceeded usize::MAX; returning 0 sessions",
+                self.sessions.entry_count()
+            );
+            0
         }
     }
 }

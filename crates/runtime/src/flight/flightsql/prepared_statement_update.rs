@@ -42,7 +42,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::prepared_statement_query::{PreparedStatement, decode_param_values, error_to_status};
 
-/// Static schema for affected_rows result to avoid allocation on each request.
+/// Static schema for `affected_rows` result to avoid allocation on each request.
 static AFFECTED_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![Field::new(
         "affected_rows",
