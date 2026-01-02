@@ -70,12 +70,14 @@ type SchedulerEndpointOverride =
 pub mod datafusion;
 mod discovery;
 pub mod lease;
+pub mod lease_executor;
 mod polling;
 mod servers;
 mod service;
 
 pub use discovery::start_executor_discovery_loop;
 pub use lease::LeaseManager;
+pub use lease_executor::{LEASE_ID_PROP_KEY, LeaseValidatingExecutorGrpc};
 pub use polling::start_executor_poll_loop;
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::{ClusterServiceImpl, ExecutorLeaseServiceImpl, ExecutorServiceImpl};

@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::ClusterTlsConfig;
 use super::lease::LeaseManager;
+use super::lease_executor::LeaseValidatingExecutorGrpc;
 use crate::cluster::{ClusterServiceImpl, ExecutorLeaseServiceImpl, ExecutorServiceImpl};
 use crate::flight::{Error, is_address_in_use_error};
 use crate::{Runtime, metrics as runtime_metrics};
@@ -165,7 +166,12 @@ pub async fn start_executor_flight_server(
         .ok()
         .and_then(|maybe_executor| maybe_executor.clone())
         .ok_or(Error::ClusterExecutorNotInitialized {})?;
-    let executor_grpc_server = ExecutorGrpcServer::new(executor_grpc.as_ref().clone())
+    // Wrap executor with lease validation to enforce slot reservations
+    let lease_validating_executor = LeaseValidatingExecutorGrpc::new(
+        executor_grpc.as_ref().clone(),
+        Arc::clone(&lease_manager),
+    );
+    let executor_grpc_server = ExecutorGrpcServer::new(lease_validating_executor)
         .max_decoding_message_size(usize::MAX)
         .max_encoding_message_size(usize::MAX);
 
