@@ -24,15 +24,19 @@ use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::executor_service_server::ExecutorService;
 use runtime_proto::{
     DescribeExecutorRequest, DescribeExecutorResponse, ExpandSecretRequest, ExpandSecretResponse,
-    GetAppDefinitionRequest, GetAppDefinitionResponse,
+    GetAppDefinitionRequest, GetAppDefinitionResponse, PollExecutorRequest, PollExecutorResponse,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use crate::datafusion::DataFusion;
+use ballista_executor::executor_server::TERMINATING;
+use prost::Message;
 
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
@@ -181,6 +185,58 @@ impl ExecutorService for ExecutorServiceImpl {
             port: registration.port,
             grpc_port: registration.grpc_port,
             task_slots,
+        }))
+    }
+
+    async fn poll_executor(
+        &self,
+        request: Request<PollExecutorRequest>,
+    ) -> Result<Response<PollExecutorResponse>, Status> {
+        let request = request.into_inner();
+        tracing::trace!(
+            "ExecutorService::poll_executor called for scheduler {}",
+            request.scheduler_id
+        );
+
+        let executor_guard = self
+            .df
+            .executor
+            .read()
+            .map_err(|_| Status::internal("Failed to acquire executor lock"))?;
+
+        let Some(ref executor) = *executor_guard else {
+            return Err(Status::unavailable(
+                "Executor registration not yet available",
+            ));
+        };
+
+        let max_statuses = usize::try_from(request.max_statuses).unwrap_or(0);
+        let task_statuses = executor
+            .status_store()
+            .drain_task_statuses(&request.scheduler_id, max_statuses);
+
+        let mut encoded = Vec::with_capacity(task_statuses.len());
+        for status in task_statuses {
+            let mut buf = Vec::new();
+            status
+                .encode(&mut buf)
+                .map_err(|e| Status::internal(format!("Failed to encode task status: {e}")))?;
+            encoded.push(buf);
+        }
+
+        let timestamp_millis = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| Status::internal(format!("Failed to read system time: {e}")))?
+                .as_millis(),
+        )
+        .map_err(|e| Status::internal(format!("Failed to read system time: {e}")))?;
+
+        Ok(Response::new(PollExecutorResponse {
+            executor_id: executor.metadata.id.clone(),
+            terminating: TERMINATING.load(Ordering::Acquire),
+            timestamp_millis,
+            task_statuses: encoded,
         }))
     }
 }

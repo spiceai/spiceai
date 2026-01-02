@@ -23,6 +23,8 @@ service ExecutorService {
     // Get the executor's registration information including task slots.
     // Called by schedulers during executor discovery.
     rpc DescribeExecutor(DescribeExecutorRequest) returns (DescribeExecutorResponse);
+    // Poll the executor for task status updates and basic health.
+    rpc PollExecutor(PollExecutorRequest) returns (PollExecutorResponse);
 }
 
 // Request message for DescribeExecutor RPC.
@@ -40,6 +42,26 @@ message DescribeExecutorResponse {
     uint32 grpc_port = 4;
     // Number of task slots available for concurrent task execution.
     uint32 task_slots = 5;
+}
+
+// Request message for PollExecutor RPC.
+message PollExecutorRequest {
+    // Scheduler ID requesting status updates.
+    string scheduler_id = 1;
+    // Maximum number of task statuses to return. Zero means no limit.
+    uint32 max_statuses = 2;
+}
+
+// Response message for PollExecutor RPC.
+message PollExecutorResponse {
+    // Executor ID that produced the response.
+    string executor_id = 1;
+    // True if the executor is terminating.
+    bool terminating = 2;
+    // Milliseconds since UNIX epoch for this snapshot.
+    uint64 timestamp_millis = 3;
+    // Serialized TaskStatus protobufs (ballista_core::serde::protobuf::TaskStatus).
+    repeated bytes task_statuses = 4;
 }
 
 // Request message for GetAppDefinition RPC.

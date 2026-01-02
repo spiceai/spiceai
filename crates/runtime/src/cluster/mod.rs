@@ -26,6 +26,7 @@ use crate::{
 use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::prelude::SessionConfig;
 use app::App;
+use ballista_core::config::TaskSchedulingPolicy;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::BallistaCodec;
@@ -36,9 +37,11 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_core::{ConfigProducer, RuntimeProducer};
-use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
+use ballista_executor::executor_process::ExecutorProcessConfig;
+use ballista_executor::executor_server::create_executor_server_without_registration;
 use ballista_executor::metrics::LoggingMetricsCollector;
+use ballista_executor::shutdown::ShutdownNotifier;
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process;
@@ -47,7 +50,6 @@ use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use futures::TryFutureExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::GetAppDefinitionRequest;
@@ -58,7 +60,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
 
@@ -67,10 +69,12 @@ type SchedulerEndpointOverride =
 
 pub mod datafusion;
 mod discovery;
+mod polling;
 mod servers;
 mod service;
 
 pub use discovery::start_executor_discovery_loop;
+pub use polling::start_executor_poll_loop;
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::{ClusterServiceImpl, ExecutorServiceImpl};
 
@@ -531,9 +535,9 @@ pub async fn initialize_cluster_executor(
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service - use advertise address for scheduler to contact this executor
-        host: Some(advertise_host),
+        host: Some(advertise_host.clone()),
         port: u32::from(advertise_port),
-        // grpc_port is used only for push mode, and not initialized for pull mode (default)
+        // executor gRPC service shares the executor cluster service port
         grpc_port: u32::from(advertise_port),
         specification: Some(ExecutorSpecification {
             resources: vec![ExecutorResource {
@@ -565,22 +569,58 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    let (tx_ready, rx_ready) = oneshot::channel::<String>();
+    let (stop_send, mut stop_recv) = mpsc::channel::<bool>(10);
+    let shutdown_noti = ShutdownNotifier::new();
 
-    let executor_poll_loop = tokio::spawn(
-        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec, Some(tx_ready)).map_err(
-            |e| FailedToStartClusterExecutor {
-                source: Box::new(e),
-            },
-        ),
-    );
+    let scheduler_host = scheduler_url
+        .host_str()
+        .ok_or_else(|| FailedToStartClusterExecutor {
+            source: "Unable to determine scheduler host".to_string().into(),
+        })?
+        .to_string();
+    let scheduler_port =
+        scheduler_url
+            .port_or_known_default()
+            .ok_or_else(|| FailedToStartClusterExecutor {
+                source: "Unable to determine scheduler port".to_string().into(),
+            })?;
+
+    let executor_config = ExecutorProcessConfig {
+        task_scheduling_policy: TaskSchedulingPolicy::PushStaged,
+        bind_host: "0.0.0.0".to_string(),
+        external_host: Some(advertise_host.clone()),
+        port: advertise_port,
+        grpc_port: advertise_port,
+        scheduler_host,
+        scheduler_port,
+        grpc_max_decoding_message_size: u32::MAX,
+        grpc_max_encoding_message_size: u32::MAX,
+        disable_scheduler_heartbeats: true,
+        disable_task_status_push: true,
+        override_create_grpc_client_endpoint: client_tls_config
+            .clone()
+            .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _),
+        ..Default::default()
+    };
+
+    let executor_server = create_executor_server_without_registration(
+        scheduler,
+        Arc::new(executor_config),
+        Arc::clone(&executor),
+        codec,
+        stop_send,
+        &shutdown_noti,
+    )
+    .await
+    .boxed()
+    .context(FailedToStartClusterExecutorSnafu)?;
+
+    rt.df
+        .bind_executor_grpc(Arc::clone(&executor_server))
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
 
     Ok(async move {
-        let _ = rx_ready
-            .await
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
-
         // Bind the already-fetched app and initialize secrets for object store configuration
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
 
@@ -588,10 +628,11 @@ pub async fn initialize_cluster_executor(
 
         rt.status.update_cluster("executor", ComponentStatus::Ready);
 
-        executor_poll_loop
-            .await
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?
+        if stop_recv.recv().await.is_some() {
+            let _ = shutdown_noti.notify_shutdown.send(());
+        }
+
+        Ok(())
     })
 }
 
@@ -612,6 +653,7 @@ async fn create_scheduler_server(
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
         bind_port: bind_addr.port(),
+        scheduling_policy: TaskSchedulingPolicy::PushStaged,
 
         override_logical_codec: Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt))),
         override_physical_codec: Some(
@@ -622,6 +664,7 @@ async fn create_scheduler_server(
 
         grpc_server_max_decoding_message_size: u32::MAX,
         grpc_server_max_encoding_message_size: u32::MAX,
+        executor_grpc_use_tls: client_tls_config.is_some(),
 
         override_session_builder: Some(Arc::new(move |_cfg| {
             let cfg = current_context

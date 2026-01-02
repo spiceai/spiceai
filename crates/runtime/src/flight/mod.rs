@@ -428,11 +428,26 @@ pub enum Error {
     ))]
     ClusterSchedulerNotInitialized {},
 
+    #[snafu(display(
+        "The cluster executor is not initialized, preventing the flight service from starting."
+    ))]
+    ClusterExecutorNotInitialized {},
+
     #[snafu(display("Unable to start internal cluster server: {source}"))]
     UnableToStartClusterServer { source: tonic::transport::Error },
 
     #[snafu(display("The flight service has an insecure configuration: {message}"))]
     InsecureConfiguration { message: String },
+
+    #[snafu(display("Failed to register executor with scheduler: {source}"))]
+    FailedToRegisterExecutor {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Executor flight server task failed: {source}"))]
+    FlightServerTaskFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

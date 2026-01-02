@@ -18,11 +18,14 @@ use super::ClusterTlsConfig;
 use crate::cluster::{ClusterServiceImpl, ExecutorServiceImpl};
 use crate::flight::{Error, is_address_in_use_error};
 use crate::{Runtime, metrics as runtime_metrics};
+use ballista_core::serde::protobuf::executor_grpc_server::ExecutorGrpcServer;
+use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
+use ballista_core::utils::create_grpc_client_endpoint;
+use ballista_executor::executor_server::register_executor_with_scheduler;
 use ballista_executor::flight_service::BallistaFlightService;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use runtime_proto::executor_service_server::ExecutorServiceServer;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Server, ServerTlsConfig};
@@ -149,6 +152,16 @@ pub async fn start_executor_flight_server(
     // and ExecutorService for scheduler-driven discovery.
     let executor_service = ExecutorServiceImpl::new(Arc::clone(&rt.df));
     let executor_service_server = ExecutorServiceServer::new(executor_service);
+    let executor_grpc = rt
+        .df
+        .executor_grpc
+        .read()
+        .ok()
+        .and_then(|maybe_executor| maybe_executor.clone())
+        .ok_or(Error::ClusterExecutorNotInitialized {})?;
+    let executor_grpc_server = ExecutorGrpcServer::new(executor_grpc.as_ref().clone())
+        .max_decoding_message_size(usize::MAX)
+        .max_encoding_message_size(usize::MAX);
 
     let server = server
         .add_service(
@@ -158,10 +171,11 @@ pub async fn start_executor_flight_server(
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX),
         )
-        .add_service(executor_service_server);
+        .add_service(executor_service_server)
+        .add_service(executor_grpc_server);
 
     // Use the executor's bound address if it was dynamically assigned during registration.
-    #[expect(clippy::cast_possible_truncation)]
+    let cluster_bind_ip = rt.df.cluster_config.node_bind_address().ip();
     let bind_address = rt
         .df
         .executor
@@ -170,39 +184,78 @@ pub async fn start_executor_flight_server(
         .and_then(|maybe_executor| {
             maybe_executor
                 .as_ref()
-                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
+                .map(|e| e.metadata.port)
+                .and_then(|port| u16::try_from(port).ok())
         })
-        .and_then(|spec| {
-            let (host, port) = &spec;
-            tokio::task::block_in_place(|| match spec.to_socket_addrs() {
-                Ok(sa) => Some(sa),
-                Err(e) => {
-                    tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
-                    None
-                }
-            })
-        })
-        .and_then(|mut addrs| addrs.next())
-        .unwrap_or(bind_address);
+        .map_or(bind_address, |port| {
+            std::net::SocketAddr::new(cluster_bind_ip, port)
+        });
 
     tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
 
-    if let Some(token) = shutdown_signal {
+    let server_shutdown = shutdown_signal.unwrap_or_default();
+    let server_shutdown_token = server_shutdown.clone();
+    let server_handle = tokio::spawn(async move {
         server
-            .serve_with_shutdown(bind_address, token.cancelled())
+            .serve_with_shutdown(bind_address, server_shutdown_token.cancelled())
             .await
-    } else {
-        server.serve(bind_address).await
-    }
-    .map_err(|e| {
-        if is_address_in_use_error(&e) {
-            return Error::AddressAlreadyInUse {
-                addr: bind_address.to_string(),
-            };
+    });
+
+    if let Some(scheduler_url) = rt.df.cluster_config.scheduler_address() {
+        let mut endpoint = create_grpc_client_endpoint(scheduler_url.to_string()).map_err(|e| {
+            Error::FailedToRegisterExecutor {
+                source: Box::new(e),
+            }
+        })?;
+        if let Some(tls_config) = rt.df.cluster_config.client_tls_config().cloned() {
+            endpoint =
+                endpoint
+                    .tls_config(tls_config)
+                    .map_err(|e| Error::FailedToRegisterExecutor {
+                        source: Box::new(e),
+                    })?;
         }
-        Error::UnableToStartFlightServer { source: e }
-    })?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| Error::FailedToRegisterExecutor {
+                source: Box::new(e),
+            })?;
+        let mut scheduler = SchedulerGrpcClient::new(channel)
+            .max_encoding_message_size(usize::MAX)
+            .max_decoding_message_size(usize::MAX);
+
+        let executor = rt
+            .df
+            .executor
+            .read()
+            .ok()
+            .and_then(|maybe_executor| maybe_executor.clone())
+            .ok_or(Error::ClusterExecutorNotInitialized {})?;
+
+        if let Err(e) = register_executor_with_scheduler(&mut scheduler, executor).await {
+            server_shutdown.cancel();
+            let _ = server_handle.await;
+            return Err(Error::FailedToRegisterExecutor {
+                source: Box::new(e),
+            });
+        }
+    }
+
+    server_handle
+        .await
+        .map_err(|e| Error::FlightServerTaskFailed {
+            source: Box::new(e),
+        })?
+        .map_err(|e| {
+            if is_address_in_use_error(&e) {
+                return Error::AddressAlreadyInUse {
+                    addr: bind_address.to_string(),
+                };
+            }
+            Error::UnableToStartFlightServer { source: e }
+        })?;
 
     tracing::debug!("Spice Runtime executor Flight stopped");
 

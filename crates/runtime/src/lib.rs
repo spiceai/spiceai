@@ -683,6 +683,23 @@ impl Runtime {
                 None
             };
 
+        // Executor polling future (scheduler-only)
+        let maybe_poll_future: Option<BoxedClusterFuture> =
+            if self.df.cluster_config.effective_role() == Some(ClusterRole::Scheduler) {
+                let poll_shutdown = CancellationToken::new();
+                let poll_rt = Arc::clone(&self);
+                let cloned_poll_shutdown = poll_shutdown.clone();
+                let poll_fut = async move {
+                    cluster::start_executor_poll_loop(poll_rt, cloned_poll_shutdown).await
+                };
+                Some(Box::pin(
+                    self.start_runtime_task("cluster_executor_poll", Some(poll_shutdown), poll_fut)
+                        .await,
+                ))
+            } else {
+                None
+            };
+
         let maybe_cluster_future: Option<BoxedClusterFuture> =
             match self.df.cluster_config.effective_role() {
                 Some(ClusterRole::Scheduler) => {
@@ -854,8 +871,27 @@ impl Runtime {
             .await;
 
         // wait for all servers to shut down or if any of the servers fail to start
-        match (maybe_cluster_future, maybe_discovery_future) {
-            (Some(cluster_future), Some(discovery_future)) => {
+        match (
+            maybe_cluster_future,
+            maybe_discovery_future,
+            maybe_poll_future,
+        ) {
+            (Some(cluster_future), Some(discovery_future), Some(poll_future)) => {
+                match tokio::try_join!(
+                    http_future,
+                    flight_future,
+                    metrics_future,
+                    pods_watcher_future,
+                    cluster_future,
+                    discovery_future,
+                    poll_future,
+                    shutdown_signal_future
+                ) {
+                    Err(err) => Err(err),
+                    _ => Ok(()),
+                }
+            }
+            (Some(cluster_future), Some(discovery_future), None) => {
                 match tokio::try_join!(
                     http_future,
                     flight_future,
@@ -869,13 +905,67 @@ impl Runtime {
                     _ => Ok(()),
                 }
             }
-            (Some(cluster_future), None) => {
+            (Some(cluster_future), None, Some(poll_future)) => {
                 match tokio::try_join!(
                     http_future,
                     flight_future,
                     metrics_future,
                     pods_watcher_future,
                     cluster_future,
+                    poll_future,
+                    shutdown_signal_future
+                ) {
+                    Err(err) => Err(err),
+                    _ => Ok(()),
+                }
+            }
+            (Some(cluster_future), None, None) => {
+                match tokio::try_join!(
+                    http_future,
+                    flight_future,
+                    metrics_future,
+                    pods_watcher_future,
+                    cluster_future,
+                    shutdown_signal_future
+                ) {
+                    Err(err) => Err(err),
+                    _ => Ok(()),
+                }
+            }
+            (None, Some(discovery_future), Some(poll_future)) => {
+                match tokio::try_join!(
+                    http_future,
+                    flight_future,
+                    metrics_future,
+                    pods_watcher_future,
+                    discovery_future,
+                    poll_future,
+                    shutdown_signal_future
+                ) {
+                    Err(err) => Err(err),
+                    _ => Ok(()),
+                }
+            }
+            (None, Some(discovery_future), None) => {
+                match tokio::try_join!(
+                    http_future,
+                    flight_future,
+                    metrics_future,
+                    pods_watcher_future,
+                    discovery_future,
+                    shutdown_signal_future
+                ) {
+                    Err(err) => Err(err),
+                    _ => Ok(()),
+                }
+            }
+            (None, None, Some(poll_future)) => {
+                match tokio::try_join!(
+                    http_future,
+                    flight_future,
+                    metrics_future,
+                    pods_watcher_future,
+                    poll_future,
                     shutdown_signal_future
                 ) {
                     Err(err) => Err(err),
