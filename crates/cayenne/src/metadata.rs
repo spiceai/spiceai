@@ -87,7 +87,7 @@ pub struct DataFile {
     pub row_id_start: i64,
     /// Sequence number when this data file was written.
     /// Used for ordering deletions: a deletion only applies to data files with
-    /// sequence_number <= the delete file's sequence_number.
+    /// `sequence_number` <= the delete file's `sequence_number`.
     pub sequence_number: i64,
 }
 

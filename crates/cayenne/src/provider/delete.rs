@@ -344,6 +344,7 @@ impl datafusion_execution::RecordBatchStream for DeletionFilterStream {
 /// A row is only filtered out if its key is in `deleted_row_keys` AND either:
 /// - It's not in `insert_records`, OR
 /// - Its `insert_sequence < delete_sequence` for that key
+///
 /// This allows upsert semantics without full table compaction.
 ///
 /// # Zero-Copy Design
@@ -615,6 +616,7 @@ impl datafusion_execution::RecordBatchStream for KeyBasedDeletionFilterStream {
 /// A row is only filtered out if its PK is in `deleted_pk_values` AND either:
 /// - It's not in `insert_records`, OR
 /// - Its `insert_sequence < delete_sequence` for that PK
+///
 /// This allows upsert semantics without full table compaction.
 pub struct Int64PkDeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
@@ -1268,7 +1270,7 @@ impl CayenneDeletionSink {
         &self,
         row_keys: Vec<Box<[u8]>>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let filtered_row_keys = self.filter_existing_key_deletions(row_keys).await?;
+        let filtered_row_keys = Self::filter_existing_key_deletions(row_keys);
 
         if filtered_row_keys.is_empty() {
             return Ok(0);
@@ -1360,7 +1362,7 @@ impl CayenneDeletionSink {
         &self,
         pk_values: Vec<i64>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let filtered_pk_values = self.filter_existing_int64_pk_deletions(pk_values)?;
+        let filtered_pk_values = Self::filter_existing_int64_pk_deletions(pk_values);
 
         if filtered_pk_values.is_empty() {
             return Ok(0);
@@ -1446,17 +1448,14 @@ impl CayenneDeletionSink {
         Ok(deleted_count)
     }
 
-    fn filter_existing_int64_pk_deletions(
-        &self,
-        pk_values: Vec<i64>,
-    ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+    fn filter_existing_int64_pk_deletions(pk_values: Vec<i64>) -> Vec<i64> {
         // For sequence-based ordering, we MUST write new deletion files even for
         // PKs that were already deleted, because the new deletion has a higher
         // sequence number. This ensures proper ordering: data written after the
         // first delete but before the second delete will be properly filtered.
         //
         // We only deduplicate within the current batch (in DeletionVectorWriter).
-        Ok(pk_values)
+        pk_values
     }
 
     async fn filter_existing_position_deletions(
@@ -1504,17 +1503,14 @@ impl CayenneDeletionSink {
             .collect())
     }
 
-    async fn filter_existing_key_deletions(
-        &self,
-        row_keys: Vec<Box<[u8]>>,
-    ) -> Result<Vec<Box<[u8]>>, Box<dyn std::error::Error + Send + Sync>> {
+    fn filter_existing_key_deletions(row_keys: Vec<Box<[u8]>>) -> Vec<Box<[u8]>> {
         // For sequence-based ordering, we MUST write new deletion files even for
         // PKs that were already deleted, because the new deletion has a higher
         // sequence number. This ensures proper ordering: data written after the
         // first delete but before the second delete will be properly filtered.
         //
         // We only deduplicate within the current batch (in DeletionVectorWriter).
-        Ok(row_keys)
+        row_keys
     }
 }
 
@@ -1700,6 +1696,7 @@ pub fn read_deletion_vectors(
 /// # Errors
 ///
 /// Returns an error if any deletion vector file cannot be read or parsed.
+#[expect(dead_code)]
 pub fn read_key_based_deletion_vectors(
     delete_files: Vec<crate::metadata::DeleteFile>,
 ) -> datafusion_common::Result<HashSet<Box<[u8]>>> {
@@ -1784,6 +1781,7 @@ pub fn read_key_based_deletion_vectors(
 /// # Errors
 ///
 /// Returns an error if any deletion vector file cannot be read or parsed.
+#[expect(clippy::type_complexity)]
 pub fn detect_deletion_type_and_read(
     delete_files: Vec<crate::metadata::DeleteFile>,
 ) -> datafusion_common::Result<(RoaringBitmap, HashMap<Box<[u8]>, i64>)> {

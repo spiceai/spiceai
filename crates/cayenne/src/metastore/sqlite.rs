@@ -161,8 +161,8 @@ impl SqliteMetastore {
     /// Insert records track PKs that were re-inserted after being deleted.
     /// Each record stores the sequence number when the insert occurred.
     /// Combined with the delete's sequence number, this enables ordering:
-    /// - If insert_sequence > delete_sequence for a PK, the row is visible
-    /// - If delete_sequence > insert_sequence, the row is filtered out
+    /// - If `insert_sequence` > `delete_sequence` for a PK, the row is visible
+    /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
             insert_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,8 +177,8 @@ impl SqliteMetastore {
     /// Schema for the `cayenne_snapshot_sequence` table.
     ///
     /// Tracks the sequence number for each snapshot. This enables Iceberg-style
-    /// sequence ordering: a deletion only applies to snapshots with sequence_number
-    /// <= the delete file's sequence_number.
+    /// sequence ordering: a deletion only applies to snapshots with `sequence_number`
+    /// <= the delete file's `sequence_number`.
     const SNAPSHOT_SEQUENCE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_snapshot_sequence (
             table_id INTEGER NOT NULL,

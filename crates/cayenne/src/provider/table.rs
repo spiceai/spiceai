@@ -125,28 +125,28 @@ pub struct CayenneTableProvider {
     ///
     /// This is the most efficient deletion strategy - direct i64 comparison without
     /// any serialization overhead. 8 bytes per deleted key.
-    /// Maps PK -> delete_sequence_number for sequence-based ordering.
+    /// Maps PK -> `delete_sequence_number` for sequence-based ordering.
     cached_deleted_pk_i64: Arc<RwLock<Arc<std::collections::HashMap<i64, i64>>>>,
     /// Cached deletion vectors (deleted row keys) for key-based deletion.
     /// Used for tables with composite or non-integer primary keys.
     ///
     /// Keys are the byte representation of primary key columns via Arrow's `RowConverter`.
-    /// Maps PK bytes -> delete_sequence_number for sequence-based ordering.
+    /// Maps PK bytes -> `delete_sequence_number` for sequence-based ordering.
     #[expect(clippy::type_complexity)]
     cached_deleted_row_keys: Arc<RwLock<Arc<std::collections::HashMap<Box<[u8]>, i64>>>>,
     /// Cached insert records for Int64 primary key-based deletion.
     /// Used for tables with a single-column Int64 primary key.
     ///
     /// Insert records track PKs that were re-inserted after being deleted (upserted).
-    /// Maps PK -> insert_sequence_number.
-    /// During scan: delete applies only if delete_sequence > insert_sequence for that PK.
+    /// Maps PK -> `insert_sequence_number`.
+    /// During scan: delete applies only if `delete_sequence` > `insert_sequence` for that PK.
     cached_insert_records_pk_i64: Arc<RwLock<Arc<std::collections::HashMap<i64, i64>>>>,
     /// Cached insert records (row keys) for key-based deletion.
     /// Used for tables with composite or non-integer primary keys.
     ///
     /// Insert records track PKs that were re-inserted after being deleted (upserted).
-    /// Maps PK bytes -> insert_sequence_number.
-    /// During scan: delete applies only if delete_sequence > insert_sequence for that PK.
+    /// Maps PK bytes -> `insert_sequence_number`.
+    /// During scan: delete applies only if `delete_sequence` > `insert_sequence` for that PK.
     #[expect(clippy::type_complexity)]
     cached_insert_records_row_keys: Arc<RwLock<Arc<std::collections::HashMap<Box<[u8]>, i64>>>>,
     /// Strategy for primary key-based deletion filtering.
@@ -182,7 +182,7 @@ pub struct CayenneTableProvider {
     /// to a new snapshot that is "protected" - deletions that existed at the time
     /// of insert should not apply to this snapshot's data.
     ///
-    /// Maps snapshot_id -> minimum_sequence (all deletes with seq <= min_seq don't apply).
+    /// Maps `snapshot_id` -> `minimum_sequence` (all deletes with seq <= `min_seq` don't apply).
     /// At scan time, data from these snapshots is scanned without deletion filtering.
     protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
 }
@@ -1097,8 +1097,8 @@ impl CayenneTableProvider {
     ///
     /// This is used when inserting while pending PK-based deletions exist.
     /// By writing to a new snapshot with a higher sequence number, we ensure:
-    /// - Old data in previous snapshots is filtered by deletions (delete_seq >= old_snapshot_seq)
-    /// - New data in this snapshot is visible (new_snapshot_seq > delete_seq)
+    /// - Old data in previous snapshots is filtered by deletions (`delete_seq` >= `old_snapshot_seq`)
+    /// - New data in this snapshot is visible (`new_snapshot_seq` > `delete_seq`)
     ///
     /// This achieves Iceberg-style sequence ordering without rewriting existing files.
     async fn insert_to_new_snapshot_with_sequence(
@@ -1149,8 +1149,8 @@ impl CayenneTableProvider {
             guard.insert(new_snapshot_id.clone(), max_delete_seq);
         }
 
-        // Update the listing table to include both old and new snapshot data
-        self.update_to_merged_snapshot(&new_snapshot_id).await?;
+        // The listing table stays as-is. Protected snapshots are handled at scan time.
+        // See the doc comment above for why we do NOT update current_snapshot.
 
         Ok(total_rows)
     }
@@ -1179,38 +1179,8 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Update the table to use a new snapshot that includes data from both
-    /// the previous snapshot and the new snapshot.
-    ///
-    /// IMPORTANT: We do NOT merge into a single multi-path ListingTable because
-    /// we need to apply deletion filters differently to old vs new data.
-    /// Instead, we track the new snapshot as "protected" and handle it at scan time.
-    ///
-    /// At scan time, the `scan()` method will:
-    /// 1. Scan the main listing table (old data) with deletion filter
-    /// 2. Scan protected snapshots without deletion filter
-    /// 3. UNION the results
-    ///
-    /// CRITICAL: We do NOT update current_snapshot in the catalog here.
-    /// The current_snapshot must remain pointing to the base snapshot (old data).
-    /// The new snapshot is tracked ONLY via cayenne_snapshot_sequence table,
-    /// which is loaded via load_protected_snapshots on table reopen.
-    async fn update_to_merged_snapshot(&self, _new_snapshot_id: &str) -> CatalogResult<()> {
-        // The main listing table stays as-is (pointing to old snapshot)
-        // The new snapshot is tracked in protected_snapshots and handled at scan time
-        //
-        // We do NOT call catalog.set_current_snapshot() because:
-        // - current_snapshot should always point to the "base" data (old snapshot)
-        // - Protected snapshots are tracked in cayenne_snapshot_sequence table
-        // - On reopen, load_protected_snapshots finds snapshots with seq > max_delete_seq
-        //
-        // If we updated current_snapshot to the new snapshot, we would lose
-        // the reference to the old data, causing 0 rows to be returned.
-
-        Ok(())
-    }
-
-    /// Create a ListingTable that reads from multiple directories.
+    /// Create a `ListingTable` that reads from multiple directories.
+    #[expect(dead_code)]
     fn create_multi_path_listing_table(
         urls: &[&str],
         schema: SchemaRef,
@@ -2119,8 +2089,8 @@ impl CayenneTableProvider {
     /// 5. Returns a stream of the batches for normal insert processing
     ///
     /// Insert records are stored in the catalog and cached in memory. During scan,
-    /// a row is deleted only if its PK is in the deletion set AND (not in insert_records
-    /// OR insert_seq < delete_seq).
+    /// a row is deleted only if its PK is in the deletion set AND (not in `insert_records`
+    /// OR `insert_seq` < `delete_seq`).
     ///
     /// # Errors
     ///
@@ -2129,7 +2099,7 @@ impl CayenneTableProvider {
     /// NOTE: Currently unused because we use compaction for all strategies when there
     /// are pending deletions. Kept for potential future optimization with per-file
     /// sequence tracking.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     async fn add_insert_records_for_incoming_pks(
         &self,
         stream: SendableRecordBatchStream,
@@ -2196,7 +2166,6 @@ impl CayenneTableProvider {
     /// Extracts ALL Int64 PKs from incoming batches and adds insert records with the current
     /// sequence number. This is required for sequence-based ordering where we need to know
     /// when each PK was inserted to compare against deletion sequences.
-    #[allow(dead_code)]
     async fn add_insert_records_int64(
         &self,
         batches: &[RecordBatch],
@@ -2279,7 +2248,6 @@ impl CayenneTableProvider {
     /// Converts ALL PK columns to byte representation and adds insert records with the current
     /// sequence number. This is required for sequence-based ordering where we need to know
     /// when each PK was inserted to compare against deletion sequences.
-    #[allow(dead_code)]
     async fn add_insert_records_row_converter(
         &self,
         batches: &[RecordBatch],
@@ -2313,7 +2281,7 @@ impl CayenneTableProvider {
                 }
             })?;
 
-            for row in rows.iter() {
+            for row in &rows {
                 let key: Box<[u8]> = row.as_ref().into();
                 keys_to_record.push(key);
             }
@@ -3334,7 +3302,7 @@ impl CayenneTableProvider {
 
     /// Load protected snapshots from the catalog.
     ///
-    /// Protected snapshots are those with sequence > max_delete_sequence.
+    /// Protected snapshots are those with sequence > `max_delete_sequence`.
     /// They contain data written after deletions and should skip deletion filtering.
     async fn load_protected_snapshots(
         catalog: Arc<dyn MetadataCatalog>,
@@ -3417,8 +3385,8 @@ impl CayenneTableProvider {
     /// Scan protected snapshots with partial deletion filtering.
     ///
     /// Protected snapshots skip deletions that existed when they were created
-    /// (deletions with seq <= max_delete_seq_at_creation), but newer deletions
-    /// (seq > max_delete_seq_at_creation) are still applied.
+    /// (deletions with seq <= `max_delete_seq_at_creation`), but newer deletions
+    /// (seq > `max_delete_seq_at_creation`) are still applied.
     async fn scan_protected_snapshots(
         &self,
         state: &dyn Session,
@@ -3775,13 +3743,16 @@ impl TableProvider for CayenneTableProvider {
         // If there are protected snapshots, we need to:
         // 1. Apply deletion filter to main plan
         // 2. UNION with unfiltered protected snapshot plans
-        let plan = if !protected_snapshot_plans.is_empty() {
+        let plan = if protected_snapshot_plans.is_empty() {
+            main_plan
+        } else {
+            use datafusion_physical_plan::union::UnionExec;
+
             // Apply deletion filter to main plan only
             let filtered_main_plan =
                 self.apply_deletion_filter(main_plan, &pk_indices_in_projection)?;
 
             // UNION the filtered main plan with unfiltered protected snapshot plans
-            use datafusion_physical_plan::union::UnionExec;
             let mut all_plans = vec![filtered_main_plan];
             all_plans.extend(protected_snapshot_plans);
             let union_plan = Arc::new(UnionExec::new(all_plans));
@@ -3794,8 +3765,6 @@ impl TableProvider for CayenneTableProvider {
             }
 
             return Ok(union_plan);
-        } else {
-            main_plan
         };
 
         // Apply deletion filter based on strategy (original logic for when no protected snapshots)

@@ -209,7 +209,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// Add an insert record for a primary key with its sequence number.
     ///
     /// Insert records track PKs that were re-inserted after being deleted.
-    /// The sequence number determines ordering: if insert_sequence > delete_sequence
+    /// The sequence number determines ordering: if `insert_sequence` > `delete_sequence`
     /// for a PK, the row is visible; otherwise it's filtered out.
     ///
     /// Uses INSERT OR REPLACE to update the sequence if the PK already exists.
@@ -217,7 +217,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// # Arguments
     ///
     /// * `table_id` - The table to add the insert record to
-    /// * `pk_bytes` - The primary key bytes (from RowConverter or Int64 encoding)
+    /// * `pk_bytes` - The primary key bytes (from `RowConverter` or Int64 encoding)
     /// * `sequence_number` - The sequence at which this insert occurred
     async fn add_insert_record(
         &self,
@@ -250,7 +250,7 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// This records when the snapshot was created relative to deletions.
     /// Used for Iceberg-style sequence ordering: deletions only apply to
-    /// snapshots with sequence <= delete_sequence.
+    /// snapshots with sequence <= `delete_sequence`.
     async fn set_snapshot_sequence(
         &self,
         table_id: i64,
@@ -269,7 +269,7 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get all snapshot sequences for a table.
     ///
-    /// Returns a map of snapshot_id -> sequence_number for all snapshots
+    /// Returns a map of `snapshot_id` -> `sequence_number` for all snapshots
     /// that have sequence tracking enabled.
     async fn get_all_snapshot_sequences(
         &self,
