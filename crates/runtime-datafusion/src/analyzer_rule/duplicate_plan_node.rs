@@ -34,6 +34,7 @@ pub struct DuplicateLogicalPlanNode {
 }
 
 impl DuplicateLogicalPlanNode {
+    #[must_use] 
     pub fn extension_nodes(extension_name: &'static str) -> Self {
         Self {
             is_duplicate: Arc::new(make_duplicate_extension_checker(extension_name)),
@@ -85,7 +86,7 @@ impl AnalyzerRule for DuplicateLogicalPlanNode {
         .data()
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DuplicateLogicalPlanNode"
     }
 }

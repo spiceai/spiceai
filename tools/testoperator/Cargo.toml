@@ -9,8 +9,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+arrow.workspace = true
 arrow-json.workspace = true
 clap.workspace = true
+itertools.workspace = true
 hf-hub = { workspace = true }
 reqwest.workspace = true
 serde.workspace = true
@@ -19,8 +21,10 @@ serde_yaml.workspace = true
 spiceai.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
+tokio-util.workspace = true
 
 [features]
+default = ["append"]
 anonymous_telemetry = []
 aws-secrets-manager = []
 clickhouse = []

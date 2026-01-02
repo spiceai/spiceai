@@ -34,12 +34,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/dustin/go-humanize"
 	"github.com/klauspost/compress/zstd"
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
-	"github.com/spiceai/gospice/v7"
+	"github.com/spiceai/gospice/v8"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	rtcontext "github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/display"
@@ -306,7 +306,7 @@ func runCloudREPL(cmd *cobra.Command, apiKey string) error {
 
 		var results []string
 		for reader.Next() {
-			record := reader.Record()
+			record := reader.RecordBatch()
 			if record.NumCols() == 0 {
 				continue
 			}
@@ -419,7 +419,7 @@ func runGRPCREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, grpcEndpoint
 
 		var results []string
 		for reader.Next() {
-			record := reader.Record()
+			record := reader.RecordBatch()
 			if record.NumCols() == 0 {
 				continue
 			}
@@ -595,6 +595,9 @@ func runREPLWithHealthAndMetadata(endpoint string, executor QueryExecutor, metad
 		}
 
 		if strings.ToLower(queryStr) == ".clear history" {
+			// Clear session history (in-memory)
+			line.ClearHistory()
+			// Clear persistent history
 			if historyMgr != nil {
 				historyMgr.Clear()
 				if err := historyMgr.Save(); err != nil {
@@ -744,7 +747,7 @@ func runHTTPREPL(cmd *cobra.Command, ctx *rtcontext.RuntimeContext, httpEndpoint
 		// Check cache status header
 		cacheStatus := resp.Header.Get("Results-Cache-Status")
 		cachedStr := ""
-		if cacheStatus == "HIT" {
+		if cacheStatus == "HIT" || cacheStatus == "STALE" {
 			cachedStr = " (cached)"
 		}
 
@@ -959,7 +962,7 @@ func displayArrowResults(reader array.RecordReader) (int, uint64, error) {
 
 	// Read all records and collect data
 	for reader.Next() {
-		record := reader.Record()
+		record := reader.RecordBatch()
 
 		// Calculate size of this record batch
 		for i := 0; i < int(record.NumCols()); i++ {
@@ -1026,9 +1029,9 @@ func displayArrowResults(reader array.RecordReader) (int, uint64, error) {
 func init() {
 	sqlCmd.Flags().String("cache-control", "cache", "Control whether the results cache is used for queries. [possible values: cache, no-cache]")
 	sqlCmd.Flags().String("endpoint", "", "Specifies the remote Spice instance endpoint. Supports http://, https://, grpc://, or grpc+tls:// schemes. If not provided, uses local spiced runtime.")
-	sqlCmd.Flags().String("flight-endpoint", "", "Specifies the remote Spice instance Flight endpoint (treated as gRPC endpoint). If not provided, uses local spiced runtime.")
+	sqlCmd.Flags().String("flight-endpoint", "", "(Deprecated) Specifies the remote Spice instance Flight endpoint (treated as gRPC endpoint). If not provided, uses local spiced runtime.")
 	sqlCmd.Flags().StringSlice("headers", []string{}, "Custom HTTP headers to pass to remote endpoint in the format 'Key:Value'. Can be specified multiple times.")
 	// Must override `--http-endpoint` to provide socket address (i.e. 0.0.0.0:8090), not http endpoint (http://localhost:8090). `spice sql` uses flight endpoint.
-	sqlCmd.PersistentFlags().String(constants.HttpEndpointKeyFlag, "0.0.0.0:8090", "HTTP endpoint of Spice")
+	sqlCmd.PersistentFlags().String(constants.HttpEndpointKeyFlag, "0.0.0.0:8090", "(Deprecated) HTTP endpoint of Spice")
 	RootCmd.AddCommand(sqlCmd)
 }

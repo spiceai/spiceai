@@ -18,6 +18,7 @@ use crate::models::hf::{get_huggingface_embeddings, get_model_to_vec_embeddings}
 use crate::models::openai::get_openai_embeddings;
 #[cfg(feature = "s3_vectors")]
 use crate::models::s3_vectors::basic_vector_search_tests;
+use crate::models::s3_vectors::replace_s3_vector_index_names;
 use crate::models::{
     create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
 };
@@ -384,7 +385,9 @@ pub(crate) async fn run_search_w_explain(
                                 .try_collect::<Vec<RecordBatch>>()
                                 .await?;
 
-                            let disp = arrow::util::pretty::pretty_format_batches(&c)?;
+                            let mut disp =
+                                arrow::util::pretty::pretty_format_batches(&c)?.to_string();
+                            disp = replace_s3_vector_index_names(&disp);
 
                             insta::with_settings!({
                                 omit_expression => true,
@@ -881,7 +884,6 @@ async fn test_rrf_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_text_search() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
@@ -970,7 +972,6 @@ async fn test_text_search() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_text_search_view() -> Result<(), anyhow::Error> {
     let (ds, views) = get_mega_science_view(
         Some("qs"),
@@ -1148,7 +1149,6 @@ async fn test_text_search_where_rowid_is_search_column_composite_pk() -> Result<
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
     run_search(
         AppBuilder::new("search_app")
@@ -1230,7 +1230,6 @@ async fn test_text_search_multiple_columns() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_text_search_metadata() -> Result<(), anyhow::Error> {
     let mut ds = get_mega_science_dataset(
         Some("qs"),

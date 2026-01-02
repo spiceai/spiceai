@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::LazyLock;
 
-use test_framework::opentelemetry::metrics::Gauge;
+use test_framework::opentelemetry::metrics::{Gauge, Histogram};
 use test_framework::telemetry::METER;
 
 pub static ITERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
@@ -55,6 +55,14 @@ pub static READY_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("ready_duration_ms")
         .with_description("Duration until the spicepod is ready.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static HEALTH_LATENCY: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("health_latency_ms")
+        .with_description("Latency of /health and /v1/ready probes.")
         .with_unit("ms")
         .build()
 });
@@ -179,6 +187,34 @@ pub static SCORE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
+// Text to Sql specific metrics
+
+pub static AVERAGE_TEXT_TO_SQL_ATTEMPTS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_attempts")
+        .with_description(
+            "The average number of internal SQL queries performed to perform a text-to-SQL",
+        )
+        .with_unit("queries")
+        .build()
+});
+pub static TEXT_TO_SQL_EXACT_MATCH_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_exact_match_rate")
+        .with_description(
+            "The rate at which a text-to-SQL operation correctly outputs an exact match",
+        )
+        .with_unit("ratio")
+        .build()
+});
+pub static TEXT_TO_SQL_ERROR_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_error_rate")
+        .with_description("The rate at which a text-to-SQL operation returns an error externally")
+        .with_unit("ratio")
+        .build()
+});
+
 // Spiced runtime metrics (scraped from /metrics endpoint)
 
 pub static SPICED_QUERY_COUNT: LazyLock<Gauge<f64>> = LazyLock::new(|| {
@@ -189,7 +225,7 @@ pub static SPICED_QUERY_COUNT: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub static SPICED_QUERY_DURATION_AVG: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("spiced_query_duration_avg_ms")

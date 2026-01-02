@@ -31,7 +31,6 @@ use test_framework::{
     },
 };
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
     let mut spiced_instance = SpicedInstance::empty();
 
@@ -49,7 +48,9 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
+    let queries = query_set
+        .get_queries(query_overrides, Some(&spiced_instance), None)
+        .await?;
 
     let mut test = NotStarted::new()
         .with_parallel_count(1)

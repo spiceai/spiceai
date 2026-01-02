@@ -16,8 +16,9 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use snafu::prelude::*;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 use std::{fmt, sync::Arc};
 use token_provider::{Result, TokenProvider};
@@ -44,10 +45,16 @@ pub struct DatabricksM2MTokenProvider {
     endpoint: String,
     client_id: String,
 
-    tx: watch::Sender<String>,
-    rx: watch::Receiver<String>,
+    rx: watch::Receiver<SecretString>,
 
     _handle: Arc<JoinHandle<()>>,
+}
+
+impl Hash for DatabricksM2MTokenProvider {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.endpoint.hash(state);
+        self.client_id.hash(state);
+    }
 }
 
 impl fmt::Debug for DatabricksM2MTokenProvider {
@@ -78,12 +85,12 @@ impl DatabricksM2MTokenProvider {
             .map_err(|e| Error::UnableToGetToken { source: e })?;
 
         // create watch channel
-        let (tx, rx) = watch::channel(access_token.clone());
+        let (tx, rx) = watch::channel(access_token);
 
         // spawn background refresh loop
         let cloned_client_id = client_id.clone();
         let cloned_endpoint = endpoint.clone();
-        let cloned_tx = tx.clone();
+        let cloned_tx = tx;
 
         let secret = client_secret.clone();
 
@@ -131,7 +138,6 @@ impl DatabricksM2MTokenProvider {
         Ok(Self {
             endpoint,
             client_id,
-            tx,
             rx,
             _handle: Arc::new(handle),
         })
@@ -140,20 +146,57 @@ impl DatabricksM2MTokenProvider {
 
 impl TokenProvider for DatabricksM2MTokenProvider {
     fn get_token(&self) -> String {
-        self.rx.borrow().clone()
+        self.rx.borrow().expose_secret().to_string()
+    }
+
+    fn dyn_hash(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish().to_string()
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {
-        Some(self.tx.subscribe())
+        let mut secret_rx = self.rx.clone();
+        let (tx, rx) = watch::channel(secret_rx.borrow().expose_secret().to_string());
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tx.closed() => {
+                        break;
+                    }
+                    changed = secret_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let exposed = secret_rx.borrow().expose_secret().to_string();
+                        if tx.send(exposed).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Some(rx)
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
-    access_token: String,
+    access_token: SecretString,
     token_type: String,
     expires_in: u64,
     scope: String,
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 async fn get_m2m_access_token(
@@ -193,6 +236,7 @@ async fn get_m2m_access_token(
 }
 
 #[derive(Debug)]
+#[cfg(feature = "databricks")]
 pub enum AuthCredentials<'a> {
     Token(&'a SecretString),
     ServicePrincipal(&'a str, &'a SecretString),
@@ -207,6 +251,13 @@ pub enum AuthCredentials<'a> {
 pub struct DatabricksU2MTokenProvider {
     endpoint: String,
     client_id: String,
+}
+
+impl Hash for DatabricksU2MTokenProvider {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.endpoint.hash(state);
+        self.client_id.hash(state);
+    }
 }
 
 impl fmt::Debug for DatabricksU2MTokenProvider {
@@ -243,10 +294,15 @@ impl TokenProvider for DatabricksU2MTokenProvider {
 
         String::new()
     }
+
+    fn dyn_hash(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish().to_string()
+    }
 }
 
 impl DatabricksU2MTokenProvider {
-    #[allow(clippy::needless_pass_by_value)]
     pub fn new(endpoint: String, client_id: String) -> Self {
         Self {
             endpoint,

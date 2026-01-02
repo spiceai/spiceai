@@ -17,6 +17,7 @@ limitations under the License.
 //! Data structures for Cayenne metadata.
 
 use arrow_schema::SchemaRef;
+use serde::{Deserialize, Serialize};
 
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
@@ -42,6 +43,17 @@ pub struct TableMetadata {
     pub partition_column: Option<String>,
     /// Vortex encoding configuration for this table
     pub vortex_config: VortexConfig,
+    /// Current sequence number for ordering operations (Iceberg-style).
+    ///
+    /// Monotonically increasing counter used to order deletes and inserts.
+    /// When data is inserted, it gets the current sequence number.
+    /// When a delete is written, it also gets the current sequence number.
+    /// A delete only applies to data with `data_sequence < delete_sequence`.
+    ///
+    /// This enables upsert semantics: if a PK is deleted and then re-inserted,
+    /// the new insert has a higher sequence than the delete, so the delete
+    /// doesn't apply to the new data.
+    pub current_sequence_number: i64,
 }
 
 /// Represents a data file containing table rows.
@@ -73,6 +85,22 @@ pub struct DataFile {
     pub file_size_bytes: i64,
     /// Starting row ID for this file (for row ID assignment)
     pub row_id_start: i64,
+    /// Sequence number when this data file was written.
+    /// Used for ordering deletions: a deletion only applies to data files with
+    /// `sequence_number` <= the delete file's `sequence_number`.
+    pub sequence_number: i64,
+}
+
+/// The type of deletion vector: position-based or key-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeletionType {
+    /// Position-based deletion using row IDs (for tables without primary key).
+    /// Requires consistent ordering between delete and read operations.
+    #[default]
+    PositionBased,
+    /// Key-based deletion using primary key bytes (for tables with primary key).
+    /// Position-independent, survives data reorganization.
+    KeyBased,
 }
 
 /// Represents a deletion vector file tracking deleted rows.
@@ -82,18 +110,31 @@ pub struct DeleteFile {
     pub delete_file_id: i64,
     /// Table this delete file belongs to
     pub table_id: i64,
-    /// Data file this delete file applies to
-    pub data_file_id: i64,
-    /// Path to the delete file (Parquet format)
+    /// Path of the data file this deletion vector applies to (for position-based deletions).
+    /// `None` for key-based deletions which apply to the entire table.
+    /// For position-based deletions, row IDs are relative to this specific data file.
+    pub source_data_file_path: Option<String>,
+    /// Path to the delete file (Arrow IPC format)
     pub path: String,
     /// Whether the path is relative
     pub path_is_relative: bool,
-    /// Format of the delete file (always "parquet")
+    /// Format of the delete file (always `arrow_ipc`)
     pub format: String,
     /// Number of deleted rows in this file
     pub delete_count: i64,
     /// Size of the file in bytes
     pub file_size_bytes: i64,
+    /// The type of deletion vector (position-based or key-based).
+    /// Inferred from the file schema when read, or set when writing.
+    pub deletion_type: DeletionType,
+    /// Sequence number for ordering deletes (Iceberg-style).
+    ///
+    /// A delete only applies to data files whose `data_sequence_number` is
+    /// strictly less than this delete's `sequence_number`. This enables
+    /// upsert semantics without anti-deletion tracking:
+    /// - New inserts get higher sequence numbers
+    /// - Old deletes don't apply to new data with the same PK
+    pub sequence_number: i64,
 }
 
 /// Metadata about a partition in a table.
@@ -117,35 +158,19 @@ pub struct PartitionMetadata {
     pub file_size_bytes: i64,
 }
 
-/// Statistics about a partition for query optimization.
-#[derive(Debug, Clone, Default)]
-pub struct PartitionStats {
-    /// Total number of records
-    pub record_count: i64,
-    /// Total file size in bytes
-    pub file_size_bytes: i64,
+/// Which compression strategy to use for the Vortex layout.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum CompressionStrategy {
+    /// Uses the default Vortex Btrblocks compression.
+    #[default]
+    Btrblocks,
+    /// Uses the Vortex `CompactCompressor` with Zstd compression.
+    Zstd,
 }
 
 /// Configuration for Vortex encodings to optimize compression and performance.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VortexConfig {
-    /// Enable ALP (Adaptive Lossless Precision) encoding for numeric columns
-    pub enable_alp: bool,
-    /// Enable FSST (Fast String Suffix Trie) encoding for string columns
-    pub enable_fsst: bool,
-    /// Enable `BitPacking` encoding for integer columns
-    pub enable_bitpacking: bool,
-    /// Enable Delta encoding for sequential data
-    pub enable_delta: bool,
-    /// Enable Run-Length Encoding (RLE)
-    pub enable_rle: bool,
-    /// Enable Dictionary encoding for low-cardinality columns
-    pub enable_dict: bool,
-    /// Enable Frame-of-Reference (FOR) encoding
-    pub enable_for: bool,
-    /// Enable `ZigZag` encoding for signed integers
-    pub enable_zigzag: bool,
     /// Footer cache size in MB
     pub footer_cache_mb: usize,
     /// Segment cache size in MB
@@ -153,27 +178,26 @@ pub struct VortexConfig {
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
-    /// Defaults to 256 MB.
+    /// Defaults to 128 MB.
     pub target_vortex_file_size_mb: usize,
+    /// Columns to sort data by on refresh operations (empty = no sorting)
+    pub sort_columns: Vec<String>,
+    /// Compression strategy to use for Vortex files
+    /// Defaults to Btrblocks
+    pub compression_strategy: CompressionStrategy,
 }
 
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
-            // Enable all SIMD-optimized encodings by default
-            enable_alp: true,
-            enable_fsst: true,
-            enable_bitpacking: true,
-            enable_delta: true,
-            enable_rle: true,
-            enable_dict: true,
-            enable_for: true,
-            enable_zigzag: true,
-            // Cache configuration
+            // Larger caches improve read performance
             footer_cache_mb: 128,
-            segment_cache_mb: 32,
-            // Target file size: 256 MB
-            target_vortex_file_size_mb: 256,
+            segment_cache_mb: 256,
+            // Smaller files = better parallelism and predicate pushdown
+            target_vortex_file_size_mb: 128,
+            // No sort columns by default
+            sort_columns: Vec::new(),
+            compression_strategy: CompressionStrategy::default(),
         }
     }
 }
@@ -187,7 +211,7 @@ pub struct CreateTableOptions {
     pub schema: SchemaRef,
     /// Primary key columns (for deletion vector support)
     pub primary_key: Vec<String>,
-    /// Base path for storing table data
+    /// Base path for storing table data (can be local path or S3 URL)
     pub base_path: String,
     /// Optional partition column name (for partitioned tables)
     pub partition_column: Option<String>,
@@ -195,17 +219,11 @@ pub struct CreateTableOptions {
     pub vortex_config: VortexConfig,
 }
 
-/// Statistics about a table.
-#[derive(Debug, Clone, Default)]
-pub struct TableStats {
-    /// Total number of records (including deleted ones)
-    pub total_records: i64,
-    /// Number of deleted records
-    pub deleted_records: i64,
-    /// Total size in bytes of all data files
-    pub total_size_bytes: i64,
-    /// Number of active data files
-    pub active_data_files: i64,
-    /// Number of delete files
-    pub delete_files: i64,
+/// Configuration for an external object store (e.g., S3).
+#[derive(Debug, Clone)]
+pub struct ObjectStoreConfig {
+    /// The object store URL (e.g., `s3://bucket-name/prefix/`)
+    pub url: url::Url,
+    /// The object store implementation
+    pub store: std::sync::Arc<dyn object_store::ObjectStore>,
 }

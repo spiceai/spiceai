@@ -27,19 +27,20 @@ use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::streaming_utils::{create_stream_response, generate_stream_id};
 use async_openai::error::OpenAIError;
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestDeveloperMessage,
-    ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestMessage,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
+    ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
+    ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestMessage,
     ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionToolType,
+    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionTools,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FunctionCall, FunctionCallStream, Role, Stop,
+    FunctionCall, FunctionCallStream, FunctionType, Role, StopConfiguration,
 };
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::error::{BuildError, SdkError};
@@ -100,8 +101,10 @@ impl BedrockConverse {
         // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
             for t in tools.iter_mut() {
-                if t.function.parameters.is_none() {
-                    t.function.parameters.replace(json!(
+                if let ChatCompletionTools::Function(tool) = t
+                    && tool.function.parameters.is_none()
+                {
+                    tool.function.parameters.replace(json!(
                         {
                             "$schema": "http://json-schema.org/draft-07/schema#",
                             "properties": {},
@@ -119,7 +122,6 @@ impl BedrockConverse {
     /// Convert [`ChatCompletionRequestMessage`] that are neither [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`Message`] format.
     ///
     /// Other enum variants will be ignored.
-    #[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
     fn convert_non_system_messages(
         msgs: Vec<ChatCompletionRequestMessage>,
     ) -> Result<Vec<Message>, BuildError> {
@@ -130,13 +132,13 @@ impl BedrockConverse {
                     ..
                 }) => MessageBuilder::default()
                     .set_content(Some(vec![ContentBlock::Text(match content {
-                        ChatCompletionRequestUserMessageContent::Text(s) => s.clone(),
+                        ChatCompletionRequestUserMessageContent::Text(s) => s,
                         ChatCompletionRequestUserMessageContent::Array(arr) => arr
                             .into_iter()
                             .filter_map(|p| match p {
                                 ChatCompletionRequestUserMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
-                                ) => Some(text.clone()),
+                                ) => Some(text),
                                 _ => None,
                             })
                             .join(""),
@@ -152,15 +154,13 @@ impl BedrockConverse {
                 ) => {
                     let mut message_content = vec![];
                     let text_content: Option<String> = match content {
-                        Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => {
-                            Some(s.clone())
-                        }
+                        Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => Some(s),
                         Some(ChatCompletionRequestAssistantMessageContent::Array(arr)) => arr
                             .into_iter()
                             .filter_map(|p| match p {
                                 ChatCompletionRequestAssistantMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
-                                ) => Some(text.clone()),
+                                ) => Some(text),
                                 ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => {
                                     None
                                 }
@@ -174,11 +174,16 @@ impl BedrockConverse {
                         tools
                             .iter()
                             .filter_map(|t| {
-                                let ChatCompletionMessageToolCall {
-                                    id,
-                                    function: FunctionCall { name, arguments },
-                                    ..
-                                } = t;
+                                let ChatCompletionMessageToolCalls::Function(
+                                    ChatCompletionMessageToolCall {
+                                        id,
+                                        function: FunctionCall { name, arguments },
+                                        ..
+                                    },
+                                ) = t
+                                else {
+                                    return None;
+                                };
 
                                 let tool_input = serde_json::from_str(arguments).ok().map_or(
                                     Document::Object(HashMap::default()),
@@ -214,7 +219,7 @@ impl BedrockConverse {
                 }) => {
                     let block_content = match content {
                         ChatCompletionRequestToolMessageContent::Text(t) => {
-                            vec![ToolResultContentBlock::Text(t.clone())]
+                            vec![ToolResultContentBlock::Text(t)]
                         }
                         ChatCompletionRequestToolMessageContent::Array(arr) => arr
                             .into_iter()
@@ -222,7 +227,7 @@ impl BedrockConverse {
                                 let ChatCompletionRequestToolMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
                                 ) = s;
-                                ToolResultContentBlock::Text(text.clone())
+                                ToolResultContentBlock::Text(text)
                             })
                             .collect(),
                     };
@@ -230,7 +235,7 @@ impl BedrockConverse {
                         .set_content(
                             ToolResultBlockBuilder::default()
                                 .set_content(Some(block_content))
-                                .set_tool_use_id(Some(tool_call_id.clone()))
+                                .set_tool_use_id(Some(tool_call_id))
                                 .set_status(Some(ToolResultStatus::Success))
                                 .build()
                                 .ok()
@@ -251,7 +256,6 @@ impl BedrockConverse {
     /// Convert [`ChatCompletionRequestMessage`] that are [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`SystemContentBlock`] format.
     ///
     /// Other enum variants will be ignored.
-    #[allow(clippy::cast_possible_wrap)]
     fn convert_system_messages(msgs: Vec<ChatCompletionRequestMessage>) -> Vec<SystemContentBlock> {
         msgs.into_iter()
             .flat_map(|m| match m {
@@ -275,7 +279,7 @@ impl BedrockConverse {
                 | ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                     content: ChatCompletionRequestSystemMessageContent::Text(s),
                     name: _,
-                }) => vec![SystemContentBlock::Text(s.to_string())],
+                }) => vec![SystemContentBlock::Text(s)],
                 ChatCompletionRequestMessage::Developer(
                     ChatCompletionRequestDeveloperMessage {
                         content: ChatCompletionRequestDeveloperMessageContent::Array(arr),
@@ -284,7 +288,9 @@ impl BedrockConverse {
                 ) => arr
                     .into_iter()
                     .map(|s| {
-                        let ChatCompletionRequestMessageContentPartText { text } = s;
+                        let ChatCompletionRequestDeveloperMessageContentPart::Text(
+                            ChatCompletionRequestMessageContentPartText { text },
+                        ) = s;
                         SystemContentBlock::Text(text)
                     })
                     .collect(),
@@ -293,7 +299,7 @@ impl BedrockConverse {
             .collect()
     }
 
-    #[allow(clippy::cast_possible_wrap, deprecated)]
+    #[expect(clippy::cast_possible_wrap, deprecated)]
     fn inference_cfg(req: &CreateChatCompletionRequest) -> InferenceConfiguration {
         InferenceConfiguration::builder()
             .set_max_tokens(
@@ -302,8 +308,8 @@ impl BedrockConverse {
                     .map(|u| u as i32),
             )
             .set_stop_sequences(req.stop.as_ref().map(|stop| match stop {
-                Stop::String(s) => vec![s.clone()],
-                Stop::StringArray(arr) => arr.clone(),
+                StopConfiguration::String(s) => vec![s.clone()],
+                StopConfiguration::StringArray(arr) => arr.clone(),
             }))
             .set_temperature(req.temperature)
             .set_top_p(req.top_p)
@@ -357,16 +363,18 @@ impl BedrockConverse {
             .set_guardrail_config(guardrails)
             .set_tool_config(tool_config(tools, tool_choice));
 
-        if let Some(Value::Object(m)) = metadata {
-            bldr = bldr.set_request_metadata(Some(
-                m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
-            ));
+        if let Some(metadata) = metadata {
+            // Metadata is a newtype around serde_json::Value - convert and extract object
+            if let Ok(Value::Object(m)) = serde_json::to_value(&metadata) {
+                bldr = bldr.set_request_metadata(Some(
+                    m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
+                ));
+            }
         }
 
         Ok(bldr)
     }
 
-    #[allow(deprecated)]
     fn to_converse(
         &self,
         client: &Arc<BedrockClient>,
@@ -414,16 +422,19 @@ impl BedrockConverse {
             .set_guardrail_config(guardrails)
             .set_tool_config(tool_config(tools, tool_choice));
 
-        if let Some(Value::Object(m)) = metadata {
-            bldr = bldr.set_request_metadata(Some(
-                m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
-            ));
+        if let Some(metadata) = metadata {
+            // Metadata is a newtype around serde_json::Value - convert and extract object
+            if let Ok(Value::Object(m)) = serde_json::to_value(&metadata) {
+                bldr = bldr.set_request_metadata(Some(
+                    m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
+                ));
+            }
         }
 
         Ok(bldr)
     }
 
-    #[allow(clippy::cast_possible_truncation, deprecated, clippy::type_complexity)]
+    #[expect(clippy::cast_possible_truncation, deprecated, clippy::type_complexity)]
     fn convert_converse_output(
         &self,
         output: ConverseOutput,
@@ -446,12 +457,24 @@ impl BedrockConverse {
                 let (content_and_refusal, tool_calls): (Vec<_>, Vec<_>) = data.into_iter().unzip();
                 let (content, refusals): (Vec<_>, Vec<_>) = content_and_refusal.into_iter().unzip();
 
+                // Convert tool_calls from Vec<ChatCompletionMessageToolCall> to Vec<ChatCompletionMessageToolCalls>
+                let tool_calls_enum: Vec<ChatCompletionMessageToolCalls> = tool_calls
+                    .into_iter()
+                    .flatten()
+                    .map(ChatCompletionMessageToolCalls::Function)
+                    .collect();
+
                 Ok::<_, OpenAIError>(ChatChoice {
                     index: 0,
                     message: ChatCompletionResponseMessage {
                         content: Some(content.into_iter().flatten().join("\n")),
                         refusal: Some(refusals.into_iter().flatten().join("\n")),
-                        tool_calls: Some(tool_calls.into_iter().flatten().collect()),
+                        tool_calls: if tool_calls_enum.is_empty() {
+                            None
+                        } else {
+                            Some(tool_calls_enum)
+                        },
+                        annotations: None,
                         role: try_convert_role(role)?,
                         function_call: None,
                         audio: None,
@@ -482,7 +505,6 @@ impl BedrockConverse {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn process_stream(
         model: &str,
         input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,
@@ -600,7 +622,7 @@ impl BedrockConverse {
                                                 Some(vec![ChatCompletionMessageToolCallChunk {
                                                     index: tool_delta_idx,
                                                     id: Some(tool_use_id.clone()),
-                                                    r#type: Some(ChatCompletionToolType::Function),
+                                                    r#type: Some(FunctionType::Function),
                                                     function: Some(FunctionCallStream {
                                                         name: Some(name.clone()),
                                                         arguments: Some(input),
@@ -665,7 +687,6 @@ impl BedrockConverse {
 
 #[async_trait]
 impl Chat for BedrockConverse {
-    #[allow(deprecated)]
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,

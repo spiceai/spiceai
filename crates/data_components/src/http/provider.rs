@@ -22,7 +22,7 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraint, Constraints, project_schema},
+    common::{Constraints, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -124,6 +124,7 @@ struct CachedResponse {
     cached_at: SystemTime,
     max_age: Duration,
     detected_format: Option<String>,
+    response_date: Option<SystemTime>,
 }
 
 impl CachedResponse {
@@ -194,6 +195,7 @@ struct HttpFetchResult {
     content: String,
     max_age: Duration,
     detected_format: String,
+    response_date: Option<SystemTime>,
 }
 
 impl HttpFetchResult {
@@ -245,8 +247,10 @@ impl HttpTableProvider {
             client,
             file_format,
             schema: Arc::new(Self::base_table_schema()),
-            // Mark `request_path`, `request_query`, and `request_body` as primary key components
-            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0, 1, 2])]),
+            // No primary key constraints - HTTP responses can contain multiple rows
+            // with the same (request_path, request_query, request_body) but different content
+            // (e.g., search API results). Caching mode uses filter values as cache keys instead.
+            constraints: Constraints::new_unverified(vec![]),
             cache: Arc::new(RwLock::new(HashMap::new())),
             acceleration_enabled,
             retry_strategy: RetryBackoffBuilder::new()
@@ -390,6 +394,11 @@ impl HttpTableProvider {
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
+            Field::new(
+                "fetched_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                true,
+            ),
         ])
     }
 
@@ -580,6 +589,7 @@ impl HttpTableProvider {
             cached_at: SystemTime::now(),
             max_age: result.max_age,
             detected_format: Some(result.detected_format),
+            response_date: result.response_date,
         };
 
         let mut cache_write = self.cache.write().await;
@@ -658,6 +668,16 @@ impl HttpTableProvider {
                     .and_then(|v| v.to_str().ok());
                 let max_age = Self::parse_cache_control(cache_control_header);
 
+                // Extract Date header from response
+                let response_date = response
+                    .headers()
+                    .get(reqwest::header::DATE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|date_str| {
+                        // Parse HTTP date format (RFC 2822/RFC 1123)
+                        httpdate::parse_http_date(date_str).ok()
+                    });
+
                 let content = response
                     .text()
                     .await
@@ -675,6 +695,7 @@ impl HttpTableProvider {
                     content,
                     max_age,
                     detected_format,
+                    response_date,
                 })
             }
         })
@@ -716,6 +737,11 @@ impl HttpTableProvider {
         query: Option<&str>,
         body: Option<&str>,
     ) -> Result<String> {
+        // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it
+        if self.acceleration_enabled {
+            return self.fetch_and_cache(path, query, body).await;
+        }
+
         let cache_key = Self::get_cache_key(path, query, body);
 
         // Try to get from cache
@@ -890,6 +916,15 @@ impl HttpExec {
             .await
             .map_err(DataFusionError::from)?;
 
+        // Get the response date from cache (if available)
+        let cache_key = HttpTableProvider::get_cache_key(path_val, query_val, body_val);
+        let response_date = {
+            let cache = provider.cache.read().await;
+            cache
+                .get(&cache_key)
+                .and_then(|cached| cached.response_date)
+        };
+
         // Store the actual values from the partition for the primary key
         let path_for_batch = path.as_deref().unwrap_or("");
         let query_for_batch = query.as_deref().unwrap_or("");
@@ -913,6 +948,24 @@ impl HttpExec {
         }
 
         // Create columns with the same number of rows
+        // Use response Date header if available, otherwise use current time
+        let timestamp_nanos = if let Some(date) = response_date {
+            i64::try_from(
+                date.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| DataFusionError::Execution(format!("Invalid response date: {e}")))?
+                    .as_nanos(),
+            )
+            .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))?
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to get current time: {e}"))
+                })?;
+            i64::try_from(now.as_nanos())
+                .map_err(|e| DataFusionError::Execution(format!("Timestamp overflow: {e}")))?
+        };
+
         let columns = self
             .projected_schema
             .fields()
@@ -928,6 +981,13 @@ impl HttpExec {
                     Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
                 }
                 "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
+                "fetched_at" => {
+                    use arrow::array::TimestampNanosecondArray;
+                    Ok(Arc::new(TimestampNanosecondArray::from(vec![
+                        timestamp_nanos;
+                        num_rows
+                    ])) as ArrayRef)
+                }
                 _ => Err(DataFusionError::Execution(format!(
                     "Unsupported field name: {}",
                     field.name()
@@ -1855,19 +1915,25 @@ mod tests {
     fn test_base_table_schema() {
         let schema = HttpTableProvider::base_table_schema();
 
-        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.fields().len(), 5);
         assert_eq!(schema.field(0).name(), "request_path");
         assert_eq!(schema.field(1).name(), "request_query");
         assert_eq!(schema.field(2).name(), "request_body");
         assert_eq!(schema.field(3).name(), "content");
+        assert_eq!(schema.field(4).name(), "fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
+        assert_eq!(
+            *schema.field(4).data_type(),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
+        );
         assert!(!schema.field(0).is_nullable()); // request_path is not nullable
         assert!(schema.field(1).is_nullable()); // request_query is nullable
         assert!(schema.field(2).is_nullable()); // request_body is nullable
         assert!(!schema.field(3).is_nullable()); // content is not nullable
+        assert!(schema.field(4).is_nullable()); // fetched_at is nullable
     }
 
     #[test]
@@ -2273,7 +2339,7 @@ mod tests {
                 None,
             )),
         })];
-        assert!(provider.extract_partitions(&filters).is_ok());
+        provider.extract_partitions(&filters).expect("should match");
 
         // Test * pattern
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -2284,7 +2350,7 @@ mod tests {
                 None,
             )),
         })];
-        assert!(provider.extract_partitions(&filters).is_ok());
+        provider.extract_partitions(&filters).expect("should match");
 
         // Test ** pattern
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -2295,7 +2361,7 @@ mod tests {
                 None,
             )),
         })];
-        assert!(provider.extract_partitions(&filters).is_ok());
+        provider.extract_partitions(&filters).expect("should match");
 
         // Test non-matching path
         let filters = vec![Expr::BinaryExpr(BinaryExpr {
@@ -2306,7 +2372,9 @@ mod tests {
                 None,
             )),
         })];
-        assert!(provider.extract_partitions(&filters).is_err());
+        provider
+            .extract_partitions(&filters)
+            .expect_err("should not match");
     }
 
     #[tokio::test]

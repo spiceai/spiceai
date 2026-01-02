@@ -19,6 +19,7 @@ use llms::{
     anthropic::Anthropic,
     bedrock::chat::{BedrockConverse, guardrail::GuardRail},
     chat::{Chat, Error as LlmError},
+    google::Google,
     openai::UsageTier,
     perplexity::PerplexitySonar,
     xai::Xai,
@@ -37,7 +38,10 @@ use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU
 use crate::{
     Runtime,
     parameters::Parameters,
-    tools::{options::SpiceToolsOptions, utils::get_tools},
+    tools::{
+        options::SpiceToolsOptions,
+        utils::{create_table_allowlist, get_tools_with_allowlist},
+    },
 };
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
@@ -103,11 +107,14 @@ pub async fn try_to_chat_model(
         // Prevent infinite recursion in case of circular tool calls.
         .or(Some(DEFAULT_SPICE_TOOL_RECURSION_LIMIT));
 
+    // Create table allowlist from model's datasets if specified
+    let table_allowlist = create_table_allowlist(&component.datasets);
+
     let tool_model = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingChat::new(
             model,
             Arc::clone(&rt),
-            get_tools(Arc::clone(&rt), &opts).await,
+            get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await,
             spice_recursion_limit,
         )),
         Some(_) | None => model,
@@ -129,6 +136,7 @@ pub async fn construct_model(
         ModelSource::HuggingFace => huggingface(model_id, component, params).await,
         ModelSource::File => file(component, params).await,
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
+        ModelSource::Google => google(model_id.as_deref(), params),
         ModelSource::Perplexity => perplexity(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         ModelSource::Xai => xai(model_id.as_deref(), params),
@@ -236,6 +244,25 @@ fn anthropic(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat
     })?;
 
     Ok(Arc::new(anthropic) as Arc<dyn Chat>)
+}
+
+fn google(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    let Some(model_id) = model_id else {
+        return Err(LlmError::ModelNotProvided {
+            model_source: "google".to_string(),
+        });
+    };
+    let Some(api_key) = params.get("api_key").ok() else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "`model.params.google_api_key` is required.".into(),
+        });
+    };
+
+    let google = Google::new(api_key, model_id).map_err(|e| LlmError::FailedToLoadModel {
+        source: format!("Failed to create Google client: {e}").into(),
+    })?;
+
+    Ok(Arc::new(google) as Arc<dyn Chat>)
 }
 
 async fn huggingface(
@@ -507,24 +534,16 @@ async fn file(
 }
 
 // Get OpenAI compatible request parameter overrides.
-// Prioritizes parameters with the model prefix (e.g., `hf_temperature`) over deprecated (e.g. `openai_temperature`) parameters.
+// Prioritizes parameters without prefix, then model prefix (e.g., `hf_temperature`), then deprecated (e.g. `openai_temperature`) parameters.
 pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
-    let prefix_str = format!("{prefix}_");
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
-
-    for (k, v) in &model.params {
-        if k.starts_with(&prefix_str) {
-            if let Some(new_k) = k.strip_prefix(&prefix_str)
-                && OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
-            {
-                request_overrides.insert(new_k.to_string(), v.clone());
-            }
-        } else if k.starts_with("openai_")
-            && let Some(new_k) = k.strip_prefix("openai_")
-            && OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
-            && !request_overrides.contains_key(new_k)
-        {
-            request_overrides.insert(new_k.to_string(), v.clone());
+    for &key in OPENAI_DEFAULT_PARAM_KEYS.iter() {
+        if let Some(v) = model.params.get(key) {
+            request_overrides.insert(key.to_string(), v.clone());
+        } else if let Some(v) = model.params.get(&format!("{prefix}_{key}")) {
+            request_overrides.insert(key.to_string(), v.clone());
+        } else if let Some(v) = model.params.get(&format!("openai_{key}")) {
+            request_overrides.insert(key.to_string(), v.clone());
         }
     }
 

@@ -66,7 +66,7 @@ pub trait Responses: Sync + Send {
                 .boxed()
                 .context(FailedToRunModelSnafu)?;
 
-            Ok(resp.output_text)
+            Ok(resp.output_text())
         }
         .instrument(span)
         .await

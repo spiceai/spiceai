@@ -59,8 +59,7 @@ pub(crate) async fn start<A>(
     rt: Arc<Runtime>,
     config: Arc<config::Config>,
     tls_config: Option<Arc<TlsConfig>>,
-    auth_provider: Arc<dyn HttpAuth + Send + Sync>,
-    has_auth: bool,
+    auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()>
 where
@@ -75,11 +74,7 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
-    let auth_layer = if has_auth {
-        Some(AuthLayer::new(auth_provider))
-    } else {
-        None
-    };
+    let auth_layer = auth_provider.map(AuthLayer::new);
     let routes = routes::routes(&rt, config, vsearch, auth_layer, &cors_config);
     drop(app);
 
@@ -265,11 +260,9 @@ mod tests {
 
         // Verify that the shutdown does not fail if there are no active connections
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
     }
 
     #[tokio::test]
@@ -304,16 +297,12 @@ mod tests {
 
         // Verify that the shutdown will close the active request and drop all receivers
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(5), request_completion_handle)
-                .await
-                .is_ok()
-        );
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        let _ = timeout(Duration::from_secs(5), request_completion_handle)
+            .await
+            .expect("should complete request after shutdown");
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
     }
 
     fn build_test_http_client() -> reqwest::Client {

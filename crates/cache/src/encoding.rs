@@ -17,10 +17,15 @@ limitations under the License.
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
+use async_compression::Level;
+use async_compression::tokio::bufread::ZstdDecoder;
+use async_compression::tokio::write::ZstdEncoder as AsyncZstdEncoder;
+use async_trait::async_trait;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::caching::Encoding;
 use std::io::Cursor;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -35,72 +40,32 @@ pub enum Error {
 
     #[snafu(display("Failed to decompress data with zstd: {source}"))]
     FailedToDecompress { source: std::io::Error },
+
+    #[snafu(display("No encoder specified for decoding cached data"))]
+    NoEncoderSpecified,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Trait for encoding and decoding `RecordBatch` data.
+#[async_trait]
 pub trait Encoder: Send + Sync {
     /// Encode a vector of `RecordBatch`es into compressed bytes.
     ///
     /// # Errors
     ///
     /// Returns an error if serialization or compression fails.
-    fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>>;
+    async fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>>;
 
     /// Decode compressed bytes back into a vector of `RecordBatch`es.
     ///
     /// # Errors
     ///
     /// Returns an error if decompression or deserialization fails.
-    fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>>;
+    async fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>>;
 
     /// Returns a reference to self as `Any` for downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
-}
-
-/// No-op encoder that just serializes to Arrow IPC format without compression.
-#[derive(Debug, Clone, Copy)]
-pub struct NoOpEncoder;
-
-impl Encoder for NoOpEncoder {
-    fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>> {
-        if batches.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let schema = batches[0].schema();
-        let mut buffer = Vec::new();
-        {
-            let mut writer =
-                StreamWriter::try_new(&mut buffer, &schema).context(FailedToSerializeSnafu)?;
-
-            for batch in batches {
-                writer.write(batch).context(FailedToSerializeSnafu)?;
-            }
-
-            writer.finish().context(FailedToSerializeSnafu)?;
-        }
-
-        Ok(buffer)
-    }
-
-    fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>> {
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let cursor = Cursor::new(data);
-        let reader = StreamReader::try_new(cursor, None).context(FailedToDeserializeSnafu)?;
-
-        reader
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context(FailedToDeserializeSnafu)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 /// Zstd encoder that compresses `RecordBatch` data.
@@ -120,12 +85,13 @@ impl ZstdEncoder {
 
 impl Default for ZstdEncoder {
     fn default() -> Self {
-        Self::new(3) // Zstd default compression level
+        Self::new(6) // Zstd compression level 6
     }
 }
 
+#[async_trait]
 impl Encoder for ZstdEncoder {
-    fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    async fn encode(&self, batches: &[RecordBatch]) -> Result<Vec<u8>> {
         if batches.is_empty() {
             return Ok(Vec::new());
         }
@@ -144,18 +110,30 @@ impl Encoder for ZstdEncoder {
             writer.finish().context(FailedToSerializeSnafu)?;
         }
 
-        // Then compress with zstd
-        zstd::encode_all(ipc_buffer.as_slice(), self.compression_level)
-            .context(FailedToCompressSnafu)
+        let mut compressed_data = Vec::new();
+        let mut encoder = AsyncZstdEncoder::with_quality(
+            &mut compressed_data,
+            Level::Precise(self.compression_level),
+        );
+        encoder
+            .write_all(&ipc_buffer)
+            .await
+            .context(FailedToCompressSnafu)?;
+        encoder.shutdown().await.context(FailedToCompressSnafu)?;
+        Ok(compressed_data)
     }
 
-    fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>> {
+    async fn decode(&self, data: &[u8]) -> Result<Vec<RecordBatch>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
 
-        // First, decompress with zstd
-        let decompressed = zstd::decode_all(data).context(FailedToDecompressSnafu)?;
+        let mut decompressed = Vec::new();
+        let mut decoder = ZstdDecoder::new(data);
+        decoder
+            .read_to_end(&mut decompressed)
+            .await
+            .context(FailedToDecompressSnafu)?;
 
         // Then deserialize from Arrow IPC format
         let cursor = Cursor::new(decompressed);
@@ -173,10 +151,10 @@ impl Encoder for ZstdEncoder {
 
 /// Create an encoder based on the encoding configuration.
 #[must_use]
-pub fn get_encoder(encoding: Encoding) -> Arc<dyn Encoder> {
+pub fn get_encoder(encoding: Encoding) -> Option<Arc<dyn Encoder>> {
     match encoding {
-        Encoding::None => Arc::new(NoOpEncoder),
-        Encoding::Zstd => Arc::new(ZstdEncoder::default()),
+        Encoding::None => None,
+        Encoding::Zstd => Some(Arc::new(ZstdEncoder::default())),
     }
 }
 
@@ -202,68 +180,57 @@ mod tests {
         .expect("valid record batch")
     }
 
-    #[test]
-    fn test_noop_encoder_roundtrip() {
-        let encoder = NoOpEncoder;
-        let original = vec![create_test_batch()];
-
-        let encoded_data = encoder.encode(&original).expect("encode should succeed");
-        assert!(!encoded_data.is_empty());
-
-        let decoded = encoder
-            .decode(&encoded_data)
-            .expect("decode should succeed");
-        assert_eq!(decoded.len(), original.len());
-        assert_eq!(decoded[0].num_rows(), original[0].num_rows());
-        assert_eq!(decoded[0].num_columns(), original[0].num_columns());
-    }
-
-    #[test]
-    fn test_noop_encoder_empty() {
-        let encoder = NoOpEncoder;
-        let empty: Vec<RecordBatch> = vec![];
-
-        let encoded_data = encoder.encode(&empty).expect("encode should succeed");
-        assert!(encoded_data.is_empty());
-
-        let decoded = encoder
-            .decode(&encoded_data)
-            .expect("decode should succeed");
-        assert!(decoded.is_empty());
-    }
-
-    #[test]
-    fn test_zstd_encoder_roundtrip() {
+    #[tokio::test]
+    async fn test_zstd_encoder_roundtrip() {
         let encoder = ZstdEncoder::default();
         let original = vec![create_test_batch()];
 
-        let encoded_data = encoder.encode(&original).expect("encode should succeed");
-        assert!(!encoded_data.is_empty());
+        let encoded_data = encoder
+            .encode(&original)
+            .await
+            .expect("encode should succeed");
+        (!encoded_data.is_empty())
+            .then_some(())
+            .expect("encoded data should not be empty");
 
         let decoded = encoder
             .decode(&encoded_data)
+            .await
             .expect("decode should succeed");
-        assert_eq!(decoded.len(), original.len());
-        assert_eq!(decoded[0].num_rows(), original[0].num_rows());
-        assert_eq!(decoded[0].num_columns(), original[0].num_columns());
+        (decoded.len() == original.len())
+            .then_some(())
+            .expect("decoded and original should have same length");
+        (decoded[0].num_rows() == original[0].num_rows())
+            .then_some(())
+            .expect("decoded and original should have same num_rows");
+        (decoded[0].num_columns() == original[0].num_columns())
+            .then_some(())
+            .expect("decoded and original should have same num_columns");
     }
 
-    #[test]
-    fn test_zstd_encoder_empty() {
+    #[tokio::test]
+    async fn test_zstd_encoder_empty() {
         let encoder = ZstdEncoder::default();
         let empty: Vec<RecordBatch> = vec![];
 
-        let encoded_data = encoder.encode(&empty).expect("encode should succeed");
-        assert!(encoded_data.is_empty());
+        let encoded_data = encoder.encode(&empty).await.expect("encode should succeed");
+        encoded_data
+            .is_empty()
+            .then_some(())
+            .expect("encoded empty data should be empty");
 
         let decoded = encoder
             .decode(&encoded_data)
+            .await
             .expect("decode should succeed");
-        assert!(decoded.is_empty());
+        decoded
+            .is_empty()
+            .then_some(())
+            .expect("decoded empty data should be empty");
     }
 
-    #[test]
-    fn test_zstd_compression_reduces_size() {
+    #[tokio::test]
+    async fn test_zstd_compression_reduces_size() {
         // Create a batch with repetitive data that should compress well
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -275,22 +242,19 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
             .expect("valid record batch");
 
-        let noop_encoder = NoOpEncoder;
         let zstd_encoder = ZstdEncoder::default();
 
-        let noop_size = noop_encoder
-            .encode(std::slice::from_ref(&batch))
-            .expect("encode should succeed")
-            .len();
+        let uncompressed_size = batch.get_array_memory_size();
         let zstd_size = zstd_encoder
             .encode(std::slice::from_ref(&batch))
+            .await
             .expect("encode should succeed")
             .len();
 
         // Zstd should compress this significantly
         assert!(
-            zstd_size < noop_size,
-            "Zstd size ({zstd_size}) should be less than uncompressed size ({noop_size})"
+            zstd_size < uncompressed_size,
+            "Zstd size ({zstd_size}) should be less than uncompressed size ({uncompressed_size})"
         );
     }
 }

@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use crate::Runtime;
 use arrow_schema::SchemaRef;
 use ballista_core::serde::BallistaLogicalExtensionCodec;
@@ -67,7 +83,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
     }
 
     fn try_encode(&self, node: &Extension, buf: &mut Vec<u8>) -> Result<()> {
-        if let Ok(()) = self.inner.try_encode(node, buf) {
+        if matches!(self.inner.try_encode(node, buf), Ok(())) {
             return Ok(());
         }
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ use data_components::rate_limit::RateLimiter;
 use reqwest::header::HeaderMap;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
+
+const GITHUB_RATE_LIMIT_BUFFER: i32 = 100;
 
 #[derive(Debug)]
 pub struct GitHubRateLimiter {
@@ -149,7 +151,7 @@ impl RateLimiter for GitHubRateLimiter {
                 }
                 RateLimitInfo::Primary(primary) => {
                     // GitHub GraphQL requests consume more than 1 rate-limit unit, so add some buffer to ensure the proper handling
-                    if primary.remaining <= 5 {
+                    if primary.remaining <= GITHUB_RATE_LIMIT_BUFFER {
                         let now = Utc::now();
                         if now < primary.reset_time {
                             let wait_duration = (primary.reset_time - now)

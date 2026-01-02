@@ -38,8 +38,9 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::component::dataset::Dataset;
-use crate::federated_table::FederatedTable;
+use crate::{
+    component::dataset::Dataset, federated_table::FederatedTable, register_data_connector,
+};
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
@@ -352,6 +353,8 @@ impl DataConnector for SpiceAI {
     }
 }
 
+register_data_connector!("spice.ai", SpiceAIFactory);
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpiceAIDatasetPath {
     OrgAppPath {
@@ -406,7 +409,7 @@ pub fn subscribe_to_append_stream(
                             DecodedPayload::None | DecodedPayload::Schema(_) => {},
                             DecodedPayload::RecordBatch(batch) => {
                                 match ChangeBatch::try_new(batch).map(|rb| {
-                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)
+                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
                                 }) {
                                     Ok(change_batch) => yield Ok(change_batch),
                                     Err(e) => {
@@ -443,7 +446,6 @@ mod tests {
     use crate::component::dataset::builder::DatasetBuilder;
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_spice_dataset_path() {
         let tests = vec![
             (

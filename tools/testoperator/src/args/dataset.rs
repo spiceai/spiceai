@@ -56,6 +56,16 @@ pub struct DatasetTestArgs {
     /// Whether to add HTTP clients for the test
     #[arg(long)]
     pub(crate) http_clients: bool,
+
+    /// Random parameter set count for parameterized queries (tests with different random parameters each run).
+    /// If not specified or 0, fixed parameters are used (no randomization).
+    #[arg(long)]
+    pub(crate) random_param_set_count: Option<usize>,
+
+    /// Mark queries as failed if they exceed this duration threshold (e.g., "500ms", "2s").
+    /// Useful for identifying slow queries that should be treated as failures in metrics.
+    #[arg(long, value_parser = parse_duration)]
+    pub(crate) mark_query_failed_if_exceeds: Option<std::time::Duration>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -149,6 +159,8 @@ pub enum QueryOverridesArg {
     Duckdb,
     #[serde(rename = "duckdb-zero-results")]
     DuckdbZeroResults,
+    #[serde(rename = "duckdb-partitioned")]
+    DuckdbPartitioned,
     #[serde(rename = "snowflake")]
     Snowflake,
     #[serde(rename = "oracle")]
@@ -189,12 +201,27 @@ impl From<QuerySetArg> for QuerySet {
     }
 }
 
-impl DatasetTestArgs {
-    /// Load the query set, handling scenario query sets from files
-    pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
-        match self.query_set {
+impl PartialEq<QuerySet> for QuerySetArg {
+    fn eq(&self, other: &QuerySet) -> bool {
+        matches!(
+            (self, other),
+            (QuerySetArg::Tpch, QuerySet::Tpch)
+                | (QuerySetArg::Tpcds, QuerySet::Tpcds)
+                | (QuerySetArg::Clickbench, QuerySet::Clickbench)
+                | (QuerySetArg::ParameterizedTpch, QuerySet::ParameterizedTpch)
+                | (QuerySetArg::Scenario, QuerySet::Scenario { .. })
+        )
+    }
+}
+
+pub trait QuerySetLoader {
+    fn query_set(&self) -> &QuerySetArg;
+    fn scenario_query_file(&self) -> Option<&PathBuf>;
+
+    fn load_query_set(&self) -> anyhow::Result<QuerySet> {
+        match self.query_set() {
             QuerySetArg::Scenario => {
-                let Some(file_path) = self.scenario_query_file.as_ref() else {
+                let Some(file_path) = self.scenario_query_file() else {
                     anyhow::bail!("scenario_query_file is required when query_set is Scenario");
                 };
 
@@ -209,6 +236,13 @@ impl DatasetTestArgs {
             }
             _ => Ok(QuerySet::from(self.query_set.clone())),
         }
+    }
+}
+
+impl DatasetTestArgs {
+    /// Load the query set, handling scenario query sets from files
+    pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
+        QuerySetLoader::load_query_set(self)
     }
 }
 
@@ -254,6 +288,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::ODBCDatabricks => QueryOverrides::ODBCDatabricks,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
             QueryOverridesArg::DuckdbZeroResults => QueryOverrides::DuckDBOnZeroResults,
+            QueryOverridesArg::DuckdbPartitioned => QueryOverrides::DuckDBPartitioned,
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
             QueryOverridesArg::Oracle => QueryOverrides::Oracle,
             QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
@@ -285,4 +320,37 @@ pub struct LoadTestArgs {
 
     #[arg(long)]
     pub(crate) no_error: bool,
+
+    /// Run until manually interrupted; disables duration-based stopping for the load phase
+    #[arg(long)]
+    pub(crate) run_until_stopped: bool,
+}
+
+/// Parse a duration string like "500ms", "2s", "1m" into a `Duration`
+fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("duration cannot be empty".to_string());
+    }
+
+    // Find where the numeric part ends
+    let num_end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+
+    let (num_str, unit) = s.split_at(num_end);
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid number: {num_str}"))?;
+
+    let multiplier = match unit.trim().to_lowercase().as_str() {
+        "ms" | "millis" | "milliseconds" => 1.0,
+        "s" | "sec" | "secs" | "second" | "seconds" | "" => 1000.0,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60_000.0,
+        _ => return Err(format!("unknown time unit: {unit}")),
+    };
+
+    #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let millis = (num * multiplier) as u64;
+    Ok(std::time::Duration::from_millis(millis))
 }

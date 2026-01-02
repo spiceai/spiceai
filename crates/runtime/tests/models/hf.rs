@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use app::AppBuilder;
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use runtime::{Runtime, auth::EndpointAuth};
 use spicepod::component::caching::CacheConfig;
 use spicepod::component::{embeddings::Embeddings, model::Model};
@@ -186,7 +186,6 @@ mod search {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(clippy::too_many_lines)]
     async fn huggingface_test_search() -> Result<(), anyhow::Error> {
         let app = AppBuilder::new("text-to-sql")
             .with_dataset(item_tpcds_dataset_w_embeddings(

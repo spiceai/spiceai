@@ -22,7 +22,7 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, SchemaRef};
 
 use arrow::error::ArrowError;
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use async_stream::stream;
 use chunking::Chunker;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -350,11 +350,7 @@ pub(crate) async fn compute_additional_embedding_columns(
 ///
 ///                 [`FixedSizeListArray`]
 /// ```
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
+#[expect(clippy::cast_sign_loss)]
 pub(super) async fn get_vectors(
     arr: impl Iterator<Item = Option<&str>>,
     model: &dyn Embed,
@@ -419,7 +415,7 @@ pub(super) async fn get_vectors(
 /// Similar to [`get_vectors`] but runs synchronously and processes embeddings in parallel
 /// across multiple threads using [`rayon::par_iter`]. The output is a [`FixedSizeListArray`],
 /// where each [`String`] gets embedded into a single [`f32`] vector.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[expect(clippy::cast_sign_loss)]
 pub(super) fn get_vectors_in_process(
     arr: Vec<Option<String>>,
     model: &Arc<dyn Embed>,
@@ -497,11 +493,6 @@ pub(super) fn get_vectors_in_process(
 ///                          | [[0, 10], [10, 21]]           |
 ///                          +-------------------------------+
 /// ```
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::too_many_lines
-)]
 async fn get_vectors_with_chunker(
     arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,
@@ -548,11 +539,10 @@ async fn get_vectors_with_chunker(
             .boxed()?
     };
 
-    #[allow(clippy::cast_sign_loss)]
     let vector_length = model.size();
     let capacity = chunks_per_row.iter().sum();
 
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     let mut vectors_builder = FixedSizeListBuilder::with_capacity(
         PrimitiveBuilder::<Float32Type>::with_capacity(capacity * (vector_length as usize)),
         vector_length,
@@ -569,11 +559,7 @@ async fn get_vectors_with_chunker(
 
     let mut lengths = Vec::with_capacity(chunks_per_row.len());
     let mut curr = 0;
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for chunkz_in_row in chunks_per_row {
         // Get the actual vectors
         for i in curr..curr + chunkz_in_row {
@@ -655,7 +641,7 @@ fn build_embedding_pool(
         .map_err(Into::into)
 }
 
-#[allow(clippy::float_cmp)]
+#[expect(clippy::float_cmp)]
 #[cfg(test)]
 mod tests {
     use crate::embeddings::execution_plan::get_vectors;
@@ -663,7 +649,7 @@ mod tests {
         array::{Array, AsArray},
         datatypes::Float32Type,
     };
-    use async_openai::types::EmbeddingInput;
+    use async_openai::types::embeddings::EmbeddingInput;
     use async_trait::async_trait;
     use llms::embeddings::{self, Embed};
     use std::collections::HashMap;

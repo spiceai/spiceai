@@ -40,7 +40,7 @@ use datafusion_table_providers::{
         TableDefinition, write::DuckDBTableWriter,
     },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
-    util::on_conflict::OnConflict,
+    util::{constraints::UpsertOptions, on_conflict::OnConflict},
 };
 use duckdb::AccessMode;
 use runtime_table_partition::{
@@ -66,6 +66,7 @@ use crate::{
     datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
     make_spice_data_directory,
     parameters::ParameterSpec,
+    register_data_accelerator,
 };
 
 type Result<T, E = super::Error> = std::result::Result<T, E>;
@@ -184,8 +185,8 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let partition_by_first = partition_by
-            .first()
+        let partition_by_last = partition_by
+            .last()
             .context(super::PartitionByRequiredSnafu)?
             .clone();
 
@@ -201,7 +202,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             DuckDBPartitionCreator::new(
                 self.get_shared_pool(source).await?,
                 cmd.clone(),
-                partition_by_first,
+                partition_by_last,
                 Arc::clone(&schema),
                 &self.duckdb_factory,
             )
@@ -213,6 +214,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             self.get_shared_pool(source).await?,
             creator.table_definition(),
             creator.on_conflict().cloned(),
+            creator.upsert_options().clone(),
             source,
         ));
 
@@ -246,6 +248,7 @@ struct DuckDBPartitionCreator {
     cmd: CreateExternalTable,
     table_definition: Arc<TableDefinition>,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
     partition_by: PartitionedBy,
     schema: SchemaRef,
 }
@@ -276,14 +279,35 @@ impl DuckDBPartitionCreator {
             .downcast_ref::<DuckDBTableWriter>()
             .ok_or("Expected DuckDBTableWriter but got different writer type")?;
 
+        // Extract UpsertOptions from cmd options
+        let upsert_options = Self::extract_upsert_options(&cmd);
+
         Ok(Self {
             pool,
             cmd,
             table_definition: writer.table_definition(),
             on_conflict: writer.on_conflict().cloned(),
+            upsert_options,
             partition_by,
             schema,
         })
+    }
+
+    /// Extracts `UpsertOptions` from the command options.
+    fn extract_upsert_options(cmd: &CreateExternalTable) -> UpsertOptions {
+        let remove_duplicates = cmd
+            .options
+            .get("upsert_remove_duplicates")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let last_write_wins = cmd
+            .options
+            .get("upsert_last_write_wins")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+        UpsertOptions {
+            remove_duplicates,
+            last_write_wins,
+        }
     }
 
     pub(crate) fn table_definition(&self) -> Arc<TableDefinition> {
@@ -292,6 +316,10 @@ impl DuckDBPartitionCreator {
 
     pub fn on_conflict(&self) -> Option<&OnConflict> {
         self.on_conflict.as_ref()
+    }
+
+    pub fn upsert_options(&self) -> &UpsertOptions {
+        &self.upsert_options
     }
 
     fn list_partitioned_tables(&self) -> Result<Vec<String>, creator::Error> {
@@ -439,6 +467,11 @@ async fn get_pool(
     ))
 }
 
+register_data_accelerator!(
+    Engine::TableModePartitionedDuckDB,
+    TablesModePartitionedDuckDBAccelerator
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,7 +494,6 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_tables_mode_partitioned_duckdb_accelerator() {
         // Ensure no previous database version exists
         let test_db_path = "./test_table.db";

@@ -98,9 +98,7 @@ impl PhysicalOptimizerRule for BytesProcessedPhysicalOptimizer {
             let mut exec_plan =
                 BytesProcessedExec::new(plan, Arc::clone(&self.emit_bytes_callback));
 
-            if cfg!(feature = "cluster") {
-                exec_plan = exec_plan.fallback_to_new_context();
-            }
+            exec_plan = exec_plan.fallback_to_new_context();
 
             Ok(Transformed::new(
                 Arc::new(exec_plan),
@@ -327,7 +325,7 @@ impl ExecutionPlan for BytesProcessedExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         self.input_exec.statistics()
     }
 
@@ -410,7 +408,7 @@ mod tests {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_preserve_order_pushdown() -> Result<()> {
         let ctx = SessionContext::new();

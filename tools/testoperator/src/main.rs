@@ -24,8 +24,8 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, HttpConsistencyTestArgs,
-    HttpOverheadTestArgs, LoadTestArgs, TestCommands,
+    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, TestCommands,
+    TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -52,10 +52,9 @@ async fn main() -> anyhow::Result<()> {
                 test_args: DatasetTestArgs { common, .. },
                 ..
             })
-            | TestCommands::HttpConsistency(HttpConsistencyTestArgs { common, .. })
-            | TestCommands::HttpOverhead(HttpOverheadTestArgs { common, .. })
             | TestCommands::Evals(EvalsTestArgs { common, .. })
             | TestCommands::Search(SearchTestArgs { common, .. })
+            | TestCommands::TextToSql(TextToSqlArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -74,12 +73,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(TestCommands::DataConsistency(args)) => {
             commands::data_consistency::run(&args).await?;
         }
-        Commands::Run(TestCommands::HttpOverhead(args)) => {
-            commands::http::overhead_run(&args).await?;
-        }
-        Commands::Run(TestCommands::HttpConsistency(args)) => {
-            commands::http::consistency_run(&args).await?;
-        }
         Commands::Dispatch(args) => {
             commands::dispatch::dispatch(args).await?;
         }
@@ -92,10 +85,13 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "append")]
         Commands::Export(TestCommands::Append(args)) => {
-            commands::env_export(&args.common).await?;
+            commands::env_export(&args.test_args.common).await?;
         }
         Commands::Run(TestCommands::Search(args)) => {
             commands::search::run(&args).await?;
+        }
+        Commands::Run(TestCommands::TextToSql(args)) => {
+            commands::text_to_sql::run(&args).await?;
         }
         _ => {
             return Err(anyhow::anyhow!("Unsupported command"));
