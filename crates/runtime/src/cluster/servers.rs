@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 use super::ClusterTlsConfig;
-use crate::cluster::ClusterServiceImpl;
+use crate::cluster::{ClusterServiceImpl, ExecutorServiceImpl};
 use crate::flight::{Error, is_address_in_use_error};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use ballista_executor::flight_service::BallistaFlightService;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
+use runtime_proto::executor_service_server::ExecutorServiceServer;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -144,13 +145,20 @@ pub async fn start_executor_flight_server(
         );
     }
 
-    // Executor: serve only BallistaFlightService for receiving query fragments.
-    // No OTel service needed on executors.
-    let server = server.add_service(
-        arrow_flight::flight_service_server::FlightServiceServer::new(BallistaFlightService::new())
+    // Executor: serve BallistaFlightService for receiving query fragments
+    // and ExecutorService for scheduler-driven discovery.
+    let executor_service = ExecutorServiceImpl::new(Arc::clone(&rt.df));
+    let executor_service_server = ExecutorServiceServer::new(executor_service);
+
+    let server = server
+        .add_service(
+            arrow_flight::flight_service_server::FlightServiceServer::new(
+                BallistaFlightService::new(),
+            )
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX),
-    );
+        )
+        .add_service(executor_service_server);
 
     // Use the executor's bound address if it was dynamically assigned during registration.
     #[expect(clippy::cast_possible_truncation)]

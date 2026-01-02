@@ -21,14 +21,18 @@ limitations under the License.
 
 use app::App;
 use runtime_proto::cluster_service_server::ClusterService;
+use runtime_proto::executor_service_server::ExecutorService;
 use runtime_proto::{
-    ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
+    DescribeExecutorRequest, DescribeExecutorResponse, ExpandSecretRequest, ExpandSecretResponse,
+    GetAppDefinitionRequest, GetAppDefinitionResponse,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
+
+use crate::datafusion::DataFusion;
 
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
@@ -114,6 +118,69 @@ impl ClusterService for ClusterServiceImpl {
         Ok(Response::new(ExpandSecretResponse {
             key: request.key,
             value: exposed.to_string(),
+        }))
+    }
+}
+
+/// Executor service for scheduler-driven discovery.
+///
+/// This service is exposed by executors so schedulers can query their
+/// registration information (executor ID, host, port, task slots).
+pub struct ExecutorServiceImpl {
+    df: Arc<DataFusion>,
+}
+
+impl ExecutorServiceImpl {
+    /// Creates a new executor service implementation.
+    #[must_use]
+    pub fn new(df: Arc<DataFusion>) -> Self {
+        Self { df }
+    }
+}
+
+#[tonic::async_trait]
+impl ExecutorService for ExecutorServiceImpl {
+    async fn describe_executor(
+        &self,
+        _request: Request<DescribeExecutorRequest>,
+    ) -> Result<Response<DescribeExecutorResponse>, Status> {
+        tracing::trace!("ExecutorService::describe_executor called");
+
+        let executor_guard = self
+            .df
+            .executor
+            .read()
+            .map_err(|_| Status::internal("Failed to acquire executor lock"))?;
+
+        let Some(ref executor) = *executor_guard else {
+            return Err(Status::unavailable(
+                "Executor registration not yet available",
+            ));
+        };
+
+        let registration = &executor.metadata;
+
+        let task_slots = registration
+            .specification
+            .as_ref()
+            .and_then(|spec| {
+                spec.resources.iter().find_map(|r| {
+                    r.resource.as_ref().map(|res| {
+                        let ballista_core::serde::protobuf::executor_resource::Resource::TaskSlots(
+                            slots,
+                        ) = res;
+                        *slots
+                    })
+                })
+            })
+            .unwrap_or(0);
+
+        Ok(Response::new(DescribeExecutorResponse {
+            executor_id: registration.id.clone(),
+            host: registration.host.clone().unwrap_or_default(),
+            port: registration.port,
+            grpc_port: registration.grpc_port,
+            task_slots,
         }))
     }
 }

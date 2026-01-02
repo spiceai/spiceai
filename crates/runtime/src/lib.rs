@@ -659,6 +659,30 @@ impl Runtime {
             reason = "type alias scoped to cluster setup"
         )]
         type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+        // Discovery future (scheduler-only, optional based on --executor-discovery-dns)
+        let maybe_discovery_future: Option<BoxedClusterFuture> =
+            if self.df.cluster_config.effective_role() == Some(ClusterRole::Scheduler)
+                && self.df.cluster_config.executor_discovery_dns().is_some()
+            {
+                let discovery_shutdown = CancellationToken::new();
+                let discovery_rt = Arc::clone(&self);
+                let cloned_discovery_shutdown = discovery_shutdown.clone();
+                let discovery_fut = async move {
+                    cluster::start_executor_discovery_loop(discovery_rt, cloned_discovery_shutdown)
+                        .await
+                };
+                Some(Box::pin(
+                    self.start_runtime_task(
+                        "cluster_executor_discovery",
+                        Some(discovery_shutdown),
+                        discovery_fut,
+                    )
+                    .await,
+                ))
+            } else {
+                None
+            };
+
         let maybe_cluster_future: Option<BoxedClusterFuture> =
             match self.df.cluster_config.effective_role() {
                 Some(ClusterRole::Scheduler) => {
@@ -675,6 +699,7 @@ impl Runtime {
                         .await
                         .context(UnableToStartClusterServerSnafu)
                     };
+
                     let self_for_task = Arc::clone(&self);
                     Some(Box::pin(
                         self_for_task
@@ -829,29 +854,46 @@ impl Runtime {
             .await;
 
         // wait for all servers to shut down or if any of the servers fail to start
-        if let Some(cluster_future) = maybe_cluster_future {
-            return match tokio::try_join!(
-                http_future,
-                flight_future,
-                metrics_future,
-                pods_watcher_future,
-                cluster_future,
-                shutdown_signal_future
-            ) {
-                Err(err) => Err(err),
-                _ => Ok(()),
-            };
-        }
-
-        match tokio::try_join!(
-            http_future,
-            flight_future,
-            metrics_future,
-            pods_watcher_future,
-            shutdown_signal_future
-        ) {
-            Err(err) => Err(err),
-            _ => Ok(()),
+        match (maybe_cluster_future, maybe_discovery_future) {
+            (Some(cluster_future), Some(discovery_future)) => {
+                match tokio::try_join!(
+                    http_future,
+                    flight_future,
+                    metrics_future,
+                    pods_watcher_future,
+                    cluster_future,
+                    discovery_future,
+                    shutdown_signal_future
+                ) {
+                    Err(err) => Err(err),
+                    _ => Ok(()),
+                }
+            }
+            (Some(cluster_future), None) => {
+                match tokio::try_join!(
+                    http_future,
+                    flight_future,
+                    metrics_future,
+                    pods_watcher_future,
+                    cluster_future,
+                    shutdown_signal_future
+                ) {
+                    Err(err) => Err(err),
+                    _ => Ok(()),
+                }
+            }
+            _ => {
+                match tokio::try_join!(
+                    http_future,
+                    flight_future,
+                    metrics_future,
+                    pods_watcher_future,
+                    shutdown_signal_future
+                ) {
+                    Err(err) => Err(err),
+                    _ => Ok(()),
+                }
+            }
         }
     }
 

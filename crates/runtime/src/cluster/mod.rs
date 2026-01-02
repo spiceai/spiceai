@@ -61,17 +61,18 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
-use uuid::Uuid;
 
 type SchedulerEndpointOverride =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
 
 pub mod datafusion;
+mod discovery;
 mod servers;
 mod service;
 
+pub use discovery::start_executor_discovery_loop;
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-pub use service::ClusterServiceImpl;
+pub use service::{ClusterServiceImpl, ExecutorServiceImpl};
 
 /// mTLS configuration for cluster communications.
 ///
@@ -329,6 +330,12 @@ impl ResolvedClusterConfig {
     pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
         self.tls_config.as_ref().map(|t| &t.client_tls_config)
     }
+
+    /// Returns the DNS SRV record name for executor discovery (scheduler mode only).
+    #[must_use]
+    pub fn executor_discovery_dns(&self) -> Option<&str> {
+        self.config.executor_discovery_dns.as_deref()
+    }
 }
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
@@ -384,66 +391,6 @@ pub async fn initialize_cluster_executor(
 
         config
     });
-
-    // Generate executor_id early so we can use it for both the app definition request and executor registration
-    let executor_id = Uuid::new_v4().to_string();
-
-    // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
-    // This ensures shuffle files are written to the configured directory.
-    let mut cluster_client =
-        create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
-
-    let app_definition_request = GetAppDefinitionRequest {
-        executor_id: executor_id.clone(),
-    };
-
-    let response = cluster_client
-        .get_app_definition(app_definition_request)
-        .await
-        .map_err(|status| FailedToStartClusterExecutor {
-            source: format!("Failed to get app definition from scheduler: {status}").into(),
-        })?;
-
-    let app_json = response.into_inner().app_json;
-
-    let app_def: App = serde_json::from_str(&app_json)
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
-
-    // Extract temp_directory from the app definition for the executor's work_dir
-    let work_dir = app_def
-        .runtime
-        .query
-        .as_ref()
-        .and_then(|q| q.temp_directory.clone())
-        .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string());
-
-    let app_def = Arc::new(app_def);
-
-    let scheduler_endpoint = create_grpc_client_endpoint(scheduler_url.to_string())
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
-    let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
-        scheduler_endpoint
-            .tls_config(tls_config)
-            .map_err(|e| FailedToStartClusterExecutor {
-                source: Box::new(e),
-            })?
-    } else {
-        scheduler_endpoint
-    };
-
-    let scheduler_connection =
-        scheduler_endpoint
-            .connect()
-            .await
-            .map_err(|e| FailedToStartClusterExecutor {
-                source: format!("Unable to connect to scheduler at {scheduler_url}: {e}").into(),
-            })?;
-
-    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
-        .max_encoding_message_size(usize::MAX)
-        .max_decoding_message_size(usize::MAX);
 
     // Use the configured node_bind_address for the executor flight server.
     // Fall back to dynamic port assignment if binding fails (e.g., port already in use).
@@ -521,13 +468,73 @@ pub async fn initialize_cluster_executor(
         (hostname, bind_addr.port())
     };
 
+    // Use the advertise address as the executor_id for easier identification
+    let executor_id = format!("{advertise_host}:{advertise_port}");
+
+    // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
+    // This ensures shuffle files are written to the configured directory.
+    let mut cluster_client =
+        create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
+
+    let app_definition_request = GetAppDefinitionRequest {
+        executor_id: executor_id.clone(),
+    };
+
+    let response = cluster_client
+        .get_app_definition(app_definition_request)
+        .await
+        .map_err(|status| FailedToStartClusterExecutor {
+            source: format!("Failed to get app definition from scheduler: {status}").into(),
+        })?;
+
+    let app_json = response.into_inner().app_json;
+
+    let app_def: App = serde_json::from_str(&app_json)
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
+
+    // Extract temp_directory from the app definition for the executor's work_dir
+    let work_dir = app_def
+        .runtime
+        .query
+        .as_ref()
+        .and_then(|q| q.temp_directory.clone())
+        .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string());
+
+    let app_def = Arc::new(app_def);
+
+    let scheduler_endpoint = create_grpc_client_endpoint(scheduler_url.to_string())
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
+    let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
+        scheduler_endpoint
+            .tls_config(tls_config)
+            .map_err(|e| FailedToStartClusterExecutor {
+                source: Box::new(e),
+            })?
+    } else {
+        scheduler_endpoint
+    };
+
+    let scheduler_connection =
+        scheduler_endpoint
+            .connect()
+            .await
+            .map_err(|e| FailedToStartClusterExecutor {
+                source: format!("Unable to connect to scheduler at {scheduler_url}: {e}").into(),
+            })?;
+
+    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
+        .max_encoding_message_size(usize::MAX)
+        .max_decoding_message_size(usize::MAX);
+
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service - use advertise address for scheduler to contact this executor
         host: Some(advertise_host),
         port: u32::from(advertise_port),
         // grpc_port is used only for push mode, and not initialized for pull mode (default)
-        grpc_port: 0,
+        grpc_port: u32::from(advertise_port),
         specification: Some(ExecutorSpecification {
             resources: vec![ExecutorResource {
                 resource: Some(Resource::TaskSlots(concurrent_tasks)),

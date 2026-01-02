@@ -129,6 +129,18 @@ pub struct ClusterConfig {
     ///   https://<node-advertise-address>:<port from --node-bind-address> (http:// if --allow-insecure-connections is set)
     #[arg(long = "node-advertise-address", value_name = "NODE_ADVERTISE_ADDRESS")]
     pub node_advertise_address: Option<String>,
+
+    /// The DNS SRV record name for discovering executors (scheduler mode only).
+    /// When set, the scheduler will periodically query this DNS SRV record to discover
+    /// executor endpoints and automatically register them.
+    ///
+    /// This is typically a Kubernetes headless service name, e.g.:
+    ///   my-executor.default.svc.cluster.local
+    ///
+    /// The SRV query returns executor hostnames and ports, which are then used to
+    /// call the `DescribeExecutor` RPC on each discovered executor.
+    #[arg(long = "executor-discovery-dns", value_name = "EXECUTOR_DISCOVERY_DNS")]
+    pub executor_discovery_dns: Option<String>,
 }
 
 impl Default for ClusterConfig {
@@ -142,6 +154,7 @@ impl Default for ClusterConfig {
             allow_insecure_connections: false,
             scheduler_address: None,
             node_advertise_address: None,
+            executor_discovery_dns: None,
         }
     }
 }

@@ -17,6 +17,31 @@ service ClusterService {
     rpc ExpandSecret(ExpandSecretRequest) returns (ExpandSecretResponse);
 }
 
+// Executor service for scheduler-driven discovery.
+// Exposed by executors so schedulers can query their registration information.
+service ExecutorService {
+    // Get the executor's registration information including task slots.
+    // Called by schedulers during executor discovery.
+    rpc DescribeExecutor(DescribeExecutorRequest) returns (DescribeExecutorResponse);
+}
+
+// Request message for DescribeExecutor RPC.
+message DescribeExecutorRequest {}
+
+// Response message for DescribeExecutor RPC.
+message DescribeExecutorResponse {
+    // Unique identifier for this executor.
+    string executor_id = 1;
+    // Hostname or IP address where the executor is reachable.
+    string host = 2;
+    // Port for the Arrow Flight service.
+    uint32 port = 3;
+    // Port for the gRPC service (used for push-based scheduling).
+    uint32 grpc_port = 4;
+    // Number of task slots available for concurrent task execution.
+    uint32 task_slots = 5;
+}
+
 // Request message for GetAppDefinition RPC.
 message GetAppDefinitionRequest {
     string executor_id = 1;

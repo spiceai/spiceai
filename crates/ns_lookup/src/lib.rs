@@ -38,9 +38,78 @@ pub enum Error {
 
     #[snafu(display("Invalid endpoint (no port specified): {endpoint}"))]
     InvalidPort { endpoint: String },
+
+    #[snafu(display("Failed to perform SRV lookup for {name}: {message}"))]
+    SrvLookupFailed { name: String, message: String },
+
+    #[snafu(display("Failed to create DNS resolver: {message}"))]
+    ResolverCreationFailed { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Result of an SRV record lookup.
+#[derive(Debug, Clone)]
+pub struct SrvRecord {
+    /// The target hostname from the SRV record.
+    pub target: String,
+    /// The port from the SRV record.
+    pub port: u16,
+    /// The priority of the SRV record (lower is higher priority).
+    pub priority: u16,
+    /// The weight for load balancing among records with the same priority.
+    pub weight: u16,
+}
+
+/// Perform a DNS SRV lookup for the given service name.
+///
+/// This is useful for discovering services in Kubernetes headless services,
+/// where the SRV record returns the individual pod hostnames and ports.
+///
+/// # Arguments
+///
+/// * `name` - The DNS name to query for SRV records (e.g., `my-service.default.svc.cluster.local`)
+///
+/// # Returns
+///
+/// A vector of `SrvRecord` containing the discovered services.
+///
+/// # Errors
+///
+/// Returns an error if the DNS lookup fails.
+pub async fn lookup_srv(name: &str) -> Result<Vec<SrvRecord>> {
+    let resolver = Resolver::builder_tokio()
+        .map_err(|e| Error::ResolverCreationFailed {
+            message: e.to_string(),
+        })?
+        .build();
+
+    let srv_lookup = resolver
+        .srv_lookup(name)
+        .await
+        .map_err(|e| Error::SrvLookupFailed {
+            name: name.to_string(),
+            message: e.to_string(),
+        })?;
+
+    let records: Vec<SrvRecord> = srv_lookup
+        .iter()
+        .map(|srv| {
+            // Remove trailing dot from target hostname
+            let target = srv.target().to_string();
+            let target = target.trim_end_matches('.').to_string();
+
+            SrvRecord {
+                target,
+                port: srv.port(),
+                priority: srv.priority(),
+                weight: srv.weight(),
+            }
+        })
+        .collect();
+
+    Ok(records)
+}
 
 /// Verify NS lookup and TCP connect for the provided `endpoint`.
 ///
