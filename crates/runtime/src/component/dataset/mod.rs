@@ -116,6 +116,26 @@ pub enum Error {
         "'snapshots_batches' is required when setting 'snapshots_trigger: batches'. For details, visit: https://spiceai.org/docs/features/data-acceleration/snapshots"
     ))]
     SnapshotTriggerIntervalRequiresInterval,
+
+    #[snafu(display(
+        "Dynamic dataset '{dataset}' must be read-only. Set 'access: readonly' or remove the 'params.dynamic' flag."
+    ))]
+    DynamicDatasetMustBeReadOnly { dataset: String },
+
+    #[snafu(display(
+        "Dynamic dataset '{dataset}' cannot have acceleration enabled. Remove the 'acceleration' configuration or set 'params.dynamic: false'."
+    ))]
+    DynamicDatasetCannotHaveAcceleration { dataset: String },
+
+    #[snafu(display(
+        "Dynamic dataset '{dataset}' cannot have embeddings configured. Remove the 'embeddings' configuration or set 'params.dynamic: false'."
+    ))]
+    DynamicDatasetCannotHaveEmbeddings { dataset: String },
+
+    #[snafu(display(
+        "Dynamic dataset '{dataset}' uses an unsupported connector '{connector}'. Dynamic datasets only support object-store listing connectors: s3, abfs, file, http, https, ftp, nfs, smb."
+    ))]
+    DynamicDatasetUnsupportedConnector { dataset: String, connector: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -265,6 +285,10 @@ pub struct Dataset {
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
     pub check_availability: CheckAvailability,
+    /// Dynamic datasets use UDTF-based queries to list objects in object stores.
+    /// When enabled, the dataset must be read-only, cannot have acceleration or embeddings,
+    /// and can only use object-store listing connectors (s3, abfs, file, http, https, ftp, nfs, smb).
+    pub dynamic: bool,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -290,6 +314,7 @@ impl std::fmt::Debug for Dataset {
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
             .field("check_availability", &self.check_availability)
+            .field("dynamic", &self.dynamic)
             .finish_non_exhaustive()
     }
 }
@@ -315,6 +340,7 @@ impl PartialEq for Dataset {
             && self.metrics == other.metrics
             && self.vectors == other.vectors
             && self.check_availability == other.check_availability
+            && self.dynamic == other.dynamic
     }
 }
 
@@ -551,6 +577,20 @@ impl Dataset {
         }
 
         false
+    }
+
+    #[must_use]
+    pub fn is_dynamic(&self) -> bool {
+        self.dynamic
+    }
+
+    /// Returns true if the dataset's source connector supports dynamic datasets.
+    /// Dynamic datasets only work with object-store listing connectors.
+    #[must_use]
+    pub fn source_supports_dynamic(&self) -> bool {
+        const DYNAMIC_SUPPORTED_SOURCES: &[&str] =
+            &["s3", "abfs", "file", "http", "https", "ftp", "nfs", "smb"];
+        DYNAMIC_SUPPORTED_SOURCES.contains(&self.source())
     }
 
     #[must_use]

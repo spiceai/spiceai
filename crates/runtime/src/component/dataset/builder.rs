@@ -62,6 +62,7 @@ pub struct DatasetBuilder {
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
     pub check_availability: CheckAvailability,
+    pub dynamic: bool,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -107,6 +108,17 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             }
         }
 
+        // Parse params.dynamic flag
+        let dynamic = dataset
+            .params
+            .as_ref()
+            .and_then(|p| p.data.get("dynamic"))
+            .is_some_and(|v| match v {
+                spicepod::param::ParamValue::Bool(b) => *b,
+                spicepod::param::ParamValue::String(s) => s.eq_ignore_ascii_case("true"),
+                _ => false,
+            });
+
         Ok(DatasetBuilder {
             from: dataset.from,
             name: table_reference,
@@ -142,6 +154,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             runtime: None,
             vectors: dataset.vectors,
             check_availability: CheckAvailability::from(dataset.check_availability),
+            dynamic,
         })
     }
 }
@@ -172,6 +185,7 @@ impl DatasetBuilder {
             runtime: None,
             vectors: None,
             check_availability: CheckAvailability::default(),
+            dynamic: false,
         })
     }
 
@@ -268,7 +282,40 @@ impl DatasetBuilder {
             runtime,
             vectors: self.vectors,
             check_availability: self.check_availability,
+            dynamic: self.dynamic,
         };
+
+        // Validate dynamic dataset configuration
+        if dataset.dynamic {
+            // Dynamic datasets must be read-only
+            if dataset.access != AccessMode::Read {
+                return Err(Error::DynamicDatasetMustBeReadOnly {
+                    dataset: dataset.name.to_string(),
+                });
+            }
+
+            // Dynamic datasets cannot have acceleration
+            if dataset.is_accelerated() {
+                return Err(Error::DynamicDatasetCannotHaveAcceleration {
+                    dataset: dataset.name.to_string(),
+                });
+            }
+
+            // Dynamic datasets cannot have embeddings
+            if dataset.has_embeddings() {
+                return Err(Error::DynamicDatasetCannotHaveEmbeddings {
+                    dataset: dataset.name.to_string(),
+                });
+            }
+
+            // Dynamic datasets must use object-store listing connectors
+            if !dataset.source_supports_dynamic() {
+                return Err(Error::DynamicDatasetUnsupportedConnector {
+                    dataset: dataset.name.to_string(),
+                    connector: dataset.source().to_string(),
+                });
+            }
+        }
 
         Ok(dataset)
     }
