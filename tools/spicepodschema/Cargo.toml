@@ -10,5 +10,39 @@ version.workspace = true
 
 [dependencies]
 schemars.workspace = true
+serde.workspace = true
 serde_json = "1"
+regex = "1"
 spicepod = { path = "../../crates/spicepod", features = ["schemars"] }
+
+# Runtime for accessing connector/accelerator registrations
+# Enable all data connector features for complete schema generation
+runtime = { path = "../../crates/runtime", features = [
+    # All data connectors
+    "clickhouse",
+    "databricks",
+    "debezium",
+    "delta_lake",
+    "dremio",
+    "duckdb",
+    "dynamodb",
+    "flightsql",
+    "ftp",
+    "imap",
+    "kafka",
+    "mongodb",
+    "mssql",
+    "mysql",
+    # "odbc",
+    "oracle",
+    "postgres",
+    "sharepoint",
+    "snowflake",
+    "spark",
+    "sqlite",
+    "turso",
+    # Models for model source parameters
+    "models",
+] }
+
+runtime-parameters = { path = "../../crates/runtime-parameters" }

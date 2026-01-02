@@ -422,17 +422,14 @@ pub enum Error {
     ))]
     AddressAlreadyInUse { addr: String },
 
-    #[cfg(feature = "cluster")]
     #[snafu(display(
         "The cluster scheduler is not initialized, preventing the flight service from starting."
     ))]
     ClusterSchedulerNotInitialized {},
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Unable to start internal cluster server: {source}"))]
     UnableToStartClusterServer { source: tonic::transport::Error },
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("The flight service has an insecure configuration: {message}"))]
     InsecureConfiguration { message: String },
 }
@@ -469,7 +466,6 @@ pub async fn start(
     rate_limits: Arc<RateLimits>,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
-    #[cfg(feature = "cluster")]
     if matches!(
         rt.df.cluster_config.effective_role(),
         Some(crate::config::ClusterRole::Executor)
@@ -483,8 +479,25 @@ pub async fn start(
 
     let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
     let session_store = service.session_store.clone();
+
+    let flight_message_size = app
+        .as_ref()
+        .and_then(|a| a.runtime.flight.clone())
+        .and_then(|f| f.max_message_size_bytes().transpose())
+        .transpose()
+        .map_err(|e| Error::InsecureConfiguration {
+            message: format!(
+                "Failed to parse spicepod value 'runtime.flight.max_message_size': {e}"
+            ),
+        })?;
+
     let spice_flight_service = FlightServiceServer::new(service)
-        .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
+        .max_decoding_message_size(
+            flight_message_size.unwrap_or(flight_client::MAX_DECODING_MESSAGE_SIZE),
+        )
+        .max_encoding_message_size(
+            flight_message_size.unwrap_or(flight_client::MAX_ENCODING_MESSAGE_SIZE),
+        );
 
     let mut server = Server::builder();
 

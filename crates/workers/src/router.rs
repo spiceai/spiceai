@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
     },
 };

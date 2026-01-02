@@ -92,34 +92,23 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ));
                 }
             }
-            TestType::HttpConsistency => {
-                for consistency in &test_file.tests.http_consistency {
-                    tests_to_dispatch.push((
-                        path,
-                        serde_json::json!(WorkflowArgs {
-                            specific_args: consistency.clone(),
-                            spiced_commit: args.spiced_commit.clone(),
-                        }),
-                    ));
-                }
-            }
-            TestType::HttpOverhead => {
-                for overhead in &test_file.tests.http_overhead {
-                    tests_to_dispatch.push((
-                        path,
-                        serde_json::json!(WorkflowArgs {
-                            specific_args: overhead.clone(),
-                            spiced_commit: args.spiced_commit.clone(),
-                        }),
-                    ));
-                }
-            }
             TestType::Append => {
                 for append in &test_file.tests.append {
                     tests_to_dispatch.push((
                         path,
                         serde_json::json!(WorkflowArgs {
                             specific_args: append.clone(),
+                            spiced_commit: args.spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
+            TestType::TextToSql => {
+                for text_to_sql in &test_file.tests.text_to_sql {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: text_to_sql.clone(),
                             spiced_commit: args.spiced_commit.clone(),
                         }),
                     ));

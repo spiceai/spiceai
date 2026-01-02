@@ -24,7 +24,7 @@ use crate::embeddings::{
     Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
     candle::util::link_files_into_tmp_dir, encode_embedding,
 };
-use async_openai::types::{
+use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
 };
 use async_trait::async_trait;

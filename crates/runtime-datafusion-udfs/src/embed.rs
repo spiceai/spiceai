@@ -20,7 +20,7 @@ use arrow::array::Array;
 use arrow::array::{ListBuilder, PrimitiveBuilder};
 use arrow::datatypes::Float32Type;
 use arrow_schema::{DataType, Field};
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::cast::{as_large_string_array, as_list_array, as_string_array};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{DocSection, Documentation, ScalarFunctionArgs};

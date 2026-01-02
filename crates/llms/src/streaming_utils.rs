@@ -18,7 +18,7 @@ limitations under the License.
 
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionStreamResponseDelta, CompletionUsage,
         CreateChatCompletionStreamResponse, FinishReason, Role,
     },
@@ -49,7 +49,8 @@ pub fn create_stream_response(
         .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
         .as_secs() as u32;
 
-    Ok(CreateChatCompletionStreamResponse {
+    #[expect(deprecated)]
+    let resp = CreateChatCompletionStreamResponse {
         id: id.to_string(),
         created,
         model: model.to_string(),
@@ -58,7 +59,8 @@ pub fn create_stream_response(
         object: "chat.completion.chunk".to_string(),
         usage,
         choices,
-    })
+    };
+    Ok(resp)
 }
 
 /// Creates a standardized `CreateChatCompletionStreamResponse` with custom timestamp
@@ -74,7 +76,8 @@ pub fn create_stream_response_with_timestamp(
     usage: Option<CompletionUsage>,
     created: u32,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
-    Ok(CreateChatCompletionStreamResponse {
+    #[expect(deprecated)]
+    let resp = CreateChatCompletionStreamResponse {
         id: id.to_string(),
         created,
         model: model.to_string(),
@@ -83,7 +86,8 @@ pub fn create_stream_response_with_timestamp(
         object: "chat.completion.chunk".to_string(),
         usage,
         choices,
-    })
+    };
+    Ok(resp)
 }
 
 /// Creates a chat choice for streaming with optional content
@@ -218,7 +222,7 @@ pub fn create_mock_streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::{CompletionUsage, Role};
+    use async_openai::types::chat::{CompletionUsage, Role};
     use futures::StreamExt;
 
     #[test]

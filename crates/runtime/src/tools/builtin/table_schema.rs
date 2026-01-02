@@ -22,11 +22,11 @@ use arrow_schema::{Field, Schema};
 use arrow_tools::format::table_schemas_to_markdown_table;
 use async_openai::{
     error::OpenAIError,
-    types::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestToolMessageContent,
-        ChatCompletionToolType, FunctionCall,
+    types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionRequestToolMessageContent, FunctionCall,
     },
 };
 use async_trait::async_trait;
@@ -239,15 +239,16 @@ impl TableSchemaTool {
         params: &TableSchemaToolParams,
     ) -> Result<ChatCompletionRequestAssistantMessage, OpenAIError> {
         ChatCompletionRequestAssistantMessageArgs::default()
-            .tool_calls(vec![ChatCompletionMessageToolCall {
-                id: id.to_string(),
-                r#type: ChatCompletionToolType::Function,
-                function: FunctionCall {
-                    name: self.name().to_string(),
-                    arguments: serde_json::to_string(&params)
-                        .map_err(OpenAIError::JSONDeserialize)?,
+            .tool_calls(vec![ChatCompletionMessageToolCalls::Function(
+                ChatCompletionMessageToolCall {
+                    id: id.to_string(),
+                    function: FunctionCall {
+                        name: self.name().to_string(),
+                        arguments: serde_json::to_string(&params)
+                            .map_err(|e| OpenAIError::JSONDeserialize(e, String::new()))?,
+                    },
                 },
-            }])
+            )])
             .build()
     }
 }

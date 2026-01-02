@@ -29,9 +29,9 @@ aws-sdk-s3.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
 axum-extra = { version = "0.10.1", features = ["typed-header"] }
-ballista-core = { workspace = true, optional = true }
-ballista-executor = { workspace = true, optional = true }
-ballista-scheduler = { workspace = true, optional = true }
+ballista-core = { workspace = true }
+ballista-executor = { workspace = true }
+ballista-scheduler = { workspace = true }
 base64.workspace = true
 byte-unit.workspace = true
 bytes.workspace = true
@@ -50,7 +50,7 @@ datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
-datafusion-proto = { workspace = true, optional = true }
+datafusion-proto = { workspace = true }
 datafusion-spark.workspace = true
 datafusion-table-providers = { workspace = true }
 dynamodb-streams = { path="../dynamodb-streams", optional = true }
@@ -69,7 +69,7 @@ globset.workspace = true
 governor.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
-headers-accept = "0.1.3"
+headers-accept = "0.3.0"
 http.workspace = true
 http-body-util = "0.1.3"
 humantime = { workspace = true, optional = true }
@@ -84,7 +84,7 @@ indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
 llms = { path = "../llms" }
-mediatype = "0.19.18"
+mediatype = "0.21.0"
 model_components = { path = "../model_components" }
 moka.workspace = true
 mongodb = { workspace = true, optional = true }
@@ -233,25 +233,14 @@ clickhouse = [
     "db_connection_pool/clickhouse",
     "data_components/clickhouse",
 ]
-cluster = [
-    "dep:ballista-core",
-    "dep:ballista-scheduler",
-    "dep:ballista-executor",
-    "dep:datafusion-proto",
-    "runtime-datafusion/cluster",
-    "datafusion-optimizer-rules/cluster",
-    "runtime-secrets/cluster"
-]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
 default = [
-    "cluster",
     "keyring-secret-store",
     "aws-secrets-manager",
     "sharepoint",
     "bedrock",
-    "dep:datafusion-proto",
 ]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
@@ -277,6 +266,7 @@ models = [
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
+nfs = ["runtime-object-store/nfs"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
 openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 oracle = ["data_components/oracle"]
@@ -291,7 +281,9 @@ s3_vectors = [
     "dep:s3_vectors",
     "search/s3_vectors",
 ]
+sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
+smb = ["runtime-object-store/smb"]
 snapshots = ["runtime-acceleration/snapshots"]
 snowflake = [
     "dep:snowflake-api",
