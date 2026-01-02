@@ -1,0 +1,4 @@
+tests:
+  nas:
+    spicepod_path: federated/smb[parquet].yaml
+    validate_results: true

@@ -2,30 +2,30 @@ version: v1
 kind: Spicepod
 name: smb[parquet]-federated
 datasets:
-  - from: smb://${env:SMB_HOST}/${env:SMB_SHARE}/tpch/customer.parquet
+  - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/customer.parquet
     name: customer
     params: &smb_params
       file_format: parquet
-      user: ${env:SMB_USER}
-      pass: ${secrets:SMB_PASS}
-  - from: smb://${env:SMB_HOST}/${env:SMB_SHARE}/tpch/lineitem.parquet
+      smb_user: runner
+      smb_pass: ${secrets:UNAS_SMB_PASS}
+  - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/lineitem.parquet
     name: lineitem
     params: *smb_params
-  - from: smb://${env:SMB_HOST}/${env:SMB_SHARE}/tpch/nation.parquet
+  - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/nation.parquet
     name: nation
     params: *smb_params
-  - from: smb://${env:SMB_HOST}/${env:SMB_SHARE}/tpch/orders.parquet
+  - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/orders.parquet
     name: orders
     params: *smb_params
-  - from: smb://${env:SMB_HOST}/${env:SMB_SHARE}/tpch/part.parquet
+  - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/part.parquet
     name: part
     params: *smb_params
-  - from: smb://${env:SMB_HOST}/${env:SMB_SHARE}/tpch/partsupp.parquet
+  - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/partsupp.parquet
     name: partsupp
     params: *smb_params
-  - from: smb://${env:SMB_HOST}/${env:SMB_SHARE}/tpch/region.parquet
+  - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/region.parquet
     name: region
     params: *smb_params
-  - from: smb://${env:SMB_HOST}/${env:SMB_SHARE}/tpch/supplier.parquet
+  - from: smb://192.168.3.148/ai_platform_dev/data/benchmarks/tpch/sf1/supplier.parquet
     name: supplier
     params: *smb_params
