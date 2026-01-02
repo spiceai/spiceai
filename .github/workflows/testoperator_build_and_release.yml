@@ -1,4 +1,4 @@
-name: testoperator_build_and_release
+name: Build testoperator binary and Docker Image
 
 on:
   push:
