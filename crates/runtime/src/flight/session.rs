@@ -70,9 +70,14 @@ const MAX_SESSIONS: u64 = 10_000;
 /// This enables stateful operations like SQL PREPARE/EXECUTE across multiple Flight SQL requests.
 /// Sessions are automatically expired after `SESSION_TTL_SECS` of inactivity and the store
 /// enforces a maximum of `MAX_SESSIONS` concurrent sessions with LRU eviction.
+///
+/// Each session is associated with an optional API key that was used during the handshake.
+/// This allows validating session IDs in the auth layer.
 #[derive(Clone)]
 pub struct SessionStore {
     sessions: Cache<String, Arc<SessionContext>>,
+    /// Maps session IDs to the API key that created them (for auth validation)
+    session_principals: Cache<String, String>,
 }
 
 impl std::fmt::Debug for SessionStore {
@@ -92,12 +97,17 @@ impl SessionStore {
                 .max_capacity(MAX_SESSIONS)
                 .time_to_idle(Duration::from_secs(SESSION_TTL_SECS))
                 .build(),
+            session_principals: Cache::builder()
+                .max_capacity(MAX_SESSIONS)
+                .time_to_idle(Duration::from_secs(SESSION_TTL_SECS))
+                .build(),
         }
     }
 
     /// Creates a new session with a unique ID and returns both the ID and the context.
     ///
     /// The session context is created from the provided base context's state.
+    /// If an `api_key` is provided, it's associated with this session for auth validation.
     ///
     /// # Important: Session State Snapshot
     ///
@@ -110,13 +120,52 @@ impl SessionStore {
     /// long-running sessions may see stale catalog information if the runtime's
     /// registered datasets change.
     #[must_use]
-    pub fn create_session(&self, base_ctx: &SessionContext) -> (String, Arc<SessionContext>) {
+    pub fn create_session(
+        &self,
+        base_ctx: &SessionContext,
+        api_key: Option<&str>,
+    ) -> (String, Arc<SessionContext>) {
         let session_id = Uuid::now_v7().hyphenated().to_string();
-        let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
+
+        // Create a new SessionState with a unique session_id using SessionStateBuilder.
+        // This is critical for session isolation - each session needs its own session_id
+        // so that prepared statements stored in SessionState.prepared_plans are isolated.
+        //
+        // Note: We use new_from_existing() which copies all catalog/function registrations
+        // but sets session_id to None, allowing build() to generate a new unique ID.
+        let new_state =
+            datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+                base_ctx.state(),
+            )
+            .with_session_id(session_id.clone())
+            .build();
+        let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
         self.sessions
             .insert(session_id.clone(), Arc::clone(&session_ctx));
+
+        // Track the API key associated with this session for auth validation
+        if let Some(key) = api_key {
+            self.session_principals
+                .insert(session_id.clone(), key.to_string());
+        }
+
         self.sessions.run_pending_tasks();
+        self.session_principals.run_pending_tasks();
         (session_id, session_ctx)
+    }
+
+    /// Validates a session ID and returns the associated API key if valid.
+    ///
+    /// Returns `Some(api_key)` if the session exists and was created with an API key.
+    /// Returns `None` if the session doesn't exist or wasn't created with an API key.
+    #[must_use]
+    pub fn validate_session(&self, session_id: &str) -> Option<String> {
+        // Only return the principal if the session also exists
+        if self.sessions.get(session_id).is_some() {
+            self.session_principals.get(session_id)
+        } else {
+            None
+        }
     }
 
     /// Gets an existing session context by ID.
@@ -148,7 +197,15 @@ impl SessionStore {
             Some(session)
         } else {
             // Create new session with the provided ID (from auth token)
-            let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
+            // Use SessionStateBuilder to ensure the session has its own unique session_id
+            // for proper prepared statement isolation
+            let new_state =
+                datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+                    base_ctx.state(),
+                )
+                .with_session_id(session_id.clone())
+                .build();
+            let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
             self.sessions.insert(session_id, Arc::clone(&session_ctx));
             self.sessions.run_pending_tasks();
             Some(session_ctx)
@@ -170,7 +227,7 @@ impl SessionStore {
         let session_id = extract_session_id_from_headers(headers)?;
 
         tracing::debug!(
-            "Flight SQL session: ID={}, existing_sessions={}",
+            "Flight SQL session lookup: ID={}, existing_sessions={}",
             session_id,
             self.session_count()
         );
@@ -180,9 +237,20 @@ impl SessionStore {
             tracing::debug!("Using existing Flight SQL session: {}", session_id);
             Some(session)
         } else {
-            tracing::debug!("Creating new Flight SQL session: {}", session_id);
+            tracing::debug!(
+                "Creating NEW Flight SQL session from request: {}",
+                session_id
+            );
             // Create new session with the provided ID (from auth token)
-            let session_ctx = Arc::new(SessionContext::new_with_state(base_ctx.state()));
+            // Use SessionStateBuilder to ensure the session has its own unique session_id
+            // for proper prepared statement isolation
+            let new_state =
+                datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+                    base_ctx.state(),
+                )
+                .with_session_id(session_id.clone())
+                .build();
+            let session_ctx = Arc::new(SessionContext::new_with_state(new_state));
             self.sessions.insert(session_id, Arc::clone(&session_ctx));
             self.sessions.run_pending_tasks();
             Some(session_ctx)
@@ -285,13 +353,31 @@ mod tests {
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
 
-        let (session_id, ctx1) = store.create_session(&base_ctx);
+        let (session_id, ctx1) = store.create_session(&base_ctx, Some("test-api-key"));
         assert!(store.get_session(&session_id).is_some());
 
         let ctx2 = store
             .get_session(&session_id)
             .expect("Session should exist");
         assert!(Arc::ptr_eq(&ctx1, &ctx2));
+
+        // Validate session returns the API key
+        assert_eq!(
+            store.validate_session(&session_id),
+            Some("test-api-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_session_without_api_key() {
+        let store = SessionStore::new();
+        let base_ctx = SessionContext::new();
+
+        let (session_id, _) = store.create_session(&base_ctx, None);
+        assert!(store.get_session(&session_id).is_some());
+
+        // Validate session returns None when no API key was provided
+        assert_eq!(store.validate_session(&session_id), None);
     }
 
     #[test]
@@ -299,7 +385,7 @@ mod tests {
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
 
-        let (session_id, _) = store.create_session(&base_ctx);
+        let (session_id, _) = store.create_session(&base_ctx, Some("key"));
         assert_eq!(store.session_count(), 1);
 
         assert!(store.remove_session(&session_id));
@@ -312,14 +398,18 @@ mod tests {
         let store = SessionStore::new();
         let base_ctx = SessionContext::new();
 
-        let (id1, _) = store.create_session(&base_ctx);
-        let (id2, _) = store.create_session(&base_ctx);
+        let (id1, _) = store.create_session(&base_ctx, Some("key1"));
+        let (id2, _) = store.create_session(&base_ctx, Some("key2"));
 
         assert_ne!(id1, id2);
         assert_eq!(store.session_count(), 2);
 
         assert!(store.get_session(&id1).is_some());
         assert!(store.get_session(&id2).is_some());
+
+        // Validate each session returns its own API key
+        assert_eq!(store.validate_session(&id1), Some("key1".to_string()));
+        assert_eq!(store.validate_session(&id2), Some("key2".to_string()));
     }
 
     #[test]

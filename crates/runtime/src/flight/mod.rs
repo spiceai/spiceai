@@ -70,6 +70,7 @@ mod handshake;
 mod metrics;
 mod middleware;
 mod session;
+mod session_auth;
 mod util;
 
 pub use session::SessionStore;
@@ -505,8 +506,13 @@ pub async fn start(
         server = server_with_tls_config(server, tls_config).context(UnableToConfigureTlsSnafu)?;
     }
 
+    // Wrap the auth in session-awareness to accept session IDs as bearer tokens
+    let session_aware_auth = session_auth::with_session_awareness(
+        endpoint_auth.flight_basic_auth,
+        session_store.clone(),
+    );
     let auth_layer = tower::ServiceBuilder::new()
-        .layer(BasicAuthLayer::new(endpoint_auth.flight_basic_auth))
+        .layer(BasicAuthLayer::new(session_aware_auth))
         .into_inner();
 
     // Create the OpenTelemetry MetricsService

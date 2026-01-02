@@ -51,10 +51,15 @@ pub(crate) async fn handle(
     let request_context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&request_context);
 
-    // Create a new session from the base context
-    let (session_id, _session_ctx) = session_store.create_session(&datafusion.ctx);
+    // Create a new session from the base context, associating it with the auth token
+    let (session_id, _session_ctx) =
+        session_store.create_session(&datafusion.ctx, auth_token.as_deref());
 
-    tracing::debug!("Created new Flight SQL session: {}", session_id);
+    tracing::debug!(
+        "Created new Flight SQL session: {} (auth_token={:?})",
+        session_id,
+        auth_token
+    );
 
     // Return the session ID in the response payload
     let result = HandshakeResponse {
@@ -66,13 +71,17 @@ pub(crate) async fn handle(
     let mut resp: Response<HandshakeResponseStream> = Response::new(Box::pin(output));
 
     // Add session ID as a header for standard session tracking
-    let session_header = MetadataValue::try_from(session_id)
+    let session_header = MetadataValue::try_from(&session_id)
         .map_err(|_| Status::internal("generated session ID could not be parsed"))?;
     resp.metadata_mut().insert("x-session-id", session_header);
 
-    // If there was an auth token, still return it for backward compatibility
-    if let Some(auth_token) = auth_token {
-        let auth_str = format!("Bearer {auth_token}");
+    // Return session ID as the Authorization Bearer token.
+    // The FlightSqlServiceClient extracts this token and uses it for all subsequent requests.
+    // Using session_id (not auth_token) ensures prepared statements are isolated per session.
+    // We only set this if authentication was performed (auth_token is Some), to maintain
+    // backward compatibility with unauthenticated setups.
+    if auth_token.is_some() {
+        let auth_str = format!("Bearer {session_id}");
         let md = MetadataValue::try_from(auth_str)
             .map_err(|_| Status::internal("generated authorization could not be parsed"))?;
         resp.metadata_mut().insert("authorization", md);

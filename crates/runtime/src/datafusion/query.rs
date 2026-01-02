@@ -457,8 +457,15 @@ impl Query {
                         request_context
                             .extension::<super::flight_session_extension::FlightSessionExtension>()
                     {
+                        tracing::debug!(
+                            "Statement plan using Flight session: {}",
+                            flight_session.session_context().session_id()
+                        );
                         Arc::clone(flight_session.session_context())
                     } else {
+                        tracing::debug!(
+                            "Statement plan using ad-hoc session (no FlightSessionExtension)"
+                        );
                         Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
                     };
 
@@ -639,8 +646,17 @@ impl Query {
 
     /// Return the schema for the data and (possibly) the parameters of a [`Query`].
     pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
-        let session = self.df.ctx.state();
         let request_context = RequestContext::current(AsyncMarker::new().await);
+
+        // Check if there's a Flight SQL session-specific context for session isolation
+        let session = if let Some(flight_session) =
+            request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
+        {
+            flight_session.session_context().state()
+        } else {
+            self.df.ctx.state()
+        };
+
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
             QueryMethod::Text { ref sql, .. } => match session.create_logical_plan(sql).await {

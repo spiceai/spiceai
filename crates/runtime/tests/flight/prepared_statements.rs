@@ -643,4 +643,499 @@ mod flight_prepared_statements {
             })
             .await
     }
+
+    /// Test null parameter handling in prepared statements.
+    ///
+    /// Verifies that null values can be correctly bound and used in prepared statements.
+    #[tokio::test]
+    async fn test_null_parameter_handling() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                // Test with a nullable parameter using COALESCE to handle nulls
+                let query = "SELECT COALESCE($1, 'default_value') AS result";
+
+                let param_batch = {
+                    let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+                        "$1",
+                        arrow::datatypes::DataType::Utf8,
+                        true,
+                    )]);
+                    // Create a null string value
+                    let null_array = arrow::array::StringArray::from(vec![None as Option<&str>]);
+                    RecordBatch::try_new(
+                        Arc::new(schema),
+                        vec![Arc::new(null_array) as Arc<dyn arrow::array::Array>],
+                    )?
+                };
+
+                let results = execute_parameterized_query(&mut client, query, param_batch).await?;
+
+                let results_str =
+                    arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+                insta::assert_snapshot!("null_parameter_coalesce", results_str);
+
+                // Verify the result is 'default_value' since we passed null
+                if let Some(batch) = results.first() {
+                    assert_eq!(batch.num_rows(), 1);
+                    // DataFusion may return Utf8 or LargeUtf8 depending on the query
+                    let col = batch.column(0);
+                    let value = if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        arr.value(0).to_string()
+                    } else if let Some(arr) = col
+                        .as_any()
+                        .downcast_ref::<arrow::array::LargeStringArray>()
+                    {
+                        arr.value(0).to_string()
+                    } else {
+                        panic!(
+                            "Expected Utf8 or LargeUtf8 array, got {:?}",
+                            col.data_type()
+                        );
+                    };
+                    assert_eq!(value, "default_value");
+                }
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Test prepared statement with no parameters.
+    ///
+    /// Verifies that prepared statements work correctly when no parameters are bound.
+    #[tokio::test]
+    async fn test_no_parameters() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                // Query with no parameters
+                let query = "SELECT 1 + 1 AS result";
+
+                let prepared_stmt = get_prepared_statement(&mut client, query).await?;
+
+                // Verify parameter schema is empty
+                let param_schema = prepared_stmt.parameter_schema()?;
+                assert_eq!(
+                    param_schema.fields().len(),
+                    0,
+                    "Query without parameters should have empty parameter schema"
+                );
+
+                // Execute with empty parameters
+                let empty_batch = {
+                    let schema = arrow::datatypes::Schema::empty();
+                    RecordBatch::new_empty(Arc::new(schema))
+                };
+
+                let results =
+                    execute_prepared_statement(&mut client, prepared_stmt, empty_batch).await?;
+
+                let results_str =
+                    arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+                insta::assert_snapshot!("no_parameters_query", results_str);
+
+                // Verify the result is 2
+                if let Some(batch) = results.first() {
+                    assert_eq!(batch.num_rows(), 1);
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("column should be Int64Array");
+                    assert_eq!(col.value(0), 2);
+                }
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Test prepared statement re-execution with different parameters.
+    ///
+    /// Verifies that the same prepared statement can be executed multiple times
+    /// with different parameter values.
+    #[tokio::test]
+    async fn test_prepared_statement_reexecution() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                let query = "SELECT $1 * $2 AS product";
+
+                // First execution: 3 * 7 = 21
+                let param_batch1 = create_param_batch(
+                    vec![
+                        ("$1", arrow::datatypes::DataType::Int64, false),
+                        ("$2", arrow::datatypes::DataType::Int64, false),
+                    ],
+                    vec![
+                        Arc::new(Int64Array::from(vec![3])) as Arc<dyn arrow::array::Array>,
+                        Arc::new(Int64Array::from(vec![7])) as Arc<dyn arrow::array::Array>,
+                    ],
+                )?;
+
+                let results1 =
+                    execute_parameterized_query(&mut client, query, param_batch1).await?;
+
+                if let Some(batch) = results1.first() {
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("column should be Int64Array");
+                    assert_eq!(col.value(0), 21, "3 * 7 should equal 21");
+                }
+
+                // Second execution with different values: 5 * 11 = 55
+                let param_batch2 = create_param_batch(
+                    vec![
+                        ("$1", arrow::datatypes::DataType::Int64, false),
+                        ("$2", arrow::datatypes::DataType::Int64, false),
+                    ],
+                    vec![
+                        Arc::new(Int64Array::from(vec![5])) as Arc<dyn arrow::array::Array>,
+                        Arc::new(Int64Array::from(vec![11])) as Arc<dyn arrow::array::Array>,
+                    ],
+                )?;
+
+                let results2 =
+                    execute_parameterized_query(&mut client, query, param_batch2).await?;
+
+                if let Some(batch) = results2.first() {
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("column should be Int64Array");
+                    assert_eq!(col.value(0), 55, "5 * 11 should equal 55");
+                }
+
+                // Third execution: -2 * 6 = -12
+                let param_batch3 = create_param_batch(
+                    vec![
+                        ("$1", arrow::datatypes::DataType::Int64, false),
+                        ("$2", arrow::datatypes::DataType::Int64, false),
+                    ],
+                    vec![
+                        Arc::new(Int64Array::from(vec![-2])) as Arc<dyn arrow::array::Array>,
+                        Arc::new(Int64Array::from(vec![6])) as Arc<dyn arrow::array::Array>,
+                    ],
+                )?;
+
+                let results3 =
+                    execute_parameterized_query(&mut client, query, param_batch3).await?;
+
+                if let Some(batch) = results3.first() {
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("column should be Int64Array");
+                    assert_eq!(col.value(0), -12, "-2 * 6 should equal -12");
+                }
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Test session isolation for SQL PREPARE/EXECUTE statements.
+    ///
+    /// Verifies that prepared statements are scoped to individual sessions and
+    /// are not visible across sessions.
+    ///
+    /// Each handshake creates a unique session with its own `SessionContext`. The session ID
+    /// is returned in the Authorization Bearer token, ensuring subsequent requests from
+    /// the same client use the same session.
+    #[tokio::test]
+    async fn test_session_isolation() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let auth = Arc::new(ApiKeyAuth::new(vec![
+                    ApiKey::parse_str("user1:rw"),
+                    ApiKey::parse_str("user2:rw"),
+                ])) as Arc<dyn FlightBasicAuth + Send + Sync>;
+                let (channel, _df) = start_spice_test_app(Some(auth), None, None).await?;
+
+                // Session 1: Create a prepared statement
+                let mut client1 = FlightSqlServiceClient::new(channel.clone());
+                client1.handshake("", "user1").await?;
+
+                let prepare_sql = "PREPARE session1_query AS SELECT 'from_session_1' AS source";
+                let mut prepare_stmt1 = client1.prepare(prepare_sql.to_string(), None).await?;
+                let prepare_info1 = prepare_stmt1.execute().await?;
+
+                // Consume the prepare result
+                if let Some(endpoint) = prepare_info1.endpoint.first()
+                    && let Some(ticket) = &endpoint.ticket
+                {
+                    let prepare_stream = client1.do_get(ticket.clone()).await?;
+                    let _: Vec<RecordBatch> = prepare_stream.try_collect().await?;
+                }
+
+                // Session 1 should be able to execute its own prepared statement
+                let execute1_sql = "EXECUTE session1_query";
+                let mut execute1_stmt = client1.prepare(execute1_sql.to_string(), None).await?;
+                let execute1_info = execute1_stmt.execute().await?;
+
+                let ticket1 = execute1_info
+                    .endpoint
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("No endpoint"))?
+                    .ticket
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("No ticket"))?;
+
+                let stream1 = client1.do_get(ticket1.clone()).await?;
+                let results1: Vec<RecordBatch> = stream1.try_collect().await?;
+
+                // Verify session 1 gets correct result
+                let results1_str =
+                    arrow::util::pretty::pretty_format_batches(&results1).expect("pretty batches");
+                insta::assert_snapshot!("session_isolation_session1_result", results1_str);
+
+                // Session 2: Should NOT be able to access session 1's prepared statement
+                let mut client2 = FlightSqlServiceClient::new(channel);
+                client2.handshake("", "user2").await?;
+
+                // Attempting to execute session1_query from session2 should fail
+                // Note: prepare() and execute() succeed because they just create/return metadata.
+                // The actual execution happens during do_get(), which is when we verify
+                // the prepared statement exists in the session.
+                let execute2_sql = "EXECUTE session1_query";
+                let mut execute2_stmt = client2.prepare(execute2_sql.to_string(), None).await?;
+                let execute2_info = execute2_stmt.execute().await?;
+
+                // Get the ticket and try to fetch results - this is when the actual execution happens
+                let ticket2 = execute2_info
+                    .endpoint
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("No endpoint"))?
+                    .ticket
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("No ticket"))?;
+
+                // This should fail because session2 doesn't have the prepared statement
+                let stream2_result = client2.do_get(ticket2.clone()).await;
+                assert!(
+                    stream2_result.is_err(),
+                    "Session 2 should not be able to execute session 1's prepared statement"
+                );
+
+                let err_msg = stream2_result
+                    .expect_err("Expected error")
+                    .to_string()
+                    .to_lowercase();
+                assert!(
+                    err_msg.contains("session1_query") || err_msg.contains("not found"),
+                    "Error should mention the statement name or 'not found': {err_msg}",
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Test error handling when executing non-existent prepared statement.
+    ///
+    /// Verifies that attempting to execute a non-existent prepared statement returns
+    /// a proper error.
+    #[tokio::test]
+    async fn test_execute_nonexistent_statement() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                    as Arc<dyn FlightBasicAuth + Send + Sync>;
+                let (channel, _df) = start_spice_test_app(Some(auth), None, None).await?;
+
+                let mut client = FlightSqlServiceClient::new(channel);
+                client.handshake("", "valid").await?;
+
+                // Try to execute a statement that was never prepared
+                // Note: prepare() and execute() succeed because they just create/return metadata.
+                // The actual execution happens during do_get(), which is when we verify
+                // the prepared statement exists in the session.
+                let execute_sql = "EXECUTE nonexistent_statement";
+                let mut execute_stmt = client.prepare(execute_sql.to_string(), None).await?;
+                let execute_info = execute_stmt.execute().await?;
+
+                // Get the ticket and try to fetch results - this is when the actual execution happens
+                let ticket = execute_info
+                    .endpoint
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("No endpoint"))?
+                    .ticket
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("No ticket"))?;
+
+                // This should fail because the prepared statement doesn't exist
+                let stream_result = client.do_get(ticket.clone()).await;
+                assert!(
+                    stream_result.is_err(),
+                    "Executing non-existent prepared statement should fail"
+                );
+
+                let err_msg = stream_result
+                    .expect_err("Expected error")
+                    .to_string()
+                    .to_lowercase();
+                assert!(
+                    err_msg.contains("nonexistent_statement") || err_msg.contains("not found"),
+                    "Error should mention the statement name: {err_msg}",
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Test DEALLOCATE on non-existent statement.
+    ///
+    /// Verifies proper error handling when attempting to deallocate a statement that doesn't exist.
+    #[tokio::test]
+    async fn test_deallocate_nonexistent_statement() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                    as Arc<dyn FlightBasicAuth + Send + Sync>;
+                let (channel, _df) = start_spice_test_app(Some(auth), None, None).await?;
+
+                let mut client = FlightSqlServiceClient::new(channel);
+                client.handshake("", "valid").await?;
+
+                // Try to deallocate a statement that was never prepared
+                // Note: prepare() and execute() succeed because they just create/return metadata.
+                // The actual execution happens during do_get(), which is when we verify
+                // the prepared statement exists in the session.
+                let deallocate_sql = "DEALLOCATE nonexistent_statement";
+                let mut deallocate_stmt = client.prepare(deallocate_sql.to_string(), None).await?;
+                let deallocate_info = deallocate_stmt.execute().await?;
+
+                // Get the ticket and try to fetch results - this is when the actual execution happens
+                let ticket = deallocate_info
+                    .endpoint
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("No endpoint"))?
+                    .ticket
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("No ticket"))?;
+
+                // DEALLOCATE on non-existent statement should fail
+                let stream_result = client.do_get(ticket.clone()).await;
+                assert!(
+                    stream_result.is_err(),
+                    "Deallocating non-existent prepared statement should fail"
+                );
+
+                let err_msg = stream_result
+                    .expect_err("Expected error")
+                    .to_string()
+                    .to_lowercase();
+                assert!(
+                    err_msg.contains("nonexistent_statement") || err_msg.contains("not found"),
+                    "Error should mention the statement name: {err_msg}",
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Test mixed parameter types.
+    ///
+    /// Verifies that prepared statements can handle a mix of different parameter types
+    /// (int, string, boolean, float) in the same query.
+    #[tokio::test]
+    async fn test_mixed_parameter_types() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                use arrow::array::Float64Array;
+
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                // Query with multiple parameter types
+                let query = "SELECT CAST($1 AS INTEGER) AS int_val, $2 AS str_val, $3 AS bool_val, CAST($4 AS DOUBLE) AS float_val";
+
+                let param_batch = create_param_batch(
+                    vec![
+                        ("$1", arrow::datatypes::DataType::Int64, false),
+                        ("$2", arrow::datatypes::DataType::Utf8, false),
+                        ("$3", arrow::datatypes::DataType::Boolean, false),
+                        ("$4", arrow::datatypes::DataType::Float64, false),
+                    ],
+                    vec![
+                        Arc::new(Int64Array::from(vec![42])) as Arc<dyn arrow::array::Array>,
+                        Arc::new(StringArray::from(vec!["hello"])) as Arc<dyn arrow::array::Array>,
+                        Arc::new(BooleanArray::from(vec![true])) as Arc<dyn arrow::array::Array>,
+                        Arc::new(Float64Array::from(vec![std::f64::consts::PI]))
+                            as Arc<dyn arrow::array::Array>,
+                    ],
+                )?;
+
+                let results = execute_parameterized_query(&mut client, query, param_batch).await?;
+
+                let results_str =
+                    arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
+                insta::assert_snapshot!("mixed_parameter_types", results_str);
+
+                // Verify the results
+                if let Some(batch) = results.first() {
+                    assert_eq!(batch.num_columns(), 4);
+                    assert_eq!(batch.num_rows(), 1);
+
+                    // Verify string column value (may be Utf8 or LargeUtf8)
+                    let str_col = batch.column(1);
+                    let str_value = if let Some(arr) = str_col.as_any().downcast_ref::<StringArray>()
+                    {
+                        arr.value(0).to_string()
+                    } else if let Some(arr) = str_col
+                        .as_any()
+                        .downcast_ref::<arrow::array::LargeStringArray>()
+                    {
+                        arr.value(0).to_string()
+                    } else {
+                        panic!(
+                            "str column should be Utf8 or LargeUtf8, got {:?}",
+                            str_col.data_type()
+                        );
+                    };
+                    assert_eq!(str_value, "hello");
+
+                    let bool_col = batch
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .expect("bool column should be BooleanArray");
+                    assert!(bool_col.value(0));
+                }
+
+                Ok(())
+            })
+            .await
+    }
 }
