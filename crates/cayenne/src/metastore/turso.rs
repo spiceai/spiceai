@@ -112,7 +112,8 @@ impl TursoMetastore {
             primary_key_json TEXT,
             current_snapshot_id TEXT NOT NULL DEFAULT '',
             partition_column TEXT,
-            vortex_config_json TEXT
+            vortex_config_json TEXT,
+            current_sequence_number BIGINT NOT NULL DEFAULT 0
         )
     ";
 
@@ -126,6 +127,8 @@ impl TursoMetastore {
             format TEXT NOT NULL,
             delete_count BIGINT NOT NULL,
             file_size_bytes BIGINT NOT NULL,
+            source_data_file_path TEXT,
+            sequence_number BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -143,6 +146,39 @@ impl TursoMetastore {
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             UNIQUE(table_id, partition_column, partition_value)
+        )
+    ";
+
+    /// Schema for the `cayenne_insert_record` table.
+    ///
+    /// Insert records track PKs that were re-inserted after being deleted.
+    /// Each record stores the sequence number when the insert occurred.
+    /// Combined with the delete's sequence number, this enables ordering:
+    /// - If `insert_sequence` > `delete_sequence` for a PK, the row is visible
+    /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
+    const INSERT_RECORD_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_insert_record (
+            insert_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_id INTEGER NOT NULL,
+            pk_bytes BLOB NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            UNIQUE(table_id, pk_bytes)
+        )
+    ";
+
+    /// Schema for the `cayenne_snapshot_sequence` table.
+    ///
+    /// Tracks the sequence number for each snapshot. This enables Iceberg-style
+    /// sequence ordering: a deletion only applies to snapshots with `sequence_number`
+    /// <= the delete file's `sequence_number`.
+    const SNAPSHOT_SEQUENCE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_snapshot_sequence (
+            table_id INTEGER NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, snapshot_id)
         )
     ";
 }
@@ -183,6 +219,16 @@ impl MetastoreRow for TursoRow {
         bool::from_value(value)
     }
 
+    fn get_blob(&self, index: usize) -> CatalogResult<Vec<u8>> {
+        let value = self
+            .values
+            .get(index)
+            .ok_or_else(|| CatalogError::Database {
+                message: format!("Column index {index} out of bounds"),
+            })?;
+        Vec::<u8>::from_value(value)
+    }
+
     fn get_optional_i64(&self, index: usize) -> CatalogResult<Option<i64>> {
         let value = self
             .values
@@ -214,10 +260,7 @@ fn convert_turso_value(value: &TursoValue) -> MetastoreValue {
             MetastoreValue::Null
         }
         TursoValue::Text(t) => MetastoreValue::Text(t.clone()),
-        TursoValue::Blob(_) => {
-            // We don't use blobs in metadata
-            MetastoreValue::Null
-        }
+        TursoValue::Blob(b) => MetastoreValue::Blob(b.clone()),
     }
 }
 
@@ -227,6 +270,7 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
         MetastoreValue::Integer(i) => TursoValue::Integer(*i),
         MetastoreValue::Text(s) => TursoValue::Text(s.clone()),
         MetastoreValue::Bool(b) => TursoValue::Integer(i64::from(*b)),
+        MetastoreValue::Blob(b) => TursoValue::Blob(b.clone()),
         MetastoreValue::Null => TursoValue::Null,
     }
 }
@@ -254,10 +298,12 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {};",
+            "{}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
             Self::DELETE_FILE_TABLE_DDL,
-            Self::PARTITION_TABLE_DDL
+            Self::PARTITION_TABLE_DDL,
+            Self::INSERT_RECORD_TABLE_DDL,
+            Self::SNAPSHOT_SEQUENCE_TABLE_DDL
         );
 
         conn.execute_batch(&schema_sql)

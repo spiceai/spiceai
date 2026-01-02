@@ -1,0 +1,12 @@
+# Simple Spicepod for testing Python ADBC Flight SQL
+version: v1beta1
+kind: Spicepod
+name: adbc_test
+
+# This minimal configuration allows testing of:
+# - Basic queries
+# - Prepared statements
+# - Parameter binding
+#
+# No datasets are required for the basic tests as they use
+# simple SELECT statements without table access.
