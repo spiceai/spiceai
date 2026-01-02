@@ -57,6 +57,7 @@ use {
 };
 
 use datafusion::execution::SessionState;
+use datafusion::prelude::SessionContext;
 
 use async_stream::stream;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -158,7 +159,16 @@ macro_rules! handle_error {
 }
 
 impl Query {
-    fn get_session_state(&self) -> Result<SessionState> {
+    fn get_session_state(&self, request_context: &Arc<RequestContext>) -> Result<SessionState> {
+        // Check if there's a Flight SQL session-specific context
+        if let Some(flight_session) =
+            request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
+        {
+            // For cluster mode with session context, we don't apply cluster modifications
+            // since the session state should remain local to preserve prepared statements
+            return Ok(flight_session.session_context().state());
+        }
+
         if !matches!(self.df.cluster_config.role(), Some(ClusterRole::Scheduler)) {
             return Ok(self.df.ctx.state());
         }
@@ -290,7 +300,7 @@ impl Query {
         let inner_span = span.clone();
 
         let query_result = async {
-            let mut session = self.get_session_state()?;
+            let mut session = self.get_session_state(&request_context)?;
 
             let ctx = self;
             let tracker = ctx.tracker;
@@ -434,49 +444,134 @@ impl Query {
                 ctx.df.ctx.state()
             };
 
-            let physical_plan = match session_for_execution.create_physical_plan(&plan).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    let e = find_datafusion_root(e);
-                    let error_code = ErrorCode::from(&e);
+            // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
+            // They modify session state rather than producing query results, so must be
+            // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
+            let (res_stream, physical_plan): (SendableRecordBatchStream, Arc<dyn ExecutionPlan>) =
+                if matches!(&*plan, LogicalPlan::Statement(_)) {
+                    // For Statement plans, use SessionContext::execute_logical_plan()
+                    // which handles PREPARE/EXECUTE/DEALLOCATE by modifying session state.
+                    // Use the session-specific context if available to ensure prepared statements
+                    // are scoped to individual sessions.
+                    let session_ctx = if let Some(flight_session) =
+                        request_context
+                            .extension::<super::flight_session_extension::FlightSessionExtension>()
+                    {
+                        tracing::debug!(
+                            "Statement plan using Flight session: {}",
+                            flight_session.session_context().session_id()
+                        );
+                        Arc::clone(flight_session.session_context())
+                    } else {
+                        tracing::debug!(
+                            "Statement plan using ad-hoc session (no FlightSessionExtension)"
+                        );
+                        Arc::new(SessionContext::new_with_state(ctx.df.ctx.state()))
+                    };
+
+                    let dataframe = match session_ctx
+                        .execute_logical_plan(plan.as_ref().clone())
+                        .await
+                    {
+                        Ok(df) => df,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
+
+                    // Create a physical plan from the dataframe and execute it with our own TaskContext
+                    // that includes the request context. This ensures BytesProcessedExec has access to it.
+                    let df_plan = match dataframe.create_physical_plan().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
+
+                    let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
+                    let stream = match execute_stream(Arc::clone(&df_plan), task_ctx) {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
+                    (stream, df_plan)
+                } else {
+                    // For regular plans, use the standard physical plan execution
+                    let physical_plan =
+                        match session_for_execution.create_physical_plan(&plan).await {
+                            Ok(stream) => stream,
+                            Err(e) => {
+                                let e = find_datafusion_root(e);
+                                let error_code = ErrorCode::from(&e);
+                                handle_error!(
+                                    tracker,
+                                    &request_context,
+                                    error_code,
+                                    e,
+                                    UnableToExecuteQuery
+                                )
+                            }
+                        };
+
+                    let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
+
+                    let stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
+                    (stream, physical_plan)
+                };
+
+            // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE)
+            // as their logical plan schema may differ from the actual execution result
+            if !matches!(&*plan, LogicalPlan::Statement(_)) {
+                let plan_schema = Arc::clone(plan.schema().inner());
+                let res_schema = res_stream.schema();
+
+                if let Err(e) = verify_schema(plan_schema.fields(), res_schema.fields()) {
                     handle_error!(
                         tracker,
                         &request_context,
-                        error_code,
+                        ErrorCode::InternalError,
                         e,
-                        UnableToExecuteQuery
+                        SchemaMismatch
                     )
                 }
-            };
-
-            let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
-
-            let res_stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
-                Ok(stream) => stream,
-                Err(e) => {
-                    let e = find_datafusion_root(e);
-                    let error_code = ErrorCode::from(&e);
-                    handle_error!(
-                        tracker,
-                        &request_context,
-                        error_code,
-                        e,
-                        UnableToExecuteQuery
-                    )
-                }
-            };
-
-            let plan_schema = Arc::clone(plan.schema().inner());
-            let res_schema = res_stream.schema();
-
-            if let Err(e) = verify_schema(plan_schema.fields(), res_schema.fields()) {
-                handle_error!(
-                    tracker,
-                    &request_context,
-                    ErrorCode::InternalError,
-                    e,
-                    SchemaMismatch
-                )
             }
 
             let final_stream = if cache_manager.should_cache_results() {
@@ -551,8 +646,17 @@ impl Query {
 
     /// Return the schema for the data and (possibly) the parameters of a [`Query`].
     pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
-        let session = self.df.ctx.state();
         let request_context = RequestContext::current(AsyncMarker::new().await);
+
+        // Check if there's a Flight SQL session-specific context for session isolation
+        let session = if let Some(flight_session) =
+            request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
+        {
+            flight_session.session_context().state()
+        } else {
+            self.df.ctx.state()
+        };
+
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
             QueryMethod::Text { ref sql, .. } => match session.create_logical_plan(sql).await {

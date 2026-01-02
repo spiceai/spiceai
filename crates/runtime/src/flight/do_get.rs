@@ -31,6 +31,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, flightsql, to_tonic_err};
 
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn handle(
     request: Request<Ticket>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
@@ -46,6 +47,9 @@ pub(crate) async fn handle(
         Command::CommandPreparedStatementQuery(command) => {
             Box::pin(flightsql::prepared_statement_query::do_get(command)).await
         }
+        Command::CommandPreparedStatementUpdate(command) => {
+            Box::pin(flightsql::prepared_statement_update::do_get(command)).await
+        }
         Command::CommandGetCatalogs(command) => flightsql::get_catalogs::do_get(command).await,
         Command::CommandGetDbSchemas(command) => flightsql::get_schemas::do_get(command).await,
         Command::CommandGetTables(command) => flightsql::get_tables::do_get(command).await,
@@ -54,10 +58,89 @@ pub(crate) async fn handle(
         }
         Command::CommandGetTableTypes(command) => flightsql::get_table_types::do_get(command).await,
         Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command).await,
-        unsupported => {
+        Command::CommandStatementIngest(command) => {
             let _start = metrics::track_flight_request("do_get", None).await;
             Err(Status::unimplemented(format!(
-                "Not yet implemented: {unsupported:?})"
+                "StatementIngest is not yet implemented: {command:?}"
+            )))
+        }
+        Command::CommandGetXdbcTypeInfo(command) => {
+            Box::pin(flightsql::get_xdbc_type_info::do_get(command)).await
+        }
+        // Additional Commands not yet supported
+        Command::CommandStatementUpdate(cmd) => {
+            let _start = metrics::track_flight_request("do_get", Some("statement_update")).await;
+            tracing::debug!("CommandStatementUpdate not yet implemented: {cmd:?}");
+            Err(Status::unimplemented(
+                "CommandStatementUpdate is not yet implemented",
+            ))
+        }
+        Command::CommandStatementSubstraitPlan(cmd) => {
+            let _start =
+                metrics::track_flight_request("do_get", Some("statement_substrait_plan")).await;
+            tracing::debug!("CommandStatementSubstraitPlan not yet implemented: {cmd:?}");
+            Err(Status::unimplemented(
+                "CommandStatementSubstraitPlan is not yet implemented",
+            ))
+        }
+        Command::CommandGetCrossReference(cmd) => {
+            let _start = metrics::track_flight_request("do_get", Some("get_cross_reference")).await;
+            tracing::debug!("CommandGetCrossReference not yet implemented: {cmd:?}");
+            Err(Status::unimplemented(
+                "CommandGetCrossReference is not yet implemented",
+            ))
+        }
+        Command::CommandGetExportedKeys(cmd) => {
+            let _start = metrics::track_flight_request("do_get", Some("get_exported_keys")).await;
+            tracing::debug!("CommandGetExportedKeys not yet implemented: {cmd:?}");
+            Err(Status::unimplemented(
+                "CommandGetExportedKeys is not yet implemented",
+            ))
+        }
+        Command::CommandGetImportedKeys(cmd) => {
+            let _start = metrics::track_flight_request("do_get", Some("get_imported_keys")).await;
+            tracing::debug!("CommandGetImportedKeys not yet implemented: {cmd:?}");
+            Err(Status::unimplemented(
+                "CommandGetImportedKeys is not yet implemented",
+            ))
+        }
+        // Action commands (handled via do_action, not do_get)
+        Command::ActionBeginSavepointRequest(_)
+        | Command::ActionBeginSavepointResult(_)
+        | Command::ActionBeginTransactionRequest(_)
+        | Command::ActionBeginTransactionResult(_)
+        | Command::ActionCancelQueryRequest(_)
+        | Command::ActionCancelQueryResult(_)
+        | Command::ActionClosePreparedStatementRequest(_)
+        | Command::ActionCreatePreparedStatementRequest(_)
+        | Command::ActionCreatePreparedStatementResult(_)
+        | Command::ActionCreatePreparedSubstraitPlanRequest(_)
+        | Command::ActionEndSavepointRequest(_)
+        | Command::ActionEndTransactionRequest(_) => {
+            let _start = metrics::track_flight_request("do_get", None).await;
+            Err(Status::invalid_argument(
+                "Action commands should be sent via do_action, not do_get",
+            ))
+        }
+        // Result types (returned from do_put, not used in do_get)
+        Command::DoPutPreparedStatementResult(_) | Command::DoPutUpdateResult(_) => {
+            let _start = metrics::track_flight_request("do_get", None).await;
+            Err(Status::invalid_argument(
+                "Result types should not be sent to do_get",
+            ))
+        }
+        // Ticket types (used in do_get, not part of Command routing)
+        Command::TicketStatementQuery(_) => {
+            let _start = metrics::track_flight_request("do_get", None).await;
+            Err(Status::internal(
+                "TicketStatementQuery should not reach this code path",
+            ))
+        }
+        Command::Unknown(any) => {
+            let _start = metrics::track_flight_request("do_get", None).await;
+            Err(Status::unimplemented(format!(
+                "Unknown command type: {}",
+                any.type_url
             )))
         }
     }

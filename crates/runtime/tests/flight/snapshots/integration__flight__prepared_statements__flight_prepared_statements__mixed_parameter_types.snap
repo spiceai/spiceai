@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/flight/prepared_statements.rs
+expression: results_str
+---
++---------+---------+----------+-------------------+
+| int_val | str_val | bool_val | float_val         |
++---------+---------+----------+-------------------+
+| 42      | hello   | true     | 3.141592653589793 |
++---------+---------+----------+-------------------+
