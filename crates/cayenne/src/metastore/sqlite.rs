@@ -119,7 +119,8 @@ impl SqliteMetastore {
             primary_key_json TEXT,
             current_snapshot_id TEXT NOT NULL DEFAULT '',
             partition_column TEXT,
-            vortex_config_json TEXT
+            vortex_config_json TEXT,
+            current_sequence_number BIGINT NOT NULL DEFAULT 0
         )
     ";
 
@@ -133,6 +134,8 @@ impl SqliteMetastore {
             format TEXT NOT NULL,
             delete_count BIGINT NOT NULL,
             file_size_bytes BIGINT NOT NULL,
+            source_data_file_path TEXT,
+            sequence_number BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -150,6 +153,39 @@ impl SqliteMetastore {
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             UNIQUE(table_id, partition_column, partition_value)
+        )
+    ";
+
+    /// Schema for the `cayenne_insert_record` table.
+    ///
+    /// Insert records track PKs that were re-inserted after being deleted.
+    /// Each record stores the sequence number when the insert occurred.
+    /// Combined with the delete's sequence number, this enables ordering:
+    /// - If `insert_sequence` > `delete_sequence` for a PK, the row is visible
+    /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
+    const INSERT_RECORD_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_insert_record (
+            insert_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_id INTEGER NOT NULL,
+            pk_bytes BLOB NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            UNIQUE(table_id, pk_bytes)
+        )
+    ";
+
+    /// Schema for the `cayenne_snapshot_sequence` table.
+    ///
+    /// Tracks the sequence number for each snapshot. This enables Iceberg-style
+    /// sequence ordering: a deletion only applies to snapshots with `sequence_number`
+    /// <= the delete file's `sequence_number`.
+    const SNAPSHOT_SEQUENCE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_snapshot_sequence (
+            table_id INTEGER NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, snapshot_id)
         )
     ";
 }
@@ -190,6 +226,16 @@ impl MetastoreRow for SqliteRow {
         bool::from_value(value)
     }
 
+    fn get_blob(&self, index: usize) -> CatalogResult<Vec<u8>> {
+        let value = self
+            .values
+            .get(index)
+            .ok_or_else(|| CatalogError::Database {
+                message: format!("Column index {index} out of bounds"),
+            })?;
+        Vec::<u8>::from_value(value)
+    }
+
     fn get_optional_i64(&self, index: usize) -> CatalogResult<Option<i64>> {
         let value = self
             .values
@@ -223,10 +269,7 @@ fn convert_sqlite_value(value: rusqlite::types::ValueRef<'_>) -> MetastoreValue 
         rusqlite::types::ValueRef::Text(t) => {
             MetastoreValue::Text(String::from_utf8_lossy(t).to_string())
         }
-        rusqlite::types::ValueRef::Blob(_) => {
-            // We don't use blobs in metadata
-            MetastoreValue::Null
-        }
+        rusqlite::types::ValueRef::Blob(b) => MetastoreValue::Blob(b.to_vec()),
     }
 }
 
@@ -236,6 +279,7 @@ fn to_sqlite_param(value: &MetastoreValue) -> Box<dyn rusqlite::ToSql> {
         MetastoreValue::Integer(i) => Box::new(*i),
         MetastoreValue::Text(s) => Box::new(s.clone()),
         MetastoreValue::Bool(b) => Box::new(*b),
+        MetastoreValue::Blob(b) => Box::new(b.clone()),
         MetastoreValue::Null => Box::new(rusqlite::types::Null),
     }
 }
@@ -263,10 +307,12 @@ impl MetastoreBackend for SqliteMetastore {
 
             // Create tables in a transaction
             conn.execute_batch(&format!(
-                "{}; {}; {};",
+                "{}; {}; {}; {}; {};",
                 Self::TABLE_TABLE_DDL,
                 Self::DELETE_FILE_TABLE_DDL,
-                Self::PARTITION_TABLE_DDL
+                Self::PARTITION_TABLE_DDL,
+                Self::INSERT_RECORD_TABLE_DDL,
+                Self::SNAPSHOT_SEQUENCE_TABLE_DDL
             ))?;
 
             Ok::<(), CatalogError>(())
