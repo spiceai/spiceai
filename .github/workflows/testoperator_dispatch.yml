@@ -77,7 +77,11 @@ jobs:
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Build spicepod validator
-        run: make build-validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Validate spicepods - TPCH - SF1
         run: |
