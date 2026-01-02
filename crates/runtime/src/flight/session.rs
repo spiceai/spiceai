@@ -202,10 +202,9 @@ impl SessionStore {
     /// Returns the number of active sessions.
     #[must_use]
     pub fn session_count(&self) -> usize {
-        // On 32-bit platforms this could truncate, but MAX_SESSIONS is 10,000 which fits
-        #[expect(clippy::cast_possible_truncation)]
-        let count = self.sessions.entry_count() as usize;
-        count
+        // MAX_SESSIONS is 10,000 which fits in usize on all platforms,
+        // but we use try_from for explicit safety and better code quality
+        usize::try_from(self.sessions.entry_count()).unwrap_or(usize::MAX)
     }
 }
 

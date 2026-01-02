@@ -21,7 +21,7 @@ from typing import Optional
 
 try:
     import adbc_driver_flightsql.dbapi as flight_sql
-    import pyarrow as pa
+    import pyarrow  # noqa: F401 - imported for availability check
 except ImportError as e:
     print(f"Error: Missing required package: {e}")
     print("Install with: pip install adbc-driver-flightsql pyarrow")

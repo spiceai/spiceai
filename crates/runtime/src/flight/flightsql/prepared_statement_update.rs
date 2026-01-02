@@ -147,9 +147,9 @@ pub(crate) async fn do_get(
                 .as_any()
                 .downcast_ref::<arrow::array::UInt64Array>()
             {
-                #[expect(clippy::cast_possible_wrap)]
-                let value = uint64_array.value(0) as i64;
-                value
+                let raw_value = uint64_array.value(0);
+                // Safely convert u64 to i64, capping at i64::MAX if overflow would occur
+                i64::try_from(raw_value).unwrap_or(i64::MAX)
             } else {
                 0
             }

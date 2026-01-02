@@ -313,9 +313,9 @@ pub(crate) fn get_xdbc_type_info_data() -> &'static XdbcTypeInfoData {
         match builder.build() {
             Ok(data) => data,
             Err(e) => {
-                // This should never happen as we're providing valid static data
-                // If it does, it's a programming error, not a runtime error
-                unreachable!("Failed to build XDBC type info data: {e:?}");
+                // This should never happen as we're providing valid static data.
+                // If it does, it's a programming error that should be caught during development.
+                panic!("Failed to build XDBC type info data - this is a programming error: {e:?}");
             }
         }
     });
