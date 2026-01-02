@@ -65,7 +65,7 @@ spice install v1.8.3 ai
 		// Parse arguments: can be [version], [flavor], or [version, flavor]
 		var targetVersion string
 		flavor := constants.FlavorDefault
-		
+
 		for _, arg := range args {
 			// Check if it's a version (starts with 'v' followed by numbers)
 			if strings.HasPrefix(arg, "v") && len(arg) > 1 {
@@ -121,7 +121,7 @@ spice install v1.8.3 ai
 				slog.Error("installing runtime", "error", err)
 				os.Exit(1)
 			}
-			
+
 			// Then install CLI - this may restart the process
 			if !installSpecificCli(targetVersion, flavor, !cpu, rtcontext) {
 				// CLI install failed
@@ -161,7 +161,7 @@ spice install v1.8.3 ai
 // Returns false if install failed or completed (with process restart)
 func installSpecificCli(targetVersion string, flavor constants.Flavor, allowAccelerator bool, rtcontext *context.RuntimeContext) bool {
 	cliVersion := version.Version()
-	
+
 	// Check if we're already at the target version
 	if cliVersion == targetVersion {
 		slog.Info(fmt.Sprintf("CLI already at version %s", targetVersion))
@@ -264,7 +264,7 @@ func installSpecificCli(targetVersion string, flavor constants.Flavor, allowAcce
 
 	// For install command, we don't need to restart - just show success
 	slog.Info(fmt.Sprintf("Spice.ai version %s installed successfully. Runtime is ready to use.", release.TagName))
-	
+
 	// For unix, the binary has been replaced
 	// For windows, we need cleanup on next run
 	return false
