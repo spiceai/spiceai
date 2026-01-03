@@ -37,11 +37,9 @@ const CACHE_WEIGHT: u64 = 100_000;
 const KEY_SPACE: u64 = 100_000;
 const OPERATIONS_PER_THREAD: usize = 10_000;
 
-/// Creates a lightweight single-threaded runtime for benchmark worker threads.
-/// Using `current_thread` runtime instead of `multi_thread` reduces overhead
-/// since each thread only needs to run its own async operations.
+/// Creates a runtime that can be shared across benchmark worker threads.
 fn create_bench_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create benchmark runtime")
@@ -102,6 +100,7 @@ fn random_value(rng: &mut StdRng) -> String {
 fn bench_simple_cache_concurrent_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_cache_concurrent_get");
     let rt = create_bench_runtime();
+    let handle = rt.handle().clone();
 
     let hash_builder =
         get_hash_builder(HashingAlgorithm::XXH3).expect("Failed to get hash builder");
@@ -126,7 +125,7 @@ fn bench_simple_cache_concurrent_get(c: &mut Criterion) {
                             hash_builder.clone(),
                         ));
                         let mut rng = StdRng::seed_from_u64(42);
-                        rt.block_on(async {
+                        handle.block_on(async {
                             for i in 0..5000 {
                                 let key = (i as u64 * 17) % KEY_SPACE;
                                 let value = random_value(&mut rng);
@@ -139,11 +138,10 @@ fn bench_simple_cache_concurrent_get(c: &mut Criterion) {
                         let handles: Vec<_> = (0..threads)
                             .map(|thread_id| {
                                 let cache = Arc::clone(&cache);
+                                let handle = handle.clone();
                                 std::thread::spawn(move || {
-                                    let rt = tokio::runtime::Runtime::new()
-                                        .expect("Failed to create runtime");
                                     let mut rng = StdRng::seed_from_u64(thread_id as u64);
-                                    rt.block_on(async {
+                                    handle.block_on(async {
                                         for _ in 0..OPERATIONS_PER_THREAD {
                                             let key = rng.gen_range(0..KEY_SPACE);
                                             black_box(cache.get_raw_key(&key).await);
@@ -166,6 +164,8 @@ fn bench_simple_cache_concurrent_get(c: &mut Criterion) {
 
 fn bench_simple_cache_concurrent_put(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_cache_concurrent_put");
+    let rt = create_bench_runtime();
+    let handle = rt.handle().clone();
 
     let hash_builder =
         get_hash_builder(HashingAlgorithm::XXH3).expect("Failed to get hash builder");
@@ -196,11 +196,10 @@ fn bench_simple_cache_concurrent_put(c: &mut Criterion) {
                         let handles: Vec<_> = (0..threads)
                             .map(|thread_id| {
                                 let cache = Arc::clone(&cache);
+                                let handle = handle.clone();
                                 std::thread::spawn(move || {
-                                    let rt = tokio::runtime::Runtime::new()
-                                        .expect("Failed to create runtime");
                                     let mut rng = StdRng::seed_from_u64(thread_id as u64);
-                                    rt.block_on(async {
+                                    handle.block_on(async {
                                         for _ in 0..OPERATIONS_PER_THREAD {
                                             let key = rng.gen_range(0..KEY_SPACE);
                                             let value = random_value(&mut rng);
@@ -225,6 +224,7 @@ fn bench_simple_cache_concurrent_put(c: &mut Criterion) {
 fn bench_simple_cache_concurrent_mixed(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_cache_concurrent_mixed_80_20");
     let rt = create_bench_runtime();
+    let handle = rt.handle().clone();
 
     let hash_builder =
         get_hash_builder(HashingAlgorithm::XXH3).expect("Failed to get hash builder");
@@ -249,7 +249,7 @@ fn bench_simple_cache_concurrent_mixed(c: &mut Criterion) {
                             hash_builder.clone(),
                         ));
                         let mut rng = StdRng::seed_from_u64(42);
-                        rt.block_on(async {
+                        handle.block_on(async {
                             for i in 0..5000 {
                                 let key = (i as u64 * 17) % KEY_SPACE;
                                 let value = random_value(&mut rng);
@@ -262,11 +262,10 @@ fn bench_simple_cache_concurrent_mixed(c: &mut Criterion) {
                         let handles: Vec<_> = (0..threads)
                             .map(|thread_id| {
                                 let cache = Arc::clone(&cache);
+                                let handle = handle.clone();
                                 std::thread::spawn(move || {
-                                    let rt = tokio::runtime::Runtime::new()
-                                        .expect("Failed to create runtime");
                                     let mut rng = StdRng::seed_from_u64(thread_id as u64);
-                                    rt.block_on(async {
+                                    handle.block_on(async {
                                         for _ in 0..OPERATIONS_PER_THREAD {
                                             let key = rng.gen_range(0..KEY_SPACE);
                                             if rng.gen_bool(0.8) {
@@ -295,6 +294,7 @@ fn bench_simple_cache_concurrent_mixed(c: &mut Criterion) {
 fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("lru_cache_concurrent_get");
     let rt = create_bench_runtime();
+    let handle = rt.handle().clone();
 
     // Benchmark all combinations of caching policy and hash algorithm
     for (policy_name, policy) in all_caching_policies() {
@@ -328,7 +328,7 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                                     policy,
                                 ));
                                 let mut rng = StdRng::seed_from_u64(42);
-                                rt.block_on(async {
+                                handle.block_on(async {
                                     for i in 0..5000 {
                                         let key = (i as u64 * 17) % KEY_SPACE;
                                         let value = BenchValue(random_value(&mut rng));
@@ -341,11 +341,10 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                                 let handles: Vec<_> = (0..threads)
                                     .map(|thread_id| {
                                         let cache = Arc::clone(&cache);
+                                        let handle = handle.clone();
                                         std::thread::spawn(move || {
-                                            let rt = tokio::runtime::Runtime::new()
-                                                .expect("Failed to create runtime");
                                             let mut rng = StdRng::seed_from_u64(thread_id as u64);
-                                            rt.block_on(async {
+                                            handle.block_on(async {
                                                 for _ in 0..OPERATIONS_PER_THREAD {
                                                     let key = rng.gen_range(0..KEY_SPACE);
                                                     black_box(cache.get_raw_key(&key).await);
@@ -370,6 +369,8 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
 
 fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
     let mut group = c.benchmark_group("lru_cache_concurrent_put");
+    let rt = create_bench_runtime();
+    let handle = rt.handle().clone();
 
     // Benchmark all combinations of caching policy and hash algorithm
     for (policy_name, policy) in all_caching_policies() {
@@ -405,11 +406,10 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
                                 let handles: Vec<_> = (0..threads)
                                     .map(|thread_id| {
                                         let cache = Arc::clone(&cache);
+                                        let handle = handle.clone();
                                         std::thread::spawn(move || {
-                                            let rt = tokio::runtime::Runtime::new()
-                                                .expect("Failed to create runtime");
                                             let mut rng = StdRng::seed_from_u64(thread_id as u64);
-                                            rt.block_on(async {
+                                            handle.block_on(async {
                                                 for _ in 0..OPERATIONS_PER_THREAD {
                                                     let key = rng.gen_range(0..KEY_SPACE);
                                                     let value = BenchValue(random_value(&mut rng));
@@ -436,6 +436,7 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
 fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
     let mut group = c.benchmark_group("lru_cache_concurrent_mixed_80_20");
     let rt = create_bench_runtime();
+    let handle = rt.handle().clone();
 
     // Benchmark all combinations of caching policy and hash algorithm
     for (policy_name, policy) in all_caching_policies() {
@@ -469,7 +470,7 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                                     policy,
                                 ));
                                 let mut rng = StdRng::seed_from_u64(42);
-                                rt.block_on(async {
+                                handle.block_on(async {
                                     for i in 0..5000 {
                                         let key = (i as u64 * 17) % KEY_SPACE;
                                         let value = BenchValue(random_value(&mut rng));
@@ -482,11 +483,10 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                                 let handles: Vec<_> = (0..threads)
                                     .map(|thread_id| {
                                         let cache = Arc::clone(&cache);
+                                        let handle = handle.clone();
                                         std::thread::spawn(move || {
-                                            let rt = tokio::runtime::Runtime::new()
-                                                .expect("Failed to create runtime");
                                             let mut rng = StdRng::seed_from_u64(thread_id as u64);
-                                            rt.block_on(async {
+                                            handle.block_on(async {
                                                 for _ in 0..OPERATIONS_PER_THREAD {
                                                     let key = rng.gen_range(0..KEY_SPACE);
                                                     if rng.gen_bool(0.8) {

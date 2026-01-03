@@ -32,12 +32,12 @@ pub enum CacheKeyType {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HashingAlgorithm {
-    #[default]
     #[serde(rename = "siphash")]
     Siphash,
     #[serde(rename = "ahash")]
     Ahash,
     #[serde(rename = "xxh3")]
+    #[default]
     XXH3,
     #[serde(rename = "xxh32")]
     XXH32,
@@ -196,6 +196,8 @@ pub struct ResultsCache {
     pub cache_key_type: CacheKeyType,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    #[serde(default)]
+    pub engine: CacheEngine,
     /// Maximum stale-while-revalidate duration to add to the cache TTL.
     pub max_stale_while_revalidate: Option<String>,
 }
@@ -209,6 +211,7 @@ impl Default for ResultsCache {
             caching_policy: CachingPolicy::default(),
             cache_key_type: CacheKeyType::default(),
             hashing_algorithm: HashingAlgorithm::default(),
+            engine: CacheEngine::default(),
             max_stale_while_revalidate: None,
         }
     }
@@ -223,7 +226,7 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             caching_policy: val.caching_policy,
             hashing_algorithm: val.hashing_algorithm,
             cache_key_type: val.cache_key_type,
-            engine: CacheEngine::default(),
+            engine: val.engine,
             stale_while_revalidate_ttl: None,
             encoding: Encoding::default(),
         }
