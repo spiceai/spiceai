@@ -237,7 +237,7 @@ impl DataConnector for DynamoDB {
             .unwrap_or(false);
 
         let mut config_loader = if aws_force_iam_only {
-            initiate_config_with_iam_role_only("aws_region", &self.params)
+            initiate_config_with_iam_role_only("aws_region", &self.params).await
         } else {
             initiate_config_with_credentials(
                 "DynamoDBTableProvider",
@@ -247,8 +247,8 @@ impl DataConnector for DynamoDB {
                 "aws_session_token",
                 &self.params,
             )
+            .await
         }
-        .await
         .map_err(|message| DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "dynamodb".to_string(),
             connector_component: ConnectorComponent::from(dataset),

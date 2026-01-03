@@ -420,11 +420,8 @@ pub async fn initiate_config_with_credentials(
 /// # Returns
 /// A `ConfigLoader` that can be further customized before loading.
 pub async fn initiate_config_with_iam_role_only(region: String) -> aws_config::ConfigLoader {
-    if let Err(err) = get_or_init_sdk_config().await {
-        tracing::warn!("Unable to initialize AWS SDK config: {err}");
-    }
-
-    let provider_config = ProviderConfig::with_default_region().await;
+    let provider_config = ProviderConfig::default()
+        .with_region(Some(Region::new(region.clone())));
 
     let web_identity_provider = WebIdentityTokenCredentialsProvider::builder()
         .configure(&provider_config)
