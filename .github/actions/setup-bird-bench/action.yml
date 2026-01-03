@@ -1,36 +1,51 @@
 name: Setup Bird-Bench Data
-description: 'Download data and spicepods from `spiceai/spice-bird-bench` repostitory into specified directory. Prepare queryset.json file and spicepods for use in `testoperator`.'
+description: Download bird-bench data and prepare queryset/spicepods
 inputs:
   data_directory:
-    description: 'path to load data and spicepods into'
+    description: path to load data and spicepods into
     required: true
     type: string
 
 runs:
-  using: 'composite'
+  using: composite
   steps:
     # actions/checkout should not be used with composite actions. Would reset workspace/github repo state.
     - name: Clone bird-bench repo (no checkout action)
       shell: bash
       run: |
+        set -euxo pipefail
+
         git clone \
           --depth 1 \
           --filter=blob:none \
           --sparse \
           https://github.com/spiceai/spice-bird-bench.git bird-bench
+
         cd bird-bench
         git sparse-checkout set dev_20240627
 
     - name: Configure Bird-Bench Data
       shell: bash
       run: |
-        # Make queryset
-        sudo apt install jq -y
-        ls -l "$GITHUB_WORKSPACE/dev_20240627/"
-        sudo bash -c "jq -c '.[] | { sql: .SQL, question: .question}' \"$GITHUB_WORKSPACE/dev_20240627/dev.json\" > /opt/spiced/data/queryset.json"
+        set -euxo pipefail
 
-        # Move data and spicepods appropriately
-        mv "$GITHUB_WORKSPACE/dev_20240627/" "${{ inputs.data_directory }}"
+        BIRD_BENCH_DIR="$GITHUB_WORKSPACE/bird-bench/dev_20240627"
 
-        # Fix spicepod paths to be under `./data` directory.
-        find "${{ inputs.data_directory }}/spicepods" -name "spicepod.yaml" -exec sudo sed -i 's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' {} \;
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+        sudo mkdir -p /opt/spiced/data
+        sudo chown runner:runner /opt/spiced/data
+
+        ls -l "$BIRD_BENCH_DIR"
+
+        jq -c '.[] | { sql: .SQL, question: .question }' \
+          "$BIRD_BENCH_DIR/dev.json" \
+          > /opt/spiced/data/queryset.json
+
+        mv "$BIRD_BENCH_DIR" "${{ inputs.data_directory }}/"
+
+        find "${{ inputs.data_directory }}/dev_20240627/spicepods" \
+          -name spicepod.yaml \
+          -exec sudo sed -i \
+          's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' {} \;
