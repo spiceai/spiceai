@@ -595,7 +595,8 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
 
     match overrides {
         Some(QueryOverrides::ODBCAthena) => remove_tpch_query!(
-            queries, 4,  // https://github.com/spiceai/spiceai/issues/2077
+            queries, 2,  // https://github.com/spiceai/spiceai/issues/8379
+            4,  // https://github.com/spiceai/spiceai/issues/2077
             20  // https://github.com/spiceai/spiceai/issues/2078
         ),
         Some(QueryOverrides::ODBCDatabricks) => remove_tpch_query!(
