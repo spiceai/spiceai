@@ -27,7 +27,9 @@ on:
         description: 'Predefined (possibly external) queryset to setup and use'
         required: false
         type: choice
+        default: ''
         options:
+          - ''
           - 'bird-bench-small'
       runner_type:
         description: 'Runner type'
