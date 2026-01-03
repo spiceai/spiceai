@@ -11,7 +11,6 @@ runs:
   steps:
     - name: Checkout Bird-Bench Data
       uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-      if: inputs.query_set == 'bird-bench-small'
       with:
         repository: spiceai/spice-bird-bench
         sparse-checkout: 'dev_20240627/'
@@ -22,6 +21,7 @@ runs:
       run: |
         # Make queryset
         sudo apt install jq -y
+        ls -l "$GITHUB_WORKSPACE/dev_20240627/"
         sudo bash -c "jq -c '.[] | { sql: .SQL, question: .question}' \"$GITHUB_WORKSPACE/dev_20240627/dev.json\" > /opt/spiced/data/queryset.json"
 
         # Move data and spicepods appropriately
