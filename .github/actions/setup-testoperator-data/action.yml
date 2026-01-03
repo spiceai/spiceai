@@ -63,7 +63,7 @@ runs:
         mc cp spice-minio/benchmarks/clickbench/hits.parquet ./
 
     - name: Prepare Bird-Bench Data
-      uses: .github/actions/setup-bird-bench
+      uses: ./.github/actions/setup-bird-bench
       if: inputs.query_set == 'bird-bench-small'
       with:
         data-dir: /opt/spiced/data/
