@@ -74,6 +74,9 @@ runs:
       if: inputs.query_set == 'bird-bench-small'
       shell: bash
       run: |
+        ls -l $GITHUB_WORKSPACE/dev_20240627/
+        ls -l $GITHUB_WORKSPACE/spice-bird-bench/
+        ls -l $GITHUB_WORKSPACE/spice-bird-bench/dev_20240627/
         # Make queryset
         sudo apt install jq -y
         sudo bash -c 'jq -c ".[] | { sql: .SQL, question: .question}" spice-bird-bench/dev_20240627/dev.json > /opt/spiced/data/queryset.json'
