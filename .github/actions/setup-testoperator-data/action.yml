@@ -76,9 +76,9 @@ runs:
       run: |
         # Make queryset
         sudo apt install jq -y
-        sudo bash -c 'jq -c ".[] | { sql: .SQL, question: .question}" dev_20240627/dev.json > /opt/spiced/data/queryset.json'
+        sudo bash -c 'jq -c ".[] | { sql: .SQL, question: .question}" $GITHUB_WORKSPACE/dev_20240627/dev.json > /opt/spiced/data/queryset.json'
 
         # Move data and spicepods appropriately
-        mv dev_20240627/ /opt/spiced/data/
+        mv $GITHUB_WORKSPACE/dev_20240627/ /opt/spiced/data/
         # Fix spicepod paths to be under `./data` directory.
         find /opt/spiced/data/spicepods -name "spicepod.yaml" -exec sudo sed -i 's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' {} \;
