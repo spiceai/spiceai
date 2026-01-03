@@ -1,0 +1,31 @@
+name: Setup Bird-Bench Data
+description: 'Download data and spicepods from `spiceai/spice-bird-bench` repostitory into specified directory. Prepare queryset.json file and spicepods for use in `testoperator`.'
+inputs:
+  data_directory:
+    description: 'path to load data and spicepods into'
+    required: true
+    type: string
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout Bird-Bench Data
+      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      if: inputs.query_set == 'bird-bench-small'
+      with:
+        repository: spiceai/spice-bird-bench
+        sparse-checkout: 'dev_20240627/'
+        path: 'dev_20240627/'
+
+    - name: Configure Bird-Bench Data
+      shell: bash
+      run: |
+        # Make queryset
+        sudo apt install jq -y
+        sudo bash -c "jq -c '.[] | { sql: .SQL, question: .question}' \"$GITHUB_WORKSPACE/dev_20240627/dev.json\" > /opt/spiced/data/queryset.json"
+
+        # Move data and spicepods appropriately
+        mv "$GITHUB_WORKSPACE/dev_20240627/" "${{ inputs.data_directory }}"
+
+        # Fix spicepod paths to be under `./data` directory.
+        find "${{ inputs.data_directory }}/spicepods" -name "spicepod.yaml" -exec sudo sed -i 's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' {} \;

@@ -62,23 +62,8 @@ runs:
         mc cp spice-minio/benchmarks/clickbench/hits_0.parquet ./
         mc cp spice-minio/benchmarks/clickbench/hits.parquet ./
 
-    - name: Checkout Bird-Bench Data
-      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+    - name: Prepare Bird-Bench Data
+      uses: .github/actions/setup-bird-bench
       if: inputs.query_set == 'bird-bench-small'
       with:
-        repository: spiceai/spice-bird-bench
-        sparse-checkout: 'dev_20240627/'
-        path: 'dev_20240627/'
-
-    - name: Configure Bird-Bench Data
-      if: inputs.query_set == 'bird-bench-small'
-      shell: bash
-      run: |
-        # Make queryset
-        sudo apt install jq -y
-        sudo bash -c 'jq -c ".[] | { sql: .SQL, question: .question}" $GITHUB_WORKSPACE/dev_20240627/dev.json > /opt/spiced/data/queryset.json'
-
-        # Move data and spicepods appropriately
-        mv $GITHUB_WORKSPACE/dev_20240627/ /opt/spiced/data/
-        # Fix spicepod paths to be under `./data` directory.
-        find /opt/spiced/data/spicepods -name "spicepod.yaml" -exec sudo sed -i 's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' {} \;
+        data-dir: /opt/spiced/data/
