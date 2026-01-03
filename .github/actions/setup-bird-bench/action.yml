@@ -9,11 +9,17 @@ inputs:
 runs:
   using: 'composite'
   steps:
-    - name: Checkout Bird-Bench Data
-      uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-      with:
-        repository: spiceai/spice-bird-bench
-        sparse-checkout: 'dev_20240627/'
+    # actions/checkout should not be used with composite actions. Would reset workspace/github repo state.
+    - name: Clone bird-bench repo (no checkout action)
+      shell: bash
+      run: |
+        git clone \
+          --depth 1 \
+          --filter=blob:none \
+          --sparse \
+          https://github.com/spiceai/spice-bird-bench.git bird-bench
+        cd bird-bench
+        git sparse-checkout set dev_20240627
 
     - name: Configure Bird-Bench Data
       shell: bash
