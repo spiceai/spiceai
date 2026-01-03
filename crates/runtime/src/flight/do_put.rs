@@ -49,10 +49,11 @@ use crate::{
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{
-    Service, flightsql::prepared_statement_query, metrics,
+    Service, flightsql, flightsql::prepared_statement_query, metrics,
     middleware::rate_limit::RateLimiterExtension,
 };
 
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn handle(
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
@@ -73,12 +74,44 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
 
-    if let Ok(message) = Any::decode(&*fd.cmd)
-        && let Command::CommandPreparedStatementQuery(query) =
-            Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))?
-    {
-        return prepared_statement_query::do_put_query(query, streaming_flight).await;
-    }
+    // Extract table path from FlightSQL commands if present
+    let table_path_override = if let Ok(message) = Any::decode(&*fd.cmd) {
+        match Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))? {
+            Command::CommandPreparedStatementQuery(query) => {
+                return prepared_statement_query::do_put_query(query, streaming_flight).await;
+            }
+            Command::CommandPreparedStatementUpdate(query) => {
+                return flightsql::prepared_statement_update::do_put_update(
+                    query,
+                    streaming_flight,
+                )
+                .await;
+            }
+            Command::CommandStatementIngest(ingest_cmd) => {
+                // Handle FlightSQL bulk ingestion command
+                // Extract the table reference from the command
+                let table_ref = if let Some(catalog) = &ingest_cmd.catalog {
+                    if let Some(schema) = &ingest_cmd.schema {
+                        TableReference::full(
+                            catalog.as_str(),
+                            schema.as_str(),
+                            ingest_cmd.table.as_str(),
+                        )
+                    } else {
+                        TableReference::partial(catalog.as_str(), ingest_cmd.table.as_str())
+                    }
+                } else if let Some(schema) = &ingest_cmd.schema {
+                    TableReference::partial(schema.as_str(), ingest_cmd.table.as_str())
+                } else {
+                    TableReference::bare(ingest_cmd.table.as_str())
+                };
+                Some(vec![table_ref.to_string()])
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     // Check if the request should be rate limited.
     if let Some(rate_limit_check) = rate_limit_check_fn {
@@ -114,12 +147,15 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
 
-    if fd.path.is_empty() {
+    // Use table path from FlightSQL command if available, otherwise use descriptor path
+    let path_vec = table_path_override.as_ref().unwrap_or(&fd.path);
+
+    if path_vec.is_empty() {
         let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No path provided"));
     }
 
-    let path = TableReference::parse_str(&fd.path.join("."));
+    let path = TableReference::parse_str(&path_vec.join("."));
 
     // Initializing tracking here so that both counter and duration have consistent path dimensions
     let start = metrics::track_flight_request("do_put", Some(&path.to_string())).await;

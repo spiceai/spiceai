@@ -153,7 +153,7 @@ impl TableProvider for WorkflowsTableProvider {
                 let col_name = self.schema.field(*idx).name();
                 projection_expr.push((
                     Arc::new(Column::new(col_name, *idx)) as Arc<dyn PhysicalExpr>,
-                    col_name.to_string(),
+                    col_name.clone(),
                 ));
             }
 

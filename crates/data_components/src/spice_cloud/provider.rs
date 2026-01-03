@@ -109,7 +109,7 @@ impl SpiceCloudPlatformCatalogProvider {
             let Some(last_name) = name_inner.last() else {
                 unreachable!("The namespace should have at least one element");
             };
-            child_namespace_vec.push(last_name.to_string());
+            child_namespace_vec.push(last_name.clone());
             let Ok(child_namespace) = NamespaceIdent::from_vec(child_namespace_vec) else {
                 unreachable!("This only panics if the vec is empty");
             };
@@ -135,7 +135,7 @@ impl SpiceCloudPlatformCatalogProvider {
                 let Some(last_name) = name_inner.last() else {
                     unreachable!("The namespace should have at least one element");
                 };
-                (last_name.to_string(), provider)
+                (last_name.clone(), provider)
             })
             .collect();
 

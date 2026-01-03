@@ -131,7 +131,7 @@ impl LocationPruningListingTable {
 
         let mut values = Vec::with_capacity(self.partition_column_types().len());
         for (value, (_, dtype)) in parts.into_iter().zip(self.partition_column_types()) {
-            let scalar = ScalarValue::try_from_string(value.to_string(), dtype).ok()?;
+            let scalar = ScalarValue::try_from_string(value.clone(), dtype).ok()?;
             values.push(scalar);
         }
         Some(values)
@@ -1058,7 +1058,7 @@ pub trait ListingTableConnector: DataConnector {
         let mut idents = schema
             .fields
             .iter()
-            .map(|f| (f.name().to_string(), f.as_ref().clone()))
+            .map(|f| (f.name().clone(), f.as_ref().clone()))
             .collect::<HashMap<_, _>>();
 
         for (name, partition_type) in partition_cols {

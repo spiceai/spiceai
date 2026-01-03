@@ -420,14 +420,14 @@ pub async fn initialize_state_from_checkpoint(
         );
 
         let shard = ActiveShard {
-            shard_id: shard_id.to_string(),
+            shard_id: shard_id.clone(),
             parent_shard_id: shard_checkpoint.parent_id.clone(),
             iterator,
             last_checkpoint: shard_checkpoint.clone(),
             current_watermark: None,
         };
 
-        state.active.insert(shard_id.to_string(), shard);
+        state.active.insert(shard_id.clone(), shard);
 
         // Recursively add all descendants to blocked
         add_all_descendants_to_blocked(&mut state, shard_id, &parent_map, &all_shards)?;

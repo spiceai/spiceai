@@ -85,7 +85,7 @@ pub(crate) fn position_offset(config: &ModelConfig) -> usize {
 /// Converts the `OpenAI` format to the TEI format
 pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     match input {
-        EmbeddingInput::String(s) => vec![EncodingInput::Single(s.to_string())],
+        EmbeddingInput::String(s) => vec![EncodingInput::Single(s.clone())],
         EmbeddingInput::StringArray(arr) => arr
             .iter()
             .map(|s| EncodingInput::Single(s.clone()))

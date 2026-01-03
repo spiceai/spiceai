@@ -194,8 +194,8 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     telemetry.set_resource(benchmark_resource);
 
     let attributes = vec![
-        KeyValue::new("model_name", model.to_string()),
-        KeyValue::new("benchmark_name", eval.to_string()),
+        KeyValue::new("model_name", model.clone()),
+        KeyValue::new("benchmark_name", eval.clone()),
     ];
     crate::metrics::STATUS.record(metrics.status.to_u64(), &attributes);
     crate::metrics::SCORE.record(metrics.score, &attributes);
