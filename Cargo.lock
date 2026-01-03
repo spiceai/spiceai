@@ -2847,18 +2847,21 @@ dependencies = [
  "blake3",
  "byte-unit",
  "bytes",
- "criterion 0.7.0",
+ "criterion 0.5.1",
  "datafusion",
  "fundu",
  "futures",
  "moka",
  "opentelemetry 0.29.1",
+ "parking_lot 0.12.5",
+ "rand 0.8.5",
  "rstest 0.25.0",
  "snafu",
  "spicepod",
  "tokio",
  "tracing",
  "twox-hash",
+ "zstd",
 ]
 
 [[package]]
