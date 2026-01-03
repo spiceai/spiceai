@@ -394,14 +394,14 @@ async fn query_vector_stream(
         top_k = limit
     );
 
-    let query_vectors = query_vectors_call(Arc::clone(&client), &idx, query, filters, limit)
+    let mut query_vectors = query_vectors_call(Arc::clone(&client), &idx, query, filters, limit)
         .instrument(combined_span.clone())
         .await?;
 
     // Only fetch vector data if the embeddings column is in the projection.
     // Check if "data" column is present in the schema.
-    let vector_data = if schema.column_with_name(S3_VECTOR_EMBEDDING_NAME).is_some() {
-        let vector_data = get_vectors_call(
+    if schema.column_with_name(S3_VECTOR_EMBEDDING_NAME).is_some() {
+        let mut vector_data = get_vectors_call(
             Arc::clone(&client),
             &idx,
             query_vectors.iter().map(|v| v.key.clone()).collect(),
@@ -410,8 +410,10 @@ async fn query_vector_stream(
         .await?;
 
         let mut missing_keys = Vec::new();
-        for query_vector in &query_vectors {
-            if !vector_data.contains_key(&query_vector.key) {
+        for query_vector in &mut query_vectors {
+            if let Some(output_vector) = vector_data.remove(&query_vector.key) {
+                query_vector.data = Some(output_vector);
+            } else {
                 missing_keys.push(&query_vector.key);
             }
         }
@@ -424,15 +426,9 @@ async fn query_vector_stream(
                 missing_keys
             );
         }
-        Some(vector_data)
-    } else {
-        None
-    };
+    }
 
-    let rows: Vec<_> = query_vectors
-        .into_iter()
-        .map(|output| to_flat_value(output, vector_data.as_ref()))
-        .collect();
+    let rows: Vec<_> = query_vectors.into_iter().map(to_flat_value).collect();
     decoder.serialize(rows.as_slice()).map_err(|e| {
         DataFusionError::ArrowError(
             Box::new(e),
@@ -464,23 +460,21 @@ async fn query_vector_stream(
 }
 
 /// Converts a `QueryOutputVector` into a flat JSON value (i.e unnest metadata fields).
-fn to_flat_value(
-    output: QueryOutputVector,
-    vector_data: Option<&HashMap<String, VectorData>>,
-) -> serde_json::Value {
+fn to_flat_value(output: QueryOutputVector) -> serde_json::Value {
     let QueryOutputVector {
         metadata,
+        data,
         key,
         distance,
         ..
     } = output;
     let mut result = document_to_json_map(metadata.unwrap_or_default()).unwrap_or_default();
-    if let Some(VectorData::Float32(vec)) = vector_data.and_then(|data| data.get(&key)) {
+    if let Some(VectorData::Float32(vec)) = data {
         result.insert(
             S3_VECTOR_EMBEDDING_NAME.into(),
             serde_json::Value::Array(
-                vec.iter()
-                    .filter_map(|f| serde_json::Number::from_f64(f64::from(*f)))
+                vec.into_iter()
+                    .filter_map(|f| serde_json::Number::from_f64(f64::from(f)))
                     .map(serde_json::Value::Number)
                     .collect::<Vec<_>>(),
             ),
