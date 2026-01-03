@@ -17,7 +17,7 @@ inputs:
   os:
     description: 'Operating system to install MinIO for'
     required: false
-    default: 'linux' # 'linux', 'windows', 'darwin'
+    default: 'linux' # 'linux', 'darwin'
     type: string
 
 runs:
@@ -37,14 +37,6 @@ runs:
       run: |
         brew update
         brew install minio/stable/mc
-
-    - name: Install MinIO on Windows
-      shell: pwsh
-      if: ${{ inputs.os == 'windows' }}
-      run: |
-        Invoke-WebRequest https://dl.min.io/client/mc/release/windows-amd64/mc.exe -OutFile "C:\Program Files\mc.exe"
-        Set-ExecutionPolicy RemoteSigned -Scope Process
-        $env:PATH += ";C:\Program Files"
 
     - name: Set MinIO alias
       shell: bash
