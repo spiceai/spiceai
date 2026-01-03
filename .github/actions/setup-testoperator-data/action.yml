@@ -66,4 +66,4 @@ runs:
       uses: ./.github/actions/setup-bird-bench
       if: inputs.query_set == 'bird-bench-small'
       with:
-        data-dir: /opt/spiced/data/
+        data_directory: /opt/spiced/data/
