@@ -850,7 +850,8 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             )
         }
         Some(QueryOverrides::Dremio) => remove_tpcds_query!(
-            queries, 8, 38, 87 // LEFT SEMI, and LEFT ANTI
+            queries, 8, 38, 87, // LEFT SEMI, and LEFT ANTI
+            64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
         ),
         Some(_) | None => queries,
     }
