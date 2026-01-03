@@ -17,7 +17,7 @@ models:
     name: claude-sonnet-4-5
     params:
       anthropic_api_key: ${secrets:SPICE_ANTHROPIC_API_KEY}
-  - from: xai:grok-4-beta
-    name: grok4
+  - from: xai:grok-4-1-fast-non-reasoning
+    name: grok41
     params:
       xai_api_key: ${secrets:SPICE_XAI_API_KEY}
