@@ -521,6 +521,7 @@ impl QuerySet {
                     "tpcds_q44",
                     "tpcds_q54",
                     "tpcds_q58",
+                    "tpcds_q76",
                 ]
             }
             QuerySet::Clickbench | QuerySet::Scenario { .. } => vec![],
