@@ -233,7 +233,7 @@ pub(super) async fn all_spill_tables(
             .iter()
             .map(|spill_index_name| {
                 table.clone().with_new_id(S3VectorIdentifier::Index {
-                    bucket_name: bucket_name.to_string(),
+                    bucket_name: bucket_name.clone(),
                     index_name: spill_index_name.clone(),
                 })
             })

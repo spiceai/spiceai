@@ -417,7 +417,7 @@ impl SpiceObjectStoreRegistry {
             builder = builder.with_tenant_id(tenant_id);
         }
         if let Some(endpoint) = params.get("endpoint") {
-            builder = builder.with_endpoint(endpoint.to_string());
+            builder = builder.with_endpoint(endpoint.clone());
         }
 
         if let Some(use_fabric_endpoint) = params.get("use_fabric_endpoint") {

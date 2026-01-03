@@ -186,11 +186,9 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                         row,
                         idx,
                         |v: String| {
-                            let decimal =
-                                v.parse::<BigDecimal>()
-                                    .context(FailedToParseBigDecimalSnafu {
-                                        value: v.to_string(),
-                                    })?;
+                            let decimal = v
+                                .parse::<BigDecimal>()
+                                .context(FailedToParseBigDecimalSnafu { value: v.clone() })?;
 
                             big_decimal_to_i128(&decimal, *scale).context(
                                 FailedToConvertBigDecimalToI128Snafu {

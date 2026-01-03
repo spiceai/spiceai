@@ -966,7 +966,7 @@ impl DataSink for MemSink {
                 // Just collect unique keys and check for nulls, don't enforce uniqueness
                 for id in &new_primary_key_ids {
                     if let Some(key) = id {
-                        new_key_set.insert(key.to_string());
+                        new_key_set.insert(key.clone());
                     } else {
                         return Err(DataFusionError::Execution(
                             "Primary key values cannot be null".to_string(),

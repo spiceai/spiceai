@@ -89,7 +89,7 @@ pub(crate) async fn post(
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
     Json(req): Json<CreateEmbeddingRequest>,
 ) -> Response {
-    let model_id = req.model.clone().to_string();
+    let model_id = req.model.clone();
     match embeddings.read().await.get(&model_id) {
         Some(model) => {
             let resp: Response = match model.embed_request(req).await {

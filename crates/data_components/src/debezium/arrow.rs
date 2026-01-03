@@ -165,7 +165,7 @@ pub fn append_value_to_struct_builder(
     for (idx, field) in builder.fields().iter().enumerate() {
         let Some(field_value) = value.get(field.name()) else {
             return MissingFieldInValueSnafu {
-                field_name: field.name().to_string(),
+                field_name: field.name().clone(),
                 value,
             }
             .fail();

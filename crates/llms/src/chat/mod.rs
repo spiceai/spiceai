@@ -524,7 +524,7 @@ pub fn message_to_mistral(
                         };
 
                         let mut map = IndexMap::new();
-                        map.insert("id".to_string(), Value::String(func_call.id.to_string()));
+                        map.insert("id".to_string(), Value::String(func_call.id.clone()));
                         map.insert("function".to_string(), function);
                         map.insert("type".to_string(), Value::String("function".to_string()));
 

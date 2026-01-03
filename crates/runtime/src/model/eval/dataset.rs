@@ -66,7 +66,7 @@ pub async fn get_eval_data(
     validate_identifier(&eval.dataset)
         .boxed()
         .context(FailedToQueryDatasetSnafu {
-            dataset_name: eval.dataset.to_string(),
+            dataset_name: eval.dataset.clone(),
         })?;
 
     let dataset = TableReference::parse_str(&eval.dataset)

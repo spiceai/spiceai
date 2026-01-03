@@ -164,7 +164,7 @@ impl ImapFactory {
                         dataconnector: "imap".to_string(),
                         connector_component: params.component.clone(),
                         source: Error::InvalidFrom {
-                            from: dataset.from.to_string(),
+                            from: dataset.from.clone(),
                         }
                         .into(),
                     }

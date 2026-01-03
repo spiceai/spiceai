@@ -642,7 +642,7 @@ impl<T: ExtendedMetrics, R: ExtendedMetrics> QueryMetrics<T, R> {
     /// The record batch is a single row, representing the run as a whole - which can pass or fail separately from individual queries
     pub fn build_run(&self, status: &QueryStatus) -> Result<Vec<RecordBatch>> {
         let run_id = vec![self.run_id.to_string()];
-        let spiced_version = vec![self.spiced_version.to_string()];
+        let spiced_version = vec![self.spiced_version.clone()];
         let run_name = vec![self.run_name.clone()];
         let commit_sha = vec![self.commit_sha.clone()];
         let branch_name = vec![self.branch_name.clone()];

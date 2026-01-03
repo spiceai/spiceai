@@ -108,7 +108,7 @@ pub(crate) async fn score_results(
             if let Some(scorer_results) = aggregate.get_mut(name) {
                 scorer_results.push(s);
             } else {
-                aggregate.insert((*name).to_string(), vec![s]);
+                aggregate.insert((*name).clone(), vec![s]);
             }
         }
     }
