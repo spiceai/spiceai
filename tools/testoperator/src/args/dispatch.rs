@@ -277,10 +277,29 @@ pub struct TextToSqlArgs {
     pub spicepod_path: PathBuf,
     pub runner_type: RunnerType,
     pub model_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub queryset_file: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub queryset: Option<String>,
+
+    #[serde(flatten)]
+    pub queryset_source: QuerysetSource,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
+pub enum QuerysetSource {
+    File {
+        queryset_file: PathBuf,
+    },
+    Payload {
+        queryset: String,
+    },
+    Benchmark {
+        benchmark_queryset: BenchmarkQueryset,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum BenchmarkQueryset {
+    BirdBenchSmall,
 }
 
 /// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects
