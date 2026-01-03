@@ -533,8 +533,6 @@ pub enum QueryOverrides {
     GlueCatalog,
     Spicecloud,
     DynamoDB,
-    DynamoDBFederated,
-    DynamoDBAccelerated,
 }
 
 impl QueryOverrides {
@@ -548,8 +546,7 @@ impl QueryOverrides {
             "spark" => Some(Self::Spark),
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
-            "dynamodb_federated" => Some(Self::DynamoDBFederated),
-            "dynamodb_accelerated" => Some(Self::DynamoDBAccelerated),
+            "dynamodb" => Some(Self::DynamoDB),
             _ => None,
         }
     }
@@ -577,11 +574,8 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             17 // Analysis error: [UNSUPPORTED_SUBQUERY_EXPRESSION_CATEGORY.UNSUPPORTED_CORRELATED_SCALAR_SUBQUERY] Unsupported subquery expression: Correlated scalar subqueries can only be used in filters, aggregations, projections, and UPDATE/MERGE/DELETE commands
         ),
         Some(QueryOverrides::MySQL) => remove_tpch_query!(queries, simple_q7),
-        Some(QueryOverrides::DynamoDBFederated) => remove_tpch_query!(
+        Some(QueryOverrides::DynamoDB) => remove_tpch_query!(
             queries, 6 // Unsupported Decimals
-        ),
-        Some(QueryOverrides::DynamoDBAccelerated) => remove_tpch_query!(
-            queries, 1, 5, 6, 7, 8, 9, 10, 14, 17, 19, 22 // Unsupported Decimals
         ),
         Some(QueryOverrides::Snowflake) => generate_tpch_queries_override!(
             "snowflake",
@@ -655,12 +649,20 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             q19, q20, q21, q22, simple_q1, simple_q2, simple_q3, simple_q4, simple_q5, simple_q6,
             simple_q7
         ),
+        Some(QueryOverrides::Spicecloud) => remove_tpch_query!(
+            queries,
+            2, // Correlated scalar subquery can only be used in Projection; https://github.com/spiceai/spiceai/issues/7356
+            4, // Binder Error; https://github.com/spiceai/spiceai/issues/7356
+            17, // Correlated scalar subquery can only be used in Projection; https://github.com/spiceai/spiceai/issues/7356
+            20, // Binder Error; https://github.com/spiceai/spiceai/issues/7356
+            22  // Binder Error; https://github.com/spiceai/spiceai/issues/7356
+        ),
         Some(QueryOverrides::SpicecloudCatalog) => generate_tpch_queries_override!(
             "spicecloud_catalog",
             q1,
-            q2,
+            // q2, Correlated scalar subquery can only be used in Projection; https://github.com/spiceai/spiceai/issues/7356
             q3,
-            q4,
+            // q4, Binder Error; https://github.com/spiceai/spiceai/issues/7356
             q5,
             q6,
             q7,
@@ -672,12 +674,12 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             q13,
             q14,
             q16,
-            q17,
+            // q17, Correlated scalar subquery can only be used in Projection; https://github.com/spiceai/spiceai/issues/7356
             q18,
             q19,
-            q20,
+            // q20, Binder Error; https://github.com/spiceai/spiceai/issues/7356
             q21,
-            q22,
+            // q22, Binder Error; https://github.com/spiceai/spiceai/issues/7356
             simple_q1,
             simple_q2,
             simple_q3,
