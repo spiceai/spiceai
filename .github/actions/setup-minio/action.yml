@@ -14,13 +14,31 @@ inputs:
     description: 'MinIO secret key'
     required: true
     type: string
+  os:
+    description: 'Operating system to install MinIO for'
+    required: false
+    default: 'linux' # 'linux', 'darwin'
+    type: string
+
 runs:
   using: 'composite'
   steps:
-    - name: Install MinIO
+    - name: Install MinIO on Linux
       shell: bash
+      if: ${{ inputs.os == 'linux' }}
       run: |
         sudo apt update && sudo apt install wget -y
         sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
         sudo chmod +x /usr/local/bin/mc
+
+    - name: Install MinIO on macOS
+      shell: bash
+      if: ${{ inputs.os == 'darwin' }}
+      run: |
+        brew update
+        brew install minio/stable/mc
+
+    - name: Set MinIO alias
+      shell: bash
+      run: |
         mc alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}
