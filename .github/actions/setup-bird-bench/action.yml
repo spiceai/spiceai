@@ -14,7 +14,6 @@ runs:
       with:
         repository: spiceai/spice-bird-bench
         sparse-checkout: 'dev_20240627/'
-        path: 'dev_20240627/'
 
     - name: Configure Bird-Bench Data
       shell: bash
