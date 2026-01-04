@@ -10,6 +10,11 @@ inputs:
     required: true
     type: string
 
+outputs:
+  spicepod_dependency:
+    description: 'Path to the spicepod dependency'
+    value: ${{ steps.configure_bird_bench.outputs.spicepod_dependency }}
+
 runs:
   using: composite
   steps:
@@ -59,7 +64,7 @@ runs:
 
         mv "$BIRD_BENCH_DIR" "${{ inputs.data_directory }}"
 
-        DATASET_SPICEPOD="${{ inputs.data_directory }}/dev_20240627/spicepods/$BIRD_BENCH_DATASET/spicepod.yaml"
+        DATASET_SPICEPOD="${{ inputs.data_directory }}dev_20240627/spicepods/$BIRD_BENCH_DATASET/spicepod.yaml"
 
         sudo sed -i \
           's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' "$DATASET_SPICEPOD"
