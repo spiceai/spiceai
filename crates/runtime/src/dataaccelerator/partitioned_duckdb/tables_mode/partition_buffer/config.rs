@@ -25,9 +25,10 @@ use crate::spice_data_base_path;
 const ROWS_PER_PARTITION_BUFFER: usize = 122_880;
 
 /// Configuration for partition buffer type selection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PartitionBufferType {
     /// Use in-memory buffers (default behavior)
+    #[default]
     Memory,
     /// Use Parquet file-based buffers
     Parquet,
@@ -56,12 +57,6 @@ impl PartitionBufferType {
             Self::Memory => "memory",
             Self::Parquet => "parquet",
         }
-    }
-}
-
-impl Default for PartitionBufferType {
-    fn default() -> Self {
-        Self::Memory
     }
 }
 

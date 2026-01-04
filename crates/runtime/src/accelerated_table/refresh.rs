@@ -1100,7 +1100,7 @@ async fn notify_refresh_done(
     let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
     let refresh_guard = refresh.read().await;
     if let Some(sql) = &refresh_guard.sql {
-        labels.push(KeyValue::new("sql", sql.to_string()));
+        labels.push(KeyValue::new("sql", sql.clone()));
     }
 
     metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);

@@ -546,6 +546,40 @@ impl QuerySet {
             _ => Ok(None),
         }
     }
+
+    /// Returns query names that should be skipped for row count validation.
+    #[must_use]
+    pub fn get_row_count_validation_skip_queries(
+        &self,
+        _overrides: Option<QueryOverrides>,
+        scale_factor: f64,
+    ) -> Vec<&'static str> {
+        match self {
+            QuerySet::Tpch | QuerySet::ParameterizedTpch => {
+                // Skip these queries for SF != 1 because their thresholds are SF-dependent
+                // https://github.com/spiceai/spiceai/issues/8755
+                if (scale_factor - 1.0).abs() > f64::EPSILON {
+                    vec!["tpch_q11"]
+                } else {
+                    vec![]
+                }
+            }
+            QuerySet::Tpcds => {
+                // TPCDS queries that return 0 rows and should skip row count validation
+                vec![
+                    "tpcds_q8",
+                    "tpcds_q29",
+                    "tpcds_q37",
+                    "tpcds_q41",
+                    "tpcds_q44",
+                    "tpcds_q54",
+                    "tpcds_q58",
+                    "tpcds_q76",
+                ]
+            }
+            QuerySet::Clickbench | QuerySet::Scenario { .. } => vec![],
+        }
+    }
 }
 
 impl Display for QuerySet {
@@ -617,7 +651,8 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
 
     match overrides {
         Some(QueryOverrides::ODBCAthena) => remove_tpch_query!(
-            queries, 4,  // https://github.com/spiceai/spiceai/issues/2077
+            queries, 2,  // https://github.com/spiceai/spiceai/issues/8379
+            4,  // https://github.com/spiceai/spiceai/issues/2077
             20  // https://github.com/spiceai/spiceai/issues/2078
         ),
         Some(QueryOverrides::ODBCDatabricks) => remove_tpch_query!(
@@ -872,7 +907,8 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             )
         }
         Some(QueryOverrides::Dremio) => remove_tpcds_query!(
-            queries, 8, 38, 87 // LEFT SEMI, and LEFT ANTI
+            queries, 8, 38, 87, // LEFT SEMI, and LEFT ANTI
+            64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
         ),
         Some(_) | None => queries,
     }

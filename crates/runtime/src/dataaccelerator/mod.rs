@@ -635,7 +635,7 @@ pub(crate) fn get_primary_keys_from_constraints(
                 Some(
                     col_indexes
                         .iter()
-                        .map(|&col_index| schema.field(col_index).name().to_string()),
+                        .map(|&col_index| schema.field(col_index).name().clone()),
                 )
             } else {
                 None
@@ -2187,7 +2187,7 @@ mod accelerator_compat_tests {
                 if _mode == "file" {
                     options.insert("file".to_string(), location.clone());
                 }
-                options.insert("mode".to_string(), _mode.to_string());
+                options.insert("mode".to_string(), _mode.clone());
 
                 let external_table = CreateExternalTable {
                     schema: df_schema,

@@ -223,7 +223,7 @@ impl TableProvider for GraphQLTableProvider {
                 let col_name = self.table_schema.field(*idx).name();
                 projection_expr.push((
                     Arc::new(Column::new(col_name, *idx)) as Arc<dyn PhysicalExpr>,
-                    col_name.to_string(),
+                    col_name.clone(),
                 ));
             }
 

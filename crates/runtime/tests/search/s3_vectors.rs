@@ -67,8 +67,8 @@ pub(super) async fn prepare_for_aws_tests(
         let s3_vector_client = Client::new(&config);
 
         let input = DeleteIndexInput::builder()
-            .set_index_name(Some(index_name.to_string()))
-            .set_vector_bucket_name(Some(bucket_name.to_string()))
+            .set_index_name(Some(index_name.clone()))
+            .set_vector_bucket_name(Some(bucket_name.clone()))
             .build()?;
 
         // Don't return error if delete fails, as index may not exist

@@ -17,6 +17,7 @@ limitations under the License.
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_credentials,
+    parameters::aws::initiate_config_with_iam_role_only,
 };
 use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
@@ -85,6 +86,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_session_token")
         .description("The AWS session token to use for DynamoDB.")
         .secret(),
+    ParameterSpec::component("aws_force_iam_only")
+        .description("Force IAM role authentication only, ignoring environment variables and profile credentials")
+        .default("false"),
     ParameterSpec::runtime("unnest_depth")
         .description("Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields."),
     ParameterSpec::runtime("schema_infer_max_records")
@@ -223,15 +227,27 @@ impl DataConnector for DynamoDB {
 
         let table_name = dataset.path();
 
-        let mut config_loader = initiate_config_with_credentials(
-            "DynamoDBTableProvider",
-            "aws_region",
-            "aws_access_key_id",
-            "aws_secret_access_key",
-            "aws_session_token",
-            &self.params,
-        )
-        .await
+        let aws_force_iam_only = self
+            .params
+            .get("aws_force_iam_only")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        let mut config_loader = if aws_force_iam_only {
+            initiate_config_with_iam_role_only("aws_region", &self.params)
+        } else {
+            initiate_config_with_credentials(
+                "DynamoDBTableProvider",
+                "aws_region",
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+                &self.params,
+            )
+            .await
+        }
         .map_err(|message| DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "dynamodb".to_string(),
             connector_component: ConnectorComponent::from(dataset),

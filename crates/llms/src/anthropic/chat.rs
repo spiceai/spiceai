@@ -95,7 +95,7 @@ impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
     fn try_from(value: MessageCreateResponse) -> Result<Self, Self::Error> {
         Ok(CreateChatCompletionResponse {
             id: value.id,
-            model: value.model.to_string(),
+            model: value.model.clone(),
             usage: Some(CompletionUsage {
                 prompt_tokens: value.usage.input_tokens,
                 completion_tokens: value.usage.output_tokens,

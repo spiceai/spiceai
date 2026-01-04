@@ -206,11 +206,11 @@ async fn query_to_record_batches(
 
     let columns = stmt.columns();
 
-    for i in 0..column_count {
+    for (i, value) in all_rows[0].iter().enumerate().take(column_count) {
         let field_name = columns
             .get(i)
             .map_or_else(|| format!("column_{i}"), |col| col.name().to_string());
-        let data_type = match &all_rows[0][i] {
+        let data_type = match value {
             turso::Value::Integer(_) => DataType::Int64,
             turso::Value::Real(_) => DataType::Float64,
             turso::Value::Null | turso::Value::Text(_) => DataType::Utf8,
