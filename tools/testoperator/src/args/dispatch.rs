@@ -299,7 +299,26 @@ pub enum QuerysetSource {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum BenchmarkQueryset {
-    BirdBenchSmall,
+    #[serde(rename = "bird-bench-small[california_schools]")]
+    BirdBenchSmallCaliforniaSchools,
+    #[serde(rename = "bird-bench-small[card_games]")]
+    BirdBenchSmallCardGames,
+    #[serde(rename = "bird-bench-small[community]")]
+    BirdBenchSmallCodebaseCommunity,
+    #[serde(rename = "bird-bench-small[credit_card_specializing]")]
+    BirdBenchSmallDebitCardSpecializing,
+    #[serde(rename = "bird-bench-small[european_football2]")]
+    BirdBenchSmallEuropeanFootball2,
+    #[serde(rename = "bird-bench-small[financial]")]
+    BirdBenchSmallFinancial,
+    #[serde(rename = "bird-bench-small[formula1]")]
+    BirdBenchSmallFormula1,
+    #[serde(rename = "bird-bench-small[superhero]")]
+    BirdBenchSmallSuperhero,
+    #[serde(rename = "bird-bench-small[thrombosis_prediction]")]
+    BirdBenchSmallThrombosisPrediction,
+    #[serde(rename = "bird-bench-small[toxicology]")]
+    BirdBenchSmallToxicology,
 }
 
 /// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects

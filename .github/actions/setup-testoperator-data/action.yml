@@ -11,7 +11,6 @@ inputs:
       - 'tpch[parameterized]'
       - 'tpcds'
       - 'clickbench'
-      - 'bird-bench-small'
 
 runs:
   using: 'composite'
@@ -61,9 +60,3 @@ runs:
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/clickbench/hits_0.parquet ./
         mc cp spice-minio/benchmarks/clickbench/hits.parquet ./
-
-    - name: Prepare Bird-Bench Data
-      uses: ./.github/actions/setup-bird-bench
-      if: inputs.query_set == 'bird-bench-small'
-      with:
-        data_directory: /opt/spiced/data/

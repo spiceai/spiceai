@@ -30,7 +30,16 @@ on:
         default: ''
         options:
           - ''
-          - 'bird-bench-small'
+          - 'bird-bench-small[california_schools]'
+          - 'bird-bench-small[card_games]'
+          - 'bird-bench-small[community]'
+          - 'bird-bench-small[credit_card_specializing]'
+          - 'bird-bench-small[european_football2]'
+          - 'bird-bench-small[financial]'
+          - 'bird-bench-small[formula1]'
+          - 'bird-bench-small[superhero]'
+          - 'bird-bench-small[thrombosis_prediction]'
+          - 'bird-bench-small[toxicology]'
       runner_type:
         description: 'Runner type'
         required: true
@@ -91,11 +100,13 @@ jobs:
           SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
-      - name: Setup benchmark queryset data
+      - name: Prepare Bird-Bench Data
+        id: bird_bench_setup
+        uses: ./.github/actions/setup-bird-bench
         if: ${{ github.event.inputs.benchmark_queryset != '' }}
-        uses: ./.github/actions/setup-testoperator-data
         with:
-          query_set: ${{ github.event.inputs.benchmark_queryset }}
+          data_directory: /opt/spiced/data/
+          queryset_name: ${{ github.event.inputs.benchmark_queryset }}
 
       - name: Build spicepod validator
         uses: ./.github/actions/build-spicepod-validator
@@ -126,7 +137,7 @@ jobs:
             QUERYSET_ARG="--queryset ${{ github.event.inputs.queryset }}"
           elif [ -n "${{ github.event.inputs.benchmark_queryset }}" ]; then
             QUERYSET_ARG='--queryset-file /opt/spiced/data/queryset.json'
-            SPICEPOD_DEPENDENCY="--spicepod-dependencies /opt/spiced/data/spicepods/california_schools"
+            SPICEPOD_DEPENDENCY="--spicepod-dependencies ${{ steps.bird_bench_setup.outputs.spicepod_dependency }}"
           else
             echo "Error: No valid queryset input provided"
             exit 1
