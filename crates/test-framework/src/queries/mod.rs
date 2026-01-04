@@ -493,6 +493,40 @@ impl QuerySet {
             _ => Ok(None),
         }
     }
+
+    /// Returns query names that should be skipped for row count validation.
+    #[must_use]
+    pub fn get_row_count_validation_skip_queries(
+        &self,
+        _overrides: Option<QueryOverrides>,
+        scale_factor: f64,
+    ) -> Vec<&'static str> {
+        match self {
+            QuerySet::Tpch | QuerySet::ParameterizedTpch => {
+                // Skip these queries for SF != 1 because their thresholds are SF-dependent
+                // https://github.com/spiceai/spiceai/issues/8755
+                if (scale_factor - 1.0).abs() > f64::EPSILON {
+                    vec!["tpch_q11"]
+                } else {
+                    vec![]
+                }
+            }
+            QuerySet::Tpcds => {
+                // TPCDS queries that return 0 rows and should skip row count validation
+                vec![
+                    "tpcds_q8",
+                    "tpcds_q29",
+                    "tpcds_q37",
+                    "tpcds_q41",
+                    "tpcds_q44",
+                    "tpcds_q54",
+                    "tpcds_q58",
+                    "tpcds_q76",
+                ]
+            }
+            QuerySet::Clickbench | QuerySet::Scenario { .. } => vec![],
+        }
+    }
 }
 
 impl Display for QuerySet {
