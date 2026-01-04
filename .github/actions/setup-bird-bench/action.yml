@@ -40,6 +40,7 @@ runs:
         git sparse-checkout set dev_20240627
 
     - name: Configure Bird-Bench Data
+      id: configure_bird_bench
       shell: bash
       run: |
         set -euxo pipefail
