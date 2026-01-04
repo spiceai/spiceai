@@ -75,7 +75,7 @@ impl DatabricksDelta {
                     storage_options.insert("timeout".into(), value.clone());
                 }
                 _ => {
-                    storage_options.insert(key.to_string(), value.clone());
+                    storage_options.insert(key.clone(), value.clone());
                 }
             }
         }

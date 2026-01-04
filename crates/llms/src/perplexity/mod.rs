@@ -65,7 +65,7 @@ impl PerplexitySonar {
             .iter()
             .filter_map(|(k, v)| {
                 if *k != auth_token_key {
-                    return Some((k.to_string(), v.expose_secret().to_string()));
+                    return Some((k.clone(), v.expose_secret().to_string()));
                 }
                 None
             })

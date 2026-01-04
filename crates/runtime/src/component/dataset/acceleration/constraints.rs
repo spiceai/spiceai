@@ -37,7 +37,7 @@ impl Acceleration {
         schema
             .flattened_fields()
             .into_iter()
-            .map(|f| f.name().to_string())
+            .map(|f| f.name().clone())
             .collect::<Vec<_>>()
             .join(", ")
     }

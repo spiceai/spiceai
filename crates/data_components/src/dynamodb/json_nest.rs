@@ -41,7 +41,7 @@ pub fn json_nest_except_fields(
                 let json_string =
                     serde_json::to_string(&data_map).context(JsonSerializationSnafu)?;
                 result.insert(
-                    json_nesting.json_field_name.to_string(),
+                    json_nesting.json_field_name.clone(),
                     AttributeValue::S(json_string),
                 );
             }

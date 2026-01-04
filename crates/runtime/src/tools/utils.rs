@@ -61,7 +61,7 @@ pub async fn create_tool_use_messages(
                     id: id.to_string(),
                     function: FunctionCall {
                         name: tool.name().to_string(),
-                        arguments: arg.to_string(),
+                        arguments: arg.clone(),
                     },
                 },
             )])

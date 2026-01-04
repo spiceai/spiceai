@@ -75,7 +75,10 @@ pub(crate) async fn build_test_with_validation(
         .map(test_framework::queries::QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides, None, None).await?;
 
-    let mut test_builder = test_builder.with_query_set(queries);
+    let mut test_builder = test_builder
+        .with_query_set(queries)
+        .with_query_set_type(query_set.clone())
+        .with_query_overrides(query_overrides);
 
     // Add validation data if this is a scenario query set with validation enabled
     if args.validate

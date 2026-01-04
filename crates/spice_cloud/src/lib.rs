@@ -120,8 +120,8 @@ impl SpiceExtension {
         self.manifest
             .params
             .get("endpoint")
-            .unwrap_or(&"https://data.spiceai.io".to_string())
-            .to_string()
+            .cloned()
+            .unwrap_or_else(|| "https://data.spiceai.io".to_string())
     }
 
     async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
@@ -229,7 +229,7 @@ impl SpiceExtension {
             connection.org_name, connection.app_name, connection.metrics_dataset_name
         );
 
-        let from = spiceai_metrics_dataset_path.to_string();
+        let from = spiceai_metrics_dataset_path;
         self.register_runtime_metrics_table(runtime, from.clone())
             .await?;
         tracing::info!("Enabled metrics sync from runtime.metrics to {from}");

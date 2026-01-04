@@ -73,7 +73,7 @@ impl VectorScanTableProvider {
         if !projection.is_subset(
             &schema
                 .iter()
-                .map(|f| f.name().to_string())
+                .map(|f| f.name().clone())
                 .collect::<HashSet<String>>(),
         ) {
             // schema does not have all columns.

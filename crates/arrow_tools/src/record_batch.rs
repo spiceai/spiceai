@@ -264,7 +264,7 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
 
         // Not a numbered parameter - switch to named mode
         is_list = false;
-        named_params.push((name.to_string(), scalar));
+        named_params.push((name.clone(), scalar));
     }
 
     if is_list && !list_params.is_empty() {

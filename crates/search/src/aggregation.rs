@@ -147,7 +147,7 @@ fn from_single_input(
             {
                 None
             } else {
-                Some(f.name().to_string())
+                Some(f.name().clone())
             }
         })
         .collect();

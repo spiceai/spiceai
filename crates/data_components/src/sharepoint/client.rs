@@ -156,10 +156,10 @@ async fn resolve_drive_ptr(
     drive: &PublicDrivePtr,
 ) -> Result<DrivePtr, Error> {
     match drive {
-        PublicDrivePtr::DriveId(id) => Ok(DrivePtr::DriveId(id.to_string())),
-        PublicDrivePtr::UserId(id) => Ok(DrivePtr::UserId(id.to_string())),
-        PublicDrivePtr::GroupId(id) => Ok(DrivePtr::GroupId(id.to_string())),
-        PublicDrivePtr::SiteId(id) => Ok(DrivePtr::SiteId(id.to_string())),
+        PublicDrivePtr::DriveId(id) => Ok(DrivePtr::DriveId(id.clone())),
+        PublicDrivePtr::UserId(id) => Ok(DrivePtr::UserId(id.clone())),
+        PublicDrivePtr::GroupId(id) => Ok(DrivePtr::GroupId(id.clone())),
+        PublicDrivePtr::SiteId(id) => Ok(DrivePtr::SiteId(id.clone())),
         PublicDrivePtr::Me => Ok(DrivePtr::Me),
         PublicDrivePtr::DriveName(name) => {
             let drives = get_drive_items(Arc::clone(&client)).await.map_err(|e| {
@@ -178,10 +178,10 @@ async fn resolve_drive_ptr(
                         .join(", ")
                 );
                 return Err(Error::DriveNotFound {
-                    drive: name.to_string(),
+                    drive: name.clone(),
                 });
             };
-            Ok(DrivePtr::DriveId(drive_id.to_string()))
+            Ok(DrivePtr::DriveId(drive_id.clone()))
         }
         PublicDrivePtr::GroupName(name) => {
             let groups = get_group_items(Arc::clone(&client)).await.map_err(|e| {
@@ -200,7 +200,7 @@ async fn resolve_drive_ptr(
                         .join(", ")
                 );
                 return Err(Error::GroupNotFound {
-                    group: name.to_string(),
+                    group: name.clone(),
                 });
             };
 
@@ -214,12 +214,12 @@ async fn resolve_drive_ptr(
             {
                 Err(_) => {
                     return Err(Error::GroupHasNoDrive {
-                        group: name.to_string(),
+                        group: name.clone(),
                     });
                 }
                 Ok(r) if !r.status().is_success() => {
                     return Err(Error::GroupHasNoDrive {
-                        group: name.to_string(),
+                        group: name.clone(),
                     });
                 }
                 Ok(_) => {
@@ -227,7 +227,7 @@ async fn resolve_drive_ptr(
                 }
             }
 
-            Ok(DrivePtr::GroupId(group_id.to_string()))
+            Ok(DrivePtr::GroupId(group_id.clone()))
         }
         PublicDrivePtr::SiteName(name) => {
             let sites = get_site_items(Arc::clone(&client)).await.map_err(|e| {
@@ -245,9 +245,7 @@ async fn resolve_drive_ptr(
                         .collect::<Vec<String>>()
                         .join(", ")
                 );
-                return Err(Error::SiteNotFound {
-                    site: name.to_string(),
-                });
+                return Err(Error::SiteNotFound { site: name.clone() });
             };
             // Check if the site has a drive. This can't be done in the above `get_site_items` call (with an $expand).
             match Arc::clone(&client)
@@ -258,20 +256,16 @@ async fn resolve_drive_ptr(
                 .await
             {
                 Err(_) => {
-                    return Err(Error::SiteHasNoDrive {
-                        site: name.to_string(),
-                    });
+                    return Err(Error::SiteHasNoDrive { site: name.clone() });
                 }
                 Ok(r) if !r.status().is_success() => {
-                    return Err(Error::SiteHasNoDrive {
-                        site: name.to_string(),
-                    });
+                    return Err(Error::SiteHasNoDrive { site: name.clone() });
                 }
                 Ok(_) => {
                     tracing::debug!("Found a drive for sharepoint site '{name}'");
                 }
             }
-            Ok(DrivePtr::SiteId(site_id.to_string()))
+            Ok(DrivePtr::SiteId(site_id.clone()))
         }
     }
 }
