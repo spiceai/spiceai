@@ -28,7 +28,6 @@ use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, Dy
 use crate::federated_table::FederatedTable;
 use crate::register_data_connector;
 use async_trait::async_trait;
-use aws_config::ConfigLoader;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use data_components::dynamodb::{Error, JsonNesting};
