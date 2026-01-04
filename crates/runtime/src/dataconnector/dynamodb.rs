@@ -237,7 +237,7 @@ impl DataConnector for DynamoDB {
             .unwrap_or(false);
 
         let mut config_loader = if aws_force_iam_only {
-            initiate_config_with_iam_role_only("aws_region", &self.params).await
+            initiate_config_with_iam_role_only("aws_region", &self.params)
         } else {
             initiate_config_with_credentials(
                 "DynamoDBTableProvider",

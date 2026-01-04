@@ -408,7 +408,7 @@ pub async fn initiate_config_with_credentials(
 
 /// Initiates an AWS SDK configuration that only uses IAM role authentication.
 ///
-/// This bypasses environment variables (AWS_ACCESS_KEY_ID, etc.) and profile credentials,
+/// This bypasses environment variables (`AWS_ACCESS_KEY_ID`, etc.) and profile credentials,
 /// only using:
 /// - Web Identity Token (EKS/IRSA)
 /// - ECS Container Credentials
@@ -419,7 +419,7 @@ pub async fn initiate_config_with_credentials(
 ///
 /// # Returns
 /// A `ConfigLoader` that can be further customized before loading.
-pub async fn initiate_config_with_iam_role_only(region: String) -> aws_config::ConfigLoader {
+pub fn initiate_config_with_iam_role_only(region: String) -> aws_config::ConfigLoader {
     let provider_config = ProviderConfig::default().with_region(Some(Region::new(region.clone())));
 
     let web_identity_provider = WebIdentityTokenCredentialsProvider::builder()
