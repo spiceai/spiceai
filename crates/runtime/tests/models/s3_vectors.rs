@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
+
 use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_credential_bridge::default_aws_config;
@@ -29,7 +31,7 @@ use spicepod::{
 
 use crate::models::search::{SearchTestCase, SearchTestType, vectors_nonfilterable_col};
 
-mod search {
+pub(crate) mod search {
     use crate::{
         configure_test_datafusion,
         models::{
@@ -37,7 +39,7 @@ mod search {
             hf::{get_huggingface_embeddings, get_model_to_vec_embeddings},
             s3_vectors::{
                 basic_vector_search_tests, basic_vector_search_tests_on_table, delete_index,
-                vectors_filterable_col,
+                replace_s3_vector_index_names, vectors_filterable_col,
             },
             search::{
                 SearchTestCase, SearchTestType, run_search_w_explain, vectors_nonfilterable_col,
@@ -142,7 +144,6 @@ mod search {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn hybrid_w_vector_engine() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
@@ -541,7 +542,6 @@ mod search {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn metadata_columns() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
@@ -862,25 +862,43 @@ mod search {
         .await
     }
 
-    async fn init_vector_store_w_index_name(
-        bucket_name: &str,
-        index_name: &str,
+    pub(crate) async fn prepare_for_aws_tests(
+        store: &VectorStore,
         predelete_index: bool,
-    ) -> Result<VectorStore, anyhow::Error> {
+    ) -> Result<(), anyhow::Error> {
         for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
             verify_env_secret_exists(env_var)
                 .await
                 .map_err(anyhow::Error::msg)?;
         }
 
+        let bucket_name = store
+            .params
+            .as_ref()
+            .and_then(|p| p.as_string_map().get("s3_vectors_bucket").cloned())
+            .unwrap_or_default();
+        let index_name = store
+            .params
+            .as_ref()
+            .and_then(|p| p.as_string_map().get("s3_vectors_index").cloned())
+            .unwrap_or_default();
+
         if predelete_index {
-            let _ = delete_index(bucket_name, index_name)
+            return delete_index(bucket_name.as_str(), index_name.as_str())
                 .await
-                .inspect_err(|e| {
+                .map_err(|e| {
                     tracing::warn!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
+                    anyhow::anyhow!(e)
                 });
         }
+        Ok(())
+    }
 
+    pub(crate) async fn init_vector_store_w_index_name(
+        bucket_name: &str,
+        index_name: &str,
+        predelete_index: bool,
+    ) -> Result<VectorStore, anyhow::Error> {
         let params = spicepod::param::Params::from_string_map(
             vec![
                 ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
@@ -899,12 +917,14 @@ mod search {
             .collect(),
         );
 
-        Ok(VectorStore {
+        let store = VectorStore {
             enabled: true,
             engine: Some("s3_vectors".to_string()),
             params: Some(params),
             partition_by: vec![],
-        })
+        };
+        let () = prepare_for_aws_tests(&store, predelete_index).await?;
+        Ok(store)
     }
 
     async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
@@ -942,8 +962,9 @@ mod search {
         }
 
         let formatted = arrow::util::pretty::pretty_format_batches(&batches)
-            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-        insta::assert_snapshot!(test_name, formatted);
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?
+            .to_string();
+        insta::assert_snapshot!(test_name, replace_s3_vector_index_names(&formatted));
         Ok(())
     }
 }
@@ -1029,6 +1050,57 @@ async fn delete_index(
     s3_vector_client.delete_index(input).await.boxed()?;
 
     Ok(())
+}
+
+/// This function redacts the `S3Vector` index name from [`S3VectorsQueryExec`] in `LogicalPlan` output.
+///
+/// It keeps different index names unique via `INDEX_NAME_{i}`.
+pub(crate) fn replace_s3_vector_index_names(input: &str) -> String {
+    let mut index_map: HashMap<String, String> = HashMap::new();
+    let mut counter = 1;
+
+    input
+        .lines()
+        .map(|line| {
+            if !line.contains("S3VectorsQueryExec") {
+                return line.to_string();
+            }
+
+            // Find the content within parentheses after "S3VectorsQueryExec"
+            let Some(start_idx) = line.find("S3VectorsQueryExec (") else {
+                return line.to_string();
+            };
+            let after_paren = start_idx + "S3VectorsQueryExec (".len();
+            let Some(end_idx) = line[after_paren..].find(')') else {
+                return line.to_string();
+            };
+
+            let line_length = line.len();
+            let index_name = &line[after_paren..after_paren + end_idx];
+
+            // Get or create a replacement name for this index
+            let replacement = index_map
+                .entry(index_name.to_string())
+                .or_insert_with(|| {
+                    let name = format!("INDEX_NAME_{counter}");
+                    counter += 1;
+                    name
+                })
+                .clone();
+
+            // Build the new line with the replacement
+            let before = &line[..after_paren];
+            let after = &line[after_paren + end_idx..line_length - 1];
+            format!(
+                "{}{}{}{}|",
+                before,
+                replacement,
+                after,
+                " ".repeat(line_length - 1 - (before.len() + replacement.len() + after.len()))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn vectors_filterable_col(col: impl Into<Column>) -> Column {

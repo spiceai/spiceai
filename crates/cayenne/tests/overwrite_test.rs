@@ -24,7 +24,6 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 #[tokio::test]
-#[expect(clippy::too_many_lines)]
 async fn test_insert_overwrite() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 Testing INSERT OVERWRITE functionality...");
 

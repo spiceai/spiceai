@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::embeddings::Embed;
 use crate::embeddings::Error::{FailedToInstantiateEmbeddingModel, UnsupportedEmbeddingInput};
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use async_trait::async_trait;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -191,9 +191,9 @@ impl Embed for Model2Vec {
 mod tests {
     use crate::embeddings::Embed;
     use crate::model2vec::Model2Vec;
-    use async_openai::types::EmbeddingInput;
+    use async_openai::types::embeddings::EmbeddingInput;
 
-    #[tokio::test]
+    #[expect(dead_code)]
     async fn test_embed() {
         // This embedding is dim 256
         let model = Model2Vec::from_params(

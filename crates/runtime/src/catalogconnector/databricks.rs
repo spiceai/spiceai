@@ -64,7 +64,7 @@ impl Databricks {
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
         .required()
         .secret()
@@ -133,7 +133,6 @@ impl CatalogConnector for Databricks {
         self
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         runtime: Arc<Runtime>,

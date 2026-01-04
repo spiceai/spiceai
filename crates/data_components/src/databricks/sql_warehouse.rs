@@ -314,7 +314,7 @@ impl SqlWarehouseApi {
             )));
         }
 
-        let token = token.to_string();
+        let token = token.clone();
         let stream = stream::unfold(initial_external_link, move |current_link| {
             let api = Arc::clone(&self);
             let token = token.clone();

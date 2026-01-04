@@ -1,0 +1,99 @@
+name: network-attached storage benchmark tests
+run-name: NAS bench - ${{ github.event.inputs.spicepod_path }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with (e.g., federated/smb[parquet].yaml, federated/ftp[parquet].yaml, federated/nfs[parquet].yaml)'
+        required: true
+        type: string
+      ready_wait:
+        description: 'How long (in seconds) to wait for spiced to start'
+        required: true
+        default: '30'
+        type: string
+      validate_results:
+        description: 'Validate the results?'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  run-nas-bench:
+    name: Run network-attached storage benchmark tests
+    runs-on: spiceai-macos
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          SPICEPOD_PATH="./test/spicepods/tpch/sf1/${{ github.event.inputs.spicepod_path }}"
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup Testoperator
+        uses: ./.github/actions/setup-testoperator-data
+        with:
+          query_set: tpch
+
+      - name: Run the NAS benchmark test - ${{ github.event.inputs.spicepod_path }}
+        run: |
+          rm -rf .spice/data
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
+            -s /usr/local/bin/spiced \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            -d /opt/spiced/data \
+            --query-set tpch \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --disable-progress-bars \
+            --validate=${{ github.event.inputs.validate_results }} \
+            --metrics \
+            --scale-factor 1
+        env:
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          UNAS_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

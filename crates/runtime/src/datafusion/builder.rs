@@ -24,8 +24,7 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
-#[cfg(feature = "cluster")]
-use crate::config::ClusterConfig;
+use crate::cluster::ResolvedClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
@@ -120,8 +119,7 @@ pub struct DataFusionBuilder {
     task_history_enabled: bool,
     caching: Option<Arc<Caching>>,
     spill_compression: Option<SpillCompression>,
-    #[cfg(feature = "cluster")]
-    cluster_config: Arc<ClusterConfig>,
+    cluster_config: Option<Arc<ResolvedClusterConfig>>,
     metrics: Option<Metrics>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -163,8 +161,7 @@ impl DataFusionBuilder {
             task_history_enabled: true,
             caching: None,
             spill_compression: None,
-            #[cfg(feature = "cluster")]
-            cluster_config: Arc::new(ClusterConfig::default()),
+            cluster_config: None,
             metrics: None,
             io_runtime,
             resource_monitor: None,
@@ -183,10 +180,9 @@ impl DataFusionBuilder {
         self
     }
 
-    #[cfg(feature = "cluster")]
     #[must_use]
-    pub fn with_cluster_config(mut self, config: Arc<ClusterConfig>) -> Self {
-        self.cluster_config = config;
+    pub fn with_cluster_config(mut self, config: ResolvedClusterConfig) -> Self {
+        self.cluster_config = Some(Arc::new(config));
         self
     }
 
@@ -244,7 +240,6 @@ impl DataFusionBuilder {
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
-    #[expect(clippy::too_many_lines)]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
 
@@ -375,14 +370,12 @@ impl DataFusionBuilder {
             task_history_enabled: self.task_history_enabled,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
+            refresh_runtime: OnceLock::new(),
             io_runtime: self.io_runtime,
             metrics: self.metrics,
             resource_monitor: self.resource_monitor,
-            #[cfg(feature = "cluster")]
-            cluster_config: self.cluster_config,
-            #[cfg(feature = "cluster")]
+            cluster_config: self.cluster_config.unwrap_or_default(),
             scheduler_server: RwLock::new(None),
-            #[cfg(feature = "cluster")]
             executor: RwLock::new(None),
         }
     }

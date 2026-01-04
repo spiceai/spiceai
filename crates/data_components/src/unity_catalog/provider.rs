@@ -155,13 +155,13 @@ impl UnityCatalogSchemaProvider {
             .list_tables(&schema.catalog_name, &schema.name)
             .await?
             .context(super::SchemaDoesntExistSnafu {
-                schema: schema.name.to_string(),
-                catalog_id: schema.catalog_name.to_string(),
+                schema: schema.name.clone(),
+                catalog_id: schema.catalog_name.clone(),
             })?;
 
         let mut tables_map = HashMap::new();
         for table in tables {
-            let table_name = table.name.to_string();
+            let table_name = table.name.clone();
             let table_reference = table_reference_creator(&table);
 
             let Some(table_reference) = table_reference else {
@@ -204,8 +204,8 @@ impl UnityCatalogSchemaProvider {
             .list_tables(&self.schema.catalog_name, &self.schema.name)
             .await?
             .context(super::SchemaDoesntExistSnafu {
-                schema: self.schema.name.to_string(),
-                catalog_id: self.schema.catalog_name.to_string(),
+                schema: self.schema.name.clone(),
+                catalog_id: self.schema.catalog_name.clone(),
             })?;
 
         let mut new_tables = Vec::new();
@@ -236,7 +236,7 @@ impl UnityCatalogSchemaProvider {
             else {
                 continue;
             };
-            new_table_providers.insert(table.name.to_string(), provider);
+            new_table_providers.insert(table.name.clone(), provider);
         }
 
         let mut guard = match self.tables.write() {
@@ -285,7 +285,7 @@ impl UnityCatalogSchemaProvider {
         table_reference_creator: fn(&UCTable) -> Option<TableReference>,
         include: Option<Arc<GlobSet>>,
     ) -> Option<Arc<dyn TableProvider>> {
-        let table_name = table.name.to_string();
+        let table_name = table.name.clone();
         let table_reference = table_reference_creator(table)?;
 
         let schema_with_table = format!("{}.{}", schema.name, table_name);

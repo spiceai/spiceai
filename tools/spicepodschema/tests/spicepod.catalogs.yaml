@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
+# =============================================================================
+# CATALOG CONNECTORS - Schema coverage tests
+# =============================================================================
+version: v1
+kind: Spicepod
+name: schema-test-catalogs
+
+catalogs:
+  # ---------------------------------------------------------------------------
+  # Databricks catalog
+  # Runtime params: mode, client_timeout
+  # ---------------------------------------------------------------------------
+  - name: databricks_catalog
+    from: databricks:my_catalog
+    params:
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      databricks_mode: spark_connect
+      databricks_client_timeout: "60s"
+
+  # ---------------------------------------------------------------------------
+  # Unity Catalog
+  # ---------------------------------------------------------------------------
+  - name: unity_catalog
+    from: unity_catalog:another_catalog
+    params:
+      databricks_endpoint: https://unity.databricks.com
+      databricks_token: dapi456
+
+  # ---------------------------------------------------------------------------
+  # Iceberg catalog
+  # ---------------------------------------------------------------------------
+  - name: iceberg_catalog
+    from: iceberg:my_iceberg_catalog
+    params:
+      iceberg_catalog_type: rest
+      iceberg_rest_uri: http://localhost:8181
+
+  # ---------------------------------------------------------------------------
+  # Spice.ai catalog
+  # ---------------------------------------------------------------------------
+  - name: spiceai_catalog
+    from: spice.ai
+    params:
+      spiceai_api_key: my-api-key

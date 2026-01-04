@@ -45,9 +45,8 @@ use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
 
-#[cfg(feature = "cluster")]
 use {
-    crate::config::ClusterConfig,
+    crate::cluster::ResolvedClusterConfig,
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -98,6 +97,7 @@ pub mod builder;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
+pub mod flight_session_extension;
 pub mod managed_runtime;
 pub mod param_utils;
 pub mod refresh_sql;
@@ -105,7 +105,7 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
-mod sql_validator;
+pub(crate) mod sql_validator;
 pub mod udf;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
@@ -243,11 +243,9 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
-    #[cfg(feature = "cluster")]
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableExecutorHandle {},
 
@@ -270,7 +268,7 @@ pub enum Error {
     AppendRequiresTimeColumn { from: String },
 
     #[snafu(display(
-        "Failed to create an accelerated table for dataset {dataset_name} ({connector}): `refresh_mode: caching` is only supported with the HTTP/HTTPS data connector. See https://spiceai.org/docs/features/data-acceleration/refresh-modes/caching"
+        "Failed to create an accelerated table for dataset {dataset_name} ({connector}): `refresh_mode: caching` is only supported with the HTTP/HTTPS or localpod data connectors. See https://spiceai.org/docs/features/data-acceleration/refresh-modes/caching"
     ))]
     InvalidCachingRefreshMode {
         dataset_name: String,
@@ -352,17 +350,17 @@ pub struct DataFusion {
     // Controls the parallelism of accelerated table refreshes
     acceleration_refresh_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
+    // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
+    refresh_runtime: OnceLock<ManagedTokioRuntime>,
     io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
 
     pub temp_directory: Option<String>,
-    #[cfg(feature = "cluster")]
-    pub cluster_config: Arc<ClusterConfig>,
-    #[cfg(feature = "cluster")]
+    pub cluster_config: Arc<ResolvedClusterConfig>,
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
-    #[cfg(feature = "cluster")]
     pub executor: RwLock<Option<Arc<Executor>>>,
 }
 
@@ -628,7 +626,7 @@ impl DataFusion {
         if self.cpu_runtime.set(handle).is_err() {
             // Failure to set means this was already set - that shouldn't happen.
             tracing::error!(
-                "Failed to set tokio runtime on the Datafusion struct, this is an unexpected internal error"
+                "Failed to set cpu tokio runtime on the Datafusion struct, this is an unexpected internal error"
             );
         }
     }
@@ -636,6 +634,27 @@ impl DataFusion {
     #[must_use]
     pub fn cpu_runtime(&self) -> Option<&tokio::runtime::Handle> {
         self.cpu_runtime.get().map(ManagedTokioRuntime::handle)
+    }
+
+    /// Set the dedicated refresh runtime for acceleration refresh workers.
+    /// This runtime is isolated from the query runtime to prevent refresh workloads from impacting query latency.
+    pub fn set_refresh_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.refresh_runtime.set(handle).is_err() {
+            // Failure to set means this was already set - that shouldn't happen.
+            tracing::error!(
+                "Failed to set refresh tokio runtime on the Datafusion struct, this is an unexpected internal error"
+            );
+        }
+    }
+
+    /// Returns the dedicated refresh runtime for acceleration refresh workers.
+    /// Falls back to `cpu_runtime()` if no dedicated refresh runtime is set.
+    #[must_use]
+    pub fn refresh_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.refresh_runtime
+            .get()
+            .map(ManagedTokioRuntime::handle)
+            .or_else(|| self.cpu_runtime())
     }
 
     async fn get_table_provider(
@@ -950,7 +969,6 @@ impl DataFusion {
         Ok(())
     }
 
-    #[expect(clippy::too_many_lines)]
     pub async fn create_accelerated_table(
         &self,
         dataset: &Dataset,
@@ -1003,8 +1021,9 @@ impl DataFusion {
             let connector = dataset.source();
             let is_http_connector =
                 connector.eq_ignore_ascii_case("http") || connector.eq_ignore_ascii_case("https");
+            let is_localpod_connector = connector.eq_ignore_ascii_case(LOCALPOD_DATACONNECTOR);
             ensure!(
-                is_http_connector,
+                is_http_connector || is_localpod_connector,
                 InvalidCachingRefreshModeSnafu {
                     dataset_name: dataset.name.to_string(),
                     connector: connector.to_string(),
@@ -1120,7 +1139,7 @@ impl DataFusion {
             refresh,
             self.io_runtime.clone(),
         );
-        accelerated_table_builder.cpu_runtime(self.cpu_runtime().cloned());
+        accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {
@@ -1188,6 +1207,7 @@ impl DataFusion {
                 acceleration_settings.snapshot_behavior.clone(),
                 Some(snapshot_path),
                 acceleration_settings.snapshots_trigger_threshold,
+                acceleration_settings.snapshots_create_interval,
             );
         }
 
@@ -1264,7 +1284,7 @@ impl DataFusion {
     ///
     /// This will not work if:
     /// - The parent table is not an accelerated table.
-    /// - The parent or child acceleration is not configured as `RefreshMode::Full`.
+    /// - The parent and child acceleration modes don't match (both must be Full or both must be Caching).
     ///
     /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
     pub async fn attempt_to_synchronize_accelerated_table(
@@ -1716,7 +1736,7 @@ impl DataFusion {
             refresh,
             self.io_runtime.clone(),
         );
-        builder.cpu_runtime(self.cpu_runtime().cloned());
+        builder.cpu_runtime(self.refresh_runtime().cloned());
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
@@ -1918,7 +1938,6 @@ impl DataFusion {
         }
     }
 
-    #[cfg(feature = "cluster")]
     pub fn bind_scheduler_server(
         &self,
         server: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
@@ -1931,7 +1950,6 @@ impl DataFusion {
         Ok(())
     }
 
-    #[cfg(feature = "cluster")]
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
         let mut executor_handle = self
             .executor

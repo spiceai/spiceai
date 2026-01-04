@@ -22,7 +22,7 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, SchemaRef};
 
 use arrow::error::ArrowError;
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use async_stream::stream;
 use chunking::Chunker;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -493,7 +493,6 @@ pub(super) fn get_vectors_in_process(
 ///                          | [[0, 10], [10, 21]]           |
 ///                          +-------------------------------+
 /// ```
-#[expect(clippy::too_many_lines)]
 async fn get_vectors_with_chunker(
     arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,
@@ -650,7 +649,7 @@ mod tests {
         array::{Array, AsArray},
         datatypes::Float32Type,
     };
-    use async_openai::types::EmbeddingInput;
+    use async_openai::types::embeddings::EmbeddingInput;
     use async_trait::async_trait;
     use llms::embeddings::{self, Embed};
     use std::collections::HashMap;

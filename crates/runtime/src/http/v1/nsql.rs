@@ -29,7 +29,7 @@ use crate::{
         utils::create_tool_use_messages,
     },
 };
-use async_openai::types::ChatCompletionRequestMessage;
+use async_openai::types::chat::ChatCompletionRequestMessage;
 use axum::{
     Extension, Json,
     http::StatusCode,
@@ -290,7 +290,6 @@ pub(crate) async fn post(
     }
 }
 
-#[expect(clippy::too_many_lines)]
 pub(crate) async fn handle_nsql_query(
     rt: Arc<Runtime>,
     context: Arc<RequestContext>,

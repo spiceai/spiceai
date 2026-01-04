@@ -36,7 +36,6 @@ use test_framework::{
         SpiceTest,
         datasets::{EndCondition, NotStarted},
     },
-    telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::{observe_memory, recursively_get_dir_size},
 };
@@ -67,7 +66,6 @@ fn emit_acceleration_size_if_applicable(app: &App, app_path: &Path) -> anyhow::R
     Ok(())
 }
 
-#[expect(clippy::too_many_lines)]
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -84,7 +82,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     // Create telemetry early before any metrics calls (e.g., HealthMonitor)
     // Resource will be set later with set_resource() before emit()
-    let mut telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
+    let mut telemetry = super::create_telemetry(&args.common);
 
     let health_monitor = HealthMonitor::spawn()?;
 
@@ -107,7 +105,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             .with_disable_caching(args.disable_caching)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))
             .with_http_client(args.http_clients),
-    )?;
+    )
+    .await?;
 
     let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)

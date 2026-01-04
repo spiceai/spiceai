@@ -231,3 +231,22 @@ pub async fn initiate_config_with_credentials(
     )
     .await)
 }
+
+/// Initiate a [`ConfigLoader`] with only IAM role authentication (ignoring environment variables).
+///
+/// Return [`ConfigLoader`] to allow further customization.
+pub fn initiate_config_with_iam_role_only(
+    region_name: &'static str,
+    params: &Parameters,
+) -> Result<ConfigLoader, Error> {
+    let region = params
+        .get(region_name)
+        .expose()
+        .ok_or_else(|_| Error::NoRegionSpecified {
+            region: region_name.to_string(),
+        })?
+        .to_string();
+
+    // Delegate to the common implementation in aws-sdk-credential-bridge
+    Ok(aws_sdk_credential_bridge::initiate_config_with_iam_role_only(region))
+}

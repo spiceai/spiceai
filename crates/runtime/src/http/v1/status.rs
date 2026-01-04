@@ -17,8 +17,6 @@ use csv::Writer;
 use flight_client::{Credentials, FlightClient};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, sync::Arc};
-use tonic::transport::Channel;
-use tonic_health::{ServingStatus, pb::health_client::HealthClient};
 
 use axum::{
     Extension, Json,
@@ -104,6 +102,7 @@ pub(crate) async fn get(
 ) -> Response {
     let cfg = cfg.as_ref();
     let flight_url = cfg.flight_bind_address.to_string();
+    let flight_status = get_flight_status(&flight_url).await;
 
     let details = vec![
         ConnectionDetails {
@@ -113,8 +112,8 @@ pub(crate) async fn get(
         },
         ConnectionDetails {
             name: "flight",
-            status: get_flight_status(&flight_url).await,
-            endpoint: flight_url,
+            status: flight_status,
+            endpoint: flight_url.clone(),
         },
         ConnectionDetails {
             name: "metrics",
@@ -130,24 +129,11 @@ pub(crate) async fn get(
                 None => ComponentStatus::Disabled,
             },
         },
+        // OpenTelemetry is served on the same gRPC port as Flight
         ConnectionDetails {
             name: "opentelemetry",
-            status: match get_opentelemetry_status(
-                cfg.open_telemetry_bind_address.to_string().as_str(),
-            )
-            .await
-            {
-                Ok(status) => status,
-                Err(e) => {
-                    tracing::error!(
-                        "Error getting opentelemetry status from {}: {}",
-                        cfg.open_telemetry_bind_address,
-                        e
-                    );
-                    ComponentStatus::Error
-                }
-            },
-            endpoint: cfg.open_telemetry_bind_address.to_string(),
+            status: flight_status,
+            endpoint: flight_url,
         },
     ];
 
@@ -196,27 +182,6 @@ async fn get_metrics_status(
 ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
     let resp = reqwest::get(format!("http://{metrics_addr}/health")).await?;
     if resp.status().is_success() && resp.text().await? == "OK" {
-        Ok(ComponentStatus::Ready)
-    } else {
-        Ok(ComponentStatus::Error)
-    }
-}
-async fn get_opentelemetry_status(
-    addr: &str,
-) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
-    let channel = Channel::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
-
-    let mut client = HealthClient::new(channel);
-
-    let resp = client
-        .check(tonic_health::pb::HealthCheckRequest {
-            service: String::new(),
-        })
-        .await?;
-
-    if resp.into_inner().status == ServingStatus::Serving as i32 {
         Ok(ComponentStatus::Ready)
     } else {
         Ok(ComponentStatus::Error)

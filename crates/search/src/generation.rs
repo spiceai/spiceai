@@ -40,12 +40,24 @@ pub enum Error {
 }
 
 impl Error {
+    /// Returns true if this error was caused by a user error (e.g., invalid query syntax).
+    ///
+    /// This method is feature-gated because [`Error::TextSearchError`] only exists when
+    /// the `text_search` feature is enabled. Without the feature gate, the match would
+    /// fail to compile when `text_search` is disabled.
     #[must_use]
     pub fn is_user_error(&self) -> bool {
-        matches!(
-            self,
-            Error::TextSearchError { source } if source.is_user_error()
-        )
+        #[cfg(feature = "text_search")]
+        {
+            matches!(
+                self,
+                Error::TextSearchError { source } if source.is_user_error()
+            )
+        }
+        #[cfg(not(feature = "text_search"))]
+        {
+            false
+        }
     }
 
     #[must_use]

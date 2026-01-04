@@ -31,11 +31,11 @@ import (
 
 // progressReader wraps an io.Reader and reports progress
 type progressReader struct {
-	reader      io.Reader
-	total       int64
-	current     int64
-	lastPrint   time.Time
-	startTime   time.Time
+	reader    io.Reader
+	total     int64
+	current   int64
+	lastPrint time.Time
+	startTime time.Time
 }
 
 func newProgressReader(reader io.Reader, total int64) *progressReader {
@@ -51,14 +51,14 @@ func newProgressReader(reader io.Reader, total int64) *progressReader {
 func (pr *progressReader) Read(p []byte) (int, error) {
 	n, err := pr.reader.Read(p)
 	pr.current += int64(n)
-	
+
 	// Print progress every 500ms or on completion
 	now := time.Now()
 	if now.Sub(pr.lastPrint) > 500*time.Millisecond || err == io.EOF {
 		pr.printProgress()
 		pr.lastPrint = now
 	}
-	
+
 	return n, err
 }
 
@@ -66,14 +66,14 @@ func (pr *progressReader) printProgress() {
 	if pr.total <= 0 {
 		return
 	}
-	
+
 	percent := float64(pr.current) / float64(pr.total) * 100
 	downloaded := float64(pr.current) / 1024 / 1024 // MB
-	total := float64(pr.total) / 1024 / 1024 // MB
-	
+	total := float64(pr.total) / 1024 / 1024        // MB
+
 	elapsed := time.Since(pr.startTime).Seconds()
 	speed := downloaded / elapsed // MB/s
-	
+
 	// Calculate ETA
 	remaining := total - downloaded
 	eta := ""
@@ -85,10 +85,10 @@ func (pr *progressReader) printProgress() {
 			eta = fmt.Sprintf("ETA: %dm%ds", int(etaSeconds)/60, int(etaSeconds)%60)
 		}
 	}
-	
-	fmt.Fprintf(os.Stderr, "\rDownloading: %.1f%% (%.1f/%.1f MB) @ %.1f MB/s %s", 
+
+	fmt.Fprintf(os.Stderr, "\rDownloading: %.1f%% (%.1f/%.1f MB) @ %.1f MB/s %s",
 		percent, downloaded, total, speed, eta)
-	
+
 	if pr.current >= pr.total {
 		fmt.Fprintln(os.Stderr) // New line on completion
 	}

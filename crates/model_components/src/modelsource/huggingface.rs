@@ -30,7 +30,6 @@ pub struct Huggingface {}
 
 #[async_trait]
 impl ModelSource for Huggingface {
-    #[expect(clippy::too_many_lines)]
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
         let name = params
             .get("name")

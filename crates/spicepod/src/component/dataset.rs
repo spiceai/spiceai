@@ -190,6 +190,14 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn with_params(self, params: Params) -> Self {
+        Self {
+            params: Some(params),
+            ..self
+        }
+    }
+
+    #[must_use]
     pub fn has_embeddings(&self) -> bool {
         !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
     }
@@ -233,10 +241,10 @@ impl Dataset {
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         if let Some(d) = self.description.as_ref() {
-            metadata.insert("description".to_string(), d.to_string());
+            metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.to_string(), v.to_string());
+            metadata.insert(k.clone(), v.to_string());
         }
         metadata
     }

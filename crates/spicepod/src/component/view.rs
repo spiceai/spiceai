@@ -84,13 +84,25 @@ impl View {
     }
 
     #[must_use]
+    pub fn with_acceleration(mut self, acceleration: Acceleration) -> Self {
+        self.acceleration = Some(acceleration);
+        self
+    }
+
+    #[must_use]
+    pub fn with_sql(mut self, sql: impl Into<String>) -> Self {
+        self.sql = Some(sql.into());
+        self
+    }
+
+    #[must_use]
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         if let Some(d) = self.description.as_ref() {
-            metadata.insert("description".to_string(), d.to_string());
+            metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.to_string(), v.to_string());
+            metadata.insert(k.clone(), v.to_string());
         }
         metadata
     }

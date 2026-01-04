@@ -18,9 +18,10 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     error::OpenAIError,
-    types::{
-        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-        ChatCompletionRequestMessage, ChatCompletionResponseStream, CreateChatCompletionRequest,
+    types::chat::{
+        ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
+        ChatCompletionResponseStream, ChatCompletionTools, CreateChatCompletionRequest,
         CreateChatCompletionResponse,
     },
 };
@@ -75,8 +76,10 @@ impl Xai {
 
                 // xAI requires tool calls with empty parameters used to be `{}` not ``.
                 for t in tool_calls.iter_mut() {
-                    if t.function.arguments.is_empty() {
-                        t.function.arguments = "{}".to_string();
+                    if let ChatCompletionMessageToolCalls::Function(func_call) = t
+                        && func_call.function.arguments.is_empty()
+                    {
+                        func_call.function.arguments = "{}".to_string();
                     }
                 }
             }
@@ -86,8 +89,10 @@ impl Xai {
         // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
             for t in tools.iter_mut() {
-                if t.function.parameters.is_none() {
-                    t.function.parameters.replace(json!(
+                if let ChatCompletionTools::Function(func_tool) = t
+                    && func_tool.function.parameters.is_none()
+                {
+                    func_tool.function.parameters.replace(json!(
                         {
                             "$schema": "http://json-schema.org/draft-07/schema#",
                             "properties": {},
@@ -104,6 +109,7 @@ impl Xai {
     }
 }
 
+#[expect(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 struct Model {
     id: String,
@@ -116,11 +122,7 @@ struct Model {
 impl Chat for Xai {
     async fn health(&self) -> Result<(), Error> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
-        match self
-            .client
-            .get::<Model>(format!("/models/{}", self.model).as_str())
-            .await
-        {
+        match self.client.models().retrieve(&self.model).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "{e}");

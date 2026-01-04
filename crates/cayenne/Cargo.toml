@@ -11,6 +11,7 @@ version = "0.1.0"
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
+arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-row = { workspace = true }
 async-stream = { workspace = true }
@@ -28,6 +29,7 @@ datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
+object_store = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
 rusqlite = { workspace = true }
@@ -37,22 +39,12 @@ snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
+url = { workspace = true }
+util = { path = "../util" }
 uuid = { workspace = true, features = ["v7"] }
 vortex = { workspace = true }
-vortex-alp = { workspace = true }
-vortex-array = { workspace = true }
-vortex-bytebool = { workspace = true }
 vortex-datafusion = { workspace = true }
-vortex-datetime-parts = { workspace = true }
-vortex-decimal-byte-parts = { workspace = true }
-vortex-fastlanes = { workspace = true }
-vortex-fsst = { workspace = true }
-vortex-runend = { workspace = true }
-vortex-sequence = { workspace = true }
 vortex-session = { workspace = true }
-vortex-sparse = { workspace = true }
-vortex-zigzag = { workspace = true }
-util = { path = "../util" }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 aegis = { version = "0.9.3", default-features = false, features = [
@@ -66,11 +58,19 @@ turso = ["dep:turso"]
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
+datafusion-federation.workspace = true
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
+rstest = "0.26.1"
 tempfile = { workspace = true }
+test-framework = { path = "../test-framework" }
+test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 
 [[bench]]
 harness = false
 name = "metastore_operations"
+
+[[bench]]
+harness = false
+name = "deletion_strategies"

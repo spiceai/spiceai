@@ -19,15 +19,17 @@ limitations under the License.
 //! This module contains the main `CayenneTableProvider` struct which implements
 //! `DataFusion`'s `TableProvider` trait for Cayenne tables.
 
-use super::constants::{
-    DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
+use super::constants::{DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
+use super::delete::{
+    read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec, Int64PkDeletionFilterExec,
+    KeyBasedDeletionFilterExec,
 };
-use super::delete::{read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec};
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::deletion::{DeletionVectorWriteSpec, DeletionVectorWriter};
-use crate::metadata::{CreateTableOptions, TableMetadata};
+use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
+use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
@@ -37,6 +39,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::Constraints;
@@ -44,18 +47,43 @@ use datafusion_execution::config::SessionConfig;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::collect;
+use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
+use object_store::path::Path as ObjectStorePath;
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::task;
+use vortex::compressor::CompactCompressor;
+use vortex::file::WriteStrategyBuilder;
+use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormat;
+use vortex_session::VortexSession;
+
+/// Strategy for primary key-based deletion filtering.
+///
+/// Determines which cache and filter execution plan to use at query time.
+/// Chosen based on the table's primary key configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkDeletionStrategy {
+    /// No primary key - use position-based deletion with `RoaringBitmap`.
+    /// Requires `CoalescePartitionsExec` to ensure consistent ordering.
+    PositionBased,
+    /// Single-column Int64 primary key - use direct `HashSet<i64>` lookup.
+    /// Most efficient: no serialization, 8 bytes per key, parallel reads.
+    Int64Pk,
+    /// Composite or non-integer primary key - use `RowConverter` + `HashSet<Box<[u8]>>`.
+    /// Handles all PK types but has serialization overhead.
+    RowConverterBased,
+}
 
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
@@ -83,8 +111,10 @@ pub struct CayenneTableProvider {
     retention_filters: Vec<Expr>,
     /// Vortex encoding configuration for hardware-accelerated compression
     vortex_config: crate::metadata::VortexConfig,
-    /// Cached deletion vectors (deleted row IDs) to avoid repeated metastore queries on every scan.
-    /// This is loaded once during table provider initialization and invalidated when delete files change.
+    /// Cached deletion vectors (deleted row IDs) for position-based deletion.
+    /// Used for tables WITHOUT a primary key.
+    ///
+    /// Loaded once during table provider initialization and invalidated when delete files change.
     /// Using `RwLock` for concurrent reads during scans with occasional writes on updates.
     /// The inner `Arc<RoaringBitmap>` enables zero-copy sharing: scans clone the Arc (cheap ref count
     /// increment) rather than cloning the entire bitmap, aligning with zero-copy principles.
@@ -93,6 +123,43 @@ pub struct CayenneTableProvider {
     /// contains operations. Limited to u32 row IDs (4 billion rows). Tables with excessive deleted rows
     /// (approaching billions) should trigger compaction to maintain query performance and clear deletion vectors.
     cached_deleted_row_ids: Arc<RwLock<Arc<RoaringBitmap>>>,
+    /// Cached deletion vectors for Int64 primary key-based deletion.
+    /// Used for tables with a single-column Int64 primary key.
+    ///
+    /// This is the most efficient deletion strategy - direct i64 comparison without
+    /// any serialization overhead. 8 bytes per deleted key.
+    /// Maps PK -> `delete_sequence_number` for sequence-based ordering.
+    cached_deleted_pk_i64: Arc<RwLock<Arc<std::collections::HashMap<i64, i64>>>>,
+    /// Cached deletion vectors (deleted row keys) for key-based deletion.
+    /// Used for tables with composite or non-integer primary keys.
+    ///
+    /// Keys are the byte representation of primary key columns via Arrow's `RowConverter`.
+    /// Maps PK bytes -> `delete_sequence_number` for sequence-based ordering.
+    #[expect(clippy::type_complexity)]
+    cached_deleted_row_keys: Arc<RwLock<Arc<std::collections::HashMap<Box<[u8]>, i64>>>>,
+    /// Cached insert records for Int64 primary key-based deletion.
+    /// Used for tables with a single-column Int64 primary key.
+    ///
+    /// Insert records track PKs that were re-inserted after being deleted (upserted).
+    /// Maps PK -> `insert_sequence_number`.
+    /// During scan: delete applies only if `delete_sequence` > `insert_sequence` for that PK.
+    cached_insert_records_pk_i64: Arc<RwLock<Arc<std::collections::HashMap<i64, i64>>>>,
+    /// Cached insert records (row keys) for key-based deletion.
+    /// Used for tables with composite or non-integer primary keys.
+    ///
+    /// Insert records track PKs that were re-inserted after being deleted (upserted).
+    /// Maps PK bytes -> `insert_sequence_number`.
+    /// During scan: delete applies only if `delete_sequence` > `insert_sequence` for that PK.
+    #[expect(clippy::type_complexity)]
+    cached_insert_records_row_keys: Arc<RwLock<Arc<std::collections::HashMap<Box<[u8]>, i64>>>>,
+    /// Strategy for primary key-based deletion filtering.
+    /// Determines which cache and filter exec to use at query time.
+    pk_deletion_strategy: PkDeletionStrategy,
+    /// `RowConverter` for converting primary key columns to byte representation.
+    /// Only set for tables with composite or non-integer primary keys.
+    pk_row_converter: Option<Arc<RowConverter>>,
+    /// Indices of primary key columns in the table schema.
+    pk_column_indices: Vec<usize>,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -102,6 +169,116 @@ pub struct CayenneTableProvider {
     ///
     /// Uses `tokio::sync::Mutex` because the lock is held across `.await` points during insert operations.
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Optional object store configuration for remote storage (e.g., S3 Express One Zone).
+    /// When set, this object store is registered with `SessionContext` for data file operations.
+    object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    /// Current snapshot ID, updated after compaction operations.
+    ///
+    /// This is separate from `table_metadata.current_snapshot_id` because compaction
+    /// creates a new snapshot but we don't want to modify the original `TableMetadata`.
+    /// Uses `RwLock` for concurrent reads during normal operations with occasional
+    /// writes on compaction. The lock is held briefly for string operations.
+    current_snapshot_id: Arc<RwLock<String>>,
+    /// Protected snapshot IDs that should skip deletion filtering.
+    ///
+    /// When data is inserted while pending deletions exist, the new data is written
+    /// to a new snapshot that is "protected" - deletions that existed at the time
+    /// of insert should not apply to this snapshot's data.
+    ///
+    /// Maps `snapshot_id` -> `minimum_sequence` (all deletes with seq <= `min_seq` don't apply).
+    /// At scan time, data from these snapshots is scanned without deletion filtering.
+    protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
+}
+
+/// Builder for constructing a `CayenneTableProvider` with optional configuration.
+///
+/// Use this builder to configure optional parameters before opening an existing table
+/// or creating a new one.
+///
+/// # Example
+///
+/// ```ignore
+/// // Open an existing table
+/// let provider = CayenneTableProviderBuilder::new(catalog)
+///     .with_retention_filters(filters)
+///     .with_object_store(config)
+///     .open("my_table").await?;
+///
+/// // Create a new table
+/// let provider = CayenneTableProviderBuilder::new(catalog)
+///     .with_retention_filters(filters)
+///     .create(options).await?;
+/// ```
+#[derive(Clone)]
+pub struct CayenneTableProviderBuilder {
+    catalog: Arc<dyn MetadataCatalog>,
+    retention_filters: Vec<Expr>,
+    object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+}
+
+impl CayenneTableProviderBuilder {
+    /// Create a new builder with the required catalog.
+    #[must_use]
+    pub fn new(catalog: Arc<dyn MetadataCatalog>) -> Self {
+        Self {
+            catalog,
+            retention_filters: Vec::new(),
+            object_store_config: None,
+        }
+    }
+
+    /// Set retention filters that will be applied after writes.
+    ///
+    /// These filters cause automatic deletion of rows matching the filter criteria
+    /// after each write operation.
+    #[must_use]
+    pub fn with_retention_filters(mut self, filters: Vec<Expr>) -> Self {
+        self.retention_filters = filters;
+        self
+    }
+
+    /// Set the object store configuration for remote storage.
+    ///
+    /// Used for S3 Express One Zone storage where data files are stored remotely
+    /// while metadata remains on local disk.
+    #[must_use]
+    pub fn with_object_store(mut self, config: crate::metadata::ObjectStoreConfig) -> Self {
+        self.object_store_config = Some(config);
+        self
+    }
+
+    /// Open an existing table by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be found in the catalog or if the listing
+    /// table cannot be created.
+    pub async fn open(self, table_name: &str) -> CatalogResult<CayenneTableProvider> {
+        CayenneTableProvider::new_internal(
+            table_name,
+            self.catalog,
+            self.retention_filters,
+            self.object_store_config,
+        )
+        .await
+    }
+
+    /// Create a new table with the given options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be created in the catalog.
+    pub async fn create(self, options: CreateTableOptions) -> CatalogResult<CayenneTableProvider> {
+        let table_name = options.table_name.clone();
+        let _table_id = self.catalog.create_table(options).await?;
+        CayenneTableProvider::new_internal(
+            &table_name,
+            self.catalog,
+            self.retention_filters,
+            self.object_store_config,
+        )
+        .await
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,63 +337,143 @@ impl CayenneTableProvider {
         url_str
     }
 
-    /// Create a configured `VortexSession` with selected encodings for hardware acceleration.
-    ///
-    /// This method registers only the encodings that are enabled in the configuration,
-    /// allowing fine-grained control over compression vs performance tradeoffs.
-    fn create_vortex_session(
-        config: &crate::metadata::VortexConfig,
-    ) -> vortex_session::VortexSession {
-        use vortex::VortexSessionDefault;
-        use vortex_session::VortexSession;
+    fn register_object_store_if_needed(
+        runtime_env: &Arc<RuntimeEnv>,
+        config: &crate::metadata::ObjectStoreConfig,
+    ) {
+        // Use the object store registry to check if already registered
+        let already_registered = runtime_env
+            .object_store_registry
+            .get_store(&config.url)
+            .map(|existing| Arc::ptr_eq(&existing, &config.store))
+            .unwrap_or(false);
 
-        // Use default session which registers all encodings
-        // Note: If all encodings are enabled, this is optimal. Otherwise, the overhead
-        // of unused encodings is minimal compared to the complexity of custom registration.
-        // Future enhancement: Vortex may provide API for selective encoding registration.
-        let session = VortexSession::default();
+        if !already_registered {
+            runtime_env.register_object_store(&config.url, Arc::clone(&config.store));
+            tracing::debug!("Registered object store for {}", config.url.as_str());
+        }
+    }
 
-        // Log which encodings are configured to be used
-        let mut enabled = Vec::new();
-        if config.enable_alp {
-            enabled.push("ALP (SIMD numeric compression)");
-        }
-        if config.enable_fsst {
-            enabled.push("FSST (SIMD string compression)");
-        }
-        if config.enable_bitpacking {
-            enabled.push("BitPacking (SIMD integer compression)");
-        }
-        if config.enable_delta {
-            enabled.push("Delta");
-        }
-        if config.enable_rle {
-            enabled.push("RLE");
-        }
-        if config.enable_dict {
-            enabled.push("Dictionary");
-        }
-        if config.enable_for {
-            enabled.push("FOR");
-        }
-        if config.enable_zigzag {
-            enabled.push("ZigZag");
+    fn require_object_store(&self) -> CatalogResult<&crate::metadata::ObjectStoreConfig> {
+        self.object_store_config
+            .as_ref()
+            .ok_or_else(|| CatalogError::InvalidOperation {
+                message: "S3 storage requires an object_store_config".to_string(),
+                source: Box::new(std::io::Error::other("missing object store configuration")),
+            })
+    }
+
+    fn snapshot_object_store_prefix(
+        &self,
+        snapshot_id: &str,
+    ) -> CatalogResult<Option<ObjectStorePath>> {
+        if !self.table_metadata.path.starts_with("s3://") {
+            return Ok(None);
         }
 
-        if enabled.is_empty() {
-            tracing::warn!("All Cayenne Vortex encodings disabled - using canonical encoding only");
-        } else {
-            tracing::info!("Cayenne Vortex encodings enabled: {}", enabled.join(", "));
+        let snapshot_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            snapshot_id,
+        );
+
+        let url = url::Url::parse(&snapshot_url).map_err(|e| CatalogError::InvalidOperation {
+            message: format!("Failed to parse snapshot URL {snapshot_url}"),
+            source: Box::new(e),
+        })?;
+
+        let host = url.host_str().unwrap_or_default();
+        let config = self.require_object_store()?;
+        let config_host = config.url.host_str().unwrap_or_default();
+
+        if !config_host.is_empty() && !host.is_empty() && config_host != host {
+            return Err(CatalogError::InvalidOperation {
+                message: format!(
+                    "Snapshot host {host} does not match configured object store host {config_host}"
+                ),
+                source: Box::new(std::io::Error::other("host mismatch")),
+            });
         }
 
-        session
+        let path = url.path().trim_start_matches('/');
+        Ok(Some(ObjectStorePath::from(path)))
+    }
+
+    async fn delete_prefix_with_object_store(&self, prefix: &ObjectStorePath) -> CatalogResult<()> {
+        let config = self.require_object_store()?;
+        let objects: Vec<_> = config
+            .store
+            .list(Some(prefix))
+            .try_collect()
+            .await
+            .map_err(|source| CatalogError::InvalidOperation {
+                message: "Failed to list objects for snapshot cleanup".to_string(),
+                source: Box::new(source),
+            })?;
+
+        for meta in objects {
+            config
+                .store
+                .delete(&meta.location)
+                .await
+                .map_err(|source| CatalogError::InvalidOperation {
+                    message: format!(
+                        "Failed to delete object {} from snapshot cleanup",
+                        meta.location
+                    ),
+                    source: Box::new(source),
+                })?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_old_snapshots_s3(&self, current_snapshot: &str) -> CatalogResult<()> {
+        let config = self.require_object_store()?;
+
+        let base_url = url::Url::parse(&self.table_metadata.path).map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to parse table path for snapshot cleanup: {}",
+                    self.table_metadata.path
+                ),
+                source: Box::new(e),
+            }
+        })?;
+
+        let mut base_prefix = base_url.path().trim_start_matches('/').to_string();
+        if !base_prefix.ends_with('/') {
+            base_prefix.push('/');
+        }
+
+        let prefix =
+            ObjectStorePath::from(format!("{base_prefix}{}/", self.table_metadata.table_id));
+
+        let list_result = config
+            .store
+            .list_with_delimiter(Some(&prefix))
+            .await
+            .map_err(|source| CatalogError::InvalidOperation {
+                message: "Failed to list snapshots for cleanup".to_string(),
+                source: Box::new(source),
+            })?;
+
+        for common_prefix in list_result.common_prefixes {
+            if let Some(snapshot_id) = common_prefix.parts().last() {
+                if snapshot_id.as_ref() != current_snapshot {
+                    self.delete_prefix_with_object_store(&common_prefix).await?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Create a new `ListingTable` for a snapshot directory.
     ///
     /// # Arguments
     ///
-    /// * `snapshot_dir` - Path to the snapshot directory
+    /// * `snapshot_dir_url` - URL string for the snapshot directory (local path or S3 URL)
     /// * `schema` - Arrow schema for the table
     /// * `vortex_config` - Vortex encoding configuration
     ///
@@ -224,19 +481,46 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the listing table cannot be created.
     fn create_listing_table(
-        snapshot_dir: &std::path::Path,
+        snapshot_dir_url: &str,
         schema: SchemaRef,
         vortex_config: &crate::metadata::VortexConfig,
     ) -> CatalogResult<Arc<ListingTable>> {
-        let dir_url_str = Self::dir_to_url_string(snapshot_dir);
+        let table_url = ListingTableUrl::parse(snapshot_dir_url).map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: format!("Failed to parse table URL '{snapshot_dir_url}'."),
+                source: Box::new(e),
+            }
+        })?;
 
-        let table_url =
-            ListingTableUrl::parse(&dir_url_str).map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to parse table URL: {e}"),
+        let listing_options = Self::create_listing_options(vortex_config);
+
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(listing_options)
+            .with_schema(schema);
+
+        let listing_table =
+            ListingTable::try_new(config).map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to create listing table.".to_string(),
+                source: Box::new(e),
             })?;
 
+        Ok(Arc::new(listing_table))
+    }
+
+    /// Create listing options for Vortex format with the given configuration.
+    fn create_listing_options(vortex_config: &crate::metadata::VortexConfig) -> ListingOptions {
         // Create a configured Vortex session with selected encodings
-        let vortex_session = Self::create_vortex_session(vortex_config);
+        let vortex_session = VortexSession::default();
+
+        let vortex_session = if matches!(
+            vortex_config.compression_strategy,
+            CompressionStrategy::Zstd
+        ) {
+            vortex_session
+                .set(WriteStrategyBuilder::new().with_compressor(CompactCompressor::default()))
+        } else {
+            vortex_session
+        };
 
         // Configure VortexFormat with hardware-optimized settings
         let vortex_opts = vortex_datafusion::VortexOptions {
@@ -245,19 +529,29 @@ impl CayenneTableProvider {
         };
 
         let format = Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts));
-        let listing_options =
-            ListingOptions::new(format).with_session_config_options(&SessionConfig::default());
+        ListingOptions::new(format).with_session_config_options(&SessionConfig::default())
+    }
 
-        let config = ListingTableConfig::new(table_url)
-            .with_listing_options(listing_options)
-            .with_schema(schema);
-
-        let listing_table =
-            ListingTable::try_new(config).map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to create listing table: {e}"),
-            })?;
-
-        Ok(Arc::new(listing_table))
+    /// Construct the snapshot directory URL string.
+    ///
+    /// For local paths, returns a file:// URL or path string.
+    /// For S3 paths, returns the S3 URL with proper path components.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_path` - The base path for the table (local path or S3 URL)
+    /// * `table_id` - The unique identifier for the table
+    /// * `snapshot_id` - The snapshot identifier
+    fn snapshot_dir_url(table_path: &str, table_id: i64, snapshot_id: &str) -> String {
+        if table_path.starts_with("s3://") {
+            // S3 URL: join path components with /
+            let base = table_path.trim_end_matches('/');
+            format!("{base}/{table_id}/{snapshot_id}/")
+        } else {
+            // Local path: use PathBuf and convert to URL string
+            let path = Self::snapshot_dir_path(table_path, table_id, snapshot_id);
+            Self::dir_to_url_string(&path)
+        }
     }
 
     /// Ensure a snapshot directory exists, creating it if necessary.
@@ -274,6 +568,40 @@ impl CayenneTableProvider {
                 .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
         }
         Ok(())
+    }
+
+    /// Sync a directory to ensure all files are durably written to disk.
+    ///
+    /// This is critical for crash safety: we must ensure all data files are
+    /// persisted before updating the catalog metadata. Otherwise, a crash
+    /// after catalog update but before data flush could result in a catalog
+    /// pointing to incomplete/missing data files.
+    ///
+    /// # ACID Durability
+    ///
+    /// This function is part of the durability guarantee:
+    /// 1. Write data files to new snapshot directory
+    /// 2. Sync directory (this function) - ensures data is on disk
+    /// 3. Update catalog atomically - commits the transaction
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be synced.
+    async fn sync_snapshot_dir(snapshot_dir: &std::path::Path) -> CatalogResult<()> {
+        let snapshot_dir = snapshot_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            // Open the directory and call sync_all to flush metadata
+            let dir = std::fs::File::open(&snapshot_dir)
+                .map_err(|source| CatalogError::IoError { source })?;
+            dir.sync_all()
+                .map_err(|source| CatalogError::IoError { source })?;
+            Ok::<(), CatalogError>(())
+        })
+        .await
+        .map_err(|e| CatalogError::InvalidOperation {
+            message: "Directory sync task panicked".to_string(),
+            source: Box::new(e),
+        })?
     }
 
     /// Cleanup old snapshot directories after a full refresh.
@@ -368,18 +696,21 @@ impl CayenneTableProvider {
 
     /// Create a new Cayenne table provider.
     ///
+    /// For more configuration options, use [`CayenneTableProviderBuilder`].
+    ///
     /// # Errors
     ///
     /// Returns an error if the table cannot be found in the catalog or if the listing
     /// table cannot be created.
     pub async fn new(table_name: &str, catalog: Arc<dyn MetadataCatalog>) -> CatalogResult<Self> {
-        Self::new_with_retention(table_name, catalog, Vec::new()).await
+        CayenneTableProviderBuilder::new(catalog)
+            .open(table_name)
+            .await
     }
 
     /// Create a new table provider with explicit retention filters.
     ///
-    /// This is primarily used by the runtime when datasets specify `retention_sql`
-    /// so that deletion vectors are written before a refresh completes.
+    /// For more configuration options, use [`CayenneTableProviderBuilder`].
     ///
     /// # Errors
     ///
@@ -390,12 +721,34 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         retention_filters: Vec<Expr>,
     ) -> CatalogResult<Self> {
+        CayenneTableProviderBuilder::new(catalog)
+            .with_retention_filters(retention_filters)
+            .open(table_name)
+            .await
+    }
+
+    /// Internal constructor used by the builder.
+    async fn new_internal(
+        table_name: &str,
+        catalog: Arc<dyn MetadataCatalog>,
+        retention_filters: Vec<Expr>,
+        object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    ) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
 
-        // Construct path to current snapshot
+        if table_metadata.path.starts_with("s3://") && object_store_config.is_none() {
+            return Err(CatalogError::InvalidOperation {
+                message: format!(
+                    "Table {table_name} uses S3 storage but no object_store_config was provided"
+                ),
+                source: Box::new(std::io::Error::other("missing object store configuration")),
+            });
+        }
+
+        // Construct URL to current snapshot
         // Directory structure: [table_path]/[table_id]/[snapshot_id]/
         // All tables have a snapshot ID (created on table initialization)
-        let snapshot_dir = Self::snapshot_dir_path(
+        let snapshot_dir_url = Self::snapshot_dir_url(
             &table_metadata.path,
             table_metadata.table_id,
             &table_metadata.current_snapshot_id,
@@ -404,17 +757,92 @@ impl CayenneTableProvider {
         let vortex_config = table_metadata.vortex_config.clone();
 
         let listing_table = Self::create_listing_table(
-            &snapshot_dir,
+            &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
             &vortex_config,
         )?;
 
-        // Load deletion vectors once at initialization to avoid repeated SQLite queries on every scan
+        // Determine if this table has a primary key for key-based deletion
+        let has_primary_key = !table_metadata.primary_key.is_empty();
+
+        // Determine PK deletion strategy and build RowConverter if needed
+        let (pk_deletion_strategy, pk_row_converter, pk_column_indices) = if has_primary_key {
+            let schema = &table_metadata.schema;
+            let mut indices = Vec::with_capacity(table_metadata.primary_key.len());
+            let mut pk_fields = Vec::with_capacity(table_metadata.primary_key.len());
+
+            for pk_col in &table_metadata.primary_key {
+                let (idx, field) = schema.column_with_name(pk_col).ok_or_else(|| {
+                    CatalogError::InvalidOperation {
+                        message: format!(
+                            "Primary key column '{pk_col}' not found in schema for table {table_name}"
+                        ),
+                        source: Box::new(std::io::Error::other("missing primary key column")),
+                    }
+                })?;
+                indices.push(idx);
+                pk_fields.push(field.clone());
+            }
+
+            // Check if we can use the optimized Int64 PK strategy:
+            // - Single column primary key
+            // - Column type is Int64
+            if pk_fields.len() == 1
+                && *pk_fields[0].data_type() == arrow::datatypes::DataType::Int64
+            {
+                // Optimized path: single Int64 PK - no RowConverter needed
+                (PkDeletionStrategy::Int64Pk, None, indices)
+            } else {
+                // General path: composite or non-integer PK - use RowConverter
+                let sort_fields: Vec<SortField> = pk_fields
+                    .iter()
+                    .map(|f| SortField::new(f.data_type().clone()))
+                    .collect();
+
+                let row_converter =
+                    RowConverter::new(sort_fields).map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to create RowConverter for primary key columns"
+                            .to_string(),
+                        source: Box::new(e),
+                    })?;
+
+                (
+                    PkDeletionStrategy::RowConverterBased,
+                    Some(Arc::new(row_converter)),
+                    indices,
+                )
+            }
+        } else {
+            (PkDeletionStrategy::PositionBased, None, Vec::new())
+        };
+
+        // Load deletion vectors and insert records once at initialization
+        // to avoid repeated SQLite queries on every scan
         let table_id = table_metadata.table_id;
         let catalog_for_load = Arc::clone(&catalog);
-        let deleted_row_ids = Self::load_deletion_vectors(table_id, catalog_for_load).await?;
+        let (
+            deleted_row_ids,
+            deleted_pk_i64,
+            deleted_row_keys,
+            insert_records_pk_i64,
+            insert_records_row_keys,
+        ) = Self::load_deletion_vectors_all(table_id, catalog_for_load, pk_deletion_strategy)
+            .await?;
+
+        // Load protected snapshots from catalog.
+        // Protected snapshots are those with sequence > max_delete_sequence.
+        // They contain data written after deletions and should skip deletion filtering.
+        let protected_snapshots = Self::load_protected_snapshots(
+            Arc::clone(&catalog),
+            table_id,
+            &deleted_pk_i64,
+            &deleted_row_keys,
+            pk_deletion_strategy,
+        )
+        .await?;
 
         Ok(Self {
+            current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
             table_metadata,
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
@@ -422,11 +850,24 @@ impl CayenneTableProvider {
             vortex_config,
             // Wrap in Arc for zero-copy sharing across concurrent scans
             cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(deleted_row_ids))),
+            cached_deleted_pk_i64: Arc::new(RwLock::new(Arc::new(deleted_pk_i64))),
+            cached_deleted_row_keys: Arc::new(RwLock::new(Arc::new(deleted_row_keys))),
+            cached_insert_records_pk_i64: Arc::new(RwLock::new(Arc::new(insert_records_pk_i64))),
+            cached_insert_records_row_keys: Arc::new(RwLock::new(Arc::new(
+                insert_records_row_keys,
+            ))),
+            pk_deletion_strategy,
+            pk_row_converter,
+            pk_column_indices,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            object_store_config,
+            protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
         })
     }
 
     /// Create a new table in Cayenne.
+    ///
+    /// For more configuration options, use [`CayenneTableProviderBuilder`].
     ///
     /// # Errors
     ///
@@ -435,10 +876,14 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         options: CreateTableOptions,
     ) -> CatalogResult<Self> {
-        Self::create_table_with_retention(catalog, options, Vec::new()).await
+        CayenneTableProviderBuilder::new(catalog)
+            .create(options)
+            .await
     }
 
     /// Create a new table in Cayenne with retention filters applied to subsequent writes.
+    ///
+    /// For more configuration options, use [`CayenneTableProviderBuilder`].
     ///
     /// # Errors
     ///
@@ -448,8 +893,10 @@ impl CayenneTableProvider {
         options: CreateTableOptions,
         retention_filters: Vec<Expr>,
     ) -> CatalogResult<Self> {
-        let _table_id = catalog.create_table(options.clone()).await?;
-        Self::new_with_retention(&options.table_name, catalog, retention_filters).await
+        CayenneTableProviderBuilder::new(catalog)
+            .with_retention_filters(retention_filters)
+            .create(options)
+            .await
     }
 
     /// Get a reference to the catalog.
@@ -531,6 +978,66 @@ impl CayenneTableProvider {
         // and retention filters are applied atomically.
         let _write_guard = self.write_lock.lock().await;
 
+        // Check for pending deletions based on the deletion strategy.
+        // Position-based: Requires compaction - row IDs would conflict when new files are added
+        // PK-based (Int64Pk, RowConverterBased): Use anti-deletions to avoid compaction
+        let has_pending_deletions =
+            match self.pk_deletion_strategy {
+                PkDeletionStrategy::PositionBased => {
+                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "check position-based deletion cache".to_string(),
+                        }
+                    })?;
+                    !guard.is_empty()
+                }
+                PkDeletionStrategy::Int64Pk => {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "check Int64 PK deletion cache".to_string(),
+                        }
+                    })?;
+                    !guard.is_empty()
+                }
+                PkDeletionStrategy::RowConverterBased => {
+                    let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "check key-based deletion cache".to_string(),
+                        }
+                    })?;
+                    !guard.is_empty()
+                }
+            };
+
+        // For position-based strategy, we still need compaction because row IDs change
+        // when new files are added.
+        if has_pending_deletions && self.pk_deletion_strategy == PkDeletionStrategy::PositionBased {
+            tracing::info!(
+                "Table {} has pending position-based deletions, performing merge-insert with compaction",
+                self.table_metadata.table_name
+            );
+            return self.merge_insert_stream_with_compaction(stream).await;
+        }
+
+        // For PK-based strategies with pending deletions, we need to write to a NEW snapshot
+        // with a higher sequence number. This ensures proper Iceberg-style ordering:
+        // - Deletions apply to snapshots with sequence <= delete_sequence
+        // - New data in snapshots with sequence > delete_sequence is visible
+        if has_pending_deletions {
+            let new_sequence = self
+                .catalog
+                .increment_sequence_number(self.table_metadata.table_id)
+                .await?;
+            tracing::info!(
+                "Table {} has pending PK-based deletions, inserting to new snapshot with seq={}",
+                self.table_metadata.table_name,
+                new_sequence
+            );
+            return self
+                .insert_to_new_snapshot_with_sequence(stream, new_sequence)
+                .await;
+        }
+
         let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
 
         // If a primary key is configured, enforce on_conflict behavior by materializing
@@ -611,7 +1118,8 @@ impl CayenneTableProvider {
                 }
                 Err(err) => {
                     return Err(CatalogError::InvalidOperation {
-                        message: format!("Failed to apply retention filters after insert: {err}"),
+                        message: "Failed to apply retention filters after insert.".to_string(),
+                        source: Box::new(err),
                     });
                 }
             }
@@ -640,6 +1148,123 @@ impl CayenneTableProvider {
         Ok(total_rows)
     }
 
+    /// Insert data to a NEW snapshot with a specific sequence number.
+    ///
+    /// This is used when inserting while pending PK-based deletions exist.
+    /// By writing to a new snapshot with a higher sequence number, we ensure:
+    /// - Old data in previous snapshots is filtered by deletions (`delete_seq` >= `old_snapshot_seq`)
+    /// - New data in this snapshot is visible (`new_snapshot_seq` > `delete_seq`)
+    ///
+    /// This achieves Iceberg-style sequence ordering without rewriting existing files.
+    async fn insert_to_new_snapshot_with_sequence(
+        &self,
+        stream: SendableRecordBatchStream,
+        sequence_number: i64,
+    ) -> CatalogResult<u64> {
+        let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
+
+        // Generate a new snapshot ID
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+        // Write data to the new snapshot
+        let (total_rows, chunk_count) = self
+            .chunk_and_write_parallel_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
+            .await?;
+
+        tracing::debug!(
+            "Insert to new snapshot {} completed, wrote {} rows to Vortex in {} chunk(s)",
+            new_snapshot_id,
+            total_rows,
+            chunk_count
+        );
+
+        // Record the snapshot's sequence number in the catalog
+        self.catalog
+            .set_snapshot_sequence(
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+                sequence_number,
+            )
+            .await?;
+
+        // Get the maximum delete sequence from current deletions.
+        // This snapshot is protected from deletions with seq <= max_delete_seq.
+        let max_delete_seq = self.get_max_delete_sequence()?;
+
+        // Add to protected snapshots so scan applies only NEWER deletions (seq > max_delete_seq)
+        // We do NOT clear old protected snapshots because they may contain data that's still valid.
+        // Each protected snapshot applies its own partial deletion filter based on when it was created.
+        {
+            let mut guard =
+                self.protected_snapshots
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "add protected snapshot".to_string(),
+                    })?;
+            guard.insert(new_snapshot_id.clone(), max_delete_seq);
+        }
+
+        // The listing table stays as-is. Protected snapshots are handled at scan time.
+        // See the doc comment above for why we do NOT update current_snapshot.
+
+        Ok(total_rows)
+    }
+
+    /// Get the maximum delete sequence number from the cached deletions.
+    fn get_max_delete_sequence(&self) -> CatalogResult<i64> {
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                let guard =
+                    self.cached_deleted_pk_i64
+                        .read()
+                        .map_err(|_| CatalogError::LockPoisoned {
+                            operation: "read Int64 PK deletions for max sequence".to_string(),
+                        })?;
+                Ok(guard.values().max().copied().unwrap_or(0))
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                    CatalogError::LockPoisoned {
+                        operation: "read row key deletions for max sequence".to_string(),
+                    }
+                })?;
+                Ok(guard.values().max().copied().unwrap_or(0))
+            }
+            PkDeletionStrategy::PositionBased => Ok(0),
+        }
+    }
+
+    /// Create a `ListingTable` that reads from multiple directories.
+    #[expect(dead_code)]
+    fn create_multi_path_listing_table(
+        urls: &[&str],
+        schema: SchemaRef,
+        vortex_config: &crate::metadata::VortexConfig,
+    ) -> CatalogResult<Arc<ListingTable>> {
+        let listing_urls: Vec<ListingTableUrl> = urls
+            .iter()
+            .map(|url| {
+                ListingTableUrl::parse(url).map_err(|e| CatalogError::InvalidOperation {
+                    message: format!("Failed to parse listing table URL: {url}"),
+                    source: Box::new(e),
+                })
+            })
+            .collect::<CatalogResult<Vec<_>>>()?;
+
+        let listing_options = Self::create_listing_options(vortex_config);
+        let config = ListingTableConfig::new_with_multi_paths(listing_urls)
+            .with_listing_options(listing_options)
+            .with_schema(schema);
+
+        let listing_table =
+            ListingTable::try_new(config).map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to create multi-path listing table".to_string(),
+                source: Box::new(e),
+            })?;
+
+        Ok(Arc::new(listing_table))
+    }
+
     /// Process stream in chunks and write them in parallel with bounded concurrency.
     ///
     /// This method optimizes throughput by:
@@ -656,16 +1281,38 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if any chunk write fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Progress tracking for S3 Express uploads adds necessary complexity"
+    )]
     async fn chunk_and_write_parallel(
         &self,
         mut stream: SendableRecordBatchStream,
         target_size_bytes: usize,
     ) -> CatalogResult<(u64, usize)> {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::time::Instant;
         use tokio::sync::Semaphore;
 
         // Bounded parallelism: max 4 concurrent writes to avoid overwhelming I/O
         let semaphore = Arc::new(Semaphore::new(4));
+
+        // Progress tracking for S3 Express uploads
+        let is_s3_storage = self.table_metadata.path.starts_with("s3://");
+        let start_time = Instant::now();
+        let last_progress_ms = Arc::new(AtomicU64::new(0));
+        let total_bytes_written = Arc::new(AtomicUsize::new(0));
+        let files_written = Arc::new(AtomicUsize::new(0));
         let mut write_tasks = tokio::task::JoinSet::new();
+
+        // Log when starting S3 upload process
+        if is_s3_storage {
+            tracing::info!(
+                "Starting S3 upload for table {} (target chunk size: {})",
+                self.table_metadata.table_name,
+                format_bytes(target_size_bytes)
+            );
+        }
 
         // Pre-allocate chunk vector with estimated capacity
         // Estimate: average batch ~8MB, so reserve for a few batches per chunk
@@ -677,7 +1324,8 @@ impl CayenneTableProvider {
 
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result.map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to read batch from stream: {e}"),
+                message: "Failed to read batch from stream.".to_string(),
+                source: Box::new(e),
             })?;
 
             let batch_size = batch.get_array_memory_size();
@@ -687,7 +1335,8 @@ impl CayenneTableProvider {
                 // Acquire semaphore permit before spawning write task
                 let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
                     CatalogError::InvalidOperation {
-                        message: format!("Failed to acquire write permit: {e}"),
+                        message: "Failed to acquire write permit.".to_string(),
+                        source: Box::new(e),
                     }
                 })?;
 
@@ -696,13 +1345,66 @@ impl CayenneTableProvider {
                     &mut current_chunk,
                     Vec::with_capacity(estimated_batches_per_chunk),
                 );
+                let chunk_size = current_size;
                 current_size = 0;
                 chunk_count += 1;
 
-                // Clone self for the async task
+                // Clone self and progress trackers for the async task
                 let self_clone = self.clone_for_write();
+                let total_bytes = Arc::clone(&total_bytes_written);
+                let files_count = Arc::clone(&files_written);
+                let progress_time = Arc::clone(&last_progress_ms);
+                let is_s3 = is_s3_storage;
+                let table_name = self.table_metadata.table_name.clone();
+                let start = start_time;
+                let current_chunk_num = chunk_count;
+
+                // Log when starting a chunk upload (before the slow I/O operation)
+                if is_s3 {
+                    tracing::info!(
+                        "Starting S3 upload for {} chunk {} ({})...",
+                        table_name,
+                        current_chunk_num,
+                        format_bytes(chunk_size)
+                    );
+                }
+
                 write_tasks.spawn(async move {
                     let result = self_clone.write_chunk(chunk_to_write).await;
+
+                    // Track progress for S3 uploads
+                    if is_s3 {
+                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
+                        let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        // Log progress every 10 seconds or when a file completes
+                        let elapsed = start.elapsed();
+                        // Use saturating conversion since elapsed time in real usage won't exceed u64::MAX milliseconds
+                        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                        let last_logged = progress_time.load(Ordering::Relaxed);
+                        let should_log =
+                            elapsed_ms.saturating_sub(last_logged) >= 10_000 || result.is_ok();
+                        if should_log {
+                            let bytes_so_far = total_bytes.load(Ordering::Relaxed);
+                            let throughput = if elapsed.as_secs_f64() > 0.0 {
+                                #[expect(clippy::cast_precision_loss)]
+                                let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
+                                format_bytes_per_sec(bytes_per_sec)
+                            } else {
+                                "calculating...".to_string()
+                            };
+                            tracing::info!(
+                                "S3 upload for {}: {} files completed ({}) in {:.1}s, {}",
+                                table_name,
+                                file_num,
+                                format_bytes(bytes_so_far),
+                                elapsed.as_secs_f64(),
+                                throughput
+                            );
+                            progress_time.store(elapsed_ms, Ordering::Relaxed);
+                        }
+                    }
+
                     drop(permit); // Release permit after write completes
                     result
                 });
@@ -716,15 +1418,28 @@ impl CayenneTableProvider {
         if !current_chunk.is_empty() {
             let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
                 CatalogError::InvalidOperation {
-                    message: format!("Failed to acquire write permit for final chunk: {e}"),
+                    message: "Failed to acquire write permit for final chunk.".to_string(),
+                    source: Box::new(e),
                 }
             })?;
 
             chunk_count += 1;
+            let final_chunk_size = current_size;
 
             let self_clone = self.clone_for_write();
+            let total_bytes = Arc::clone(&total_bytes_written);
+            let files_count = Arc::clone(&files_written);
+            let is_s3 = is_s3_storage;
+
             write_tasks.spawn(async move {
                 let result = self_clone.write_chunk(current_chunk).await;
+
+                // Track final chunk for S3 uploads
+                if is_s3 {
+                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
+                    files_count.fetch_add(1, Ordering::Relaxed);
+                }
+
                 drop(permit);
                 result
             });
@@ -733,12 +1448,312 @@ impl CayenneTableProvider {
         // Wait for all writes to complete and collect row counts
         while let Some(result) = write_tasks.join_next().await {
             let row_count = result.map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Write task panicked: {e}"),
+                message: "Write task panicked.".to_string(),
+                source: Box::new(e),
             })??;
             total_rows += row_count;
         }
 
+        // Log final summary for S3 Express uploads
+        if is_s3_storage {
+            let elapsed = start_time.elapsed();
+            let total_bytes = total_bytes_written.load(Ordering::Relaxed);
+            let files_count = files_written.load(Ordering::Relaxed);
+            let throughput = if elapsed.as_secs_f64() > 0.0 {
+                #[expect(clippy::cast_precision_loss)]
+                let bytes_per_sec = total_bytes as f64 / elapsed.as_secs_f64();
+                format_bytes_per_sec(bytes_per_sec)
+            } else {
+                "N/A".to_string()
+            };
+            tracing::info!(
+                "Completed S3 upload for {}: {} rows in {} files ({}) in {:.1}s, {}",
+                self.table_metadata.table_name,
+                total_rows,
+                files_count,
+                format_bytes(total_bytes),
+                elapsed.as_secs_f64(),
+                throughput
+            );
+        }
+
         Ok((total_rows, chunk_count))
+    }
+
+    /// Write a stream of record batches to a specific snapshot directory, chunking into
+    /// parallel writes for efficiency.
+    ///
+    /// This is similar to `chunk_and_write_parallel` but writes to a specified snapshot
+    /// directory rather than the current listing table's location. This is used during
+    /// compaction operations where data needs to be written to a new snapshot.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream` - The stream of record batches to write
+    /// * `target_size_bytes` - Target size for each output file in bytes
+    /// * `snapshot_id` - The snapshot ID to write to
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (total rows written, number of files written)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write operation fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Parallel chunked writing requires orchestration logic"
+    )]
+    async fn chunk_and_write_parallel_to_snapshot(
+        &self,
+        mut stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        snapshot_id: &str,
+    ) -> CatalogResult<(u64, usize)> {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::time::Instant;
+        use tokio::sync::Semaphore;
+
+        // Construct snapshot directory URL
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            snapshot_id,
+        );
+
+        // Create a new ListingTable pointing to the snapshot directory
+        let snapshot_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            &self.vortex_config,
+        )?;
+
+        // Bounded parallelism: max 4 concurrent writes to avoid overwhelming I/O
+        let semaphore = Arc::new(Semaphore::new(4));
+
+        // Progress tracking for S3 Express uploads
+        let is_s3_storage = self.table_metadata.path.starts_with("s3://");
+        let start_time = Instant::now();
+        let last_progress_ms = Arc::new(AtomicU64::new(0));
+        let total_bytes_written = Arc::new(AtomicUsize::new(0));
+        let files_written = Arc::new(AtomicUsize::new(0));
+        let mut write_tasks = tokio::task::JoinSet::new();
+
+        // Log when starting S3 upload process
+        if is_s3_storage {
+            tracing::info!(
+                "Starting S3 upload to snapshot {} for table {} (target chunk size: {})",
+                snapshot_id,
+                self.table_metadata.table_name,
+                format_bytes(target_size_bytes)
+            );
+        }
+
+        // Pre-allocate chunk vector with estimated capacity
+        let estimated_batches_per_chunk = (target_size_bytes / (8 * 1024 * 1024)).max(1);
+        let mut current_chunk = Vec::with_capacity(estimated_batches_per_chunk);
+        let mut current_size = 0usize;
+        let mut total_rows = 0u64;
+        let mut chunk_count = 0usize;
+
+        let snapshot_listing_table = Arc::new(snapshot_listing_table);
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to read batch from stream.".to_string(),
+                source: Box::new(e),
+            })?;
+
+            let batch_size = batch.get_array_memory_size();
+
+            // If adding this batch would exceed target size and we have data, write current chunk
+            if current_size + batch_size > target_size_bytes && !current_chunk.is_empty() {
+                let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
+                    CatalogError::InvalidOperation {
+                        message: "Failed to acquire write permit.".to_string(),
+                        source: Box::new(e),
+                    }
+                })?;
+
+                let chunk_to_write = std::mem::replace(
+                    &mut current_chunk,
+                    Vec::with_capacity(estimated_batches_per_chunk),
+                );
+                let chunk_size = current_size;
+                current_size = 0;
+                chunk_count += 1;
+
+                let listing_table_clone = Arc::clone(&snapshot_listing_table);
+                let total_bytes = Arc::clone(&total_bytes_written);
+                let files_count = Arc::clone(&files_written);
+                let progress_time = Arc::clone(&last_progress_ms);
+                let is_s3 = is_s3_storage;
+                let table_name = self.table_metadata.table_name.clone();
+                let start = start_time;
+                let current_chunk_num = chunk_count;
+
+                if is_s3 {
+                    tracing::info!(
+                        "Starting S3 upload for {} chunk {} ({})...",
+                        table_name,
+                        current_chunk_num,
+                        format_bytes(chunk_size)
+                    );
+                }
+
+                write_tasks.spawn(async move {
+                    let result =
+                        Self::write_chunk_to_listing_table(&listing_table_clone, chunk_to_write)
+                            .await;
+
+                    if is_s3 {
+                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
+                        let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                        let elapsed = start.elapsed();
+                        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                        let last_logged = progress_time.load(Ordering::Relaxed);
+                        let should_log =
+                            elapsed_ms.saturating_sub(last_logged) >= 10_000 || result.is_ok();
+                        if should_log {
+                            let bytes_so_far = total_bytes.load(Ordering::Relaxed);
+                            let throughput = if elapsed.as_secs_f64() > 0.0 {
+                                #[expect(clippy::cast_precision_loss)]
+                                let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
+                                format_bytes_per_sec(bytes_per_sec)
+                            } else {
+                                "calculating...".to_string()
+                            };
+                            tracing::info!(
+                                "S3 upload for {}: {} files completed ({}) in {:.1}s, {}",
+                                table_name,
+                                file_num,
+                                format_bytes(bytes_so_far),
+                                elapsed.as_secs_f64(),
+                                throughput
+                            );
+                            progress_time.store(elapsed_ms, Ordering::Relaxed);
+                        }
+                    }
+
+                    drop(permit);
+                    result
+                });
+            }
+
+            current_size += batch_size;
+            current_chunk.push(batch);
+        }
+
+        // Write final chunk if non-empty
+        if !current_chunk.is_empty() {
+            let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
+                CatalogError::InvalidOperation {
+                    message: "Failed to acquire write permit for final chunk.".to_string(),
+                    source: Box::new(e),
+                }
+            })?;
+
+            chunk_count += 1;
+            let final_chunk_size = current_size;
+
+            let listing_table_clone = Arc::clone(&snapshot_listing_table);
+            let total_bytes = Arc::clone(&total_bytes_written);
+            let files_count = Arc::clone(&files_written);
+            let is_s3 = is_s3_storage;
+
+            write_tasks.spawn(async move {
+                let result =
+                    Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk).await;
+
+                if is_s3 {
+                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
+                    files_count.fetch_add(1, Ordering::Relaxed);
+                }
+
+                drop(permit);
+                result
+            });
+        }
+
+        // Wait for all writes to complete and collect row counts
+        while let Some(result) = write_tasks.join_next().await {
+            let row_count = result.map_err(|e| CatalogError::InvalidOperation {
+                message: "Write task panicked.".to_string(),
+                source: Box::new(e),
+            })??;
+            total_rows += row_count;
+        }
+
+        // Log final summary for S3 Express uploads
+        if is_s3_storage {
+            let elapsed = start_time.elapsed();
+            let total_bytes = total_bytes_written.load(Ordering::Relaxed);
+            let files_count = files_written.load(Ordering::Relaxed);
+            let throughput = if elapsed.as_secs_f64() > 0.0 {
+                #[expect(clippy::cast_precision_loss)]
+                let bytes_per_sec = total_bytes as f64 / elapsed.as_secs_f64();
+                format_bytes_per_sec(bytes_per_sec)
+            } else {
+                "N/A".to_string()
+            };
+            tracing::info!(
+                "Completed S3 upload for {} to snapshot {}: {} rows in {} files ({}) in {:.1}s, {}",
+                self.table_metadata.table_name,
+                snapshot_id,
+                total_rows,
+                files_count,
+                format_bytes(total_bytes),
+                elapsed.as_secs_f64(),
+                throughput
+            );
+        }
+
+        Ok((total_rows, chunk_count))
+    }
+
+    /// Write a chunk of record batches to a specific `ListingTable`.
+    ///
+    /// This is a static helper method for `chunk_and_write_parallel_to_snapshot`.
+    async fn write_chunk_to_listing_table(
+        listing_table: &ListingTable,
+        chunk: Vec<RecordBatch>,
+    ) -> CatalogResult<u64> {
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = chunk[0].schema();
+        let row_count: u64 = chunk.iter().map(|b| b.num_rows() as u64).sum();
+
+        // Create a stream from the chunk batches
+        let batch_stream = futures::stream::iter(chunk.into_iter().map(Ok));
+        let chunk_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
+
+        let stream_exec = Arc::new(StreamingExec::new(
+            Arc::clone(&schema),
+            Box::pin(chunk_stream),
+        ));
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let insert_plan = listing_table
+            .insert_into(&state, stream_exec, InsertOp::Append)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to create insert plan for chunk.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        collect(insert_plan, state.task_ctx()).await.map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: "Failed to execute insert for chunk.".to_string(),
+                source: Box::new(e),
+            }
+        })?;
+
+        Ok(row_count)
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -769,7 +1784,17 @@ impl CayenneTableProvider {
             vortex_config: self.vortex_config.clone(),
             retention_filters: Vec::new(), // Applied once after all chunks complete, not per-chunk
             cached_deleted_row_ids: Arc::clone(&self.cached_deleted_row_ids),
+            cached_deleted_pk_i64: Arc::clone(&self.cached_deleted_pk_i64),
+            cached_deleted_row_keys: Arc::clone(&self.cached_deleted_row_keys),
+            cached_insert_records_pk_i64: Arc::clone(&self.cached_insert_records_pk_i64),
+            cached_insert_records_row_keys: Arc::clone(&self.cached_insert_records_row_keys),
+            pk_deletion_strategy: self.pk_deletion_strategy,
+            pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
+            pk_column_indices: self.pk_column_indices.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
+            object_store_config: self.object_store_config.clone(),
+            current_snapshot_id: Arc::clone(&self.current_snapshot_id),
+            protected_snapshots: Arc::clone(&self.protected_snapshots),
         }
     }
 
@@ -1276,7 +2301,8 @@ impl CayenneTableProvider {
         let sorted_stream =
             util::stream_utils::sort_stream(stream, &self.vortex_config.sort_columns, &task_ctx)
                 .map_err(|e| CatalogError::InvalidOperation {
-                    message: format!("Failed to execute sort: {e}"),
+                    message: "Failed to execute sort.".to_string(),
+                    source: Box::new(e),
                 })?;
 
         Ok(sorted_stream)
@@ -1314,11 +2340,12 @@ impl CayenneTableProvider {
         };
 
         // Create a session context and scan the listing table to get all data
-        let ctx = SessionContext::new();
+        let ctx = self.create_session_context();
         let df = ctx
             .read_table(listing_table)
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to read listing table for sorting: {e}"),
+                message: "Failed to read listing table for sorting.".to_string(),
+                source: Box::new(e),
             })?;
 
         // Get the data as a stream
@@ -1326,20 +2353,34 @@ impl CayenneTableProvider {
             .execute_stream()
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to get stream from listing table: {e}"),
+                message: "Failed to get stream from listing table.".to_string(),
+                source: Box::new(e),
             })?;
 
         // Sort the stream using our existing sort logic
         let sorted_stream = self.sort_stream(stream)?;
 
         // Delete all existing Vortex files in the snapshot directory before rewriting
-        let snapshot_dir = Self::snapshot_dir_path(
-            &self.table_metadata.path,
-            self.table_metadata.table_id,
-            &self.table_metadata.current_snapshot_id,
-        );
+        // Note: For S3 paths, we skip deletion and let new files coexist (may need future cleanup)
+        let is_s3_path = self.table_metadata.path.starts_with("s3://");
+        let current_snapshot = self.get_current_snapshot_id()?;
 
-        self.delete_snapshot_files(&snapshot_dir).await?;
+        if is_s3_path {
+            if let Some(prefix) = self.snapshot_object_store_prefix(&current_snapshot)? {
+                self.delete_prefix_with_object_store(&prefix).await?;
+            } else {
+                tracing::warn!(
+                    "S3 path detected but no object store prefix could be derived for sorted rewrite cleanup"
+                );
+            }
+        } else {
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &current_snapshot,
+            );
+            self.delete_snapshot_files(&snapshot_dir).await?;
+        }
 
         // Write the sorted data back in chunks
         let (total_rows, chunk_count) = self
@@ -1395,6 +2436,24 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Create a `SessionContext` for data operations, registering object store if configured.
+    fn create_session_context(&self) -> SessionContext {
+        let ctx = SessionContext::new();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+
+        // Register object store if configured for remote storage (e.g., S3 Express One Zone)
+        if let Some(ref config) = self.object_store_config {
+            Self::register_object_store_if_needed(&ctx.runtime_env(), config);
+        } else if is_s3 {
+            tracing::warn!(
+                "Creating SessionContext for S3 table {} but no object_store_config!",
+                self.table_metadata.table_name
+            );
+        }
+
+        ctx
+    }
+
     /// Write a single chunk of record batches as a Vortex file.
     ///
     /// # Errors
@@ -1417,8 +2476,8 @@ impl CayenneTableProvider {
             Box::pin(chunk_stream),
         ));
 
-        // Create a session context for executing the insert
-        let ctx = SessionContext::new();
+        // Create a session context for executing the insert (with object store if needed)
+        let ctx = self.create_session_context();
         let state = ctx.state();
 
         // Delegate to ListingTable's insert_into to write Vortex files
@@ -1436,13 +2495,15 @@ impl CayenneTableProvider {
             .insert_into(&state, stream_exec, InsertOp::Append)
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to create insert plan for chunk: {e}"),
+                message: "Failed to create insert plan for chunk.".to_string(),
+                source: Box::new(e),
             })?;
 
         // Execute the insert plan
         collect(insert_plan, state.task_ctx()).await.map_err(|e| {
             CatalogError::InvalidOperation {
-                message: format!("Failed to execute insert for chunk: {e}"),
+                message: "Failed to execute insert for chunk.".to_string(),
+                source: Box::new(e),
             }
         })?;
 
@@ -1466,13 +2527,20 @@ impl CayenneTableProvider {
             Arc::clone(&self.table_metadata.schema),
             &filters,
             Arc::clone(&self.cached_deleted_row_ids),
+            Arc::clone(&self.cached_deleted_pk_i64),
+            Arc::clone(&self.cached_deleted_row_keys),
+            self.pk_deletion_strategy,
+            self.pk_row_converter.as_ref().map(Arc::clone),
+            self.pk_column_indices.clone(),
+            Vec::new(), // Retention filters don't need to scan protected snapshots
         );
 
         let deleted_count =
             sink.delete_from()
                 .await
                 .map_err(|err| CatalogError::InvalidOperation {
-                    message: format!("Failed to execute retention filters: {err}"),
+                    message: "Failed to execute retention filters.".to_string(),
+                    source: err,
                 })?;
 
         // Refresh deletion cache after applying retention filters
@@ -1517,6 +2585,366 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Process incoming batches and add insert records for PKs that are being re-inserted.
+    ///
+    /// This method implements upsert semantics using sequence-based ordering:
+    /// 1. Collects all incoming batches
+    /// 2. Gets a new sequence number from the catalog
+    /// 3. Extracts PKs from the data
+    /// 4. For PKs that are in the deletion set, adds insert records with the new sequence
+    /// 5. Returns a stream of the batches for normal insert processing
+    ///
+    /// Insert records are stored in the catalog and cached in memory. During scan,
+    /// a row is deleted only if its PK is in the deletion set AND (not in `insert_records`
+    /// OR `insert_seq` < `delete_seq`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if processing fails.
+    ///
+    /// NOTE: Currently unused because we use compaction for all strategies when there
+    /// are pending deletions. Kept for potential future optimization with per-file
+    /// sequence tracking.
+    #[expect(dead_code)]
+    async fn add_insert_records_for_incoming_pks(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> CatalogResult<SendableRecordBatchStream> {
+        use futures::TryStreamExt;
+
+        // Collect all batches from the stream
+        let batches: Vec<RecordBatch> =
+            stream
+                .try_collect()
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to collect batches for insert record processing".to_string(),
+                    source: Box::new(e),
+                })?;
+
+        if batches.is_empty() {
+            let schema = Arc::clone(&self.table_metadata.schema);
+            let empty_stream: futures::stream::Iter<
+                std::vec::IntoIter<datafusion_common::Result<RecordBatch>>,
+            > = futures::stream::iter(Vec::new());
+            return Ok(Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    schema,
+                    empty_stream,
+                ),
+            ));
+        }
+
+        // Get a new sequence number for this insert operation
+        let insert_sequence = self
+            .catalog
+            .increment_sequence_number(self.table_metadata.table_id)
+            .await?;
+
+        // Extract PKs and add insert records based on strategy
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                self.add_insert_records_int64(&batches, insert_sequence)
+                    .await?;
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                self.add_insert_records_row_converter(&batches, insert_sequence)
+                    .await?;
+            }
+            PkDeletionStrategy::PositionBased => {
+                // Should not reach here - position-based uses compaction
+                unreachable!("Position-based strategy should use compaction, not insert records");
+            }
+        }
+
+        // Return the batches as a stream for normal insert processing
+        let schema = Arc::clone(&self.table_metadata.schema);
+        let batch_results: Vec<datafusion_common::Result<RecordBatch>> =
+            batches.into_iter().map(Ok).collect();
+        let batch_stream = futures::stream::iter(batch_results);
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batch_stream),
+        ))
+    }
+
+    /// Add insert records for Int64 PK strategy.
+    ///
+    /// Extracts ALL Int64 PKs from incoming batches and adds insert records with the current
+    /// sequence number. This is required for sequence-based ordering where we need to know
+    /// when each PK was inserted to compare against deletion sequences.
+    async fn add_insert_records_int64(
+        &self,
+        batches: &[RecordBatch],
+        insert_sequence: i64,
+    ) -> CatalogResult<()> {
+        use arrow::array::Int64Array;
+
+        let pk_column_index =
+            *self
+                .pk_column_indices
+                .first()
+                .ok_or_else(|| CatalogError::InvalidOperation {
+                    message: "Int64 PK strategy requires exactly one PK column index".to_string(),
+                    source: Box::new(std::io::Error::other("missing pk column")),
+                })?;
+
+        // Extract ALL PKs from incoming batches
+        let mut pks_to_record: Vec<i64> = Vec::new();
+
+        for batch in batches {
+            let pk_column = batch.column(pk_column_index);
+            let pk_array = pk_column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| CatalogError::InvalidOperation {
+                    message: "Failed to downcast PK column to Int64Array".to_string(),
+                    source: Box::new(std::io::Error::other("invalid pk type")),
+                })?;
+
+            for value in pk_array.values() {
+                pks_to_record.push(*value);
+            }
+        }
+
+        if pks_to_record.is_empty() {
+            tracing::debug!(
+                "No PKs in incoming data for table {}",
+                self.table_metadata.table_name
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Adding {} insert records (seq={}) for table {} (Int64 PK strategy)",
+            pks_to_record.len(),
+            insert_sequence,
+            self.table_metadata.table_name
+        );
+
+        // Convert to bytes for catalog storage
+        let pk_bytes_list: Vec<Vec<u8>> = pks_to_record
+            .iter()
+            .map(|pk| pk.to_be_bytes().to_vec())
+            .collect();
+
+        // Add to catalog with sequence number
+        self.catalog
+            .add_insert_records_batch(self.table_metadata.table_id, pk_bytes_list, insert_sequence)
+            .await?;
+
+        // Update in-memory cache
+        {
+            let mut guard = self.cached_insert_records_pk_i64.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "update Int64 insert records cache".to_string(),
+                }
+            })?;
+            let mut new_map = (**guard).clone();
+            for pk in pks_to_record {
+                new_map.insert(pk, insert_sequence);
+            }
+            *guard = Arc::new(new_map);
+        }
+
+        Ok(())
+    }
+
+    /// Add insert records for `RowConverter`-based PK strategy.
+    ///
+    /// Converts ALL PK columns to byte representation and adds insert records with the current
+    /// sequence number. This is required for sequence-based ordering where we need to know
+    /// when each PK was inserted to compare against deletion sequences.
+    async fn add_insert_records_row_converter(
+        &self,
+        batches: &[RecordBatch],
+        insert_sequence: i64,
+    ) -> CatalogResult<()> {
+        let row_converter =
+            self.pk_row_converter
+                .as_ref()
+                .ok_or_else(|| CatalogError::InvalidOperation {
+                    message: "RowConverter not available for RowConverterBased strategy"
+                        .to_string(),
+                    source: Box::new(std::io::Error::other("missing row converter")),
+                })?;
+
+        // Extract ALL PKs from incoming batches
+        let mut keys_to_record: Vec<Box<[u8]>> = Vec::new();
+
+        for batch in batches {
+            // Extract PK columns
+            let pk_columns: Vec<ArrayRef> = self
+                .pk_column_indices
+                .iter()
+                .map(|&idx| Arc::clone(batch.column(idx)))
+                .collect();
+
+            // Convert to row format
+            let rows = row_converter.convert_columns(&pk_columns).map_err(|e| {
+                CatalogError::InvalidOperation {
+                    message: "Failed to convert PK columns to row format".to_string(),
+                    source: Box::new(e),
+                }
+            })?;
+
+            for row in &rows {
+                let key: Box<[u8]> = row.as_ref().into();
+                keys_to_record.push(key);
+            }
+        }
+
+        if keys_to_record.is_empty() {
+            tracing::debug!(
+                "No PKs in incoming data for table {}",
+                self.table_metadata.table_name
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Adding {} insert records (seq={}) for table {} (RowConverter strategy)",
+            keys_to_record.len(),
+            insert_sequence,
+            self.table_metadata.table_name
+        );
+
+        // Convert to Vec<Vec<u8>> for catalog storage
+        let pk_bytes_list: Vec<Vec<u8>> = keys_to_record.iter().map(|k| k.to_vec()).collect();
+
+        // Add to catalog with sequence number
+        self.catalog
+            .add_insert_records_batch(self.table_metadata.table_id, pk_bytes_list, insert_sequence)
+            .await?;
+
+        // Update in-memory cache
+        {
+            let mut guard = self.cached_insert_records_row_keys.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "update key-based insert records cache".to_string(),
+                }
+            })?;
+            let mut new_map = (**guard).clone();
+            for key in keys_to_record {
+                new_map.insert(key, insert_sequence);
+            }
+            *guard = Arc::new(new_map);
+        }
+
+        Ok(())
+    }
+
+    /// Clear all cached deletion vectors and insert records.
+    ///
+    /// This should be called after compaction operations that have applied all deletions
+    /// and written a clean snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any cache lock is poisoned.
+    fn clear_all_deletion_caches(&self) -> CatalogResult<()> {
+        // Clear position-based cache
+        {
+            let mut guard =
+                self.cached_deleted_row_ids
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "clear position-based deletion cache".to_string(),
+                    })?;
+            *guard = Arc::new(roaring::RoaringBitmap::new());
+        }
+
+        // Clear Int64 PK cache
+        {
+            let mut guard =
+                self.cached_deleted_pk_i64
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "clear Int64 PK deletion cache".to_string(),
+                    })?;
+            *guard = Arc::new(HashMap::new());
+        }
+
+        // Clear key-based cache
+        {
+            let mut guard =
+                self.cached_deleted_row_keys
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "clear key-based deletion cache".to_string(),
+                    })?;
+            *guard = Arc::new(HashMap::new());
+        }
+
+        // Clear Int64 insert records cache
+        {
+            let mut guard = self.cached_insert_records_pk_i64.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "clear Int64 insert records cache".to_string(),
+                }
+            })?;
+            *guard = Arc::new(HashMap::new());
+        }
+
+        // Clear key-based insert records cache
+        {
+            let mut guard = self.cached_insert_records_row_keys.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "clear key-based insert records cache".to_string(),
+                }
+            })?;
+            *guard = Arc::new(HashMap::new());
+        }
+
+        tracing::debug!(
+            "Cleared all deletion and insert records caches for table {}",
+            self.table_metadata.table_name
+        );
+
+        Ok(())
+    }
+
+    /// Get the current snapshot ID.
+    ///
+    /// This returns the live snapshot ID which may differ from `table_metadata.current_snapshot_id`
+    /// after compaction operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned.
+    fn get_current_snapshot_id(&self) -> CatalogResult<String> {
+        let guard = self
+            .current_snapshot_id
+            .read()
+            .map_err(|_| CatalogError::LockPoisoned {
+                operation: "read current snapshot id".to_string(),
+            })?;
+        Ok(guard.clone())
+    }
+
+    /// Update the current snapshot ID after a compaction operation.
+    ///
+    /// This must be called after `commit_compaction` to keep the in-memory snapshot ID
+    /// in sync with the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is poisoned.
+    fn update_current_snapshot_id(&self, new_snapshot_id: &str) -> CatalogResult<()> {
+        let mut guard =
+            self.current_snapshot_id
+                .write()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "update current snapshot id".to_string(),
+                })?;
+        *guard = new_snapshot_id.to_string();
+        tracing::debug!(
+            "Updated current snapshot ID for table {} to {}",
+            self.table_metadata.table_name,
+            new_snapshot_id
+        );
+        Ok(())
+    }
+
     /// Delete rows matching the given primary key values.
     ///
     /// # Errors
@@ -1529,9 +2957,553 @@ impl CayenneTableProvider {
         // 3. Write deletion vector files
         // 4. Add delete file entries to catalog
         // 5. Return number of rows deleted
-        Err(CatalogError::InvalidOperation {
-            message: "Delete not yet implemented".to_string(),
+        Err(CatalogError::NotImplemented {
+            function: "delete_by_primary_key".to_string(),
         })
+    }
+
+    /// Perform a merge-insert: read existing data with deletion filter, combine with new data,
+    /// and write to a new snapshot. This is used when there are pending deletions to ensure
+    /// deletions are applied before new data is added.
+    ///
+    /// Supports all deletion strategies:
+    /// - Position-based: Prevents row ID conflicts when new files are added
+    /// - Key-based (Int64 PK and RowConverter): Prevents new rows from being incorrectly filtered
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - The session state for query execution
+    /// * `new_input` - The execution plan for new data to insert
+    ///
+    /// # Returns
+    ///
+    /// An execution plan that writes the merged data to a new snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the merge-insert operation fails.
+    async fn merge_insert_with_compaction(
+        &self,
+        state: &dyn Session,
+        new_input: Arc<dyn ExecutionPlan>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        use super::delete::{
+            DeletionFilterExec, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
+        };
+        use datafusion_physical_plan::union::UnionExec;
+
+        // Get the existing listing table
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
+            })?;
+            Arc::clone(&guard)
+        };
+
+        // Create a new session context for the scan
+        let ctx = SessionContext::new();
+
+        // Scan existing data with deletion filter applied
+        let existing_scan = listing_table.scan(&ctx.state(), None, &[], None).await?;
+
+        // Apply the appropriate deletion filter based on strategy
+        let filtered_existing: Arc<dyn ExecutionPlan> = match self.pk_deletion_strategy {
+            PkDeletionStrategy::PositionBased => {
+                let deleted_row_ids = {
+                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                Arc::new(DeletionFilterExec::new(existing_scan, deleted_row_ids))
+            }
+            PkDeletionStrategy::Int64Pk => {
+                let deleted_pk_values = {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let insert_records_pk_values = {
+                    let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let pk_column_index = self.pk_column_indices.first().copied().ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal(
+                        "Int64 PK strategy requires exactly one PK column index".to_string(),
+                    )
+                })?;
+                Arc::new(Int64PkDeletionFilterExec::new(
+                    existing_scan,
+                    deleted_pk_values,
+                    insert_records_pk_values,
+                    pk_column_index,
+                ))
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                let deleted_row_keys = {
+                    let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let insert_records_row_keys = {
+                    let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let row_converter = self.pk_row_converter.as_ref().ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal(
+                        "RowConverter not available for RowConverterBased strategy".to_string(),
+                    )
+                })?;
+                Arc::new(KeyBasedDeletionFilterExec::new(
+                    existing_scan,
+                    deleted_row_keys,
+                    insert_records_row_keys,
+                    self.pk_column_indices.clone(),
+                    Arc::clone(row_converter),
+                ))
+            }
+        };
+
+        // Union the filtered existing data with new input
+        let union_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(UnionExec::new(vec![filtered_existing, new_input]));
+
+        // Generate a new snapshot ID
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+        // Construct snapshot directory URL
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &new_snapshot_id,
+        );
+
+        // For local paths, ensure the directory exists
+        if !self.table_metadata.path.starts_with("s3://") {
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+            );
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
+
+        // Create a new ListingTable pointing to the snapshot directory
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            &self.vortex_config,
+        )
+        .map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to create listing table for compaction snapshot: {e}"
+            ))
+        })?;
+
+        // Perform the insert using the new listing table with append mode
+        let result = new_listing_table
+            .insert_into(state, union_plan, InsertOp::Append)
+            .await?;
+
+        // Sync the snapshot directory to ensure all data is durably written.
+        // This is critical for ACID durability - we must ensure data files are
+        // on disk before updating the catalog metadata.
+        if !self.table_metadata.path.starts_with("s3://") {
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+            );
+            Self::sync_snapshot_dir(&snapshot_dir).await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to sync snapshot directory for durability: {e}"
+                ))
+            })?;
+        }
+
+        // Atomically update the catalog snapshot and clear delete files.
+        // This is the commit point for the compaction operation - both changes
+        // happen together or not at all, ensuring ACID compliance.
+        self.catalog
+            .commit_compaction(self.table_metadata.table_id, &new_snapshot_id)
+            .await
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to commit compaction: {e}"
+                ))
+            })?;
+
+        // Update the in-memory snapshot ID to match the new catalog state
+        self.update_current_snapshot_id(&new_snapshot_id)
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to update current snapshot ID: {e}"
+                ))
+            })?;
+
+        // Clear the in-memory cached deletion vectors since they've been applied
+        self.clear_all_deletion_caches().map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to clear deletion caches after compaction: {e}"
+            ))
+        })?;
+
+        // Update the provider's listing table to point to the new snapshot
+        {
+            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
+            })?;
+            *listing_table_guard = new_listing_table;
+        }
+
+        // Cleanup old snapshots
+        if self.table_metadata.path.starts_with("s3://") {
+            let current_snapshot = new_snapshot_id.clone();
+            if let Err(err) = self.cleanup_old_snapshots_s3(&current_snapshot).await {
+                tracing::warn!(
+                    "Failed to cleanup old S3 snapshots for table {}: {err}",
+                    self.table_metadata.table_id
+                );
+            }
+        } else {
+            let table_path = self.table_metadata.path.clone();
+            let table_id = self.table_metadata.table_id;
+            let current_snapshot = new_snapshot_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) =
+                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
+                {
+                    tracing::warn!(
+                        "Failed to cleanup old snapshots for table {}: {e}",
+                        table_id
+                    );
+                }
+            });
+        }
+
+        tracing::info!(
+            "Completed merge-insert with compaction for table {}",
+            self.table_metadata.table_name
+        );
+
+        Ok(result)
+    }
+
+    /// Perform a merge-insert with compaction using a stream of new data.
+    ///
+    /// This is the stream-based version used by the `insert()` method.
+    /// It reads existing data with the deletion filter applied, combines with the new stream,
+    /// and writes everything to a new snapshot.
+    ///
+    /// Supports all deletion strategies:
+    /// - Position-based: Filters by row position using `RoaringBitmap`
+    /// - Int64 PK: Filters by Int64 primary key values
+    /// - RowConverter-based: Filters by composite/non-integer primary key bytes
+    ///
+    /// # Arguments
+    ///
+    /// * `new_stream` - Stream of new data batches to insert
+    ///
+    /// # Returns
+    ///
+    /// The total number of rows written (existing + new).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the merge-insert operation fails.
+    async fn merge_insert_stream_with_compaction(
+        &self,
+        new_stream: SendableRecordBatchStream,
+    ) -> CatalogResult<u64> {
+        use super::delete::{
+            DeletionFilterExec, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
+        };
+
+        // First, collect all new data batches
+        let new_batches: Vec<RecordBatch> =
+            new_stream
+                .try_collect()
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to collect new data stream".to_string(),
+                    source: Box::new(e),
+                })?;
+
+        let new_row_count: u64 = new_batches
+            .iter()
+            .map(|b| u64::try_from(b.num_rows()).unwrap_or(0))
+            .sum();
+
+        // Get existing data with deletion filter applied
+        let listing_table = {
+            let guard = self
+                .listing_table
+                .read()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "read listing table".to_string(),
+                })?;
+            Arc::clone(&guard)
+        };
+
+        let ctx = SessionContext::new();
+
+        // Scan existing data
+        let existing_scan = listing_table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to scan existing data for compaction".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // Apply the appropriate deletion filter based on strategy
+        let filtered_plan: Arc<dyn ExecutionPlan> = match self.pk_deletion_strategy {
+            PkDeletionStrategy::PositionBased => {
+                let deleted_row_ids = {
+                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "read position-based deletion cache".to_string(),
+                        }
+                    })?;
+                    Arc::clone(&guard)
+                };
+                Arc::new(DeletionFilterExec::new(existing_scan, deleted_row_ids))
+            }
+            PkDeletionStrategy::Int64Pk => {
+                let deleted_pk_values = {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "read Int64 PK deletion cache".to_string(),
+                        }
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let insert_records_pk_values = {
+                    let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "read Int64 insert records cache".to_string(),
+                        }
+                    })?;
+                    Arc::clone(&guard)
+                };
+                // For Int64 PK, we only have one PK column
+                let pk_column_index = self.pk_column_indices.first().copied().ok_or_else(|| {
+                    CatalogError::InvalidOperation {
+                        message: "Int64 PK strategy requires exactly one PK column index"
+                            .to_string(),
+                        source: Box::new(std::io::Error::other("missing pk column")),
+                    }
+                })?;
+                Arc::new(Int64PkDeletionFilterExec::new(
+                    existing_scan,
+                    deleted_pk_values,
+                    insert_records_pk_values,
+                    pk_column_index,
+                ))
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                let deleted_row_keys = {
+                    let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "read key-based deletion cache".to_string(),
+                        }
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let insert_records_row_keys = {
+                    let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "read key-based insert records cache".to_string(),
+                        }
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let row_converter =
+                    self.pk_row_converter
+                        .as_ref()
+                        .ok_or_else(|| CatalogError::InvalidOperation {
+                            message:
+                                "RowConverter not available for RowConverterBased strategy during compaction"
+                                    .to_string(),
+                            source: Box::new(std::io::Error::other("missing row converter")),
+                        })?;
+                Arc::new(KeyBasedDeletionFilterExec::new(
+                    existing_scan,
+                    deleted_row_keys,
+                    insert_records_row_keys,
+                    self.pk_column_indices.clone(),
+                    Arc::clone(row_converter),
+                ))
+            }
+        };
+
+        // Collect existing (filtered) data
+        let existing_batches = collect(filtered_plan, ctx.task_ctx()).await.map_err(|e| {
+            CatalogError::InvalidOperation {
+                message: "Failed to collect existing data for compaction".to_string(),
+                source: Box::new(e),
+            }
+        })?;
+
+        let existing_row_count: u64 = existing_batches
+            .iter()
+            .map(|b| u64::try_from(b.num_rows()).unwrap_or(0))
+            .sum();
+
+        // Combine all batches
+        let all_batches: Vec<RecordBatch> =
+            existing_batches.into_iter().chain(new_batches).collect();
+
+        if all_batches.is_empty() {
+            // Nothing to write - just clear all deletion caches and return
+            self.clear_all_deletion_caches()?;
+            return Ok(0);
+        }
+
+        // Generate a new snapshot ID
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+
+        // Construct snapshot directory URL
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            &new_snapshot_id,
+        );
+
+        // For local paths, ensure the directory exists
+        if !self.table_metadata.path.starts_with("s3://") {
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+            );
+            Self::ensure_snapshot_dir_exists(&snapshot_dir)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to create snapshot directory".to_string(),
+                    source: Box::new(e),
+                })?;
+        }
+
+        // Write all batches to new snapshot
+        let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
+
+        // Create a stream from the batches
+        let schema = Arc::clone(&self.table_metadata.schema);
+        let batch_stream = futures::stream::iter(all_batches.into_iter().map(Ok));
+        let stream: SendableRecordBatchStream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batch_stream),
+        );
+
+        // Use chunk_and_write with the new listing table's path
+        let (total_rows, chunk_count) = self
+            .chunk_and_write_parallel_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
+            .await?;
+
+        tracing::debug!(
+            "Compaction completed: wrote {} rows to {} chunks",
+            total_rows,
+            chunk_count
+        );
+
+        // Sync the snapshot directory to ensure all data is durably written.
+        // This is critical for ACID durability - we must ensure data files are
+        // on disk before updating the catalog metadata.
+        if !self.table_metadata.path.starts_with("s3://") {
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &new_snapshot_id,
+            );
+            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        }
+
+        // Create a new ListingTable pointing to the snapshot directory AFTER files are written
+        // This ensures the ListingTable discovers all the newly written files
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            &self.vortex_config,
+        )?;
+
+        // Atomically update the catalog snapshot and clear delete files.
+        // This is the commit point for the compaction operation - both changes
+        // happen together or not at all, ensuring ACID compliance.
+        self.catalog
+            .commit_compaction(self.table_metadata.table_id, &new_snapshot_id)
+            .await?;
+
+        // Update the in-memory snapshot ID to match the new catalog state
+        self.update_current_snapshot_id(&new_snapshot_id)?;
+
+        // Clear all in-memory cached deletion vectors since they've been applied
+        self.clear_all_deletion_caches()?;
+
+        // Update the provider's listing table to point to the new snapshot
+        {
+            let mut listing_table_guard =
+                self.listing_table
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "update listing table after compaction".to_string(),
+                    })?;
+            *listing_table_guard = new_listing_table;
+        }
+
+        // Cleanup old snapshots
+        if self.table_metadata.path.starts_with("s3://") {
+            let current_snapshot = new_snapshot_id.clone();
+            if let Err(err) = self.cleanup_old_snapshots_s3(&current_snapshot).await {
+                tracing::warn!(
+                    "Failed to cleanup old S3 snapshots for table {}: {err}",
+                    self.table_metadata.table_id
+                );
+            }
+        } else {
+            let table_path = self.table_metadata.path.clone();
+            let table_id = self.table_metadata.table_id;
+            let current_snapshot = new_snapshot_id.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) =
+                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
+                {
+                    tracing::warn!(
+                        "Failed to cleanup old snapshots for table {}: {e}",
+                        table_id
+                    );
+                }
+            });
+        }
+
+        tracing::info!(
+            "Completed merge-insert stream with compaction for table {}: {} existing + {} new = {} total rows",
+            self.table_metadata.table_name,
+            existing_row_count,
+            new_row_count,
+            total_rows
+        );
+
+        Ok(total_rows)
     }
 
     /// Update rows matching the given primary key values.
@@ -1548,8 +3520,8 @@ impl CayenneTableProvider {
         // 1. Delete old rows using deletion vectors
         // 2. Insert new rows
         // 3. Return number of rows updated
-        Err(CatalogError::InvalidOperation {
-            message: "Update not yet implemented".to_string(),
+        Err(CatalogError::NotImplemented {
+            function: "update_by_primary_key".to_string(),
         })
     }
 
@@ -1574,15 +3546,17 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the listing table cannot be refreshed.
     fn refresh_listing_table(&self) -> CatalogResult<()> {
-        // Construct path to current snapshot
-        let snapshot_dir = Self::snapshot_dir_path(
+        // Construct URL to current snapshot using the live snapshot ID
+        // (which may differ from table_metadata after compaction)
+        let current_snapshot = self.get_current_snapshot_id()?;
+        let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             self.table_metadata.table_id,
-            &self.table_metadata.current_snapshot_id,
+            &current_snapshot,
         );
 
         let new_listing_table = Self::create_listing_table(
-            &snapshot_dir,
+            &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
             &self.vortex_config,
         )?;
@@ -1632,7 +3606,8 @@ impl CayenneTableProvider {
             .get_table_delete_files(table_id)
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: format!("Failed to load deletion vectors from catalog: {e}"),
+                message: "Failed to load deletion vectors from catalog.".to_string(),
+                source: Box::new(e),
             })?;
 
         if delete_files.is_empty() {
@@ -1643,22 +3618,510 @@ impl CayenneTableProvider {
         let deleted_row_ids = task::spawn_blocking(move || read_deletion_vectors(delete_files))
             .await
             .map_err(|err| CatalogError::InvalidOperation {
-                message: format!("Deletion vector reader task panicked or was cancelled: {err}"),
+                message: "Deletion vector reader task panicked or was cancelled.".to_string(),
+                source: Box::new(err),
             })
             .and_then(|result| {
                 result.map_err(|err| CatalogError::InvalidOperation {
-                    message: format!("Failed to read deletion vectors: {err}"),
+                    message: "Failed to read deletion vectors.".to_string(),
+                    source: Box::new(err),
                 })
             })?;
 
         tracing::debug!(
-            "Cached {} deletion vectors ({} deleted rows) for table_id {}",
+            "Cached {} deletion vectors ({} deleted rows) for table_id {table_id}",
             deleted_row_ids.len(),
             deleted_row_ids.len(),
-            table_id
         );
 
         Ok(deleted_row_ids)
+    }
+
+    /// Load both position-based and key-based deletion vectors from the catalog.
+    ///
+    /// This method queries the catalog for delete files and loads them into memory,
+    /// routing to the appropriate cache based on the PK deletion strategy:
+    /// - `PositionBased`: Load into `RoaringBitmap` (row positions)
+    /// - `Int64Pk`: Load into `HashMap<i64, i64>` (PK -> max delete sequence)
+    /// - `RowConverterBased`: Load into `HashMap<Box<[u8]>, i64>` (serialized PK bytes -> max delete sequence)
+    ///
+    /// Also loads insert records for sequence-based ordering of upserts.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - `position_based_row_ids`: `RoaringBitmap` for position-based deletions
+    /// - `deleted_pk_i64`: `HashMap<i64, i64>` mapping PK -> max delete sequence
+    /// - `deleted_row_keys`: `HashMap<Box<[u8]>, i64>` mapping PK bytes -> max delete sequence
+    /// - `insert_records_pk_i64`: `HashMap<i64, i64>` mapping PK -> insert sequence
+    /// - `insert_records_row_keys`: `HashMap<Box<[u8]>, i64>` mapping PK bytes -> insert sequence
+    async fn load_deletion_vectors_all(
+        table_id: i64,
+        catalog: Arc<dyn MetadataCatalog>,
+        strategy: PkDeletionStrategy,
+    ) -> CatalogResult<(
+        RoaringBitmap,
+        HashMap<i64, i64>,
+        HashMap<Box<[u8]>, i64>,
+        HashMap<i64, i64>,
+        HashMap<Box<[u8]>, i64>,
+    )> {
+        use super::delete::detect_deletion_type_and_read;
+
+        // Query catalog for delete files
+        let delete_files = catalog
+            .get_table_delete_files(table_id)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to load deletion vectors from catalog.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // Load insert records from catalog (only for PK-based strategies)
+        let insert_records_bytes = if strategy == PkDeletionStrategy::PositionBased {
+            HashMap::new()
+        } else {
+            catalog.get_insert_records(table_id).await.map_err(|e| {
+                CatalogError::InvalidOperation {
+                    message: "Failed to load insert records from catalog.".to_string(),
+                    source: Box::new(e),
+                }
+            })?
+        };
+
+        if delete_files.is_empty() && insert_records_bytes.is_empty() {
+            return Ok((
+                RoaringBitmap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ));
+        }
+
+        // Parse insert records based on strategy
+        let (insert_records_pk_i64, insert_records_row_keys) = match strategy {
+            PkDeletionStrategy::PositionBased => (HashMap::new(), HashMap::new()),
+            PkDeletionStrategy::Int64Pk => {
+                // Convert insert record bytes to i64
+                let int64_pks: HashMap<i64, i64> = insert_records_bytes
+                    .iter()
+                    .filter_map(|(bytes, &seq)| {
+                        if bytes.len() >= 8 {
+                            let mut arr = [0_u8; 8];
+                            arr.copy_from_slice(&bytes[..8]);
+                            Some((i64::from_be_bytes(arr), seq))
+                        } else {
+                            tracing::warn!(
+                                "Skipping invalid Int64 insert record key with length {} (expected at least 8 bytes)",
+                                bytes.len()
+                            );
+                            None
+                        }
+                    })
+                    .collect();
+                (int64_pks, HashMap::new())
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                // Use the byte keys directly
+                (HashMap::new(), insert_records_bytes)
+            }
+        };
+
+        if delete_files.is_empty() {
+            return Ok((
+                RoaringBitmap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                insert_records_pk_i64,
+                insert_records_row_keys,
+            ));
+        }
+
+        // Read deletion vector files in a blocking task, detecting type from schema
+        // Returns (RoaringBitmap, HashMap<Box<[u8]>, i64>) where the map is PK -> max delete sequence
+        let (deleted_row_ids, deleted_row_keys) =
+            task::spawn_blocking(move || detect_deletion_type_and_read(delete_files))
+                .await
+                .map_err(|err| CatalogError::InvalidOperation {
+                    message: "Deletion vector reader task panicked or was cancelled.".to_string(),
+                    source: Box::new(err),
+                })
+                .and_then(|result| {
+                    result.map_err(|err| CatalogError::InvalidOperation {
+                        message: "Failed to read deletion vectors.".to_string(),
+                        source: Box::new(err),
+                    })
+                })?;
+
+        // Route data to appropriate caches based on strategy
+        let (position_ids, int64_pks, row_keys) = match strategy {
+            PkDeletionStrategy::PositionBased => {
+                // Position-based uses RoaringBitmap
+                (deleted_row_ids, HashMap::new(), HashMap::new())
+            }
+            PkDeletionStrategy::Int64Pk => {
+                // Int64 PK - convert row_keys (which contain Int64 bytes) to i64
+                // TODO: Optimize to store Int64 PK values directly in deletion files
+                let int64_pks: HashMap<i64, i64> = deleted_row_keys
+                    .iter()
+                    .filter_map(|(bytes, &seq)| {
+                        if bytes.len() >= 8 {
+                            // RowConverter uses big-endian for i64 with sign bit flipped
+                            let mut arr = [0_u8; 8];
+                            arr.copy_from_slice(&bytes[..8]);
+                            Some((i64::from_be_bytes(arr), seq))
+                        } else {
+                            tracing::warn!(
+                                "Skipping invalid Int64 deletion key with length {} (expected at least 8 bytes)",
+                                bytes.len()
+                            );
+                            None
+                        }
+                    })
+                    .collect();
+                (RoaringBitmap::new(), int64_pks, HashMap::new())
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                // RowConverter-based uses the byte keys directly
+                (RoaringBitmap::new(), HashMap::new(), deleted_row_keys)
+            }
+        };
+
+        tracing::debug!(
+            "Cached deletion vectors for table_id {table_id}: {} position-based, {} int64-pk, {} key-based, {} int64-insert, {} key-insert",
+            position_ids.len(),
+            int64_pks.len(),
+            row_keys.len(),
+            insert_records_pk_i64.len(),
+            insert_records_row_keys.len(),
+        );
+
+        Ok((
+            position_ids,
+            int64_pks,
+            row_keys,
+            insert_records_pk_i64,
+            insert_records_row_keys,
+        ))
+    }
+
+    /// Load protected snapshots from the catalog.
+    ///
+    /// Protected snapshots are those with sequence > `max_delete_sequence`.
+    /// They contain data written after deletions and should skip deletion filtering.
+    async fn load_protected_snapshots(
+        catalog: Arc<dyn MetadataCatalog>,
+        table_id: i64,
+        deleted_pk_i64: &HashMap<i64, i64>,
+        deleted_row_keys: &HashMap<Box<[u8]>, i64>,
+        strategy: PkDeletionStrategy,
+    ) -> CatalogResult<HashMap<String, i64>> {
+        // Check if there are any pending deletions
+        let has_deletions = match strategy {
+            PkDeletionStrategy::Int64Pk => !deleted_pk_i64.is_empty(),
+            PkDeletionStrategy::RowConverterBased => !deleted_row_keys.is_empty(),
+            PkDeletionStrategy::PositionBased => false, // Position-based uses compaction, not protected snapshots
+        };
+
+        if !has_deletions {
+            // No deletions, no protected snapshots needed
+            return Ok(HashMap::new());
+        }
+
+        // Get the maximum delete sequence from the current deletions
+        let max_delete_seq = match strategy {
+            PkDeletionStrategy::Int64Pk => deleted_pk_i64.values().max().copied().unwrap_or(0),
+            PkDeletionStrategy::RowConverterBased => {
+                deleted_row_keys.values().max().copied().unwrap_or(0)
+            }
+            PkDeletionStrategy::PositionBased => 0,
+        };
+
+        // Get all snapshot sequences from catalog
+        let snapshot_sequences = catalog.get_all_snapshot_sequences(table_id).await?;
+
+        // Filter to only protected snapshots (those with seq > max_delete_seq)
+        let protected: HashMap<String, i64> = snapshot_sequences
+            .into_iter()
+            .filter(|(_snapshot_id, seq)| *seq > max_delete_seq)
+            .map(|(snapshot_id, _seq)| (snapshot_id, max_delete_seq)) // Store max_delete_seq for reference
+            .collect();
+
+        if !protected.is_empty() {
+            tracing::debug!(
+                "Loaded {} protected snapshot(s) for table_id {} with max_delete_seq={}",
+                protected.len(),
+                table_id,
+                max_delete_seq
+            );
+        }
+
+        Ok(protected)
+    }
+
+    /// Creates a projection that strips additional columns added for deletion filtering.
+    ///
+    /// When filtering by PK, we may have added PK columns to the scan that weren't in the
+    /// original projection. This creates a `ProjectionExec` that only outputs the originally
+    /// requested columns.
+    #[expect(clippy::unused_self)]
+    fn create_projection_strip(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        num_columns_to_keep: usize,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let input_schema = input.schema();
+        let mut projection_expr: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(num_columns_to_keep);
+
+        for idx in 0..num_columns_to_keep {
+            let field = input_schema.field(idx);
+            let col_name = field.name().clone();
+            projection_expr.push((
+                Arc::new(Column::new(&col_name, idx)) as Arc<dyn PhysicalExpr>,
+                col_name,
+            ));
+        }
+
+        let projection = ProjectionExec::try_new(projection_expr, input)?;
+        Ok(Arc::new(CayenneAccelerationExec::new(Arc::new(projection))))
+    }
+
+    /// Scan protected snapshots with partial deletion filtering.
+    ///
+    /// Protected snapshots skip deletions that existed when they were created
+    /// (deletions with seq <= `max_delete_seq_at_creation`), but newer deletions
+    /// (seq > `max_delete_seq_at_creation`) are still applied.
+    async fn scan_protected_snapshots(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        pk_indices_in_projection: &[usize],
+    ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
+        let protected_snapshots = {
+            let guard = self.protected_snapshots.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Protected snapshots lock poisoned".to_string(),
+                )
+            })?;
+            guard.clone()
+        };
+
+        if protected_snapshots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut plans = Vec::with_capacity(protected_snapshots.len());
+
+        for (snapshot_id, max_delete_seq_at_creation) in protected_snapshots {
+            // Create listing table for this snapshot
+            let snapshot_url = Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &snapshot_id,
+            );
+
+            let listing_table = Self::create_listing_table(
+                &snapshot_url,
+                Arc::clone(&self.table_metadata.schema),
+                &self.vortex_config,
+            )
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
+                ))
+            })?;
+
+            let plan = listing_table
+                .scan(state, projection, filters, limit)
+                .await?;
+
+            // Apply partial deletion filter - only deletions with seq > max_delete_seq_at_creation
+            let filtered_plan = self.apply_partial_deletion_filter(
+                plan,
+                pk_indices_in_projection,
+                max_delete_seq_at_creation,
+            )?;
+
+            plans.push(filtered_plan);
+        }
+
+        Ok(plans)
+    }
+
+    /// Apply partial deletion filter - only deletions with seq > threshold are applied.
+    ///
+    /// This is used for protected snapshots which should skip deletions that existed
+    /// when they were created, but still honor newer deletions.
+    fn apply_partial_deletion_filter(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        pk_indices_in_projection: &[usize],
+        min_delete_seq_to_apply: i64,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                let all_deleted_pks = {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+
+                // Filter to only include deletions with seq > min_delete_seq_to_apply
+                let filtered_deletions: HashMap<i64, i64> = all_deleted_pks
+                    .iter()
+                    .filter(|(_pk, &seq)| seq > min_delete_seq_to_apply)
+                    .map(|(&pk, &seq)| (pk, seq))
+                    .collect();
+
+                if filtered_deletions.is_empty() {
+                    // No deletions to apply, return plan as-is
+                    return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
+                }
+
+                let pk_column_index =
+                    pk_indices_in_projection.first().copied().ok_or_else(|| {
+                        datafusion_common::DataFusionError::Internal(
+                            "Int64 PK strategy requires exactly one PK column index".to_string(),
+                        )
+                    })?;
+
+                let empty_insert_records = Arc::new(HashMap::new());
+                Ok(Arc::new(Int64PkDeletionFilterExec::new(
+                    plan,
+                    Arc::new(filtered_deletions),
+                    empty_insert_records,
+                    pk_column_index,
+                )))
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                // Similar logic for RowConverter-based strategy
+                if let Some(ref row_converter) = self.pk_row_converter {
+                    let all_deleted_keys = {
+                        let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
+
+                    // Filter to only include deletions with seq > min_delete_seq_to_apply
+                    let filtered_deletions: HashMap<Box<[u8]>, i64> = all_deleted_keys
+                        .iter()
+                        .filter(|(_key, &seq)| seq > min_delete_seq_to_apply)
+                        .map(|(key, &seq)| (key.clone(), seq))
+                        .collect();
+
+                    if filtered_deletions.is_empty() {
+                        return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
+                    }
+
+                    let empty_insert_records = Arc::new(HashMap::new());
+                    Ok(Arc::new(KeyBasedDeletionFilterExec::new(
+                        plan,
+                        Arc::new(filtered_deletions),
+                        empty_insert_records,
+                        self.pk_column_indices.clone(),
+                        Arc::clone(row_converter),
+                    )))
+                } else {
+                    Ok(Arc::new(CayenneAccelerationExec::new(plan)))
+                }
+            }
+            PkDeletionStrategy::PositionBased => {
+                // Position-based doesn't use protected snapshots
+                Ok(Arc::new(CayenneAccelerationExec::new(plan)))
+            }
+        }
+    }
+
+    /// Apply deletion filter to a plan based on the current deletion strategy.
+    fn apply_deletion_filter(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        pk_indices_in_projection: &[usize],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                let deleted_pk_values = {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                // Don't use insert_records for protected snapshot approach
+                // The protected snapshots already handle new data without filtering
+                let empty_insert_records = Arc::new(HashMap::new());
+
+                if !deleted_pk_values.is_empty() {
+                    let pk_column_index =
+                        pk_indices_in_projection.first().copied().ok_or_else(|| {
+                            datafusion_common::DataFusionError::Internal(
+                                "Int64 PK strategy requires exactly one PK column index"
+                                    .to_string(),
+                            )
+                        })?;
+
+                    return Ok(Arc::new(Int64PkDeletionFilterExec::new(
+                        plan,
+                        deleted_pk_values,
+                        empty_insert_records,
+                        pk_column_index,
+                    )));
+                }
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                if let Some(ref row_converter) = self.pk_row_converter {
+                    let deleted_row_keys = {
+                        let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
+                    // Don't use insert_records for protected snapshot approach
+                    let empty_insert_records: Arc<HashMap<Box<[u8]>, i64>> =
+                        Arc::new(HashMap::new());
+
+                    if !deleted_row_keys.is_empty() {
+                        return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
+                            plan,
+                            deleted_row_keys,
+                            empty_insert_records,
+                            pk_indices_in_projection.to_vec(),
+                            Arc::clone(row_converter),
+                        )));
+                    }
+                }
+            }
+            PkDeletionStrategy::PositionBased => {
+                let deleted_row_ids = {
+                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+
+                if !deleted_row_ids.is_empty() {
+                    return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
+                }
+            }
+        }
+
+        // No deletions to apply
+        Ok(Arc::new(CayenneAccelerationExec::new(plan)))
     }
 }
 
@@ -1687,7 +4150,78 @@ impl TableProvider for CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // Delegate to the underlying listing table first
+        // Register object store with the session's runtime env if configured for S3 Express One Zone.
+        // This ensures the session can access S3 when the underlying ListingTable reads data.
+        if let Some(ref config) = self.object_store_config {
+            Self::register_object_store_if_needed(state.runtime_env(), config);
+        }
+
+        // Determine if we need PK-based deletion (Int64 or RowConverter based)
+        let need_pk_deletion = match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                    )
+                })?;
+                !guard.is_empty()
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                    )
+                })?;
+                !guard.is_empty()
+            }
+            PkDeletionStrategy::PositionBased => false,
+        };
+
+        // For PK-based deletion, we need to ensure PK columns are included in the projection
+        // so we can filter by key. We may need to strip them out afterward if they weren't
+        // originally requested.
+        let (effective_projection, pk_indices_in_projection, need_projection_strip) =
+            if need_pk_deletion {
+                if let Some(proj) = projection {
+                    // Check which PK columns are missing from the projection
+                    let mut extended_proj: Vec<usize> = proj.clone();
+                    let mut pk_indices: Vec<usize> =
+                        Vec::with_capacity(self.pk_column_indices.len());
+                    let mut added_columns = false;
+
+                    for &pk_idx in &self.pk_column_indices {
+                        if let Some(pos) = extended_proj.iter().position(|&p| p == pk_idx) {
+                            // PK column already in projection
+                            pk_indices.push(pos);
+                        } else {
+                            // PK column not in projection - add it at the end
+                            pk_indices.push(extended_proj.len());
+                            extended_proj.push(pk_idx);
+                            added_columns = true;
+                        }
+                    }
+
+                    (Some(extended_proj), pk_indices, added_columns)
+                } else {
+                    // No projection means all columns are selected
+                    (None, self.pk_column_indices.clone(), false)
+                }
+            } else {
+                // No PK-based deletion needed, use original projection
+                let pk_indices = if let Some(proj) = projection {
+                    self.pk_column_indices
+                        .iter()
+                        .filter_map(|&orig_idx| {
+                            proj.iter().position(|&proj_idx| proj_idx == orig_idx)
+                        })
+                        .collect()
+                } else {
+                    self.pk_column_indices.clone()
+                };
+                (projection.cloned(), pk_indices, false)
+            };
+
+        // Delegate to the underlying listing table
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| {
@@ -1697,31 +4231,171 @@ impl TableProvider for CayenneTableProvider {
             })?;
             Arc::clone(&guard)
         };
-        let plan = listing_table
-            .scan(state, projection, filters, limit)
+        let main_plan = listing_table
+            .scan(state, effective_projection.as_ref(), filters, limit)
             .await?;
 
-        // Use cached deletion vectors instead of querying the catalog on every scan.
-        // This dramatically improves concurrent query performance by avoiding repeated
-        // SQLite queries and spawn_blocking tasks.
-        // Zero-copy Arc clone: just increments reference count, no HashSet allocation.
-        let deleted_row_ids = {
-            let guard = self.cached_deleted_row_ids.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            Arc::clone(&guard)
+        // Check for protected snapshots that need to be scanned with partial deletion filter
+        let protected_snapshot_plans = self
+            .scan_protected_snapshots(
+                state,
+                effective_projection.as_ref(),
+                filters,
+                limit,
+                &pk_indices_in_projection,
+            )
+            .await?;
+
+        // If there are protected snapshots, we need to:
+        // 1. Apply deletion filter to main plan
+        // 2. UNION with unfiltered protected snapshot plans
+        let plan = if protected_snapshot_plans.is_empty() {
+            main_plan
+        } else {
+            use datafusion_physical_plan::union::UnionExec;
+
+            // Apply deletion filter to main plan only
+            let filtered_main_plan =
+                self.apply_deletion_filter(main_plan, &pk_indices_in_projection)?;
+
+            // UNION the filtered main plan with unfiltered protected snapshot plans
+            let mut all_plans = vec![filtered_main_plan];
+            all_plans.extend(protected_snapshot_plans);
+            let union_plan = Arc::new(UnionExec::new(all_plans));
+
+            // Strip extra PK columns if needed
+            if need_projection_strip {
+                if let Some(orig_proj) = projection {
+                    return self.create_projection_strip(union_plan, orig_proj.len());
+                }
+            }
+
+            return Ok(union_plan);
         };
 
-        // If there are any deleted rows, apply filtering
-        if !deleted_row_ids.is_empty() {
-            tracing::debug!(
-                "Applying cached deletion filter ({} deleted rows) to scan of table {}",
-                deleted_row_ids.len(),
-                self.table_metadata.table_name
-            );
-            return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
+        // Apply deletion filter based on strategy (original logic for when no protected snapshots)
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                // Optimized Int64 PK deletion - direct HashSet<i64> lookup
+                let deleted_pk_values = {
+                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let insert_records_pk_values = {
+                    let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+
+                if !deleted_pk_values.is_empty() {
+                    tracing::debug!(
+                        "Applying Int64 PK deletion filter ({} deleted keys, {} insert records) to scan of table {}",
+                        deleted_pk_values.len(),
+                        insert_records_pk_values.len(),
+                        self.table_metadata.table_name
+                    );
+
+                    // For Int64 PK, we only have one PK column
+                    let pk_column_index =
+                        pk_indices_in_projection.first().copied().ok_or_else(|| {
+                            datafusion_common::DataFusionError::Internal(
+                                "Int64 PK strategy requires exactly one PK column index"
+                                    .to_string(),
+                            )
+                        })?;
+
+                    let deletion_filter = Arc::new(Int64PkDeletionFilterExec::new(
+                        plan,
+                        deleted_pk_values,
+                        insert_records_pk_values,
+                        pk_column_index,
+                    ));
+
+                    // Strip extra PK columns if needed
+                    if need_projection_strip {
+                        if let Some(orig_proj) = projection {
+                            return self.create_projection_strip(deletion_filter, orig_proj.len());
+                        }
+                    }
+
+                    return Ok(deletion_filter);
+                }
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                // RowConverter-based deletion for composite/non-integer PKs
+                if let Some(ref row_converter) = self.pk_row_converter {
+                    let deleted_row_keys = {
+                        let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
+                    let insert_records_row_keys = {
+                        let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
+
+                    if !deleted_row_keys.is_empty() {
+                        tracing::debug!(
+                            "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
+                            deleted_row_keys.len(),
+                            insert_records_row_keys.len(),
+                            self.table_metadata.table_name
+                        );
+
+                        let deletion_filter = Arc::new(KeyBasedDeletionFilterExec::new(
+                            plan,
+                            deleted_row_keys,
+                            insert_records_row_keys,
+                            pk_indices_in_projection.clone(),
+                            Arc::clone(row_converter),
+                        ));
+
+                        // Strip extra PK columns if needed
+                        if need_projection_strip {
+                            if let Some(orig_proj) = projection {
+                                return self
+                                    .create_projection_strip(deletion_filter, orig_proj.len());
+                            }
+                        }
+
+                        return Ok(deletion_filter);
+                    }
+                }
+            }
+            PkDeletionStrategy::PositionBased => {
+                // Position-based deletion for tables WITHOUT primary key
+                let deleted_row_ids = {
+                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+
+                if !deleted_row_ids.is_empty() {
+                    tracing::debug!(
+                        "Applying position-based deletion filter ({} deleted rows) to scan of table {}",
+                        deleted_row_ids.len(),
+                        self.table_metadata.table_name
+                    );
+                    return Ok(Arc::new(DeletionFilterExec::new(plan, deleted_row_ids)));
+                }
+            }
         }
 
         Ok(Arc::new(CayenneAccelerationExec::new(plan)))
@@ -1781,25 +4455,54 @@ impl TableProvider for CayenneTableProvider {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+
+        if is_s3 {
+            tracing::info!(
+                "Cayenne insert_into called for S3 table {} (overwrite: {:?})",
+                self.table_metadata.table_name,
+                overwrite
+            );
+        }
+
+        // Register object store with the session's runtime env if configured for S3 Express One Zone.
+        // This ensures the session can access S3 when the underlying ListingTable writes data.
+        if let Some(ref config) = self.object_store_config {
+            Self::register_object_store_if_needed(state.runtime_env(), config);
+        } else if is_s3 {
+            tracing::warn!(
+                "S3 table {} has no object_store_config! Writes will fail.",
+                self.table_metadata.table_name
+            );
+        }
+
         // Handle overwrite by creating a new snapshot
         // Directory structure: [data_dir]/[table_id]/[snapshot_id]/
         if overwrite == InsertOp::Overwrite {
             // Generate a new UUIDv7 for the snapshot
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
 
-            // Create snapshot directory: [table_path]/[table_id]/[snapshot_id]/
-            let snapshot_dir = Self::snapshot_dir_path(
+            // Construct snapshot directory URL
+            let snapshot_dir_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
                 self.table_metadata.table_id,
                 &new_snapshot_id,
             );
 
-            // Create the snapshot directory
-            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+            // For local paths, ensure the directory exists
+            // S3 doesn't require directory creation (object storage creates paths on write)
+            if !self.table_metadata.path.starts_with("s3://") {
+                let snapshot_dir = Self::snapshot_dir_path(
+                    &self.table_metadata.path,
+                    self.table_metadata.table_id,
+                    &new_snapshot_id,
+                );
+                Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+            }
 
             // Create a new ListingTable pointing to the snapshot directory
             let new_listing_table = Self::create_listing_table(
-                &snapshot_dir,
+                &snapshot_dir_url,
                 Arc::clone(&self.table_metadata.schema),
                 &self.vortex_config,
             )
@@ -1815,53 +4518,129 @@ impl TableProvider for CayenneTableProvider {
                 .insert_into(state, input, InsertOp::Append)
                 .await?;
 
-            // Update the catalog to point to the new snapshot
+            // Sync the snapshot directory to ensure all data is durably written.
+            // This is critical for ACID durability - we must ensure data files are
+            // on disk before updating the catalog metadata.
+            if !self.table_metadata.path.starts_with("s3://") {
+                let snapshot_dir = Self::snapshot_dir_path(
+                    &self.table_metadata.path,
+                    self.table_metadata.table_id,
+                    &new_snapshot_id,
+                );
+                Self::sync_snapshot_dir(&snapshot_dir).await.map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to sync snapshot directory for durability: {e}"
+                    ))
+                })?;
+            }
+
+            // Atomically update the catalog snapshot and clear any delete files.
+            // For overwrite operations, any existing delete files are stale since
+            // we're replacing all data. Using commit_compaction ensures atomicity.
             self.catalog
-                .set_current_snapshot(self.table_metadata.table_id, &new_snapshot_id)
+                .commit_compaction(self.table_metadata.table_id, &new_snapshot_id)
                 .await
                 .map_err(|e| {
                     datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to update snapshot after overwrite: {e}"
+                        "Failed to commit overwrite: {e}"
                     ))
                 })?;
 
+            // Update the in-memory snapshot ID to match the new catalog state
+            self.update_current_snapshot_id(&new_snapshot_id)
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to update current snapshot ID: {e}"
+                    ))
+                })?;
+
+            // Clear any in-memory deletion caches since all data was replaced
+            if let Err(e) = self.clear_all_deletion_caches() {
+                tracing::warn!(
+                    "Failed to clear deletion caches after overwrite for table {}: {e}",
+                    self.table_metadata.table_name
+                );
+            }
+
             // Update the provider's listing table to point to the new snapshot
             // This ensures subsequent queries in the same context will read from the new data
-            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    LISTING_TABLE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            *listing_table_guard = new_listing_table;
+            {
+                let mut listing_table_guard = self.listing_table.write().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        LISTING_TABLE_LOCK_POISONED.to_string(),
+                    )
+                })?;
+                *listing_table_guard = new_listing_table;
+            }
 
             // Trigger cleanup of old snapshot directories after successful full refresh
-            // This is fire-and-forget using spawn_blocking to avoid blocking the async runtime
-            let table_path = self.table_metadata.path.clone();
-            let table_id = self.table_metadata.table_id;
-            let current_snapshot = new_snapshot_id.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) =
-                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
-                {
+            // Local paths use blocking cleanup; S3 paths use object store deletion
+            if self.table_metadata.path.starts_with("s3://") {
+                let current_snapshot = new_snapshot_id.clone();
+                if let Err(err) = self.cleanup_old_snapshots_s3(&current_snapshot).await {
                     tracing::warn!(
-                        "Failed to cleanup old snapshots for table {}: {e}",
-                        table_id
+                        "Failed to cleanup old S3 snapshots for table {}: {err}",
+                        self.table_metadata.table_id
                     );
                 }
-            });
+            } else {
+                let table_path = self.table_metadata.path.clone();
+                let table_id = self.table_metadata.table_id;
+                let current_snapshot = new_snapshot_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = Self::cleanup_old_snapshots_blocking(
+                        &table_path,
+                        table_id,
+                        &current_snapshot,
+                    ) {
+                        tracing::warn!(
+                            "Failed to cleanup old snapshots for table {}: {e}",
+                            table_id
+                        );
+                    }
+                });
+            }
 
             return Ok(result);
         }
 
         // For regular appends, use the existing snapshot and listing table
-        // Ensure the snapshot directory exists (it might not if this is the first write to a newly created table)
-        let snapshot_dir = Self::snapshot_dir_path(
-            &self.table_metadata.path,
-            self.table_metadata.table_id,
-            &self.table_metadata.current_snapshot_id,
-        );
+        // Ensure the snapshot directory exists for local paths (S3 creates paths on write)
+        if !self.table_metadata.path.starts_with("s3://") {
+            let current_snapshot = self.get_current_snapshot_id().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to get current snapshot ID: {e}"
+                ))
+            })?;
+            let snapshot_dir = Self::snapshot_dir_path(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &current_snapshot,
+            );
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
 
-        Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        // For position-based deletion tables with pending deletions, we must compact
+        // before appending to prevent row ID conflicts. Position-based row IDs are global
+        // and become invalid when new files are added.
+        if self.pk_deletion_strategy == PkDeletionStrategy::PositionBased {
+            let has_pending_deletions = {
+                let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        DELETION_CACHE_LOCK_POISONED.to_string(),
+                    )
+                })?;
+                !guard.is_empty()
+            };
+
+            if has_pending_deletions {
+                tracing::info!(
+                    "Table {} has pending position-based deletions, converting append to merge-insert",
+                    self.table_metadata.table_name
+                );
+                return self.merge_insert_with_compaction(state, input).await;
+            }
+        }
 
         // Clone the Arc and drop the lock before awaiting
         let listing_table = {
@@ -1872,9 +4651,24 @@ impl TableProvider for CayenneTableProvider {
             })?;
             Arc::clone(&guard)
         };
+
+        if is_s3 {
+            tracing::info!(
+                "Delegating S3 write to ListingTable for {}",
+                self.table_metadata.table_name
+            );
+        }
+
         let result = listing_table
             .insert_into(state, input, InsertOp::Append)
             .await?;
+
+        if is_s3 {
+            tracing::info!(
+                "ListingTable insert_into returned for {} (S3 write plan created)",
+                self.table_metadata.table_name
+            );
+        }
 
         // Refresh the listing table to pick up new files and update statistics
         // This ensures query plans have access to up-to-date statistics after the insert
@@ -1896,6 +4690,40 @@ impl DeletionTableProvider for CayenneTableProvider {
         _state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        // Collect protected snapshot listing tables for deletion scanning
+        let protected_snapshot_tables = {
+            let protected_snapshots = {
+                let guard = self.protected_snapshots.read().map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        "Protected snapshots lock poisoned".to_string(),
+                    )
+                })?;
+                guard.clone()
+            };
+
+            let mut tables = Vec::with_capacity(protected_snapshots.len());
+            for (snapshot_id, _) in protected_snapshots {
+                let snapshot_url = Self::snapshot_dir_url(
+                    &self.table_metadata.path,
+                    self.table_metadata.table_id,
+                    &snapshot_id,
+                );
+
+                let listing_table = Self::create_listing_table(
+                    &snapshot_url,
+                    Arc::clone(&self.table_metadata.schema),
+                    &self.vortex_config,
+                )
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
+                    ))
+                })?;
+                tables.push(listing_table);
+            }
+            tables
+        };
+
         Ok(Arc::new(DeletionExec::new(
             Arc::new(CayenneDeletionSink::new(
                 self.table_metadata.clone(),
@@ -1904,8 +4732,287 @@ impl DeletionTableProvider for CayenneTableProvider {
                 Arc::clone(&self.table_metadata.schema),
                 filters,
                 Arc::clone(&self.cached_deleted_row_ids),
+                Arc::clone(&self.cached_deleted_pk_i64),
+                Arc::clone(&self.cached_deleted_row_keys),
+                self.pk_deletion_strategy,
+                self.pk_row_converter.as_ref().map(Arc::clone),
+                self.pk_column_indices.clone(),
+                protected_snapshot_tables,
             )),
             &self.table_metadata.schema,
         )))
+    }
+}
+
+/// Formats a byte count as a human-readable string (e.g., "1.23 GiB").
+fn format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    #[expect(clippy::cast_precision_loss)]
+    let bytes_f64 = bytes as f64;
+
+    if bytes_f64 >= GIB {
+        format!("{:.2} GiB", bytes_f64 / GIB)
+    } else if bytes_f64 >= MIB {
+        format!("{:.2} MiB", bytes_f64 / MIB)
+    } else if bytes_f64 >= KIB {
+        format!("{:.2} KiB", bytes_f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Formats bytes per second as a human-readable throughput string.
+fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    if bytes_per_sec >= GIB {
+        format!("{:.2} GiB/s", bytes_per_sec / GIB)
+    } else if bytes_per_sec >= MIB {
+        format!("{:.2} MiB/s", bytes_per_sec / MIB)
+    } else if bytes_per_sec >= KIB {
+        format!("{:.2} KiB/s", bytes_per_sec / KIB)
+    } else {
+        format!("{bytes_per_sec:.0} B/s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::metadata::VortexConfig;
+    use crate::CayenneCatalog;
+
+    use super::*;
+
+    use datafusion::arrow::array::RecordBatch;
+    use datafusion::arrow::datatypes::SchemaRef;
+    use datafusion::catalog::TableProviderFactory;
+    use datafusion::common::{Constraints, ToDFSchema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::logical_expr::dml::InsertOp;
+    use datafusion::logical_expr::CreateExternalTable;
+    use datafusion::physical_plan::collect;
+    use datafusion_common::DataFusionError;
+    use datafusion_federation::schema_cast::record_convert::try_cast_to;
+    use rstest::rstest;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use test_framework::arrow_record_batch_gen::*;
+
+    /// A `TableProviderFactory` implementation to create new instances of `CayenneTableProvider`.
+    // Not used outside of tests until https://github.com/spiceai/spiceai/issues/8534 is resolved
+    #[derive(Debug)]
+    pub struct CayenneTableProviderFactory {}
+
+    #[async_trait]
+    impl TableProviderFactory for CayenneTableProviderFactory {
+        async fn create(
+            &self,
+            _state: &dyn Session,
+            cmd: &CreateExternalTable,
+        ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+            let metastore_type = cmd
+                .options
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+
+            let metadata_dir = cmd.options.get("cayenne_metadata_dir").cloned().ok_or(
+                DataFusionError::Execution("cayenne_metadata_dir option is required".to_string()),
+            )?;
+
+            // Ensure metadata directory exists
+            std::fs::create_dir_all(&metadata_dir).map_err(DataFusionError::IoError)?;
+
+            let connection_string = match metastore_type {
+                "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
+                "sqlite" => format!("sqlite://{metadata_dir}/cayenne.db"),
+                _ => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Unsupported cayenne_metastore type: {metastore_type}"
+                    )))
+                }
+            };
+
+            let catalog = async move {
+                let catalog = Arc::new(
+                    CayenneCatalog::new(connection_string)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                ) as Arc<dyn MetadataCatalog>;
+
+                catalog
+                    .init()
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                Ok::<Arc<dyn MetadataCatalog>, DataFusionError>(catalog)
+            }
+            .await?;
+
+            // Support vortex configuration via options: https://github.com/spiceai/spiceai/issues/8533
+            let vortex_config = VortexConfig::default();
+
+            // Use file_path if provided as base, otherwise use default: spice_data_base_path() + dataset_name
+            let dir_path =
+                cmd.options
+                    .get("cayenne_data_dir")
+                    .cloned()
+                    .ok_or(DataFusionError::Execution(
+                        "cayenne_metadata_dir option is required".to_string(),
+                    ))?;
+
+            let table_options = CreateTableOptions {
+                table_name: cmd.name.to_string(),
+                schema: Arc::clone(cmd.schema.inner()),
+                primary_key: vec![], // No PK by default, can be set by caller
+                base_path: dir_path,
+                partition_column: None, // Non-partitioned table
+                vortex_config,
+            };
+
+            let retention_filters = Vec::new();
+
+            // Create CayenneTableProvider
+            let cayenne_table = CayenneTableProvider::create_table_with_retention(
+                catalog,
+                table_options,
+                retention_filters,
+            )
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            Ok(Arc::new(cayenne_table) as Arc<dyn TableProvider>)
+        }
+    }
+
+    async fn arrow_cayenne_round_trip(
+        arrow_record: RecordBatch,
+        source_schema: SchemaRef,
+        table_name: &str,
+    ) {
+        let factory = CayenneTableProviderFactory {};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+
+        let cmd_options = HashMap::from([
+            (
+                "cayenne_metadata_dir".to_string(),
+                format!(
+                    "{}/metadata",
+                    temp_dir.path().to_str().expect("should be str")
+                ),
+            ),
+            (
+                "cayenne_data_dir".to_string(),
+                format!("{}/data", temp_dir.path().to_str().expect("should be str")),
+            ),
+        ]);
+
+        let ctx = SessionContext::new();
+        let cmd = CreateExternalTable {
+            schema: Arc::new(arrow_record.schema().to_dfschema().expect("to df schema")),
+            name: table_name.into(),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: cmd_options,
+            constraints: Constraints::default(),
+            column_defaults: HashMap::new(),
+            temporary: false,
+        };
+        let table_provider = factory
+            .create(&ctx.state(), &cmd)
+            .await
+            .expect("table provider created");
+
+        let ctx = SessionContext::new();
+
+        let mem_exec = MemorySourceConfig::try_new_exec(
+            &[vec![arrow_record.clone()]],
+            arrow_record.schema(),
+            None,
+        )
+        .expect("memory exec created");
+        let insert_plan = table_provider
+            .insert_into(&ctx.state(), mem_exec, InsertOp::Append)
+            .await
+            .expect("insert plan created");
+
+        let _ = collect(insert_plan, ctx.task_ctx())
+            .await
+            .expect("insert done");
+
+        ctx.register_table(table_name, table_provider)
+            .expect("Table should be registered");
+        let sql = format!("SELECT * FROM {table_name}");
+        let df = ctx
+            .sql(&sql)
+            .await
+            .expect("DataFrame should be created from query");
+
+        let record_batch = df.collect().await.expect("RecordBatch should be collected");
+        let casted_record =
+            try_cast_to(record_batch[0].clone(), source_schema).expect("should cast record batch");
+
+        tracing::debug!("Original Arrow Record Batch: {:?}", arrow_record.columns());
+        tracing::debug!(
+            "Cayenne returned Record Batch: {:?}",
+            record_batch[0].columns()
+        );
+
+        // Check results
+        assert_eq!(record_batch.len(), 1);
+        assert_eq!(record_batch[0].num_rows(), arrow_record.num_rows());
+        assert_eq!(record_batch[0].num_columns(), arrow_record.num_columns());
+        assert_eq!(casted_record, arrow_record);
+    }
+
+    #[rstest]
+    #[case::binary(get_arrow_binary_record_batch(), "binary")]
+    #[case::binary(get_arrow_large_binary_record_batch(), "large_binary")]
+    #[ignore = "Vortex does not support fixed size binary yet"]
+    #[case::binary(get_arrow_fixed_sized_binary_record_batch(), "fixed_size_binary")]
+    #[case::int(get_arrow_int_record_batch(), "int")]
+    #[case::float(get_arrow_float_record_batch(), "float")]
+    #[case::utf8(get_arrow_utf8_record_batch(), "utf8")]
+    #[case::time(get_arrow_time_record_batch(), "time")]
+    #[case::timestamp(get_arrow_timestamp_record_batch(), "timestamp")]
+    #[case::date(get_arrow_date_record_batch(), "date")]
+    #[case::struct_type(get_arrow_struct_record_batch(), "struct")]
+    #[case::decimal(get_arrow_decimal_record_batch(), "decimal")]
+    #[ignore = "Vortex does not support interval yet"]
+    #[case::interval(get_arrow_interval_record_batch(), "interval")]
+    #[ignore = "Vortex does not support duration yet"]
+    #[case::duration(get_arrow_duration_record_batch(), "duration")]
+    #[case::list(get_arrow_list_record_batch(), "list")]
+    #[case::null(get_arrow_null_record_batch(), "null")]
+    #[case::list_of_structs(get_arrow_list_of_structs_record_batch(), "list_of_structs")]
+    #[case::list_of_fixed_size_lists(
+        get_arrow_list_of_fixed_size_lists_record_batch(),
+        "list_of_fixed_size_lists"
+    )]
+    #[case::list_of_lists(get_arrow_list_of_lists_record_batch(), "list_of_lists")]
+    #[ignore = "Vortex does not support map yet"]
+    #[case::map(get_arrow_map_record_batch(), "map")]
+    #[case::dictionary(get_arrow_dictionary_array_record_batch(), "dictionary")]
+    #[test_log::test(tokio::test)]
+    async fn test_arrow_cayenne_roundtrip(
+        #[case] arrow_result: (RecordBatch, SchemaRef),
+        #[case] table_name: &str,
+    ) {
+        arrow_cayenne_round_trip(
+            arrow_result.0,
+            arrow_result.1,
+            &format!("{table_name}_types"),
+        )
+        .await;
     }
 }

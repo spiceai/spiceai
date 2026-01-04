@@ -528,7 +528,6 @@ pub(crate) fn check_and_filter_unique_constraint<S: std::hash::BuildHasher + Def
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
-#[expect(clippy::too_many_lines)]
 pub(crate) fn extract_primary_keys_str(
     batch: &RecordBatch,
     pk_indices_ordered: &[usize],
@@ -967,7 +966,7 @@ impl DataSink for MemSink {
                 // Just collect unique keys and check for nulls, don't enforce uniqueness
                 for id in &new_primary_key_ids {
                     if let Some(key) = id {
-                        new_key_set.insert(key.to_string());
+                        new_key_set.insert(key.clone());
                     } else {
                         return Err(DataFusionError::Execution(
                             "Primary key values cannot be null".to_string(),

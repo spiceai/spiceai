@@ -18,13 +18,15 @@ limitations under the License.
 use async_openai::{
     Client,
     error::OpenAIError,
-    types::{
+    traits::RequestOptionsBuilder,
+    types::chat::{
         ChatChoiceStream, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
+        ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream, ChatCompletionTools,
         CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, CreateEmbeddingRequest,
-        CreateEmbeddingResponse, EmbeddingInput, PromptTokensDetails, ServiceTierResponse,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, PromptTokensDetails,
+        ServiceTier,
     },
+    types::embeddings::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput},
 };
 use async_trait::async_trait;
 use cache::{CacheProvider, result::embeddings::CachedEmbeddingResult};
@@ -61,33 +63,35 @@ impl Databricks {
         // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
             for t in tools.iter_mut() {
-                if t.function.parameters.is_none() {
-                    t.function.parameters.replace(json!(
-                        {
-                            "$schema": "http://json-schema.org/draft-07/schema#",
-                            "properties": {},
-                            "required": [],
-                            "title": "",
-                            "type": "object"
-                        }
-                    ));
-                }
-
-                // For tools that want to have Uint as inputs, they will set `minimum=0`.
-                // This is valid JSON schema, but not supported in Databricks.
-                if let Some(Some(serde_json::Value::Object(properties))) = t
-                    .function
-                    .parameters
-                    .as_mut()
-                    .map(|v| v.get_mut("properties"))
-                {
-                    for (_field, value) in properties.iter_mut() {
-                        if let Some(Value::String(value_type)) = value.get("type") {
-                            if value_type != "integer" {
-                                continue;
+                if let ChatCompletionTools::Function(func_tool) = t {
+                    if func_tool.function.parameters.is_none() {
+                        func_tool.function.parameters.replace(json!(
+                            {
+                                "$schema": "http://json-schema.org/draft-07/schema#",
+                                "properties": {},
+                                "required": [],
+                                "title": "",
+                                "type": "object"
                             }
-                            if let Some(value_map) = value.as_object_mut() {
-                                value_map.remove("minimum");
+                        ));
+                    }
+
+                    // For tools that want to have Uint as inputs, they will set `minimum=0`.
+                    // This is valid JSON schema, but not supported in Databricks.
+                    if let Some(Some(serde_json::Value::Object(properties))) = func_tool
+                        .function
+                        .parameters
+                        .as_mut()
+                        .map(|v| v.get_mut("properties"))
+                    {
+                        for (_field, value) in properties.iter_mut() {
+                            if let Some(Value::String(value_type)) = value.get("type") {
+                                if value_type != "integer" {
+                                    continue;
+                                }
+                                if let Some(value_map) = value.as_object_mut() {
+                                    value_map.remove("minimum");
+                                }
                             }
                         }
                     }
@@ -164,7 +168,7 @@ pub struct DatabricksCreateChatCompletionStreamResponse {
     pub choices: Vec<ChatChoiceStream>,
     pub created: u32,
     pub model: String,
-    pub service_tier: Option<ServiceTierResponse>,
+    pub service_tier: Option<ServiceTier>,
     pub system_fingerprint: Option<String>,
     pub object: String,
 
@@ -185,7 +189,8 @@ impl From<DatabricksCreateChatCompletionStreamResponse> for CreateChatCompletion
             object,
             usage,
         } = val;
-        CreateChatCompletionStreamResponse {
+        #[expect(deprecated)]
+        let resp = CreateChatCompletionStreamResponse {
             id,
             choices,
             created,
@@ -194,7 +199,8 @@ impl From<DatabricksCreateChatCompletionStreamResponse> for CreateChatCompletion
             system_fingerprint,
             object,
             usage: usage.map(Into::into),
-        }
+        };
+        resp
     }
 }
 
@@ -261,27 +267,33 @@ impl Chat for Databricks {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
-        let mut inner_req = req.clone();
-        inner_req.model.clone_from(&self.model);
-        inner_req.stream_options = None; // Not supported by Databricks.
-
-        // Must use `post_stream` instead of `chat().create(...` to avoid concatenation of `chat/completions`.
-        Ok(Box::pin(
-            self.client
-                .post_stream::<_, DatabricksCreateChatCompletionStreamResponse, _>(
-                    "",
-                    self.alter_request(req),
-                )
-                .await
-                .map_ok(Into::into),
-        ))
+        // Must use `create_stream_byot` with custom response type to handle Databricks-specific format.
+        let altered_req = self.alter_request(req);
+        let stream: std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<DatabricksCreateChatCompletionStreamResponse, OpenAIError>,
+                    > + Send,
+            >,
+        > = self
+            .client
+            .chat()
+            .path("")?
+            .create_stream_byot(altered_req)
+            .await?;
+        Ok(Box::pin(stream.map_ok(Into::into)))
     }
 
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-        self.client.post("", self.alter_request(req)).await
+        // Must use `create_byot` with empty path to avoid concatenation of `chat/completions`.
+        self.client
+            .chat()
+            .path("")?
+            .create_byot(self.alter_request(req))
+            .await
     }
 }
 
@@ -315,10 +327,14 @@ impl Embed for Databricks {
             return Ok(cached);
         }
 
-        // Must use `post` instead of `embeddings().create(...` to avoid concatenation of `/embeddings`.
-        let response = self
+        // Must use `create_byot` with empty path to avoid concatenation of `/embeddings`.
+        let response: CreateEmbeddingResponse = self
             .client
-            .post::<_, CreateEmbeddingResponse>("", req.clone())
+            .embeddings()
+            .path("")
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .context(FailedToCreateEmbeddingSnafu)?
+            .create_byot(req.clone())
             .await
             .boxed()
             .context(FailedToCreateEmbeddingSnafu)?;

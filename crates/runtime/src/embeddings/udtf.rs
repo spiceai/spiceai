@@ -29,7 +29,7 @@ limitations under the License.
 
 use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
 use arrow_schema::{DataType, Field, SchemaRef};
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
 use datafusion::datasource::ViewTable;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
@@ -115,8 +115,8 @@ impl VectorSearchTableFuncArgs {
             .cloned();
         match (self.column.as_deref(), cfg) {
             (Some(col), Some(cfg)) => Ok((col.to_string(), cfg)),
-            (Some(col), None) => Err(DataFusionError::Internal(format!(
-                "User function 'vector_search' is called on table '{}' that does not have a embedding index on '{col}' column. Index is on column(s): {}.",
+            (Some(col), None) => Err(DataFusionError::Plan(format!(
+                "User function 'vector_search' is called on table '{}' that does not have a embedding index on '{col}' column. Index is on column(s): {}",
                 self.tbl,
                 embedded_columns
                     .keys()
@@ -314,7 +314,7 @@ impl VectorSearchTableFunc {
             tbl: tbl_ref
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .into(),
-            query: q.to_string(),
+            query: q.clone(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
             include_score,
@@ -359,8 +359,8 @@ impl VectorSearchTableFunc {
                 .find(|idx| *idx.search_column() == *col)
         } else {
             if vector_indexes.len() > 1 {
-                return Err(DataFusionError::Internal(format!(
-                    "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
+                return Err(DataFusionError::Plan(format!(
+                    "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`",
                     args.tbl,
                     vector_indexes.len()
                 )));

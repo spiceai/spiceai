@@ -78,8 +78,8 @@ impl TextSearchTableFuncArgs {
         let TextSearchTableFuncArgs { column, tbl, .. } = &self;
         let col: String = if let Some(col) = column {
             if !search_fields.contains(col) {
-                return Err(DataFusionError::Internal(format!(
-                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}.",
+                return Err(DataFusionError::Plan(format!(
+                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}",
                     search_fields.join(", ")
                 )));
             }
@@ -90,14 +90,14 @@ impl TextSearchTableFuncArgs {
             match (fields.next(), fields.next()) {
                 (Some(field), None) => field.clone(),
                 (Some(_), Some(_)) => {
-                    return Err(DataFusionError::Internal(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`.",
+                    return Err(DataFusionError::Plan(format!(
+                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
                         search_fields.len()
                     )));
                 }
                 _ => {
-                    return Err(DataFusionError::Internal(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has no associated full text search index."
+                    return Err(DataFusionError::Plan(format!(
+                        "User function 'text_search' is called on table '{tbl}' that has no associated full text search index"
                     )));
                 }
             }
@@ -251,7 +251,7 @@ impl TextSearchTableFunc {
             tbl: tbl_ref
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .into(),
-            query: q.to_string(),
+            query: q.clone(),
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
             include_score,

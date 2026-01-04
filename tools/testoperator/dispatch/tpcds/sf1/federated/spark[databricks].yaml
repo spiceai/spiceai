@@ -4,3 +4,4 @@ tests:
     query_set: tpcds
     query_overrides: spark
     runner_type: spiceai-dev-runners
+    ready_wait: 600
