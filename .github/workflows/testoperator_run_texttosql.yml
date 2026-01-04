@@ -119,6 +119,11 @@ jobs:
       #   run: |
       #     spicepod-validator "${{ github.event.inputs.spicepod_path }}"
 
+      - name: hello
+        run: |
+          echo "${{ steps.bird_bench_setup.outputs.spicepod_dependency }}"
+          cat "${GITHUB_OUTPUT}"
+
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
         with:

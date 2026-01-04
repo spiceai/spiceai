@@ -71,3 +71,7 @@ runs:
 
         # Output DATASET_SPICEPOD from action
         echo "spicepod_dependency=$DATASET_SPICEPOD" >> "$GITHUB_OUTPUT"
+
+        # Verify it was written
+        echo "Contents of GITHUB_OUTPUT:"
+        cat "$GITHUB_OUTPUT"
