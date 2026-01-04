@@ -595,7 +595,8 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
 
     match overrides {
         Some(QueryOverrides::ODBCAthena) => remove_tpch_query!(
-            queries, 4,  // https://github.com/spiceai/spiceai/issues/2077
+            queries, 2,  // https://github.com/spiceai/spiceai/issues/8379
+            4,  // https://github.com/spiceai/spiceai/issues/2077
             20  // https://github.com/spiceai/spiceai/issues/2078
         ),
         Some(QueryOverrides::ODBCDatabricks) => remove_tpch_query!(
@@ -850,7 +851,8 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             )
         }
         Some(QueryOverrides::Dremio) => remove_tpcds_query!(
-            queries, 8, 38, 87 // LEFT SEMI, and LEFT ANTI
+            queries, 8, 38, 87, // LEFT SEMI, and LEFT ANTI
+            64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
         ),
         Some(_) | None => queries,
     }
