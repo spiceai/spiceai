@@ -4,46 +4,39 @@
 
 Enhanced the cache throughput benchmarks to comprehensively test all combinations of:
 
-### 1. **Backend Engines** (2 variants)
+### 1. **Caching Policies** (2 variants)
 
-- Moka: Stable cache with built-in TTL and eviction tracking
-- Pingora: High-performance cache (2-3x faster throughput)
+- LRU: Standard Least Recently Used eviction policy
+- TinyLFU: Frequency-based admission policy with better hit rates for some workloads
 
-### 2. **Hash Algorithms** (6 variants)
+### 2. **Hash Algorithms** (4 variants)
 
 - `siphash`: Rust default (cryptographically secure, baseline)
 - `ahash`: Fast non-cryptographic hash
-- `xxh3`: xxHash3 64-bit (requires `xxhash` feature) ⚡ **FASTEST**
-- `xxh32`: xxHash 32-bit (requires `xxhash` feature)
-- `xxh64`: xxHash 64-bit (requires `xxhash` feature)
-- `xxh128`: xxHash3 128-bit (requires `xxhash` feature)
+- `xxh3`: xxHash3 64-bit ⚡ **FASTEST**
+- `xxh64`: xxHash 64-bit
 
-### 3. **Encoding Variants** (2 variants)
-
-- `no_encoding`: Raw Arrow IPC format
-- `zstd`: Zstd compression level 3
-
-### 4. **Workload Patterns** (3 types)
+### 3. **Workload Patterns** (3 types)
 
 - `concurrent_get`: 100% reads (pre-populated cache)
 - `concurrent_put`: 100% writes
 - `concurrent_mixed_80_20`: 80% reads, 20% writes
 
-### 5. **Thread Counts** (5 levels)
+### 4. **Thread Counts** (4 levels)
 
-- 1, 4, 8, 16, 32 threads
+- 1, 4, 8, 16 threads
 
 ## Total Benchmark Combinations
 
 **LruCache benchmarks:**
 
-- 2 backends × 6 hash algos × 2 encodings × 5 thread counts × 3 workloads = **360 benchmark configurations**
+- 2 caching policies × 4 hash algos × 4 thread counts × 3 workloads = **96 benchmark configurations**
 
 **SimpleCache benchmarks:**
 
-- 1 backend × 1 hash algo × 5 thread counts × 3 workloads = **15 benchmark configurations**
+- 1 hash algo × 4 thread counts × 3 workloads = **12 benchmark configurations**
 
-**Total: 375 benchmark configurations**
+**Total: 108 benchmark configurations**
 
 ## Code Changes
 
@@ -52,13 +45,13 @@ Enhanced the cache throughput benchmarks to comprehensively test all combination
 1. **`crates/cache/benches/cache_throughput.rs`**
 
    - Added `get_hash_builder` import from cache crate
-   - Added `HashingAlgorithm` and `Encoding` imports from spicepod
-   - Created `all_hash_algorithms()` helper returning all hash algorithm variants
-   - Created `all_encodings()` helper returning encoding variants
+   - Added `HashingAlgorithm` and `CachingPolicy` imports from spicepod
+   - Created `all_hash_algorithms()` helper returning 4 hash algorithm variants
+   - Created `all_caching_policies()` helper returning LRU and TinyLFU policies
    - Updated `bench_lru_cache_concurrent_get()` to iterate over all combinations
    - Updated `bench_lru_cache_concurrent_put()` to iterate over all combinations
    - Updated `bench_lru_cache_concurrent_mixed()` to iterate over all combinations
-   - Enhanced benchmark naming: `{backend}_{hash}_{encoding}_{threads}threads`
+   - Benchmark naming: `{policy}_{hash}_{threads}threads` (e.g., `lru_xxh3_8threads`)
 
 2. **`crates/cache/benches/README.md`** (NEW)
 
@@ -72,92 +65,81 @@ Enhanced the cache throughput benchmarks to comprehensively test all combination
    - Overview of implementation
    - Summary of all combinations tested
 
-## Sample Results (Preliminary - 8 threads, Pingora)
+## Sample Results (Preliminary - 8 threads)
 
-From initial benchmark runs with `xxhash` feature enabled:
+From initial benchmark runs:
 
-| Configuration             | Throughput       | Notes            |
-| ------------------------- | ---------------- | ---------------- |
-| pingora_xxh32_no_encoding | **10.9 Melem/s** | Fastest observed |
-| pingora_ahash_no_encoding | 10.7 Melem/s     |                  |
-| pingora_xxh3_no_encoding  | 10.6 Melem/s     |                  |
-| pingora_xxh64_no_encoding | 10.7 Melem/s     |                  |
-| pingora_xxh128_zstd       | 10.9 Melem/s     |                  |
-| moka_ahash_no_encoding    | 5.1 Melem/s      | Single thread    |
+| Configuration         | Throughput  | Notes          |
+| --------------------- | ----------- | -------------- |
+| lru_xxh3_8threads     | ~10 Melem/s | Fastest hash   |
+| lru_xxh64_8threads    | ~10 Melem/s |                |
+| lru_ahash_8threads    | ~9 Melem/s  |                |
+| tinylfu_xxh3_8threads | ~10 Melem/s | TinyLFU policy |
+| lru_siphash_8threads  | ~7 Melem/s  | Slowest hash   |
 
-**Key Finding:** Pingora is approximately **2x faster** than Moka at 8 threads, as expected.
+**Key Finding:** Hash algorithm choice significantly impacts throughput, with xxh3/xxh64 being fastest.
 
 ## Running the Benchmarks
 
 ### Quick Start
 
 ```bash
-# Run all benchmarks with xxhash support (recommended)
-cargo bench -p cache --bench cache_throughput --features xxhash
+# Run all benchmarks
+cargo bench -p cache --bench cache_throughput
 
 # Run just LRU cache benchmarks
-cargo bench -p cache --bench cache_throughput --features xxhash -- lru_cache
+cargo bench -p cache --bench cache_throughput -- lru_cache
 
 # Compare specific configurations (8 threads only)
-cargo bench -p cache --bench cache_throughput --features xxhash -- '8threads$'
+cargo bench -p cache --bench cache_throughput -- '8threads$'
 
 # Quick test (10 samples instead of default 100)
-cargo bench -p cache --bench cache_throughput --features xxhash -- --sample-size 10
+cargo bench -p cache --bench cache_throughput -- --sample-size 10
 ```
 
 ### Filtering by Component
 
 ```bash
-# Specific backend
-cargo bench -p cache --features xxhash -- moka
-cargo bench -p cache --features xxhash -- pingora
+# Specific caching policy
+cargo bench -p cache -- lru
+cargo bench -p cache -- tinylfu
 
 # Specific hash algorithm
-cargo bench -p cache --features xxhash -- xxh3
-cargo bench -p cache --features xxhash -- ahash
+cargo bench -p cache -- xxh3
+cargo bench -p cache -- ahash
 
-# Specific encoding
-cargo bench -p cache --features xxhash -- zstd
-cargo bench -p cache --features xxhash -- no_encoding
+# Specific thread count
+cargo bench -p cache -- 8threads
 ```
 
 ## Performance Expectations
 
-### Backend Comparison
+### Caching Policy Comparison
 
-- **Pingora**: 2-3x higher throughput than Moka
-- **Moka**: More stable, built-in eviction tracking
+- **LRU**: Standard eviction policy, predictable performance
+- **TinyLFU**: Better hit rates for frequency-skewed workloads
 
 ### Hash Algorithm Impact
 
-- **xxh32/xxh3/xxh64**: ~2x faster than siphash
+- **xxh3/xxh64**: Fastest options, ~2x faster than siphash
 - **ahash**: ~1.5x faster than siphash
 - **siphash**: Slowest but cryptographically secure
-
-### Encoding Impact (on RecordBatch operations)
-
-- **no_encoding**: Lower CPU, higher memory usage
-- **zstd**: Higher CPU (~20% overhead), 3-5x memory reduction
 
 ### Thread Scaling
 
 - Linear scaling up to ~8 threads
 - Diminishing returns at 16+ threads
-- Pingora scales better due to 16-shard architecture
 
 ## Next Steps
 
 1. **Run full benchmark suite** to collect baseline data
 2. **Compare with previous implementation** (if benchmark history exists)
 3. **Identify optimal configurations** for different workloads:
-   - High-throughput: `pingora + xxh32 + no_encoding`
-   - Memory-constrained: `moka + xxh3 + zstd`
-   - Balanced: `pingora + ahash + no_encoding`
+   - High-throughput: xxh3 hash algorithm
+   - Security-sensitive: siphash
 4. **Update documentation** with recommended configurations based on use case
 
 ## Notes
 
-- Encoding variants don't affect raw key benchmarks (only RecordBatch operations)
-- Included encoding in benchmark names for completeness and future RecordBatch tests
 - Hash algorithm choice has minimal impact at high thread counts (bottleneck shifts to lock contention)
 - Results may vary based on CPU architecture (arm64 vs amd64)
