@@ -33,19 +33,19 @@ description: "Query: tpch_q13"
 |               |                               PartitionedUnionExec                                                                                                                             |
 |               |                                 CooperativeExec                                                                                                                                |
 |               |                                   BytesProcessedExec                                                                                                                           |
-|               |                                     DuckSqlExec sql= SELECT "c_custkey" FROM "expression=1/customer"                                                                           |
-|               |                                 CooperativeExec                                                                                                                                |
-|               |                                   BytesProcessedExec                                                                                                                           |
-|               |                                     DuckSqlExec sql= SELECT "c_custkey" FROM "expression=3/customer"                                                                           |
-|               |                                 CooperativeExec                                                                                                                                |
-|               |                                   BytesProcessedExec                                                                                                                           |
 |               |                                     DuckSqlExec sql= SELECT "c_custkey" FROM "expression=2/customer"                                                                           |
+|               |                                 CooperativeExec                                                                                                                                |
+|               |                                   BytesProcessedExec                                                                                                                           |
+|               |                                     DuckSqlExec sql= SELECT "c_custkey" FROM "expression=4/customer"                                                                           |
 |               |                                 CooperativeExec                                                                                                                                |
 |               |                                   BytesProcessedExec                                                                                                                           |
 |               |                                     DuckSqlExec sql= SELECT "c_custkey" FROM "expression=0/customer"                                                                           |
 |               |                                 CooperativeExec                                                                                                                                |
 |               |                                   BytesProcessedExec                                                                                                                           |
-|               |                                     DuckSqlExec sql= SELECT "c_custkey" FROM "expression=4/customer"                                                                           |
+|               |                                     DuckSqlExec sql= SELECT "c_custkey" FROM "expression=1/customer"                                                                           |
+|               |                                 CooperativeExec                                                                                                                                |
+|               |                                   BytesProcessedExec                                                                                                                           |
+|               |                                     DuckSqlExec sql= SELECT "c_custkey" FROM "expression=3/customer"                                                                           |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                              |
 |               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 32), input_partitions=32                                                                             |
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=5                                                                                |
@@ -56,15 +56,15 @@ description: "Query: tpch_q13"
 |               |                                     DuckSqlExec sql= SELECT "o_orderkey", "o_custkey" FROM "expression=3/orders" WHERE "o_comment" NOT LIKE '%special%requests%'               |
 |               |                                 CooperativeExec                                                                                                                                |
 |               |                                   BytesProcessedExec                                                                                                                           |
-|               |                                     DuckSqlExec sql= SELECT "o_orderkey", "o_custkey" FROM "expression=1/orders" WHERE "o_comment" NOT LIKE '%special%requests%'               |
-|               |                                 CooperativeExec                                                                                                                                |
-|               |                                   BytesProcessedExec                                                                                                                           |
-|               |                                     DuckSqlExec sql= SELECT "o_orderkey", "o_custkey" FROM "expression=2/orders" WHERE "o_comment" NOT LIKE '%special%requests%'               |
-|               |                                 CooperativeExec                                                                                                                                |
-|               |                                   BytesProcessedExec                                                                                                                           |
 |               |                                     DuckSqlExec sql= SELECT "o_orderkey", "o_custkey" FROM "expression=4/orders" WHERE "o_comment" NOT LIKE '%special%requests%'               |
 |               |                                 CooperativeExec                                                                                                                                |
 |               |                                   BytesProcessedExec                                                                                                                           |
 |               |                                     DuckSqlExec sql= SELECT "o_orderkey", "o_custkey" FROM "expression=0/orders" WHERE "o_comment" NOT LIKE '%special%requests%'               |
+|               |                                 CooperativeExec                                                                                                                                |
+|               |                                   BytesProcessedExec                                                                                                                           |
+|               |                                     DuckSqlExec sql= SELECT "o_orderkey", "o_custkey" FROM "expression=1/orders" WHERE "o_comment" NOT LIKE '%special%requests%'               |
+|               |                                 CooperativeExec                                                                                                                                |
+|               |                                   BytesProcessedExec                                                                                                                           |
+|               |                                     DuckSqlExec sql= SELECT "o_orderkey", "o_custkey" FROM "expression=2/orders" WHERE "o_comment" NOT LIKE '%special%requests%'               |
 |               |                                                                                                                                                                                |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

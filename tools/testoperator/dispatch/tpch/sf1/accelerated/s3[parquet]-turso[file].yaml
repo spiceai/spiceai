@@ -1,10 +1,11 @@
 tests:
-  bench:
-    spicepod_path: accelerated/s3[parquet]-turso[file].yaml
-    query_set: tpch
-    runner_type: spiceai-dev-runners
-    validate_results: true
-    ready_wait: 900
+  # bench:
+  #   https://github.com/spiceai/spiceai/issues/8764
+  #   spicepod_path: accelerated/s3[parquet]-turso[file].yaml
+  #   query_set: tpch
+  #   runner_type: spiceai-dev-runners
+  #   validate_results: true
+  #   ready_wait: 900
   throughput:
     spicepod_path: accelerated/s3[parquet]-turso[file].yaml
     query_set: tpch
