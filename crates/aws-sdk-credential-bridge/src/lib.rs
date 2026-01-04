@@ -419,6 +419,7 @@ pub async fn initiate_config_with_credentials(
 ///
 /// # Returns
 /// A `ConfigLoader` that can be further customized before loading.
+#[must_use]
 pub fn initiate_config_with_iam_role_only(region: String) -> aws_config::ConfigLoader {
     let provider_config = ProviderConfig::default().with_region(Some(Region::new(region.clone())));
 
