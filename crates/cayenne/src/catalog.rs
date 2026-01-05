@@ -59,6 +59,13 @@ pub enum CatalogError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// Invalid operation (without underlying source error)
+    #[snafu(display("Invalid operation: {message}"))]
+    InvalidOperationNoSource {
+        /// Description of the invalid operation
+        message: String,
+    },
+
     /// IO error
     #[snafu(display("IO error: {source}"))]
     Io {

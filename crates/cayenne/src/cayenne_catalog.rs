@@ -314,9 +314,9 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: r"
                     INSERT INTO cayenne_table (
                         table_uuid, table_name, path, path_is_relative, schema_json, primary_key_json,
-                        current_snapshot_id, partition_column, vortex_config_json
+                        on_conflict_json, current_snapshot_id, partition_column, vortex_config_json
                     ) VALUES (
-                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
                     )
                 ",
                 params: vec![
@@ -326,6 +326,7 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Bool(false), // path_is_relative
                     MetastoreValue::Text(schema_json),
                     primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                    on_conflict_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Text(initial_snapshot_id.clone()),
                     partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Text(vortex_config_json),

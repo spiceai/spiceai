@@ -28,7 +28,7 @@ use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
-    column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
+    column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
 // Run against all supported backends.
@@ -46,10 +46,9 @@ async fn test_on_conflict_upsert_impl(
         table_name: "conflict_upsert".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
-        on_conflict: Some(OnConflict::Upsert(
-            ColumnReference::new(vec!["id".to_string()]),
-            UpsertOptions::default(),
-        )),
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string()
+        ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -58,6 +57,9 @@ async fn test_on_conflict_upsert_impl(
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
     let table = Arc::new(table);
+    
+    // Debug: print table
+    eprintln!("Table: {:?}", table);
 
     let ctx = SessionContext::new();
     ctx.register_table(

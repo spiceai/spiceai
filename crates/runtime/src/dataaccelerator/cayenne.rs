@@ -1496,10 +1496,9 @@ impl CayenneAccelerator {
                             )
                         }
                         crate::component::dataset::acceleration::OnConflictBehavior::Upsert(
-                            options,
+                            _options,
                         ) => datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
                             col,
-                            options.clone(),
                         ),
                     }
                 })
