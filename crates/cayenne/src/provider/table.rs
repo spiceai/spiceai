@@ -309,9 +309,9 @@ struct BatchValidationResult {
     filtered_batch: Option<RecordBatch>,
     delete_specs: Vec<(i64, Vec<i64>)>,
     kept_keys: HashSet<OwnedRow>,
-    /// Int64 PK values being deleted (for Int64Pk strategy)
+    /// Int64 PK values being deleted (for `Int64Pk` strategy)
     deleted_pk_i64: Vec<i64>,
-    /// Row key bytes being deleted (for RowConverterBased strategy)
+    /// Row key bytes being deleted (for `RowConverterBased` strategy)
     deleted_row_keys: Vec<Box<[u8]>>,
 }
 
@@ -319,9 +319,9 @@ struct BatchValidationResult {
 struct OnConflictValidationResult {
     filtered_batches: Vec<RecordBatch>,
     delete_specs: HashMap<i64, Vec<i64>>,
-    /// Deleted Int64 PK values (for Int64Pk strategy)
+    /// Deleted Int64 PK values (for `Int64Pk` strategy)
     deleted_pk_i64: Vec<i64>,
-    /// Deleted row keys (for RowConverterBased strategy)
+    /// Deleted row keys (for `RowConverterBased` strategy)
     deleted_row_keys: Vec<Box<[u8]>>,
 }
 
@@ -1957,8 +1957,7 @@ impl CayenneTableProvider {
             })?;
 
             // For Int64Pk strategy, get the PK column as Int64Array for efficient lookup
-            use arrow::array::Int64Array;
-            let int64_pk_array: Option<&Int64Array> = if self.pk_deletion_strategy
+            let int64_pk_array: Option<&arrow::array::Int64Array> = if self.pk_deletion_strategy
                 == PkDeletionStrategy::Int64Pk
                 && pk_indices.len() == 1
             {
@@ -2290,8 +2289,8 @@ impl CayenneTableProvider {
     ///    - `RowConverterBased`: Updates `cached_deleted_row_keys` AND `cached_insert_records_row_keys`
     ///    - `PositionBased`: Updates `cached_deleted_row_ids` with row positions
     ///
-    /// For upsert operations, we track both the deletion (with delete_sequence) and the
-    /// re-insertion (with insert_sequence = delete_sequence + 1) so that the new row
+    /// For upsert operations, we track both the deletion (with `delete_sequence`) and the
+    /// re-insertion (with `insert_sequence` = `delete_sequence` + 1) so that the new row
     /// isn't filtered out by the deletion filter during scans.
     ///
     /// Following Iceberg's sequence-based ordering model where deletes are tracked by
@@ -4958,7 +4957,7 @@ impl TableProvider for CayenneTableProvider {
             eprintln!("DEBUG: Primary key found, applying on-conflict handling");
             // Execute the input plan to get the data stream
             let task_ctx = state.task_ctx();
-            let input_stream = input.execute(0, task_ctx.clone()).map_err(|e| {
+            let input_stream = input.execute(0, Arc::clone(&task_ctx)).map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
                     "Failed to execute input plan for on-conflict handling: {e}"
                 ))
@@ -5061,8 +5060,7 @@ impl TableProvider for CayenneTableProvider {
                     })?;
 
                 eprintln!(
-                    "DEBUG: Wrote {} rows to new snapshot with seq={}",
-                    rows_written, insert_sequence
+                    "DEBUG: Wrote {rows_written} rows to new snapshot with seq={insert_sequence}"
                 );
 
                 // Refresh the listing table to include the new snapshot

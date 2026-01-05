@@ -49,9 +49,8 @@ async fn insert_batch(
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let schema = batch.schema();
     let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream),
-    );
+    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
+        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
     table.insert(boxed_stream).await.map_err(Into::into)
 }
 
@@ -105,13 +104,18 @@ async fn test_delete_then_insert_different_key_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("delete_insert", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "delete_insert",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Insert initial data
-    ctx.sql("INSERT INTO delete_insert VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Carol', 300)")
-        .await?
-        .collect()
-        .await?;
+    ctx.sql(
+        "INSERT INTO delete_insert VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Carol', 300)",
+    )
+    .await?
+    .collect()
+    .await?;
 
     // Delete row with id=2 using proper API
     let deleted = delete_records(&table, col("id").eq(lit(2i64))).await?;
@@ -131,14 +135,18 @@ async fn test_delete_then_insert_different_key_impl(
 
     assert_eq!(results.len(), 1);
     let batch = &results[0];
-    assert_eq!(batch.num_rows(), 3, "Should have 3 rows (deleted 1, inserted 1)");
+    assert_eq!(
+        batch.num_rows(),
+        3,
+        "Should have 3 rows (deleted 1, inserted 1)"
+    );
 
     let ids = batch
         .column(0)
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("id column");
-    
+
     // Should have ids 1, 3, 4 (id=2 was deleted)
     assert_eq!(ids.value(0), 1);
     assert_eq!(ids.value(1), 3);
@@ -177,7 +185,10 @@ async fn test_single_upsert_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("single_upsert", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "single_upsert",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Initial insert
     ctx.sql("INSERT INTO single_upsert VALUES (1, 100), (2, 200)")
@@ -204,7 +215,7 @@ async fn test_single_upsert_impl(
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("value column");
-    
+
     assert_eq!(values.value(0), 999, "id=1 should have upserted value 999");
     assert_eq!(values.value(1), 200, "id=2 should remain 200");
 
@@ -241,7 +252,10 @@ async fn test_do_nothing_drops_conflicts_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("do_nothing", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "do_nothing",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Insert initial data
     ctx.sql("INSERT INTO do_nothing VALUES (1, 100), (2, 200)")
@@ -261,16 +275,24 @@ async fn test_do_nothing_drops_conflicts_impl(
         .collect()
         .await?;
 
-    assert_eq!(results[0].num_rows(), 3, "Should have 3 rows (id=1 conflict dropped, id=3 inserted)");
+    assert_eq!(
+        results[0].num_rows(),
+        3,
+        "Should have 3 rows (id=1 conflict dropped, id=3 inserted)"
+    );
 
     let values = results[0]
         .column(1)
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("value column");
-    
+
     // id=1 should retain original value (conflict dropped)
-    assert_eq!(values.value(0), 100, "id=1 should retain original value 100");
+    assert_eq!(
+        values.value(0),
+        100,
+        "id=1 should retain original value 100"
+    );
     assert_eq!(values.value(1), 200, "id=2 should be 200");
     assert_eq!(values.value(2), 300, "id=3 should be 300");
 
@@ -309,7 +331,10 @@ async fn test_upsert_composite_pk_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("composite_upsert", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "composite_upsert",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Insert initial data
     ctx.sql("INSERT INTO composite_upsert VALUES ('US', 1, 100), ('EU', 1, 200), ('US', 2, 300)")
@@ -336,7 +361,7 @@ async fn test_upsert_composite_pk_impl(
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("value column");
-    
+
     // ('EU', 1) should be 200, ('US', 1) should be 999, ('US', 2) should be 300
     assert_eq!(values.value(0), 200, "EU,1 should be 200");
     assert_eq!(values.value(1), 999, "US,1 should be upserted to 999");
@@ -375,7 +400,10 @@ async fn test_upsert_large_batch_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("large_batch", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "large_batch",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Insert 100 rows using SQL (builds VALUES clause)
     let mut values: Vec<String> = Vec::with_capacity(100);
@@ -386,8 +414,17 @@ async fn test_upsert_large_batch_impl(
     ctx.sql(&insert_sql).await?.collect().await?;
 
     // Verify count
-    let results = ctx.sql("SELECT COUNT(*) FROM large_batch").await?.collect().await?;
-    let count = results[0].column(0).as_any().downcast_ref::<Int64Array>().expect("count").value(0);
+    let results = ctx
+        .sql("SELECT COUNT(*) FROM large_batch")
+        .await?
+        .collect()
+        .await?;
+    let count = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count")
+        .value(0);
     assert_eq!(count, 100, "Should have 100 rows");
 
     // Upsert first 50 rows with new values using SQL
@@ -395,17 +432,38 @@ async fn test_upsert_large_batch_impl(
     for i in 1..=50 {
         upsert_values.push(format!("({}, {})", i, i * 100));
     }
-    let upsert_sql = format!("INSERT INTO large_batch VALUES {}", upsert_values.join(", "));
+    let upsert_sql = format!(
+        "INSERT INTO large_batch VALUES {}",
+        upsert_values.join(", ")
+    );
     ctx.sql(&upsert_sql).await?.collect().await?;
 
     // Verify first row was upserted
-    let results = ctx.sql("SELECT value FROM large_batch WHERE id = 1").await?.collect().await?;
-    let value = results[0].column(0).as_any().downcast_ref::<Int64Array>().expect("value").value(0);
+    let results = ctx
+        .sql("SELECT value FROM large_batch WHERE id = 1")
+        .await?
+        .collect()
+        .await?;
+    let value = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value")
+        .value(0);
     assert_eq!(value, 100, "id=1 should have value 100 after upsert");
 
     // Verify row 51 was not upserted (retained original value)
-    let results = ctx.sql("SELECT value FROM large_batch WHERE id = 51").await?.collect().await?;
-    let value = results[0].column(0).as_any().downcast_ref::<Int64Array>().expect("value").value(0);
+    let results = ctx
+        .sql("SELECT value FROM large_batch WHERE id = 51")
+        .await?
+        .collect()
+        .await?;
+    let value = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value")
+        .value(0);
     assert_eq!(value, 510, "id=51 should retain original value 510");
 
     Ok(())
@@ -439,7 +497,10 @@ async fn test_delete_nonexistent_then_insert_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("delete_nonexistent", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "delete_nonexistent",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Insert initial data
     ctx.sql("INSERT INTO delete_nonexistent VALUES (1, 'Alice')")
@@ -457,8 +518,17 @@ async fn test_delete_nonexistent_then_insert_impl(
         .collect()
         .await?;
 
-    let results = ctx.sql("SELECT COUNT(*) FROM delete_nonexistent").await?.collect().await?;
-    let count = results[0].column(0).as_any().downcast_ref::<Int64Array>().expect("count").value(0);
+    let results = ctx
+        .sql("SELECT COUNT(*) FROM delete_nonexistent")
+        .await?
+        .collect()
+        .await?;
+    let count = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count")
+        .value(0);
     assert_eq!(count, 2, "Should have 2 rows");
 
     Ok(())
@@ -494,7 +564,10 @@ async fn test_string_pk_upsert_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("string_pk", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "string_pk",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Insert initial data
     ctx.sql("INSERT INTO string_pk VALUES ('ABC', 100), ('DEF', 200)")
@@ -521,7 +594,7 @@ async fn test_string_pk_upsert_impl(
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("value column");
-    
+
     assert_eq!(values.value(0), 999, "ABC should be upserted to 999");
     assert_eq!(values.value(1), 200, "DEF should be 200");
 
@@ -556,7 +629,10 @@ async fn test_delete_all_then_insert_new_keys_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("delete_all_insert", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "delete_all_insert",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Insert initial data
     ctx.sql("INSERT INTO delete_all_insert VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')")
@@ -569,8 +645,17 @@ async fn test_delete_all_then_insert_new_keys_impl(
     assert_eq!(deleted, 3, "Should delete 3 rows");
 
     // Verify empty
-    let results = ctx.sql("SELECT COUNT(*) FROM delete_all_insert").await?.collect().await?;
-    let count = results[0].column(0).as_any().downcast_ref::<Int64Array>().expect("count").value(0);
+    let results = ctx
+        .sql("SELECT COUNT(*) FROM delete_all_insert")
+        .await?
+        .collect()
+        .await?;
+    let count = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count")
+        .value(0);
     assert_eq!(count, 0, "Table should be empty after delete all");
 
     // Insert with NEW keys (different from deleted ones) - should work
@@ -591,7 +676,7 @@ async fn test_delete_all_then_insert_new_keys_impl(
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("id column");
-    
+
     assert_eq!(ids.value(0), 10);
     assert_eq!(ids.value(1), 20);
 
@@ -628,7 +713,10 @@ async fn test_mixed_conflict_batch_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("mixed_batch", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "mixed_batch",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Insert initial data: ids 1, 2, 3
     ctx.sql("INSERT INTO mixed_batch VALUES (1, 100), (2, 200), (3, 300)")
@@ -654,22 +742,30 @@ async fn test_mixed_conflict_batch_impl(
 
     assert_eq!(results[0].num_rows(), 5, "Should have 5 rows total");
 
-    let ids = results[0].column(0).as_any().downcast_ref::<Int64Array>().expect("id");
-    let values = results[0].column(1).as_any().downcast_ref::<Int64Array>().expect("value");
-    
+    let ids = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id");
+    let values = results[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value");
+
     // Verify values
     assert_eq!(ids.value(0), 1);
     assert_eq!(values.value(0), 111, "id=1 should be upserted to 111");
-    
+
     assert_eq!(ids.value(1), 2);
     assert_eq!(values.value(1), 222, "id=2 should be upserted to 222");
-    
+
     assert_eq!(ids.value(2), 3);
     assert_eq!(values.value(2), 300, "id=3 should remain 300");
-    
+
     assert_eq!(ids.value(3), 4);
     assert_eq!(values.value(3), 400, "id=4 should be inserted as 400");
-    
+
     assert_eq!(ids.value(4), 5);
     assert_eq!(values.value(4), 500, "id=5 should be inserted as 500");
 
@@ -706,7 +802,10 @@ async fn test_empty_batch_impl(
     let table = Arc::new(table);
 
     let ctx = SessionContext::new();
-    ctx.register_table("empty_batch", Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>)?;
+    ctx.register_table(
+        "empty_batch",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
 
     // Insert initial data
     ctx.sql("INSERT INTO empty_batch VALUES (1, 'Alice')")
@@ -719,8 +818,17 @@ async fn test_empty_batch_impl(
     let _ = insert_batch(&table, empty_batch).await;
 
     // Data should be unchanged
-    let results = ctx.sql("SELECT COUNT(*) FROM empty_batch").await?.collect().await?;
-    let count = results[0].column(0).as_any().downcast_ref::<Int64Array>().expect("count").value(0);
+    let results = ctx
+        .sql("SELECT COUNT(*) FROM empty_batch")
+        .await?
+        .collect()
+        .await?;
+    let count = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count")
+        .value(0);
     assert_eq!(count, 1, "Row count should still be 1");
 
     Ok(())
