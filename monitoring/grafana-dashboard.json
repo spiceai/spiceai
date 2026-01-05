@@ -2417,7 +2417,7 @@
           "type": "timeseries"
         }
       ],
-      "title": "📦 DynamoDB Streams (Collapsed)",
+      "title": "📦 DynamoDB Streams Ingestion",
       "type": "row"
     },
     {
@@ -2730,7 +2730,7 @@
           "type": "timeseries"
         }
       ],
-      "title": "🔧 Resource Loading (Collapsed)",
+      "title": "🔧 Resource Loading",
       "type": "row"
     }
   ],
