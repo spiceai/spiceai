@@ -138,7 +138,13 @@ jobs:
       - name: Install OpenAI Codex CLI
         if: (steps.merge.outputs.conflicts == 'true' && env.CONFLICT_RESOLUTION_MODE != 'never') || env.CONFLICT_RESOLUTION_MODE == 'always'
         run: |
-          npm install -g @openai/codex
+          if command -v codex &> /dev/null; then
+            echo "Codex CLI already installed, checking for updates..."
+            npm install -g @openai/codex@latest
+          else
+            echo "Installing Codex CLI..."
+            npm install -g @openai/codex
+          fi
 
       - name: Attempt automated conflict resolution
         if: (steps.merge.outputs.conflicts == 'true' && env.CONFLICT_RESOLUTION_MODE != 'never') || env.CONFLICT_RESOLUTION_MODE == 'always'
