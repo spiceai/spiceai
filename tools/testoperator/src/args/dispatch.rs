@@ -286,14 +286,14 @@ pub struct TextToSqlArgs {
 #[serde(rename_all = "snake_case")]
 #[serde(untagged)]
 pub enum QuerysetSource {
+    Benchmark {
+        benchmark_queryset: BenchmarkQueryset,
+    },
     File {
         queryset_file: PathBuf,
     },
     Payload {
         queryset: String,
-    },
-    Benchmark {
-        benchmark_queryset: BenchmarkQueryset,
     },
 }
 
