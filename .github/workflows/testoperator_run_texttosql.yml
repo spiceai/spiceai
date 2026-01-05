@@ -33,7 +33,7 @@ on:
           - 'bird-bench-small[california_schools]'
           - 'bird-bench-small[card_games]'
           - 'bird-bench-small[community]'
-          - 'bird-bench-small[credit_card_specializing]'
+          - 'bird-bench-small[debit_card_specializing]'
           - 'bird-bench-small[european_football2]'
           - 'bird-bench-small[financial]'
           - 'bird-bench-small[formula1]'
@@ -101,10 +101,12 @@ jobs:
 
       - name: Validate queryset inputs
         run: |
-          if [ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.queryset_file }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]; then
-            echo "Error: Only one of 'queryset', 'queryset_file' or 'benchmark_queryset' can be provided"
-            exit 1
-          fi
+          if ([ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.queryset_file }}" ]) || \
+              ([ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]) || \
+              ([ -n "${{ github.event.inputs.queryset_file }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]); then
+              echo "Error: Only one of 'queryset', 'queryset_file' or 'benchmark_queryset' can be provided"
+              exit 1
+            fi
 
           if [ -z "${{ github.event.inputs.queryset }}" ] && [ -z "${{ github.event.inputs.queryset_file }}" ] && [ -z "${{ github.event.inputs.benchmark_queryset }}" ]; then
             echo "Error: Either 'queryset', 'queryset_file' or 'benchmark_queryset' must be provided"

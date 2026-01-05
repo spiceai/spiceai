@@ -57,8 +57,6 @@ runs:
         sudo mkdir -p /opt/spiced/data
         sudo chown runner:runner /opt/spiced/data
 
-        ls -l "$BIRD_BENCH_DIR"
-
         jq -c --arg db "$BIRD_BENCH_DATASET" \
           '.[] | select(.db_id == $db) | { sql: .SQL, question: .question }' "$BIRD_BENCH_DIR/dev.json" \
           > /opt/spiced/data/queryset.json
@@ -66,13 +64,13 @@ runs:
         mv "$BIRD_BENCH_DIR" "${{ inputs.data_directory }}"
 
         DATASET_SPICEPOD="${{ inputs.data_directory }}dev_20240627/spicepods/$BIRD_BENCH_DATASET/spicepod.yaml"
+        if [ ! -f "$DATASET_SPICEPOD" ]; then
+          echo "Error: Spicepod file not found at $DATASET_SPICEPOD"
+          exit 1
+        fi
 
         sudo sed -i \
           's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' "$DATASET_SPICEPOD"
 
         # Output DATASET_SPICEPOD from action
         echo "spicepod_dependency=$DATASET_SPICEPOD" >> "$GITHUB_OUTPUT"
-
-        # Verify it was written
-        echo "Contents of GITHUB_OUTPUT:"
-        cat "$GITHUB_OUTPUT"
