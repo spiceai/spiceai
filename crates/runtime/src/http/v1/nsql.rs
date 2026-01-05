@@ -317,10 +317,7 @@ pub(crate) async fn handle_nsql_query(
         ..
     } = payload;
     let table_allowlist_opt = match table_allowlist(&model, &rt).await {
-        Ok(ta) => {
-            // tracing::error!("Table allowlist= {ta:#?}");
-            ta
-        }
+        Ok(ta) => ta,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, headers, e);
         }
@@ -357,7 +354,7 @@ pub(crate) async fn handle_nsql_query(
                 .filter(|t| {
                     table_allowlist_opt
                         .as_ref()
-                        .is_some_and(|a| a.table_is_allowed(t))
+                        .is_none_or(|a| a.table_is_allowed(t))
                 })
                 .collect(),
         );
@@ -400,7 +397,7 @@ pub(crate) async fn handle_nsql_query(
         return (
             StatusCode::BAD_REQUEST,
             headers,
-            format!("Model {} not found", model),
+            format!("Model {model} not found"),
         );
     };
 
@@ -509,7 +506,7 @@ pub(crate) async fn handle_nsql_query(
     }
 }
 
-/// Construct a  [`ResolvedTableAwareAllowlist`] based on the `App`'s `model.datasets`.
+/// Construct a [`ResolvedTableAwareAllowlist`] based on the `App`'s `model.datasets`.
 async fn table_allowlist(
     model_name: &str,
     rt: &Arc<Runtime>,

@@ -29,7 +29,7 @@ use tracing::Span;
 use tracing_futures::Instrument;
 
 use super::{
-    RandomSampleParams, SampleFrom, SampleTableMethod, SampleTableParams, TopSamplesParams,
+    RandomSampleParams, SampleFrom, SampleTableMethod, TopSamplesParams,
     distinct::DistinctColumnsParams,
 };
 
