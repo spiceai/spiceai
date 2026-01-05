@@ -121,6 +121,7 @@ async fn test_deletion_with_projection_excluding_pk() -> TestResult<()> {
         table_name: "pk_projection_test".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -211,6 +212,7 @@ async fn test_deletion_persists_after_reopen() -> TestResult<()> {
             table_name: "persist_test".to_string(),
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
+            on_conflict: None,
             base_path: data_dir.path().to_string_lossy().to_string(),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -321,7 +323,8 @@ async fn test_position_based_deletion_no_pk() -> TestResult<()> {
     let table_options = CreateTableOptions {
         table_name: "no_pk_test".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec![], // NO primary key
+        primary_key: vec![],
+        on_conflict: None, // NO primary key
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -386,7 +389,8 @@ async fn test_composite_primary_key_deletion() -> TestResult<()> {
     let table_options = CreateTableOptions {
         table_name: "composite_pk_test".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["region".to_string(), "year".to_string()], // Composite PK
+        primary_key: vec!["region".to_string(), "year".to_string()],
+        on_conflict: None, // Composite PK
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -480,6 +484,7 @@ async fn test_delete_then_insert_different_key() -> TestResult<()> {
         table_name: "delete_insert_test".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -574,6 +579,7 @@ async fn test_multiple_delete_operations() -> TestResult<()> {
         table_name: "multi_delete_test".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -662,6 +668,7 @@ async fn test_large_scale_deletion() -> TestResult<()> {
         table_name: "large_scale_test".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),

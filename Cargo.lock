@@ -3150,6 +3150,7 @@ dependencies = [
  "datafusion-federation",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
+ "datafusion-table-providers",
  "futures",
  "insta",
  "object_store",

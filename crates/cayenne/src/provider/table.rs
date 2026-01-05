@@ -19,18 +19,21 @@ limitations under the License.
 //! This module contains the main `CayenneTableProvider` struct which implements
 //! `DataFusion`'s `TableProvider` trait for Cayenne tables.
 
-use super::constants::{DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
+use super::constants::{
+    DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
+};
 use super::delete::{
     read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec, Int64PkDeletionFilterExec,
     KeyBasedDeletionFilterExec,
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
+use crate::deletion::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
-use arrow_row::{RowConverter, SortField};
+use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionTableProvider};
@@ -51,12 +54,14 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_table_providers::util::constraints::UpsertOptions;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectStorePath;
 use roaring::RoaringBitmap;
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::task;
 use vortex::compressor::CompactCompressor;
@@ -64,6 +69,22 @@ use vortex::file::WriteStrategyBuilder;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormat;
 use vortex_session::VortexSession;
+
+/// Extension trait to extract `UpsertOptions` from `OnConflict`.
+///
+/// The upstream `OnConflict` enum only contains `ColumnReference`, but our on-conflict
+/// logic requires `UpsertOptions`. This trait provides a compatibility shim.
+trait OnConflictExt {
+    /// Returns `UpsertOptions` for this `OnConflict` variant.
+    /// Currently returns default options; future versions may store options in `OnConflict`.
+    fn get_upsert_options(&self) -> UpsertOptions;
+}
+
+impl OnConflictExt for OnConflict {
+    fn get_upsert_options(&self) -> UpsertOptions {
+        UpsertOptions::default()
+    }
+}
 
 /// Strategy for primary key-based deletion filtering.
 ///
@@ -276,6 +297,41 @@ impl CayenneTableProviderBuilder {
         )
         .await
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RowLocation {
+    data_file_id: i64,
+    row_id: i64,
+}
+
+struct BatchValidationResult {
+    filtered_batch: Option<RecordBatch>,
+    delete_specs: Vec<(i64, Vec<i64>)>,
+    kept_keys: HashSet<OwnedRow>,
+    /// Int64 PK values being deleted (for `Int64Pk` strategy)
+    deleted_pk_i64: Vec<i64>,
+    /// Row key bytes being deleted (for `RowConverterBased` strategy)
+    deleted_row_keys: Vec<Box<[u8]>>,
+}
+
+/// Result of on-conflict validation containing deleted PK information.
+struct OnConflictValidationResult {
+    filtered_batches: Vec<RecordBatch>,
+    delete_specs: HashMap<i64, Vec<i64>>,
+    /// Deleted Int64 PK values (for `Int64Pk` strategy)
+    deleted_pk_i64: Vec<i64>,
+    /// Deleted row keys (for `RowConverterBased` strategy)
+    deleted_row_keys: Vec<Box<[u8]>>,
+}
+
+struct OnConflictContext<'a> {
+    pk_indices: &'a [usize],
+    converter: &'a RowConverter,
+    on_conflict: &'a OnConflict,
+    upsert_options: &'a UpsertOptions,
+    existing_keys: &'a mut HashMap<OwnedRow, RowLocation>,
+    incoming_keys: &'a HashSet<OwnedRow>,
 }
 
 impl std::fmt::Debug for CayenneTableProvider {
@@ -1016,9 +1072,39 @@ impl CayenneTableProvider {
 
         let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
 
+        // If a primary key is configured, enforce on_conflict behavior by materializing
+        // the incoming stream, validating keys, and preparing deletion vectors.
+        let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
+            if let Some(pk_indices) = self.primary_key_indices()? {
+                let converter = self.build_pk_converter(&pk_indices)?;
+                let mut existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
+                let validation_result = self
+                    .validate_on_conflict(stream, &pk_indices, &converter, &mut existing_keys)
+                    .await?;
+
+                // Build a new stream from the validated batches.
+                let schema = validation_result.filtered_batches.first().map_or_else(
+                    || Arc::clone(&self.table_metadata.schema),
+                    RecordBatch::schema,
+                );
+                let validated_stream = RecordBatchStreamAdapter::new(
+                    Arc::clone(&schema),
+                    futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok)),
+                );
+
+                (
+                    Box::pin(validated_stream) as SendableRecordBatchStream,
+                    validation_result.delete_specs,
+                    validation_result.deleted_pk_i64,
+                    validation_result.deleted_row_keys,
+                )
+            } else {
+                (stream, HashMap::new(), Vec::new(), Vec::new())
+            };
+
         // Process stream in chunks and write them in parallel with bounded concurrency
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel(stream, target_size_bytes)
+            .chunk_and_write_parallel(prepared_stream, target_size_bytes)
             .await?;
 
         tracing::debug!(
@@ -1026,6 +1112,10 @@ impl CayenneTableProvider {
             total_rows,
             chunk_count
         );
+
+        // Apply any deletion vectors generated by on_conflict handling before retention.
+        self.apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
+            .await?;
 
         // Apply retention filters before refreshing the listing table so any rows matching the
         // configured predicate are captured in deletion vector files within this refresh.
@@ -1741,6 +1831,724 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
         }
+    }
+
+    /// Returns the column indices for the configured primary key, if any.
+    fn primary_key_indices(&self) -> CatalogResult<Option<Vec<usize>>> {
+        if self.table_metadata.primary_key.is_empty() {
+            return Ok(None);
+        }
+
+        let mut indices = Vec::with_capacity(self.table_metadata.primary_key.len());
+        for pk_col in &self.table_metadata.primary_key {
+            let idx = self.table_metadata.schema.index_of(pk_col).map_err(|_| {
+                CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Primary key column '{pk_col}' not found in schema for table {}",
+                        self.table_metadata.table_name
+                    ),
+                }
+            })?;
+            indices.push(idx);
+        }
+
+        Ok(Some(indices))
+    }
+
+    /// Build a `RowConverter` for the primary key columns.
+    fn build_pk_converter(&self, pk_indices: &[usize]) -> CatalogResult<RowConverter> {
+        let mut sort_fields = Vec::with_capacity(pk_indices.len());
+        for idx in pk_indices {
+            let field = self.table_metadata.schema.field(*idx);
+            sort_fields.push(SortField::new(field.data_type().clone()));
+        }
+
+        RowConverter::new(sort_fields).map_err(|err| CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "Failed to create row converter for primary key on table {}: {err}",
+                self.table_metadata.table_name
+            ),
+        })
+    }
+
+    /// Build the existing keyset (primary key bytes -> row location) for append-mode inserts.
+    ///
+    /// This method respects ALL deletion caches based on `pk_deletion_strategy`:
+    /// - `Int64Pk`: Uses `cached_deleted_pk_i64` (single Int64 primary key)
+    /// - `RowConverterBased`: Uses `cached_deleted_row_keys` (composite/non-integer PK)
+    /// - `PositionBased`: Uses `cached_deleted_row_ids` (no primary key)
+    async fn load_existing_keyset(
+        &self,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+    ) -> CatalogResult<HashMap<OwnedRow, RowLocation>> {
+        // Clone listing table to avoid holding locks across await points
+        let listing_table = {
+            let guard = self
+                .listing_table
+                .read()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "load_existing_keyset (read listing table)".to_string(),
+                })?;
+            Arc::clone(&guard)
+        };
+
+        let ctx = SessionContext::new();
+        let scan_plan = listing_table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to scan listing table for primary keys: {err}"),
+            })?;
+
+        let batches = collect(scan_plan, ctx.task_ctx()).await.map_err(|err| {
+            CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to collect primary key scan: {err}"),
+            }
+        })?;
+
+        // Load the appropriate deletion cache based on pk_deletion_strategy.
+        // This ensures keys that were previously deleted are not considered as conflicts.
+        let deleted_row_ids = {
+            let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                CatalogError::InvalidOperationNoSource {
+                    message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                }
+            })?;
+            Arc::clone(&guard)
+        };
+
+        let deleted_pk_i64 = if self.pk_deletion_strategy == PkDeletionStrategy::Int64Pk {
+            let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                CatalogError::InvalidOperationNoSource {
+                    message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                }
+            })?;
+            Some(Arc::clone(&guard))
+        } else {
+            None
+        };
+
+        let deleted_row_keys = if self.pk_deletion_strategy == PkDeletionStrategy::RowConverterBased
+        {
+            let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                CatalogError::InvalidOperationNoSource {
+                    message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                }
+            })?;
+            Some(Arc::clone(&guard))
+        } else {
+            None
+        };
+
+        let mut keyset = HashMap::with_capacity(1024);
+        let mut row_id_base: i64 = 0;
+
+        for batch in batches {
+            let pk_columns: Vec<_> = pk_indices
+                .iter()
+                .map(|idx| Arc::clone(batch.column(*idx)))
+                .collect();
+
+            let rows = converter.convert_columns(&pk_columns).map_err(|err| {
+                CatalogError::InvalidOperationNoSource {
+                    message: format!("Failed to convert primary key columns: {err}"),
+                }
+            })?;
+
+            // For Int64Pk strategy, get the PK column as Int64Array for efficient lookup
+            let int64_pk_array: Option<&arrow::array::Int64Array> = if self.pk_deletion_strategy
+                == PkDeletionStrategy::Int64Pk
+                && pk_indices.len() == 1
+            {
+                batch.column(pk_indices[0]).as_any().downcast_ref()
+            } else {
+                None
+            };
+
+            for row_idx in 0..batch.num_rows() {
+                let row_id = row_id_base
+                    + i64::try_from(row_idx).map_err(|_| {
+                        CatalogError::InvalidOperationNoSource {
+                            message: "Row index exceeds i64::MAX; cannot compute row_id"
+                                .to_string(),
+                        }
+                    })?;
+
+                // Check if row is deleted based on pk_deletion_strategy
+                let is_deleted = match self.pk_deletion_strategy {
+                    PkDeletionStrategy::Int64Pk => {
+                        if let (Some(pk_array), Some(deleted_pks)) =
+                            (int64_pk_array, &deleted_pk_i64)
+                        {
+                            let pk_value = pk_array.value(row_idx);
+                            deleted_pks.contains_key(&pk_value)
+                        } else {
+                            false
+                        }
+                    }
+                    PkDeletionStrategy::RowConverterBased => {
+                        if let Some(deleted_keys) = &deleted_row_keys {
+                            let key = rows.row(row_idx);
+                            deleted_keys.contains_key(key.as_ref())
+                        } else {
+                            false
+                        }
+                    }
+                    PkDeletionStrategy::PositionBased => {
+                        if let Ok(row_id_u32) = u32::try_from(row_id) {
+                            deleted_row_ids.contains(row_id_u32)
+                        } else {
+                            false
+                        }
+                    }
+                };
+
+                if is_deleted {
+                    continue;
+                }
+
+                // Enforce non-null primary key values
+                let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
+                if has_null {
+                    return Err(CatalogError::InvalidOperationNoSource {
+                        message: format!(
+                            "Null primary key encountered in existing data for table {}",
+                            self.table_metadata.table_name
+                        ),
+                    });
+                }
+
+                let key = rows.row(row_idx).owned();
+
+                if keyset
+                    .insert(
+                        key,
+                        RowLocation {
+                            data_file_id: DEFAULT_DATA_FILE_ID,
+                            row_id,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(CatalogError::InvalidOperationNoSource {
+                        message: format!(
+                            "Existing data for table {} violates primary key uniqueness",
+                            self.table_metadata.table_name
+                        ),
+                    });
+                }
+            }
+
+            row_id_base += i64::try_from(batch.num_rows()).map_err(|_| {
+                CatalogError::InvalidOperationNoSource {
+                    message: "Batch row count exceeds i64::MAX; cannot compute row_id_base"
+                        .to_string(),
+                }
+            })?;
+        }
+
+        Ok(keyset)
+    }
+
+    /// Validate incoming batches against primary key uniqueness and configured on-conflict behavior.
+    ///
+    /// Returns filtered batches (with dropped rows removed) and a map of deletion vector specs
+    /// keyed by `data_file_id`.
+    async fn validate_on_conflict(
+        &self,
+        mut stream: SendableRecordBatchStream,
+        pk_indices: &[usize],
+        converter: &RowConverter,
+        existing_keys: &mut HashMap<OwnedRow, RowLocation>,
+    ) -> CatalogResult<OnConflictValidationResult> {
+        let mut incoming_keys: HashSet<OwnedRow> = HashSet::with_capacity(1024);
+        let mut filtered_batches = Vec::new();
+        let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut all_deleted_pk_i64: Vec<i64> = Vec::new();
+        let mut all_deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
+
+        // Use configured on_conflict or default to DoNothingAll (silently drops duplicates).
+        // When a primary key is configured without explicit on_conflict, this ensures
+        // inserts succeed without unique constraint errors.
+        let on_conflict = self
+            .table_metadata
+            .on_conflict
+            .clone()
+            .unwrap_or(OnConflict::DoNothingAll);
+        let upsert_options = on_conflict.get_upsert_options();
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.map_err(|e| CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to read batch for on_conflict validation: {e}"),
+            })?;
+
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let mut ctx = OnConflictContext {
+                pk_indices,
+                converter,
+                on_conflict: &on_conflict,
+                upsert_options: &upsert_options,
+                existing_keys,
+                incoming_keys: &incoming_keys,
+            };
+
+            let BatchValidationResult {
+                filtered_batch,
+                delete_specs: batch_delete_specs,
+                kept_keys,
+                deleted_pk_i64,
+                deleted_row_keys,
+            } = self.apply_on_conflict_to_batch(batch, &mut ctx)?;
+
+            for (data_file_id, rows) in batch_delete_specs {
+                delete_specs.entry(data_file_id).or_default().extend(rows);
+            }
+
+            all_deleted_pk_i64.extend(deleted_pk_i64);
+            all_deleted_row_keys.extend(deleted_row_keys);
+
+            incoming_keys.extend(kept_keys);
+
+            if let Some(batch) = filtered_batch {
+                filtered_batches.push(batch);
+            }
+        }
+
+        Ok(OnConflictValidationResult {
+            filtered_batches,
+            delete_specs,
+            deleted_pk_i64: all_deleted_pk_i64,
+            deleted_row_keys: all_deleted_row_keys,
+        })
+    }
+
+    fn apply_on_conflict_to_batch(
+        &self,
+        batch: RecordBatch,
+        ctx: &mut OnConflictContext<'_>,
+    ) -> CatalogResult<BatchValidationResult> {
+        use arrow::array::Int64Array;
+
+        let pk_columns: Vec<_> = ctx
+            .pk_indices
+            .iter()
+            .map(|idx| Arc::clone(batch.column(*idx)))
+            .collect();
+
+        let rows = ctx.converter.convert_columns(&pk_columns).map_err(|err| {
+            CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to convert primary key columns: {err}"),
+            }
+        })?;
+
+        // For Int64Pk strategy, get direct access to the PK column for value extraction
+        let int64_pk_array: Option<&Int64Array> =
+            if self.pk_deletion_strategy == PkDeletionStrategy::Int64Pk && pk_columns.len() == 1 {
+                pk_columns[0].as_any().downcast_ref::<Int64Array>()
+            } else {
+                None
+            };
+
+        let mut keep_mask = Vec::with_capacity(batch.num_rows());
+        let mut row_keys: Vec<OwnedRow> = Vec::with_capacity(batch.num_rows());
+        let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut deleted_pk_i64: Vec<i64> = Vec::new();
+        let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
+
+        for row_idx in 0..batch.num_rows() {
+            let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
+            if has_null {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Primary key values must be non-null for table {}",
+                        self.table_metadata.table_name
+                    ),
+                });
+            }
+
+            let key = rows.row(row_idx).owned();
+            if ctx.incoming_keys.contains(&key) {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Incoming data for table {} contains duplicate primary key across batches",
+                        self.table_metadata.table_name
+                    ),
+                });
+            }
+
+            if let Some(existing) = ctx.existing_keys.get(&key) {
+                match ctx.on_conflict {
+                    OnConflict::DoNothingAll | OnConflict::DoNothing(_) => {
+                        keep_mask.push(false);
+                    }
+                    OnConflict::Upsert(_) => {
+                        delete_specs
+                            .entry(existing.data_file_id)
+                            .or_default()
+                            .push(existing.row_id);
+
+                        // Track the PK value being deleted for cache updates
+                        match self.pk_deletion_strategy {
+                            PkDeletionStrategy::Int64Pk => {
+                                if let Some(arr) = int64_pk_array {
+                                    deleted_pk_i64.push(arr.value(row_idx));
+                                }
+                            }
+                            PkDeletionStrategy::RowConverterBased => {
+                                deleted_row_keys.push(key.as_ref().to_vec().into_boxed_slice());
+                            }
+                            PkDeletionStrategy::PositionBased => {
+                                // Position-based doesn't need PK values
+                            }
+                        }
+
+                        ctx.existing_keys.insert(
+                            key.clone(),
+                            RowLocation {
+                                data_file_id: DEFAULT_DATA_FILE_ID,
+                                row_id: -1,
+                            },
+                        );
+                        keep_mask.push(true);
+                    }
+                }
+            } else {
+                keep_mask.push(true);
+            }
+
+            row_keys.push(key);
+        }
+
+        if !ctx.upsert_options.is_default() {
+            let mut seen: HashMap<OwnedRow, usize> = HashMap::new();
+            for (row_idx, key) in row_keys.iter().enumerate() {
+                if !keep_mask[row_idx] {
+                    continue;
+                }
+
+                if let Some(existing_idx) = seen.get(key) {
+                    if ctx.upsert_options.last_write_wins {
+                        keep_mask[*existing_idx] = false;
+                        seen.insert(key.clone(), row_idx);
+                    } else if ctx.upsert_options.remove_duplicates {
+                        keep_mask[row_idx] = false;
+                    } else {
+                        return Err(CatalogError::InvalidOperationNoSource {
+                            message: format!(
+                                "Duplicate primary key found in batch for table {}",
+                                self.table_metadata.table_name
+                            ),
+                        });
+                    }
+                } else {
+                    seen.insert(key.clone(), row_idx);
+                }
+            }
+        }
+
+        let (filtered_batch, kept_keys) =
+            Self::filter_validated_batch(batch, keep_mask, &row_keys)?;
+
+        Ok(BatchValidationResult {
+            filtered_batch,
+            delete_specs: delete_specs.into_iter().collect(),
+            kept_keys,
+            deleted_pk_i64,
+            deleted_row_keys,
+        })
+    }
+
+    fn filter_validated_batch(
+        batch: RecordBatch,
+        keep_mask: Vec<bool>,
+        row_keys: &[OwnedRow],
+    ) -> CatalogResult<(Option<RecordBatch>, HashSet<OwnedRow>)> {
+        if keep_mask.iter().all(|v| !*v) {
+            return Ok((None, HashSet::new()));
+        }
+
+        let kept_keys: HashSet<OwnedRow> = row_keys
+            .iter()
+            .zip(&keep_mask)
+            .filter(|(_, keep)| **keep)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        if keep_mask.iter().all(|v| *v) {
+            return Ok((Some(batch), kept_keys));
+        }
+
+        let filter_array = arrow::array::BooleanArray::from(keep_mask);
+        let filtered_batch =
+            arrow::compute::filter_record_batch(&batch, &filter_array).map_err(|err| {
+                CatalogError::InvalidOperationNoSource {
+                    message: format!("Failed to filter batch for on_conflict handling: {err}"),
+                }
+            })?;
+
+        Ok((Some(filtered_batch), kept_keys))
+    }
+
+    /// Apply deletion vectors generated by on-conflict handling.
+    ///
+    /// This function:
+    /// 1. Writes deletion vectors for position-based tracking (compatible with compaction)
+    /// 2. Updates the appropriate in-memory cache based on `pk_deletion_strategy`:
+    ///    - `Int64Pk`: Updates `cached_deleted_pk_i64` AND `cached_insert_records_pk_i64`
+    ///    - `RowConverterBased`: Updates `cached_deleted_row_keys` AND `cached_insert_records_row_keys`
+    ///    - `PositionBased`: Updates `cached_deleted_row_ids` with row positions
+    ///
+    /// For upsert operations, we track both the deletion (with `delete_sequence`) and the
+    /// re-insertion (with `insert_sequence` = `delete_sequence` + 1) so that the new row
+    /// isn't filtered out by the deletion filter during scans.
+    ///
+    /// Following Iceberg's sequence-based ordering model where deletes are tracked by
+    /// PK value + sequence number for proper ordering of concurrent operations.
+    async fn apply_on_conflict_deletions(
+        &self,
+        delete_specs: HashMap<i64, Vec<i64>>,
+        deleted_pk_i64: Vec<i64>,
+        deleted_row_keys: Vec<Box<[u8]>>,
+    ) -> CatalogResult<()> {
+        if delete_specs.is_empty() {
+            return Ok(());
+        }
+
+        // Get a fresh sequence number for this deletion operation.
+        // This ensures proper ordering: data written after this delete but before
+        // the next delete will be properly filtered.
+        let delete_sequence = self
+            .catalog
+            .increment_sequence_number(self.table_metadata.table_id)
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to get delete sequence number: {err}"),
+            })?;
+
+        // The insert sequence must be higher than delete sequence so the new row
+        // isn't filtered out. We use delete_sequence + 1 for the re-insertion.
+        let insert_sequence = delete_sequence + 1;
+
+        // Capture existing delete files so we can replace them atomically.
+        let existing_delete_files = self
+            .catalog
+            .get_table_delete_files(self.table_metadata.table_id)
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Failed to load existing delete files: {err}"),
+            })?;
+
+        let existing_ids: Vec<i64> = existing_delete_files
+            .iter()
+            .map(|f| f.delete_file_id)
+            .collect();
+        let existing_paths: Vec<std::path::PathBuf> = existing_delete_files
+            .iter()
+            .map(|f| f.path.clone().into())
+            .collect();
+
+        let writer = DeletionVectorWriter::new(&self.table_metadata);
+        let cached_deleted = {
+            let guard = self.cached_deleted_row_ids.read().map_err(|_| {
+                CatalogError::InvalidOperationNoSource {
+                    message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                }
+            })?;
+            Arc::clone(&guard)
+        };
+        let mut specs = Vec::new();
+        for (data_file_id, mut rows) in delete_specs {
+            if !cached_deleted.is_empty() && data_file_id == DEFAULT_DATA_FILE_ID {
+                rows.extend(
+                    cached_deleted
+                        .iter()
+                        .map(i64::from)
+                        .filter(|row_id| *row_id >= 0),
+                );
+            }
+            specs.push(DeletionVectorWriteSpec::new(rows));
+        }
+
+        let results = writer.write(specs).await?;
+
+        if results.is_empty() {
+            return Ok(());
+        }
+
+        let mut new_deleted_rows = RoaringBitmap::new();
+        // Register new delete files
+        for result in &results {
+            self.catalog
+                .add_delete_file(result.delete_file.clone())
+                .await
+                .map_err(|err| CatalogError::InvalidOperationNoSource {
+                    message: format!("Failed to register delete file: {err}"),
+                })?;
+
+            if let DeletionIdentifier::PositionBased(row_ids) = &result.identifiers {
+                for &row_id in row_ids {
+                    if let Ok(row_id_u32) = u32::try_from(row_id) {
+                        new_deleted_rows.insert(row_id_u32);
+                    }
+                }
+            }
+        }
+
+        // Remove old delete files after new ones are registered.
+        if !existing_ids.is_empty() {
+            self.catalog
+                .remove_delete_files(self.table_metadata.table_id, &existing_ids)
+                .await
+                .map_err(|err| CatalogError::InvalidOperationNoSource {
+                    message: format!("Failed to remove old delete files: {err}"),
+                })?;
+
+            // Best-effort cleanup of old files on disk.
+            for path in existing_paths {
+                if let Err(err) = tokio::fs::remove_file(&path).await {
+                    tracing::debug!(
+                        "Failed to delete obsolete deletion vector file {:?}: {err}",
+                        path
+                    );
+                }
+            }
+        }
+
+        // Update the appropriate cache based on deletion strategy.
+        // This follows Iceberg's pattern where deletes are tracked by PK + sequence number.
+        // For upserts, we also update insert records so the new row isn't filtered out.
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::Int64Pk => {
+                // Update Int64 PK deletion cache with delete sequence
+                {
+                    let mut guard = self.cached_deleted_pk_i64.write().map_err(|_| {
+                        CatalogError::InvalidOperationNoSource {
+                            message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                        }
+                    })?;
+
+                    let mut updated_map = (**guard).clone();
+                    for &pk_value in &deleted_pk_i64 {
+                        updated_map
+                            .entry(pk_value)
+                            .and_modify(|seq| *seq = (*seq).max(delete_sequence))
+                            .or_insert(delete_sequence);
+                    }
+                    let updated_count = updated_map.len();
+                    *guard = Arc::new(updated_map);
+
+                    tracing::debug!(
+                        "Updated Int64 PK deletion cache with {} keys (seq={}) for table {}",
+                        updated_count,
+                        delete_sequence,
+                        self.table_metadata.table_name
+                    );
+                }
+
+                // Update Int64 PK insert records cache with insert sequence (higher than delete)
+                // This ensures the newly inserted row isn't filtered out by the deletion filter.
+                {
+                    let mut guard = self.cached_insert_records_pk_i64.write().map_err(|_| {
+                        CatalogError::InvalidOperationNoSource {
+                            message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                        }
+                    })?;
+
+                    let mut updated_map = (**guard).clone();
+                    for pk_value in deleted_pk_i64 {
+                        updated_map
+                            .entry(pk_value)
+                            .and_modify(|seq| *seq = (*seq).max(insert_sequence))
+                            .or_insert(insert_sequence);
+                    }
+                    let updated_count = updated_map.len();
+                    *guard = Arc::new(updated_map);
+
+                    tracing::debug!(
+                        "Updated Int64 PK insert records cache with {} keys (seq={}) for table {}",
+                        updated_count,
+                        insert_sequence,
+                        self.table_metadata.table_name
+                    );
+                }
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                // Update row key deletion cache with delete sequence
+                {
+                    let mut guard = self.cached_deleted_row_keys.write().map_err(|_| {
+                        CatalogError::InvalidOperationNoSource {
+                            message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                        }
+                    })?;
+
+                    let mut updated_map = (**guard).clone();
+                    for row_key in &deleted_row_keys {
+                        updated_map
+                            .entry(row_key.clone())
+                            .and_modify(|seq| *seq = (*seq).max(delete_sequence))
+                            .or_insert(delete_sequence);
+                    }
+                    let updated_count = updated_map.len();
+                    *guard = Arc::new(updated_map);
+
+                    tracing::debug!(
+                        "Updated RowConverter deletion cache with {} keys (seq={}) for table {}",
+                        updated_count,
+                        delete_sequence,
+                        self.table_metadata.table_name
+                    );
+                }
+
+                // Update row key insert records cache with insert sequence
+                {
+                    let mut guard = self.cached_insert_records_row_keys.write().map_err(|_| {
+                        CatalogError::InvalidOperationNoSource {
+                            message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                        }
+                    })?;
+
+                    let mut updated_map = (**guard).clone();
+                    for row_key in deleted_row_keys {
+                        updated_map
+                            .entry(row_key)
+                            .and_modify(|seq| *seq = (*seq).max(insert_sequence))
+                            .or_insert(insert_sequence);
+                    }
+                    let updated_count = updated_map.len();
+                    *guard = Arc::new(updated_map);
+
+                    tracing::debug!(
+                        "Updated RowConverter insert records cache with {} keys (seq={}) for table {}",
+                        updated_count,
+                        insert_sequence,
+                        self.table_metadata.table_name
+                    );
+                }
+            }
+            PkDeletionStrategy::PositionBased => {
+                // Update position-based cache (original behavior)
+                let mut guard = self.cached_deleted_row_ids.write().map_err(|_| {
+                    CatalogError::InvalidOperationNoSource {
+                        message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                    }
+                })?;
+
+                let mut merged = (**guard).clone();
+                merged |= new_deleted_rows;
+                *guard = Arc::new(merged);
+
+                tracing::debug!(
+                    "Updated position-based deletion cache for table {}",
+                    self.table_metadata.table_name
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Sort a record batch stream using `DataFusion`'s `SortExec` for optimal performance.
@@ -4153,8 +4961,147 @@ impl TableProvider for CayenneTableProvider {
             );
         }
 
+        // If a primary key is configured, materialize the input and apply on-conflict handling.
+        let final_input = if let Some(pk_indices) = self.primary_key_indices().map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to get primary key indices: {e}"
+            ))
+        })? {
+            // Execute the input plan to get the data stream
+            let task_ctx = state.task_ctx();
+            let input_stream = input.execute(0, Arc::clone(&task_ctx)).map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to execute input plan for on-conflict handling: {e}"
+                ))
+            })?;
+
+            // Build converter and load existing keys
+            let converter = self.build_pk_converter(&pk_indices).map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to build PK converter: {e}"
+                ))
+            })?;
+            let mut existing_keys = self
+                .load_existing_keyset(&pk_indices, &converter)
+                .await
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to load existing keyset: {e}"
+                    ))
+                })?;
+
+            // Validate on-conflict and get filtered batches + deletion specs
+            let validation_result = self
+                .validate_on_conflict(input_stream, &pk_indices, &converter, &mut existing_keys)
+                .await
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to validate on-conflict: {e}"
+                    ))
+                })?;
+
+            // Apply deletion vectors for upserted rows
+            let has_on_conflict_deletions = !validation_result.delete_specs.is_empty();
+            if has_on_conflict_deletions {
+                self.apply_on_conflict_deletions(
+                    validation_result.delete_specs,
+                    validation_result.deleted_pk_i64,
+                    validation_result.deleted_row_keys,
+                )
+                .await
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to apply on-conflict deletions: {e}"
+                    ))
+                })?;
+            }
+
+            // Create new input from validated batches
+            if validation_result.filtered_batches.is_empty() {
+                // Nothing to insert after on-conflict filtering
+                // Return a plan that does nothing
+                return Ok(Arc::new(datafusion_physical_plan::empty::EmptyExec::new(
+                    Arc::clone(&self.table_metadata.schema),
+                )));
+            }
+
+            // If there were on-conflict deletions, write to a NEW snapshot that's protected
+            // from those deletions. Otherwise, write to the main snapshot.
+            if has_on_conflict_deletions {
+                // Use the streaming insert to write to a new snapshot with proper sequence handling
+                let schema = validation_result
+                    .filtered_batches
+                    .first()
+                    .map(RecordBatch::schema)
+                    .ok_or_else(|| {
+                        datafusion_common::DataFusionError::Execution(
+                            "No validated batches after applying on-conflict deletions".to_string(),
+                        )
+                    })?;
+                let batch_stream =
+                    futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok));
+                let validated_stream =
+                    RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
+
+                // Get a sequence number higher than the delete sequence
+                let insert_sequence = self
+                    .catalog
+                    .increment_sequence_number(self.table_metadata.table_id)
+                    .await
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to get insert sequence: {e}"
+                        ))
+                    })?;
+
+                // Write to a new snapshot
+                let _rows_written = self
+                    .insert_to_new_snapshot_with_sequence(
+                        Box::pin(validated_stream),
+                        insert_sequence,
+                    )
+                    .await
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to insert to new snapshot: {e}"
+                        ))
+                    })?;
+
+                // Refresh the listing table to include the new snapshot
+                self.refresh_listing_table().map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to refresh listing table: {e}"
+                    ))
+                })?;
+
+                // Return an empty plan since we already did the insert
+                return Ok(Arc::new(datafusion_physical_plan::empty::EmptyExec::new(
+                    Arc::clone(&self.table_metadata.schema),
+                )));
+            }
+
+            let schema = validation_result
+                .filtered_batches
+                .first()
+                .map(RecordBatch::schema)
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(
+                        "No validated batches for on-conflict handling".to_string(),
+                    )
+                })?;
+            let batch_stream =
+                futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok));
+            let validated_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
+
+            Arc::new(StreamingExec::new(schema, Box::pin(validated_stream)))
+                as Arc<dyn ExecutionPlan>
+        } else {
+            // No primary key, use input as-is
+            input
+        };
+
         let result = listing_table
-            .insert_into(state, input, InsertOp::Append)
+            .insert_into(state, final_input, InsertOp::Append)
             .await?;
 
         if is_s3 {
@@ -4363,6 +5310,7 @@ mod tests {
                 table_name: cmd.name.to_string(),
                 schema: Arc::clone(cmd.schema.inner()),
                 primary_key: vec![], // No PK by default, can be set by caller
+                on_conflict: None,   // No on-conflict behavior by default
                 base_path: dir_path,
                 partition_column: None, // Non-partitioned table
                 vortex_config,
