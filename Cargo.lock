@@ -14294,7 +14294,7 @@ dependencies = [
  "http 1.4.0",
  "insta",
  "libnfs",
- "nix 0.25.1",
+ "nix 0.30.1",
  "object_store",
  "reqwest",
  "serde",
