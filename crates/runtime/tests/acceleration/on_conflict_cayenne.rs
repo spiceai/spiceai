@@ -305,8 +305,7 @@ async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
                 metadata_dir.display().to_string(),
             );
 
-            let mut dataset =
-                Dataset::new(format!("file://{}", types_csv.display()), "types_test");
+            let mut dataset = Dataset::new(format!("file://{}", types_csv.display()), "types_test");
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
                 engine: Some("cayenne".to_string()),
@@ -332,8 +331,7 @@ async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
             runtime_ready_check(&rt).await;
 
             // Verify all data was loaded correctly
-            let result =
-                execute_sql(&rt, "SELECT COUNT(*) as cnt FROM types_test").await?;
+            let result = execute_sql(&rt, "SELECT COUNT(*) as cnt FROM types_test").await?;
             let expected = ["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
@@ -358,8 +356,7 @@ async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
             assert_eq!(count, 1, "Should have 1 row for aggregate");
 
             // Test text filtering
-            let result =
-                execute_sql(&rt, "SELECT text_col FROM types_test WHERE id = 1").await?;
+            let result = execute_sql(&rt, "SELECT text_col FROM types_test WHERE id = 1").await?;
             let expected = [
                 "+----------+",
                 "| text_col |",
@@ -421,8 +418,7 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
                 metadata_dir.display().to_string(),
             );
 
-            let mut dataset =
-                Dataset::new(format!("file://{}", csv_file.display()), "pk_test");
+            let mut dataset = Dataset::new(format!("file://{}", csv_file.display()), "pk_test");
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
                 engine: Some("cayenne".to_string()),
@@ -477,10 +473,7 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
         .await
 }
 
-async fn execute_sql(
-    rt: &Arc<Runtime>,
-    sql: &str,
-) -> Result<Vec<RecordBatch>, anyhow::Error> {
+async fn execute_sql(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
     rt.datafusion()
         .query_builder(sql)
         .build()
