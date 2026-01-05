@@ -304,11 +304,15 @@ impl SpanExporter for OtelExportMultiplexer {
         let zipkin_future = self.zipkin.as_ref().map(|exporter| exporter.export(batch));
 
         async move {
-            if let Some(zipkin_future) = zipkin_future {
-                let _ = zipkin_future.await;
+            if let Some(zipkin_future) = zipkin_future
+                && let Err(e) = zipkin_future.await
+            {
+                tracing::warn!("Failed to send traces to Zipkin: {e}");
             }
 
-            let _ = history_future.await;
+            if let Err(e) = history_future.await {
+                tracing::warn!("Failed to write to task history: {e}");
+            }
 
             Ok(())
         }

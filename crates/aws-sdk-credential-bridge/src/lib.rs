@@ -17,6 +17,12 @@ limitations under the License.
 mod credential_provider;
 use std::{sync::Arc, time::Duration};
 
+use aws_config::Region;
+use aws_config::ecs::EcsCredentialsProvider;
+use aws_config::imds::credentials::ImdsCredentialsProvider;
+use aws_config::meta::credentials::CredentialsProviderChain;
+use aws_config::provider_config::ProviderConfig;
+use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_s3::{config::ProvideCredentials, error::ConnectorError};
@@ -398,6 +404,43 @@ pub async fn initiate_config_with_credentials(
         }
         default_aws_config().region(Region::new(region))
     }
+}
+
+/// Initiates an AWS SDK configuration that only uses IAM role authentication.
+///
+/// This bypasses environment variables (`AWS_ACCESS_KEY_ID`, etc.) and profile credentials,
+/// only using:
+/// - Web Identity Token (EKS/IRSA)
+/// - ECS Container Credentials
+/// - EC2 Instance Metadata (IMDS)
+///
+/// # Parameters
+/// - `region`: AWS region
+///
+/// # Returns
+/// A `ConfigLoader` that can be further customized before loading.
+#[must_use]
+pub fn initiate_config_with_iam_role_only(region: String) -> aws_config::ConfigLoader {
+    let provider_config = ProviderConfig::default().with_region(Some(Region::new(region.clone())));
+
+    let web_identity_provider = WebIdentityTokenCredentialsProvider::builder()
+        .configure(&provider_config)
+        .build();
+    let ecs_provider = EcsCredentialsProvider::builder()
+        .configure(&provider_config)
+        .build();
+    let imds_provider = ImdsCredentialsProvider::builder()
+        .configure(&provider_config)
+        .build();
+
+    let iam_only_chain =
+        CredentialsProviderChain::first_try("WebIdentityToken", web_identity_provider)
+            .or_else("EcsContainer", ecs_provider)
+            .or_else("Ec2InstanceMetadata", imds_provider);
+
+    default_aws_config()
+        .region(Region::new(region))
+        .credentials_provider(iam_only_chain)
 }
 
 #[cfg(test)]
