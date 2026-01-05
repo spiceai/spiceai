@@ -1469,10 +1469,49 @@ impl CayenneAccelerator {
             );
         }
 
+        let (primary_keys, on_conflict) = if let Some(acceleration) = source.acceleration() {
+            // Use configured primary key if provided.
+            let pk_vec = acceleration
+                .primary_key
+                .as_ref()
+                .map(|pk| pk.iter().map(std::string::ToString::to_string).collect())
+                .unwrap_or_default();
+
+            // Derive on_conflict from acceleration settings.
+            let on_conflict = acceleration
+                .on_conflict
+                .iter()
+                .map(|(col_ref, behavior)| {
+                    let col =
+                        datafusion_table_providers::util::column_reference::ColumnReference::new(
+                            col_ref
+                                .iter()
+                                .map(std::string::ToString::to_string)
+                                .collect(),
+                        );
+                    match behavior {
+                        crate::component::dataset::acceleration::OnConflictBehavior::Drop => {
+                            datafusion_table_providers::util::on_conflict::OnConflict::DoNothing(
+                                col,
+                            )
+                        }
+                        crate::component::dataset::acceleration::OnConflictBehavior::Upsert(
+                            _options,
+                        ) => datafusion_table_providers::util::on_conflict::OnConflict::Upsert(col),
+                    }
+                })
+                .next();
+
+            (pk_vec, on_conflict)
+        } else {
+            (Vec::new(), None)
+        };
+
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
             schema: Arc::<arrow_schema::Schema>::clone(&schema),
-            primary_key: vec![], // No PK by default, can be set by caller
+            primary_key: primary_keys,
+            on_conflict,
             base_path: dir_path.to_string(),
             partition_column: None, // Non-partitioned table
             vortex_config,
@@ -2113,6 +2152,7 @@ impl PartitionCreator for CayennePartitionCreator {
             table_name: self.partition_table_name(&partition_value_str),
             schema: Arc::clone(&self.schema),
             primary_key: vec![],
+            on_conflict: None,
             base_path: partition_path.clone(),
             partition_column: None, // Partitions themselves are not partitioned
             vortex_config: self.vortex_config.clone(),

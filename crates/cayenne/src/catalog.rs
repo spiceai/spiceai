@@ -59,6 +59,13 @@ pub enum CatalogError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// Invalid operation (without underlying source error)
+    #[snafu(display("Invalid operation: {message}"))]
+    InvalidOperationNoSource {
+        /// Description of the invalid operation
+        message: String,
+    },
+
     /// IO error
     #[snafu(display("IO error: {source}"))]
     Io {
@@ -199,6 +206,13 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get all active delete files for a table (across all virtual files).
     async fn get_table_delete_files(&self, table_id: i64) -> CatalogResult<Vec<DeleteFile>>;
+
+    /// Remove delete files (deletion vectors) by ID for a table.
+    async fn remove_delete_files(
+        &self,
+        table_id: i64,
+        delete_file_ids: &[i64],
+    ) -> CatalogResult<()>;
 
     /// Clear all delete files for a table.
     ///

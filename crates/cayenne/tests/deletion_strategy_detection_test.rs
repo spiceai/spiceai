@@ -60,7 +60,8 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
     let table_options = CreateTableOptions {
         table_name: "int64_pk_table".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["id".to_string()], // Single Int64 PK -> Int64Pk strategy
+        primary_key: vec!["id".to_string()],
+        on_conflict: None, // Single Int64 PK -> Int64Pk strategy
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -142,7 +143,8 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
     let table_options = CreateTableOptions {
         table_name: "string_pk_table".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["code".to_string()], // String PK -> RowConverter strategy
+        primary_key: vec!["code".to_string()],
+        on_conflict: None, // String PK -> RowConverter strategy
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -224,7 +226,8 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
     let table_options = CreateTableOptions {
         table_name: "composite_pk_table".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["region".to_string(), "id".to_string()], // Composite PK -> RowConverter
+        primary_key: vec!["region".to_string(), "id".to_string()],
+        on_conflict: None, // Composite PK -> RowConverter
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -304,7 +307,8 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
     let table_options = CreateTableOptions {
         table_name: "no_pk_table".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec![], // No PK -> PositionBased strategy
+        primary_key: vec![],
+        on_conflict: None, // No PK -> PositionBased strategy
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -378,7 +382,8 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
     let table_options = CreateTableOptions {
         table_name: "int32_pk_table".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["id".to_string()], // Int32 PK -> RowConverter (not Int64Pk)
+        primary_key: vec!["id".to_string()],
+        on_conflict: None, // Int32 PK -> RowConverter (not Int64Pk)
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -462,6 +467,7 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
         table_name: "persist_int64pk".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -541,6 +547,7 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
         table_name: "persist_position".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -625,6 +632,7 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
                 table_name: "t1_int64".to_string(),
                 schema: Arc::clone(&schema1),
                 primary_key: vec!["id".to_string()],
+                on_conflict: None,
                 base_path: fixture.data_path.to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -660,6 +668,7 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
                 table_name: "t2_string".to_string(),
                 schema: Arc::clone(&schema2),
                 primary_key: vec!["key".to_string()],
+                on_conflict: None,
                 base_path: fixture.data_path.to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -695,6 +704,7 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
                 table_name: "t3_no_pk".to_string(),
                 schema: Arc::clone(&schema3),
                 primary_key: vec![],
+                on_conflict: None,
                 base_path: fixture.data_path.to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: cayenne::metadata::VortexConfig::default(),

@@ -20,6 +20,8 @@ use crate::{
 use arrow::util::pretty::pretty_format_batches;
 use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
 use async_trait::async_trait;
+use datafusion::sql::TableReference;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
@@ -41,6 +43,8 @@ pub struct SampleDataTool {
     // Overrides
     name: Option<String>,
     description: Option<String>,
+
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 
 impl SampleDataTool {
@@ -51,6 +55,7 @@ impl SampleDataTool {
             method,
             name: None,
             description: None,
+            table_allowlist: None,
         }
     }
 
@@ -58,6 +63,12 @@ impl SampleDataTool {
     pub fn with_overrides(mut self, name: Option<&str>, description: Option<&str>) -> Self {
         self.name = name.map(ToString::to_string);
         self.description = description.map(ToString::to_string);
+        self
+    }
+
+    #[must_use]
+    pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
+        self.table_allowlist = allowlist;
         self
     }
 }
@@ -91,6 +102,14 @@ impl SpiceModelTool for SampleDataTool {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name().to_string(), input = format!("{params}"), sample_method = self.method.name());
 
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
+            // Check table allowlist before sampling
+            if let Some(ref allowlist) = self.table_allowlist {
+                let table_ref = TableReference::parse_str(params.dataset());
+                if !allowlist.table_is_allowed(&table_ref) {
+                    return Err("Table not found".into());
+                }
+            }
+
             let mut batch = params.sample(Arc::clone(&self.df)).await?;
 
             // truncate large text fields

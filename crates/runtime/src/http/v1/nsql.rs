@@ -15,8 +15,11 @@ limitations under the License.
 */
 use crate::{
     Runtime,
-    datafusion::request_context_extension::get_current_datafusion,
-    http::v1::{ResponseMetadata, ResponseMimeType, run_sql, to_http_response},
+    datafusion::{
+        SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
+        request_context_extension::get_current_datafusion,
+    },
+    http::v1::{ResponseMetadata, ResponseMimeType, to_http_response},
     model::LLMChatCompletionsModelStore,
     tools::{
         builtin::{
@@ -43,8 +46,10 @@ use datafusion::sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use headers_accept::Accept;
 use http::HeaderMap;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+use arrow::array::RecordBatch;
 use itertools::Itertools;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
 use serde::{Deserialize, Serialize};
@@ -54,6 +59,7 @@ use tracing::Span;
 use tracing_futures::Instrument;
 
 use super::accept_header_types;
+use crate::datafusion::query::QueryBuilder;
 
 // Default number of retries for NSQL queries if the generated query fails to execute
 const DEFAULT_NSQL_RETRIES: u8 = 10;
@@ -84,6 +90,7 @@ fn clean_model_based_sql(input: &str) -> String {
 async fn sample_messages(
     sample_from: &[TableReference],
     rt: Arc<Runtime>,
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
 ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
     let message_futures = sample_from.iter().flat_map(|dataset| {
         [
@@ -100,10 +107,12 @@ async fn sample_messages(
         .into_iter()
         .map(|params| {
             let rt = Arc::clone(&rt);
+            let allowlist = table_allowlist.clone();
             async move {
                 let method = SampleTableMethod::from(&params);
                 create_tool_use_messages(
-                    &SampleDataTool::new(rt.datafusion(), method.clone()),
+                    &SampleDataTool::new(rt.datafusion(), method.clone())
+                        .with_table_allowlist(allowlist),
                     format!("sample-{method:?}").as_str(),
                     &params,
                 )
@@ -300,23 +309,60 @@ pub(crate) async fn handle_nsql_query(
     let df = get_current_datafusion(&context);
     let headers = HeaderMap::new();
 
+    let Request {
+        query,
+        model,
+        sample_data_enabled,
+        datasets,
+        ..
+    } = payload;
+    let table_allowlist_opt = match table_allowlist(&model, &rt).await {
+        Ok(ta) => ta,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e);
+        }
+    };
+
+    // Validate that requested datasets are within the model's allowlist
+    if let (Some(requested_datasets), Some(allowlist)) = (&datasets, &table_allowlist_opt) {
+        for ds in requested_datasets {
+            let table_ref = TableReference::parse_str(ds);
+            if !allowlist.table_is_allowed(&table_ref) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    headers,
+                    format!("Dataset '{ds}' not found"),
+                );
+            }
+        }
+    }
+
     crate::model::add_tools_used(&context, 1);
 
-    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %payload.query, model = %payload.model, "labels");
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %query, model = %model, "labels");
 
     if let Some(traceparent) = context.trace_parent() {
         crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
     }
 
     // Default to all available tables if specific table(s) are not provided.
-    let tables = payload
-        .datasets
+    let tables = datasets
         .map(|ds| ds.iter().map(TableReference::from).collect_vec())
-        .unwrap_or(df.get_user_table_names());
+        .unwrap_or(
+            df.get_user_table_names()
+                .into_iter()
+                .filter(|t| {
+                    table_allowlist_opt
+                        .as_ref()
+                        .is_none_or(|a| a.table_is_allowed(t))
+                })
+                .collect(),
+        );
 
     // Create assistant/tool result messages for calling `table_schema` tool for all or provided tables.
     let schema_messages = match create_tool_use_messages(
-        &TableSchemaTool::new(Arc::clone(&rt), None, None),
+        &TableSchemaTool::new(Arc::clone(&rt), None, None)
+            .with_table_allowlist(table_allowlist_opt.clone()),
         "schemas-nsql",
         &TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
     )
@@ -331,8 +377,8 @@ pub(crate) async fn handle_nsql_query(
     };
 
     // Create sample data assistant/tool messages if user wants to sample from dataset(s).
-    let sample_data_messages = if payload.sample_data_enabled {
-        match sample_messages(&tables, Arc::clone(&rt))
+    let sample_data_messages = if sample_data_enabled {
+        match sample_messages(&tables, Arc::clone(&rt), table_allowlist_opt.clone())
             .instrument(span.clone())
             .await
         {
@@ -347,11 +393,11 @@ pub(crate) async fn handle_nsql_query(
     };
 
     let models = llms.read().await;
-    let Some(nql_model) = models.get(&payload.model) else {
+    let Some(nql_model) = models.get(&model) else {
         return (
             StatusCode::BAD_REQUEST,
             headers,
-            format!("Model {} not found", payload.model),
+            format!("Model {model} not found"),
         );
     };
 
@@ -361,9 +407,7 @@ pub(crate) async fn handle_nsql_query(
     let mut num_retries = 0;
 
     loop {
-        let Ok(mut req) =
-            sql_gen.create_request_for_query(&payload.model, &payload.query, &sql_gen_ctx)
-        else {
+        let Ok(mut req) = sql_gen.create_request_for_query(&model, &query, &sql_gen_ctx) else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 headers,
@@ -394,20 +438,41 @@ pub(crate) async fn handle_nsql_query(
 
                 tracing::debug!("Running query:\n{cleaned_query}");
 
-                match run_sql(Arc::clone(&df), &cleaned_query, None)
-                    .instrument(span.clone())
-                    .await
-                {
-                    Ok((data, cache_status)) => {
-                        return to_http_response(
-                            data,
-                            cache_status,
-                            ResponseMimeType::from_accept_header(accept.as_ref()),
-                            ResponseMetadata::empty().with_sql(&cleaned_query),
-                        )
-                        .instrument(span.clone())
-                        .await;
+                // Run the SQL with table allowlist enforcement
+                let query_result = {
+                    let mut builder = QueryBuilder::new(&cleaned_query, Arc::clone(&df));
+                    if let Some(ref allowlist) = table_allowlist_opt {
+                        builder = builder.allow_tables(allowlist.clone());
                     }
+                    builder.build().run().await
+                };
+
+                match query_result {
+                    Ok(result) => match result.data.try_collect::<Vec<RecordBatch>>().await {
+                        Ok(data) => {
+                            return to_http_response(
+                                data,
+                                result.cache_status,
+                                ResponseMimeType::from_accept_header(accept.as_ref()),
+                                ResponseMetadata::empty().with_sql(&cleaned_query),
+                            )
+                            .instrument(span.clone())
+                            .await;
+                        }
+                        Err(e) => {
+                            if num_retries >= DEFAULT_NSQL_RETRIES {
+                                tracing::error!("Error collecting query results: {e}");
+                                return (StatusCode::BAD_REQUEST, headers, e.to_string());
+                            }
+
+                            tracing::debug!("Error collecting query results: {e}. Retrying...");
+
+                            num_retries += 1;
+                            sql_gen_ctx
+                                .failed_attempts
+                                .push(FailedAttempt::new(cleaned_query.clone(), e.to_string()));
+                        }
+                    },
                     Err(e) => {
                         // If query failed, retry with the updated context
 
@@ -439,4 +504,41 @@ pub(crate) async fn handle_nsql_query(
             }
         }
     }
+}
+
+/// Construct a [`ResolvedTableAwareAllowlist`] based on the `App`'s `model.datasets`.
+async fn table_allowlist(
+    model_name: &str,
+    rt: &Arc<Runtime>,
+) -> Result<Option<ResolvedTableAwareAllowlist>, String> {
+    let Some(app) = &*rt.app.read().await else {
+        return Err("Unexpected internal error. App not prepared in runtime.".to_string());
+    };
+
+    // Create table allowlist from the model's datasets configuration
+    let model_datasets = app
+        .models
+        .iter()
+        .find(|m| m.name == model_name)
+        .map(|m| m.datasets.clone())
+        .unwrap_or_default();
+
+    let table_allowlist = if model_datasets.is_empty() {
+        None
+    } else {
+        match ResolvedTableAwareAllowlist::with_defaults(
+            SPICE_DEFAULT_CATALOG,
+            SPICE_DEFAULT_SCHEMA,
+        )
+        .with_table_patterns(model_datasets)
+        {
+            Ok(allowlist) => Some(allowlist),
+            Err(_) => {
+                return Err(format!(
+                    "Unexpected internal error. Model '{model_name}' datasets are invalid."
+                ));
+            }
+        }
+    };
+    Ok(table_allowlist)
 }

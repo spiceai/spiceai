@@ -227,6 +227,7 @@ fn bench_int64pk_single_delete(c: &mut Criterion) {
                                 base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                                 partition_column: None,
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
+                                on_conflict: None,
                             },
                         )
                         .await
@@ -259,6 +260,7 @@ fn bench_int64pk_single_delete(c: &mut Criterion) {
                                 base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                                 partition_column: None,
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
+                                on_conflict: None,
                             },
                         )
                         .await
@@ -298,6 +300,7 @@ fn bench_int64pk_batch_delete(c: &mut Criterion) {
                                 base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                                 partition_column: None,
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
+                                on_conflict: None,
                             },
                         )
                         .await
@@ -344,6 +347,7 @@ fn bench_int64pk_query_after_delete(c: &mut Criterion) {
                             base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                             partition_column: None,
                             vortex_config: cayenne::metadata::VortexConfig::default(),
+                            on_conflict: None,
                         },
                     )
                     .await
@@ -395,6 +399,7 @@ fn bench_stringpk_single_delete(c: &mut Criterion) {
                                 base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                                 partition_column: None,
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
+                                on_conflict: None,
                             },
                         )
                         .await
@@ -427,6 +432,7 @@ fn bench_stringpk_single_delete(c: &mut Criterion) {
                                 base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                                 partition_column: None,
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
+                                on_conflict: None,
                             },
                         )
                         .await
@@ -468,6 +474,7 @@ fn bench_stringpk_batch_delete(c: &mut Criterion) {
                                 base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                                 partition_column: None,
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
+                                on_conflict: None,
                             },
                         )
                         .await
@@ -508,6 +515,7 @@ fn bench_stringpk_query_after_delete(c: &mut Criterion) {
                             base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                             partition_column: None,
                             vortex_config: cayenne::metadata::VortexConfig::default(),
+                            on_conflict: None,
                         },
                     )
                     .await
@@ -559,6 +567,7 @@ fn bench_positionbased_single_delete(c: &mut Criterion) {
                                 base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                                 partition_column: None,
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
+                                on_conflict: None,
                             },
                         )
                         .await
@@ -592,6 +601,7 @@ fn bench_positionbased_single_delete(c: &mut Criterion) {
                                 base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                                 partition_column: None,
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
+                                on_conflict: None,
                             },
                         )
                         .await
@@ -632,6 +642,7 @@ fn bench_positionbased_batch_delete(c: &mut Criterion) {
                                 base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                                 partition_column: None,
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
+                                on_conflict: None,
                             },
                         )
                         .await
@@ -673,6 +684,7 @@ fn bench_positionbased_query_after_delete(c: &mut Criterion) {
                             base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                             partition_column: None,
                             vortex_config: cayenne::metadata::VortexConfig::default(),
+                            on_conflict: None,
                         },
                     )
                     .await
@@ -727,6 +739,7 @@ fn bench_strategy_comparison(c: &mut Criterion) {
                             base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                             partition_column: None,
                             vortex_config: cayenne::metadata::VortexConfig::default(),
+                            on_conflict: None,
                         },
                     )
                     .await
@@ -759,6 +772,7 @@ fn bench_strategy_comparison(c: &mut Criterion) {
                             base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                             partition_column: None,
                             vortex_config: cayenne::metadata::VortexConfig::default(),
+                            on_conflict: None,
                         },
                     )
                     .await
@@ -792,6 +806,7 @@ fn bench_strategy_comparison(c: &mut Criterion) {
                             base_path: fixture.data_dir.path().to_string_lossy().to_string(),
                             partition_column: None,
                             vortex_config: cayenne::metadata::VortexConfig::default(),
+                            on_conflict: None,
                         },
                     )
                     .await

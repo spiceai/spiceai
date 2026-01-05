@@ -401,6 +401,7 @@ mod tests {
             path_is_relative: false,
             schema: Arc::new(arrow::datatypes::Schema::empty()),
             primary_key: vec!["id".to_string()],
+            on_conflict: None,
             current_snapshot_id: Uuid::now_v7().to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),

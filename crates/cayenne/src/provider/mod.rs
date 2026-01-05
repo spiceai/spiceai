@@ -83,6 +83,7 @@ mod tests {
     use datafusion_catalog::TableProvider;
     use datafusion_expr::dml::InsertOp;
     use datafusion_physical_plan::collect;
+    use datafusion_table_providers::util::on_conflict::OnConflict;
     use futures::future::join_all;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -112,6 +113,7 @@ mod tests {
                 table_name: table_name.to_string(),
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
                 base_path: temp_dir.path().to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
@@ -553,6 +555,7 @@ mod tests {
             table_name: "sorted_test".to_string(),
             schema: Arc::clone(&schema),
             primary_key: vec![],
+            on_conflict: None,
             base_path: data_path.to_string_lossy().to_string(),
             partition_column: None,
             vortex_config,

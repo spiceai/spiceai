@@ -58,6 +58,7 @@ async fn setup_test_table(
         table_name: "test_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),

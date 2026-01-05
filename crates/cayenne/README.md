@@ -136,7 +136,10 @@ let options = CreateTableOptions {
         Field::new("name", DataType::Utf8, false),
     ])),
     primary_key: vec!["id".to_string()],
+    on_conflict: None,
     base_path: "/data/users".to_string(),
+    partition_column: None,
+    vortex_config: cayenne::metadata::VortexConfig::default(),
 };
 
 let table = CayenneTableProvider::create_table(catalog, options).await?;
@@ -270,7 +273,10 @@ let options = CreateTableOptions {
         Field::new("data", DataType::Utf8, true),
     ])),
     primary_key: vec!["event_id".to_string()],
+    on_conflict: None,
     base_path: "/data/events".to_string(),
+    partition_column: None,
+    vortex_config: cayenne::metadata::VortexConfig::default(),
 };
 
 let table = CayenneTableProvider::create_table(catalog.clone(), options).await?;
