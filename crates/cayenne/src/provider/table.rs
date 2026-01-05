@@ -1967,7 +1967,13 @@ impl CayenneTableProvider {
             };
 
             for row_idx in 0..batch.num_rows() {
-                let row_id = row_id_base + i64::try_from(row_idx).unwrap_or(0);
+                let row_id = row_id_base
+                    + i64::try_from(row_idx).map_err(|_| {
+                        CatalogError::InvalidOperationNoSource {
+                            message: "Row index exceeds i64::MAX; cannot compute row_id"
+                                .to_string(),
+                        }
+                    })?;
 
                 // Check if row is deleted based on pk_deletion_strategy
                 let is_deleted = match self.pk_deletion_strategy {
@@ -2034,7 +2040,12 @@ impl CayenneTableProvider {
                 }
             }
 
-            row_id_base += i64::try_from(batch.num_rows()).unwrap_or(0);
+            row_id_base += i64::try_from(batch.num_rows()).map_err(|_| {
+                CatalogError::InvalidOperationNoSource {
+                    message: "Batch row count exceeds i64::MAX; cannot compute row_id_base"
+                        .to_string(),
+                }
+            })?;
         }
 
         Ok(keyset)
@@ -2057,7 +2068,9 @@ impl CayenneTableProvider {
         let mut all_deleted_pk_i64: Vec<i64> = Vec::new();
         let mut all_deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
 
-        // Use configured on_conflict or default to error on conflict
+        // Use configured on_conflict or default to DoNothingAll (silently drops duplicates).
+        // When a primary key is configured without explicit on_conflict, this ensures
+        // inserts succeed without unique constraint errors.
         let on_conflict = self
             .table_metadata
             .on_conflict
@@ -4954,7 +4967,6 @@ impl TableProvider for CayenneTableProvider {
                 "Failed to get primary key indices: {e}"
             ))
         })? {
-            eprintln!("DEBUG: Primary key found, applying on-conflict handling");
             // Execute the input plan to get the data stream
             let task_ctx = state.task_ctx();
             let input_stream = input.execute(0, Arc::clone(&task_ctx)).map_err(|e| {
@@ -4969,7 +4981,6 @@ impl TableProvider for CayenneTableProvider {
                     "Failed to build PK converter: {e}"
                 ))
             })?;
-            eprintln!("DEBUG: Loading existing keyset...");
             let mut existing_keys = self
                 .load_existing_keyset(&pk_indices, &converter)
                 .await
@@ -4978,7 +4989,6 @@ impl TableProvider for CayenneTableProvider {
                         "Failed to load existing keyset: {e}"
                     ))
                 })?;
-            eprintln!("DEBUG: Existing keys count: {}", existing_keys.len());
 
             // Validate on-conflict and get filtered batches + deletion specs
             let validation_result = self
@@ -4989,16 +4999,10 @@ impl TableProvider for CayenneTableProvider {
                         "Failed to validate on-conflict: {e}"
                     ))
                 })?;
-            eprintln!(
-                "DEBUG: Validated batches: {}, delete_specs: {:?}",
-                validation_result.filtered_batches.len(),
-                validation_result.delete_specs
-            );
 
             // Apply deletion vectors for upserted rows
             let has_on_conflict_deletions = !validation_result.delete_specs.is_empty();
             if has_on_conflict_deletions {
-                eprintln!("DEBUG: Applying delete_specs");
                 self.apply_on_conflict_deletions(
                     validation_result.delete_specs,
                     validation_result.deleted_pk_i64,
@@ -5014,7 +5018,6 @@ impl TableProvider for CayenneTableProvider {
 
             // Create new input from validated batches
             if validation_result.filtered_batches.is_empty() {
-                eprintln!("DEBUG: No validated batches, returning empty");
                 // Nothing to insert after on-conflict filtering
                 // Return a plan that does nothing
                 return Ok(Arc::new(datafusion_physical_plan::empty::EmptyExec::new(
@@ -5025,11 +5028,16 @@ impl TableProvider for CayenneTableProvider {
             // If there were on-conflict deletions, write to a NEW snapshot that's protected
             // from those deletions. Otherwise, write to the main snapshot.
             if has_on_conflict_deletions {
-                eprintln!(
-                    "DEBUG: On-conflict deletions applied, writing to new protected snapshot"
-                );
                 // Use the streaming insert to write to a new snapshot with proper sequence handling
-                let schema = validation_result.filtered_batches[0].schema();
+                let schema = validation_result
+                    .filtered_batches
+                    .first()
+                    .map(RecordBatch::schema)
+                    .ok_or_else(|| {
+                        datafusion_common::DataFusionError::Execution(
+                            "No validated batches after applying on-conflict deletions".to_string(),
+                        )
+                    })?;
                 let batch_stream =
                     futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok));
                 let validated_stream =
@@ -5047,7 +5055,7 @@ impl TableProvider for CayenneTableProvider {
                     })?;
 
                 // Write to a new snapshot
-                let rows_written = self
+                let _rows_written = self
                     .insert_to_new_snapshot_with_sequence(
                         Box::pin(validated_stream),
                         insert_sequence,
@@ -5058,10 +5066,6 @@ impl TableProvider for CayenneTableProvider {
                             "Failed to insert to new snapshot: {e}"
                         ))
                     })?;
-
-                eprintln!(
-                    "DEBUG: Wrote {rows_written} rows to new snapshot with seq={insert_sequence}"
-                );
 
                 // Refresh the listing table to include the new snapshot
                 self.refresh_listing_table().map_err(|e| {
@@ -5076,7 +5080,15 @@ impl TableProvider for CayenneTableProvider {
                 )));
             }
 
-            let schema = validation_result.filtered_batches[0].schema();
+            let schema = validation_result
+                .filtered_batches
+                .first()
+                .map(RecordBatch::schema)
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(
+                        "No validated batches for on-conflict handling".to_string(),
+                    )
+                })?;
             let batch_stream =
                 futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok));
             let validated_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);

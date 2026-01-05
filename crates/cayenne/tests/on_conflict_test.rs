@@ -58,9 +58,6 @@ async fn test_on_conflict_upsert_impl(
     let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
     let table = Arc::new(table);
 
-    // Debug: print table
-    eprintln!("Table: {table:?}");
-
     let ctx = SessionContext::new();
     ctx.register_table(
         "conflict_upsert",
