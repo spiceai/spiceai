@@ -22,7 +22,7 @@ limitations under the License.
 //! These tests cover:
 //! - Delete followed by insert of the same key (DELETE + INSERT pattern, not upsert)
 //! - On-conflict upsert with single batch conflict
-//! - DoNothing vs Upsert behavior
+//! - `DoNothing` vs `Upsert` behavior
 //! - On-conflict with composite primary keys
 //! - String primary key upserts
 //! - Empty batch handling
@@ -54,7 +54,7 @@ async fn insert_batch(
     table.insert(boxed_stream).await.map_err(Into::into)
 }
 
-/// Helper to delete records from a table using the DeletionTableProvider API
+/// Helper to delete records from a table using the `DeletionTableProvider` API
 async fn delete_records(
     table: &Arc<CayenneTableProvider>,
     filter: Expr,

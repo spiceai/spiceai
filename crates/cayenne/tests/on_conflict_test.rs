@@ -59,7 +59,7 @@ async fn test_on_conflict_upsert_impl(
     let table = Arc::new(table);
 
     // Debug: print table
-    eprintln!("Table: {:?}", table);
+    eprintln!("Table: {table:?}");
 
     let ctx = SessionContext::new();
     ctx.register_table(
