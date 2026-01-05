@@ -252,7 +252,7 @@ snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "85
 sqlparser = "0.58.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
-sysinfo = "0.35.2"
+sysinfo = "0.37.2"
 tantivy = "0.25.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
