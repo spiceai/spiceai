@@ -2092,7 +2092,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "chrono",
- "clap 4.5.53",
+ "clap 4.5.54",
  "datafusion",
  "datafusion-proto",
  "datafusion-proto-common",
@@ -2124,7 +2124,7 @@ dependencies = [
  "arrow-flight",
  "async-trait",
  "ballista-core",
- "clap 4.5.53",
+ "clap 4.5.54",
  "dashmap",
  "datafusion",
  "datafusion-proto",
@@ -2153,7 +2153,7 @@ dependencies = [
  "async-trait",
  "axum",
  "ballista-core",
- "clap 4.5.53",
+ "clap 4.5.54",
  "dashmap",
  "datafusion",
  "datafusion-proto",
@@ -3435,9 +3435,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.53"
+version = "4.5.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9e340e012a1bf4935f5282ed1436d1489548e8f72308207ea5df0e23d2d03f8"
+checksum = "c6e6ff9dcd79cff5cd969a17a545d79e84ab086e444102a591e288a8aa3ce394"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -3445,9 +3445,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.53"
+version = "4.5.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d76b5d13eaa18c901fd2f7fca939fefe3a0727a953561fefdf3b2922b8569d00"
+checksum = "fa42cf4d2b7a41bc8f663a7cab4031ebafa1bf3875705bfaf8466dc60ab52c00"
 dependencies = [
  "anstream",
  "anstyle",
@@ -3815,7 +3815,7 @@ dependencies = [
  "anes",
  "cast",
  "ciborium",
- "clap 4.5.53",
+ "clap 4.5.54",
  "criterion-plot 0.5.0",
  "futures",
  "is-terminal",
@@ -3843,7 +3843,7 @@ dependencies = [
  "anes",
  "cast",
  "ciborium",
- "clap 4.5.53",
+ "clap 4.5.54",
  "criterion-plot 0.6.0",
  "itertools 0.13.0",
  "num-traits",
@@ -6161,7 +6161,7 @@ name = "evalconverter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap 4.5.53",
+ "clap 4.5.54",
  "env_logger 0.11.8",
  "serde",
  "serde_yaml",
@@ -6509,7 +6509,7 @@ version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
- "clap 4.5.53",
+ "clap 4.5.54",
  "futures",
  "parquet",
  "tokio",
@@ -6523,7 +6523,7 @@ dependencies = [
  "ansi_term",
  "arrow-flight",
  "arrow-json",
- "clap 4.5.53",
+ "clap 4.5.54",
  "datafusion",
  "flight_client",
  "futures",
@@ -6545,7 +6545,7 @@ name = "flightsubscriber"
 version = "1.11.0-unstable"
 dependencies = [
  "arrow-flight",
- "clap 4.5.53",
+ "clap 4.5.54",
  "futures",
  "tokio",
  "tonic 0.13.1",
@@ -9908,7 +9908,7 @@ dependencies = [
  "anyhow",
  "candle-core 0.8.0",
  "candle-nn 0.8.0",
- "clap 4.5.53",
+ "clap 4.5.54",
  "either",
  "futures",
  "image 0.25.9",
@@ -9954,7 +9954,7 @@ dependencies = [
  "candle-nn 0.8.0",
  "cfgrammar",
  "chrono",
- "clap 4.5.53",
+ "clap 4.5.54",
  "csv",
  "derive-new 0.7.0",
  "derive_more 2.0.1",
@@ -10111,7 +10111,7 @@ version = "0.1.3"
 source = "git+https://github.com/spiceai/model2vec-rs.git?rev=dd0beab3810aebacb716d4ab6d38455e74499d13#dd0beab3810aebacb716d4ab6d38455e74499d13"
 dependencies = [
  "anyhow",
- "clap 4.5.53",
+ "clap 4.5.54",
  "half",
  "hf-hub",
  "ndarray 0.15.6",
@@ -11626,7 +11626,7 @@ dependencies = [
 name = "otelpublisher"
 version = "1.11.0-unstable"
 dependencies = [
- "clap 4.5.53",
+ "clap 4.5.54",
  "opentelemetry-proto 0.30.0",
  "tokio",
  "tonic 0.13.1",
@@ -11869,7 +11869,7 @@ version = "1.11.0-unstable"
 dependencies = [
  "bytes",
  "chunking",
- "clap 4.5.53",
+ "clap 4.5.54",
  "document_parse",
  "serde",
  "serde_json",
@@ -14015,7 +14015,7 @@ dependencies = [
  "cayenne",
  "chrono",
  "chunking",
- "clap 4.5.53",
+ "clap 4.5.54",
  "clickhouse-rs",
  "criterion 0.7.0",
  "csv",
@@ -14126,7 +14126,7 @@ dependencies = [
  "spiceai",
  "spicepod",
  "strsim 0.11.1",
- "sysinfo 0.35.2",
+ "sysinfo 0.37.2",
  "telemetry",
  "tempfile",
  "tera",
@@ -14295,7 +14295,7 @@ dependencies = [
  "http 1.4.0",
  "insta",
  "libnfs",
- "nix 0.25.1",
+ "nix 0.30.1",
  "object_store",
  "reqwest",
  "serde",
@@ -15963,7 +15963,7 @@ name = "spiced"
 version = "1.11.0-unstable"
 dependencies = [
  "app",
- "clap 4.5.53",
+ "clap 4.5.54",
  "event_stream",
  "flightrepl",
  "futures",
@@ -16022,7 +16022,7 @@ name = "spicepod-validator"
 version = "1.11.0-unstable"
 dependencies = [
  "app",
- "clap 4.5.53",
+ "clap 4.5.54",
  "snafu",
  "tokio",
 ]
@@ -16044,7 +16044,7 @@ dependencies = [
 name = "spiceschema"
 version = "1.11.0-unstable"
 dependencies = [
- "clap 4.5.53",
+ "clap 4.5.54",
  "runtime",
  "serde_json",
  "serde_yaml",
@@ -16643,9 +16643,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.35.2"
+version = "0.37.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3ffa3e4ff2b324a57f7aeb3c349656c7b127c3c189520251a648102a92496e"
+checksum = "16607d5caffd1c07ce073528f9ed972d88db15dd44023fa57142963be3feb11f"
 dependencies = [
  "libc",
  "memchr",
@@ -16876,7 +16876,7 @@ dependencies = [
  "otel-arrow",
  "sha2 0.10.9",
  "snafu",
- "sysinfo 0.35.2",
+ "sysinfo 0.37.2",
  "tokio",
  "tracing",
  "util",
@@ -16988,7 +16988,7 @@ dependencies = [
  "serde_yaml",
  "spiceai",
  "spicepod",
- "sysinfo 0.35.2",
+ "sysinfo 0.37.2",
  "telemetry",
  "tempfile",
  "tokio",
@@ -17026,7 +17026,7 @@ version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
- "clap 4.5.53",
+ "clap 4.5.54",
  "hf-hub",
  "itertools 0.14.0",
  "reqwest",
