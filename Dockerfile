@@ -44,7 +44,7 @@ ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=1d27641f16df1b1384f5d61cdcbd95a5ca57ba5d25
 
 # Install required packages
 RUN apt update \
-    && apt install --yes ca-certificates libssl3 findutils --no-install-recommends \
+    && apt install --yes ca-certificates libssl3 findutils tzdata --no-install-recommends \
     && if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
     apt install --yes unixodbc --no-install-recommends; \
     fi \
@@ -55,6 +55,7 @@ RUN mkdir -p /spice_sandbox/bin && \
     mkdir -p /spice_sandbox/lib && \
     mkdir -p /spice_sandbox/usr/lib && \
     mkdir -p /spice_sandbox/usr/local/bin && \
+    mkdir -p /spice_sandbox/usr/share && \
     mkdir -p /spice_sandbox/etc && \
     mkdir -p /spice_sandbox/etc/ssl && \
     mkdir -p /spice_sandbox/dev && \
@@ -66,6 +67,9 @@ COPY --from=build /root/spiced /spice_sandbox/usr/local/bin/
 
 # Copy CA certificates
 RUN cp -r /etc/ssl/certs /spice_sandbox/etc/ssl/certs
+
+# Copy timezone database (IANA tzdb) - used by jiff, chrono, libc, and other timezone-aware libraries
+RUN cp -r /usr/share/zoneinfo /spice_sandbox/usr/share/zoneinfo
 
 # Copy every dependent library reported by ldd
 RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
