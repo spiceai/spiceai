@@ -61,7 +61,7 @@ use std::{
 use super::models::sort_json_keys;
 use crate::{
     DEFAULT_TRACING_MODELS, configure_test_datafusion, init_tracing,
-    models::{create_api_bindings_config, http_post},
+    models::{create_api_bindings_config, http_post, search::replace_s3_vector_index_names},
     search::{
         s3_vectors::prepare_for_aws_tests,
         tables::{SearchTable, enrich_table},
@@ -613,6 +613,7 @@ pub(crate) async fn run_search(
                                 format!("Could not prepare EXPLAIN plan. SQL error: {resp}")
                             };
                         disp = sanitize_cayenne_file_paths(&disp);
+                        disp = replace_s3_vector_index_names(&disp);
                         insta::with_settings!({
                             omit_expression => true,
                             description => sql
