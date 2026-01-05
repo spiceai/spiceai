@@ -26,6 +26,7 @@ fundu = { workspace = true }
 futures.workspace = true
 moka = { workspace = true, features = ["future"] }
 parking_lot.workspace = true
+pingora-lru = { workspace = true, optional = true }
 opentelemetry.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
@@ -44,6 +45,7 @@ twox-hash = { workspace = true }
 
 [features]
 default = []
+pingora = ["dep:pingora-lru"]
 
 [[bench]]
 name = "cache_throughput"

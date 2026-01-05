@@ -27,7 +27,7 @@ use datafusion::sql::TableReference;
 use rand::distributions::Alphanumeric;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use spicepod::component::caching::{CachingPolicy, HashingAlgorithm};
+use spicepod::component::caching::{CacheEngine, CachingPolicy, HashingAlgorithm};
 use std::collections::HashSet;
 use std::hash::Hasher;
 use std::sync::Arc;
@@ -326,6 +326,7 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                                     Duration::from_secs(60),
                                     hash_builder.clone(),
                                     policy,
+                                    CacheEngine::Moka,
                                 ));
                                 let mut rng = StdRng::seed_from_u64(42);
                                 handle.block_on(async {
@@ -400,6 +401,7 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
                                     Duration::from_secs(60),
                                     hash_builder.clone(),
                                     policy,
+                                    CacheEngine::Moka,
                                 ))
                             },
                             |cache| {
@@ -468,6 +470,7 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                                     Duration::from_secs(60),
                                     hash_builder.clone(),
                                     policy,
+                                    CacheEngine::Moka,
                                 ));
                                 let mut rng = StdRng::seed_from_u64(42);
                                 handle.block_on(async {

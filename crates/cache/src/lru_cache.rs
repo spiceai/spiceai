@@ -29,7 +29,7 @@ use byte_unit::Byte;
 use datafusion::sql::TableReference;
 use moka::future::Cache;
 use snafu::ResultExt;
-use spicepod::component::caching::{CacheConfig, CachingPolicy};
+use spicepod::component::caching::{CacheConfig, CacheEngine, CachingPolicy};
 use std::fmt::Display;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
@@ -121,6 +121,7 @@ pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'sta
         ttl,
         hash_builder,
         cache_config.caching_policy,
+        cache_config.engine,
     )))
 }
 
@@ -131,10 +132,37 @@ impl<
 > LruCache<V, T, H>
 {
     #[must_use]
-    pub fn new(cache_max_size: u64, ttl: Duration, hasher: T, caching_policy: CachingPolicy) -> Self
+    pub fn new(
+        cache_max_size: u64,
+        ttl: Duration,
+        hasher: T,
+        caching_policy: CachingPolicy,
+        engine: CacheEngine,
+    ) -> Self
     where
         <T as BuildHasher>::Hasher: Send + Sync + 'static,
     {
+        // Log the selected cache engine
+        match engine {
+            CacheEngine::Moka => {
+                tracing::info!("Using Moka cache engine");
+            }
+            CacheEngine::Pingora => {
+                #[cfg(feature = "pingora")]
+                {
+                    tracing::info!(
+                        "Using Pingora cache engine (high-performance, lock-free). Note: table-specific invalidation not supported."
+                    );
+                }
+                #[cfg(not(feature = "pingora"))]
+                {
+                    tracing::warn!(
+                        "Pingora cache engine requested but 'pingora' feature is not enabled. Falling back to Moka."
+                    );
+                }
+            }
+        }
+
         let moka_eviction_policy = match caching_policy {
             CachingPolicy::Lru => moka::policy::EvictionPolicy::lru(),
             CachingPolicy::TinyLfu => moka::policy::EvictionPolicy::tiny_lfu(),
@@ -401,8 +429,13 @@ mod tests {
     >(
         #[case] hasher: T,
     ) {
-        let cache: LruCache<CachedQueryResult, _, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            10,
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
 
@@ -432,8 +465,13 @@ mod tests {
     >(
         #[case] hasher: T,
     ) {
-        let cache: LruCache<CachedQueryResult, _, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            10,
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
         let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
 
         // Try to get a non-existent key
@@ -455,8 +493,13 @@ mod tests {
     >(
         #[case] hasher: T,
     ) {
-        let cache: LruCache<CachedQueryResult, _, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            10,
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
         let table_ref = TableReference::Bare {
             table: Arc::from("test_table"),
         };
@@ -498,8 +541,13 @@ mod tests {
     >(
         #[case] hasher: T,
     ) {
-        let cache: LruCache<CachedSearchResult, _, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher, CachingPolicy::Lru);
+        let cache: LruCache<CachedSearchResult, _, _> = LruCache::new(
+            10,
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
         let table_ref = TableReference::Bare {
             table: Arc::from("test_table"),
         };
@@ -538,8 +586,13 @@ mod tests {
     async fn test_cache_ttl(#[case] hashing_algo: HashingAlgorithm) {
         let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
 
-        let cache: LruCache<CachedQueryResult, _, _> =
-            LruCache::new(10, Duration::from_millis(100), hasher, CachingPolicy::Lru);
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            10,
+            Duration::from_millis(100),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
 
@@ -573,8 +626,13 @@ mod tests {
     async fn test_cache_ttl_xhash(#[case] hashing_algo: HashingAlgorithm) {
         let hasher = get_hash_builder(hashing_algo).expect("Failed to get hash builder");
 
-        let cache: LruCache<CachedQueryResult, _, _> =
-            LruCache::new(10, Duration::from_millis(100), hasher, CachingPolicy::Lru);
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            10,
+            Duration::from_millis(100),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
 
@@ -605,8 +663,13 @@ mod tests {
     #[tokio::test]
     async fn test_cache_with_caching_policy(#[case] caching_policy: CachingPolicy) {
         let hasher = RandomState::default();
-        let cache: LruCache<CachedQueryResult, _, _> =
-            LruCache::new(10, Duration::from_secs(60), hasher, caching_policy);
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            10,
+            Duration::from_secs(60),
+            hasher,
+            caching_policy,
+            CacheEngine::Moka,
+        );
 
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;

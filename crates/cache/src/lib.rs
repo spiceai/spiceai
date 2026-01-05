@@ -32,6 +32,7 @@ use result::search::CachedSearchResult;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::caching::HashingAlgorithm;
 
+pub mod backend;
 pub mod lru_cache;
 pub mod metrics;
 mod simple_cache;
@@ -40,6 +41,13 @@ mod utils;
 pub mod encoding;
 pub mod key;
 pub mod result;
+
+pub use backend::CacheBackend;
+pub use backend::CacheBackendBuilder;
+pub use backend::MokaBackend;
+
+#[cfg(feature = "pingora")]
+pub use backend::PingoraBackend;
 
 pub use lru_cache::LruCache;
 pub use metrics::CacheMetrics;
@@ -388,6 +396,7 @@ impl QueryResultsCacheProvider {
             cache_ttl,
             hash_builder,
             config.caching_policy,
+            config.engine,
         ));
 
         let encoder = encoding::get_encoder(config.encoding);
