@@ -35,6 +35,8 @@ mod cron;
 mod file_watcher;
 #[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+#[cfg(not(target_os = "windows"))]
+mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
 #[cfg(not(target_os = "windows"))]
