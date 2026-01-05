@@ -92,6 +92,13 @@ jobs:
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
       - name: Validate queryset inputs
         run: |
           if [ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.queryset_file }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]; then
@@ -118,13 +125,6 @@ jobs:
         with:
           data_directory: /opt/spiced/data/
           queryset_name: ${{ github.event.inputs.benchmark_queryset }}
-
-      - name: Build Testoperator
-        uses: ./.github/actions/build-testoperator
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |
