@@ -37,6 +37,8 @@ jobs:
         with:
           install_to_system_path: 'false'
           upload_artifact: 'true'
+          force_rebuild: 'true'
+          download_from_minio: 'false'
 
   build-spiced:
     name: Build spiced

@@ -345,7 +345,7 @@ impl DynamoDBRequestPlanBuilder {
                 }
             } else {
                 // For non-flattened fields, add the full name
-                attribute_names.insert(format!("#{field_name}"), field_name.to_string());
+                attribute_names.insert(format!("#{field_name}"), field_name.clone());
             }
         }
     }

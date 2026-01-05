@@ -360,7 +360,7 @@ impl SearchQueryProvider {
         let search_index_columns: HashSet<String> = search_index_schema
             .fields()
             .iter()
-            .map(|f| f.name().to_string())
+            .map(|f| f.name().clone())
             .collect();
 
         // Check if projection can be satisfied

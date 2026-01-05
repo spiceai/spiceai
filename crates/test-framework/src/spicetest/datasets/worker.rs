@@ -205,6 +205,14 @@ impl SpiceTestQueryWorker {
         self
     }
 
+    pub fn with_skip_row_count_validation(
+        mut self,
+        queries: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.skip_row_count_validation = queries.into_iter().collect();
+        self
+    }
+
     /// Send a query metric event to the streaming exporter if configured.
     /// If a duration threshold is set and the query exceeds it, it will be marked as a timeout failure.
     fn send_streaming_metric(&self, query_name: &str, duration: Duration, success: bool) {

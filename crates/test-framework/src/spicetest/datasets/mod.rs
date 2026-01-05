@@ -25,7 +25,7 @@ use crate::{
         DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
         ThroughputMetrics, system_time_to_unix_epoch_ms,
     },
-    queries::Query,
+    queries::{Query, QueryOverrides, QuerySet},
     telemetry::streaming::QueryMetricEvent,
 };
 use anyhow::Result;
@@ -77,6 +77,8 @@ pub struct NotStarted {
     reference_schema: Option<String>,
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
     query_duration_threshold: Option<Duration>,
+    query_set_type: Option<QuerySet>,
+    query_overrides: Option<QueryOverrides>,
 }
 
 impl NotStarted {
@@ -154,6 +156,20 @@ impl NotStarted {
         self.query_duration_threshold = threshold;
         self
     }
+
+    /// Set the query set type (e.g., Tpch, Tpcds, Clickbench).
+    #[must_use]
+    pub fn with_query_set_type(mut self, query_set_type: QuerySet) -> Self {
+        self.query_set_type = Some(query_set_type);
+        self
+    }
+
+    /// Set query overrides for the query set.
+    #[must_use]
+    pub fn with_query_overrides(mut self, query_overrides: Option<QueryOverrides>) -> Self {
+        self.query_overrides = query_overrides;
+        self
+    }
 }
 
 pub type SpiceTestQueryWorkers = Vec<JoinHandle<Result<SpiceTestQueryWorkerResult>>>;
@@ -226,6 +242,21 @@ impl SpiceTest<NotStarted> {
         let http_client = self.get_spiced()?.http_client()?;
         let shutdown_token = tokio_util::sync::CancellationToken::new();
 
+        let row_count_validation_skip_queries: Vec<String> = self
+            .state
+            .query_set_type
+            .as_ref()
+            .map(|qs| {
+                qs.get_row_count_validation_skip_queries(
+                    self.state.query_overrides,
+                    self.state.scale_factor,
+                )
+                .into_iter()
+                .map(String::from)
+                .collect()
+            })
+            .unwrap_or_default();
+
         let mut query_workers = Vec::new();
         for id in 0..self.state.parallel_count {
             let mut worker = SpiceTestQueryWorker::new(
@@ -238,7 +269,8 @@ impl SpiceTest<NotStarted> {
             .with_results_snapshot(self.results_snapshot_predicate)
             .with_validate(self.state.validate)
             .with_scale_factor(self.state.scale_factor)
-            .with_shutdown_token(shutdown_token.clone());
+            .with_shutdown_token(shutdown_token.clone())
+            .with_skip_row_count_validation(row_count_validation_skip_queries.clone());
 
             if let Some(multi) = &multi {
                 worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));

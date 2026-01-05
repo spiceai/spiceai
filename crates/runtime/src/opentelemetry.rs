@@ -118,7 +118,7 @@ impl MetricsService for Service {
                             Ok(record_batch) => {
                                 if !self
                                     .datafusion
-                                    .is_writable(&TableReference::bare(metric.name.to_string()))
+                                    .is_writable(&TableReference::bare(metric.name.clone()))
                                 {
                                     warn_once!(
                                         self.once_tracer,

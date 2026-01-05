@@ -706,7 +706,7 @@ fn include_computed_columns(
                                 {
                                     proj.expr.push(Expr::Column(Column::new(
                                         proj.schema.qualified_field(idx).0.cloned(),
-                                        computed_column.name().to_string(),
+                                        computed_column.name().clone(),
                                     )));
                                 }
                             }

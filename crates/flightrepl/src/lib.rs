@@ -330,7 +330,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     rl.set_helper(Some(EditorHelper::new(
         Some(client.clone()),
         repl_config.api_key.clone(),
-        user_agent.to_string(),
+        user_agent.clone(),
     )));
     if let Some(helper) = rl.helper_mut() {
         // Perform initial refresh to populate autocomplete immediately with a 2-second timeout

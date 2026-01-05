@@ -153,7 +153,7 @@ impl DeltaTable {
                     storage_options.insert("timeout".into(), value.expose_secret().to_string());
                 }
                 _ => {
-                    storage_options.insert(key.to_string(), value.expose_secret().to_string());
+                    storage_options.insert(key.clone(), value.expose_secret().to_string());
                 }
             }
         }
