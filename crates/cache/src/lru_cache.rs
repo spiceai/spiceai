@@ -21,6 +21,7 @@ use crate::HashProvider;
 use crate::Result;
 use crate::Sizeable;
 use crate::TabledCacheProvider;
+use crate::backend::{CacheBackend, MokaBackend};
 use crate::key::PassthroughHashBuilder;
 use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
@@ -38,13 +39,124 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "pingora")]
+use crate::backend::PingoraBackend;
+
+/// Internal enum to hold either backend type, enabling runtime backend selection.
+enum CacheBackendEnum<V, T>
+where
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+    <T as BuildHasher>::Hasher: Send + Sync + 'static,
+{
+    Moka(MokaBackend<V, T>),
+    #[cfg(feature = "pingora")]
+    Pingora(PingoraBackend<V>),
+    /// Fallback to Moka when Pingora is requested but feature not enabled
+    #[cfg(not(feature = "pingora"))]
+    MokaFallback(MokaBackend<V, T>),
+}
+
+#[async_trait]
+impl<V, T> CacheBackend<V> for CacheBackendEnum<V, T>
+where
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher + Clone + Send + Sync + 'static,
+    <T as BuildHasher>::Hasher: Send + Sync + 'static,
+{
+    async fn insert(&self, key: u64, value: V, size: usize) {
+        match self {
+            Self::Moka(backend) => backend.insert(key, value, size).await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.insert(key, value, size).await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.insert(key, value, size).await,
+        }
+    }
+
+    async fn get(&self, key: &u64) -> Option<V> {
+        match self {
+            Self::Moka(backend) => backend.get(key).await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.get(key).await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.get(key).await,
+        }
+    }
+
+    async fn remove(&self, key: &u64) -> Option<V> {
+        match self {
+            Self::Moka(backend) => backend.remove(key).await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.remove(key).await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.remove(key).await,
+        }
+    }
+
+    async fn clear(&self) {
+        match self {
+            Self::Moka(backend) => backend.clear().await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.clear().await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.clear().await,
+        }
+    }
+
+    async fn iter_keys(&self) -> Vec<u64> {
+        match self {
+            Self::Moka(backend) => backend.iter_keys().await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.iter_keys().await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.iter_keys().await,
+        }
+    }
+
+    async fn len(&self) -> usize {
+        match self {
+            Self::Moka(backend) => backend.len().await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.len().await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.len().await,
+        }
+    }
+
+    async fn weighted_size(&self) -> u64 {
+        match self {
+            Self::Moka(backend) => backend.weighted_size().await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.weighted_size().await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.weighted_size().await,
+        }
+    }
+
+    async fn run_pending_tasks(&self) {
+        match self {
+            Self::Moka(backend) => backend.run_pending_tasks().await,
+            #[cfg(feature = "pingora")]
+            Self::Pingora(backend) => backend.run_pending_tasks().await,
+            #[cfg(not(feature = "pingora"))]
+            Self::MokaFallback(backend) => backend.run_pending_tasks().await,
+        }
+    }
+}
+
 // 'static is required by a bound from moka::Cache
 pub struct LruCache<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
 > {
-    cache: Cache<u64, V, PassthroughHashBuilder<T>>,
+    /// The underlying cache backend (Moka or Pingora)
+    backend: CacheBackendEnum<V, T>,
+    /// Moka cache for table invalidation (only used when Moka engine or for `invalidate_entries_if`)
+    moka_cache: Option<Cache<u64, V, PassthroughHashBuilder<T>>>,
+    /// The selected cache engine
+    engine: CacheEngine,
     hasher: T,
     max_size: u64,
     metrics_last_reported_time: AtomicU64,
@@ -78,8 +190,8 @@ impl<
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LruCache")
-            .field("cache_size", &self.cache.weighted_size())
-            .field("item_count", &self.cache.entry_count())
+            .field("engine", &self.engine)
+            .field("max_size", &self.max_size)
             .field(
                 "metrics_reported_last_time",
                 &self.metrics_last_reported_time,
@@ -142,62 +254,82 @@ impl<
     where
         <T as BuildHasher>::Hasher: Send + Sync + 'static,
     {
-        // Log the selected cache engine
-        match engine {
+        let moka_eviction_policy = match caching_policy {
+            CachingPolicy::Lru => moka::policy::EvictionPolicy::lru(),
+            CachingPolicy::TinyLfu => moka::policy::EvictionPolicy::tiny_lfu(),
+        };
+
+        // Build the Moka cache (used for Moka backend or for table invalidation support)
+        let build_moka_cache = || {
+            Cache::builder()
+                .time_to_live(ttl)
+                .weigher(|_key, value: &V| -> u32 {
+                    let val: usize = value.get_memory_size();
+                    match val.try_into() {
+                        Ok(val) => val,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Lru cache: Failed to convert query result size to u32: {}",
+                                e
+                            );
+                            u32::MAX
+                        }
+                    }
+                })
+                .max_capacity(cache_max_size)
+                .eviction_policy(moka_eviction_policy.clone())
+                .support_invalidation_closures()
+                .eviction_listener(|_key, _value, cause| {
+                    if cause.was_evicted() {
+                        V::record_eviction();
+                    }
+                })
+                .build_with_hasher(PassthroughHashBuilder::new(hasher.clone()))
+        };
+
+        // Create the appropriate backend and moka_cache based on engine selection
+        #[expect(
+            clippy::type_complexity,
+            reason = "Tuple is used locally for destructuring"
+        )]
+        let (backend, moka_cache, effective_engine): (
+            CacheBackendEnum<V, T>,
+            Option<Cache<u64, V, PassthroughHashBuilder<T>>>,
+            CacheEngine,
+        ) = match engine {
             CacheEngine::Moka => {
                 tracing::info!("Using Moka cache engine");
+                let cache = build_moka_cache();
+                let backend = CacheBackendEnum::Moka(MokaBackend::from_cache(cache.clone()));
+                (backend, Some(cache), CacheEngine::Moka)
             }
             CacheEngine::Pingora => {
                 #[cfg(feature = "pingora")]
                 {
                     tracing::info!(
-                        "Using Pingora cache engine (high-performance, lock-free). Note: table-specific invalidation not supported."
+                        "Using Pingora cache engine (high-performance, lock-free). Note: table-specific invalidation will iterate all keys."
                     );
+                    let backend =
+                        CacheBackendEnum::Pingora(PingoraBackend::with_params(cache_max_size, ttl));
+                    (backend, None, CacheEngine::Pingora)
                 }
                 #[cfg(not(feature = "pingora"))]
                 {
                     tracing::warn!(
                         "Pingora cache engine requested but 'pingora' feature is not enabled. Falling back to Moka."
                     );
+                    let cache = build_moka_cache();
+                    let backend =
+                        CacheBackendEnum::MokaFallback(MokaBackend::from_cache(cache.clone()));
+                    (backend, Some(cache), CacheEngine::Moka)
                 }
             }
-        }
-
-        let moka_eviction_policy = match caching_policy {
-            CachingPolicy::Lru => moka::policy::EvictionPolicy::lru(),
-            CachingPolicy::TinyLfu => moka::policy::EvictionPolicy::tiny_lfu(),
         };
 
-        let cache: Cache<u64, V, PassthroughHashBuilder<T>> = Cache::builder()
-            .time_to_live(ttl)
-            .weigher(|_key, value: &V| -> u32 {
-                let val: usize = value.get_memory_size();
-
-                match val.try_into() {
-                    Ok(val) => val,
-                    Err(e) => {
-                        // This should never happen, as the size of record batches should be less than u32::MAX
-                        tracing::warn!(
-                            "Lru cache: Failed to convert query result size to u32: {}",
-                            e
-                        );
-                        // Return the maximum value if we can't convert, so that we don't cache this record.
-                        u32::MAX
-                    }
-                }
-            })
-            .max_capacity(cache_max_size)
-            .eviction_policy(moka_eviction_policy)
-            .support_invalidation_closures()
-            .eviction_listener(|_key, _value, cause| {
-                if cause.was_evicted() {
-                    V::record_eviction();
-                }
-            })
-            .build_with_hasher(PassthroughHashBuilder::new(hasher.clone()));
-
         LruCache {
-            cache,
+            backend,
+            moka_cache,
+            engine: effective_engine,
             hasher,
             max_size: cache_max_size,
             metrics_last_reported_time: AtomicU64::new(0),
@@ -246,7 +378,7 @@ impl<
         V::record_request();
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(v) = self.cache.get(key).await {
+        if let Some(v) = self.backend.get(key).await {
             V::record_hit();
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(v)
@@ -257,7 +389,8 @@ impl<
     }
 
     async fn put_raw_key(&self, key: &u64, value: V) {
-        self.cache.insert(*key, value).await;
+        let size = value.get_memory_size();
+        self.backend.insert(*key, value, size).await;
 
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
@@ -286,7 +419,7 @@ impl<
     }
 
     async fn invalidate_all(&self) {
-        self.cache.invalidate_all();
+        self.backend.clear().await;
 
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
@@ -310,13 +443,13 @@ impl<
     }
 
     async fn size_bytes(&self) -> u64 {
-        self.cache.run_pending_tasks().await;
-        self.cache.weighted_size()
+        self.backend.run_pending_tasks().await;
+        self.backend.weighted_size().await
     }
 
     async fn item_count(&self) -> u64 {
-        self.cache.run_pending_tasks().await;
-        self.cache.entry_count()
+        self.backend.run_pending_tasks().await;
+        self.backend.len().await as u64
     }
 
     fn max_size(&self) -> usize {
@@ -324,7 +457,7 @@ impl<
     }
 
     async fn checkpoint(&self) {
-        self.cache.run_pending_tasks().await;
+        self.backend.run_pending_tasks().await;
     }
 }
 
@@ -341,10 +474,45 @@ impl<
             | TableReference::Partial { table, .. }
             | TableReference::Full { table, .. } => table,
         };
-        let table_name = Arc::clone(table_name);
-        self.cache
-            .invalidate_entries_if(move |_key, value| value.as_table_refs().contains(&table_ref))
-            .context(FailedToInvalidateCacheSnafu { table_name })?;
+        let table_name_arc = Arc::clone(table_name);
+
+        // For Moka backend, use efficient closure-based invalidation
+        // For Pingora (when moka_cache is None), we need to fall back to manual iteration
+        if let Some(ref moka_cache) = self.moka_cache {
+            moka_cache
+                .invalidate_entries_if(move |_key, value| {
+                    value.as_table_refs().contains(&table_ref)
+                })
+                .context(FailedToInvalidateCacheSnafu {
+                    table_name: table_name_arc,
+                })?;
+        } else {
+            // Pingora backend: iterate keys and remove matching entries
+            // This is O(n) but Pingora doesn't support closure-based invalidation
+            tracing::debug!(
+                "Invalidating cache entries for table {} using key iteration (Pingora backend)",
+                table_name
+            );
+
+            // Spawn a blocking task to handle the synchronous iteration
+            // Note: This is suboptimal but necessary for Pingora's API
+            let backend = &self.backend;
+            let keys_to_remove: Vec<u64> = futures::executor::block_on(async {
+                let mut keys_to_remove = Vec::new();
+                for key in backend.iter_keys().await {
+                    if let Some(value) = backend.get(&key).await
+                        && value.as_table_refs().contains(&table_ref)
+                    {
+                        keys_to_remove.push(key);
+                    }
+                }
+                keys_to_remove
+            });
+
+            for key in keys_to_remove {
+                futures::executor::block_on(backend.remove(&key));
+            }
+        }
 
         Ok(())
     }
@@ -685,5 +853,98 @@ mod tests {
         (retrieved_len == result_len)
             .then_some(())
             .expect("retrieved and result should have same length");
+    }
+
+    /// Test that Pingora backend works correctly when the feature is enabled.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn test_pingora_backend_put_and_get() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let key = CacheKey::Query("pingora_test_query", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result().await;
+
+        // Put a value in the cache
+        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+
+        // Force pending tasks to complete
+        cache.checkpoint().await;
+
+        // Get the value from the cache
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        let retrieved = retrieved.expect("Pingora cache should contain the key");
+        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
+        let result_len = result.records().await.expect("Failed to decode").len();
+        (retrieved_len == result_len)
+            .then_some(())
+            .expect("retrieved and result should have same length");
+    }
+
+    /// Test that Pingora backend cache miss works correctly.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn test_pingora_backend_cache_miss() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let key = CacheKey::Query("nonexistent_key", None).as_raw_key(cache.hasher());
+
+        // Try to get a value that doesn't exist
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain nonexistent key");
+    }
+
+    /// Test that Pingora backend `invalidate_all` works correctly.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn test_pingora_backend_invalidate_all() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let key = CacheKey::Query("pingora_invalidate_test", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result().await;
+
+        // Put a value in the cache
+        cache.put_raw_key(&key.as_u64(), result).await;
+        cache.checkpoint().await;
+
+        // Verify it's in the cache
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        retrieved
+            .is_some()
+            .then_some(())
+            .expect("cache should contain the key before invalidation");
+
+        // Invalidate all entries
+        cache.invalidate_all().await;
+
+        // Verify the cache is empty
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should be empty after invalidate_all");
     }
 }

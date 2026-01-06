@@ -81,6 +81,7 @@ default = [
     "iceberg-write",
     "turso",
     "smb",
+    "pingora",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -102,6 +103,7 @@ mysql = ["runtime/mysql"]
 nfs = ["runtime/nfs"]
 odbc = ["runtime/odbc"]
 oracle = ["runtime/oracle"]
+pingora = ["runtime/pingora"]
 postgres = ["runtime/postgres"]
 postgres-write = ["runtime/postgres-write"]
 release = []

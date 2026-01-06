@@ -57,6 +57,16 @@ where
 
         Self { cache }
     }
+
+    /// Creates a Moka backend wrapping an existing Moka cache.
+    ///
+    /// This is useful when you have already configured a Moka cache with
+    /// specific settings (eviction policy, listeners, etc.) and want to
+    /// use it with the [`CacheBackend`] trait.
+    #[must_use]
+    pub(crate) fn from_cache(cache: Cache<u64, V, PassthroughHashBuilder<T>>) -> Self {
+        Self { cache }
+    }
 }
 
 #[async_trait]
