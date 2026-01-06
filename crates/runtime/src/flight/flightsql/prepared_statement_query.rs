@@ -55,14 +55,14 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 /// Arrow `DataType` to SQL type name conversion for CAST expressions.
 ///
 /// NOTE: String types (`Utf8`, `LargeUtf8`) are intentionally NOT included here.
-/// Adding CAST for strings (e.g., `CAST($1 AS VARCHAR)`) prevents DataFusion's
-/// filter pushdown optimization from merging filters into TableScan as `full_filters`.
-/// This causes filters to remain as separate Filter nodes below SubqueryAlias, which
+/// Adding CAST for strings (e.g., `CAST($1 AS VARCHAR)`) prevents `DataFusion`'s
+/// filter pushdown optimization from merging filters into `TableScan` as `full_filters`.
+/// This causes filters to remain as separate Filter nodes below `SubqueryAlias`, which
 /// then causes datafusion-federation to generate invalid SQL with unaliased table
 /// references (e.g., `nation.n_name` instead of `n1.n_name` when the table is aliased).
 /// String type inference works correctly without explicit CASTs.
 ///
-/// Long-term fix: Update DataFusion's optimizer to recognize that `CAST(Utf8 AS Utf8View)`
+/// Long-term fix: Update `DataFusion`'s optimizer to recognize that `CAST(Utf8 AS Utf8View)`
 /// is safe to push down. This would be the proper upstream fix, but until then we avoid
 /// the CAST for string types entirely.
 fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static str> {
