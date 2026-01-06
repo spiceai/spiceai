@@ -289,7 +289,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
                     table_name,
                     &format!("id-{i}"),
                     &format!("Item {i}"),
-                    i as i32,
+                    i,
                 )
                 .await;
             }
@@ -299,7 +299,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
                     table_name,
                     &format!("id-{i}"),
                     &format!("Item {i}"),
-                    i as i32,
+                    i,
                 )
                 .await;
             }

@@ -865,7 +865,6 @@ mod tests {
         assert_eq!(result[3].1, vec![3]);
     }
 
-    // Helper to create a RecordBatch with a single row for testing
     fn make_single_row_batch(pk: i64, sk: &str) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("PK", DataType::Int64, false),
@@ -878,16 +877,10 @@ mod tests {
         RecordBatch::try_new(schema, vec![pk_array, sk_array]).expect("record batch")
     }
 
-    /// Helper to create a RecordBatch with a single string key
     fn make_single_key_batch(id: &str) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let id_array: ArrayRef = Arc::new(StringArray::from(vec![id]));
         RecordBatch::try_new(schema, vec![id_array]).expect("record batch")
-    }
-
-    /// Extracts string representation of an Expr for easier assertion
-    fn expr_to_string(expr: &Expr) -> String {
-        format!("{expr}")
     }
 
     #[test]
@@ -945,7 +938,7 @@ mod tests {
     fn test_multiple_rows_single_key_produces_or() {
         // Should produce: id='id-5' OR id='id-6' OR id='id-7'
         let row_indices = vec![0, 1, 2];
-        let ids = vec!["id-5", "id-6", "id-7"];
+        let ids = ["id-5", "id-6", "id-7"];
 
         let result = build_batch_delete_expr(
             &row_indices,
@@ -995,6 +988,7 @@ mod tests {
 
             // Verify we have conditions for both pk and sk
             let has_pk = conditions.iter().any(|e| is_column_eq(e, "pk"));
+            #[allow(clippy::similar_names)]
             let has_sk = conditions.iter().any(|e| is_column_eq(e, "sk"));
             assert!(has_pk, "Expected condition for pk");
             assert!(has_sk, "Expected condition for sk");
@@ -1007,7 +1001,7 @@ mod tests {
     fn test_multiple_rows_composite_key_produces_or_of_ands() {
         // Should produce: (pk=1 AND sk='300') OR (pk=1 AND sk='400') OR (pk=2 AND sk='100')
         let row_indices = vec![0, 1, 2];
-        let rows = vec![(1i64, "300"), (1i64, "400"), (2i64, "100")];
+        let rows = [(1i64, "300"), (1i64, "400"), (2i64, "100")];
 
         let result = build_batch_delete_expr(
             &row_indices,
@@ -1046,7 +1040,7 @@ mod tests {
     fn test_two_rows_single_key_structure() {
         // Test the exact structure: id='a' OR id='b'
         let row_indices = vec![0, 1];
-        let ids = vec!["a", "b"];
+        let ids = ["a", "b"];
 
         let result = build_batch_delete_expr(
             &row_indices,
@@ -1084,7 +1078,7 @@ mod tests {
     fn test_two_rows_composite_key_structure() {
         // Test: (pk=1 AND sk='a') OR (pk=2 AND sk='b')
         let row_indices = vec![0, 1];
-        let rows = vec![(1i64, "a"), (2i64, "b")];
+        let rows = [(1i64, "a"), (2i64, "b")];
 
         let result = build_batch_delete_expr(
             &row_indices,
@@ -1148,11 +1142,11 @@ mod tests {
 
     /// Checks if expression is `column_name = <something>`
     fn is_column_eq(expr: &Expr, column_name: &str) -> bool {
-        if let Expr::BinaryExpr(binary) = expr {
-            if binary.op == Operator::Eq {
-                if let Expr::Column(col) = binary.left.as_ref() {
-                    return col.name == column_name;
-                }
+        if let Expr::BinaryExpr(binary) = expr
+            && binary.op == Operator::Eq
+        {
+            if let Expr::Column(col) = binary.left.as_ref() {
+                return col.name == column_name;
             }
         }
         false
@@ -1160,18 +1154,13 @@ mod tests {
 
     /// Extracts the string value from `column_name = 'value'`
     fn extract_eq_value(expr: &Expr, column_name: &str) -> String {
-        if let Expr::BinaryExpr(binary) = expr {
-            if binary.op == Operator::Eq {
-                if let Expr::Column(col) = binary.left.as_ref() {
-                    if col.name == column_name {
-                        if let Expr::Literal(ScalarValue::Utf8(Some(val)), _) =
-                            binary.right.as_ref()
-                        {
-                            return val.clone();
-                        }
-                    }
-                }
-            }
+        if let Expr::BinaryExpr(binary) = expr
+            && binary.op == Operator::Eq
+            && let Expr::Column(col) = binary.left.as_ref()
+            && col.name == column_name
+            && let Expr::Literal(ScalarValue::Utf8(Some(val)), _) = binary.right.as_ref()
+        {
+            return val.clone();
         }
         panic!("Expected {column_name} = 'value', got: {expr:?}");
     }
