@@ -49,6 +49,7 @@ async fn test_partitioned_table_with_chunking_impl(
         table_name: "partitioned_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("category".to_string()),
         vortex_config: VortexConfig {
@@ -270,6 +271,7 @@ async fn test_partitioned_table_with_large_chunks_impl(
         table_name: "large_chunk_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("region".to_string()),
         vortex_config: VortexConfig {
@@ -341,6 +343,7 @@ async fn test_timestamp_partition_with_date_part_impl(
         table_name: "timestamp_partitioned_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("month".to_string()), // Simple column partitioning
         vortex_config: VortexConfig {

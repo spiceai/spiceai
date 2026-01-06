@@ -31,3 +31,8 @@ pub const LISTING_TABLE_LOCK_POISONED: &str =
 pub const DELETION_CACHE_LOCK_POISONED: &str =
     "Lock poisoned on deletion cache: a thread panicked while holding this lock. \
     This indicates an internal error that requires restarting the runtime.";
+
+/// Default data file ID used for non-partitioned tables.
+///
+/// In Cayenne, this represents the single data file in a non-partitioned table.
+pub const DEFAULT_DATA_FILE_ID: i64 = 0;

@@ -129,7 +129,7 @@ candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d
 candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" }
 charset = "0.1.5"
 chrono = "0.4.42"
-clap = { version = "4.5.47", features = ["derive", "env"] }
+clap = { version = "4.5.54", features = ["derive", "env"] }
 clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
     "tls",
@@ -181,7 +181,7 @@ iceberg-catalog-rest = "0.7.0"
 iceberg-datafusion = "0.7.0"
 imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe1799a73f48e589366d8d100f" }
 indexmap = "2"
-insta = { version = "1.43.0", features = ["filters"] }
+insta = { version = "1.46.0", features = ["filters"] }
 itertools = "0.14"
 linkme = "0.3.35"
 logos = "0.16.0"
@@ -252,7 +252,7 @@ snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "85
 sqlparser = "0.58.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
-sysinfo = "0.35.2"
+sysinfo = "0.37.2"
 tantivy = "0.25.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [

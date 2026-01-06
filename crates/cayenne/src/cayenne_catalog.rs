@@ -290,6 +290,7 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?)
         };
+        let on_conflict_json = options.on_conflict.as_ref().map(ToString::to_string);
 
         let partition_column = options.partition_column.clone();
 
@@ -313,9 +314,9 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: r"
                     INSERT INTO cayenne_table (
                         table_uuid, table_name, path, path_is_relative, schema_json, primary_key_json,
-                        current_snapshot_id, partition_column, vortex_config_json
+                        on_conflict_json, current_snapshot_id, partition_column, vortex_config_json
                     ) VALUES (
-                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
                     )
                 ",
                 params: vec![
@@ -325,6 +326,7 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Bool(false), // path_is_relative
                     MetastoreValue::Text(schema_json),
                     primary_key_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
+                    on_conflict_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Text(initial_snapshot_id.clone()),
                     partition_column.map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Text(vortex_config_json),
@@ -371,7 +373,7 @@ impl MetadataCatalog for CayenneCatalog {
                     sql: r"
                     SELECT table_id, table_uuid,
                            table_name, path, path_is_relative, schema_json, primary_key_json,
-                           current_snapshot_id, partition_column, vortex_config_json,
+                           on_conflict_json, current_snapshot_id, partition_column, vortex_config_json,
                            current_sequence_number
                     FROM cayenne_table
                     WHERE table_name = ?1
@@ -387,10 +389,11 @@ impl MetadataCatalog for CayenneCatalog {
                     let path_is_relative = row.get_bool(4)?;
                     let schema_json = row.get_string(5)?;
                     let primary_key_json = row.get_optional_string(6)?;
-                    let current_snapshot_id = row.get_string(7)?;
-                    let partition_column = row.get_optional_string(8)?;
-                    let vortex_config_json = row.get_optional_string(9)?;
-                    let current_sequence_number = row.get_optional_i64(10)?.unwrap_or(0);
+                    let on_conflict_json = row.get_optional_string(7)?;
+                    let current_snapshot_id = row.get_string(8)?;
+                    let partition_column = row.get_optional_string(9)?;
+                    let vortex_config_json = row.get_optional_string(10)?;
+                    let current_sequence_number = row.get_optional_i64(11)?.unwrap_or(0);
 
                     // Deserialize schema using Arrow IPC format
                     let schema = {
@@ -427,6 +430,20 @@ impl MetadataCatalog for CayenneCatalog {
                         vec![]
                     };
 
+                    let on_conflict = if let Some(oc_str) = on_conflict_json {
+                        Some(
+                            datafusion_table_providers::util::on_conflict::OnConflict::try_from(
+                                oc_str.as_str(),
+                            )
+                            .map_err(|e| CatalogError::InvalidOperation {
+                                message: "Failed to deserialize on_conflict".to_string(),
+                                source: Box::new(e),
+                            })?,
+                        )
+                    } else {
+                        None
+                    };
+
                     // Parse vortex config
                     let vortex_config = if let Some(config_json) = vortex_config_json {
                         serde_json::from_str(&config_json).map_err(|e| {
@@ -447,6 +464,7 @@ impl MetadataCatalog for CayenneCatalog {
                         path_is_relative,
                         schema,
                         primary_key,
+                        on_conflict,
                         current_snapshot_id,
                         partition_column,
                         vortex_config,
@@ -577,6 +595,37 @@ impl MetadataCatalog for CayenneCatalog {
             .map_err(|e| CatalogError::FailedToGetTableDeleteFiles {
                 source: Box::new(e),
             })
+    }
+
+    async fn remove_delete_files(
+        &self,
+        table_id: i64,
+        delete_file_ids: &[i64],
+    ) -> CatalogResult<()> {
+        if delete_file_ids.is_empty() {
+            return Ok(());
+        }
+
+        let placeholders = delete_file_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| format!("?{}", idx + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "DELETE FROM cayenne_delete_file WHERE table_id = ?1 AND delete_file_id IN ({placeholders})"
+        );
+
+        let mut params = Vec::with_capacity(delete_file_ids.len() + 1);
+        params.push(MetastoreValue::Integer(table_id));
+        for id in delete_file_ids {
+            params.push(MetastoreValue::Integer(*id));
+        }
+
+        self.metastore
+            .execute_helper(ExecuteParams { sql: &sql, params })
+            .await
     }
 
     async fn clear_delete_files(&self, table_id: i64) -> CatalogResult<()> {
@@ -1001,6 +1050,7 @@ mod tests {
                     table_name: table_name.clone(),
                     schema: schema_clone,
                     primary_key: vec![],
+                    on_conflict: None,
                     base_path,
                     partition_column: None,
                     vortex_config: crate::metadata::VortexConfig::default(),
@@ -1066,6 +1116,7 @@ mod tests {
             table_name: "test_table".to_string(),
             schema,
             primary_key: vec![],
+            on_conflict: None,
             base_path: "/tmp/cayenne_test_partition".to_string(),
             partition_column: Some("date".to_string()),
             vortex_config: crate::metadata::VortexConfig::default(),
