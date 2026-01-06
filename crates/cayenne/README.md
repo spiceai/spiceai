@@ -324,7 +324,7 @@ The following limitations apply to the Cayenne accelerator:
 Some Arrow data types are not natively supported by the Vortex format used by Cayenne:
 
 - `Interval` types
-- `Duration` types  
+- `Duration` types
 - `Map` types
 - `FixedSizeBinary` types
 
