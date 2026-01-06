@@ -273,7 +273,11 @@ impl RefreshTask {
             row_indices.len()
         );
 
-        let combined = build_batch_delete_expr_from_change_batch(change_batch, row_indices, dataset_name.to_string().as_str())?;
+        let combined = build_batch_delete_expr_from_change_batch(
+            change_batch,
+            row_indices,
+            dataset_name.to_string().as_str(),
+        )?;
 
         if let Some(combined) = combined {
             let ctx = SessionContext::new();
@@ -318,10 +322,8 @@ where
             exprs
                 .into_iter()
                 .reduce(datafusion_expr::Expr::and)
-                .ok_or_else(|| {
-                    crate::accelerated_table::Error::NoPrimaryKeysDefined {
-                        dataset_name: dataset_name.to_string(),
-                    }
+                .ok_or_else(|| crate::accelerated_table::Error::NoPrimaryKeysDefined {
+                    dataset_name: dataset_name.to_string(),
                 })
         })
         .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
