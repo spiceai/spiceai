@@ -40,13 +40,26 @@ jobs:
         with:
           os: 'darwin'
 
-      - name: Verify Docker/Colima setup
+      - name: Verify Docker/Colima environment
         run: |
+          echo "=== PATH ==="
+          echo "$PATH"
+          
+          echo "=== Homebrew paths ==="
+          ls -la /opt/homebrew/bin/colima 2>/dev/null || echo "/opt/homebrew/bin/colima: not found"
+          ls -la /opt/homebrew/bin/docker 2>/dev/null || echo "/opt/homebrew/bin/docker: not found"
+          ls -la /usr/local/bin/colima 2>/dev/null || echo "/usr/local/bin/colima: not found"
+          ls -la /usr/local/bin/docker 2>/dev/null || echo "/usr/local/bin/docker: not found"
+          
+          echo "=== DOCKER_HOST ==="
           echo "DOCKER_HOST=$DOCKER_HOST"
-          echo "Colima version: $(colima version 2>/dev/null || echo 'not installed')"
-          echo "Colima status: $(colima status 2>&1 || echo 'not running')"
-          echo "Docker info:"
-          docker info
+          
+          echo "=== Colima socket ==="
+          ls -la /Users/runner/.colima/default/docker.sock 2>/dev/null || echo "Colima socket not found"
+          
+          echo "=== which commands ==="
+          which colima 2>/dev/null || echo "colima not in PATH"
+          which docker 2>/dev/null || echo "docker not in PATH"
 
       - name: Set up API Keys
         run: |
