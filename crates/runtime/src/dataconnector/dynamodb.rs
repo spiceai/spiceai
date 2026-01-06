@@ -32,7 +32,7 @@ use data_components::dynamodb::provider::DynamoDBTableProvider;
 use data_components::dynamodb::{Error, JsonNesting};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector}git st;
+use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
 use runtime_parameters::ExposedParamLookup;
