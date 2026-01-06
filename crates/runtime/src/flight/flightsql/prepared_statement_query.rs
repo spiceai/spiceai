@@ -53,6 +53,18 @@ use crate::{
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 /// Arrow `DataType` to SQL type name conversion for CAST expressions.
+///
+/// NOTE: String types (`Utf8`, `LargeUtf8`) are intentionally NOT included here.
+/// Adding CAST for strings (e.g., `CAST($1 AS VARCHAR)`) prevents `DataFusion`'s
+/// filter pushdown optimization from merging filters into `TableScan` as `full_filters`.
+/// This causes filters to remain as separate Filter nodes below `SubqueryAlias`, which
+/// then causes datafusion-federation to generate invalid SQL with unaliased table
+/// references (e.g., `nation.n_name` instead of `n1.n_name` when the table is aliased).
+/// String type inference works correctly without explicit CASTs.
+///
+/// Long-term fix: Update `DataFusion`'s optimizer to recognize that `CAST(Utf8 AS Utf8View)`
+/// is safe to push down. This would be the proper upstream fix, but until then we avoid
+/// the CAST for string types entirely.
 fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static str> {
     use arrow::datatypes::DataType;
     match dt {
@@ -66,7 +78,8 @@ fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static st
         DataType::UInt64 => Some("BIGINT UNSIGNED"),
         DataType::Float32 => Some("FLOAT"),
         DataType::Float64 => Some("DOUBLE"),
-        DataType::Utf8 | DataType::LargeUtf8 => Some("VARCHAR"),
+        // String types intentionally omitted - CASTs break filter pushdown optimization
+        // DataType::Utf8 | DataType::LargeUtf8 => Some("VARCHAR"),
         DataType::Boolean => Some("BOOLEAN"),
         DataType::Date32 | DataType::Date64 => Some("DATE"),
         DataType::Timestamp(_, _) => Some("TIMESTAMP"),
@@ -131,8 +144,9 @@ fn rewrite_sql_with_type_casts(sql: &str, schema: &SchemaRef) -> String {
         if let Some(sql_type) = arrow_type_to_sql_type(field.data_type()) {
             param_types.insert(param_num, sql_type);
         } else {
-            tracing::warn!(
-                "Cannot cast parameter ${} with unsupported type: {:?}",
+            // Some types intentionally don't get CAST (e.g., strings - see arrow_type_to_sql_type docs)
+            tracing::debug!(
+                "Skipping CAST for parameter ${} with type: {:?}",
                 param_num,
                 field.data_type()
             );
@@ -1361,5 +1375,462 @@ mod tests {
         // 3. Each execution returns correct results based on the provided parameters
         // 4. DEALLOCATE properly cleans up the prepared statement
         // 5. All operations work through the DataFusion DataFrame API (ctx.sql())
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` preserves table aliases when roundtripping
+    /// through the SQL parser.
+    ///
+    /// This is critical for queries like TPC-H Q7 which use the same table with multiple aliases:
+    /// `FROM nation n1, nation n2 WHERE n1.n_name = $1 AND n2.n_name = $2`
+    ///
+    /// The bug we're testing for: after parsing and regenerating SQL, the aliases could be lost
+    /// or the column references could incorrectly refer to the original table name instead of
+    /// the alias (e.g., `nation.n_name` instead of `n1.n_name`).
+    #[test]
+    fn test_rewrite_sql_preserves_table_aliases() {
+        // Query with table aliases similar to TPC-H Q7
+        let sql = r"SELECT n1.n_name, n2.n_name FROM nation n1, nation n2 WHERE n1.n_name = $1 AND n2.n_name = $2";
+
+        // Create a schema with two VARCHAR parameters
+        // Note: String types (Utf8) intentionally don't get CAST to avoid breaking filter pushdown
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Utf8, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // The rewritten SQL should still reference n1 and n2 aliases, not "nation"
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Rewritten SQL should preserve n1 alias: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "Rewritten SQL should preserve n2 alias: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("nation.n_name"),
+            "Rewritten SQL should not have unaliased nation.n_name: {rewritten}"
+        );
+
+        // Verify the table aliases are preserved in FROM clause
+        assert!(
+            rewritten.contains("nation AS n1") || rewritten.contains("nation n1"),
+            "Rewritten SQL should preserve table alias n1: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("nation AS n2") || rewritten.contains("nation n2"),
+            "Rewritten SQL should preserve table alias n2: {rewritten}"
+        );
+
+        // String parameters should NOT be wrapped in CAST (to avoid breaking filter pushdown)
+        // The parameters should remain as plain $1, $2
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST (breaks filter pushdown): {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($2 AS"),
+            "String parameter $2 should NOT be wrapped in CAST (breaks filter pushdown): {rewritten}"
+        );
+        // Verify parameters are still present
+        assert!(
+            rewritten.contains("$1") && rewritten.contains("$2"),
+            "Parameters should be present in rewritten SQL: {rewritten}"
+        );
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` preserves column aliases and complex expressions.
+    #[test]
+    fn test_rewrite_sql_preserves_column_aliases() {
+        let sql = r"SELECT a.id AS a_id, b.id AS b_id, a.value + b.value AS total FROM table1 a JOIN table2 b ON a.id = b.ref_id WHERE a.status = $1";
+
+        // String parameter - should NOT get CAST
+        let schema = Arc::new(Schema::new(vec![Field::new("$1", DataType::Utf8, true)]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify column aliases are preserved
+        assert!(
+            rewritten.contains("a_id") || rewritten.contains("AS a_id"),
+            "Column alias a_id should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("b_id") || rewritten.contains("AS b_id"),
+            "Column alias b_id should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("total") || rewritten.contains("AS total"),
+            "Column alias total should be preserved: {rewritten}"
+        );
+
+        // Verify table aliases are preserved in column references
+        assert!(
+            rewritten.contains("a.id") || rewritten.contains("a.\"id\""),
+            "Table alias a should be preserved in column reference: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("b.id") || rewritten.contains("b.\"id\""),
+            "Table alias b should be preserved in column reference: {rewritten}"
+        );
+
+        // String parameter should NOT be wrapped in CAST
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter should NOT be wrapped in CAST: {rewritten}"
+        );
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` handles subquery aliases correctly.
+    #[test]
+    fn test_rewrite_sql_preserves_subquery_aliases() {
+        let sql = r"SELECT sub.total FROM (SELECT SUM(value) AS total FROM orders WHERE status = $1) AS sub WHERE sub.total > $2";
+
+        // $1 is string (no CAST), $2 is Int64 (gets CAST)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Int64, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify subquery alias is preserved
+        assert!(
+            rewritten.contains("sub.total") || rewritten.contains("sub.\"total\""),
+            "Subquery alias 'sub' should be preserved in column reference: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("AS sub") || rewritten.contains(") sub"),
+            "Subquery alias should be preserved: {rewritten}"
+        );
+
+        // String parameter ($1) should NOT be wrapped in CAST
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST: {rewritten}"
+        );
+        // Integer parameter ($2) SHOULD be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($2 AS"),
+            "Integer parameter $2 should be wrapped in CAST: {rewritten}"
+        );
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` handles no parameters gracefully.
+    #[test]
+    fn test_rewrite_sql_no_parameters() {
+        let sql = r"SELECT n1.n_name FROM nation n1 WHERE n1.n_name = 'FRANCE'";
+
+        // Empty schema - no parameters
+        let schema = Arc::new(Schema::empty());
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Should still preserve the alias
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Table alias n1 should be preserved: {rewritten}"
+        );
+    }
+
+    /// Tests that `rewrite_sql_with_type_casts` handles the failing Q7-style query pattern.
+    ///
+    /// This query pattern previously failed in federation when string parameters
+    /// were wrapped in CAST, which prevented filter pushdown optimization.
+    ///
+    /// The fix: String types are no longer wrapped in CAST, allowing `DataFusion` to
+    /// properly push down filters into `TableScan` as `full_filters`.
+    #[test]
+    fn test_rewrite_sql_table_alias_q7_pattern() {
+        // This is the exact pattern that was failing in TPC-H Q7 parameterized queries
+        let sql = r"
+            SELECT n1.n_name, n2.n_name 
+            FROM nation n1, nation n2 
+            WHERE (
+                (n1.n_name = $1 AND n2.n_name = $2) 
+                OR (n1.n_name = $3 AND n2.n_name = $4)
+            )";
+
+        // All 4 parameters are strings - should NOT get CAST
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Utf8, true),
+            Field::new("$3", DataType::Utf8, true),
+            Field::new("$4", DataType::Utf8, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify all n1 and n2 references are preserved
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Rewritten SQL should preserve n1.n_name references: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "Rewritten SQL should preserve n2.n_name references: {rewritten}"
+        );
+
+        // The bug would cause "nation.n_name" to appear instead of alias references
+        assert!(
+            !rewritten.contains("nation.n_name"),
+            "Rewritten SQL should NOT have unaliased nation.n_name: {rewritten}"
+        );
+
+        // Verify table aliases are in FROM clause
+        assert!(
+            rewritten.contains("nation AS n1") || rewritten.contains("nation n1"),
+            "Table alias n1 should be in FROM clause: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("nation AS n2") || rewritten.contains("nation n2"),
+            "Table alias n2 should be in FROM clause: {rewritten}"
+        );
+
+        // String parameters should NOT be wrapped in CAST (the fix for the bug)
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($2 AS"),
+            "String parameter $2 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($3 AS"),
+            "String parameter $3 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($4 AS"),
+            "String parameter $4 should NOT be wrapped in CAST: {rewritten}"
+        );
+        // Verify parameters are still present
+        assert!(
+            rewritten.contains("$1")
+                && rewritten.contains("$2")
+                && rewritten.contains("$3")
+                && rewritten.contains("$4"),
+            "All parameters should be present in rewritten SQL: {rewritten}"
+        );
+    }
+
+    /// Tests the CTE-based workaround pattern.
+    ///
+    /// This query pattern uses CTEs to create named subqueries:
+    /// `WITH n1 AS (SELECT * FROM nation), n2 AS (SELECT * FROM nation) SELECT ...`
+    ///
+    /// CTEs create proper named subqueries that avoid alias resolution issues.
+    /// Note: With the fix to not CAST string types, both patterns should now work.
+    #[test]
+    fn test_rewrite_sql_cte_workaround_pattern() {
+        // CTE pattern
+        let sql = r"
+            WITH n1 AS (SELECT * FROM nation), 
+                 n2 AS (SELECT * FROM nation) 
+            SELECT n1.n_name, n2.n_name 
+            FROM n1, n2 
+            WHERE (
+                (n1.n_name = $1 AND n2.n_name = $2) 
+                OR (n1.n_name = $3 AND n2.n_name = $4)
+            )";
+
+        // All string parameters - should NOT get CAST
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Utf8, true),
+            Field::new("$3", DataType::Utf8, true),
+            Field::new("$4", DataType::Utf8, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify CTE names are preserved
+        assert!(
+            rewritten.contains("n1 AS") || rewritten.contains("n1 AS ("),
+            "CTE n1 should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2 AS") || rewritten.contains("n2 AS ("),
+            "CTE n2 should be preserved: {rewritten}"
+        );
+
+        // Verify column references use CTE names
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Rewritten SQL should preserve n1.n_name references: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "Rewritten SQL should preserve n2.n_name references: {rewritten}"
+        );
+
+        // String parameters should NOT be wrapped in CAST
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("CAST($4 AS"),
+            "String parameter $4 should NOT be wrapped in CAST: {rewritten}"
+        );
+        // Verify parameters are present
+        assert!(
+            rewritten.contains("$1") && rewritten.contains("$4"),
+            "Parameters should be present in rewritten SQL: {rewritten}"
+        );
+    }
+
+    /// Tests without parameters - ensures aliases are preserved even when
+    /// no parameter rewriting happens.
+    #[test]
+    fn test_rewrite_sql_table_alias_no_params() {
+        // Query with table aliases but no parameters - should pass through unchanged
+        let sql = r"
+            SELECT n1.n_name, n2.n_name 
+            FROM nation n1, nation n2 
+            WHERE (
+                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') 
+                OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
+            )";
+
+        // Empty schema = no parameters
+        let schema = Arc::new(Schema::empty());
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify aliases are preserved
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "Rewritten SQL should preserve n1.n_name references: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "Rewritten SQL should preserve n2.n_name references: {rewritten}"
+        );
+
+        // Verify table aliases in FROM clause
+        assert!(
+            rewritten.contains("nation AS n1") || rewritten.contains("nation n1"),
+            "Table alias n1 should be in FROM clause: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("nation AS n2") || rewritten.contains("nation n2"),
+            "Table alias n2 should be in FROM clause: {rewritten}"
+        );
+
+        // No unaliased references
+        assert!(
+            !rewritten.contains("nation.n_name"),
+            "Rewritten SQL should NOT have unaliased nation.n_name: {rewritten}"
+        );
+    }
+
+    /// Tests CTE without parameters - the workaround pattern without parameter binding.
+    #[test]
+    fn test_rewrite_sql_cte_no_params() {
+        let sql = r"
+            WITH n1 AS (SELECT * FROM nation), 
+                 n2 AS (SELECT * FROM nation) 
+            SELECT n1.n_name, n2.n_name 
+            FROM n1, n2 
+            WHERE (
+                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') 
+                OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
+            )";
+
+        let schema = Arc::new(Schema::empty());
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Verify CTE structure is preserved
+        assert!(
+            rewritten.contains("WITH"),
+            "CTE WITH clause should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n1.n_name"),
+            "CTE reference n1.n_name should be preserved: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("n2.n_name"),
+            "CTE reference n2.n_name should be preserved: {rewritten}"
+        );
+    }
+
+    /// Tests that non-string types still get CAST expressions.
+    ///
+    /// Integer, float, boolean, and date/timestamp types still need CAST
+    /// for proper type inference in prepared statements like "SELECT $1 + $2".
+    #[test]
+    fn test_rewrite_sql_numeric_types_get_cast() {
+        let sql = r"SELECT $1 + $2 AS sum, $3 * $4 AS product";
+
+        // All numeric parameters - should get CAST
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Int64, true),
+            Field::new("$2", DataType::Int64, true),
+            Field::new("$3", DataType::Float64, true),
+            Field::new("$4", DataType::Float64, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // Integer parameters should be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($1 AS BIGINT)"),
+            "Int64 parameter $1 should be wrapped in CAST AS BIGINT: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("CAST($2 AS BIGINT)"),
+            "Int64 parameter $2 should be wrapped in CAST AS BIGINT: {rewritten}"
+        );
+
+        // Float parameters should be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($3 AS DOUBLE)"),
+            "Float64 parameter $3 should be wrapped in CAST AS DOUBLE: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("CAST($4 AS DOUBLE)"),
+            "Float64 parameter $4 should be wrapped in CAST AS DOUBLE: {rewritten}"
+        );
+    }
+
+    /// Tests mixed parameter types - strings should NOT get CAST, others should.
+    #[test]
+    fn test_rewrite_sql_mixed_types() {
+        let sql = r"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3";
+
+        // Mixed types: string (no CAST), int (CAST), float (CAST)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("$1", DataType::Utf8, true),
+            Field::new("$2", DataType::Int32, true),
+            Field::new("$3", DataType::Float64, true),
+        ]));
+
+        let rewritten = rewrite_sql_with_type_casts(sql, &schema);
+
+        // String parameter should NOT be wrapped in CAST
+        assert!(
+            !rewritten.contains("CAST($1 AS"),
+            "String parameter $1 should NOT be wrapped in CAST: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("$1"),
+            "String parameter $1 should be present: {rewritten}"
+        );
+
+        // Int32 parameter should be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($2 AS INT)"),
+            "Int32 parameter $2 should be wrapped in CAST AS INT: {rewritten}"
+        );
+
+        // Float64 parameter should be wrapped in CAST
+        assert!(
+            rewritten.contains("CAST($3 AS DOUBLE)"),
+            "Float64 parameter $3 should be wrapped in CAST AS DOUBLE: {rewritten}"
+        );
     }
 }
