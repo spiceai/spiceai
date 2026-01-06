@@ -286,10 +286,10 @@ pub async fn initiate_config_with_auth_method(
                 Some("metadata") => initiate_config_auth_iam_metadata(region),
                 Some("env") => initiate_config_auth_iam_env(region),
                 Some("auto") | None => initiate_config_default_auth(region).await,
-                _ => {
+                Some(other) => {
                     return Err(Error::InvalidIamRoleSource {
                         key: iam_role_source_name.to_string(),
-                        iam_source: auth,
+                        iam_source: other.to_string(),
                     });
                 }
             }
