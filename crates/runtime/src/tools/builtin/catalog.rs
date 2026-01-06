@@ -170,15 +170,18 @@ impl BuiltinToolCatalog {
             ))),
             "sample_distinct_columns" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::DistinctColumns)
-                    .with_overrides(Some(name), Some(description)),
+                    .with_overrides(Some(name), Some(description))
+                    .with_table_allowlist(table_allowlist),
             )),
             "random_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::RandomSample)
-                    .with_overrides(Some(name), Some(description)),
+                    .with_overrides(Some(name), Some(description))
+                    .with_table_allowlist(table_allowlist),
             )),
             "top_n_sample" => Ok(Arc::new(
                 SampleDataTool::new(self.rt.datafusion(), SampleTableMethod::TopNSample)
-                    .with_overrides(Some(name), Some(description)),
+                    .with_overrides(Some(name), Some(description))
+                    .with_table_allowlist(table_allowlist),
             )),
             "list_datasets" => Ok(Arc::new(ListDatasetsTool::new(
                 Some(name),
