@@ -5,7 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 name = "cayenne"
 repository = "https://github.com/spiceai/spiceai"
-version = "0.1.0"
+version.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
@@ -26,6 +26,7 @@ datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
+datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
 roaring = { workspace = true }

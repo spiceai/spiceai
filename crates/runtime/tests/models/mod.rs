@@ -44,7 +44,7 @@ mod models_http_endpoint;
 pub(crate) mod openai;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;
-mod search;
+pub(crate) mod search;
 mod tools;
 
 mod nsql {

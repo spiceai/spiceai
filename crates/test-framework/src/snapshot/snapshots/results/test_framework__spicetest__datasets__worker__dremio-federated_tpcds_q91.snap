@@ -8,4 +8,5 @@ description: "Query: tpcds_q91"
 | AAAAAAAAEAAAAAAA | North Midwest    | Larry Mccray | 3486.41      |
 | AAAAAAAABAAAAAAA | NY Metro         | Bob Belcher  | 3803.30      |
 | AAAAAAAAEAAAAAAA | North Midwest    | Larry Mccray | 490.38       |
+| AAAAAAAABAAAAAAA | NY Metro         | Bob Belcher  | 3803.30      |
 +------------------+------------------+--------------+--------------+

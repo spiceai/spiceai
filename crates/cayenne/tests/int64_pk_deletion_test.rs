@@ -70,7 +70,8 @@ async fn setup_int64_pk_table(
     let table_options = CreateTableOptions {
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["id".to_string()], // Int64 PK strategy
+        primary_key: vec!["id".to_string()],
+        on_conflict: None, // Int64 PK strategy
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -443,6 +444,7 @@ async fn test_int64_pk_persistence_after_full_delete_impl(fixture: TestFixture) 
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
