@@ -47,7 +47,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 **Focus:** Schema Management & Search.
 
 - **Schema Registry (Initial)**: Versioning and backward compatibility checks.
-- **Hybrid Search Ranking**: Configurable fusion strategies (RRF weights, learned ranking).
+- **Hybrid Search Ranking**: Configurable fusion strategies (Reciprocal Rank Fusion (RRF) weights, learned ranking).
 
 ### v2.2 (H2 2026)
 
