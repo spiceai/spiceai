@@ -209,12 +209,11 @@ impl RefreshTask {
 
         let data_batch = change_batch.data_batch();
 
-        if row_indices.len() > 0 {
+        if !row_indices.is_empty() {
             tracing::trace!(
                 "Processing upsert batch for {dataset_name} with {} rows",
                 row_indices.len()
             );
-            println!("data_batch: {:#?}", data_batch);
         }
 
         let indices_array = UInt32Array::from(
@@ -261,50 +260,6 @@ impl RefreshTask {
         Ok(())
     }
 
-    // async fn process_delete_batch(
-    //     &self,
-    //     change_batch: &ChangeBatch,
-    //     row_indices: &[usize],
-    //     deletion_provider: &Arc<dyn DeletionTableProvider>,
-    // ) -> crate::accelerated_table::Result<()> {
-    //     let dataset_name = &self.dataset_name;
-    //
-    //     tracing::trace!(
-    //         "Processing delete batch for {dataset_name} with {} rows",
-    //         row_indices.len()
-    //     );
-    //
-    //     let ctx = SessionContext::new();
-    //     let session_state = ctx.state();
-    //
-    //     let row_conditions: Vec<Expr> = row_indices.iter()
-    //         .map(|&row| {
-    //             let primary_keys = change_batch.primary_keys(row);
-    //             let exprs = get_delete_where_expr(&change_batch.data(row), primary_keys)?;
-    //             // AND together exprs for this row: (PK=x AND SK=y)
-    //             Ok(exprs.into_iter().reduce(|a, b| a.and(b)).unwrap())
-    //         })
-    //         .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
-    //
-    //     // OR together all row conditions: (PK=1 AND SK='300') OR (PK=1 AND SK='400')
-    //     let combined = row_conditions.into_iter().reduce(|a, b| a.or(b));
-    //
-    //     if let Some(combined) = combined {
-    //         let _lock_guard = self.accelerator_write_mutex.lock().await;
-    //         let delete_plan = deletion_provider
-    //             .delete_from(&session_state, &[combined])
-    //             .await
-    //             .map_err(find_datafusion_root)
-    //             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-    //         collect(delete_plan, ctx.task_ctx())
-    //             .await
-    //             .map_err(find_datafusion_root)
-    //             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
-    //     }
-    //
-    //     Ok(())
-    // }
-
     async fn process_delete_batch(
         &self,
         change_batch: &ChangeBatch,
@@ -318,7 +273,7 @@ impl RefreshTask {
             row_indices.len()
         );
 
-        let combined = build_batch_delete_expr_from_change_batch(change_batch, row_indices)?;
+        let combined = build_batch_delete_expr_from_change_batch(change_batch, row_indices, dataset_name.to_string().as_str())?;
 
         if let Some(combined) = combined {
             let ctx = SessionContext::new();
@@ -344,6 +299,7 @@ pub fn build_batch_delete_expr<F, G>(
     row_indices: &[usize],
     get_primary_keys: F,
     get_row_data: G,
+    dataset_name: &str,
 ) -> crate::accelerated_table::Result<Option<Expr>>
 where
     F: Fn(usize) -> Vec<String>,
@@ -359,27 +315,31 @@ where
             let primary_keys = get_primary_keys(row);
             let row_data = get_row_data(row);
             let exprs = get_delete_where_expr(&row_data, primary_keys)?;
-            // AND together exprs for this row: (PK=x AND SK=y)
-            Ok(exprs
+            exprs
                 .into_iter()
-                .reduce(|a, b| a.and(b))
-                .expect("primary_keys should not be empty"))
+                .reduce(datafusion_expr::Expr::and)
+                .ok_or_else(|| {
+                    crate::accelerated_table::Error::NoPrimaryKeysDefined {
+                        dataset_name: dataset_name.to_string(),
+                    }
+                })
         })
         .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
 
-    // OR together all row conditions
-    Ok(row_conditions.into_iter().reduce(|a, b| a.or(b)))
+    Ok(row_conditions.into_iter().reduce(datafusion_expr::Expr::or))
 }
 
-/// Simplified version that works directly with ChangeBatch
+/// Simplified version that works directly with `ChangeBatch`
 pub fn build_batch_delete_expr_from_change_batch(
     change_batch: &ChangeBatch,
     row_indices: &[usize],
+    dataset_name: &str,
 ) -> crate::accelerated_table::Result<Option<Expr>> {
     build_batch_delete_expr(
         row_indices,
         |row| change_batch.primary_keys(row),
         |row| change_batch.data(row),
+        dataset_name,
     )
 }
 
@@ -603,9 +563,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use data_components::cdc::changes_schema;
-    use std::sync::Arc;
-    use datafusion::logical_expr::Operator;
     use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::Operator;
+    use std::sync::Arc;
 
     fn create_test_data_schema() -> Schema {
         Schema::new(vec![
@@ -934,8 +894,9 @@ mod tests {
             &[],
             |_| vec!["id".to_string()],
             |_| make_single_key_batch("test"),
+            "test_dataset",
         )
-            .expect("result");
+        .expect("result");
 
         assert!(result.is_none());
     }
@@ -948,9 +909,10 @@ mod tests {
             &row_indices,
             |_| vec!["id".to_string()],
             |_| make_single_key_batch("id-5"),
+            "test_dataset",
         )
-            .unwrap()
-            .unwrap();
+        .expect("result")
+        .expect("result");
 
         // Should be: id = 'id-5' (a single equality expression)
         if let Expr::BinaryExpr(binary) = &result {
@@ -967,7 +929,10 @@ mod tests {
             if let Expr::Literal(ScalarValue::Utf8(Some(val)), _) = binary.right.as_ref() {
                 assert_eq!(val, "id-5");
             } else {
-                panic!("Expected Utf8 literal on right side, got: {:?}", binary.right);
+                panic!(
+                    "Expected Utf8 literal on right side, got: {:?}",
+                    binary.right
+                );
             }
         } else {
             panic!("Expected BinaryExpr, got: {result:?}");
@@ -984,9 +949,10 @@ mod tests {
             &row_indices,
             |_| vec!["id".to_string()],
             |row| make_single_key_batch(ids[row]),
+            "test_dataset",
         )
-            .unwrap()
-            .unwrap();
+        .expect("result")
+        .expect("result");
 
         // Collect all equality conditions from the OR tree
         let conditions = collect_or_conditions(&result);
@@ -1012,9 +978,10 @@ mod tests {
             &row_indices,
             |_| vec!["PK".to_string(), "SK".to_string()],
             |_| make_single_row_batch(1, "300"),
+            "test_dataset",
         )
-            .unwrap()
-            .unwrap();
+        .expect("result")
+        .expect("result");
 
         // Should be AND at top level
         if let Expr::BinaryExpr(binary) = &result {
@@ -1044,9 +1011,10 @@ mod tests {
             &row_indices,
             |_| vec!["PK".to_string(), "SK".to_string()],
             |row| make_single_row_batch(rows[row].0, rows[row].1),
+            "test_dataset",
         )
-            .unwrap()
-            .unwrap();
+        .expect("result")
+        .expect("result");
 
         // Collect top-level OR conditions
         let or_conditions = collect_or_conditions(&result);
@@ -1082,9 +1050,10 @@ mod tests {
             &row_indices,
             |_| vec!["id".to_string()],
             |row| make_single_key_batch(ids[row]),
+            "test_dataset",
         )
-            .unwrap()
-            .unwrap();
+        .expect("result")
+        .expect("result");
 
         // Collect OR conditions
         let conditions = collect_or_conditions(&result);
@@ -1119,9 +1088,10 @@ mod tests {
             &row_indices,
             |_| vec!["PK".to_string(), "SK".to_string()],
             |row| make_single_row_batch(rows[row].0, rows[row].1),
+            "test_dataset",
         )
-            .unwrap()
-            .unwrap();
+        .expect("result")
+        .expect("result");
 
         // Collect top-level OR conditions
         let or_conditions = collect_or_conditions(&result);
@@ -1192,7 +1162,9 @@ mod tests {
             if binary.op == Operator::Eq {
                 if let Expr::Column(col) = binary.left.as_ref() {
                     if col.name == column_name {
-                        if let Expr::Literal(ScalarValue::Utf8(Some(val)), _) = binary.right.as_ref() {
+                        if let Expr::Literal(ScalarValue::Utf8(Some(val)), _) =
+                            binary.right.as_ref()
+                        {
                             return val.clone();
                         }
                     }
@@ -1215,12 +1187,16 @@ mod tests {
                     if let Expr::Column(col) = binary.left.as_ref() {
                         match col.name.as_str() {
                             "pk" => {
-                                if let Expr::Literal(ScalarValue::Int64(Some(v)), _) = binary.right.as_ref() {
+                                if let Expr::Literal(ScalarValue::Int64(Some(v)), _) =
+                                    binary.right.as_ref()
+                                {
                                     pk_value = Some(*v);
                                 }
                             }
                             "sk" => {
-                                if let Expr::Literal(ScalarValue::Utf8(Some(v)), _) = binary.right.as_ref() {
+                                if let Expr::Literal(ScalarValue::Utf8(Some(v)), _) =
+                                    binary.right.as_ref()
+                                {
                                     sk_value = Some(v.clone());
                                 }
                             }

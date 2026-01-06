@@ -17,6 +17,7 @@ use super::{Error, JsonNesting, Result};
 use crate::arrow::struct_builder::StructBuilder;
 use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
 use crate::dynamodb::arrow::append_item_to_struct_builder;
+use crate::dynamodb::json_nest::json_nest_row_except_fields;
 use crate::dynamodb::unnest::unnest_dynamodb_row;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
@@ -33,8 +34,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
-use crate::dynamodb::json_nest::{json_nest_except_fields, json_nest_row_except_fields};
-use crate::dynamodb::provider::to_execution_error;
 
 #[derive(Debug, Snafu)]
 pub enum StreamError {
@@ -152,10 +151,12 @@ pub fn process_batch(
                             .context(FailedToUnnestSnafu)?,
                     };
 
-                    let final_streams_item = match json_nesting.clone() {
+                    let final_streams_item = match json_nesting {
                         None => unnested_streams_item,
-                        Some(ref json_nesting) => json_nest_row_except_fields(unnested_streams_item, json_nesting)
-                            .context(FailedToUnnestSnafu)?,
+                        Some(json_nesting) => {
+                            json_nest_row_except_fields(unnested_streams_item, json_nesting)
+                                .context(FailedToUnnestSnafu)?
+                        }
                     };
 
                     let op = if matches!(event_name, OperationType::Insert) {

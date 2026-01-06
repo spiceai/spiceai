@@ -284,10 +284,24 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
 
             create_table(&client, table_name).await;
             for i in 0..5 {
-                insert_item(&client, table_name, &format!("id-{i}"), &format!("Item {i}"), i as i32).await;
+                insert_item(
+                    &client,
+                    table_name,
+                    &format!("id-{i}"),
+                    &format!("Item {i}"),
+                    i as i32,
+                )
+                .await;
             }
             for i in 5..8 {
-                insert_item(&client, table_name, &format!("id-{i}"), &format!("Item {i}"), i as i32).await;
+                insert_item(
+                    &client,
+                    table_name,
+                    &format!("id-{i}"),
+                    &format!("Item {i}"),
+                    i as i32,
+                )
+                .await;
             }
 
             delete_item(&client, table_name, "id-5").await;
@@ -297,7 +311,9 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
             sleep(Duration::from_secs(1)).await;
 
             let app = AppBuilder::new("dynamodb_batch_delete_test")
-                .with_dataset(make_dynamodb_dataset(table_name, PORT1, access_key, secret_key, true))
+                .with_dataset(make_dynamodb_dataset(
+                    table_name, PORT1, access_key, secret_key, true,
+                ))
                 .with_results_cache(ResultsCache {
                     enabled: false,
                     ..Default::default()
@@ -323,7 +339,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
                 &format!("SELECT * FROM {table_name} ORDER BY id"),
                 "batch_delete_final_state",
             )
-                .await?;
+            .await?;
 
             running_container.remove().await.map_err(|e| {
                 tracing::error!("running_container.remove: {e}");

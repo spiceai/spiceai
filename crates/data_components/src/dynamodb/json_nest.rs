@@ -44,8 +44,7 @@ pub fn json_nest_row_except_fields(
     }
 
     if !data_map.is_empty() {
-        let json_string =
-            serde_json::to_string(&data_map).context(JsonSerializationSnafu)?;
+        let json_string = serde_json::to_string(&data_map).context(JsonSerializationSnafu)?;
         result.insert(
             json_nesting.json_field_name.clone(),
             AttributeValue::S(json_string),
