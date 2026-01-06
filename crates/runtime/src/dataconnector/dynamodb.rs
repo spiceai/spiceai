@@ -17,7 +17,6 @@ limitations under the License.
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
-    parameters::aws::initiate_config_with_credentials,
 };
 use crate::component::ComponentType;
 use crate::component::dataset::Dataset;

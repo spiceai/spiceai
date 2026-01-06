@@ -251,6 +251,7 @@ pub async fn initiate_config_with_credentials(
 /// - `key`: Explicit access key credentials
 ///
 /// Return [`ConfigLoader`] to allow further customisation.
+#[allow(clippy::too_many_arguments)]
 pub async fn initiate_config_with_auth_method(
     provider_name: &'static str,
     auth_name: &'static str,
