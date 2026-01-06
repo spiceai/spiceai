@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use super::{Error, Result};
+use super::{Error, JsonNesting, Result};
 use crate::arrow::struct_builder::StructBuilder;
 use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
 use crate::dynamodb::arrow::append_item_to_struct_builder;
@@ -33,6 +33,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
+use crate::dynamodb::json_nest::{json_nest_except_fields, json_nest_row_except_fields};
+use crate::dynamodb::provider::to_execution_error;
 
 #[derive(Debug, Snafu)]
 pub enum StreamError {
@@ -122,6 +124,7 @@ pub fn process_batch(
     primary_keys: &[String],
     unnest_depth: Option<usize>,
     time_format: &str,
+    json_nesting: Option<&JsonNesting>,
 ) -> Result<(ChangeBatch, Checkpoint, Option<SystemTime>), StreamError> {
     let batch = batch.context(FailedToReceiveMessageSnafu)?;
     let records = batch.records;
@@ -149,13 +152,19 @@ pub fn process_batch(
                             .context(FailedToUnnestSnafu)?,
                     };
 
+                    let final_streams_item = match json_nesting.clone() {
+                        None => unnested_streams_item,
+                        Some(ref json_nesting) => json_nest_row_except_fields(unnested_streams_item, json_nesting)
+                            .context(FailedToUnnestSnafu)?,
+                    };
+
                     let op = if matches!(event_name, OperationType::Insert) {
                         "c"
                     } else {
                         "u"
                     };
 
-                    (op, unnested_streams_item)
+                    (op, final_streams_item)
                 }
                 OperationType::Remove => {
                     let Some(keys_item) = &dynamodb.keys else {
@@ -331,6 +340,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -368,6 +378,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -401,6 +412,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -427,6 +439,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -470,6 +483,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -508,6 +522,7 @@ mod tests {
                 &primary_keys,
                 Some(2),
                 TIME_FORMAT,
+                None,
             );
 
             result.expect("Should create change envelope with unnesting");
@@ -537,6 +552,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -561,6 +577,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -588,6 +605,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -615,6 +633,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -648,6 +667,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -686,6 +706,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -719,6 +740,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -753,6 +775,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
