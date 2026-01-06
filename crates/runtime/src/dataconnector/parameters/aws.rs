@@ -98,7 +98,7 @@ pub enum Error {
     #[snafu(display("Invalid {key}: {method}. Valid values are 'auto', 'metadata' and 'env'"))]
     InvalidAuth { key: String, method: String },
 
-    #[snafu(display("Invalid {key}: {iam_source}. Valid values are 'iam_role' and 'key'"))]
+    #[snafu(display("Invalid {key}: {iam_source}. Valid values are 'auto', 'metadata' and 'env'"))]
     InvalidIamRoleSource { key: String, iam_source: String },
 }
 
