@@ -282,8 +282,8 @@ pub async fn initiate_config_with_auth_method(
             let iam_role_source = params.get(iam_role_source_name).expose().ok();
 
             match iam_role_source {
-                Some("metadata") => initiate_config_auth_iam_metadata(region).await,
-                Some("env") => initiate_config_auth_iam_env(region).await,
+                Some("metadata") => initiate_config_auth_iam_metadata(region),
+                Some("env") => initiate_config_auth_iam_env(region),
                 Some("auto") | None => initiate_config_default_auth(region).await,
                 _ => {
                     return Err(Error::InvalidIamRoleSource {
@@ -317,7 +317,6 @@ pub async fn initiate_config_with_auth_method(
                 secret_access_key,
                 session_token,
             )
-            .await
         }
         _ => {
             return Err(Error::InvalidAuth {

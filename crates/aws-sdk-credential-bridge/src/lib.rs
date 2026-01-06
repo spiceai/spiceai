@@ -443,7 +443,7 @@ pub async fn initiate_config_default_auth(region: String) -> aws_config::ConfigL
 /// # Returns
 /// A [`ConfigLoader`] that can be further customized before loading.
 #[must_use]
-pub async fn initiate_config_auth_iam_metadata(region: String) -> aws_config::ConfigLoader {
+pub fn initiate_config_auth_iam_metadata(region: String) -> aws_config::ConfigLoader {
     let provider_config = ProviderConfig::default().with_region(Some(Region::new(region.clone())));
 
     let web_identity_provider = WebIdentityTokenCredentialsProvider::builder()
@@ -479,7 +479,7 @@ pub async fn initiate_config_auth_iam_metadata(region: String) -> aws_config::Co
 /// # Returns
 /// A [`ConfigLoader`] that can be further customized before loading.
 #[must_use]
-pub async fn initiate_config_auth_iam_env(region: String) -> aws_config::ConfigLoader {
+pub fn initiate_config_auth_iam_env(region: String) -> aws_config::ConfigLoader {
     let env_provider = EnvironmentVariableCredentialsProvider::new();
 
     default_aws_config()
@@ -501,7 +501,7 @@ pub async fn initiate_config_auth_iam_env(region: String) -> aws_config::ConfigL
 /// # Returns
 /// A [`ConfigLoader`] that can be further customized before loading.
 #[must_use]
-pub async fn initiate_config_auth_key(
+pub fn initiate_config_auth_key(
     provider_name: &'static str,
     region: String,
     access_key_id: String,
