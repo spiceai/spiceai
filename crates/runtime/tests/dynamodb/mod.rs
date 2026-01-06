@@ -677,6 +677,10 @@ fn get_test_dataset(
             "ap-northeast-2".to_string(),
         ),
         (
+            "dynamodb_aws_auth".to_string(),
+            "key".to_string(),
+        ),
+        (
             "dynamodb_aws_access_key_id".to_string(),
             "${ env:AWS_DYNAMODB_KEY }".to_string(),
         ),
