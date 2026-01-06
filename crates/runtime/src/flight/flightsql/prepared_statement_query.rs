@@ -1389,7 +1389,7 @@ mod tests {
     #[test]
     fn test_rewrite_sql_preserves_table_aliases() {
         // Query with table aliases similar to TPC-H Q7
-        let sql = r#"SELECT n1.n_name, n2.n_name FROM nation n1, nation n2 WHERE n1.n_name = $1 AND n2.n_name = $2"#;
+        let sql = r"SELECT n1.n_name, n2.n_name FROM nation n1, nation n2 WHERE n1.n_name = $1 AND n2.n_name = $2";
 
         // Create a schema with two VARCHAR parameters
         // Note: String types (Utf8) intentionally don't get CAST to avoid breaking filter pushdown
@@ -1444,7 +1444,7 @@ mod tests {
     /// Tests that `rewrite_sql_with_type_casts` preserves column aliases and complex expressions.
     #[test]
     fn test_rewrite_sql_preserves_column_aliases() {
-        let sql = r#"SELECT a.id AS a_id, b.id AS b_id, a.value + b.value AS total FROM table1 a JOIN table2 b ON a.id = b.ref_id WHERE a.status = $1"#;
+        let sql = r"SELECT a.id AS a_id, b.id AS b_id, a.value + b.value AS total FROM table1 a JOIN table2 b ON a.id = b.ref_id WHERE a.status = $1";
 
         // String parameter - should NOT get CAST
         let schema = Arc::new(Schema::new(vec![Field::new("$1", DataType::Utf8, true)]));
@@ -1485,7 +1485,7 @@ mod tests {
     /// Tests that `rewrite_sql_with_type_casts` handles subquery aliases correctly.
     #[test]
     fn test_rewrite_sql_preserves_subquery_aliases() {
-        let sql = r#"SELECT sub.total FROM (SELECT SUM(value) AS total FROM orders WHERE status = $1) AS sub WHERE sub.total > $2"#;
+        let sql = r"SELECT sub.total FROM (SELECT SUM(value) AS total FROM orders WHERE status = $1) AS sub WHERE sub.total > $2";
 
         // $1 is string (no CAST), $2 is Int64 (gets CAST)
         let schema = Arc::new(Schema::new(vec![
@@ -1517,10 +1517,10 @@ mod tests {
         );
     }
 
-    /// Tests that rewrite_sql_with_type_casts handles no parameters gracefully.
+    /// Tests that `rewrite_sql_with_type_casts` handles no parameters gracefully.
     #[test]
     fn test_rewrite_sql_no_parameters() {
-        let sql = r#"SELECT n1.n_name FROM nation n1 WHERE n1.n_name = 'FRANCE'"#;
+        let sql = r"SELECT n1.n_name FROM nation n1 WHERE n1.n_name = 'FRANCE'";
 
         // Empty schema - no parameters
         let schema = Arc::new(Schema::empty());
@@ -1539,18 +1539,18 @@ mod tests {
     /// This query pattern previously failed in federation when string parameters
     /// were wrapped in CAST, which prevented filter pushdown optimization.
     ///
-    /// The fix: String types are no longer wrapped in CAST, allowing DataFusion to
-    /// properly push down filters into TableScan as full_filters.
+    /// The fix: String types are no longer wrapped in CAST, allowing `DataFusion` to
+    /// properly push down filters into `TableScan` as `full_filters`.
     #[test]
     fn test_rewrite_sql_table_alias_q7_pattern() {
         // This is the exact pattern that was failing in TPC-H Q7 parameterized queries
-        let sql = r#"
+        let sql = r"
             SELECT n1.n_name, n2.n_name 
             FROM nation n1, nation n2 
             WHERE (
                 (n1.n_name = $1 AND n2.n_name = $2) 
                 OR (n1.n_name = $3 AND n2.n_name = $4)
-            )"#;
+            )";
 
         // All 4 parameters are strings - should NOT get CAST
         let schema = Arc::new(Schema::new(vec![
@@ -1625,7 +1625,7 @@ mod tests {
     #[test]
     fn test_rewrite_sql_cte_workaround_pattern() {
         // CTE pattern
-        let sql = r#"
+        let sql = r"
             WITH n1 AS (SELECT * FROM nation), 
                  n2 AS (SELECT * FROM nation) 
             SELECT n1.n_name, n2.n_name 
@@ -1633,7 +1633,7 @@ mod tests {
             WHERE (
                 (n1.n_name = $1 AND n2.n_name = $2) 
                 OR (n1.n_name = $3 AND n2.n_name = $4)
-            )"#;
+            )";
 
         // All string parameters - should NOT get CAST
         let schema = Arc::new(Schema::new(vec![
@@ -1686,13 +1686,13 @@ mod tests {
     #[test]
     fn test_rewrite_sql_table_alias_no_params() {
         // Query with table aliases but no parameters - should pass through unchanged
-        let sql = r#"
+        let sql = r"
             SELECT n1.n_name, n2.n_name 
             FROM nation n1, nation n2 
             WHERE (
                 (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') 
                 OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
-            )"#;
+            )";
 
         // Empty schema = no parameters
         let schema = Arc::new(Schema::empty());
@@ -1729,7 +1729,7 @@ mod tests {
     /// Tests CTE without parameters - the workaround pattern without parameter binding.
     #[test]
     fn test_rewrite_sql_cte_no_params() {
-        let sql = r#"
+        let sql = r"
             WITH n1 AS (SELECT * FROM nation), 
                  n2 AS (SELECT * FROM nation) 
             SELECT n1.n_name, n2.n_name 
@@ -1737,7 +1737,7 @@ mod tests {
             WHERE (
                 (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') 
                 OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
-            )"#;
+            )";
 
         let schema = Arc::new(Schema::empty());
 
@@ -1764,7 +1764,7 @@ mod tests {
     /// for proper type inference in prepared statements like "SELECT $1 + $2".
     #[test]
     fn test_rewrite_sql_numeric_types_get_cast() {
-        let sql = r#"SELECT $1 + $2 AS sum, $3 * $4 AS product"#;
+        let sql = r"SELECT $1 + $2 AS sum, $3 * $4 AS product";
 
         // All numeric parameters - should get CAST
         let schema = Arc::new(Schema::new(vec![
@@ -1800,7 +1800,7 @@ mod tests {
     /// Tests mixed parameter types - strings should NOT get CAST, others should.
     #[test]
     fn test_rewrite_sql_mixed_types() {
-        let sql = r#"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3"#;
+        let sql = r"SELECT * FROM users WHERE name = $1 AND age > $2 AND score < $3";
 
         // Mixed types: string (no CAST), int (CAST), float (CAST)
         let schema = Arc::new(Schema::new(vec![
