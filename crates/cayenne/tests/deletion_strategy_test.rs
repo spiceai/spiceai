@@ -133,7 +133,8 @@ async fn test_int64_pk_basic_deletion() -> TestResult<()> {
     let table_options = CreateTableOptions {
         table_name: "int64_pk_test".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["id".to_string()], // Single Int64 PK
+        primary_key: vec!["id".to_string()],
+        on_conflict: None, // Single Int64 PK
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -199,6 +200,7 @@ async fn test_int64_pk_multi_insert_deletion() -> TestResult<()> {
         table_name: "int64_pk_multi".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -289,6 +291,7 @@ async fn test_int64_pk_projection_without_pk() -> TestResult<()> {
         table_name: "int64_pk_proj".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -362,6 +365,7 @@ async fn test_int64_pk_persistence() -> TestResult<()> {
             table_name: "int64_persist".to_string(),
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
+            on_conflict: None,
             base_path: data_dir.path().to_string_lossy().to_string(),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -440,7 +444,8 @@ async fn test_rowconverter_composite_pk() -> TestResult<()> {
     let table_options = CreateTableOptions {
         table_name: "composite_pk_test".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["id1".to_string(), "id2".to_string()], // Composite PK
+        primary_key: vec!["id1".to_string(), "id2".to_string()],
+        on_conflict: None, // Composite PK
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -518,7 +523,8 @@ async fn test_rowconverter_string_pk() -> TestResult<()> {
     let table_options = CreateTableOptions {
         table_name: "string_pk_test".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["user_id".to_string()], // Single String PK
+        primary_key: vec!["user_id".to_string()],
+        on_conflict: None, // Single String PK
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -600,6 +606,7 @@ async fn test_rowconverter_persistence() -> TestResult<()> {
             table_name: "rowconv_persist".to_string(),
             schema: Arc::clone(&schema),
             primary_key: vec!["code".to_string()],
+            on_conflict: None,
             base_path: data_dir.path().to_string_lossy().to_string(),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -690,7 +697,8 @@ async fn test_position_based_basic() -> TestResult<()> {
     let table_options = CreateTableOptions {
         table_name: "no_pk_basic".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec![], // NO primary key
+        primary_key: vec![],
+        on_conflict: None, // NO primary key
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -763,6 +771,7 @@ async fn test_position_based_multi_insert() -> TestResult<()> {
         table_name: "no_pk_multi".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -842,6 +851,7 @@ async fn test_position_based_persistence() -> TestResult<()> {
             table_name: "pos_persist".to_string(),
             schema: Arc::clone(&schema),
             primary_key: vec![],
+            on_conflict: None,
             base_path: data_dir.path().to_string_lossy().to_string(),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -930,6 +940,7 @@ async fn test_strategy_selection() -> TestResult<()> {
         table_name: "t_int64".to_string(),
         schema: Arc::clone(&schema1),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -946,6 +957,7 @@ async fn test_strategy_selection() -> TestResult<()> {
         table_name: "t_string".to_string(),
         schema: Arc::clone(&schema2),
         primary_key: vec!["code".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -962,6 +974,7 @@ async fn test_strategy_selection() -> TestResult<()> {
         table_name: "t_nopk".to_string(),
         schema: Arc::clone(&schema3),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -1028,6 +1041,7 @@ async fn test_large_scale_deletions() -> TestResult<()> {
         table_name: "large_scale".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
