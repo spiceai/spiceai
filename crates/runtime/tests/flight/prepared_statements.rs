@@ -1079,8 +1079,9 @@ mod flight_prepared_statements {
                 let mut client = FlightSqlServiceClient::new(channel);
 
                 // Query with multiple parameter types
-                // Note: All parameters need CAST to help DataFusion infer types for standalone SELECT queries
-                let query = "SELECT CAST($1 AS INTEGER) AS int_val, CAST($2 AS VARCHAR) AS str_val, CAST($3 AS BOOLEAN) AS bool_val, CAST($4 AS DOUBLE) AS float_val";
+                // Note: Use COALESCE for string/boolean types to help DataFusion infer types
+                // without explicit CAST (which can break filter pushdown optimization)
+                let query = "SELECT CAST($1 AS INTEGER) AS int_val, COALESCE($2, '') AS str_val, COALESCE($3, false) AS bool_val, CAST($4 AS DOUBLE) AS float_val";
 
                 let param_batch = create_param_batch(
                     vec![
