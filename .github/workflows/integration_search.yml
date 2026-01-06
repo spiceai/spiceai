@@ -40,41 +40,37 @@ jobs:
         with:
           os: 'darwin'
 
-      - name: Verify Docker/Colima environment
+      - name: Ensure Colima/Docker available
         run: |
-          echo "=== PATH ==="
-          echo "$PATH"
+          # Add Homebrew to PATH (not included by default in GitHub Actions)
+          export PATH="/opt/homebrew/bin:$PATH"
           
-          echo "=== Homebrew paths ==="
-          ls -la /opt/homebrew/bin/colima 2>/dev/null || echo "/opt/homebrew/bin/colima: not found"
-          ls -la /opt/homebrew/bin/docker 2>/dev/null || echo "/opt/homebrew/bin/docker: not found"
+          echo "=== Checking Colima status ==="
+          if ! colima status 2>/dev/null; then
+            echo "Colima not running, attempting to start..."
+            # Stop any stale state first
+            colima stop --force 2>/dev/null || true
+            # Start fresh
+            colima start --cpu 4 --memory 8
+          fi
           
-          echo "=== DOCKER_HOST ==="
-          echo "DOCKER_HOST=$DOCKER_HOST"
+          echo "=== Verifying Docker connection ==="
+          for i in {1..30}; do
+            if docker info >/dev/null 2>&1; then
+              echo "Docker is ready!"
+              docker info
+              break
+            fi
+            echo "Waiting for Docker... ($i/30)"
+            sleep 2
+          done
           
-          echo "=== Colima socket ==="
-          ls -la /Users/runner/.colima/default/docker.sock 2>/dev/null || echo "Colima socket not found"
-          
-          echo "=== which commands ==="
-          which colima 2>/dev/null || echo "colima not in PATH"
-          which docker 2>/dev/null || echo "docker not in PATH"
-          
-          echo "=== LaunchDaemon plist ==="
-          ls -la /Library/LaunchDaemons/io.colima.plist 2>/dev/null || echo "Colima LaunchDaemon plist NOT FOUND"
-          cat /Library/LaunchDaemons/io.colima.plist 2>/dev/null || echo "Cannot read plist"
-          
-          echo "=== LaunchDaemon status ==="
-          sudo launchctl list | grep colima || echo "Colima not in launchctl list"
-          
-          echo "=== Colima logs ==="
-          cat /Users/runner/colima-stdout.log 2>/dev/null || echo "No stdout log"
-          cat /Users/runner/colima-stderr.log 2>/dev/null || echo "No stderr log"
-          
-          echo "=== Colima status ==="
-          colima status || echo "Colima not running"
-          
-          echo "=== Docker info ==="
-          docker info || echo "Docker daemon not responding"
+          if ! docker info >/dev/null 2>&1; then
+            echo "ERROR: Docker failed to start"
+            colima status || true
+            cat /Users/runner/colima-stderr.log 2>/dev/null || true
+            exit 1
+          fi
 
       - name: Set up API Keys
         run: |
@@ -86,6 +82,7 @@ jobs:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          PATH: /opt/homebrew/bin:${{ env.PATH }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
             echo "Error: OpenAI API key is not defined."
