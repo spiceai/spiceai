@@ -28,7 +28,7 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
-    component::dataset::Dataset,
+    component::{access::AccessMode, dataset::Dataset},
     param::Params,
 };
 
@@ -81,6 +81,7 @@ async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
             );
 
             let mut dataset = Dataset::new(format!("file://{}", initial_csv.display()), "events");
+            dataset.access = AccessMode::ReadWrite;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
                 engine: Some("cayenne".to_string()),
@@ -193,6 +194,7 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
 
             let mut dataset =
                 Dataset::new(format!("file://{}", initial_csv.display()), "events_drop");
+            dataset.access = AccessMode::ReadWrite;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
                 engine: Some("cayenne".to_string()),
