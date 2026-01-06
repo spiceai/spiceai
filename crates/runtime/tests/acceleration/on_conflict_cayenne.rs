@@ -34,7 +34,7 @@ use spicepod::{
 
 use crate::utils::{runtime_ready_check, test_request_context};
 
-/// Test Cayenne on_conflict: upsert behavior
+/// Test Cayenne `on_conflict`: upsert behavior
 ///
 /// Verifies that when a row with the same primary key is inserted,
 /// the existing row is updated with the new values.
@@ -146,7 +146,7 @@ async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test Cayenne on_conflict: drop behavior
+/// Test Cayenne `on_conflict`: drop behavior
 ///
 /// Verifies that when a row with the same primary key is inserted,
 /// the new row is dropped and the existing row is preserved.
