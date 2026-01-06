@@ -91,6 +91,7 @@ pub fn make_dynamodb_dataset(
             secret_key.to_string(),
         ),
         ("dynamodb_aws_region".to_string(), "us-east-1".to_string()),
+        ("dynamodb_aws_auth".to_string(), "key".to_string()),
         (
             "endpoint_url".to_string(),
             format!("http://localhost:{port}"),
