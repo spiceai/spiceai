@@ -2,14 +2,16 @@
 
 ## Status
 
-Accepted
+Draft
 
 ## Context
 
-Following the decision to adopt Apache Ballista as Spice's distributed query framework (DR-004), internal cluster communication between scheduler and executor nodes includes highly privileged RPC calls:
+Following the decision to adopt Apache Ballista as Spice's distributed query framework (DR-004) and the HA design (DR-006), internal cluster communication includes highly privileged RPC calls:
 
 * **GetAppDefinition**: Executors fetch the full Spicepod configuration from the scheduler, including dataset definitions and runtime settings.
 * **ExpandSecret**: Executors request secret values from the scheduler's secret store. This is the most sensitive RPC—secrets should only be available to authenticated cluster members.
+* **GetSchedulers**: Executors request the list of all schedulers in the cluster to establish connections for work polling.
+* **PollWork**: Executors poll schedulers for available work. Executors initiate all connections to schedulers.
 * **SchedulerGrpcServer**: Ballista's task dispatch protocol for scheduling query fragments to executors.
 
 mTLS provides mutual authentication (both parties verify identity) and transport encryption, ensuring:
@@ -72,12 +74,19 @@ A new `ClusterService` gRPC service replaces the previous Flight Actions for int
 
 ```protobuf
 service ClusterService {
+    // Configuration sync
     rpc GetAppDefinition(GetAppDefinitionRequest) returns (GetAppDefinitionResponse);
     rpc ExpandSecret(ExpandSecretRequest) returns (ExpandSecretResponse);
+    
+    // Scheduler discovery (executors call this to get list of all schedulers)
+    rpc GetSchedulers(GetSchedulersRequest) returns (GetSchedulersResponse);
+    
+    // Work polling (executor-initiated)
+    rpc PollWork(PollWorkRequest) returns (PollWorkResponse);
 }
 ```
 
-This service is only served on the internal cluster port (50052) with mTLS enforced.
+This service is only served on the internal cluster port (50052) with mTLS enforced. All connections are executor-initiated; schedulers never initiate outbound connections to executors.
 
 ### Certificate Requirements
 
@@ -160,8 +169,10 @@ pub struct ClusterTlsConfig {
 
 ### Client Configuration
 
-* Executors connect to scheduler using `ClientTlsConfig` with `identity()` for mTLS.
-* Scheduler connects to executors using same pattern for task dispatch.
+* Executors connect to scheduler load balancer using `ClientTlsConfig` with `identity()` for mTLS.
+* Executors request the scheduler list and establish connections to all schedulers.
+* All cluster connections are executor-initiated; schedulers serve connections but do not initiate them.
+* This design supports executors behind NAT networks.
 
 ### Documentation Requirements
 
