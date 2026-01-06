@@ -5,7 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 name = "cayenne"
 repository = "https://github.com/spiceai/spiceai"
-version = "0.1.0"
+version.workspace = true
 
 [dependencies]
 arrow = { workspace = true }
