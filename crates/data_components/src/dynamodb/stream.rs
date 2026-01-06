@@ -842,14 +842,20 @@ mod tests {
             let id_col = data_batch
                 .column_by_name("id")
                 .expect("id column should exist");
-            let id_array = id_col.as_any().downcast_ref::<StringArray>().unwrap();
+            let id_array = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
             assert_eq!(id_array.value(0), "123");
 
             // Verify "Data" contains nested JSON with "name" and "count"
             let data_col = data_batch
                 .column_by_name("Data")
                 .expect("Data column should exist");
-            let data_array = data_col.as_any().downcast_ref::<StringArray>().unwrap();
+            let data_array = data_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
             let json_str = data_array.value(0);
 
             let parsed: serde_json::Value =
@@ -875,10 +881,7 @@ mod tests {
                 "SK".to_string(),
                 StreamsAttributeValue::S("sk456".to_string()),
             );
-            new_image.insert(
-                "MapField".to_string(),
-                StreamsAttributeValue::M(nested_map),
-            );
+            new_image.insert("MapField".to_string(), StreamsAttributeValue::M(nested_map));
             new_image.insert(
                 "ListField".to_string(),
                 StreamsAttributeValue::L(vec![
@@ -886,10 +889,7 @@ mod tests {
                     StreamsAttributeValue::S("item2".to_string()),
                 ]),
             );
-            new_image.insert(
-                "BoolField".to_string(),
-                StreamsAttributeValue::Bool(true),
-            );
+            new_image.insert("BoolField".to_string(), StreamsAttributeValue::Bool(true));
 
             let record = create_test_record(OperationType::Modify, Some(new_image), None);
             let batch = vec![record];
@@ -922,16 +922,27 @@ mod tests {
 
             // Verify static fields
             let pk_col = data_batch.column_by_name("PK").expect("PK should exist");
-            let pk_array = pk_col.as_any().downcast_ref::<StringArray>().unwrap();
+            let pk_array = pk_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
             assert_eq!(pk_array.value(0), "pk123");
 
             let sk_col = data_batch.column_by_name("SK").expect("SK should exist");
-            let sk_array = sk_col.as_any().downcast_ref::<StringArray>().unwrap();
+            let sk_array = sk_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
             assert_eq!(sk_array.value(0), "sk456");
 
             // Verify nested JSON contains complex types
-            let data_col = data_batch.column_by_name("Data").expect("Data should exist");
-            let data_array = data_col.as_any().downcast_ref::<StringArray>().unwrap();
+            let data_col = data_batch
+                .column_by_name("Data")
+                .expect("Data should exist");
+            let data_array = data_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
             let json_str = data_array.value(0);
 
             let parsed: serde_json::Value =
@@ -990,11 +1001,19 @@ mod tests {
 
             // Verify both fields are at top level
             let id_col = data_batch.column_by_name("id").expect("id should exist");
-            let id_array = id_col.as_any().downcast_ref::<StringArray>().unwrap();
+            let id_array = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
             assert_eq!(id_array.value(0), "123");
 
-            let name_col = data_batch.column_by_name("name").expect("name should exist");
-            let name_array = name_col.as_any().downcast_ref::<StringArray>().unwrap();
+            let name_col = data_batch
+                .column_by_name("name")
+                .expect("name should exist");
+            let name_array = name_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
             assert_eq!(name_array.value(0), "Test");
 
             // Data field should not exist (or be null/empty)
