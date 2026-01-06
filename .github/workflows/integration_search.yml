@@ -40,6 +40,14 @@ jobs:
         with:
           os: 'darwin'
 
+      - name: Verify Docker/Colima setup
+        run: |
+          echo "DOCKER_HOST=$DOCKER_HOST"
+          echo "Colima version: $(colima version 2>/dev/null || echo 'not installed')"
+          echo "Colima status: $(colima status 2>&1 || echo 'not running')"
+          echo "Docker info:"
+          docker info
+
       - name: Set up API Keys
         run: |
           echo 'SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"' > .env
