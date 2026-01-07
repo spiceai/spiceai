@@ -11,7 +11,6 @@ pub struct JsonNesting {
     pub static_fields: HashSet<String>,
     pub json_field_name: String,
 }
-
 /// With the following configuration: `JsonNesting` {`static_fields`: {"PK", "SK", "Baz"}, `json_field_name`: "Data"}
 ///
 /// This schema:
@@ -24,31 +23,35 @@ pub fn json_nest_except_fields(
     json_nesting: &JsonNesting,
 ) -> Result<Vec<DynamoDBRow>> {
     rows.into_iter()
-        .map(|row| {
-            let mut result = HashMap::new();
-            // To make fields sorted alphabetically
-            let mut data_map = BTreeMap::new();
-
-            for (key, value) in row {
-                if json_nesting.static_fields.contains(&key) {
-                    result.insert(key, value);
-                } else {
-                    data_map.insert(key, attribute_value_to_json(&value));
-                }
-            }
-
-            if !data_map.is_empty() {
-                let json_string =
-                    serde_json::to_string(&data_map).context(JsonSerializationSnafu)?;
-                result.insert(
-                    json_nesting.json_field_name.clone(),
-                    AttributeValue::S(json_string),
-                );
-            }
-
-            Ok(result)
-        })
+        .map(|row| json_nest_row_except_fields(row, json_nesting))
         .collect()
+}
+
+pub fn json_nest_row_except_fields(
+    row: DynamoDBRow,
+    json_nesting: &JsonNesting,
+) -> Result<DynamoDBRow> {
+    let mut result = HashMap::new();
+    // To make fields sorted alphabetically
+    let mut data_map = BTreeMap::new();
+
+    for (key, value) in row {
+        if json_nesting.static_fields.contains(&key) {
+            result.insert(key, value);
+        } else {
+            data_map.insert(key, attribute_value_to_json(&value));
+        }
+    }
+
+    if !data_map.is_empty() {
+        let json_string = serde_json::to_string(&data_map).context(JsonSerializationSnafu)?;
+        result.insert(
+            json_nesting.json_field_name.clone(),
+            AttributeValue::S(json_string),
+        );
+    }
+
+    Ok(result)
 }
 
 fn attribute_value_to_json(attr: &AttributeValue) -> Value {
