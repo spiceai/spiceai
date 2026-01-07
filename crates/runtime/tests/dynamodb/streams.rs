@@ -42,7 +42,8 @@ use tokio::time::sleep;
 use tracing::instrument;
 
 const DYNAMODB_DOCKER_CONTAINER: &str = "runtime-integration-test-dynamodb";
-const PORT: u16 = 8001;
+const PORT1: u16 = 8001;
+const PORT2: u16 = 8002;
 
 #[instrument]
 pub async fn start_dynamodb_docker_container(
@@ -166,6 +167,28 @@ async fn insert_rows(client: &Client, table_name: &str, range: Range<usize>) {
     }
 }
 
+async fn insert_item(client: &Client, table_name: &str, id: &str, name: &str, version: i32) {
+    client
+        .put_item()
+        .table_name(table_name)
+        .item("id", AttributeValue::S(id.to_string()))
+        .item("name", AttributeValue::S(name.to_string()))
+        .item("version", AttributeValue::N(version.to_string()))
+        .send()
+        .await
+        .expect("Failed to insert item");
+}
+
+async fn delete_item(client: &Client, table_name: &str, id: &str) {
+    client
+        .delete_item()
+        .table_name(table_name)
+        .key("id", AttributeValue::S(id.to_string()))
+        .send()
+        .await
+        .expect("Failed to delete item");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dynamodb_streams() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some(
@@ -178,9 +201,9 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT).await?;
+            let running_container = start_dynamodb_docker_container(PORT2).await?;
 
-            let client = get_client(PORT, access_key, secret_key);
+            let client = get_client(PORT2, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, "test_table", 0..5).await;
@@ -188,7 +211,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
             let app = AppBuilder::new("dynamodb_integration_test")
                 .with_dataset(make_dynamodb_dataset(
-                    table_name, PORT, access_key, secret_key, true,
+                    table_name, PORT2, access_key, secret_key, true,
                 ))
                 .with_results_cache(ResultsCache {
                     enabled: false,
@@ -232,6 +255,90 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
                 &rt,
                 &format!("SELECT * FROM {table_name} ORDER BY id"),
                 "test3",
+            )
+            .await?;
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamodb_streams_delete() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=debug,dynamodb_streams=debug,info",
+    ));
+
+    let table_name = "batch_delete_test";
+    let access_key = "foo";
+    let secret_key = "bar";
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_dynamodb_docker_container(PORT1).await?;
+            let client = get_client(PORT1, access_key, secret_key);
+
+            create_table(&client, table_name).await;
+            for i in 0..5 {
+                insert_item(
+                    &client,
+                    table_name,
+                    &format!("id-{i}"),
+                    &format!("Item {i}"),
+                    i,
+                )
+                .await;
+            }
+            for i in 5..8 {
+                insert_item(
+                    &client,
+                    table_name,
+                    &format!("id-{i}"),
+                    &format!("Item {i}"),
+                    i,
+                )
+                .await;
+            }
+
+            delete_item(&client, table_name, "id-5").await;
+            delete_item(&client, table_name, "id-6").await;
+            delete_item(&client, table_name, "id-7").await;
+
+            sleep(Duration::from_secs(1)).await;
+
+            let app = AppBuilder::new("dynamodb_batch_delete_test")
+                .with_dataset(make_dynamodb_dataset(
+                    table_name, PORT1, access_key, secret_key, true,
+                ))
+                .with_results_cache(ResultsCache {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+            sleep(Duration::from_secs(3)).await;
+
+            run_and_snapshot_query(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                "batch_delete_final_state",
             )
             .await?;
 
