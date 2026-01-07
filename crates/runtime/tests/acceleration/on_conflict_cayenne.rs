@@ -43,7 +43,7 @@ use crate::utils::{runtime_ready_check, test_request_context};
 /// Verifies that when a row with the same primary key is inserted,
 /// the existing row is updated with the new values.
 ///
-/// Note: This test is ignored pending investigation of on_conflict timeout issues
+/// Note: This test is ignored pending investigation of `on_conflict` timeout issues
 /// in the file connector pipeline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
@@ -159,7 +159,7 @@ async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
 /// Verifies that when a row with the same primary key is inserted,
 /// the new row is dropped and the existing row is preserved.
 ///
-/// Note: This test is ignored pending investigation of on_conflict timeout issues
+/// Note: This test is ignored pending investigation of `on_conflict` timeout issues
 /// in the file connector pipeline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
@@ -642,12 +642,12 @@ async fn test_cayenne_partitioned_primary_key() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test Cayenne partitioned table with on_conflict upsert
+/// Test Cayenne partitioned table with `on_conflict` upsert
 ///
 /// Verifies that partitioned Cayenne tables correctly handle upsert behavior
 /// when inserting rows with duplicate primary keys within a partition.
 ///
-/// Note: This test is ignored pending investigation of on_conflict timeout issues
+/// Note: This test is ignored pending investigation of `on_conflict` timeout issues
 /// in the file connector pipeline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
@@ -771,7 +771,7 @@ async fn test_cayenne_partitioned_on_conflict_upsert() -> Result<(), anyhow::Err
 /// Verifies that Cayenne correctly handles composite (multi-column) primary keys
 /// for upsert and deletion operations.
 ///
-/// Note: This test is ignored pending investigation of on_conflict timeout issues
+/// Note: This test is ignored pending investigation of `on_conflict` timeout issues
 /// in the file connector pipeline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
@@ -898,12 +898,12 @@ async fn test_cayenne_composite_primary_key() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test Cayenne primary key with no on_conflict (default behavior)
+/// Test Cayenne primary key with no `on_conflict` (default behavior)
 ///
-/// Verifies that when primary_key is set but on_conflict is not,
+/// Verifies that when `primary_key` is set but `on_conflict` is not,
 /// duplicate keys result in an error or are handled gracefully.
 ///
-/// Note: This test is ignored pending investigation of on_conflict timeout issues
+/// Note: This test is ignored pending investigation of `on_conflict` timeout issues
 /// in the file connector pipeline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]

@@ -1044,22 +1044,13 @@ async fn delete_index(
         .set_vector_bucket_name(Some(bucket_name.to_string()))
         .build()?;
 
-    match s3_vector_client.delete_index(input).await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            // Check if it's a NotFoundException (index doesn't exist) - that's OK
-            if e.as_service_error()
-                .is_some_and(|se| se.is_not_found_exception())
-            {
-                tracing::debug!(
-                    "Index {index_name} does not exist (already deleted or never created)"
-                );
-                Ok(())
-            } else {
-                Err(e.into_service_error().into())
-            }
-        }
+    // Don't return error if delete fails, as index may not exist
+    if let Err(e) = s3_vector_client.delete_index(input).await {
+        tracing::debug!(
+            "failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. "
+        );
     }
+    Ok(())
 }
 
 fn vectors_filterable_col(col: impl Into<Column>) -> Column {
