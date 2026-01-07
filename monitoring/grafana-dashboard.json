@@ -3727,7 +3727,7 @@
       },
       "id": 914,
       "panels": [],
-      "title": "🔧 Resource Utilization",
+      "title": "🔧 Kubernetes Resource Utilization",
       "type": "row"
     },
     {
