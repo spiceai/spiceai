@@ -19,7 +19,6 @@ use aws_credential_types::Credentials;
 use aws_sdk_credential_bridge::default_aws_config;
 use s3_vectors::{Client, DeleteIndexInput, S3Vectors};
 use serde_json::json;
-use snafu::ResultExt;
 use spicepod::{
     acceleration::Acceleration,
     component::dataset::Dataset,
@@ -883,12 +882,14 @@ pub(crate) mod search {
             .unwrap_or_default();
 
         if predelete_index {
-            return delete_index(bucket_name.as_str(), index_name.as_str())
+            // Delete index if it exists - NotFoundException is handled internally as Ok
+            delete_index(bucket_name.as_str(), index_name.as_str())
                 .await
                 .map_err(|e| {
-                    tracing::warn!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
-                    anyhow::anyhow!(e)
-                });
+                    anyhow::anyhow!(
+                        "failed to delete index {index_name} before test: {e}"
+                    )
+                })?;
         }
         Ok(())
     }
@@ -1046,9 +1047,22 @@ async fn delete_index(
         .set_vector_bucket_name(Some(bucket_name.to_string()))
         .build()?;
 
-    s3_vector_client.delete_index(input).await.boxed()?;
-
-    Ok(())
+    match s3_vector_client.delete_index(input).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            // Check if it's a NotFoundException (index doesn't exist) - that's OK
+            if e.as_service_error()
+                .is_some_and(|se| se.is_not_found_exception())
+            {
+                tracing::debug!(
+                    "Index {index_name} does not exist (already deleted or never created)"
+                );
+                Ok(())
+            } else {
+                Err(e.into_service_error().into())
+            }
+        }
+    }
 }
 
 fn vectors_filterable_col(col: impl Into<Column>) -> Column {
