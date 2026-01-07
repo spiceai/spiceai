@@ -2463,32 +2463,7 @@
           },
           "unit": "ms"
         },
-        "overrides": [
-          {
-            "__systemRef": "hideSeriesFrom",
-            "matcher": {
-              "id": "byNames",
-              "options": {
-                "mode": "exclude",
-                "names": [
-                  "GET /v1/ready"
-                ],
-                "prefix": "All except:",
-                "readOnly": true
-              }
-            },
-            "properties": [
-              {
-                "id": "custom.hideFrom",
-                "value": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": true
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "gridPos": {
         "h": 7,
@@ -4202,7 +4177,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               }
             ]
           },
@@ -4240,23 +4216,10 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "model_load_duration_ms_summary{quantile=~\"$percentile\", instance=~\"$instances\"} > 0",
+          "expr": "histogram_quantile($percentile, sum by (le) (rate(model_load_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))",
           "legendFormat": "{{model}} P{{quantile}}",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile($percentile, sum by (le) (rate(model_load_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))\n",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "__auto",
-          "range": true,
-          "refId": "B"
         }
       ],
       "title": "Model Load Duration",
@@ -4310,7 +4273,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               }
             ]
           },
@@ -4348,23 +4312,10 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "secrets_store_load_duration_ms_summary{quantile=~\"$percentile\", instance=~\"$instances\"} > 0",
+          "expr": "histogram_quantile($percentile, sum by (le) (rate(secrets_store_load_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))",
           "legendFormat": "Secrets P{{quantile}}",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile($percentile, sum by (le) (rate(secrets_store_load_duration_ms_bucket{instance=~\"$instances\"}[$__rate_interval])))\n",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "__auto",
-          "range": true,
-          "refId": "B"
         }
       ],
       "title": "Secrets Store Load Duration",
@@ -4418,7 +4369,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               }
             ]
           },
@@ -4513,7 +4465,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "red"
+                "color": "red",
+                "value": null
               }
             ]
           },
@@ -4640,7 +4593,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "red"
+                "color": "red",
+                "value": null
               }
             ]
           },
@@ -4770,6 +4724,6 @@
   "timezone": "browser",
   "title": "Spice.ai Comprehensive Dashboard",
   "uid": "spiceai-comprehensive-v1",
-  "version": 14,
+  "version": 15,
   "weekStart": ""
 }
