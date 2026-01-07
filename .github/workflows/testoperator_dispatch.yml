@@ -154,7 +154,7 @@ jobs:
 
       - name: Dispatch Testoperator - Scheduled Text-to-SQL - TPCH
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpch/text_to_sql --workflow text-to-sql
+          testoperator dispatch ./tools/testoperator/dispatch/text_to_sql --workflow text-to-sql
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -269,9 +269,9 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
-      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - Text to SQL
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Text to SQL
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpch/text_to_sql \
+          testoperator dispatch ./tools/testoperator/dispatch/text_to_sql \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:

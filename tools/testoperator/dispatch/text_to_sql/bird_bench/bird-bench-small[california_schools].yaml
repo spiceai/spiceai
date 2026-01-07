@@ -1,0 +1,10 @@
+tests:
+  text_to_sql:
+    - spicepod_path: test/spicepods/models/text-to-sql.yaml
+      runner_type: spiceai-dev-runners
+      model_name: grok41
+      benchmark_queryset: bird-bench-small[california_schools]
+    - spicepod_path: test/spicepods/models/text-to-sql.yaml
+      runner_type: spiceai-dev-runners
+      model_name: claude-sonnet-4-5
+      benchmark_queryset: bird-bench-small[california_schools]
