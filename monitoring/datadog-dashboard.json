@@ -28,7 +28,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.runtime.flight_server_started{$instance}",
+                      "query": "sum:runtime_flight_server_started{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -66,7 +66,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.dataset.active_count{$instance}",
+                      "query": "sum:dataset_active_count{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -101,7 +101,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.model.active_count{$instance}",
+                      "query": "sum:model_active_count{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -136,7 +136,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.embeddings.active_count{$instance}",
+                      "query": "sum:embeddings_active_count{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -171,7 +171,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.tool.active_count{$instance}",
+                      "query": "sum:tool_active_count{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -210,7 +210,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.runtime.flight_server_started{$instance} by {instance}",
+                      "query": "avg:runtime_flight_server_started{$instance} by {instance}",
                       "aggregator": "avg"
                     }
                   ],
@@ -273,7 +273,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.query.duration_ms{$instance} by {protocol}"
+                      "query": "p99:query_duration_ms{$instance} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -324,7 +324,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.query.executions{$instance} by {protocol}.as_count()"
+                      "query": "sum:query_executions{$instance} by {protocol}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -373,7 +373,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.query.active_count{$instance} by {protocol}"
+                      "query": "sum:query_active_count{$instance} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -421,7 +421,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.query.failures{$instance} by {err_code}.as_count()"
+                      "query": "sum:query_failures{$instance} by {err_code}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -469,7 +469,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.query.returned_rows{$instance} by {protocol}"
+                      "query": "p99:query_returned_rows{$instance} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -540,12 +540,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.query.processed_bytes{$instance}"
+                      "query": "sum:query_processed_bytes{$instance}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spiceai.query.returned_bytes{$instance}"
+                      "query": "sum:query_returned_bytes{$instance}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -595,7 +595,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.query.spilled_bytes{$instance}.as_count()"
+                      "query": "sum:query_spilled_bytes{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -658,7 +658,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.dataset.acceleration.time_since_last_refresh_ms{$instance,!dataset:runtime.*} by {dataset}",
+                      "query": "avg:dataset_acceleration.time_since_last_refresh_ms{$instance,!dataset:runtime.*} by {dataset}",
                       "aggregator": "last"
                     }
                   ],
@@ -712,7 +712,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.dataset.acceleration.ingestion_lag_ms{$instance,!dataset:runtime.*} by {dataset}",
+                      "query": "avg:dataset_acceleration.ingestion_lag_ms{$instance,!dataset:runtime.*} by {dataset}",
                       "aggregator": "last"
                     }
                   ],
@@ -769,7 +769,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.dataset.acceleration.refresh_duration_ms{$instance,!dataset:runtime.*} by {dataset}"
+                      "query": "p99:dataset_acceleration.refresh_duration_ms{$instance,!dataset:runtime.*} by {dataset}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -817,7 +817,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.dataset.acceleration.refresh_errors{$instance} by {dataset}.as_count()"
+                      "query": "sum:dataset_acceleration.refresh_errors{$instance} by {dataset}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -865,7 +865,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.dataset.acceleration.refresh_lag_ms{$instance,!dataset:runtime.*} by {dataset}"
+                      "query": "avg:dataset_acceleration.refresh_lag_ms{$instance,!dataset:runtime.*} by {dataset}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -924,7 +924,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.results_cache.hit_ratio{$instance}",
+                      "query": "avg:results_cache_hit_ratio{$instance}",
                       "aggregator": "last"
                     }
                   ],
@@ -987,12 +987,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.results_cache.hits{$instance}.as_count()"
+                      "query": "sum:results_cache_hits{$instance}.as_count()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spiceai.results_cache.requests{$instance}.as_count()"
+                      "query": "sum:results_cache_requests{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1049,12 +1049,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.results_cache.size_bytes{$instance}"
+                      "query": "sum:results_cache_size_bytes{$instance}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spiceai.results_cache.max_size_bytes{$instance}"
+                      "query": "sum:results_cache_max_size_bytes{$instance}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1098,7 +1098,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.results_cache.items_count{$instance}"
+                      "query": "sum:results_cache_items_count{$instance}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1142,7 +1142,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.results_cache.evictions{$instance}.as_count()"
+                      "query": "sum:results_cache_evictions{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1186,7 +1186,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.results_cache.swr_background_query_count{$instance}.as_count()"
+                      "query": "sum:results_cache_swr_background_query_count{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1252,7 +1252,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.http.requests_duration_ms{$instance} by {method,path}"
+                      "query": "p99:http_requests_duration_ms{$instance} by {method,path}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1300,7 +1300,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.http.requests{$instance} by {method,path,status}.as_count()"
+                      "query": "sum:http_requests{$instance} by {method,path,status}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1366,7 +1366,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.flight.request_duration_ms{$instance,method:do_get} by {command}"
+                      "query": "p99:flight_request_duration_ms{$instance,method:do_get} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1415,7 +1415,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.flight.request_duration_ms{$instance,method:do_put} by {command}"
+                      "query": "p99:flight_request_duration_ms{$instance,method:do_put} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1464,7 +1464,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.flight.request_duration_ms{$instance,method:get_flight_info} by {command}"
+                      "query": "p99:flight_request_duration_ms{$instance,method:get_flight_info} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1512,7 +1512,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.flight.requests{$instance} by {method}.as_count()"
+                      "query": "sum:flight_requests{$instance} by {method}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1561,7 +1561,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.flight.do_exchange_data_updates_sent{$instance}.as_count()"
+                      "query": "sum:flight_do_exchange_data_updates_sent{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1625,7 +1625,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.dataset.kafka.records_lag{$instance} by {name}"
+                      "query": "avg:dataset_kafka.records_lag{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1672,7 +1672,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.dataset.kafka.records_consumed_total{$instance} by {name}"
+                      "query": "sum:dataset_kafka.records_consumed_total{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1737,7 +1737,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.dataset.dynamodb.lag_ms{$instance} by {name}"
+                      "query": "avg:dataset_dynamodb.lag_ms{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1785,7 +1785,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.dataset.dynamodb.records_consumed_total{$instance} by {name}"
+                      "query": "sum:dataset_dynamodb.records_consumed_total{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1833,7 +1833,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:spiceai.dataset.dynamodb.shards_active{$instance} by {name}"
+                      "query": "avg:dataset_dynamodb.shards_active{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1881,7 +1881,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.dataset.dynamodb.errors_transient_total{$instance} by {name}"
+                      "query": "sum:dataset_dynamodb.errors_transient_total{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2163,7 +2163,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.model.load_duration_ms{$instance}"
+                      "query": "p99:model_load_duration_ms{$instance}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2213,7 +2213,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.secrets_store.load_duration_ms{$instance}"
+                      "query": "p99:secrets_store_load_duration_ms{$instance}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2263,7 +2263,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spiceai.workers.load_duration_ms{$instance}"
+                      "query": "p99:workers_load_duration_ms{$instance}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2324,22 +2324,22 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.model.load_errors{$instance}.as_count()"
+                      "query": "sum:model_load_errors{$instance}.as_count()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spiceai.catalog.load_errors{$instance}.as_count()"
+                      "query": "sum:catalog_load_errors{$instance}.as_count()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query3",
-                      "query": "sum:spiceai.embeddings.load_errors{$instance}.as_count()"
+                      "query": "sum:embeddings_load_errors{$instance}.as_count()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query4",
-                      "query": "sum:spiceai.tool.load_errors{$instance}.as_count()"
+                      "query": "sum:tool_load_errors{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2388,7 +2388,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.dataset.acceleration.refresh_worker_panics{$instance}.as_count()"
+                      "query": "sum:dataset_acceleration.refresh_worker_panics{$instance}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2439,9 +2439,5 @@
   "layout_type": "ordered",
   "notify_list": [],
   "reflow_type": "fixed",
-  "tags": [
-    "spiceai",
-    "observability",
-    "data-infrastructure"
-  ]
+  "tags": []
 }
