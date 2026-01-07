@@ -965,6 +965,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::similar_names)]
     fn test_single_row_composite_key_produces_and() {
         // Single row with composite key: WHERE pk=1 AND sk='300'
         let row_indices = vec![0];
@@ -988,7 +989,6 @@ mod tests {
 
             // Verify we have conditions for both pk and sk
             let has_pk = conditions.iter().any(|e| is_column_eq(e, "pk"));
-            #[allow(clippy::similar_names)]
             let has_sk = conditions.iter().any(|e| is_column_eq(e, "sk"));
             assert!(has_pk, "Expected condition for pk");
             assert!(has_sk, "Expected condition for sk");
@@ -1144,10 +1144,9 @@ mod tests {
     fn is_column_eq(expr: &Expr, column_name: &str) -> bool {
         if let Expr::BinaryExpr(binary) = expr
             && binary.op == Operator::Eq
+            && let Expr::Column(col) = binary.left.as_ref()
         {
-            if let Expr::Column(col) = binary.left.as_ref() {
-                return col.name == column_name;
-            }
+            return col.name == column_name;
         }
         false
     }
@@ -1173,27 +1172,24 @@ mod tests {
         let mut sk_value: Option<String> = None;
 
         for cond in conditions {
-            if let Expr::BinaryExpr(binary) = cond {
-                if binary.op == Operator::Eq {
-                    if let Expr::Column(col) = binary.left.as_ref() {
-                        match col.name.as_str() {
-                            "pk" => {
-                                if let Expr::Literal(ScalarValue::Int64(Some(v)), _) =
-                                    binary.right.as_ref()
-                                {
-                                    pk_value = Some(*v);
-                                }
-                            }
-                            "sk" => {
-                                if let Expr::Literal(ScalarValue::Utf8(Some(v)), _) =
-                                    binary.right.as_ref()
-                                {
-                                    sk_value = Some(v.clone());
-                                }
-                            }
-                            _ => {}
+            if let Expr::BinaryExpr(binary) = cond
+                && binary.op == Operator::Eq
+                && let Expr::Column(col) = binary.left.as_ref()
+            {
+                match col.name.as_str() {
+                    "pk" => {
+                        if let Expr::Literal(ScalarValue::Int64(Some(v)), _) = binary.right.as_ref()
+                        {
+                            pk_value = Some(*v);
                         }
                     }
+                    "sk" => {
+                        if let Expr::Literal(ScalarValue::Utf8(Some(v)), _) = binary.right.as_ref()
+                        {
+                            sk_value = Some(v.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
