@@ -886,9 +886,7 @@ pub(crate) mod search {
             delete_index(bucket_name.as_str(), index_name.as_str())
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "failed to delete index {index_name} before test: {e}"
-                    )
+                    anyhow::anyhow!("failed to delete index {index_name} before test: {e}")
                 })?;
         }
         Ok(())

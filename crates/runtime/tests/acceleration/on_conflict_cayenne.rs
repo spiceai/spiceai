@@ -941,8 +941,10 @@ async fn test_cayenne_primary_key_no_on_conflict() -> Result<(), anyhow::Error> 
                 metadata_dir.display().to_string(),
             );
 
-            let mut dataset =
-                Dataset::new(format!("file://{}", csv_file.display()), "pk_no_conflict_test");
+            let mut dataset = Dataset::new(
+                format!("file://{}", csv_file.display()),
+                "pk_no_conflict_test",
+            );
             dataset.access = AccessMode::ReadWrite;
             dataset.acceleration = Some(Acceleration {
                 enabled: true,
