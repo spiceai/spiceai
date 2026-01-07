@@ -6,48 +6,10 @@
       "id": 1,
       "definition": {
         "title": "🏠 System Overview",
-        "type": "group",
         "background_color": "vivid_blue",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
-          {
-            "id": 101,
-            "definition": {
-              "title": "Active Instances",
-              "title_size": "16",
-              "title_align": "left",
-              "type": "query_value",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "formula": "query1"
-                    }
-                  ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:runtime_flight_server_started{$instance}",
-                      "aggregator": "last"
-                    }
-                  ],
-                  "response_format": "scalar"
-                }
-              ],
-              "autoscale": true,
-              "precision": 0,
-              "timeseries_background": {
-                "type": "area"
-              }
-            },
-            "layout": {
-              "x": 0,
-              "y": 0,
-              "width": 2,
-              "height": 2
-            }
-          },
           {
             "id": 102,
             "definition": {
@@ -77,9 +39,9 @@
               "precision": 0
             },
             "layout": {
-              "x": 2,
+              "x": 0,
               "y": 0,
-              "width": 2,
+              "width": 3,
               "height": 2
             }
           },
@@ -112,9 +74,9 @@
               "precision": 0
             },
             "layout": {
-              "x": 4,
+              "x": 3,
               "y": 0,
-              "width": 2,
+              "width": 3,
               "height": 2
             }
           },
@@ -149,7 +111,7 @@
             "layout": {
               "x": 6,
               "y": 0,
-              "width": 2,
+              "width": 3,
               "height": 2
             }
           },
@@ -182,52 +144,9 @@
               "precision": 0
             },
             "layout": {
-              "x": 8,
+              "x": 9,
               "y": 0,
-              "width": 2,
-              "height": 2
-            }
-          },
-          {
-            "id": 107,
-            "definition": {
-              "title": "Instance Uptime Health",
-              "title_size": "16",
-              "title_align": "left",
-              "type": "toplist",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "formula": "query1",
-                      "limit": {
-                        "count": 10,
-                        "order": "desc"
-                      }
-                    }
-                  ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "avg:runtime_flight_server_started{$instance} by {instance}",
-                      "aggregator": "avg"
-                    }
-                  ],
-                  "response_format": "scalar"
-                }
-              ],
-              "style": {
-                "display": {
-                  "type": "stacked",
-                  "legend": "automatic"
-                }
-              }
-            },
-            "layout": {
-              "x": 10,
-              "y": 0,
-              "width": 2,
+              "width": 3,
               "height": 2
             }
           }
@@ -244,8 +163,8 @@
       "id": 2,
       "definition": {
         "title": "📊 Query Performance",
-        "type": "group",
         "background_color": "vivid_green",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
@@ -266,6 +185,12 @@
                 {
                   "formulas": [
                     {
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      },
                       "formula": "query1"
                     }
                   ],
@@ -273,7 +198,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:query_duration_ms{$instance} by {protocol}"
+                      "query": "avg:query_duration_ms{$instance} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -324,7 +249,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:query_executions{$instance} by {protocol}.as_count()"
+                      "query": "sum:query_executions{*} by {protocol}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -394,7 +319,7 @@
               "x": 0,
               "y": 3,
               "width": 4,
-              "height": 2
+              "height": 3
             }
           },
           {
@@ -442,7 +367,7 @@
               "x": 4,
               "y": 3,
               "width": 4,
-              "height": 2
+              "height": 3
             }
           },
           {
@@ -469,7 +394,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:query_returned_rows{$instance} by {protocol}"
+                      "query": "avg:query_returned_rows{$instance} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -490,7 +415,7 @@
               "x": 8,
               "y": 3,
               "width": 4,
-              "height": 2
+              "height": 3
             }
           }
         ]
@@ -499,15 +424,15 @@
         "x": 0,
         "y": 3,
         "width": 12,
-        "height": 6
+        "height": 7
       }
     },
     {
       "id": 3,
       "definition": {
         "title": "📈 Data Throughput",
-        "type": "group",
         "background_color": "vivid_purple",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
@@ -623,7 +548,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 9,
+        "y": 10,
         "width": 12,
         "height": 4
       }
@@ -632,8 +557,8 @@
       "id": 4,
       "definition": {
         "title": "⚡ Accelerated Datasets",
-        "type": "group",
         "background_color": "vivid_orange",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
@@ -645,15 +570,6 @@
               "type": "toplist",
               "requests": [
                 {
-                  "formulas": [
-                    {
-                      "formula": "query1",
-                      "limit": {
-                        "count": 10,
-                        "order": "desc"
-                      }
-                    }
-                  ],
                   "queries": [
                     {
                       "data_source": "metrics",
@@ -679,7 +595,22 @@
                       "value": 300000,
                       "palette": "white_on_red"
                     }
-                  ]
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "query1"
+                    }
+                  ],
+                  "sort": {
+                    "count": 10,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "desc"
+                      }
+                    ]
+                  }
                 }
               ]
             },
@@ -699,20 +630,11 @@
               "type": "toplist",
               "requests": [
                 {
-                  "formulas": [
-                    {
-                      "formula": "query1",
-                      "limit": {
-                        "count": 10,
-                        "order": "desc"
-                      }
-                    }
-                  ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_acceleration.ingestion_lag_ms{$instance,!dataset:runtime.*} by {dataset}",
+                      "query": "avg:dataset_acceleration_ingestion_lag_ms{$instance,!dataset:runtime.*} by {dataset}",
                       "aggregator": "last"
                     }
                   ],
@@ -733,9 +655,31 @@
                       "value": 60000,
                       "palette": "white_on_red"
                     }
-                  ]
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      }
+                    }
+                  ],
+                  "sort": {
+                    "count": 10,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "desc"
+                      }
+                    ]
+                  }
                 }
-              ]
+              ],
+              "style": {}
             },
             "layout": {
               "x": 6,
@@ -762,14 +706,20 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:dataset_acceleration.refresh_duration_ms{$instance,!dataset:runtime.*} by {dataset}"
+                      "query": "avg:dataset_acceleration_refresh_duration_ms{$instance,!dataset:runtime.*} by {dataset}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -817,7 +767,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:dataset_acceleration.refresh_errors{$instance} by {dataset}.as_count()"
+                      "query": "sum:dataset_acceleration_refresh_errors{$instance} by {dataset}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -858,14 +808,20 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_acceleration.refresh_lag_ms{$instance,!dataset:runtime.*} by {dataset}"
+                      "query": "avg:dataset_acceleration_refresh_lag_ms{$instance,!dataset:runtime.*} by {dataset}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -893,7 +849,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 13,
+        "y": 14,
         "width": 12,
         "height": 7
       }
@@ -902,8 +858,8 @@
       "id": 5,
       "definition": {
         "title": "💾 Results Cache",
-        "type": "group",
         "background_color": "vivid_pink",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
@@ -912,51 +868,66 @@
               "title": "Cache Hit Rate",
               "title_size": "16",
               "title_align": "left",
-              "type": "query_value",
+              "type": "query_table",
               "requests": [
                 {
-                  "formulas": [
-                    {
-                      "formula": "query1"
-                    }
-                  ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:results_cache_hit_ratio{$instance}",
+                      "query": "avg:results_cache_hit_ratio{$instance} by {service.instance.id}",
                       "aggregator": "last"
                     }
                   ],
                   "response_format": "scalar",
-                  "conditional_formats": [
+                  "sort": {
+                    "count": 500,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "desc"
+                      }
+                    ]
+                  },
+                  "formulas": [
                     {
-                      "comparator": ">=",
-                      "value": 80,
-                      "palette": "white_on_green"
-                    },
-                    {
-                      "comparator": ">=",
-                      "value": 50,
-                      "palette": "white_on_yellow"
-                    },
-                    {
-                      "comparator": "<",
-                      "value": 50,
-                      "palette": "white_on_red"
+                      "formula": "query1",
+                      "conditional_formats": [
+                        {
+                          "comparator": ">=",
+                          "value": 80,
+                          "palette": "white_on_green"
+                        },
+                        {
+                          "comparator": ">=",
+                          "value": 50,
+                          "palette": "white_on_yellow"
+                        },
+                        {
+                          "comparator": "<",
+                          "value": 50,
+                          "palette": "white_on_red"
+                        }
+                      ],
+                      "cell_display_mode": "bar",
+                      "number_format": {
+                        "unit": {
+                          "label": "%",
+                          "type": "custom_unit_label"
+                        }
+                      }
                     }
                   ]
                 }
               ],
-              "autoscale": false,
-              "custom_unit": "%",
-              "precision": 1
+              "has_search_bar": "auto"
             },
             "layout": {
               "x": 0,
               "y": 0,
-              "width": 3,
-              "height": 2
+              "width": 4,
+              "height": 3
             }
           },
           {
@@ -1011,9 +982,9 @@
               }
             },
             "layout": {
-              "x": 3,
+              "x": 4,
               "y": 0,
-              "width": 5,
+              "width": 4,
               "height": 3
             }
           },
@@ -1214,7 +1185,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 20,
+        "y": 21,
         "width": 12,
         "height": 6
       }
@@ -1223,8 +1194,8 @@
       "id": 6,
       "definition": {
         "title": "🌐 HTTP API",
-        "type": "group",
         "background_color": "vivid_yellow",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
@@ -1252,7 +1223,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:http_requests_duration_ms{$instance} by {method,path}"
+                      "query": "avg:http_requests_duration_ms{$instance} by {method,path}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1328,7 +1299,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 26,
+        "y": 27,
         "width": 12,
         "height": 4
       }
@@ -1337,8 +1308,8 @@
       "id": 7,
       "definition": {
         "title": "✈️ Arrow Flight Operations",
-        "type": "group",
         "background_color": "gray",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
@@ -1354,6 +1325,7 @@
                 "max",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1366,7 +1338,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:flight_request_duration_ms{$instance,method:do_get} by {command}"
+                      "query": "avg:flight_request_duration_ms{$instance,method:do_get} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1403,6 +1375,7 @@
                 "max",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1415,7 +1388,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:flight_request_duration_ms{$instance,method:do_put} by {command}"
+                      "query": "avg:flight_request_duration_ms{$instance,method:do_put} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1452,6 +1425,7 @@
                 "max",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1464,7 +1438,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:flight_request_duration_ms{$instance,method:get_flight_info} by {command}"
+                      "query": "avg:flight_request_duration_ms{$instance,method:get_flight_info} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1589,7 +1563,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 30,
+        "y": 31,
         "width": 12,
         "height": 7
       }
@@ -1598,8 +1572,8 @@
       "id": 8,
       "definition": {
         "title": "📦 Debezium Ingestion",
-        "type": "group",
         "background_color": "white",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
@@ -1613,6 +1587,7 @@
               "legend_columns": [
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1625,7 +1600,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_kafka.records_lag{$instance} by {name}"
+                      "query": "avg:dataset_kafka_records_lag{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1660,6 +1635,7 @@
               "legend_columns": [
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1672,7 +1648,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:dataset_kafka.records_consumed_total{$instance} by {name}"
+                      "query": "sum:dataset_kafka_records_consumed_total{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1700,7 +1676,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 37,
+        "y": 38,
         "width": 12,
         "height": 4
       }
@@ -1709,8 +1685,8 @@
       "id": 9,
       "definition": {
         "title": "📦 DynamoDB Streams Ingestion",
-        "type": "group",
         "background_color": "blue",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
@@ -1725,6 +1701,7 @@
                 "avg",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1737,7 +1714,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_dynamodb.lag_ms{$instance} by {name}"
+                      "query": "avg:dataset_dynamodb_lag_ms{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1773,6 +1750,7 @@
                 "avg",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1785,7 +1763,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:dataset_dynamodb.records_consumed_total{$instance} by {name}"
+                      "query": "sum:dataset_dynamodb_records_consumed_total{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1821,6 +1799,7 @@
                 "avg",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1833,7 +1812,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_dynamodb.shards_active{$instance} by {name}"
+                      "query": "avg:dataset_dynamodb_shards_active{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1869,6 +1848,7 @@
                 "sum",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1881,7 +1861,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:dataset_dynamodb.errors_transient_total{$instance} by {name}"
+                      "query": "sum:dataset_dynamodb_errors_transient_total{$instance} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1909,7 +1889,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 41,
+        "y": 42,
         "width": 12,
         "height": 7
       }
@@ -1918,8 +1898,8 @@
       "id": 10,
       "definition": {
         "title": "🔧 Resource Utilization",
-        "type": "group",
         "background_color": "vivid_green",
+        "type": "group",
         "layout_type": "ordered",
         "widgets": [
           {
@@ -1935,6 +1915,7 @@
                 "max",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1947,7 +1928,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:kubernetes.cpu.usage.total{$kube_instance} by {pod_name}"
+                      "query": "avg:k8s.pod.cpu.usage{*} by {pod_name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1984,6 +1965,7 @@
                 "max",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1996,7 +1978,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:kubernetes.memory.working_set{$kube_instance} by {pod_name}"
+                      "query": "avg:k8s.pod.memory.working_set{*} by {pod_name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2032,6 +2014,7 @@
                 "avg",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -2044,12 +2027,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:kubernetes.kubelet.volume.stats.capacity_bytes{$kube_instance,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:k8s.volume.capacity{!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:kubernetes.kubelet.volume.stats.available_bytes{$kube_instance,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:k8s.volume.available{!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2085,6 +2068,7 @@
                 "avg",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -2097,12 +2081,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:kubernetes.kubelet.volume.stats.capacity_bytes{$kube_instance,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:k8s.volume.capacity{!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "avg:kubernetes.kubelet.volume.stats.available_bytes{$kube_instance,!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
+                      "query": "avg:k8s.volume.available{!persistentvolumeclaim:kube-api-access-*,!persistentvolumeclaim:default-token-*} by {pod_name,persistentvolumeclaim}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2131,292 +2115,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 48,
-        "width": 12,
-        "height": 7
-      }
-    },
-    {
-      "id": 11,
-      "definition": {
-        "title": "🔄 Resource Loading",
-        "type": "group",
-        "background_color": "purple",
-        "layout_type": "ordered",
-        "widgets": [
-          {
-            "id": 901,
-            "definition": {
-              "title": "Model Load Duration (p99)",
-              "title_size": "16",
-              "title_align": "left",
-              "show_legend": false,
-              "type": "timeseries",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "formula": "query1"
-                    }
-                  ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "p99:model_load_duration_ms{$instance}"
-                    }
-                  ],
-                  "response_format": "timeseries",
-                  "style": {
-                    "palette": "dog_classic",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "line"
-                }
-              ],
-              "yaxis": {
-                "include_zero": true,
-                "scale": "linear"
-              }
-            },
-            "layout": {
-              "x": 0,
-              "y": 0,
-              "width": 4,
-              "height": 3
-            }
-          },
-          {
-            "id": 902,
-            "definition": {
-              "title": "Secrets Store Load Duration (p99)",
-              "title_size": "16",
-              "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "avg",
-                "max",
-                "value"
-              ],
-              "type": "timeseries",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "alias": "Secrets",
-                      "formula": "query1"
-                    }
-                  ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "p99:secrets_store_load_duration_ms{$instance}"
-                    }
-                  ],
-                  "response_format": "timeseries",
-                  "style": {
-                    "palette": "dog_classic",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "line"
-                }
-              ],
-              "yaxis": {
-                "include_zero": true,
-                "scale": "linear"
-              }
-            },
-            "layout": {
-              "x": 4,
-              "y": 0,
-              "width": 4,
-              "height": 3
-            }
-          },
-          {
-            "id": 903,
-            "definition": {
-              "title": "Workers Load Duration (p99)",
-              "title_size": "16",
-              "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "avg",
-                "max",
-                "value"
-              ],
-              "type": "timeseries",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "alias": "Workers",
-                      "formula": "query1"
-                    }
-                  ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "p99:workers_load_duration_ms{$instance}"
-                    }
-                  ],
-                  "response_format": "timeseries",
-                  "style": {
-                    "palette": "dog_classic",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "line"
-                }
-              ],
-              "yaxis": {
-                "include_zero": true,
-                "scale": "linear"
-              }
-            },
-            "layout": {
-              "x": 8,
-              "y": 0,
-              "width": 4,
-              "height": 3
-            }
-          },
-          {
-            "id": 904,
-            "definition": {
-              "title": "Component Load Errors",
-              "title_size": "16",
-              "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "sum",
-                "value"
-              ],
-              "type": "timeseries",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "alias": "Model Errors",
-                      "formula": "query1"
-                    },
-                    {
-                      "alias": "Catalog Errors",
-                      "formula": "query2"
-                    },
-                    {
-                      "alias": "Embeddings Errors",
-                      "formula": "query3"
-                    },
-                    {
-                      "alias": "Tool Errors",
-                      "formula": "query4"
-                    }
-                  ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:model_load_errors{$instance}.as_count()"
-                    },
-                    {
-                      "data_source": "metrics",
-                      "name": "query2",
-                      "query": "sum:catalog_load_errors{$instance}.as_count()"
-                    },
-                    {
-                      "data_source": "metrics",
-                      "name": "query3",
-                      "query": "sum:embeddings_load_errors{$instance}.as_count()"
-                    },
-                    {
-                      "data_source": "metrics",
-                      "name": "query4",
-                      "query": "sum:tool_load_errors{$instance}.as_count()"
-                    }
-                  ],
-                  "response_format": "timeseries",
-                  "style": {
-                    "palette": "warm",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "bars"
-                }
-              ],
-              "yaxis": {
-                "include_zero": true,
-                "scale": "linear"
-              }
-            },
-            "layout": {
-              "x": 0,
-              "y": 3,
-              "width": 6,
-              "height": 3
-            }
-          },
-          {
-            "id": 905,
-            "definition": {
-              "title": "Worker Panics",
-              "title_size": "16",
-              "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "sum",
-                "value"
-              ],
-              "type": "timeseries",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "alias": "Refresh Worker Panics",
-                      "formula": "query1"
-                    }
-                  ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:dataset_acceleration.refresh_worker_panics{$instance}.as_count()"
-                    }
-                  ],
-                  "response_format": "timeseries",
-                  "style": {
-                    "palette": "warm",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "bars"
-                }
-              ],
-              "yaxis": {
-                "include_zero": true,
-                "scale": "linear"
-              }
-            },
-            "layout": {
-              "x": 6,
-              "y": 3,
-              "width": 6,
-              "height": 3
-            }
-          }
-        ]
-      },
-      "layout": {
-        "x": 0,
-        "y": 55,
+        "y": 49,
         "width": 12,
         "height": 7
       }
@@ -2428,16 +2127,11 @@
       "prefix": "instance",
       "available_values": [],
       "default": "*"
-    },
-    {
-      "name": "kube_instance",
-      "prefix": "pod_name",
-      "available_values": [],
-      "default": "*"
     }
   ],
   "layout_type": "ordered",
   "notify_list": [],
+  "pause_auto_refresh": false,
   "reflow_type": "fixed",
   "tags": []
 }
