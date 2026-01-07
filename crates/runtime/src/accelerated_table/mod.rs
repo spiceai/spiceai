@@ -176,12 +176,12 @@ pub enum AcceleratedTableBuilderError {
     ExpectedChangesStream,
 
     #[snafu(display(
-        "An append stream is required when `refresh_mode` is set to `append` without a `time_column`. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
+        "An append stream is required when `refresh_mode` is set to `append` without a `time_column`. For details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh#append"
     ))]
     AppendStreamRequired,
 
     #[snafu(display(
-        "Append mode requires either `time_column` or `primary_key` to be specified in the dataset configuration. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
+        "Append mode requires either `time_column` or `primary_key` to be specified in the dataset configuration. For details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh#append"
     ))]
     NeitherTimeColumnNorPrimaryKey,
 
@@ -196,7 +196,7 @@ pub enum AcceleratedTableBuilderError {
     ExpectedChangesModeForChangesStream,
 
     #[snafu(display(
-        "Refresh mode must be set to `append` to use an append stream. For details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"
+        "Refresh mode must be set to `append` to use an append stream. For details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh#append"
     ))]
     ExpectedAppendModeForAppendStream,
 
