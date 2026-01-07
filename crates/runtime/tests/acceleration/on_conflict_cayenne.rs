@@ -23,9 +23,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use datafusion::assert_batches_eq;
+use cayenne::CayenneTableProvider;
+use data_components::delete::DeletionTableProvider;
+use datafusion::{assert_batches_eq, physical_plan::collect, prelude::*, sql::TableReference};
 use futures::TryStreamExt;
-use runtime::Runtime;
+use runtime::{Runtime, accelerated_table::AcceleratedTable};
+use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
 use spicepod::{
     acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
     component::{access::AccessMode, dataset::Dataset},
@@ -388,7 +391,18 @@ async fn test_cayenne_core_arrow_data_types() -> Result<(), anyhow::Error> {
 async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
 
-    test_request_context()
+    // Use a no-cache request context to ensure fresh results after deletion
+    let no_cache_context = Arc::new(
+        RequestContext::builder(Protocol::Internal)
+            .with_user_agent(UserAgent::from_ua_str(&format!(
+                "spiceci/{}",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .with_cache_control(CacheControl::NoCache)
+            .build(),
+    );
+
+    no_cache_context
         .scope(async {
             let temp_dir = tempfile::tempdir()?;
             let data_dir = temp_dir.path().join("data");
@@ -451,12 +465,31 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
             let expected = ["+-----+", "| cnt |", "+-----+", "| 5   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
-            // Delete by primary key
-            rt.datafusion()
-                .query_builder("DELETE FROM pk_test WHERE id = 3")
-                .build()
-                .run()
-                .await?;
+            // Delete by primary key using DeletionTableProvider::delete_from
+            // (SQL DELETE is not supported through the runtime's SQL interface)
+            let table_ref = TableReference::bare("pk_test");
+            let table = rt
+                .datafusion()
+                .get_table(&table_ref)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Table pk_test not found"))?;
+
+            // Get the AcceleratedTable, then its underlying accelerator (CayenneTableProvider)
+            let accelerated_table = table
+                .as_any()
+                .downcast_ref::<AcceleratedTable>()
+                .ok_or_else(|| anyhow::anyhow!("Table is not an AcceleratedTable"))?;
+
+            let accelerator = accelerated_table.get_accelerator();
+            let cayenne_provider = accelerator
+                .as_any()
+                .downcast_ref::<CayenneTableProvider>()
+                .ok_or_else(|| anyhow::anyhow!("Accelerator is not a CayenneTableProvider"))?;
+
+            let ctx = rt.datafusion().ctx.state();
+            let filter = col("id").eq(lit(3i64));
+            let delete_plan = cayenne_provider.delete_from(&ctx, &[filter]).await?;
+            collect(delete_plan, rt.datafusion().ctx.task_ctx()).await?;
 
             // Verify deletion
             let result = execute_sql(&rt, "SELECT COUNT(*) as cnt FROM pk_test").await?;
