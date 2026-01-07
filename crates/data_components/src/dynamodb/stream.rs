@@ -13,10 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use super::{Error, Result};
+use super::{Error, JsonNesting, Result};
 use crate::arrow::struct_builder::StructBuilder;
 use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
 use crate::dynamodb::arrow::append_item_to_struct_builder;
+use crate::dynamodb::json_nest::json_nest_row_except_fields;
 use crate::dynamodb::unnest::unnest_dynamodb_row;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
@@ -122,6 +123,7 @@ pub fn process_batch(
     primary_keys: &[String],
     unnest_depth: Option<usize>,
     time_format: &str,
+    json_nesting: Option<&JsonNesting>,
 ) -> Result<(ChangeBatch, Checkpoint, Option<SystemTime>), StreamError> {
     let batch = batch.context(FailedToReceiveMessageSnafu)?;
     let records = batch.records;
@@ -149,13 +151,21 @@ pub fn process_batch(
                             .context(FailedToUnnestSnafu)?,
                     };
 
+                    let final_streams_item = match json_nesting {
+                        None => unnested_streams_item,
+                        Some(json_nesting) => {
+                            json_nest_row_except_fields(unnested_streams_item, json_nesting)
+                                .context(FailedToUnnestSnafu)?
+                        }
+                    };
+
                     let op = if matches!(event_name, OperationType::Insert) {
                         "c"
                     } else {
                         "u"
                     };
 
-                    (op, unnested_streams_item)
+                    (op, final_streams_item)
                 }
                 OperationType::Remove => {
                     let Some(keys_item) = &dynamodb.keys else {
@@ -331,6 +341,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -368,6 +379,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -401,6 +413,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -427,6 +440,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -470,6 +484,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -508,6 +523,7 @@ mod tests {
                 &primary_keys,
                 Some(2),
                 TIME_FORMAT,
+                None,
             );
 
             result.expect("Should create change envelope with unnesting");
@@ -537,6 +553,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -561,6 +578,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -588,6 +606,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -615,6 +634,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -648,6 +668,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -686,6 +707,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -719,6 +741,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -753,6 +776,7 @@ mod tests {
                 &primary_keys,
                 None,
                 TIME_FORMAT,
+                None,
             );
 
             let (change_batch, _checkpoint, _watermark) =
@@ -762,6 +786,238 @@ mod tests {
             let data_batch = change_batch.data(0);
             assert_eq!(data_batch.num_rows(), 1);
             assert_eq!(data_batch.num_columns(), 2); // id and name
+        }
+
+        use arrow::array::StringArray;
+
+        #[test]
+        fn test_process_batch_with_json_nesting_verifies_data() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test Item".to_string()),
+            );
+            new_image.insert(
+                "count".to_string(),
+                StreamsAttributeValue::N("42".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, true),
+                Field::new("Data", DataType::Utf8, true),
+            ]));
+            let primary_keys = vec!["id".to_string()];
+
+            let json_nesting = JsonNesting {
+                static_fields: HashSet::from(["id".to_string()]),
+                json_field_name: "Data".to_string(),
+            };
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                Some(&json_nesting),
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            assert_eq!(change_batch.record.num_rows(), 1);
+
+            // Extract and verify the data
+            let data_batch = change_batch.data(0);
+            assert_eq!(data_batch.num_rows(), 1);
+
+            // Verify "id" is a top-level field
+            let id_col = data_batch
+                .column_by_name("id")
+                .expect("id column should exist");
+            let id_array = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(id_array.value(0), "123");
+
+            // Verify "Data" contains nested JSON with "name" and "count"
+            let data_col = data_batch
+                .column_by_name("Data")
+                .expect("Data column should exist");
+            let data_array = data_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            let json_str = data_array.value(0);
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(json_str).expect("Data should be valid JSON");
+            assert_eq!(parsed["name"], "Test Item");
+            assert_eq!(parsed["count"], 42.0); // Numbers are parsed as f64
+        }
+
+        #[test]
+        fn test_process_batch_with_json_nesting_complex_types_verifies_data() {
+            let mut nested_map = HashMap::new();
+            nested_map.insert(
+                "nested_key".to_string(),
+                StreamsAttributeValue::S("nested_value".to_string()),
+            );
+
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "PK".to_string(),
+                StreamsAttributeValue::S("pk123".to_string()),
+            );
+            new_image.insert(
+                "SK".to_string(),
+                StreamsAttributeValue::S("sk456".to_string()),
+            );
+            new_image.insert("MapField".to_string(), StreamsAttributeValue::M(nested_map));
+            new_image.insert(
+                "ListField".to_string(),
+                StreamsAttributeValue::L(vec![
+                    StreamsAttributeValue::S("item1".to_string()),
+                    StreamsAttributeValue::S("item2".to_string()),
+                ]),
+            );
+            new_image.insert("BoolField".to_string(), StreamsAttributeValue::Bool(true));
+
+            let record = create_test_record(OperationType::Modify, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = Arc::new(Schema::new(vec![
+                Field::new("PK", DataType::Utf8, true),
+                Field::new("SK", DataType::Utf8, true),
+                Field::new("Data", DataType::Utf8, true),
+            ]));
+            let primary_keys = vec!["PK".to_string(), "SK".to_string()];
+
+            let json_nesting = JsonNesting {
+                static_fields: HashSet::from(["PK".to_string(), "SK".to_string()]),
+                json_field_name: "Data".to_string(),
+            };
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                Some(&json_nesting),
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            let data_batch = change_batch.data(0);
+
+            // Verify static fields
+            let pk_col = data_batch.column_by_name("PK").expect("PK should exist");
+            let pk_array = pk_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(pk_array.value(0), "pk123");
+
+            let sk_col = data_batch.column_by_name("SK").expect("SK should exist");
+            let sk_array = sk_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(sk_array.value(0), "sk456");
+
+            // Verify nested JSON contains complex types
+            let data_col = data_batch
+                .column_by_name("Data")
+                .expect("Data should exist");
+            let data_array = data_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            let json_str = data_array.value(0);
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(json_str).expect("Data should be valid JSON");
+
+            // Verify nested map
+            assert_eq!(parsed["MapField"]["nested_key"], "nested_value");
+
+            // Verify list
+            assert_eq!(parsed["ListField"], serde_json::json!(["item1", "item2"]));
+
+            // Verify bool
+            assert_eq!(parsed["BoolField"], true);
+        }
+
+        #[test]
+        fn test_process_batch_with_json_nesting_all_fields_static() {
+            // When all fields are static, no "Data" field should be created
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, true),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let primary_keys = vec!["id".to_string()];
+
+            let json_nesting = JsonNesting {
+                static_fields: HashSet::from(["id".to_string(), "name".to_string()]),
+                json_field_name: "Data".to_string(),
+            };
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                Some(&json_nesting),
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            let data_batch = change_batch.data(0);
+
+            // Verify both fields are at top level
+            let id_col = data_batch.column_by_name("id").expect("id should exist");
+            let id_array = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(id_array.value(0), "123");
+
+            let name_col = data_batch
+                .column_by_name("name")
+                .expect("name should exist");
+            let name_array = name_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(name_array.value(0), "Test");
+
+            // Data field should not exist (or be null/empty)
+            assert!(data_batch.column_by_name("Data").is_none());
         }
     }
 
@@ -1339,53 +1595,6 @@ mod tests {
             let item = HashMap::new();
             let result = streams_to_dynamodb_item(item);
             assert!(result.is_empty());
-        }
-    }
-
-    /// Tests that demonstrate bugs in the stream conversion module.
-    /// These tests document incorrect behavior and will FAIL when the bugs are fixed.
-    mod bug_tests {
-        /// BUG: `streams_to_dynamodb_attribute` silently converts unknown variants to `Null(true)`.
-        ///
-        /// When AWS adds a new `AttributeValue` variant (which has happened in the past,
-        /// e.g., when they added Document types), this function will silently convert
-        /// it to Null, causing DATA LOSS.
-        ///
-        /// Current behavior: `_ => DynamoDbAttributeValue::Null(true)` - silent data loss
-        /// Correct behavior: Should return `Result` and error on unknown variants,
-        ///                   or at minimum log a warning.
-        ///
-        /// This test will FAIL when the bug is fixed (i.e., when the function
-        /// properly handles unknown variants instead of silently discarding data).
-        ///
-        /// NOTE: We cannot directly test this since we can't construct an "unknown"
-        /// variant without modifying the AWS SDK. Instead, we document this as a
-        /// code review finding. The `_ => ...` pattern should be replaced with
-        /// explicit handling of all known variants.
-        #[test]
-        fn test_bug_unknown_variant_becomes_null_documented() {
-            // This test documents the bug but cannot directly trigger it.
-            // The bug is in this code pattern:
-            //
-            // ```rust
-            // fn streams_to_dynamodb_attribute(value: &StreamsAttributeValue) -> DynamoDbAttributeValue {
-            //     match value {
-            //         ... // all known variants
-            //         _ => DynamoDbAttributeValue::Null(true),  // BUG: silent data loss
-            //     }
-            // }
-            // ```
-            //
-            // When AWS adds new variants (which they have done historically),
-            // this will silently convert them to Null, causing data corruption.
-            //
-            // The fix is to either:
-            // 1. Return Result<DynamoDbAttributeValue, Error> and error on unknown
-            // 2. Use #[non_exhaustive] handling with explicit error
-            // 3. At minimum, log a warning when encountering unknown variants
-            //
-            // This test passes to document the finding - the actual fix requires
-            // a code change to the function signature.
         }
     }
 }
