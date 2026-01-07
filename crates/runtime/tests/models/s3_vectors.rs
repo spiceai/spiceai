@@ -883,11 +883,10 @@ pub(crate) mod search {
             .unwrap_or_default();
 
         if predelete_index {
-            return delete_index(bucket_name.as_str(), index_name.as_str())
+            let _ = delete_index(bucket_name.as_str(), index_name.as_str())
                 .await
-                .map_err(|e| {
-                    tracing::warn!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
-                    anyhow::anyhow!(e)
+                .inspect_err(|e| {
+                    tracing::debug!("Failed to pre-delete index '{index_name}' in bucket '{bucket_name}': {e}. This is expected if the index does not exist yet.");
                 });
         }
         Ok(())
