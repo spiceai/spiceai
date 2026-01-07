@@ -324,6 +324,7 @@ impl DynamoDBTableProvider {
         let primary_keys = self.table_schema.primary_keys().clone();
         let unnest_depth = self.unnest_depth;
         let time_format = Arc::clone(&self.table_schema.time_format());
+        let json_nesting = self.json_nesting.clone();
 
         let stream = self
             .streams_client
@@ -337,6 +338,7 @@ impl DynamoDBTableProvider {
                     &primary_keys,
                     unnest_depth,
                     &time_format,
+                    json_nesting.as_ref(),
                 )
                 .map_err(crate::cdc::StreamError::DynamoDB)
             });
