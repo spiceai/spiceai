@@ -5019,9 +5019,16 @@ impl TableProvider for CayenneTableProvider {
             // Create new input from validated batches
             if validation_result.filtered_batches.is_empty() {
                 // Nothing to insert after on-conflict filtering
-                // Return a plan that does nothing
+                // Return a plan that returns 0 rows with the count schema expected by DataFusion
+                let count_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new(
+                        "count",
+                        arrow::datatypes::DataType::UInt64,
+                        false,
+                    ),
+                ]));
                 return Ok(Arc::new(datafusion_physical_plan::empty::EmptyExec::new(
-                    Arc::clone(&self.table_metadata.schema),
+                    count_schema,
                 )));
             }
 
@@ -5074,9 +5081,17 @@ impl TableProvider for CayenneTableProvider {
                     ))
                 })?;
 
-                // Return an empty plan since we already did the insert
+                // Return an empty plan with the count schema expected by DataFusion
+                // (we already did the insert, so return 0 as no more rows to insert)
+                let count_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new(
+                        "count",
+                        arrow::datatypes::DataType::UInt64,
+                        false,
+                    ),
+                ]));
                 return Ok(Arc::new(datafusion_physical_plan::empty::EmptyExec::new(
-                    Arc::clone(&self.table_metadata.schema),
+                    count_schema,
                 )));
             }
 

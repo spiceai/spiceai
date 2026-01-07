@@ -1421,6 +1421,8 @@ impl CayenneAccelerator {
     ) -> Result<Arc<dyn TableProvider>> {
         use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
 
+        tracing::debug!("create_cayenne_table_provider: starting for table {table_name}");
+
         // Get metastore type and custom metadata directory if provided
         let (metadata_dir, metastore_type) = if let Some(acceleration) = source.acceleration() {
             let metadata_dir =
@@ -1534,6 +1536,7 @@ impl CayenneAccelerator {
                 )),
             });
         }
+        tracing::debug!("create_cayenne_table_provider: calling builder.create for {table_name}");
         let cayenne_table =
             builder
                 .create(table_options)
@@ -1542,6 +1545,7 @@ impl CayenneAccelerator {
                     source: Box::new(e),
                 })?;
 
+        tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
         Ok(Arc::new(cayenne_table))
     }
 }
