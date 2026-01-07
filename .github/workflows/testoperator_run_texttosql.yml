@@ -23,6 +23,23 @@ on:
         description: 'The queryset to use for the text-to-sql benchmark'
         required: false
         type: string
+      benchmark_queryset:
+        description: 'Predefined (possibly external) queryset to setup and use'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'bird-bench-small[california_schools]'
+          - 'bird-bench-small[card_games]'
+          - 'bird-bench-small[community]'
+          - 'bird-bench-small[debit_card_specializing]'
+          - 'bird-bench-small[european_football2]'
+          - 'bird-bench-small[financial]'
+          - 'bird-bench-small[formula1]'
+          - 'bird-bench-small[superhero]'
+          - 'bird-bench-small[thrombosis_prediction]'
+          - 'bird-bench-small[toxicology]'
       runner_type:
         description: 'Runner type'
         required: true
@@ -84,12 +101,15 @@ jobs:
 
       - name: Validate queryset inputs
         run: |
-          if [ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.queryset_file }}" ]; then
-            echo "Error: Only one of 'queryset' or 'queryset_file' should be provided, not both"
-            exit 1
-          fi
-          if [ -z "${{ github.event.inputs.queryset }}" ] && [ -z "${{ github.event.inputs.queryset_file }}" ]; then
-            echo "Error: Either 'queryset' or 'queryset_file' must be provided"
+          if ([ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.queryset_file }}" ]) || \
+              ([ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]) || \
+              ([ -n "${{ github.event.inputs.queryset_file }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]); then
+              echo "Error: Only one of 'queryset', 'queryset_file' or 'benchmark_queryset' can be provided"
+              exit 1
+            fi
+
+          if [ -z "${{ github.event.inputs.queryset }}" ] && [ -z "${{ github.event.inputs.queryset_file }}" ] && [ -z "${{ github.event.inputs.benchmark_queryset }}" ]; then
+            echo "Error: Either 'queryset', 'queryset_file' or 'benchmark_queryset' must be provided"
             exit 1
           fi
 
@@ -100,18 +120,36 @@ jobs:
           SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
+      - name: Prepare Bird-Bench Data
+        id: bird_bench_setup
+        uses: ./.github/actions/setup-bird-bench
+        if: ${{ github.event.inputs.benchmark_queryset != '' }}
+        with:
+          data_directory: /opt/spiced/data/
+          queryset_name: ${{ github.event.inputs.benchmark_queryset }}
+
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |
           rm -rf .spice/data
           QUERYSET_ARG=""
+          SPICEPOD_DEPENDENCY=""
           if [ -n "${{ github.event.inputs.queryset_file }}" ]; then
             QUERYSET_ARG="--queryset-file ${{ github.event.inputs.queryset_file }}"
           elif [ -n "${{ github.event.inputs.queryset }}" ]; then
             QUERYSET_ARG="--queryset ${{ github.event.inputs.queryset }}"
+          elif [ -n "${{ github.event.inputs.benchmark_queryset }}" ]; then
+            QUERYSET_ARG='--queryset-file /opt/spiced/data/queryset.json'
+            SPICEPOD_DEPENDENCY="--spicepod-dependencies ${{ steps.bird_bench_setup.outputs.spicepod_dependency }}"
+          else
+            echo "Error: No valid queryset input provided"
+            exit 1
           fi
+
           testoperator run text-to-sql \
             --ready-wait 1800 \
             $QUERYSET_ARG \
+            $SPICEPOD_DEPENDENCY \
+            -d /opt/spiced/data \
             --model ${{ github.event.inputs.model_name }} \
             -p "${{ github.event.inputs.spicepod_path }}"
         env:

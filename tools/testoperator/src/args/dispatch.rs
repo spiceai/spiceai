@@ -277,10 +277,48 @@ pub struct TextToSqlArgs {
     pub spicepod_path: PathBuf,
     pub runner_type: RunnerType,
     pub model_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub queryset_file: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub queryset: Option<String>,
+
+    #[serde(flatten)]
+    pub queryset_source: QuerysetSource,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
+pub enum QuerysetSource {
+    Benchmark {
+        benchmark_queryset: BenchmarkQueryset,
+    },
+    File {
+        queryset_file: PathBuf,
+    },
+    Payload {
+        queryset: String,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum BenchmarkQueryset {
+    #[serde(rename = "bird-bench-small[california_schools]")]
+    BirdBenchSmallCaliforniaSchools,
+    #[serde(rename = "bird-bench-small[card_games]")]
+    BirdBenchSmallCardGames,
+    #[serde(rename = "bird-bench-small[community]")]
+    BirdBenchSmallCommunity,
+    #[serde(rename = "bird-bench-small[debit_card_specializing]")]
+    BirdBenchSmallDebitCardSpecializing,
+    #[serde(rename = "bird-bench-small[european_football2]")]
+    BirdBenchSmallEuropeanFootball2,
+    #[serde(rename = "bird-bench-small[financial]")]
+    BirdBenchSmallFinancial,
+    #[serde(rename = "bird-bench-small[formula1]")]
+    BirdBenchSmallFormula1,
+    #[serde(rename = "bird-bench-small[superhero]")]
+    BirdBenchSmallSuperhero,
+    #[serde(rename = "bird-bench-small[thrombosis_prediction]")]
+    BirdBenchSmallThrombosisPrediction,
+    #[serde(rename = "bird-bench-small[toxicology]")]
+    BirdBenchSmallToxicology,
 }
 
 /// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects
