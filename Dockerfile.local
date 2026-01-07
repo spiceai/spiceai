@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
+    && apt-get install --yes --no-install-recommends ca-certificates libssl3 tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY .spiced-local-tmp /usr/local/bin/spiced
