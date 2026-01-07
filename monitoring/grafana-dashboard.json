@@ -70,7 +70,7 @@
       }
     ]
   },
-  "description": "Comprehensive monitoring dashboard for Spice.ai runtime - covers system health, query performance, data acceleration, caching, AI/ML operations, and Flight protocol metrics.",
+  "description": "Monitoring dashboard for Spice.ai runtime - covers system health, query performance, data acceleration, caching, AI/ML operations, and Flight protocol metrics.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
