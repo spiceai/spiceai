@@ -1,6 +1,6 @@
 {
   "title": "Spice.ai Dashboard",
-  "description": "Comprehensive monitoring dashboard for Spice.ai runtime - covers system health, query performance, data acceleration, caching, AI/ML operations, and Flight protocol metrics.",
+  "description": "Monitoring dashboard for Spice.ai runtime - covers system health, query performance, data acceleration, caching, AI/ML operations, and Flight protocol metrics.",
   "widgets": [
     {
       "id": 1,
@@ -28,7 +28,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:dataset_active_count{$instance}",
+                      "query": "sum:dataset_active_count{$service.instance.id}",
                       "aggregator": "last"
                     }
                   ],
@@ -63,7 +63,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:model_active_count{$instance}",
+                      "query": "sum:model_active_count{$service.instance.id}",
                       "aggregator": "last"
                     }
                   ],
@@ -98,7 +98,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:embeddings_active_count{$instance}",
+                      "query": "sum:embeddings_active_count{$service.instance.id}",
                       "aggregator": "last"
                     }
                   ],
@@ -133,7 +133,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:tool_active_count{$instance}",
+                      "query": "sum:tool_active_count{$service.instance.id}",
                       "aggregator": "last"
                     }
                   ],
@@ -180,6 +180,7 @@
                 "max",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -198,7 +199,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:query_duration_ms{$instance} by {protocol}"
+                      "query": "p99:query_duration_ms{$service.instance.id} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -298,7 +299,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:query_active_count{$instance} by {protocol}"
+                      "query": "sum:query_active_count{$service.instance.id} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -346,7 +347,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:query_failures{$instance} by {err_code}.as_count()"
+                      "query": "sum:query_failures{$service.instance.id} by {err_code}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -382,6 +383,7 @@
                 "avg",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -394,7 +396,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:query_returned_rows{$instance} by {protocol}"
+                      "query": "p99:query_returned_rows{$service.instance.id} by {protocol}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -465,12 +467,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:query_processed_bytes{$instance}"
+                      "query": "sum:query_processed_bytes{$service.instance.id}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:query_returned_bytes{$instance}"
+                      "query": "sum:query_returned_bytes{$service.instance.id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -520,7 +522,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:query_spilled_bytes{$instance}.as_count()"
+                      "query": "sum:query_spilled_bytes{$service.instance.id}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -574,7 +576,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_acceleration.time_since_last_refresh_ms{$instance,!dataset:runtime.*} by {dataset}",
+                      "query": "avg:dataset_acceleration.time_since_last_refresh_ms{$service.instance.id,!dataset:runtime.*} by {dataset}",
                       "aggregator": "last"
                     }
                   ],
@@ -634,7 +636,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_acceleration_ingestion_lag_ms{$instance,!dataset:runtime.*} by {dataset}",
+                      "query": "avg:dataset_acceleration_ingestion_lag_ms{$service.instance.id,!dataset:runtime.*} by {dataset}",
                       "aggregator": "last"
                     }
                   ],
@@ -701,25 +703,26 @@
                 "max",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
                   "formulas": [
                     {
-                      "formula": "query1",
                       "number_format": {
                         "unit": {
                           "type": "canonical_unit",
                           "unit_name": "millisecond"
                         }
-                      }
+                      },
+                      "formula": "query1"
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_acceleration_refresh_duration_ms{$instance,!dataset:runtime.*} by {dataset}"
+                      "query": "p99:dataset_acceleration_refresh_duration_ms{$service.instance.id,!dataset:runtime.*} by {dataset}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -767,7 +770,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:dataset_acceleration_refresh_errors{$instance} by {dataset}.as_count()"
+                      "query": "sum:dataset_acceleration_refresh_errors{$service.instance.id} by {dataset}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -821,7 +824,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_acceleration_refresh_lag_ms{$instance,!dataset:runtime.*} by {dataset}"
+                      "query": "avg:dataset_acceleration_refresh_lag_ms{$service.instance.id,!dataset:runtime.*} by {dataset}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -875,7 +878,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:results_cache_hit_ratio{$instance} by {service.instance.id}",
+                      "query": "avg:results_cache_hit_ratio{$service.instance.id} by {service.instance.id}",
                       "aggregator": "last"
                     }
                   ],
@@ -958,12 +961,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:results_cache_hits{$instance}.as_count()"
+                      "query": "sum:results_cache_hits{$service.instance.id}.as_count()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:results_cache_requests{$instance}.as_count()"
+                      "query": "sum:results_cache_requests{$service.instance.id}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1020,12 +1023,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:results_cache_size_bytes{$instance}"
+                      "query": "sum:results_cache_size_bytes{$service.instance.id}"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:results_cache_max_size_bytes{$instance}"
+                      "query": "sum:results_cache_max_size_bytes{$service.instance.id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1069,7 +1072,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:results_cache_items_count{$instance}"
+                      "query": "sum:results_cache_items_count{$service.instance.id}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1113,7 +1116,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:results_cache_evictions{$instance}.as_count()"
+                      "query": "sum:results_cache_evictions{$service.instance.id}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1157,7 +1160,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:results_cache_swr_background_query_count{$instance}.as_count()"
+                      "query": "sum:results_cache_swr_background_query_count{$service.instance.id}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1211,6 +1214,7 @@
                 "max",
                 "value"
               ],
+              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1223,7 +1227,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:http_requests_duration_ms{$instance} by {method,path}"
+                      "query": "p99:http_requests_duration_ms{$service.instance.id} by {method,path}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1271,7 +1275,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:http_requests{$instance} by {method,path,status}.as_count()"
+                      "query": "sum:http_requests{$service.instance.id} by {method,path,status}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1331,14 +1335,20 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:flight_request_duration_ms{$instance,method:do_get} by {command}"
+                      "query": "p99:flight_request_duration_ms{$service.instance.id,method:do_get} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1381,14 +1391,20 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:flight_request_duration_ms{$instance,method:do_put} by {command}"
+                      "query": "p99:flight_request_duration_ms{$service.instance.id,method:do_put} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1431,14 +1447,20 @@
                 {
                   "formulas": [
                     {
-                      "formula": "query1"
+                      "formula": "query1",
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      }
                     }
                   ],
                   "queries": [
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:flight_request_duration_ms{$instance,method:get_flight_info} by {command}"
+                      "query": "p99:flight_request_duration_ms{$service.instance.id,method:get_flight_info} by {command}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1486,7 +1508,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:flight_requests{$instance} by {method}.as_count()"
+                      "query": "sum:flight_requests{$service.instance.id} by {method}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1535,7 +1557,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:flight_do_exchange_data_updates_sent{$instance}.as_count()"
+                      "query": "sum:flight_do_exchange_data_updates_sent{$service.instance.id}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1600,7 +1622,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_kafka_records_lag{$instance} by {name}"
+                      "query": "avg:dataset_kafka_records_lag{$service.instance.id} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1648,7 +1670,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:dataset_kafka_records_consumed_total{$instance} by {name}"
+                      "query": "sum:dataset_kafka_records_consumed_total{$service.instance.id} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1714,7 +1736,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_dynamodb_lag_ms{$instance} by {name}"
+                      "query": "avg:dataset_dynamodb_lag_ms{$service.instance.id} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1763,7 +1785,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:dataset_dynamodb_records_consumed_total{$instance} by {name}"
+                      "query": "sum:dataset_dynamodb_records_consumed_total{$service.instance.id} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1812,7 +1834,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "avg:dataset_dynamodb_shards_active{$instance} by {name}"
+                      "query": "avg:dataset_dynamodb_shards_active{$service.instance.id} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1861,7 +1883,7 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:dataset_dynamodb_errors_transient_total{$instance} by {name}"
+                      "query": "sum:dataset_dynamodb_errors_transient_total{$service.instance.id} by {name}"
                     }
                   ],
                   "response_format": "timeseries",
@@ -2123,15 +2145,13 @@
   ],
   "template_variables": [
     {
-      "name": "instance",
-      "prefix": "instance",
+      "name": "service.instance.id",
+      "prefix": "service.instance.id",
       "available_values": [],
       "default": "*"
     }
   ],
   "layout_type": "ordered",
   "notify_list": [],
-  "pause_auto_refresh": false,
   "reflow_type": "fixed",
-  "tags": []
 }
