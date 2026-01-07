@@ -577,7 +577,9 @@ impl QuerySet {
                     "tpcds_q76",
                 ]
             }
-            QuerySet::Clickbench | QuerySet::Scenario { .. } => vec![],
+            QuerySet::Clickbench | QuerySet::Scenario { .. } | QuerySet::ParameterizedSaffron => {
+                vec![]
+            }
         }
     }
 }
