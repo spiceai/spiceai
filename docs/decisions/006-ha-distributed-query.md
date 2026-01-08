@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft
+Accepted
 
 ## Context
 
@@ -19,7 +19,7 @@ Related decisions:
   a. allows executors to connect to schedulers.
   b. may or may not allow executors to connect to other executors.
   c. allows schedulers to connect to other schedulers.
-2. Orchestration system is responsible for maintaining minimum cluster requirements.
+2. Orchestration system is responsible for maintaining minimum host availability.
 3. Object store supports conditional writes.
 
 ## First-Principles
@@ -57,9 +57,9 @@ How schedulers and executors find each other and which side initiates and mainta
 * Service discovery via DNS/SRV or platform-native registry.
 * Bidirectional scheduler-executor connections with scheduler-initiated calls.
 
-### Cluster composition
+### Cluster topology
 
-The shape of the cluster and how schedulers and executors are arranged and shared across the cluster.
+The topology of the cluster and how schedulers and executors are arranged and shared across the cluster.
 
 * Multiple active schedulers with executors connected to all schedulers; executors may be shared.
 * Active/passive scheduler with failover.
@@ -78,8 +78,8 @@ Execution guarantees and where shuffle/intermediate data is stored during query 
 ## Decision
 
 * **Shared state and conflict resolution**
-  * Schedulers share state that is stored in object store.
-  * Job state is stored in shared state.
+  * Schedulers share state and that state is stored in object store.
+  * Job state is part of the shared state.
   * Object store conditional writes is the mechanism for distributed conflict resolution.
 * **Discovery and connectivity**
   * Scheduler discovery is via scheduler shared state registration.
