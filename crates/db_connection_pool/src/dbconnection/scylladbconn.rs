@@ -601,8 +601,7 @@ fn map_scylladb_type_to_arrow(type_str: &str) -> DataType {
         "timestamp" => DataType::Timestamp(TimeUnit::Millisecond, None),
         "time" => DataType::Timestamp(TimeUnit::Microsecond, None),
         // String-representable types and complex types
-        "ascii" | "text" | "varchar" | "uuid" | "timeuuid" | "inet" | "varint" | "duration" =>
-        {
+        "ascii" | "text" | "varchar" | "uuid" | "timeuuid" | "inet" | "varint" | "duration" => {
             DataType::Utf8
         }
         s if s.starts_with("list<")
