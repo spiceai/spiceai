@@ -1421,6 +1421,8 @@ impl CayenneAccelerator {
     ) -> Result<Arc<dyn TableProvider>> {
         use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
 
+        tracing::debug!("create_cayenne_table_provider: starting for table {table_name}");
+
         // Get metastore type and custom metadata directory if provided
         let (metadata_dir, metastore_type) = if let Some(acceleration) = source.acceleration() {
             let metadata_dir =
@@ -1534,6 +1536,7 @@ impl CayenneAccelerator {
                 )),
             });
         }
+        tracing::debug!("create_cayenne_table_provider: calling builder.create for {table_name}");
         let cayenne_table =
             builder
                 .create(table_options)
@@ -1542,6 +1545,7 @@ impl CayenneAccelerator {
                     source: Box::new(e),
                 })?;
 
+        tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
         Ok(Arc::new(cayenne_table))
     }
 }
@@ -1970,6 +1974,43 @@ impl DataAccelerator for CayenneAccelerator {
                 );
             }
 
+            // Extract primary_key and on_conflict from acceleration settings for partitioned tables
+            let (primary_keys, on_conflict) = if let Some(acceleration) = source.acceleration() {
+                let pk_vec = acceleration
+                    .primary_key
+                    .as_ref()
+                    .map(|pk| pk.iter().map(std::string::ToString::to_string).collect())
+                    .unwrap_or_default();
+
+                let on_conflict = acceleration
+                    .on_conflict
+                    .iter()
+                    .map(|(col_ref, behavior)| {
+                        let col =
+                            datafusion_table_providers::util::column_reference::ColumnReference::new(
+                                col_ref
+                                    .iter()
+                                    .map(std::string::ToString::to_string)
+                                    .collect(),
+                            );
+                        match behavior {
+                            crate::component::dataset::acceleration::OnConflictBehavior::Drop => {
+                                datafusion_table_providers::util::on_conflict::OnConflict::DoNothing(
+                                    col,
+                                )
+                            }
+                            crate::component::dataset::acceleration::OnConflictBehavior::Upsert(
+                                _options,
+                            ) => datafusion_table_providers::util::on_conflict::OnConflict::Upsert(col),
+                        }
+                    })
+                    .next();
+
+                (pk_vec, on_conflict)
+            } else {
+                (Vec::new(), None)
+            };
+
             let creator = Arc::new(CayennePartitionCreator::new(
                 table_name,
                 PathBuf::from(&dir_path),
@@ -1981,6 +2022,8 @@ impl DataAccelerator for CayenneAccelerator {
                 retention_filters,
                 vortex_config,
                 object_store_config,
+                primary_keys,
+                on_conflict,
             ));
 
             // Wrap the base table provider with partitioning logic
@@ -2037,6 +2080,8 @@ struct CayennePartitionCreator {
     retention_filters: Vec<Expr>,
     vortex_config: cayenne::metadata::VortexConfig,
     object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
+    primary_key: Vec<String>,
+    on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
 }
 
 impl std::fmt::Debug for CayennePartitionCreator {
@@ -2052,6 +2097,8 @@ impl std::fmt::Debug for CayennePartitionCreator {
             .field("retention_filters", &self.retention_filters.len())
             .field("vortex_config", &"<VortexConfig>")
             .field("object_store_config", &self.object_store_config.is_some())
+            .field("primary_key", &self.primary_key)
+            .field("on_conflict", &self.on_conflict.is_some())
             .finish()
     }
 }
@@ -2069,6 +2116,8 @@ impl CayennePartitionCreator {
         retention_filters: Vec<Expr>,
         vortex_config: cayenne::metadata::VortexConfig,
         object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
+        primary_key: Vec<String>,
+        on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
     ) -> Self {
         Self {
             table_name,
@@ -2081,6 +2130,8 @@ impl CayennePartitionCreator {
             retention_filters,
             vortex_config,
             object_store_config,
+            primary_key,
+            on_conflict,
         }
     }
 
@@ -2151,8 +2202,8 @@ impl PartitionCreator for CayennePartitionCreator {
         let table_options = cayenne::metadata::CreateTableOptions {
             table_name: self.partition_table_name(&partition_value_str),
             schema: Arc::clone(&self.schema),
-            primary_key: vec![],
-            on_conflict: None,
+            primary_key: self.primary_key.clone(),
+            on_conflict: self.on_conflict.clone(),
             base_path: partition_path.clone(),
             partition_column: None, // Partitions themselves are not partitioned
             vortex_config: self.vortex_config.clone(),

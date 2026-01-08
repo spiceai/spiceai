@@ -227,6 +227,9 @@ pub struct AcceleratedTable {
     refresh_mode: RefreshMode,
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
+    /// If true, writes only go to the accelerator table (not replicated to source).
+    /// This is set when `on_conflict` is configured - the accelerator handles writes locally.
+    write_to_accelerator_only: bool,
     synchronized_with: Option<SynchronizedTable>,
     /// Child accelerators that should receive cached data when this parent stores new cache entries (caching mode only)
     synchronized_children: Arc<RwLock<Vec<Arc<dyn TableProvider>>>>,
@@ -275,6 +278,7 @@ fn validate_refresh_data_window(
     }
 }
 
+#[expect(clippy::struct_excessive_bools)]
 pub struct Builder {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
@@ -290,6 +294,7 @@ pub struct Builder {
     changes_stream: Option<ChangesStream>,
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
+    write_to_accelerator_only: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
@@ -334,6 +339,7 @@ impl Builder {
             checkpointer: None,
             synchronize_with: None,
             disable_federation: false,
+            write_to_accelerator_only: false,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_behavior: SnapshotBehavior::default(),
@@ -377,6 +383,13 @@ impl Builder {
 
     pub fn disable_federation(&mut self) -> &mut Self {
         self.disable_federation = true;
+        self
+    }
+
+    /// Set to only write to the accelerator (not replicate to federated source).
+    /// This is used when `on_conflict` is configured - writes go only to the accelerator.
+    pub fn write_to_accelerator_only(&mut self) -> &mut Self {
+        self.write_to_accelerator_only = true;
         self
     }
 
@@ -733,6 +746,7 @@ impl Builder {
             refresh_mode,
             refresher,
             disable_federation: self.disable_federation,
+            write_to_accelerator_only: self.write_to_accelerator_only,
             synchronized_with: self.synchronize_with,
             synchronized_children: Arc::new(RwLock::new(Vec::new())),
             cache_ttl: self.caching_ttl,
@@ -1013,6 +1027,17 @@ impl TableProvider for AcceleratedTable {
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // When on_conflict is configured, writes go only to the accelerator
+        // (the federated source may not support writes, e.g., file connector).
+        if self.write_to_accelerator_only {
+            let accelerated_insert_plan = self
+                .accelerator
+                .insert_into(state, input, overwrite)
+                .await?;
+            self.refresher().set_initial_load_completed(true);
+            return Ok(accelerated_insert_plan);
+        }
+
         // Duplicate the input into two streams
         let tee_input: Arc<dyn ExecutionPlan> = Arc::new(TeeExec::new(input, 2));
 
