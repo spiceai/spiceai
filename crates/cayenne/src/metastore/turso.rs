@@ -110,6 +110,7 @@ impl TursoMetastore {
             path_is_relative BOOLEAN NOT NULL,
             schema_json TEXT NOT NULL,
             primary_key_json TEXT,
+            on_conflict_json TEXT,
             current_snapshot_id TEXT NOT NULL DEFAULT '',
             partition_column TEXT,
             vortex_config_json TEXT,
@@ -311,6 +312,15 @@ impl MetastoreBackend for TursoMetastore {
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to initialize schema: {e}"),
             })?;
+
+        // Attempt to backfill newly added columns for existing deployments. Errors are ignored
+        // because the column may already exist (libSQL doesn't support IF NOT EXISTS for ALTER).
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_table ADD COLUMN on_conflict_json TEXT",
+                (),
+            )
+            .await;
 
         Ok(())
     }

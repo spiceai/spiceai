@@ -15,21 +15,77 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v1.1x (H1 2026)
+### v1.11 (Jan 2026)
 
-**Focus:** Extensibility.
+**Focus:** Distributed Query Foundation.
 
-- **Resource Management**: Finer-grained runtime-wide control for optimized performance.
-- **Extensible Middleware**:
-  - Pluggable extensions for dynamic customization.
+- **Spice Cayenne (Beta)**: High-performance columnar storage format for accelerated datasets.
+- **Distributed Query (Beta)**: Multi-node query execution with Apache Ballista integration.
+- **Active-Active HA (Preview)**: Multi-node active-active deployment with automatic failover.
 
-### v2.0 (H2 2026)
+### v1.12 (Feb 2026)
+
+**Focus:** Distributed Query & Search Maturity.
+
+- **Spice Cayenne (RC)**: High-performance columnar storage format for accelerated datasets.
+- **Distributed Query (RC)**: Multi-node query execution with Apache Ballista integration.
+- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes.
+- **Accelerated Dataset Distribution**: Replicate accelerated datasets across executor nodes.
+- **DataFusion**: Upgrade to v51.
+
+### v2.0 (March 2026)
+
+**Focus:** Production-Grade HA.
+
+- **Spice Cayenne (GA)**: Production-ready columnar storage format for accelerated datasets.
+- **Active-Active HA (GA)**: Production-ready multi-node deployment with zero-downtime failover.
+- **Distributed Query (GA)**: Stable multi-node query execution for large-scale workloads.
+- **Backup & Point-in-Time Recovery**: Snapshot restore for accelerated datasets.
+
+### v2.1 (H2 2026)
+
+**Focus:** Schema Management & Search.
+
+- **Schema Registry (Initial)**: Versioning and backward compatibility checks.
+- **Hybrid Search Ranking**: Configurable fusion strategies (Reciprocal Rank Fusion (RRF) weights, learned ranking).
+
+### v2.2 (H2 2026)
+
+**Focus:** Reactive Actions & Event Processing.
+
+- **Actions (Drasi-based)**: Reactive event-driven actions triggered by data changes.
+- **Webhooks & Event Notifications**: Push-based data change alerts for downstream consumers.
+
+### v2.3 (H2 2026)
+
+**Focus:** Enterprise Security & Compliance.
+
+- **Data Masking & Anonymization**: Dynamic PII redaction at query time.
+- **OIDC Token Verification**: Validate identity tokens from enterprise providers (Okta, Azure AD, etc.).
+
+### v2.4 (2027)
 
 **Focus:** Governance.
 
-- **Policy Engine**:
+- **Policy Engine (Cedar-based)**:
   - Role-based security for fine-grained access control.
   - Data access policies to enforce compliance and governance.
+- **Audit Logging**: Persistent, immutable query and access logs for compliance.
+- **Resource Quotas**: Per-user/tenant query limits and throttling.
+
+### v2.5 (2027)
+
+**Focus:** Extensibility & Plugin Architecture.
+
+- **Extensible Middleware**: Pluggable extensions for dynamic customization.
+- **Custom Tool Providers**: User-defined MCP tool implementations.
+
+### v2.6 (2027)
+
+**Focus:** Encryption.
+
+- **Customer-Managed Keys (BYOK)**: Encryption key management for sensitive workloads.
+- **Data-at-Rest Encryption**: Encrypted storage for accelerated datasets.
 
 ---
 
@@ -55,6 +111,17 @@ These are prioritized based on community demand and strategic alignment. Share y
 
 - **Vision Processing**: Support for image and video.
 - **Custom Model Integration**: Framework for user-defined ML models.
+- **Model Versioning & A/B Testing**: Canary deployments and version management for models.
+- **Hallucination Detection**: Fact-checking LLM responses against source data.
+
+### Search & Retrieval
+
+- **Faceted Search**: Aggregations, filters, and counts for enterprise search UX.
+
+### Data Platform
+
+- **Data Lineage**: Track data provenance and transformations across the pipeline.
+- **Schema Registry & Evolution**: Versioning and backward compatibility checks.
 
 ### Platform Enhancements
 

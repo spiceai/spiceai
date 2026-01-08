@@ -164,6 +164,9 @@ pub enum Error {
 
     #[snafu(display("Failed to create RecordBatch: {source}"))]
     FailedToBuildRecordBatch { source: ArrowError },
+
+    #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
+    NoPrimaryKeysDefined { dataset_name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

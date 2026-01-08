@@ -185,7 +185,7 @@ mod tests {
                     "spice.public.*".to_string(),
                     "spice.my_schema.my_table".to_string(),
                     r#"spice."My.Schema".*"#.to_string(),
-                    "spice.other_schema.*".to_string(),
+                    "other_schema.*".to_string(),
                     "*.my_schema.another_table".to_string(),
                 ])
                 .expect("Failed to create allowlist");

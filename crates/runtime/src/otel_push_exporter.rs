@@ -33,6 +33,7 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
+use futures::TryFutureExt;
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{
     metrics::{
@@ -102,7 +103,17 @@ impl PushMetricExporter for FilteringExporter {
         metrics: &mut ResourceMetrics,
     ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
         self.filter_metrics(metrics);
-        self.inner.export(metrics)
+        self.inner.export(metrics).inspect_err(|err| {
+            match err {
+                opentelemetry_sdk::error::OTelSdkError::InternalFailure(msg) => {
+                    tracing::warn!("Failed to export metrics: {msg}");
+                }
+                opentelemetry_sdk::error::OTelSdkError::Timeout(duration) => {
+                    tracing::warn!("Failed to export metrics: timed out after {duration:?}");
+                }
+                opentelemetry_sdk::error::OTelSdkError::AlreadyShutdown => (), // No logging needed
+            }
+        })
     }
 
     fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
