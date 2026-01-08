@@ -1,0 +1,10 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+assertion_line: 742
+description: "Query: tpch_q21"
+---
++--------------------+---------+
+| s_name             | numwait |
++--------------------+---------+
+| Supplier#000000074 | 9       |
++--------------------+---------+

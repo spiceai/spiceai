@@ -6,11 +6,9 @@ name: scylladb-federated
 definitions:
   # Common ScyllaDB parameters
   - &scylladb_params
-    scylladb_host: ${env:SCYLLADB_HOST}
-    scylladb_port: ${env:SCYLLADB_PORT:9042}
-    scylladb_keyspace: ${env:SCYLLADB_KEYSPACE:tpch_sf1}
-    scylladb_user: ${env:SCYLLADB_USER}
-    scylladb_pass: ${env:SCYLLADB_PASSWORD}
+    scylladb_host: ${ env:SCYLLADB_HOST }
+    scylladb_port: ${ env:SCYLLADB_PORT }
+    scylladb_keyspace: ${ env:SCYLLADB_KEYSPACE }
 
 datasets:
   - from: scylladb:customer

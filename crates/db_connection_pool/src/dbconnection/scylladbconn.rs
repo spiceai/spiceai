@@ -419,6 +419,15 @@ fn convert_cqlvalue_rows_to_record_batch(
                     if let Some(Some(value)) = row.get(col_idx) {
                         if let Some(v) = value.as_double() {
                             builder.append_value(v);
+                        } else if let CqlValue::Decimal(decimal) = value {
+                            // Convert CqlDecimal to f64
+                            // CqlDecimal stores: int_val (big-endian two's complement) / 10^scale
+                            let (bytes, scale) = decimal.as_signed_be_bytes_slice_and_exponent();
+                            if let Some(f) = cql_decimal_to_f64(bytes, scale) {
+                                builder.append_value(f);
+                            } else {
+                                builder.append_null();
+                            }
                         } else {
                             builder.append_null();
                         }
@@ -541,6 +550,39 @@ fn convert_cqlvalue_rows_to_record_batch(
     })
 }
 
+/// Convert CQL decimal bytes (two's complement big-endian) with scale to f64.
+///
+/// CqlDecimal represents: int_val / 10^scale
+/// where int_val is stored as two's complement big-endian bytes.
+fn cql_decimal_to_f64(bytes: &[u8], scale: i32) -> Option<f64> {
+    if bytes.is_empty() {
+        return Some(0.0);
+    }
+
+    // Parse two's complement big-endian bytes to i128
+    // Check if negative (high bit set)
+    let is_negative = (bytes[0] & 0x80) != 0;
+
+    // Convert to i128 with sign extension
+    let mut value: i128 = if is_negative { -1 } else { 0 };
+
+    for &byte in bytes {
+        value = (value << 8) | i128::from(byte);
+    }
+
+    // Convert to f64 and apply scale
+    let float_value = value as f64;
+
+    // Apply scale: result = int_val / 10^scale
+    if scale > 0 {
+        Some(float_value / 10_f64.powi(scale))
+    } else if scale < 0 {
+        Some(float_value * 10_f64.powi(-scale))
+    } else {
+        Some(float_value)
+    }
+}
+
 /// Map CQL type string (from system_schema.columns) to Arrow DataType.
 fn map_scylladb_type_to_arrow(type_str: &str) -> DataType {
     let type_lower = type_str.to_lowercase();
@@ -552,13 +594,17 @@ fn map_scylladb_type_to_arrow(type_str: &str) -> DataType {
         "bigint" | "counter" => DataType::Int64,
         "float" => DataType::Float32,
         "double" => DataType::Float64,
+        // CQL decimal is an arbitrary-precision decimal; use Float64 for compatibility
+        "decimal" => DataType::Float64,
         "blob" => DataType::Binary,
         "date" => DataType::Date32,
         "timestamp" => DataType::Timestamp(TimeUnit::Millisecond, None),
         "time" => DataType::Timestamp(TimeUnit::Microsecond, None),
         // String-representable types and complex types
-        "ascii" | "text" | "varchar" | "uuid" | "timeuuid" | "inet" | "varint" | "decimal"
-        | "duration" => DataType::Utf8,
+        "ascii" | "text" | "varchar" | "uuid" | "timeuuid" | "inet" | "varint" | "duration" =>
+        {
+            DataType::Utf8
+        }
         s if s.starts_with("list<")
             || s.starts_with("set<")
             || s.starts_with("map<")
@@ -585,6 +631,8 @@ fn map_cql_type_to_arrow(cql_type: &ColumnType<'_>) -> DataType {
             NativeType::BigInt | NativeType::Counter => DataType::Int64,
             NativeType::Float => DataType::Float32,
             NativeType::Double => DataType::Float64,
+            // CQL decimal is an arbitrary-precision decimal; use Float64 for compatibility
+            NativeType::Decimal => DataType::Float64,
             NativeType::Blob => DataType::Binary,
             NativeType::Date => DataType::Date32,
             NativeType::Timestamp => DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -596,7 +644,6 @@ fn map_cql_type_to_arrow(cql_type: &ColumnType<'_>) -> DataType {
             | NativeType::Timeuuid
             | NativeType::Inet
             | NativeType::Varint
-            | NativeType::Decimal
             | NativeType::Duration => DataType::Utf8,
             // Catch any future native types
             _ => DataType::Utf8,
@@ -661,9 +708,9 @@ mod tests {
         // Network type
         assert_eq!(map_scylladb_type_to_arrow("inet"), DataType::Utf8);
 
-        // Complex numeric types (as string)
+        // Complex numeric types
         assert_eq!(map_scylladb_type_to_arrow("varint"), DataType::Utf8);
-        assert_eq!(map_scylladb_type_to_arrow("decimal"), DataType::Utf8);
+        assert_eq!(map_scylladb_type_to_arrow("decimal"), DataType::Float64);
         assert_eq!(map_scylladb_type_to_arrow("duration"), DataType::Utf8);
     }
 
@@ -1180,7 +1227,7 @@ mod tests {
         );
         assert_eq!(
             map_cql_type_to_arrow(&ColumnType::Native(NativeType::Decimal)),
-            DataType::Utf8
+            DataType::Float64
         );
         assert_eq!(
             map_cql_type_to_arrow(&ColumnType::Native(NativeType::Duration)),

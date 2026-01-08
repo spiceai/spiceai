@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q20"
+---
++--------------------+--------------------------------+
+| s_name             | s_address                      |
++--------------------+--------------------------------+
+| Supplier#000000013 | HK71HQyWoqRWOX8GI FpgAifW,2PoH |
++--------------------+--------------------------------+
