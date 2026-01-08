@@ -190,7 +190,7 @@ async fn retry_query_expecting_results(
                         true
                     }
                 }
-                Err(e) => false,
+                Err(_) => false,
             }
         }
     })

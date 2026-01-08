@@ -138,8 +138,8 @@ impl SpiceTest<Completed> {
 
     pub fn get_run_metrics(&self) -> Result<TextToSqlRunMetric> {
         Ok(TextToSqlRunMetric::new(
-            self.get_p95_response_time_metric()?,
-            self.get_median_response_time_metric()?,
+            self.get_p95_response_time_metric(),
+            self.get_median_response_time_metric(),
             self.get_average_attempts_metric(),
             self.get_exact_match_count(),
             self.get_error_rate(),
@@ -211,26 +211,30 @@ impl SpiceTest<Completed> {
         self.mean(|result| result.is_error)
     }
 
-    fn get_p95_response_time_metric(&self) -> Result<f64> {
-        Ok(1000.0 * self.percentile(|result| result.duration.as_secs_f32(), 95.0))
+    fn get_p95_response_time_metric(&self) -> f64 {
+        1000.0 * self.percentile(|result| result.duration.as_secs_f32(), 95.0)
     }
 
-    fn get_median_response_time_metric(&self) -> Result<f64> {
-        Ok(1000.0 * self.percentile(|result| result.duration.as_secs_f32(), 50.0))
+    fn get_median_response_time_metric(&self) -> f64 {
+        1000.0 * self.percentile(|result| result.duration.as_secs_f32(), 50.0)
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn get_average_attempts_metric(&self) -> f64 {
         self.mean(|result| result.query_count as f64)
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn get_mean_sql_query_count(&self) -> f64 {
         self.mean(|result| result.query_count as f64)
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn get_mean_llm_input_tokens(&self) -> f64 {
         self.mean(|result| result.llm_input_tokens as f64)
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn get_mean_llm_output_tokens(&self) -> f64 {
         self.mean(|result| result.llm_output_tokens as f64)
     }
