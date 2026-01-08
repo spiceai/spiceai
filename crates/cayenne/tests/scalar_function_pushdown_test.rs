@@ -72,8 +72,7 @@ async fn test_scalar_function_in_order_by_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table =
-        CayenneTableProvider::create_table(Arc::clone(catalog), table_options).await?;
+    let table = CayenneTableProvider::create_table(Arc::clone(catalog), table_options).await?;
     println!("✓ Table created");
 
     // Register with DataFusion context
@@ -139,10 +138,7 @@ async fn test_scalar_function_in_order_by_impl(
         .await?;
     let results = df.collect().await?;
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    assert!(
-        total_rows <= 5,
-        "Expected at most 5 rows with length > 5"
-    );
+    assert!(total_rows <= 5, "Expected at most 5 rows with length > 5");
     println!("✓ Scalar functions in WHERE and ORDER BY work correctly ({total_rows} rows)");
 
     // Test 4: Direct timestamp ordering (should work via native Vortex support)
