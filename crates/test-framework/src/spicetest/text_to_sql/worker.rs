@@ -132,12 +132,21 @@ impl TextToSqlWorker {
 
             for (index, request) in self.config.requests.into_iter().enumerate() {
                 let start = Instant::now();
-                let is_error =
-                    !nsql_request_ok(&self.http_client, &self.http_base_url, &request).await;
+                let mut is_error = false;
+                let mut generated_sql: Option<String> = None;
+                match nsql_request(&self.http_client, &self.http_base_url, &request).await {
+                    Ok(sql) if request.return_sql => {
+                        generated_sql = Some(sql);
+                    }
+                    Ok(_) => {} // NSQL returned data. Must get SQL from task_history
+                    Err(_) => {
+                        is_error = true;
+                    }
+                }
 
                 let duration = start.elapsed();
 
-                let (generated_sql, task_metrics) = find_task_history_metrics(&self.spice_client)
+                let (sql, task_metrics) = find_task_history_metrics(&self.spice_client)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("could not find task history metrics. Error: {e}")
@@ -146,7 +155,7 @@ impl TextToSqlWorker {
                 results.insert(
                     request.id.clone(),
                     TextToSqlResult {
-                        generated_sql,
+                        generated_sql: generated_sql.or(sql).unwrap_or_default(),
                         expected_sql: request.expected_sql,
                         duration,
                         is_error,
@@ -179,8 +188,12 @@ impl TextToSqlWorker {
     }
 }
 
-/// Runs a text to SQL HTTP operation. Returns whether it completed successfully.
-async fn nsql_request_ok(client: &Client, http_base_url: &str, req: &TextToSqlRequest) -> bool {
+/// Runs a text to SQL HTTP operation. Returns the generated SQL or generated data (based on [`TextToSqlRequest::return_sql`]).
+async fn nsql_request(
+    client: &Client,
+    http_base_url: &str,
+    req: &TextToSqlRequest,
+) -> Result<String, reqwest::Error> {
     let body = json!({
         "query": req.question,
         "model": req.model,
@@ -193,15 +206,13 @@ async fn nsql_request_ok(client: &Client, http_base_url: &str, req: &TextToSqlRe
         "application/json"
     };
 
-    match client
+    client
         .post(format!("{http_base_url}/v1/nsql"))
         .header("Content-Type", "application/json")
         .header("Accept", accept_header)
         .body(body.to_string())
         .send()
+        .await?
+        .text()
         .await
-    {
-        Err(_) => false,
-        Ok(r) => r.text().await.is_err(),
-    }
 }

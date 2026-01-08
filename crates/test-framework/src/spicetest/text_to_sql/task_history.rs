@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::utils::wait_until_true;
 use std::{sync::Arc, time::Duration};
+use tokio::time::sleep;
 
 use anyhow::Result;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -36,7 +38,7 @@ pub(crate) struct TaskHistoryMetrics {
 /// Returns: `(sql_count, generated_sql, task_history_metrics)`
 pub(super) async fn find_task_history_metrics(
     spice_client: &spiceai::Client,
-) -> Result<(String, TaskHistoryMetrics)> {
+) -> Result<(Option<String>, TaskHistoryMetrics)> {
     let data = retry_query_expecting_results(
         spice_client,
         "
@@ -50,7 +52,7 @@ WITH latest_nsql AS (
 sql_stats AS (
     SELECT
         COUNT(*) AS sql_count,
-        SUM(execution_duration_ms) AS sql_duration_ms
+        COALESCE(SUM(execution_duration_ms), 0) AS sql_duration_ms
     FROM runtime.task_history
     WHERE trace_id = (SELECT trace_id FROM latest_nsql)
       AND task = 'sql_query'
@@ -66,7 +68,7 @@ llm_stats AS (
       AND task = 'ai_completion'
 ),
 last_sql AS (
-    SELECT input AS generated_sql
+    SELECT COALESCE(input, '')  AS generated_sql
     FROM runtime.task_history
     WHERE trace_id = (SELECT trace_id FROM latest_nsql)
       AND task = 'sql_query'
@@ -83,9 +85,9 @@ SELECT
     COALESCE(ls.generated_sql, '') AS generated_sql
 FROM sql_stats s
 CROSS JOIN llm_stats l
-CROSS JOIN last_sql ls
+LEFT JOIN last_sql ls ON 1=1
 ",
-        Duration::from_secs(30),
+        Duration::from_secs(10),
     )
     .await;
 
@@ -146,8 +148,7 @@ CROSS JOIN last_sql ls
     let generated_sql = rb
         .column_by_name("generated_sql")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .map(|a| a.value(0).to_string())
-        .unwrap_or_default();
+        .map(|a| a.value(0).to_string());
 
     Ok((
         generated_sql,
@@ -167,9 +168,6 @@ async fn retry_query_expecting_results(
     query: &str,
     wait_for: Duration,
 ) -> Option<Vec<RecordBatch>> {
-    use crate::utils::wait_until_true;
-    use tokio::time::sleep;
-
     let query = query.to_string();
     let data = Arc::new(tokio::sync::Mutex::new(None));
 
@@ -180,19 +178,19 @@ async fn retry_query_expecting_results(
         async move {
             match spice_client.query(&query).await {
                 Ok(stream) => {
-                    let rb_opt = stream.try_collect::<Vec<RecordBatch>>().await.ok();
-                    let no_data = rb_opt
-                        .as_ref()
-                        .is_none_or(|z| z.first().is_none_or(|rb| rb.num_rows() == 0));
-                    if no_data {
+                    let Some(rbs) = stream.try_collect::<Vec<RecordBatch>>().await.ok() else {
+                        sleep(Duration::from_secs(1)).await;
+                        return false;
+                    };
+                    if rbs.first().is_none_or(|rb| rb.num_rows() == 0) {
                         sleep(Duration::from_secs(1)).await;
                         false
                     } else {
-                        *data.lock().await = rb_opt;
+                        *data.lock().await = Some(rbs);
                         true
                     }
                 }
-                Err(_) => false,
+                Err(e) => false,
             }
         }
     })
