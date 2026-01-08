@@ -166,7 +166,7 @@ runs:
       shell: bash
       run: |
         mkdir -p /c/usr/local/bin
-        copy target/release/testoperator.exe /c/usr/local/bin/testoperator.exe
+        cp target/release/testoperator.exe /c/usr/local/bin/testoperator.exe
         chmod +x /c/usr/local/bin/testoperator.exe
 
     - name: Set output path
@@ -185,7 +185,7 @@ runs:
 
     - name: Upload testoperator artifact
       if: inputs.upload_artifact == 'true'
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
       with:
         name: testoperator-${{ steps.detect-os.outputs.os }}
         path: target/release/testoperator${{ steps.detect-os.outputs.ext }}
