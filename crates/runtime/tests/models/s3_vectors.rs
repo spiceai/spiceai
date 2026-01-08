@@ -780,6 +780,12 @@ pub(crate) mod search {
         let _tracing: tracing::subscriber::DefaultGuard =
             crate::init_tracing(DEFAULT_TRACING_MODELS);
 
+        // Skip test if Docker is not available (e.g., on macOS CI runners without Docker)
+        if !crate::docker::is_docker_available().await {
+            tracing::info!("Docker is not available, skipping s3_vectors_kafka_stream test");
+            return Ok(());
+        }
+
         test_request_context()
             .scope(async {
                 let (running_container, producer) =
