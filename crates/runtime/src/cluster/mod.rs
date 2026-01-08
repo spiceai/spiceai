@@ -71,9 +71,11 @@ type SchedulerEndpointOverride =
 pub mod datafusion;
 mod servers;
 mod service;
+mod scheduler_registry;
 
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::ClusterServiceImpl;
+pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 
 /// mTLS configuration for cluster communications.
 ///
