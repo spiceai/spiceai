@@ -27,7 +27,7 @@ mod common;
 use arrow::array::TimestampSecondArray;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use cayenne::metadata::CreateTableOptions;
-use cayenne::CayenneTableProvider;
+use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::prelude::*;
 use std::sync::Arc;
 
@@ -45,7 +45,8 @@ test_with_backends!(test_scalar_function_in_order_by_impl);
 async fn test_scalar_function_in_order_by_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let catalog = &fixture.catalog;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let data_path = &fixture.data_path;
     let backend_name = fixture.backend_type.name();
 
@@ -72,7 +73,7 @@ async fn test_scalar_function_in_order_by_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = CayenneTableProvider::create_table(Arc::clone(catalog), table_options).await?;
+    let table = CayenneTableProvider::create_table(catalog, table_options).await?;
     println!("✓ Table created");
 
     // Register with DataFusion context
