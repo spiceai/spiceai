@@ -7,7 +7,6 @@
 import csv
 import os
 from cassandra.cluster import Cluster
-from cassandra.query import BatchStatement, SimpleStatement
 from datetime import datetime
 
 # ScyllaDB connection
