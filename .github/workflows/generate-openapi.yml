@@ -42,6 +42,14 @@ jobs:
         if: steps.check_pr.outputs.skip != 'true'
         run: rustup toolchain install stable --profile minimal
 
+      - name: Set up make
+        if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'
+        uses: ./.github/actions/setup-cc
+
       - name: Build Cargo project
         if: steps.check_pr.outputs.skip != 'true'
         run: cargo build --manifest-path tools/spiceschema/Cargo.toml
