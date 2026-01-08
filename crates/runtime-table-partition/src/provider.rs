@@ -371,8 +371,9 @@ impl DeletionSink for PartitionedDeletionSink {
             // Try to downcast the partition's table provider to DeletionTableProvider
             // The partition's table provider might be a CayenneTableProvider or similar
             // that implements DeletionTableProvider
-            let deletion_provider =
-                data_components::delete::get_deletion_provider(Arc::clone(&partition.table_provider));
+            let deletion_provider = data_components::delete::get_deletion_provider(Arc::clone(
+                &partition.table_provider,
+            ));
 
             if let Some(deletion_provider) = deletion_provider {
                 // Create a simple session state for executing the deletion
