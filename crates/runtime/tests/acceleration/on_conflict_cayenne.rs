@@ -43,8 +43,8 @@ use crate::utils::{runtime_ready_check, test_request_context};
 /// Verifies that when a row with the same primary key is inserted,
 /// the existing row is updated with the new values.
 ///
-/// This test creates a Cayenne table directly using the CayenneTableProvider API
-/// to test on_conflict behavior without going through the file connector refresh path.
+/// This test creates a Cayenne table directly using the `CayenneTableProvider` API
+/// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
 async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
@@ -169,8 +169,8 @@ async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
 /// Verifies that when a row with the same primary key is inserted,
 /// the new row is dropped and the existing row is preserved.
 ///
-/// This test creates a Cayenne table directly using the CayenneTableProvider API
-/// to test on_conflict behavior without going through the file connector refresh path.
+/// This test creates a Cayenne table directly using the `CayenneTableProvider` API
+/// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
 async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
@@ -666,8 +666,8 @@ async fn test_cayenne_partitioned_primary_key() -> Result<(), anyhow::Error> {
 /// Verifies that partitioned Cayenne tables correctly handle upsert behavior
 /// when inserting rows with duplicate primary keys within a partition.
 ///
-/// This test creates a partitioned Cayenne table directly using the CayenneTableProvider API
-/// to test on_conflict behavior without going through the file connector refresh path.
+/// This test creates a partitioned Cayenne table directly using the `CayenneTableProvider` API
+/// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
 async fn test_cayenne_partitioned_on_conflict_upsert() -> Result<(), anyhow::Error> {
@@ -788,8 +788,8 @@ async fn test_cayenne_partitioned_on_conflict_upsert() -> Result<(), anyhow::Err
 /// Verifies that Cayenne correctly handles composite (multi-column) primary keys
 /// for upsert and deletion operations.
 ///
-/// This test creates a Cayenne table directly using the CayenneTableProvider API
-/// to test on_conflict behavior without going through the file connector refresh path.
+/// This test creates a Cayenne table directly using the `CayenneTableProvider` API
+/// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
 async fn test_cayenne_composite_primary_key() -> Result<(), anyhow::Error> {
@@ -931,7 +931,7 @@ async fn test_cayenne_composite_primary_key() -> Result<(), anyhow::Error> {
 /// Cayenne defaults to drop behavior - new rows with duplicate keys are dropped
 /// and the original row is preserved.
 ///
-/// This test creates a Cayenne table directly using the CayenneTableProvider API
+/// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test primary key behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
@@ -1044,8 +1044,8 @@ async fn test_cayenne_primary_key_no_on_conflict() -> Result<(), anyhow::Error> 
         .await
 }
 
-/// Integration test to verify on_conflict works through the runtime loading path
-/// This test uses the full runtime to load a dataset with on_conflict configuration
+/// Integration test to verify `on_conflict` works through the runtime loading path
+/// This test uses the full runtime to load a dataset with `on_conflict` configuration
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[cfg(not(target_os = "windows"))]
 async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Error> {
