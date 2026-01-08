@@ -63,7 +63,7 @@ env:
 
 jobs:
   build:
-    name: Build Test Binary
+    name: Build Test Binary (macOS)
     runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -157,7 +157,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   test-ai-udf:
-    name: Test AI UDF
+    name: Test AI UDFs
     needs: build
     runs-on: 'spiceai-macos'
     steps:
@@ -246,7 +246,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   test-hf:
-    name: Test Huggingface Models
+    name: Test Hugging Face Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
     runs-on: 'spiceai-macos'
@@ -422,6 +422,9 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
 
       - name: Install Nextest
         run: |
