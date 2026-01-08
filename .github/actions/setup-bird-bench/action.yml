@@ -1,0 +1,76 @@
+name: Setup Bird-Bench Data
+description: Download bird-bench data and prepare queryset/spicepods
+inputs:
+  data_directory:
+    description: path to load data and spicepods into
+    required: true
+    type: string
+  queryset_name:
+    description: name of the queryset to load
+    required: true
+    type: string
+
+outputs:
+  spicepod_dependency:
+    description: 'Path to the spicepod dependency'
+    value: ${{ steps.configure_bird_bench.outputs.spicepod_dependency }}
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare file-based data directory
+      shell: bash
+      run: |
+        sudo rm -rf "${{ inputs.data_directory }}"
+        sudo mkdir -p "${{ inputs.data_directory }}"
+        sudo chown runner:runner -R "${{ inputs.data_directory }}"
+    # actions/checkout should not be used with composite actions. Would reset workspace/github repo state.
+    - name: Clone bird-bench repo (no checkout action)
+      shell: bash
+      run: |
+        set -euxo pipefail
+
+        git clone \
+          --depth 1 \
+          --filter=blob:none \
+          --sparse \
+          https://github.com/spiceai/spice-bird-bench.git bird-bench
+
+        cd bird-bench
+        git sparse-checkout set dev_20240627
+
+    - name: Configure Bird-Bench Data
+      id: configure_bird_bench
+      shell: bash
+      run: |
+        set -euxo pipefail
+
+        BIRD_BENCH_DIR="$GITHUB_WORKSPACE/bird-bench/dev_20240627"
+        # Parse `bird-bench-small[<dataset>]` -> `<dataset>`
+        BIRD_BENCH_DATASET="${{ inputs.queryset_name }}"
+        BIRD_BENCH_DATASET="${BIRD_BENCH_DATASET#bird-bench-small[}"
+        BIRD_BENCH_DATASET="${BIRD_BENCH_DATASET%]}"
+
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+        sudo mkdir -p /opt/spiced/data
+        sudo chown runner:runner /opt/spiced/data
+
+        jq -c --arg db "$BIRD_BENCH_DATASET" \
+          '.[] | select(.db_id == $db) | { sql: .SQL, question: .question }' "$BIRD_BENCH_DIR/dev.json" \
+          > /opt/spiced/data/queryset.json
+
+        mv "$BIRD_BENCH_DIR" "${{ inputs.data_directory }}"
+
+        DATASET_SPICEPOD="${{ inputs.data_directory }}dev_20240627/spicepods/$BIRD_BENCH_DATASET/spicepod.yaml"
+        if [ ! -f "$DATASET_SPICEPOD" ]; then
+          echo "Error: Spicepod file not found at $DATASET_SPICEPOD"
+          exit 1
+        fi
+
+        sudo sed -i \
+          's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' "$DATASET_SPICEPOD"
+
+        # Output DATASET_SPICEPOD from action
+        echo "spicepod_dependency=$DATASET_SPICEPOD" >> "$GITHUB_OUTPUT"
