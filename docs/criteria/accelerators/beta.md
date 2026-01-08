@@ -8,11 +8,11 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 
 | Accelerator | Beta Quality | DRI Sign-off |
 | ----------- | ------------ | ------------ |
-| Arrow       | ✅           | @Sevenannn   |
-| Cayenne     | ➖           |              |
-| DuckDB      | ✅           | @peasee      |
-| SQLite      | ✅           | @sgrebnov    |
-| PostgreSQL  | ✅           | @sgrebnov    |
+| Arrow       | ✅            | @Sevenannn   |
+| Cayenne     | 🔄            | @lukekim     |
+| DuckDB      | ✅            | @peasee      |
+| SQLite      | ✅            | @sgrebnov    |
+| PostgreSQL  | ✅            | @sgrebnov    |
 
 ## Beta Release Criteria
 
