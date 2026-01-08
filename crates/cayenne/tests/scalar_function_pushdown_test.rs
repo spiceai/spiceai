@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-//! Regression test for issue #8770: Unsupported ScalarFunctionExpr in ORDER BY
+//! Regression test for issue #8770: Unsupported `ScalarFunctionExpr` in ORDER BY
 //!
 //! This test ensures that queries with scalar functions (like `to_timestamp`) in ORDER BY
 //! clauses work correctly with Cayenne, even though these functions cannot be pushed down
@@ -26,6 +26,7 @@ mod common;
 
 use arrow::array::TimestampSecondArray;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::record_batch::RecordBatch;
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::prelude::*;
@@ -34,14 +35,14 @@ use std::sync::Arc;
 // Generate test variants for each backend
 test_with_backends!(test_scalar_function_in_order_by_impl);
 
-/// Regression test for issue #8770: "Unsupported ScalarFunctionExpr: to_timestamp"
+/// Regression test for issue #8770: "Unsupported `ScalarFunctionExpr`: `to_timestamp`"
 ///
 /// This test validates that queries with scalar functions in ORDER BY clauses
 /// work correctly. Previously, unsupported scalar functions like `to_timestamp`
 /// would cause the query to fail with an error during filter pushdown.
 ///
 /// The fix ensures that unsupported expressions are gracefully skipped during
-/// pushdown, allowing DataFusion to handle them at a higher level.
+/// pushdown, allowing `DataFusion` to handle them at a higher level.
 async fn test_scalar_function_in_order_by_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -108,7 +109,7 @@ async fn test_scalar_function_in_order_by_impl(
         )
         .await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total_rows, 3, "Expected 3 non-empty search phrases");
     println!("✓ to_timestamp in ORDER BY works correctly ({total_rows} rows)");
 
@@ -123,7 +124,7 @@ async fn test_scalar_function_in_order_by_impl(
         )
         .await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total_rows, 3);
     println!("✓ UPPER in ORDER BY works correctly ({total_rows} rows)");
 
@@ -138,7 +139,7 @@ async fn test_scalar_function_in_order_by_impl(
         )
         .await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
     assert!(total_rows <= 5, "Expected at most 5 rows with length > 5");
     println!("✓ Scalar functions in WHERE and ORDER BY work correctly ({total_rows} rows)");
 
