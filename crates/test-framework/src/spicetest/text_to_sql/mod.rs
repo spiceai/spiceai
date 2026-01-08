@@ -16,9 +16,7 @@ limitations under the License.
 
 use std::{collections::BTreeMap, time::SystemTime};
 
-use crate::metrics::{
-    MetricCollector, QueryMetric, QueryStatus, StatisticsCollector, system_time_to_unix_epoch_ms,
-};
+use crate::metrics::{MetricCollector, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms};
 use anyhow::{Context, Result};
 
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
@@ -27,6 +25,7 @@ pub use metrics::{TextToSqlMetric, TextToSqlRunMetric};
 mod worker;
 pub use worker::{TextToSqlConfig, TextToSqlRequest, TextToSqlResult};
 use worker::{TextToSqlWorker, TextToSqlWorkerResult};
+mod task_history;
 
 #[derive(Default)]
 pub struct NotStarted {
@@ -144,6 +143,9 @@ impl SpiceTest<Completed> {
             self.get_average_attempts_metric(),
             self.get_exact_match_count(),
             self.get_error_rate(),
+            self.get_mean_sql_query_count(),
+            self.get_mean_llm_input_tokens(),
+            self.get_mean_llm_output_tokens(),
         ))
     }
 
@@ -160,56 +162,77 @@ impl SpiceTest<Completed> {
         rate
     }
 
-    fn get_error_rate(&self) -> f64 {
-        let errors: f64 = self
+    fn aggregate<F, T, A>(&self, mut extractor: F, aggregator: A) -> f64
+    where
+        F: FnMut(&TextToSqlResult) -> T,
+        T: Into<f64>,
+        A: FnOnce(Vec<f64>) -> f64,
+    {
+        let values: Vec<f64> = self
             .state
             .results
             .values()
-            .map(|result| f64::from(result.is_error))
-            .sum();
+            .map(|x| extractor(x).into())
+            .collect();
 
-        #[expect(clippy::cast_precision_loss)]
-        let rate = errors / self.state.results.len() as f64;
-        rate
+        aggregator(values)
+    }
+    fn mean<F, T>(&self, extractor: F) -> f64
+    where
+        F: FnMut(&TextToSqlResult) -> T,
+        T: Into<f64>,
+    {
+        self.aggregate(extractor, |values| {
+            let summ: f64 = values.iter().sum();
+
+            #[expect(clippy::cast_precision_loss)]
+            let rate = summ / self.state.results.len() as f64;
+            rate
+        })
+    }
+    fn percentile<F, T>(&self, extractor: F, percentile: f64) -> f64
+    where
+        F: FnMut(&TextToSqlResult) -> T,
+        T: Into<f64>,
+    {
+        self.aggregate(extractor, move |mut values| {
+            if values.is_empty() {
+                return 0.0;
+            }
+
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            let index = ((values.len() - 1) as f64 * percentile / 100.0).round() as usize;
+            values[index]
+        })
+    }
+
+    fn get_error_rate(&self) -> f64 {
+        self.mean(|result| result.is_error)
     }
 
     fn get_p95_response_time_metric(&self) -> Result<f64> {
-        let durations = self
-            .state
-            .results
-            .values()
-            .map(|result| result.duration)
-            .collect::<Vec<_>>();
-
-        #[expect(clippy::cast_precision_loss)]
-        let p95 = durations.percentile(95.0)?.as_millis() as f64;
-        Ok(p95)
+        Ok(1000.0 * self.percentile(|result| result.duration.as_secs_f32(), 95.0))
     }
 
     fn get_median_response_time_metric(&self) -> Result<f64> {
-        let durations = self
-            .state
-            .results
-            .values()
-            .map(|result| result.duration)
-            .collect::<Vec<_>>();
-
-        #[expect(clippy::cast_precision_loss)]
-        let median = durations.median()?.as_millis() as f64;
-        Ok(median)
+        Ok(1000.0 * self.percentile(|result| result.duration.as_secs_f32(), 50.0))
     }
 
     fn get_average_attempts_metric(&self) -> f64 {
-        let total_attempts: usize = self
-            .state
-            .results
-            .values()
-            .map(|result| result.number_of_attempts)
-            .sum();
+        self.mean(|result| result.query_count as f64)
+    }
 
-        #[expect(clippy::cast_precision_loss)]
-        let avg = total_attempts as f64 / self.state.results.len() as f64;
-        avg
+    fn get_mean_sql_query_count(&self) -> f64 {
+        self.mean(|result| result.query_count as f64)
+    }
+
+    fn get_mean_llm_input_tokens(&self) -> f64 {
+        self.mean(|result| result.llm_input_tokens as f64)
+    }
+
+    fn get_mean_llm_output_tokens(&self) -> f64 {
+        self.mean(|result| result.llm_output_tokens as f64)
     }
 }
 
@@ -240,6 +263,8 @@ impl MetricCollector<TextToSqlMetric, TextToSqlRunMetric> for SpiceTest<Complete
             .results
             .iter()
             .map(|(id, result)| {
+                #[expect(clippy::cast_precision_loss)]
+                let latency_ms = result.duration.as_millis() as f64;
                 QueryMetric::new_from_durations(
                     id.as_str().into(),
                     &vec![result.duration],
@@ -251,10 +276,16 @@ impl MetricCollector<TextToSqlMetric, TextToSqlRunMetric> for SpiceTest<Complete
                     metric.with_extended_metrics(TextToSqlMetric::new(
                         result.generated_sql.clone(),
                         result.expected_sql.clone(),
-                        result.number_of_attempts,
+                        result.query_count,
                         result.sample_data_enabled,
                         result.return_sql,
                         result.is_error,
+                        latency_ms,
+                        result.sql_duration_ms,
+                        result.llm_duration_ms,
+                        result.llm_count,
+                        result.llm_input_tokens,
+                        result.llm_output_tokens,
                     ))
                 })
             })
