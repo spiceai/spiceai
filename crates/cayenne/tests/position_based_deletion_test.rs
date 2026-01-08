@@ -122,7 +122,8 @@ async fn setup_no_pk_table(
     let table_options = CreateTableOptions {
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec![], // No primary key - position-based deletion
+        primary_key: vec![],
+        on_conflict: None, // No primary key - position-based deletion
         base_path: data_dir.path().to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -566,6 +567,7 @@ async fn test_position_based_persistence_after_full_delete() -> TestResult<()> {
             table_name: "full_delete_persist".to_string(),
             schema: Arc::clone(&schema),
             primary_key: vec![],
+            on_conflict: None,
             base_path: data_dir.path().to_string_lossy().to_string(),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),

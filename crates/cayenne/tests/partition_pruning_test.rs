@@ -88,6 +88,7 @@ async fn test_cayenne_partition_pruning_impl(
         table_name: "partitioned_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("region".to_string()),
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -388,6 +389,7 @@ async fn test_cayenne_bucket_partitioning_impl(
         table_name: "bucket_table".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: Some("id".to_string()), // In practice, runtime would use bucket(3, id)
         vortex_config: cayenne::metadata::VortexConfig::default(),

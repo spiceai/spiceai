@@ -105,9 +105,7 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut replacements: HashMap<PlanNodeKey, Arc<dyn ExecutionPlan>> = HashMap::new();
-
-        let pruned = Arc::clone(&plan)
+        Arc::clone(&plan)
             .transform_down(|p| {
                 // Only operate on `ProjectionExec`
                 let Some(projection) = concrete!(p, ProjectionExec) else {
@@ -119,6 +117,8 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
                     return Ok(Transformed::no(p));
                 };
 
+                let mut replacements: HashMap<PlanNodeKey, Arc<dyn ExecutionPlan>> =
+                    HashMap::new();
                 let projection_key: PlanNodeKey = p.as_ref().into();
                 let projection_expr = Arc::new(projection.expr().to_vec());
                 let expected_schema = projection.input().schema();
@@ -267,35 +267,29 @@ impl PhysicalOptimizerRule for UnionProjectionPushdownOptimizer {
                     replacements.insert(leaf_key, rewrite_leaf);
                 }
 
-                Ok(Transformed::yes(Arc::clone(projection.input())))
-            })?
-            .data;
+                let mut remaining_replacements = replacements;
+                let rewritten_input = Arc::clone(projection.input())
+                    .transform_down(|node| {
+                        if let Some(replacement) =
+                            remaining_replacements.remove(&node.as_ref().into())
+                        {
+                            Ok(Transformed::yes(replacement))
+                        } else {
+                            Ok(Transformed::no(node))
+                        }
+                    })?
+                    .data;
 
-        // If we can push down, this will be populated
-        if replacements.is_empty() {
-            return Ok(plan);
-        }
-
-        // Rewrite projection-pruned plan with replacements
-        let optimized = pruned
-            .transform_down(|p| {
-                if let Some(replacement) = replacements.remove(&p.as_ref().into()) {
-                    Ok(Transformed::yes(replacement))
+                if remaining_replacements.is_empty() {
+                    Ok(Transformed::yes(rewritten_input))
                 } else {
-                    Ok(Transformed::no(p))
+                    exec_err!(
+                        "{}: Failed to bind all plan replacements. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
+                        self.name()
+                    )
                 }
-            })?
-            .data;
-
-        // If there are any leftover replacements, something is wrong
-        if replacements.is_empty() {
-            Ok(optimized)
-        } else {
-            exec_err!(
-                "{}: Failed to bind all plan replacements. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues",
-                self.name()
-            )
-        }
+            })
+            .map(|transformed| transformed.data)
     }
 
     fn name(&self) -> &'static str {
@@ -378,21 +372,29 @@ mod tests {
         })
     }
 
-    #[ignore = "See #8313"]
     #[test]
     fn test_projection_pushdown() {
-        let files = vec![
-            create_partitioned_file("file:///file4.parquet", 256_000_000, None),
-            create_partitioned_file("file:///file5.parquet", 256_000_000, None),
-        ];
+        let files_1 = vec![create_partitioned_file(
+            "file:///file4.parquet",
+            256_000_000,
+            None,
+        )];
+        let files_2 = vec![create_partitioned_file(
+            "file:///file5.parquet",
+            256_000_000,
+            None,
+        )];
 
-        let data_source_exec = create_data_source_exec(files);
+        let data_source_1 = create_data_source_exec(files_1);
+        let data_source_2 = create_data_source_exec(files_2);
+        let union_exec: Arc<dyn ExecutionPlan> =
+            Arc::new(UnionExec::new(vec![data_source_1, data_source_2]));
         let projection_exec = ProjectionExec::try_new(
             vec![(
-                col("id", data_source_exec.schema().as_ref()).expect("Must bind expr"),
+                col("id", union_exec.schema().as_ref()).expect("Must bind expr"),
                 "foo".to_string(),
             )],
-            data_source_exec,
+            union_exec,
         )
         .expect("Must make projection_exec");
         let plan: Arc<dyn ExecutionPlan> = Arc::new(projection_exec);
@@ -513,6 +515,87 @@ mod tests {
         assert!(
             !projections.is_empty(),
             "Plan should contain at least one projection"
+        );
+    }
+
+    #[test]
+    fn test_projection_pushdown_parent_projection_rebuild_schema_mismatch() {
+        use datafusion::physical_plan::union::UnionExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let data_source1 = {
+            let fsc = FileScanConfigBuilder::new(
+                ObjectStoreUrl::parse("file://tmp/").expect("Must parse dummy URL"),
+                Arc::clone(&schema),
+                Arc::new(ArrowSource::default()),
+            )
+            .with_file_group(FileGroup::new(vec![create_partitioned_file(
+                "file:///file1.parquet",
+                100,
+                None,
+            )]))
+            .build();
+            DataSourceExec::from_data_source(fsc)
+        };
+
+        let data_source2 = {
+            let fsc = FileScanConfigBuilder::new(
+                ObjectStoreUrl::parse("file://tmp/").expect("Must parse dummy URL"),
+                Arc::clone(&schema),
+                Arc::new(ArrowSource::default()),
+            )
+            .with_file_group(FileGroup::new(vec![create_partitioned_file(
+                "file:///file2.parquet",
+                100,
+                None,
+            )]))
+            .build();
+            DataSourceExec::from_data_source(fsc)
+        };
+
+        let union_exec: Arc<dyn ExecutionPlan> =
+            Arc::new(UnionExec::new(vec![data_source1, data_source2]));
+
+        // Child projection outputs 3 columns from a 2-column input schema.
+        let child_projection = ProjectionExec::try_new(
+            vec![
+                (
+                    col("id", union_exec.schema().as_ref()).expect("Must bind expr"),
+                    "id".to_string(),
+                ),
+                (
+                    col("id", union_exec.schema().as_ref()).expect("Must bind expr"),
+                    "id_dup".to_string(),
+                ),
+                (
+                    col("name", union_exec.schema().as_ref()).expect("Must bind expr"),
+                    "name".to_string(),
+                ),
+            ],
+            union_exec,
+        )
+        .expect("Must make child projection");
+
+        // Parent projection refers to the third output column (index 2).
+        let parent_projection = ProjectionExec::try_new(
+            vec![(
+                col("name", child_projection.schema().as_ref()).expect("Must bind expr"),
+                "name".to_string(),
+            )],
+            Arc::new(child_projection),
+        )
+        .expect("Must make parent projection");
+
+        let result =
+            OPTIMIZER.rules[0].optimize(Arc::new(parent_projection), &ConfigOptions::default());
+
+        assert!(
+            result.is_ok(),
+            "Optimization should avoid rebuilding ancestors against an intermediate schema"
         );
     }
 }

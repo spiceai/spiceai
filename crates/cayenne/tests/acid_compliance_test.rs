@@ -88,6 +88,7 @@ async fn setup_int64_pk_table(
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
+        on_conflict: None,
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -112,6 +113,7 @@ async fn setup_string_pk_table(
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["code".to_string()],
+        on_conflict: None,
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -136,6 +138,7 @@ async fn setup_composite_pk_table(
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["region".to_string(), "id".to_string()],
+        on_conflict: None,
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -540,6 +543,7 @@ async fn test_acid_durability_deletions_persist_impl(fixture: TestFixture) -> Te
             table_name: table_name.to_string(),
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
+            on_conflict: None,
             base_path: fixture.data_path.to_string_lossy().to_string(),
             partition_column: None,
             vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -1275,7 +1279,8 @@ async fn test_multifile_position_based_upsert_impl(fixture: TestFixture) -> Test
     let table_options = CreateTableOptions {
         table_name: "mf_position_upsert".to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec![], // No PK = position-based
+        primary_key: vec![],
+        on_conflict: None, // No PK = position-based
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),

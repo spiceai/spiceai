@@ -367,3 +367,18 @@ impl<'a> ContainerRunner<'a> {
         Ok(false)
     }
 }
+
+/// Check if Docker is available on this system.
+///
+/// Returns `true` if Docker daemon is accessible, `false` otherwise.
+/// This is useful for tests that require Docker to skip gracefully
+/// when Docker is not available (e.g., on certain CI runners).
+#[expect(dead_code, reason = "Used by tests with kafka feature enabled")]
+pub async fn is_docker_available() -> bool {
+    let Ok(docker) = Docker::connect_with_local_defaults() else {
+        return false;
+    };
+
+    // Try to ping the Docker daemon to verify it's actually running
+    docker.ping().await.is_ok()
+}
