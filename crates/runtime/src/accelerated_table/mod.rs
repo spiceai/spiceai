@@ -228,7 +228,7 @@ pub struct AcceleratedTable {
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
     /// If true, writes only go to the accelerator table (not replicated to source).
-    /// This is set when on_conflict is configured - the accelerator handles writes locally.
+    /// This is set when `on_conflict` is configured - the accelerator handles writes locally.
     write_to_accelerator_only: bool,
     synchronized_with: Option<SynchronizedTable>,
     /// Child accelerators that should receive cached data when this parent stores new cache entries (caching mode only)
@@ -278,6 +278,7 @@ fn validate_refresh_data_window(
     }
 }
 
+#[expect(clippy::struct_excessive_bools)]
 pub struct Builder {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
@@ -386,7 +387,7 @@ impl Builder {
     }
 
     /// Set to only write to the accelerator (not replicate to federated source).
-    /// This is used when on_conflict is configured - writes go only to the accelerator.
+    /// This is used when `on_conflict` is configured - writes go only to the accelerator.
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {
         self.write_to_accelerator_only = true;
         self

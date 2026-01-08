@@ -988,21 +988,20 @@ impl DataFusion {
             .is_some_and(|acc| !acc.on_conflict.is_empty());
         let needs_source_writes = dataset.access() == AccessMode::ReadWrite && !has_on_conflict;
 
-        let source_table_provider = match needs_source_writes {
-            false => Arc::new(federated_read_table),
-            true => {
-                let read_write_provider = source
-                    .read_write_provider(dataset)
-                    .await
-                    .ok_or_else(|| {
-                        WriteProviderNotImplementedSnafu {
-                            table_name: dataset.name.to_string(),
-                        }
-                        .build()
-                    })?
-                    .context(UnableToResolveTableProviderSnafu)?;
-                Arc::new(FederatedTable::new_unchecked(read_write_provider))
-            }
+        let source_table_provider = if needs_source_writes {
+            let read_write_provider = source
+                .read_write_provider(dataset)
+                .await
+                .ok_or_else(|| {
+                    WriteProviderNotImplementedSnafu {
+                        table_name: dataset.name.to_string(),
+                    }
+                    .build()
+                })?
+                .context(UnableToResolveTableProviderSnafu)?;
+            Arc::new(FederatedTable::new_unchecked(read_write_provider))
+        } else {
+            Arc::new(federated_read_table)
         };
 
         let source_schema = source_table_provider.schema();
