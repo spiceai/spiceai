@@ -29,3 +29,4 @@ runs:
         server_side_encryption = false
         no_credentials = false
         region = "us-east-1"
+        EOF
