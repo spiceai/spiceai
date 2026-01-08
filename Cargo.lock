@@ -14397,10 +14397,12 @@ dependencies = [
 name = "runtime-table-partition"
 version = "1.11.0-unstable"
 dependencies = [
+ "arrow",
  "arrow-schema",
  "async-trait",
  "chrono",
  "criterion 0.5.1",
+ "data_components",
  "datafusion",
  "futures",
  "insta",

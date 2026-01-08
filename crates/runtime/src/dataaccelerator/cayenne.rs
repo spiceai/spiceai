@@ -14,10 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::any::Any;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
+use data_components::poly::PolyTableProvider;
 use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
@@ -39,19 +45,19 @@ use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
-use std::any::Any;
-use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator, upsert_dedup};
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::SnapshotBehavior;
+
+/// Metadata key to identify the accelerator type in the schema metadata.
+const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -1418,7 +1424,7 @@ impl CayenneAccelerator {
         schema: Arc<Schema>,
         source: &dyn AccelerationSource,
         retention_filters: Vec<Expr>,
-    ) -> Result<Arc<dyn TableProvider>> {
+    ) -> Result<Arc<cayenne::CayenneTableProvider>> {
         use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
 
         tracing::debug!("create_cayenne_table_provider: starting for table {table_name}");
@@ -1632,15 +1638,39 @@ impl DataAccelerator for CayenneAccelerator {
         // S3 Express One Zone paths are always considered initialized
         // (the bucket/prefix is assumed to exist or will be created by the object store)
         if Self::is_s3_express_data_path(source) {
-            return true;
+            // For S3 Express, we need to check if the metadata database exists locally
+            let metadata_dir = if let Some(acceleration) = source.acceleration()
+                && let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir")
+            {
+                custom_dir.clone()
+            } else {
+                format!("{}/metadata", crate::spice_data_base_path())
+            };
+            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+            return PathBuf::from(metadata_db_path).exists();
         }
 
-        // otherwise, we're initialized if the directory exists
-        if let Ok(dir_path) = self.file_path(source) {
-            PathBuf::from(dir_path).exists()
-        } else {
-            false
+        // For local storage, check if both the data directory and metadata database exist
+        let dir_path = match self.file_path(source) {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+
+        // Check if the data directory exists
+        if !PathBuf::from(&dir_path).exists() {
+            return false;
         }
+
+        // Also check if the metadata database exists (indicates proper initialization)
+        let metadata_dir = if let Some(acceleration) = source.acceleration()
+            && let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir")
+        {
+            custom_dir.clone()
+        } else {
+            format!("{}/metadata", crate::spice_data_base_path())
+        };
+        let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+        PathBuf::from(metadata_db_path).exists()
     }
 
     /// Initializes a `Cayenne` database for the dataset
@@ -1762,7 +1792,7 @@ impl DataAccelerator for CayenneAccelerator {
             return Ok(());
         }
 
-        // If mode is FileCreate, delete the existing directory to start fresh
+        // If mode is FileCreate, delete the existing directory and metadata to start fresh
         if let Some(acceleration) = source.acceleration()
             && acceleration.mode == Mode::FileCreate
         {
@@ -1775,6 +1805,44 @@ impl DataAccelerator for CayenneAccelerator {
                 std::fs::remove_dir_all(&path_buf).map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
+            }
+
+            // Also drop the table from metadata catalog to clean up stale metadata
+            let metadata_dir =
+                if let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir") {
+                    custom_dir.clone()
+                } else {
+                    format!("{}/metadata", crate::spice_data_base_path())
+                };
+
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+
+            // Get or create catalog and drop the table if it exists
+            if let Ok(catalog) = self
+                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .await
+            {
+                let table_name = source.name().to_string();
+                match catalog.drop_table(&table_name).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            "Dropped existing Cayenne table metadata for '{}' (file_create mode)",
+                            table_name
+                        );
+                    }
+                    Ok(false) => {
+                        // Table didn't exist in metadata, nothing to drop
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to drop Cayenne table metadata for '{}': {e}. Continuing anyway.",
+                            table_name
+                        );
+                    }
+                }
             }
         }
 
@@ -1909,8 +1977,25 @@ impl DataAccelerator for CayenneAccelerator {
 
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
-            // Non-partitioned table - return base provider directly
-            Ok(cayenne_table)
+            // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
+            // Wrap with upsert deduplication if needed based on on_conflict settings
+            let (write_provider, delete_provider) =
+                upsert_dedup::wrap_with_upsert_dedup_if_needed(cayenne_table, &cmd.options);
+
+            let mut schema_metadata = HashMap::new();
+            schema_metadata.insert(
+                SPICE_ACCELERATOR_METADATA_KEY.to_string(),
+                "cayenne".to_string(),
+            );
+
+            let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
+                Arc::clone(&write_provider),
+                delete_provider,
+                write_provider,
+                schema_metadata,
+            ));
+
+            Ok(table_provider as Arc<dyn TableProvider>)
         } else {
             let partition_by_last = partition_by.last().cloned().ok_or_else(|| {
                 Box::new(Error::PartitionByRequired) as Box<dyn std::error::Error + Send + Sync>
@@ -2027,13 +2112,30 @@ impl DataAccelerator for CayenneAccelerator {
             ));
 
             // Wrap the base table provider with partitioning logic
-            let table_provider = Arc::new(
+            let partition_provider = Arc::new(
                 PartitionTableProvider::new(creator, partition_by, arrow_schema)
                     .await
                     .map_err(|e| Error::AccelerationCreationFailed {
                         source: Box::new(e),
                     })?,
             );
+
+            // Wrap with upsert deduplication if needed based on on_conflict settings
+            let (write_provider, delete_provider) =
+                upsert_dedup::wrap_with_upsert_dedup_if_needed(partition_provider, &cmd.options);
+
+            let mut schema_metadata = HashMap::new();
+            schema_metadata.insert(
+                SPICE_ACCELERATOR_METADATA_KEY.to_string(),
+                "cayenne".to_string(),
+            );
+
+            let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
+                Arc::clone(&write_provider),
+                delete_provider,
+                write_provider,
+                schema_metadata,
+            ));
 
             Ok(table_provider as Arc<dyn TableProvider>)
         }
