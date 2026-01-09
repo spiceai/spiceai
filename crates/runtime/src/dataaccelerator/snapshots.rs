@@ -21,7 +21,7 @@ use runtime_acceleration::{
     snapshot::{SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
 };
 use snafu::ResultExt;
-
+use runtime_acceleration::snapshot::AccelerationEngine;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
@@ -34,6 +34,7 @@ pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
     path: PathBuf,
+    engine: AccelerationEngine,
 ) {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
         return;
@@ -68,6 +69,7 @@ pub(super) async fn download_snapshot_if_needed(
         dataset_name.clone(),
         acceleration.snapshot_behavior.clone(),
         path,
+        engine,
     )
     .await
     {

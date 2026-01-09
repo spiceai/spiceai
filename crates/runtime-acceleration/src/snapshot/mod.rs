@@ -395,6 +395,17 @@ impl<'a> SnapshotPathLayout<'a> {
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub enum AccelerationEngine {
+    Cayenne,
+    #[cfg(feature = "duckdb")]
+    DuckDB,
+    #[cfg(feature = "sqlite")]
+    Sqlite,
+    #[cfg(feature = "turso")]
+    Turso,
+}
+
 /// Manages snapshots for a specific accelerated dataset.
 #[derive(Clone)]
 pub struct SnapshotManager {
@@ -402,6 +413,7 @@ pub struct SnapshotManager {
     snapshots_location: object_store::path::Path,
     snapshot_location_uri: String,
     local_path: PathBuf,
+    engine: AccelerationEngine,
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
@@ -505,6 +517,7 @@ impl SnapshotManager {
         dataset_name: String,
         snapshots: SnapshotBehavior,
         local_path: PathBuf,
+        engine: AccelerationEngine
     ) -> Option<Self> {
         let (snapshot_config, secrets, io_runtime) = match snapshots {
             SnapshotBehavior::Disabled => {
@@ -564,6 +577,7 @@ impl SnapshotManager {
             snapshots_location: path,
             snapshot_location_uri,
             local_path,
+            engine,
             object_store: store.into(),
             checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
@@ -1517,6 +1531,7 @@ mod tests {
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             local_path,
+            engine: AccelerationEngine::Sqlite,
             object_store,
             bootstrap_failure_behavior: behavior,
             checkpointer_factory: Some(factory),

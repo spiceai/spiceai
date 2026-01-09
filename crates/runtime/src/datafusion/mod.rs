@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
-use crate::accelerated_table::{self, AcceleratedTableBuilderError};
+use crate::accelerated_table::{self, AcceleratedTableBuilderError, SnapshotCreationConfig, SnapshotCreateTrigger};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
@@ -28,7 +28,7 @@ use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::{self};
+use crate::dataaccelerator::{self, AccelerationSource};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_file_path};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
@@ -87,6 +87,7 @@ use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotManager};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -1201,14 +1202,33 @@ impl DataFusion {
         }
 
         if acceleration_settings.snapshot_behavior.create_enabled()
+            && let Some(snapshot_creation_trigger) = acceleration_settings.snapshot_creation_trigger
             && let Ok(snapshot_path) = acceleration_file_path(dataset).await
         {
-            accelerated_table_builder.snapshot_behavior(
+            let acceleration_engine = match acceleration_settings.engine {
+                #[cfg(feature = "duckdb")]
+                Engine::DuckDB => AccelerationEngine::DuckDB,
+                #[cfg(feature = "sqlite")]
+                Engine::Sqlite => AccelerationEngine::Sqlite,
+                #[cfg(feature = "turso")]
+                Engine::Turso => AccelerationEngine::Turso,
+
+                _ => {
+                    // TODO
+                    panic!();
+                }
+            };
+
+            if let Some(snapshot_manager) = SnapshotManager::try_new(
+                dataset.name.to_string(),
                 acceleration_settings.snapshot_behavior.clone(),
-                Some(snapshot_path),
-                acceleration_settings.snapshots_trigger_threshold,
-                acceleration_settings.snapshots_create_interval,
-            );
+                snapshot_path.clone(),
+                acceleration_engine,
+            ).await {
+                // TODO: Proper trigger initialization
+                let snapshot_config = SnapshotCreationConfig::new(Arc::new(snapshot_manager), snapshot_creation_trigger);
+                accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
+            }
         }
 
         accelerated_table_builder.checkpointer_opt(

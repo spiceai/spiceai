@@ -51,7 +51,7 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -1782,7 +1782,7 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            download_snapshot_if_needed(acceleration, source, path_buf).await;
+            download_snapshot_if_needed(acceleration, source, path_buf, AccelerationEngine::Cayenne).await;
         }
 
         Ok(())

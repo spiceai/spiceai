@@ -30,7 +30,7 @@ use runtime_table_partition::expression::PartitionedBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
-
+use runtime_acceleration::snapshot::AccelerationEngine;
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
@@ -272,7 +272,7 @@ impl DataAccelerator for SqliteAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            download_snapshot_if_needed(acceleration, source, PathBuf::from(path), AccelerationEngine::Sqlite).await;
 
             self.get_shared_pool(source).await?;
         }

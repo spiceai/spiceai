@@ -14172,6 +14172,7 @@ dependencies = [
  "bytes",
  "chrono",
  "datafusion",
+ "duckdb",
  "fundu",
  "futures",
  "object_store",

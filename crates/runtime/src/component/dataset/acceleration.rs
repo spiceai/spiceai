@@ -27,6 +27,7 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
+use crate::accelerated_table::{SnapshotCreateTrigger, SnapshotCreationConfig};
 
 pub mod constraints;
 pub mod on_conflict;
@@ -359,9 +360,7 @@ pub struct Acceleration {
 
     pub snapshot_behavior: SnapshotBehavior,
 
-    pub snapshots_trigger_threshold: Option<i64>,
-
-    pub snapshots_create_interval: Option<Duration>,
+    pub snapshot_creation_trigger: Option<SnapshotCreateTrigger>,
 }
 
 impl Acceleration {
@@ -459,6 +458,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
+        // TODO: Create snapshot_creation_trigger
         let snapshots_trigger_threshold = parse_snapshots_trigger_threshold(&mut params)?;
         let snapshots_create_interval = parse_snapshots_create_interval(&mut params)?;
 
@@ -520,8 +520,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             on_conflict,
             partition_by: acceleration.partition_by,
             snapshot_behavior: SnapshotBehavior::disabled(),
-            snapshots_trigger_threshold,
-            snapshots_create_interval,
+            snapshot_creation_trigger,
         })
     }
 }
@@ -558,8 +557,7 @@ impl Default for Acceleration {
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
             snapshot_behavior: SnapshotBehavior::Disabled,
-            snapshots_trigger_threshold: None,
-            snapshots_create_interval: None,
+            snapshot_creation_trigger: None,
         }
     }
 }

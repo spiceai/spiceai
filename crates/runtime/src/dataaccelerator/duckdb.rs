@@ -64,6 +64,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Once},
 };
+use runtime_acceleration::snapshot::AccelerationEngine;
 
 pub(crate) mod settings;
 
@@ -383,7 +384,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            download_snapshot_if_needed(acceleration, source, PathBuf::from(path), AccelerationEngine::DuckDB).await;
 
             self.get_shared_pool(source).await?;
         }

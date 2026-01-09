@@ -18,7 +18,7 @@ limitations under the License.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display};
-
+use std::time::Duration;
 use crate::{
     component::dataset::ReadyState,
     metric::Metrics,

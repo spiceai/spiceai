@@ -154,7 +154,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     );
 
     refresher.checkpointer(Some(Arc::new(MockCheckpointer)));
-    refresher.with_snapshot_behavior(
+    refresher.with_snapshot_creation_config(
         snapshot_behavior,
         Some(local_snapshot_file.clone()),
         None,
