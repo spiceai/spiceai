@@ -143,7 +143,7 @@ async fn emit_telemetry(
             crate::metrics::TEXT_TO_SQL_EXACT_MATCH.record(qm.exact_match, &attributes);
             crate::metrics::TEXT_TO_SQL_EXACT_LOGICAL_PLAN_MATCH
                 .record(qm.exact_logical_plan_match, &attributes);
-            crate::metrics::TEXT_TO_SQL_ERROR.record(qm.is_error as u64, &attributes);
+            crate::metrics::TEXT_TO_SQL_ERROR.record(u64::from(qm.is_error), &attributes);
             crate::metrics::TEXT_TO_SQL_CORRECT_TABLES.record(qm.correct_tables, &attributes);
             crate::metrics::TEXT_TO_SQL_CORRECT_TABLE_PROJECTIONS
                 .record(qm.correct_table_projections, &attributes);
