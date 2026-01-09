@@ -18,11 +18,17 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder,
-    Int8Builder, Int16Builder, Int32Builder, Int64Builder, RecordBatch, StringBuilder,
-    TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+    Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, RecordBatch,
+    StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+
+/// Default precision and scale for CQL decimal type.
+/// CQL decimal is arbitrary precision, but Arrow Decimal128 has max precision of 38.
+/// Using scale of 2 for common financial/monetary use cases like TPC-H.
+const CQL_DECIMAL_PRECISION: u8 = 38;
+const CQL_DECIMAL_SCALE: i8 = 2;
 use async_stream::stream;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -420,11 +426,35 @@ fn convert_cqlvalue_rows_to_record_batch(
                         if let Some(v) = value.as_double() {
                             builder.append_value(v);
                         } else if let CqlValue::Decimal(decimal) = value {
-                            // Convert CqlDecimal to f64
-                            // CqlDecimal stores: int_val (big-endian two's complement) / 10^scale
+                            // Convert CqlDecimal to f64 (fallback for Float64 schema)
                             let (bytes, scale) = decimal.as_signed_be_bytes_slice_and_exponent();
                             if let Some(f) = cql_decimal_to_f64(bytes, scale) {
                                 builder.append_value(f);
+                            } else {
+                                builder.append_null();
+                            }
+                        } else {
+                            builder.append_null();
+                        }
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Decimal128(precision, scale) => {
+                let mut builder = Decimal128Builder::with_capacity(num_rows)
+                    .with_precision_and_scale(*precision, *scale)
+                    .unwrap_or_else(|_| Decimal128Builder::with_capacity(num_rows));
+                for row in rows {
+                    if let Some(Some(value)) = row.get(col_idx) {
+                        if let CqlValue::Decimal(decimal) = value {
+                            let (bytes, source_scale) =
+                                decimal.as_signed_be_bytes_slice_and_exponent();
+                            if let Some(mantissa) =
+                                cql_decimal_to_i128(bytes, source_scale, *scale)
+                            {
+                                builder.append_value(mantissa);
                             } else {
                                 builder.append_null();
                             }
@@ -583,6 +613,43 @@ fn cql_decimal_to_f64(bytes: &[u8], scale: i32) -> Option<f64> {
     }
 }
 
+/// Convert CQL decimal bytes to i128 for Arrow Decimal128 with target scale.
+///
+/// CqlDecimal represents: int_val / 10^source_scale
+/// Arrow Decimal128 stores: mantissa / 10^target_scale
+///
+/// We need to rescale: mantissa = int_val * 10^(target_scale - source_scale)
+fn cql_decimal_to_i128(bytes: &[u8], source_scale: i32, target_scale: i8) -> Option<i128> {
+    if bytes.is_empty() {
+        return Some(0);
+    }
+
+    // Check if value fits in i128 (max 16 bytes for signed)
+    if bytes.len() > 16 {
+        return None;
+    }
+
+    // Parse two's complement big-endian bytes to i128
+    let is_negative = (bytes[0] & 0x80) != 0;
+    let mut value: i128 = if is_negative { -1 } else { 0 };
+
+    for &byte in bytes {
+        value = (value << 8) | i128::from(byte);
+    }
+
+    // Rescale: multiply/divide to match target scale
+    let scale_diff = i32::from(target_scale) - source_scale;
+    if scale_diff > 0 {
+        // Need more decimal places: multiply
+        value.checked_mul(10_i128.pow(scale_diff.unsigned_abs()))
+    } else if scale_diff < 0 {
+        // Need fewer decimal places: divide (rounds toward zero)
+        Some(value / 10_i128.pow((-scale_diff).unsigned_abs()))
+    } else {
+        Some(value)
+    }
+}
+
 /// Map CQL type string (from system_schema.columns) to Arrow DataType.
 fn map_scylladb_type_to_arrow(type_str: &str) -> DataType {
     let type_lower = type_str.to_lowercase();
@@ -594,8 +661,8 @@ fn map_scylladb_type_to_arrow(type_str: &str) -> DataType {
         "bigint" | "counter" => DataType::Int64,
         "float" => DataType::Float32,
         "double" => DataType::Float64,
-        // CQL decimal is an arbitrary-precision decimal; use Float64 for compatibility
-        "decimal" => DataType::Float64,
+        // CQL decimal is arbitrary-precision; use Decimal128 for precise arithmetic
+        "decimal" => DataType::Decimal128(CQL_DECIMAL_PRECISION, CQL_DECIMAL_SCALE),
         "blob" => DataType::Binary,
         "date" => DataType::Date32,
         "timestamp" => DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -630,8 +697,8 @@ fn map_cql_type_to_arrow(cql_type: &ColumnType<'_>) -> DataType {
             NativeType::BigInt | NativeType::Counter => DataType::Int64,
             NativeType::Float => DataType::Float32,
             NativeType::Double => DataType::Float64,
-            // CQL decimal is an arbitrary-precision decimal; use Float64 for compatibility
-            NativeType::Decimal => DataType::Float64,
+            // CQL decimal is arbitrary-precision; use Decimal128 for precise arithmetic
+            NativeType::Decimal => DataType::Decimal128(CQL_DECIMAL_PRECISION, CQL_DECIMAL_SCALE),
             NativeType::Blob => DataType::Binary,
             NativeType::Date => DataType::Date32,
             NativeType::Timestamp => DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -709,7 +776,10 @@ mod tests {
 
         // Complex numeric types
         assert_eq!(map_scylladb_type_to_arrow("varint"), DataType::Utf8);
-        assert_eq!(map_scylladb_type_to_arrow("decimal"), DataType::Float64);
+        assert_eq!(
+            map_scylladb_type_to_arrow("decimal"),
+            DataType::Decimal128(CQL_DECIMAL_PRECISION, CQL_DECIMAL_SCALE)
+        );
         assert_eq!(map_scylladb_type_to_arrow("duration"), DataType::Utf8);
     }
 
@@ -1226,7 +1296,7 @@ mod tests {
         );
         assert_eq!(
             map_cql_type_to_arrow(&ColumnType::Native(NativeType::Decimal)),
-            DataType::Float64
+            DataType::Decimal128(CQL_DECIMAL_PRECISION, CQL_DECIMAL_SCALE)
         );
         assert_eq!(
             map_cql_type_to_arrow(&ColumnType::Native(NativeType::Duration)),
