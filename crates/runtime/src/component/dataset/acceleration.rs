@@ -459,6 +459,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
         // TODO: Create snapshot_creation_trigger
+        let snapshot_creation_trigger = Some(SnapshotCreateTrigger::RefreshComplete);
         let snapshots_trigger_threshold = parse_snapshots_trigger_threshold(&mut params)?;
         let snapshots_create_interval = parse_snapshots_create_interval(&mut params)?;
 

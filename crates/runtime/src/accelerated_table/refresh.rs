@@ -1033,14 +1033,14 @@ async fn create_checkpoint_and_snapshot(
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
 ) {
-    let _lock_guard = accelerator_write_mutex.lock().await;
+    let _lock_guard = Arc::clone(&accelerator_write_mutex).lock_owned().await;
     if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
         tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
         return;
     }
 
     if let Some(snapshot_manager) = snapshot_manager {
-        if let Err(e) = snapshot_manager.create_snapshot(&federated_schema).await {
+        if let Err(e) = snapshot_manager.create_snapshot(&federated_schema, _lock_guard).await {
             let dataset_label = dataset_name.to_string();
             snapshot_metrics::record_snapshot_failure(&dataset_label);
             tracing::warn!("Failed to create snapshot for dataset {dataset_name}: {e}");

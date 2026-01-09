@@ -44,6 +44,7 @@ use tokio::{
     runtime::Handle,
     sync::RwLock,
 };
+use tokio::sync::OwnedMutexGuard;
 use url::Url;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 
@@ -360,6 +361,36 @@ pub enum SnapshotUploadError {
     UploadMetadataSchemaMissing { dataset: String },
     #[snafu(display("Snapshot metadata schema conflict for dataset {dataset}"))]
     UploadSchemaMismatch { dataset: String },
+    #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}"))]
+    CopyLocal {
+        source_path: PathBuf,
+        dest_path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("Failed to open DuckDB for compaction: {path:?}"))]
+    #[cfg(feature = "duckdb")]
+    CompactionConnect {
+        path: PathBuf,
+        source: duckdb::Error,
+    },
+    #[snafu(display("Failed to attach database for compaction: {path:?}"))]
+    #[cfg(feature = "duckdb")]
+    CompactionAttach {
+        path: PathBuf,
+        source: duckdb::Error,
+    },
+    #[snafu(display("Failed to run COPY FROM DATABASE for {dataset}"))]
+    #[cfg(feature = "duckdb")]
+    CompactionCopy {
+        dataset: String,
+        source: duckdb::Error,
+    },
+    #[snafu(display("Compaction task panicked for {dataset}"))]
+    #[cfg(feature = "duckdb")]
+    CompactionJoin {
+        dataset: String,
+        source: tokio::task::JoinError,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -600,32 +631,93 @@ impl SnapshotManager {
     pub async fn create_snapshot(
         &self,
         schema: &SchemaRef,
+        lock_guard: OwnedMutexGuard<()>,
     ) -> Result<ObjectPath, SnapshotUploadError> {
         let start_time = Instant::now();
         let now = Utc::now();
+        let source_local_path = self.local_path.clone();
         let layout = SnapshotPathLayout::new(&self.dataset_name);
-        let location = layout.build_location(&self.snapshots_location, now);
-        let location_path = location.to_string();
-        let local_path = self.local_path.clone();
+        let destination_location = layout.build_location(&self.snapshots_location, now);
         let timestamp_ms = now.timestamp_millis();
 
         tracing::info!(
-            "Uploading snapshot. dataset={} snapshot={location}",
+            "Uploading snapshot. dataset={} snapshot={destination_location}",
             self.dataset_name
         );
 
-        let file = fs::File::open(&local_path).await.context(OpenLocalSnafu {
-            path: local_path.clone(),
+        // Step 1: Copy the database file locally (lock is held)
+        let temp_copy_path = source_local_path.with_extension("snapshot_tmp");
+        fs::copy(&source_local_path, &temp_copy_path)
+            .await
+            .context(CopyLocalSnafu {
+                source_path: source_local_path.clone(),
+                dest_path: temp_copy_path.clone(),
+            })?;
+
+        // Step 2: Release the lock - queries can resume
+        drop(lock_guard);
+        tracing::debug!("Lock released after file copy. dataset={}", self.dataset_name);
+
+        // Step 3: Compact if DuckDB, otherwise use the copy directly
+        let final_source_local_path = self.prepare_upload_file(&temp_copy_path).await?;
+
+        // Step 4: Upload the file
+        let upload_result = self
+            .upload_snapshot_file(&final_source_local_path, &destination_location)
+            .await;
+
+        // Step 5: Cleanup temp files
+        let _ = fs::remove_file(&temp_copy_path).await;
+        if final_source_local_path != temp_copy_path {
+            let _ = fs::remove_file(&final_source_local_path).await;
+        }
+
+        let (total_bytes, checksum) = upload_result?;
+
+        self.update_metadata_after_upload(
+            &destination_location,
+            checksum.clone(),
+            total_bytes,
+            timestamp_ms,
+            schema,
+        ).await?;
+
+        let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        metrics::record_write_metrics(
+            &self.dataset_name,
+            timestamp_ms / 1000,
+            duration_ms,
+            total_bytes,
+            &checksum,
+        );
+
+        tracing::info!(
+            "Snapshot uploaded. dataset={} snapshot={destination_location} size={total_bytes} sha={checksum}",
+            self.dataset_name,
+        );
+
+        Ok(destination_location)
+    }
+    /// Uploads a file to object storage, returning (size, checksum).
+    async fn upload_snapshot_file(
+        &self,
+        source_local_path: &PathBuf,
+        destination_location: &ObjectPath,
+    ) -> Result<(u64, String), SnapshotUploadError> {
+        let destination_location_path = destination_location.to_string();
+
+        let file = fs::File::open(source_local_path).await.context(OpenLocalSnafu {
+            path: source_local_path.clone(),
         })?;
 
         let mut reader = BufReader::with_capacity(SNAPSHOT_MULTIPART_CHUNK_SIZE, file);
 
         let mut upload =
             self.object_store
-                .put_multipart(&location)
+                .put_multipart(&destination_location)
                 .await
                 .context(StartUploadSnafu {
-                    path: location_path.clone(),
+                    path: destination_location_path.clone(),
                 })?;
 
         let mut buffer = BytesMut::with_capacity(SNAPSHOT_MULTIPART_CHUNK_SIZE);
@@ -647,21 +739,21 @@ impl SnapshotManager {
                     }
                     Err(source) => {
                         tracing::error!(
-                            "Failed to read local snapshot file while uploading. dataset={} snapshot={location} error={source}",
+                            "Failed to read local snapshot file. dataset={} snapshot={destination_location} error={source}",
                             self.dataset_name
                         );
                         if let Err(abort_source) = upload.abort().await {
                             tracing::warn!(
-                                "Failed to abort snapshot upload after read failure. dataset={} snapshot={location} error={abort_source}",
+                                "Failed to abort snapshot upload after read failure. dataset={} snapshot={destination_location} error={abort_source}",
                                 self.dataset_name
                             );
                             return Err(SnapshotUploadError::AbortUpload {
-                                path: location_path.clone(),
+                                path: destination_location_path.clone(),
                                 source: abort_source,
                             });
                         }
                         return Err(SnapshotUploadError::ReadLocal {
-                            path: local_path,
+                            path: source_local_path.clone(),
                             source,
                         });
                     }
@@ -677,21 +769,21 @@ impl SnapshotManager {
 
             if let Err(source) = upload.put_part(chunk.into()).await {
                 tracing::error!(
-                    "Snapshot upload part failed. dataset={} snapshot={location} error={source}",
+                    "Snapshot upload part failed. dataset={} snapshot={destination_location} error={source}",
                     self.dataset_name
                 );
                 if let Err(abort_source) = upload.abort().await {
                     tracing::warn!(
-                        "Failed to abort snapshot upload after part failure. dataset={} snapshot={location} error={abort_source}",
+                        "Failed to abort snapshot upload after part failure. dataset={} snapshot={destination_location} error={abort_source}",
                         self.dataset_name
                     );
                     return Err(SnapshotUploadError::AbortUpload {
-                        path: location_path.clone(),
+                        path: destination_location_path.clone(),
                         source: abort_source,
                     });
                 }
                 return Err(SnapshotUploadError::UploadPart {
-                    path: location_path.clone(),
+                    path: destination_location_path.to_string(),
                     source,
                 });
             }
@@ -701,53 +793,120 @@ impl SnapshotManager {
             Ok(_) => {
                 let checksum_bytes = hasher.finalize();
                 let checksum = encode_hex_lower(checksum_bytes.as_ref());
-
-                self.update_metadata_after_upload(
-                    &location,
-                    checksum.clone(),
-                    total_bytes,
-                    timestamp_ms,
-                    schema,
-                )
-                .await?;
-
-                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-                metrics::record_write_metrics(
-                    &self.dataset_name,
-                    timestamp_ms / 1000,
-                    duration_ms,
-                    total_bytes,
-                    &checksum,
-                );
-
-                tracing::info!(
-                    "Snapshot uploaded. dataset={} snapshot={location} size={total_bytes} sha={checksum}",
-                    self.dataset_name,
-                    checksum = checksum.as_str(),
-                );
-                Ok(location)
+                Ok((total_bytes, checksum))
             }
             Err(source) => {
                 tracing::error!(
-                    "Failed to finalize snapshot upload. dataset={} snapshot={location} error={source}",
+                    "Failed to finalize snapshot upload. dataset={} snapshot={destination_location} error={source}",
                     self.dataset_name
                 );
                 if let Err(abort_source) = upload.abort().await {
                     tracing::warn!(
-                        "Failed to abort snapshot upload after completion failure. dataset={} snapshot={location} error={abort_source}",
+                        "Failed to abort upload after completion failure. dataset={} error={abort_source}",
                         self.dataset_name
                     );
                     return Err(SnapshotUploadError::AbortUpload {
-                        path: location_path,
+                        path: destination_location_path,
                         source: abort_source,
                     });
                 }
                 Err(SnapshotUploadError::CompleteUpload {
-                    path: location_path,
+                    path: destination_location_path.to_string(),
                     source,
                 })
             }
         }
+    }
+
+    /// Prepares the file for upload, running compaction for DuckDB.
+    async fn prepare_upload_file(
+        &self,
+        source_path: &PathBuf,
+    ) -> Result<PathBuf, SnapshotUploadError> {
+        match self.engine {
+            #[cfg(feature = "duckdb")]
+            AccelerationEngine::DuckDB => {
+                let compacted_path = source_path.with_extension("compacted");
+                self.compact_duckdb(source_path, &compacted_path).await?;
+                Ok(compacted_path)
+            }
+            _ => Ok(source_path.clone()),
+        }
+    }
+
+    /// Compacts a DuckDB database using COPY FROM DATABASE.
+    #[cfg(feature = "duckdb")]
+    async fn compact_duckdb(&self, source: &PathBuf, dest: &PathBuf) -> Result<(), SnapshotUploadError> {
+        let source = source.clone();
+        let dest = dest.clone();
+        let dest_for_metrics = dest.clone();
+        let dataset_name = self.dataset_name.clone();
+
+        tracing::info!("Compacting DuckDB snapshot. dataset={dataset_name}");
+        let start = Instant::now();
+
+        let source_size = fs::metadata(&source)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        tokio::task::spawn_blocking(move || {
+            // Remove destination if it exists
+            let _ = std::fs::remove_file(&dest);
+
+            // Open DuckDB in-memory, attach source as read-only and dest for writing
+            let conn = duckdb::Connection::open_in_memory().map_err(|e| {
+                SnapshotUploadError::CompactionConnect {
+                    path: source.clone(),
+                    source: e,
+                }
+            })?;
+
+            let source_str = source.to_string_lossy();
+            conn.execute(
+                &format!("ATTACH '{source_str}' AS source (READ_ONLY)"),
+                [],
+            )
+                .map_err(|e| SnapshotUploadError::CompactionAttach {
+                    path: source.clone(),
+                    source: e,
+                })?;
+
+            let dest_str = dest.to_string_lossy();
+            conn.execute(&format!("ATTACH '{dest_str}' AS dest"), [])
+                .map_err(|e| SnapshotUploadError::CompactionAttach {
+                    path: dest.clone(),
+                    source: e,
+                })?;
+
+            conn.execute("COPY FROM DATABASE source TO dest", [])
+                .map_err(|e| SnapshotUploadError::CompactionCopy {
+                    dataset: dataset_name.clone(),
+                    source: e,
+                })?;
+
+            Ok::<_, SnapshotUploadError>(())
+        })
+            .await
+            .map_err(|e| SnapshotUploadError::CompactionJoin {
+                dataset: self.dataset_name.clone(),
+                source: e,
+            })??;
+
+        let dest_size = fs::metadata(&dest_for_metrics).await.map(|m| m.len()).unwrap_or(0);
+        let reduction_pct = if source_size > 0 {
+            (1.0 - (dest_size as f64 / source_size as f64)) * 100.0
+        } else {
+            0.0
+        };
+
+        tracing::info!(
+            "DuckDB compaction complete. dataset={} duration={:?} source_size={source_size} dest_size={dest_size} reduction={reduction_pct:.1}%",
+            self.dataset_name,
+            start.elapsed()
+        );
+
+        Ok(())
     }
 
     /// Attempts to download the latest snapshot, returning details if successful.
