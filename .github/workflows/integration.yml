@@ -129,6 +129,7 @@ jobs:
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
+          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       # Build the test binaries without running tests
@@ -240,6 +241,7 @@ jobs:
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
+          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Login to ACR
@@ -392,7 +394,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04 # Test on 22.04 for compatibility
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -411,6 +413,7 @@ jobs:
 
       - name: Install Nextest
         run: |
+          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Login to ACR
@@ -435,7 +438,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04 # Test on 22.04 for compatibility
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -454,6 +457,7 @@ jobs:
 
       - name: Install Nextest
         run: |
+          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Login to ACR
@@ -501,6 +505,7 @@ jobs:
 
       - name: Install Nextest
         run: |
+          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run data components integration test
@@ -515,7 +520,7 @@ jobs:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04 # Test on 22.04 for compatibility
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -533,6 +538,7 @@ jobs:
 
       - name: Install Nextest
         run: |
+          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Login to ACR
@@ -552,7 +558,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst
-      
+
       - name: Configure Git
         if: github.event.inputs.update_snapshots == 'always'
         run: |
