@@ -37,6 +37,10 @@ jobs:
         if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
+        uses: ./.github/actions/setup-cc
+
       - name: Build Cargo project
         if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: cargo build --manifest-path tools/spicepodschema/Cargo.toml

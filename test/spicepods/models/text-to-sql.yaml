@@ -1,0 +1,23 @@
+version: v1
+kind: Spicepod
+name: text-to-sql-oss
+# Spicepod for testing text-to-SQL models via the `testoperator run text-to-sql`.
+# Datasets are loaded externally via testoperator as spicepod dependencies.
+
+models:
+  - from: openai:gpt-4o-mini
+    name: gpt-4o-mini
+    params:
+      openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
+  - from: openai:o4-mini
+    name: o4-mini
+    params:
+      openai_api_key: ${secrets:SPICE_OPENAI_API_KEY}
+  - from: anthropic:claude-sonnet-4-5-20250929
+    name: claude-sonnet-4-5
+    params:
+      anthropic_api_key: ${secrets:SPICE_ANTHROPIC_API_KEY}
+  - from: xai:grok-4-1-fast-non-reasoning
+    name: grok41
+    params:
+      xai_api_key: ${secrets:SPICE_XAI_API_KEY}
