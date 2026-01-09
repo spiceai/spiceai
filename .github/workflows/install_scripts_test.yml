@@ -474,7 +474,7 @@ jobs:
         run: |
           $userPath = [Environment]::GetEnvironmentVariable("PATH", [EnvironmentVariableTarget]::User)
           $spiceBinDir = Join-Path $HOME ".spice\bin"
-          
+
           if ($userPath -like "*$spiceBinDir*") {
             Write-Host "✓ PATH was updated to include $spiceBinDir"
           } else {
@@ -550,7 +550,7 @@ jobs:
           # Install and run PSScriptAnalyzer
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
           $results = Invoke-ScriptAnalyzer -Path .\install\Install.ps1 -Severity Error
-          
+
           if ($results.Count -gt 0) {
             Write-Warning "PSScriptAnalyzer found issues:"
             $results | Format-Table -AutoSize

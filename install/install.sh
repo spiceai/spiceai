@@ -132,10 +132,10 @@ getLatestRelease() {
 downloadFile() {
     LATEST_RELEASE_TAG=$1
 
-    # Build artifact name based on OS
-    # Asset naming convention:
-    #   Unix:    spice_{os}_{arch}.tar.gz
-    #   Windows: spice.exe_{os}_{arch}.tar.gz
+    # Build artifact name
+    # Asset naming convention: spice_{os}_{arch}.tar.gz
+    # Note: This script only supports Unix systems (Linux/macOS).
+    #       Windows uses Install.ps1 which downloads spice.exe_{os}_{arch}.tar.gz
     local artifact_name="${SPICE_CLI_FILENAME}"
 
     SPICE_CLI_ARTIFACT="${artifact_name}_${OS}_${ARCH}.tar.gz"
