@@ -84,10 +84,10 @@ SELECT
     COALESCE(l.llm_output_tokens, 0) AS llm_output_tokens,
     COALESCE(ls.generated_sql, '') AS generated_sql
 FROM sql_stats s
-CROSS JOIN llm_stats l
 LEFT JOIN last_sql ls ON 1=1
+LEFT JOIN llm_stats l ON 1=1
 ",
-        Duration::from_secs(10),
+        Duration::from_secs(15),
     )
     .await;
 
