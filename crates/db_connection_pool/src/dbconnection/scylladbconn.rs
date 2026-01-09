@@ -451,8 +451,7 @@ fn convert_cqlvalue_rows_to_record_batch(
                         if let CqlValue::Decimal(decimal) = value {
                             let (bytes, source_scale) =
                                 decimal.as_signed_be_bytes_slice_and_exponent();
-                            if let Some(mantissa) =
-                                cql_decimal_to_i128(bytes, source_scale, *scale)
+                            if let Some(mantissa) = cql_decimal_to_i128(bytes, source_scale, *scale)
                             {
                                 builder.append_value(mantissa);
                             } else {
