@@ -145,6 +145,9 @@ jobs:
             exit 1
           fi
 
+          echo "testoperator run text-to-sql  \n  --ready-wait 1800 \n  $QUERYSET_ARG \n
+            $SPICEPOD_DEPENDE2NCY \n  $LIMIT_ARG \n  $CONFIG_NAME_ARG \n  -d /opt/spiced/data \n  --model ${{ github.event.inputs.model_name }} \n  -p ${{ github.event.inputs.spicepod_path }}"
+
           testoperator run text-to-sql \
             --ready-wait 1800 \
             $QUERYSET_ARG \
