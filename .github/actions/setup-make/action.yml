@@ -1,5 +1,9 @@
 name: Installs the make tool
 description: 'composite action'
+inputs:
+  os:
+    description: 'Operating system to install make for (deprecated - auto-detected)'
+    default: '' # Auto-detect from runner.os
 
 runs:
   using: 'composite'

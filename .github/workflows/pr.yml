@@ -77,7 +77,6 @@ jobs:
     runs-on: spiceai-macos
     env:
       GOVER: 1.25.5
-      RUSTC_WRAPPER: sccache
     needs: check_changes
 
     steps:
