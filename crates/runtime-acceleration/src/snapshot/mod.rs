@@ -38,13 +38,13 @@ use serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
+use tokio::sync::OwnedMutexGuard;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     runtime::Handle,
     sync::RwLock,
 };
-use tokio::sync::OwnedMutexGuard;
 use url::Url;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 
@@ -548,7 +548,7 @@ impl SnapshotManager {
         dataset_name: String,
         snapshots: SnapshotBehavior,
         local_path: PathBuf,
-        engine: AccelerationEngine
+        engine: AccelerationEngine,
     ) -> Option<Self> {
         let (snapshot_config, secrets, io_runtime) = match snapshots {
             SnapshotBehavior::Disabled => {
@@ -656,7 +656,10 @@ impl SnapshotManager {
 
         // Step 2: Release the lock - queries can resume
         drop(lock_guard);
-        tracing::debug!("Lock released after file copy. dataset={}", self.dataset_name);
+        tracing::debug!(
+            "Lock released after file copy. dataset={}",
+            self.dataset_name
+        );
 
         // Step 3: Compact if DuckDB, otherwise use the copy directly
         let final_source_local_path = self.prepare_upload_file(&temp_copy_path).await?;
@@ -680,7 +683,8 @@ impl SnapshotManager {
             total_bytes,
             timestamp_ms,
             schema,
-        ).await?;
+        )
+        .await?;
 
         let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         metrics::record_write_metrics(
@@ -706,19 +710,21 @@ impl SnapshotManager {
     ) -> Result<(u64, String), SnapshotUploadError> {
         let destination_location_path = destination_location.to_string();
 
-        let file = fs::File::open(source_local_path).await.context(OpenLocalSnafu {
-            path: source_local_path.clone(),
-        })?;
+        let file = fs::File::open(source_local_path)
+            .await
+            .context(OpenLocalSnafu {
+                path: source_local_path.clone(),
+            })?;
 
         let mut reader = BufReader::with_capacity(SNAPSHOT_MULTIPART_CHUNK_SIZE, file);
 
-        let mut upload =
-            self.object_store
-                .put_multipart(&destination_location)
-                .await
-                .context(StartUploadSnafu {
-                    path: destination_location_path.clone(),
-                })?;
+        let mut upload = self
+            .object_store
+            .put_multipart(&destination_location)
+            .await
+            .context(StartUploadSnafu {
+                path: destination_location_path.clone(),
+            })?;
 
         let mut buffer = BytesMut::with_capacity(SNAPSHOT_MULTIPART_CHUNK_SIZE);
         let mut eof = false;
@@ -836,7 +842,11 @@ impl SnapshotManager {
 
     /// Compacts a DuckDB database using COPY FROM DATABASE.
     #[cfg(feature = "duckdb")]
-    async fn compact_duckdb(&self, source: &PathBuf, dest: &PathBuf) -> Result<(), SnapshotUploadError> {
+    async fn compact_duckdb(
+        &self,
+        source: &PathBuf,
+        dest: &PathBuf,
+    ) -> Result<(), SnapshotUploadError> {
         let source = source.clone();
         let dest = dest.clone();
         let dest_for_metrics = dest.clone();
@@ -845,10 +855,7 @@ impl SnapshotManager {
         tracing::info!("Compacting DuckDB snapshot. dataset={dataset_name}");
         let start = Instant::now();
 
-        let source_size = fs::metadata(&source)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let source_size = fs::metadata(&source).await.map(|m| m.len()).unwrap_or(0);
 
         tokio::task::spawn_blocking(move || {
             // Remove destination if it exists
@@ -863,10 +870,7 @@ impl SnapshotManager {
             })?;
 
             let source_str = source.to_string_lossy();
-            conn.execute(
-                &format!("ATTACH '{source_str}' AS source (READ_ONLY)"),
-                [],
-            )
+            conn.execute(&format!("ATTACH '{source_str}' AS source (READ_ONLY)"), [])
                 .map_err(|e| SnapshotUploadError::CompactionAttach {
                     path: source.clone(),
                     source: e,
@@ -887,13 +891,16 @@ impl SnapshotManager {
 
             Ok::<_, SnapshotUploadError>(())
         })
-            .await
-            .map_err(|e| SnapshotUploadError::CompactionJoin {
-                dataset: self.dataset_name.clone(),
-                source: e,
-            })??;
+        .await
+        .map_err(|e| SnapshotUploadError::CompactionJoin {
+            dataset: self.dataset_name.clone(),
+            source: e,
+        })??;
 
-        let dest_size = fs::metadata(&dest_for_metrics).await.map(|m| m.len()).unwrap_or(0);
+        let dest_size = fs::metadata(&dest_for_metrics)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         let reduction_pct = if source_size > 0 {
             (1.0 - (dest_size as f64 / source_size as f64)) * 100.0
         } else {

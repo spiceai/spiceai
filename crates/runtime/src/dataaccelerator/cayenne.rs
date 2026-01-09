@@ -1782,7 +1782,13 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            download_snapshot_if_needed(acceleration, source, path_buf, AccelerationEngine::Cayenne).await;
+            download_snapshot_if_needed(
+                acceleration,
+                source,
+                path_buf,
+                AccelerationEngine::Cayenne,
+            )
+            .await;
         }
 
         Ok(())

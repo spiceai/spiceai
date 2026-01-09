@@ -19,7 +19,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
-use crate::accelerated_table::{self, AcceleratedTableBuilderError, SnapshotCreationConfig, SnapshotCreateTrigger};
+use crate::accelerated_table::{
+    self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
+};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
@@ -76,6 +78,7 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotManager};
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
@@ -87,7 +90,6 @@ use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotManager};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -1224,9 +1226,14 @@ impl DataFusion {
                 acceleration_settings.snapshot_behavior.clone(),
                 snapshot_path.clone(),
                 acceleration_engine,
-            ).await {
+            )
+            .await
+            {
                 // TODO: Proper trigger initialization
-                let snapshot_config = SnapshotCreationConfig::new(Arc::new(snapshot_manager), snapshot_creation_trigger);
+                let snapshot_config = SnapshotCreationConfig::new(
+                    Arc::new(snapshot_manager),
+                    snapshot_creation_trigger,
+                );
                 accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
             }
         }

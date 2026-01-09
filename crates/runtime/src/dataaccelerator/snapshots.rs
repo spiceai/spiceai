@@ -16,12 +16,6 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
-use runtime_acceleration::{
-    dataset_checkpoint::make_checkpointer_factory,
-    snapshot::{SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
-};
-use snafu::ResultExt;
-use runtime_acceleration::snapshot::AccelerationEngine;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
@@ -29,6 +23,12 @@ use crate::{
         spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     },
 };
+use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_acceleration::{
+    dataset_checkpoint::make_checkpointer_factory,
+    snapshot::{SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
+};
+use snafu::ResultExt;
 
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,

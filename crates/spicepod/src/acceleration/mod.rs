@@ -14,17 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "schemars")]
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt::Display};
-use std::time::Duration;
 use crate::{
     component::dataset::ReadyState,
     metric::Metrics,
     param::Params,
     partitioning::{PartitionedBy, deserialize_partition_by},
 };
+#[cfg(feature = "schemars")]
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use std::{collections::HashMap, fmt::Display};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]

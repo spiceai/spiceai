@@ -21,9 +21,9 @@ use std::sync::{Arc, Weak};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{metrics, SnapshotCreationConfig, SnapshotCreateTrigger};
 use super::refresh_task_runner::RefreshTaskRunner;
 use super::synchronized_table::SynchronizedTable;
+use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
@@ -577,7 +577,10 @@ impl Refresher {
         self
     }
 
-    pub fn with_snapshot_creation_config(&mut self, snapshot_config: Option<SnapshotCreationConfig>) -> &mut Self {
+    pub fn with_snapshot_creation_config(
+        &mut self,
+        snapshot_config: Option<SnapshotCreationConfig>,
+    ) -> &mut Self {
         self.snapshot_config = snapshot_config;
         self
     }
@@ -655,7 +658,10 @@ impl Refresher {
         };
 
         let (snapshot_manager, snapshot_trigger) = match self.snapshot_config.as_ref() {
-            Some(SnapshotCreationConfig {manager, create_trigger}) => (Some(Arc::clone(manager)), Some(create_trigger)),
+            Some(SnapshotCreationConfig {
+                manager,
+                create_trigger,
+            }) => (Some(Arc::clone(manager)), Some(create_trigger)),
             None => (None, None),
         };
 
@@ -671,32 +677,31 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                let (snapshot_interval_task, on_batch_process_callback) =
-                    match snapshot_trigger {
-                        None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
-                        Some(SnapshotCreateTrigger::Interval(duration)) => (
-                            spawn_snapshot_interval_task(
-                                Some(duration.clone()),
-                                checkpointer.clone(),
-                                snapshot_manager.clone(),
-                                Arc::clone(&self.accelerator_write_mutex),
-                                dataset_name.clone(),
-                                Arc::clone(&federated_schema),
-                            ),
-                            None,
+                let (snapshot_interval_task, on_batch_process_callback) = match snapshot_trigger {
+                    None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
+                    Some(SnapshotCreateTrigger::Interval(duration)) => (
+                        spawn_snapshot_interval_task(
+                            Some(duration.clone()),
+                            checkpointer.clone(),
+                            snapshot_manager.clone(),
+                            Arc::clone(&self.accelerator_write_mutex),
+                            dataset_name.clone(),
+                            Arc::clone(&federated_schema),
                         ),
-                        Some(SnapshotCreateTrigger::Batches(batches)) => (
-                            None,
-                            create_periodic_snapshot_callback(
-                                *batches,
-                                checkpointer.clone(),
-                                snapshot_manager,
-                                Arc::clone(&self.accelerator_write_mutex),
-                                &self.dataset_name,
-                                self.federated.schema(),
-                            ),
+                        None,
+                    ),
+                    Some(SnapshotCreateTrigger::Batches(batches)) => (
+                        None,
+                        create_periodic_snapshot_callback(
+                            *batches,
+                            checkpointer.clone(),
+                            snapshot_manager,
+                            Arc::clone(&self.accelerator_write_mutex),
+                            &self.dataset_name,
+                            self.federated.schema(),
                         ),
-                    };
+                    ),
+                };
                 self.snapshot_interval_task = snapshot_interval_task;
 
                 return Ok(Some(
@@ -747,23 +752,21 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
 
-        let (snapshot_interval_task, create_snapshot_after_refresh) =
-            match snapshot_trigger {
-                None | Some(SnapshotCreateTrigger::Batches(_))  => (None, false),
-                Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
-                Some(SnapshotCreateTrigger::Interval(duration)) => (
-                    spawn_snapshot_interval_task(
-                        Some(duration.clone()),
-                        checkpointer.clone(),
-                        snapshot_manager.clone(),
-                        Arc::clone(&self.accelerator_write_mutex),
-                        dataset_name.clone(),
-                        Arc::clone(&federated_schema),
-                    ),
-                    false,
+        let (snapshot_interval_task, create_snapshot_after_refresh) = match snapshot_trigger {
+            None | Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
+            Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
+            Some(SnapshotCreateTrigger::Interval(duration)) => (
+                spawn_snapshot_interval_task(
+                    Some(duration.clone()),
+                    checkpointer.clone(),
+                    snapshot_manager.clone(),
+                    Arc::clone(&self.accelerator_write_mutex),
+                    dataset_name.clone(),
+                    Arc::clone(&federated_schema),
                 ),
-
-            };
+                false,
+            ),
+        };
         self.snapshot_interval_task = snapshot_interval_task;
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
@@ -967,7 +970,8 @@ fn spawn_snapshot_interval_task(
                 &federated_schema,
                 &accelerator_write_mutex,
                 &dataset_name,
-            ).await;
+            )
+            .await;
 
             sleep(interval).await;
         }
@@ -1014,7 +1018,8 @@ fn create_periodic_snapshot_callback(
                             &federated_schema,
                             &accelerator_write_mutex,
                             &dataset_name,
-                        ).await;
+                        )
+                        .await;
                     }
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>
             })
@@ -1040,7 +1045,10 @@ async fn create_checkpoint_and_snapshot(
     }
 
     if let Some(snapshot_manager) = snapshot_manager {
-        if let Err(e) = snapshot_manager.create_snapshot(&federated_schema, _lock_guard).await {
+        if let Err(e) = snapshot_manager
+            .create_snapshot(&federated_schema, _lock_guard)
+            .await
+        {
             let dataset_label = dataset_name.to_string();
             snapshot_metrics::record_snapshot_failure(&dataset_label);
             tracing::warn!("Failed to create snapshot for dataset {dataset_name}: {e}");

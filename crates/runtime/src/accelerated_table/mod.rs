@@ -283,7 +283,10 @@ pub struct SnapshotCreationConfig {
 
 impl SnapshotCreationConfig {
     pub fn new(manager: Arc<SnapshotManager>, create_trigger: SnapshotCreateTrigger) -> Self {
-        Self { manager, create_trigger }
+        Self {
+            manager,
+            create_trigger,
+        }
     }
 }
 
@@ -488,7 +491,10 @@ impl Builder {
     }
 
     /// Configure whether snapshots are taken of the accelerated table after refreshes.
-    pub fn snapshot_creation_config(&mut self, snapshot_config: Option<SnapshotCreationConfig>) -> &mut Self {
+    pub fn snapshot_creation_config(
+        &mut self,
+        snapshot_config: Option<SnapshotCreationConfig>,
+    ) -> &mut Self {
         self.snapshot_creation_config = snapshot_config;
         self
     }
@@ -640,9 +646,7 @@ impl Builder {
             refresher.semaphore(semaphore);
         }
 
-        refresher.with_snapshot_creation_config(
-            self.snapshot_creation_config,
-        );
+        refresher.with_snapshot_creation_config(self.snapshot_creation_config);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
