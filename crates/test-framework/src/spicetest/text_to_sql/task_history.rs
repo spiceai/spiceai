@@ -135,15 +135,13 @@ LEFT JOIN llm_stats l ON 1=1
     let llm_input_tokens = rb
         .column_by_name("llm_input_tokens")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .map(|a| a.value(0) as u64)
-        .unwrap_or(0);
+        .map_or(0, |a| a.value(0) as u64);
 
     #[expect(clippy::cast_sign_loss)]
     let llm_output_tokens = rb
         .column_by_name("llm_output_tokens")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .map(|a| a.value(0) as u64)
-        .unwrap_or(0);
+        .map_or(0, |a| a.value(0) as u64);
 
     let generated_sql = rb
         .column_by_name("generated_sql")

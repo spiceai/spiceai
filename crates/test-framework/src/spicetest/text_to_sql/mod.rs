@@ -202,6 +202,11 @@ impl SpiceTest<Completed> {
 
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
             let index = ((values.len() - 1) as f64 * percentile / 100.0).round() as usize;
             values[index]
         })
@@ -219,17 +224,17 @@ impl SpiceTest<Completed> {
         1000.0 * self.percentile(|result| result.duration.as_secs_f32(), 50.0)
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn get_average_attempts_metric(&self) -> f64 {
         self.mean(|result| result.query_count as f64)
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn get_mean_sql_query_count(&self) -> f64 {
         self.mean(|result| result.query_count as f64)
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn get_mean_llm_input_tokens(&self) -> f64 {
         self.mean(|result| result.llm_input_tokens as f64)
     }
