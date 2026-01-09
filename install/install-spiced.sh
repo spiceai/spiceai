@@ -45,7 +45,7 @@ getSystemInfo() {
         amd64) ARCH="x86_64";;
     esac
 
-    OS=$(echo $(uname)|tr '[:upper:]' '[:lower:]')
+    OS=$(uname | tr '[:upper:]' '[:lower:]')
     
     # Handle MINGW/MSYS/Cygwin on Windows
     case "$OS" in
@@ -174,10 +174,10 @@ downloadFile() {
 
     # Build artifact name based on variant and OS
     # Asset naming convention:
-    #   Default:  spiced_{os}_{arch}.tar.gz  or  spiced.exe_{os}_{arch}.tar.gz (Windows)
-    #   Models:   spiced_models_{os}_{arch}.tar.gz  or  spiced.exe_models_{os}_{arch}.tar.gz (Windows)
-    #   Metal:    spiced_models_metal_{os}_{arch}.tar.gz
-    #   CUDA:     spiced_models_cuda_{version}_{os}_{arch}.tar.gz
+    #   No variant (VARIANT=""): spiced_{os}_{arch}.tar.gz  or  spiced.exe_{os}_{arch}.tar.gz (Windows)
+    #   Models (VARIANT="models", the default): spiced_models_{os}_{arch}.tar.gz  or  spiced.exe_models_{os}_{arch}.tar.gz (Windows)
+    #   Metal (VARIANT="metal"): spiced_models_metal_{os}_{arch}.tar.gz
+    #   CUDA (VARIANT="cuda"): spiced_models_cuda_{version}_{os}_{arch}.tar.gz
     local artifact_name="${SPICED_FILENAME}"
     
     # For Windows, .exe comes right after spiced
