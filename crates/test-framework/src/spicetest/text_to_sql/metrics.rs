@@ -217,7 +217,7 @@ impl TextToSqlMetric {
             question,
             generated_sql,
             expected_sql,
-            sql_query_count: sql_query_count,
+            sql_query_count,
             sample_data_enabled,
             return_sql,
             is_error,
