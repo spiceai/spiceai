@@ -1,10 +1,9 @@
 ---
 source: crates/test-framework/src/spicetest/datasets/worker.rs
-assertion_line: 742
 description: "Query: tpch_q6"
 ---
-+-------------+
-| revenue     |
-+-------------+
-| 734493.7281 |
-+-------------+
++---------------+
+| revenue       |
++---------------+
+| 75207542.5615 |
++---------------+

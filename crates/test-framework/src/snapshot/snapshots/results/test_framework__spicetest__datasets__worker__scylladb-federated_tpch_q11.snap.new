@@ -1,5 +1,6 @@
 ---
 source: crates/test-framework/src/spicetest/datasets/worker.rs
+assertion_line: 742
 description: "Query: tpch_q11"
 ---
 +------------+--------------------+
@@ -14,5 +15,5 @@ description: "Query: tpch_q11"
 | 9403       | 15451755.620000001 |
 | 154358     | 15212937.879999999 |
 | 38823      | 15064802.86        |
-| 85606      | 15053957.15        |
+| 85606      | 15053957.150000002 |
 +------------+--------------------+
