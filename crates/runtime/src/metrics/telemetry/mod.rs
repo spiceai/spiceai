@@ -86,6 +86,11 @@ static ROWS_RETURNED: LazyLock<Histogram<u64>> = LazyLock::new(|| {
         .with_description("Number of rows returned to query clients.")
         .with_boundaries(telemetry::ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec())
         .with_unit("rows")
+        .with_boundaries(vec![
+            0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0,
+            1000.0, 2500.0, 5000.0, 7500.0, 10000.0,
+            25000.0, 50000.0, 100000.0, 250000.0, 500000.0
+        ])
         .build()
 });
 
@@ -101,6 +106,11 @@ static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
             "The total amount of time spent planning and executing queries in milliseconds.",
         )
         .with_unit("ms")
+        .with_boundaries(vec![
+            0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0,
+            1000.0, 2500.0, 5000.0, 7500.0, 10000.0,
+            25000.0, 50000.0, 100000.0, 250000.0, 500000.0
+        ])
         .build()
 });
 
@@ -116,6 +126,11 @@ static QUERY_EXECUTION_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
             "The total amount of time spent only executing queries. This is 0 for cached queries.",
         )
         .with_unit("ms")
+        .with_boundaries(vec![
+            0.0, 100.0, 250.0, 500.0, 750.0,
+            1000.0, 2500.0, 5000.0, 7500.0, 10000.0,
+            25000.0, 50000.0, 100000.0, 250000.0, 500000.0
+        ])
         .build()
 });
 
