@@ -53,7 +53,7 @@ pub struct TextToSqlArgs {
     /// Limit the number of text-to-SQL operations to run.
     ///
     /// If `--return-sql` or `--sample-data-enabled` are set to `both`, the limit applies after the Cartesian product is taken.
-    #[arg(short('n'))]
+    #[arg(short('n'), long)]
     pub(crate) limit: Option<usize>,
 
     /// Unique name for the configured testoperator run. Used to identify/group runs in telemetry. If not provided, the `.name` from the spicepod will be used.
