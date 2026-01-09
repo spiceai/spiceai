@@ -1,0 +1,14 @@
+tests:
+  text_to_sql:
+    - model_name: grok4
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/nsql_bench_texttosql.yaml
+      queryset_file: test/nsql_bench/data/tpch_nsql_texttosql.jsonl
+    - model_name: claude-sonnet-4-5
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/nsql_bench_texttosql.yaml
+      queryset_file: test/nsql_bench/data/tpch_nsql_texttosql.jsonl
+    - model_name: gpt-4o-mini
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/nsql_bench_texttosql.yaml
+      queryset_file: test/nsql_bench/data/tpch_nsql_texttosql.jsonl

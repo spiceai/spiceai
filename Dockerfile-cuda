@@ -53,7 +53,7 @@ ARG CARGO_FEATURES
 RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
 
 RUN apt update \
-    && apt install --yes ca-certificates libssl3 --no-install-recommends \
+    && apt install --yes ca-certificates libssl3 tzdata --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
