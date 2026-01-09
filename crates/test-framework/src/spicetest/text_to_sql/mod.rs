@@ -217,11 +217,11 @@ impl SpiceTest<Completed> {
     }
 
     fn get_p95_response_time_metric(&self) -> f64 {
-        1000.0 * self.percentile(|result| result.duration.as_secs_f32(), 95.0)
+        1000.0 * self.percentile(|result| result.duration.as_secs_f64(), 95.0)
     }
 
     fn get_median_response_time_metric(&self) -> f64 {
-        1000.0 * self.percentile(|result| result.duration.as_secs_f32(), 50.0)
+        1000.0 * self.percentile(|result| result.duration.as_secs_f64(), 50.0)
     }
 
     #[expect(clippy::cast_precision_loss)]
@@ -239,7 +239,7 @@ impl SpiceTest<Completed> {
         self.mean(|result| result.llm_input_tokens as f64)
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn get_mean_llm_output_tokens(&self) -> f64 {
         self.mean(|result| result.llm_output_tokens as f64)
     }

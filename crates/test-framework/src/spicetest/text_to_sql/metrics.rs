@@ -56,7 +56,7 @@ impl ExtendedMetrics for TextToSqlMetric {
         vec![
             Field::new("generated_sql", DataType::Utf8, false),
             Field::new("expected_sql", DataType::Utf8, false),
-            Field::new("number_of_attempts", DataType::UInt64, false),
+            Field::new("sql_query_count", DataType::UInt64, false),
             Field::new("sample_data_enabled", DataType::Utf8, false),
             Field::new("return_sql", DataType::Utf8, false),
             Field::new("is_error", DataType::Utf8, false),
@@ -68,8 +68,8 @@ impl ExtendedMetrics for TextToSqlMetric {
             Field::new("llm_input_tokens", DataType::UInt64, false),
             Field::new("llm_output_tokens", DataType::UInt64, false),
             // Functional metrics
-            Field::new("exact_match", DataType::Float64, false),
-            Field::new("exact_logical_plan_match", DataType::Float64, false),
+            Field::new("exact_match", DataType::UInt64, false),
+            Field::new("exact_logical_plan_match", DataType::UInt64, false),
             Field::new("correct_tables", DataType::Float64, false),
             Field::new("correct_table_projections", DataType::Float64, false),
             Field::new("correct_output_schema", DataType::Float64, false),
@@ -87,7 +87,7 @@ impl ExtendedMetrics for TextToSqlMetric {
                 Builder::String(StringBuilder::new()),
             ),
             (
-                "number_of_attempts".to_string(),
+                "sql_query_count".to_string(),
                 Builder::UInt64(UInt64Builder::new()),
             ),
             (
@@ -117,6 +117,10 @@ impl ExtendedMetrics for TextToSqlMetric {
             ),
             (
                 "llm_count".to_string(),
+                Builder::UInt64(UInt64Builder::new()),
+            ),
+            (
+                "sql_query_count".to_string(),
                 Builder::UInt64(UInt64Builder::new()),
             ),
             (
@@ -155,10 +159,7 @@ impl ExtendedMetrics for TextToSqlMetric {
         Ok(vec![
             BuilderTarget::String(("generated_sql".to_string(), self.generated_sql.clone())),
             BuilderTarget::String(("expected_sql".to_string(), self.expected_sql.clone())),
-            BuilderTarget::UInt64((
-                "number_of_attempts".to_string(),
-                self.sql_query_count as u64,
-            )),
+            BuilderTarget::UInt64(("sql_query_count".to_string(), self.sql_query_count as u64)),
             BuilderTarget::String((
                 "sample_data_enabled".to_string(),
                 self.sample_data_enabled.to_string(),
@@ -197,7 +198,7 @@ impl TextToSqlMetric {
     pub fn new(
         generated_sql: String,
         expected_sql: String,
-        number_of_attempts: usize,
+        sql_query_count: usize,
         sample_data_enabled: bool,
         return_sql: bool,
         is_error: bool,
@@ -213,7 +214,7 @@ impl TextToSqlMetric {
         Self {
             generated_sql,
             expected_sql,
-            sql_query_count: number_of_attempts,
+            sql_query_count: sql_query_count,
             sample_data_enabled,
             return_sql,
             is_error,

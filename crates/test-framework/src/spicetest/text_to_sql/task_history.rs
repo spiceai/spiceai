@@ -35,7 +35,7 @@ pub(crate) struct TaskHistoryMetrics {
 
 /// Fetches metrics from `runtime.task_history` for the most recent nsql operation.
 ///
-/// Returns: `(sql_count, generated_sql, task_history_metrics)`
+/// Returns: `(generated_sql, task_history_metrics)`
 pub(super) async fn find_task_history_metrics(
     spice_client: &spiceai::Client,
 ) -> Result<(Option<String>, TaskHistoryMetrics)> {
@@ -60,7 +60,7 @@ sql_stats AS (
 llm_stats AS (
     SELECT
         COUNT(*) AS llm_count,
-        SUM(execution_duration_ms) AS llm_duration_ms,
+        COALESCE(SUM(execution_duration_ms), 0) AS llm_duration_ms,
         SUM(CAST(COALESCE(labels['prompt_tokens'], '0') AS BIGINT)) AS llm_input_tokens,
         SUM(CAST(COALESCE(labels['completion_tokens'], '0') AS BIGINT)) AS llm_output_tokens
     FROM runtime.task_history
@@ -108,28 +108,24 @@ LEFT JOIN llm_stats l ON 1=1
     let sql_count = rb
         .column_by_name("sql_count")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .map(|a| a.value(0) as usize)
-        .unwrap_or(0);
+        .map_or(0, |a| a.value(0) as usize);
 
     let sql_duration_ms = rb
         .column_by_name("sql_duration_ms")
         .and_then(|c| c.as_any().downcast_ref::<arrow::array::Float64Array>())
-        .map(|a| a.value(0))
-        .unwrap_or(0.0);
+        .map_or(0.0, |a| a.value(0));
 
     #[expect(clippy::cast_possible_truncation)]
     #[expect(clippy::cast_sign_loss)]
     let llm_count = rb
         .column_by_name("llm_count")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .map(|a| a.value(0) as usize)
-        .unwrap_or(0);
+        .map_or(0, |a| a.value(0) as usize);
 
     let llm_duration_ms = rb
         .column_by_name("llm_duration_ms")
         .and_then(|c| c.as_any().downcast_ref::<arrow::array::Float64Array>())
-        .map(|a| a.value(0))
-        .unwrap_or(0.0);
+        .map_or(0.0, |a| a.value(0));
 
     #[expect(clippy::cast_sign_loss)]
     let llm_input_tokens = rb
