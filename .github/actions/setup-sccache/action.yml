@@ -1,16 +1,16 @@
 name: Setup sccache
-description: "composite action"
+description: 'composite action'
 
 inputs:
   minio_endpoint:
-    description: "MinIO endpoint"
+    description: 'MinIO endpoint'
     required: true
     type: string
   os:
-    description: "Operating system to set up the toolchain for"
-    default: "linux" # 'linux', 'darwin', 'windows'
+    description: 'Operating system to set up the toolchain for'
+    default: 'linux' # 'linux', 'darwin', 'windows'
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     - name: Set up sccache
       if: inputs.os == 'linux'
@@ -29,3 +29,4 @@ runs:
         server_side_encryption = false
         no_credentials = false
         region = "us-east-1"
+        EOF

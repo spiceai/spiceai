@@ -301,6 +301,18 @@ fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize 
         .unwrap_or(default)
 }
 
+/// Returns true if the path is a local filesystem path (not a remote object store).
+///
+/// Local paths include:
+/// - Absolute paths: `/data/cayenne`
+/// - Relative paths: `./data`
+/// - file:// URIs: `file:///data/cayenne`
+///
+/// Remote paths (S3, etc.) return false.
+fn is_local_path(path: &str) -> bool {
+    !path.contains("://") || path.starts_with("file://")
+}
+
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -380,6 +392,33 @@ impl CayenneAccelerator {
 
     fn resolve_default_data_path(dataset_name: &str) -> String {
         format!("{}/{dataset_name}/", spice_data_base_path())
+    }
+
+    /// Resolves the metadata directory for Cayenne catalog storage.
+    ///
+    /// Priority order:
+    /// 1. `cayenne_metadata_dir` - Explicit custom metadata directory
+    /// 2. `{cayenne_file_path}/metadata` - When `cayenne_file_path` is a local path (not S3)
+    /// 3. `{spice_data_base_path()}/metadata` - Default location
+    ///
+    /// Note: S3 paths are excluded because `SQLite` (used for metadata catalog) cannot run on object storage.
+    fn resolve_metadata_dir(acceleration: Option<&Acceleration>) -> String {
+        let Some(accel) = acceleration else {
+            return format!("{}/metadata", spice_data_base_path());
+        };
+
+        if let Some(custom_dir) = accel.params.get("cayenne_metadata_dir") {
+            return custom_dir.clone();
+        }
+
+        if let Some(file_path) = accel.params.get("cayenne_file_path")
+            && is_local_path(file_path)
+        {
+            let base = file_path.trim_end_matches('/');
+            return format!("{base}/metadata");
+        }
+
+        format!("{}/metadata", spice_data_base_path())
     }
 
     /// Returns true if the path is an S3 Express One Zone path.
@@ -1423,27 +1462,13 @@ impl CayenneAccelerator {
 
         tracing::debug!("create_cayenne_table_provider: starting for table {table_name}");
 
-        // Get metastore type and custom metadata directory if provided
-        let (metadata_dir, metastore_type) = if let Some(acceleration) = source.acceleration() {
-            let metadata_dir =
-                if let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir") {
-                    custom_dir.clone()
-                } else {
-                    format!("{}/metadata", crate::spice_data_base_path())
-                };
-
-            let metastore_type = acceleration
-                .params
-                .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str);
-
-            (metadata_dir, metastore_type.to_string())
-        } else {
-            (
-                format!("{}/metadata", crate::spice_data_base_path()),
-                "sqlite".to_string(),
-            )
-        };
+        // Get metastore type and metadata directory
+        let acceleration = source.acceleration();
+        let metadata_dir = Self::resolve_metadata_dir(acceleration);
+        let metastore_type = acceleration
+            .and_then(|a| a.params.get("cayenne_metastore"))
+            .map_or("sqlite", String::as_str)
+            .to_string();
 
         // Ensure metadata directory exists
         std::fs::create_dir_all(&metadata_dir).map_err(|e| Error::AccelerationCreationFailed {
@@ -1917,15 +1942,7 @@ impl DataAccelerator for CayenneAccelerator {
             })?;
 
             // Get metadata catalog for partition tracking
-            let metadata_dir = if let Some(acceleration) = source.acceleration() {
-                if let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir") {
-                    custom_dir.clone()
-                } else {
-                    format!("{}/metadata", crate::spice_data_base_path())
-                }
-            } else {
-                format!("{}/metadata", crate::spice_data_base_path())
-            };
+            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
 
             // Ensure metadata directory exists
             std::fs::create_dir_all(&metadata_dir).map_err(|e| {
@@ -2572,5 +2589,139 @@ mod tests {
             None
         );
         assert_eq!(CayenneAccelerator::derive_region_from_zone("invalid"), None);
+    }
+
+    #[test]
+    fn test_is_local_path() {
+        // Local absolute paths
+        assert!(is_local_path("/data/cayenne"));
+        assert!(is_local_path("/var/spice/data"));
+
+        // Local relative paths
+        assert!(is_local_path("./data"));
+        assert!(is_local_path("data/cayenne"));
+
+        // file:// URIs are local
+        assert!(is_local_path("file:///data/cayenne"));
+        assert!(is_local_path("file://localhost/data"));
+
+        // S3 paths are NOT local
+        assert!(!is_local_path("s3://bucket/prefix"));
+        assert!(!is_local_path("s3://bucket-usw2-az1-x-s3/prefix"));
+
+        // Other remote schemes are NOT local
+        assert!(!is_local_path("gs://bucket/prefix"));
+        assert!(!is_local_path("az://container/blob"));
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_with_explicit_metadata_dir() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_metadata_dir".to_string(),
+                "/custom/metadata".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            "/custom/metadata"
+        );
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_with_local_file_path() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_file_path".to_string(),
+                "/persistent/data".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            "/persistent/data/metadata"
+        );
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_excludes_s3_path() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_file_path".to_string(),
+                "s3://bucket--usw2-az1--x-s3/data".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        // Should fall back to default, not use S3 path
+        let result = CayenneAccelerator::resolve_metadata_dir(Some(&acceleration));
+        assert!(result.ends_with("/metadata"));
+        assert!(!result.starts_with("s3://"));
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_explicit_overrides_file_path() {
+        // When both are set, cayenne_metadata_dir takes priority
+        let acceleration = Acceleration {
+            params: [
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    "/explicit/metadata".to_string(),
+                ),
+                (
+                    "cayenne_file_path".to_string(),
+                    "/persistent/data".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            "/explicit/metadata"
+        );
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_default() {
+        // No acceleration - uses default
+        let result = CayenneAccelerator::resolve_metadata_dir(None);
+        assert!(
+            result.ends_with(".spice/data/metadata"),
+            "Expected path to end with '.spice/data/metadata', got: {result}"
+        );
+
+        // Empty acceleration params - uses default
+        let acceleration = Acceleration::default();
+        let result = CayenneAccelerator::resolve_metadata_dir(Some(&acceleration));
+        assert!(
+            result.ends_with(".spice/data/metadata"),
+            "Expected path to end with '.spice/data/metadata', got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_trims_trailing_slash() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_file_path".to_string(),
+                "/persistent/data/".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        // Should not have double slashes
+        assert_eq!(
+            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            "/persistent/data/metadata"
+        );
     }
 }
