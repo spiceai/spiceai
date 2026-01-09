@@ -84,6 +84,7 @@ pub(crate) struct TextToSqlWorkerResult {
 }
 
 pub struct TextToSqlResult {
+    pub question: String,
     pub generated_sql: String,
     pub expected_sql: String,
     pub is_error: bool,
@@ -155,6 +156,7 @@ impl TextToSqlWorker {
                 results.insert(
                     request.id.clone(),
                     TextToSqlResult {
+                        question: request.question,
                         generated_sql: generated_sql.or(sql).unwrap_or_default(),
                         expected_sql: request.expected_sql,
                         duration,

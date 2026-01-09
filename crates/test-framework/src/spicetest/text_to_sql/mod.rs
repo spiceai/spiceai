@@ -283,6 +283,7 @@ impl MetricCollector<TextToSqlMetric, TextToSqlRunMetric> for SpiceTest<Complete
                 )
                 .map(|metric| {
                     metric.with_extended_metrics(TextToSqlMetric::new(
+                        result.question.clone(),
                         result.generated_sql.clone(),
                         result.expected_sql.clone(),
                         result.query_count,

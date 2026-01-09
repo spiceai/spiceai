@@ -24,6 +24,7 @@ use arrow::{
 };
 
 pub struct TextToSqlMetric {
+    pub question: String,
     pub generated_sql: String,
     pub expected_sql: String,
     pub sample_data_enabled: bool,
@@ -196,6 +197,7 @@ impl TextToSqlMetric {
     #[must_use]
     #[expect(clippy::too_many_arguments)]
     pub fn new(
+        question: String,
         generated_sql: String,
         expected_sql: String,
         sql_query_count: usize,
@@ -212,6 +214,7 @@ impl TextToSqlMetric {
         let exact_match = (generated_sql.trim() == expected_sql.trim()).into();
 
         Self {
+            question,
             generated_sql,
             expected_sql,
             sql_query_count: sql_query_count,

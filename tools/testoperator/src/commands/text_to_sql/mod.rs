@@ -130,7 +130,7 @@ async fn emit_telemetry(
         .iter()
         .filter_map(|qm| qm.extended_metrics.as_ref())
         .for_each(|qm| {
-            let attributes = vec![KeyValue::new("query_id", qm.expected_sql.clone())];
+            let attributes = vec![KeyValue::new("query_id", qm.question.clone())];
 
             crate::metrics::TEXT_TO_SQL_LATENCY.record(qm.latency_ms, &attributes);
             crate::metrics::TEXT_TO_SQL_SQL_DURATION.record(qm.sql_duration_ms, &attributes);
