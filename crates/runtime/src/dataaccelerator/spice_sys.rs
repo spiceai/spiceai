@@ -359,24 +359,17 @@ async fn acceleration_connection(
                     target: "CayenneAccelerator",
                 })?;
 
-            // Get the cayenne metadata directory path (used for file existence check validation)
-            let _data_dir =
-                cayenne_accelerator
-                    .file_path(source)
-                    .map_err(|e| Error::CayenneFilePath {
-                        source: super::cayenne::Error::InvalidConfiguration {
-                            detail: std::sync::Arc::from(format!("{e}")),
-                        },
-                    })?;
+            // Validate that we can resolve the file path (used for file existence check validation)
+            let _ = cayenne_accelerator
+                .file_path(source)
+                .map_err(|e| Error::CayenneFilePath {
+                    source: super::cayenne::Error::InvalidConfiguration {
+                        detail: std::sync::Arc::from(format!("{e}")),
+                    },
+                })?;
 
-            // Derive metadata directory from data directory
-            let metadata_dir = if let Some(acceleration) = source.acceleration()
-                && let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir")
-            {
-                custom_dir.clone()
-            } else {
-                format!("{}/metadata", crate::spice_data_base_path())
-            };
+            // Derive metadata directory using shared resolution logic
+            let metadata_dir = CayenneAccelerator::resolve_metadata_dir(source.acceleration());
 
             let metadata_db_path = format!("{metadata_dir}/cayenne.db");
 
@@ -389,9 +382,11 @@ async fn acceleration_connection(
 
             // Ensure metadata directory exists
             if let Some(parent) = Path::new(&metadata_db_path).parent() {
-                std::fs::create_dir_all(parent).map_err(|e| Error::CayennePool {
-                    source: Box::new(e),
-                })?;
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| Error::CayennePool {
+                        source: Box::new(e),
+                    })?;
             }
 
             // Create SQLite connection pool for cayenne metadata using the factory

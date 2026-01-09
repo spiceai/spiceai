@@ -408,7 +408,7 @@ impl CayenneAccelerator {
     /// 3. `{spice_data_base_path()}/metadata` - Default location
     ///
     /// Note: S3 paths are excluded because `SQLite` (used for metadata catalog) cannot run on object storage.
-    fn resolve_metadata_dir(acceleration: Option<&Acceleration>) -> String {
+    pub(crate) fn resolve_metadata_dir(acceleration: Option<&Acceleration>) -> String {
         let Some(accel) = acceleration else {
             return format!("{}/metadata", spice_data_base_path());
         };
@@ -1664,21 +1664,14 @@ impl DataAccelerator for CayenneAccelerator {
         // (the bucket/prefix is assumed to exist or will be created by the object store)
         if Self::is_s3_express_data_path(source) {
             // For S3 Express, we need to check if the metadata database exists locally
-            let metadata_dir = if let Some(acceleration) = source.acceleration()
-                && let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir")
-            {
-                custom_dir.clone()
-            } else {
-                format!("{}/metadata", crate::spice_data_base_path())
-            };
+            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
             let metadata_db_path = format!("{metadata_dir}/cayenne.db");
             return PathBuf::from(metadata_db_path).exists();
         }
 
         // For local storage, check if both the data directory and metadata database exist
-        let dir_path = match self.file_path(source) {
-            Ok(path) => path,
-            Err(_) => return false,
+        let Ok(dir_path) = self.file_path(source) else {
+            return false;
         };
 
         // Check if the data directory exists
@@ -1687,13 +1680,7 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         // Also check if the metadata database exists (indicates proper initialization)
-        let metadata_dir = if let Some(acceleration) = source.acceleration()
-            && let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir")
-        {
-            custom_dir.clone()
-        } else {
-            format!("{}/metadata", crate::spice_data_base_path())
-        };
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
         let metadata_db_path = format!("{metadata_dir}/cayenne.db");
         PathBuf::from(metadata_db_path).exists()
     }
@@ -1827,18 +1814,13 @@ impl DataAccelerator for CayenneAccelerator {
                     "Cayenne acceleration mode is 'file_create', removing existing directory: {}",
                     dir_path
                 );
-                std::fs::remove_dir_all(&path_buf).map_err(|err| {
+                tokio::fs::remove_dir_all(&path_buf).await.map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
             }
 
             // Also drop the table from metadata catalog to clean up stale metadata
-            let metadata_dir =
-                if let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir") {
-                    custom_dir.clone()
-                } else {
-                    format!("{}/metadata", crate::spice_data_base_path())
-                };
+            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
 
             let metastore_type = acceleration
                 .params
@@ -1874,7 +1856,8 @@ impl DataAccelerator for CayenneAccelerator {
         // Create the vortex data directory if it doesn't exist
         let path_buf = PathBuf::from(&dir_path);
         if !path_buf.exists() {
-            std::fs::create_dir_all(&path_buf)
+            tokio::fs::create_dir_all(&path_buf)
+                .await
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
 

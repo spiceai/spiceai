@@ -1456,7 +1456,7 @@ async fn test_bucket_partition_inequality_snapshot() -> Result<(), Box<dyn std::
 // Deletion Tests for PartitionTableProvider implementing DeletionTableProvider
 // ============================================================================
 
-/// A MemTable wrapper that implements DeletionTableProvider for testing purposes
+/// A `MemTable` wrapper that implements `DeletionTableProvider` for testing purposes
 #[derive(Debug)]
 struct DeletablePartitionMemTable {
     mem_table: Arc<MemTable>,
@@ -1551,7 +1551,7 @@ impl DeletionTableProvider for DeletablePartitionMemTable {
     }
 }
 
-/// Partition creator that creates DeletablePartitionMemTable instances
+/// Partition creator that creates `DeletablePartitionMemTable` instances
 #[derive(Debug)]
 struct DeletableTestPartitionCreator {
     schema: SchemaRef,
@@ -1595,10 +1595,10 @@ impl PartitionCreator for DeletableTestPartitionCreator {
             mem_table,
             partition_value.clone(),
         ));
-        self.partitions
-            .write()
-            .await
-            .insert(partition_value.to_string(), Arc::clone(&deletable_mem_table));
+        self.partitions.write().await.insert(
+            partition_value.to_string(),
+            Arc::clone(&deletable_mem_table),
+        );
         // Wrap in DeletionTableProviderAdapter so get_deletion_provider can find it
         let adapted_table: Arc<dyn TableProvider> =
             Arc::new(DeletionTableProviderAdapter::new(deletable_mem_table));
@@ -1648,7 +1648,9 @@ async fn test_deletion_table_provider_single_partition() -> Result<(), Box<dyn s
         Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
-            Arc::new(StringArray::from(vec!["us-east", "us-east", "us-east", "us-east", "us-east"])),
+            Arc::new(StringArray::from(vec![
+                "us-east", "us-east", "us-east", "us-east", "us-east",
+            ])),
             Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])),
         ],
     )?)?;
@@ -1661,7 +1663,9 @@ async fn test_deletion_table_provider_single_partition() -> Result<(), Box<dyn s
 
     // Access PartitionTableProvider directly to call delete_from
     let table = ctx.table_provider("test_table").await?;
-    let partition_provider = table.as_any().downcast_ref::<PartitionTableProvider>()
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
@@ -1672,15 +1676,25 @@ async fn test_deletion_table_provider_single_partition() -> Result<(), Box<dyn s
 
     // Check the result - should have deleted 10 rows (mocked)
     assert_eq!(result.len(), 1, "Expected 1 result batch");
-    let count_col = result[0].column_by_name("count").expect("Expected count column");
-    let count_array = count_col.as_any().downcast_ref::<UInt64Array>().expect("Expected UInt64Array");
-    assert_eq!(count_array.value(0), 10, "Expected 10 deleted rows from single partition");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        10,
+        "Expected 10 deleted rows from single partition"
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_deletion_table_provider_multiple_partitions() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_deletion_table_provider_multiple_partitions() -> Result<(), Box<dyn std::error::Error>>
+{
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("region", DataType::Utf8, false),
@@ -1723,7 +1737,9 @@ async fn test_deletion_table_provider_multiple_partitions() -> Result<(), Box<dy
 
     // Get the table provider and call delete_from
     let table = ctx.table_provider("test_table").await?;
-    let partition_provider = table.as_any().downcast_ref::<PartitionTableProvider>()
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
@@ -1734,9 +1750,18 @@ async fn test_deletion_table_provider_multiple_partitions() -> Result<(), Box<dy
 
     // Check the result - should have deleted 30 rows total (10 per partition * 3 partitions)
     assert_eq!(result.len(), 1, "Expected 1 result batch");
-    let count_col = result[0].column_by_name("count").expect("Expected count column");
-    let count_array = count_col.as_any().downcast_ref::<UInt64Array>().expect("Expected UInt64Array");
-    assert_eq!(count_array.value(0), 30, "Expected 30 deleted rows from 3 partitions");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        30,
+        "Expected 30 deleted rows from 3 partitions"
+    );
 
     Ok(())
 }
@@ -1778,7 +1803,9 @@ async fn test_deletion_table_provider_with_filters() -> Result<(), Box<dyn std::
 
     // Get the table provider and call delete_from with a filter
     let table = ctx.table_provider("test_table").await?;
-    let partition_provider = table.as_any().downcast_ref::<PartitionTableProvider>()
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
@@ -1791,9 +1818,18 @@ async fn test_deletion_table_provider_with_filters() -> Result<(), Box<dyn std::
 
     // The mock still deletes 10 per partition, so expect 20 total
     assert_eq!(result.len(), 1, "Expected 1 result batch");
-    let count_col = result[0].column_by_name("count").expect("Expected count column");
-    let count_array = count_col.as_any().downcast_ref::<UInt64Array>().expect("Expected UInt64Array");
-    assert_eq!(count_array.value(0), 20, "Expected 20 deleted rows from 2 partitions");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        20,
+        "Expected 20 deleted rows from 2 partitions"
+    );
 
     Ok(())
 }
@@ -1824,7 +1860,9 @@ async fn test_deletion_table_provider_empty_partitions() -> Result<(), Box<dyn s
 
     // Get the table provider and call delete_from
     let table = ctx.table_provider("test_table").await?;
-    let partition_provider = table.as_any().downcast_ref::<PartitionTableProvider>()
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
@@ -1835,9 +1873,18 @@ async fn test_deletion_table_provider_empty_partitions() -> Result<(), Box<dyn s
 
     // Should delete 0 rows since there are no partitions
     assert_eq!(result.len(), 1, "Expected 1 result batch");
-    let count_col = result[0].column_by_name("count").expect("Expected count column");
-    let count_array = count_col.as_any().downcast_ref::<UInt64Array>().expect("Expected UInt64Array");
-    assert_eq!(count_array.value(0), 0, "Expected 0 deleted rows from empty partitions");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        0,
+        "Expected 0 deleted rows from empty partitions"
+    );
 
     Ok(())
 }
@@ -1847,7 +1894,7 @@ async fn test_deletion_table_provider_empty_partitions() -> Result<(), Box<dyn s
 // ============================================================================
 
 /// Test that a partition provider without deletion support logs a warning and continues
-/// (non-deletable partition creator that returns regular MemTable without DeletionTableProviderAdapter)
+/// (non-deletable partition creator that returns regular `MemTable` without `DeletionTableProviderAdapter`)
 #[derive(Debug)]
 struct NonDeletablePartitionCreator {
     schema: SchemaRef,
@@ -1934,7 +1981,9 @@ async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std
 
     // Get the table provider and call delete_from
     let table = ctx.table_provider("test_table").await?;
-    let partition_provider = table.as_any().downcast_ref::<PartitionTableProvider>()
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
@@ -1945,9 +1994,18 @@ async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std
 
     // Should return 0 since the partition doesn't support deletion
     assert_eq!(result.len(), 1, "Expected 1 result batch");
-    let count_col = result[0].column_by_name("count").expect("Expected count column");
-    let count_array = count_col.as_any().downcast_ref::<UInt64Array>().expect("Expected UInt64Array");
-    assert_eq!(count_array.value(0), 0, "Expected 0 deleted rows from non-deletable partition");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        0,
+        "Expected 0 deleted rows from non-deletable partition"
+    );
 
     Ok(())
 }
@@ -1976,13 +2034,15 @@ async fn test_deletion_many_partitions() -> Result<(), Box<dyn std::error::Error
     ctx.register_table("test_table", Arc::new(table_provider))?;
 
     // Create 20 partitions
-    let num_partitions = 20;
+    let num_partitions: usize = 20;
     for i in 0..num_partitions {
         let partition_key = format!("partition_{i}");
+        #[expect(clippy::cast_possible_wrap)]
+        let i_val = i as i64;
         let df = ctx.read_batch(RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(Int64Array::from(vec![i as i64])),
+                Arc::new(Int64Array::from(vec![i_val])),
                 Arc::new(StringArray::from(vec![partition_key.as_str()])),
             ],
         )?)?;
@@ -1992,11 +2052,17 @@ async fn test_deletion_many_partitions() -> Result<(), Box<dyn std::error::Error
 
     // Verify we have 20 partitions
     let partitions = creator.get_partitions().await;
-    assert_eq!(partitions.len(), num_partitions, "Expected {num_partitions} partitions");
+    assert_eq!(
+        partitions.len(),
+        num_partitions,
+        "Expected {num_partitions} partitions"
+    );
 
     // Get the table provider and call delete_from
     let table = ctx.table_provider("test_table").await?;
-    let partition_provider = table.as_any().downcast_ref::<PartitionTableProvider>()
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
@@ -2007,9 +2073,18 @@ async fn test_deletion_many_partitions() -> Result<(), Box<dyn std::error::Error
 
     // Should have deleted 10 rows per partition * 20 partitions = 200 total
     assert_eq!(result.len(), 1, "Expected 1 result batch");
-    let count_col = result[0].column_by_name("count").expect("Expected count column");
-    let count_array = count_col.as_any().downcast_ref::<UInt64Array>().expect("Expected UInt64Array");
-    assert_eq!(count_array.value(0), 200, "Expected 200 deleted rows from 20 partitions");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        200,
+        "Expected 200 deleted rows from 20 partitions"
+    );
 
     Ok(())
 }
@@ -2054,15 +2129,18 @@ async fn test_deletion_complex_filters() -> Result<(), Box<dyn std::error::Error
 
     // Get the table provider and call delete_from with complex filters
     let table = ctx.table_provider("test_table").await?;
-    let partition_provider = table.as_any().downcast_ref::<PartitionTableProvider>()
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
     // Complex filter: (value > 100 AND status = 'active') OR id = 1
     let filters = vec![
-        col("value").gt(lit(100i64))
+        col("value")
+            .gt(lit(100i64))
             .and(col("status").eq(lit("active")))
-            .or(col("id").eq(lit(1i64)))
+            .or(col("id").eq(lit(1i64))),
     ];
     let delete_plan = partition_provider.delete_from(&state, &filters).await?;
 
@@ -2071,8 +2149,13 @@ async fn test_deletion_complex_filters() -> Result<(), Box<dyn std::error::Error
 
     // Mock deletes 10 per partition, we have 3 partitions = 30
     assert_eq!(result.len(), 1, "Expected 1 result batch");
-    let count_col = result[0].column_by_name("count").expect("Expected count column");
-    let count_array = count_col.as_any().downcast_ref::<UInt64Array>().expect("Expected UInt64Array");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
     assert_eq!(count_array.value(0), 30, "Expected 30 deleted rows");
 
     Ok(())
@@ -2106,7 +2189,11 @@ async fn test_deletion_with_null_partition_value() -> Result<(), Box<dyn std::er
         Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![Some("us-east"), None, Some("eu-west")])),
+            Arc::new(StringArray::from(vec![
+                Some("us-east"),
+                None,
+                Some("eu-west"),
+            ])),
         ],
     )?)?;
     df.write_table("test_table", DataFrameWriteOptions::new())
@@ -2118,7 +2205,9 @@ async fn test_deletion_with_null_partition_value() -> Result<(), Box<dyn std::er
 
     // Get the table provider and call delete_from
     let table = ctx.table_provider("test_table").await?;
-    let partition_provider = table.as_any().downcast_ref::<PartitionTableProvider>()
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
 
     let state = ctx.state();
@@ -2129,9 +2218,18 @@ async fn test_deletion_with_null_partition_value() -> Result<(), Box<dyn std::er
 
     // Should delete from all 3 partitions including the null one
     assert_eq!(result.len(), 1, "Expected 1 result batch");
-    let count_col = result[0].column_by_name("count").expect("Expected count column");
-    let count_array = count_col.as_any().downcast_ref::<UInt64Array>().expect("Expected UInt64Array");
-    assert_eq!(count_array.value(0), 30, "Expected 30 deleted rows from 3 partitions");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        30,
+        "Expected 30 deleted rows from 3 partitions"
+    );
 
     Ok(())
 }
@@ -2171,7 +2269,9 @@ async fn test_deletion_repeated_calls() -> Result<(), Box<dyn std::error::Error>
         .await?;
 
     let table = ctx.table_provider("test_table").await?;
-    let partition_provider = table.as_any().downcast_ref::<PartitionTableProvider>()
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
         .expect("Expected PartitionTableProvider");
     let state = ctx.state();
 
@@ -2179,12 +2279,21 @@ async fn test_deletion_repeated_calls() -> Result<(), Box<dyn std::error::Error>
     for i in 0..3 {
         let delete_plan = partition_provider.delete_from(&state, &[]).await?;
         let result = collect(delete_plan, ctx.task_ctx()).await?;
-        
+
         assert_eq!(result.len(), 1, "Iteration {i}: Expected 1 result batch");
-        let count_col = result[0].column_by_name("count").expect("Expected count column");
-        let count_array = count_col.as_any().downcast_ref::<UInt64Array>().expect("Expected UInt64Array");
+        let count_col = result[0]
+            .column_by_name("count")
+            .expect("Expected count column");
+        let count_array = count_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("Expected UInt64Array");
         // Mock always returns 10, so each call should return 10
-        assert_eq!(count_array.value(0), 10, "Iteration {i}: Expected 10 deleted rows");
+        assert_eq!(
+            count_array.value(0),
+            10,
+            "Iteration {i}: Expected 10 deleted rows"
+        );
     }
 
     Ok(())

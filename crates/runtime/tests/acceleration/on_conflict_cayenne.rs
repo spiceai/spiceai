@@ -19,11 +19,11 @@ limitations under the License.
 //! - Core Arrow data types
 //! - Primary key support
 
+use std::fmt::Write as _;
 use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use cayenne::CayenneTableProvider;
 use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 use datafusion::{assert_batches_eq, physical_plan::collect, prelude::*, sql::TableReference};
 use futures::TryStreamExt;
@@ -1216,7 +1216,7 @@ async fn test_cayenne_large_batch_roundtrip() -> Result<(), anyhow::Error> {
                     if i > 0 {
                         values.push_str(", ");
                     }
-                    values.push_str(&format!("({}, 'name_{}', {})", id, id, id as f64 * 1.5));
+                    let _ = write!(values, "({id}, 'name_{id}', {})", f64::from(id) * 1.5);
                 }
                 ctx.sql(&format!(
                     "INSERT INTO large_batch_test (id, name, value) VALUES {values}"
