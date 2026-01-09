@@ -195,8 +195,13 @@ async fn get_value_for_id(
 
 async fn test_insert_single_row_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "single_insert", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "single_insert",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     let batch = RecordBatch::try_new(
         schema,
@@ -222,8 +227,13 @@ test_with_backends!(test_insert_single_row_impl);
 
 async fn test_insert_batch_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "batch_insert", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "batch_insert",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     let batch = RecordBatch::try_new(
         schema,
@@ -251,8 +261,13 @@ test_with_backends!(test_insert_batch_impl);
 
 async fn test_insert_large_batch_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "large_insert", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "large_insert",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     let num_rows = 1000;
     let ids: Vec<i64> = (1..=num_rows).collect();
@@ -291,7 +306,7 @@ async fn test_insert_multiple_batches_impl(fixture: TestFixture) -> TestResult<(
     let (table, ctx) = setup_table(
         &fixture,
         "multi_batch_insert",
-        schema.clone(),
+        Arc::clone(&schema),
         vec!["id".into()],
     )
     .await?;
@@ -339,8 +354,13 @@ test_with_backends!(test_insert_multiple_batches_impl);
 
 async fn test_delete_single_row_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "delete_single", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "delete_single",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -375,8 +395,13 @@ test_with_backends!(test_delete_single_row_impl);
 
 async fn test_delete_multiple_rows_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "delete_multi", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "delete_multi",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -409,8 +434,13 @@ test_with_backends!(test_delete_multiple_rows_impl);
 
 async fn test_delete_all_rows_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "delete_all", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "delete_all",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert data
     let batch = RecordBatch::try_new(
@@ -441,7 +471,7 @@ async fn test_delete_no_matches_impl(fixture: TestFixture) -> TestResult<()> {
     let (table, ctx) = setup_table(
         &fixture,
         "delete_nomatch",
-        schema.clone(),
+        Arc::clone(&schema),
         vec!["id".into()],
     )
     .await?;
@@ -472,8 +502,13 @@ test_with_backends!(test_delete_no_matches_impl);
 
 async fn test_upsert_same_key_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "upsert_same", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "upsert_same",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert initial data
     let batch1 = RecordBatch::try_new(
@@ -512,8 +547,13 @@ test_with_backends!(test_upsert_same_key_impl);
 
 async fn test_multiple_upserts_same_key_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "multi_upsert", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "multi_upsert",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert initial data
     let batch1 = RecordBatch::try_new(
@@ -556,7 +596,7 @@ async fn test_insert_after_delete_all_impl(fixture: TestFixture) -> TestResult<(
     let (table, ctx) = setup_table(
         &fixture,
         "insert_after_delete",
-        schema.clone(),
+        Arc::clone(&schema),
         vec!["id".into()],
     )
     .await?;
@@ -601,7 +641,7 @@ async fn test_multi_column_update_impl(fixture: TestFixture) -> TestResult<()> {
     let (table, ctx) = setup_table(
         &fixture,
         "multi_col_update",
-        schema.clone(),
+        Arc::clone(&schema),
         vec!["id".into()],
     )
     .await?;
@@ -660,8 +700,13 @@ test_with_backends!(test_multi_column_update_impl);
 
 async fn test_nullable_field_mutations_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_nullable_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "nullable_test", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "nullable_test",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert with mix of null and non-null values
     let batch = RecordBatch::try_new(
@@ -704,12 +749,17 @@ test_with_backends!(test_nullable_field_mutations_impl);
 
 async fn test_boundary_values_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "boundary_vals", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "boundary_vals",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert boundary values
     let batch = RecordBatch::try_new(
-        schema.clone(),
+        Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![i64::MIN, -1, 0, 1, i64::MAX])),
             Arc::new(Int64Array::from(vec![i64::MAX, i64::MIN, 0, -1, 1])),
@@ -750,8 +800,13 @@ test_with_backends!(test_boundary_values_impl);
 
 async fn test_interleaved_ops_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "interleaved", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "interleaved",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert batch 1
     let batch1 = RecordBatch::try_new(
@@ -804,8 +859,13 @@ test_with_backends!(test_interleaved_ops_impl);
 
 async fn test_small_frequent_updates_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "small_updates", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "small_updates",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert initial 10 rows
     let batch = RecordBatch::try_new(
@@ -905,8 +965,13 @@ test_with_backends!(test_large_batch_delete_impl);
 
 async fn test_timestamp_mutations_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_timestamp_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "timestamp_mut", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "timestamp_mut",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert with various timestamps including epoch and future
     let batch = RecordBatch::try_new(
@@ -943,8 +1008,13 @@ test_with_backends!(test_timestamp_mutations_impl);
 
 async fn test_stress_many_operations_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "stress_test", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "stress_test",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Perform 100 operations: mix of inserts and deletes
     let mut expected_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -972,7 +1042,10 @@ async fn test_stress_many_operations_impl(fixture: TestFixture) -> TestResult<()
 
     // Verify final state matches expected
     let actual_count = get_row_count(&ctx, "stress_test").await?;
-    assert_eq!(actual_count as usize, expected_ids.len());
+    assert_eq!(
+        usize::try_from(actual_count).expect("count should be positive"),
+        expected_ids.len()
+    );
 
     let actual_ids: std::collections::HashSet<i64> = get_all_ids(&ctx, "stress_test")
         .await?
@@ -991,8 +1064,13 @@ test_with_backends!(test_stress_many_operations_impl);
 
 async fn test_full_table_replacement_impl(fixture: TestFixture) -> TestResult<()> {
     let schema = create_simple_schema();
-    let (table, ctx) =
-        setup_table(&fixture, "full_replace", schema.clone(), vec!["id".into()]).await?;
+    let (table, ctx) = setup_table(
+        &fixture,
+        "full_replace",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
 
     // Insert initial data
     let batch1 = RecordBatch::try_new(
