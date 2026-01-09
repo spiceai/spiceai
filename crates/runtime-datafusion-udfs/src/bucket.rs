@@ -512,7 +512,7 @@ mod tests {
         let error_msg = error.to_string();
 
         assert!(
-            error_msg.contains("First argument must be a positive Int64 literal"),
+            error_msg.contains("Bucket function first argument must be a positive number"),
             "Error message should indicate the first argument must be a literal: {error_msg}"
         );
         assert!(
