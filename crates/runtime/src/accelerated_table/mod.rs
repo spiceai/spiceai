@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc, time::Duration};
 
+use crate::accelerated_table::snapshots::SnapshotCreationConfig;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::get_primary_keys_from_constraints;
@@ -65,6 +66,7 @@ mod refresh_task_runner;
 mod retention;
 mod sink;
 mod synchronized_table;
+mod snapshots;
 mod timestamp_metrics_utils;
 
 pub use refresh_task_runner::RefreshTaskRunner;
@@ -273,22 +275,6 @@ fn validate_refresh_data_window(
             tracing::warn!(
                 "No time_column was provided, refresh_data_window will be ignored for {dataset}"
             );
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SnapshotCreationConfig {
-    manager: Arc<SnapshotManager>,
-    create_trigger: SnapshotCreateTrigger,
-}
-
-impl SnapshotCreationConfig {
-    #[must_use]
-    pub fn new(manager: Arc<SnapshotManager>, create_trigger: SnapshotCreateTrigger) -> Self {
-        Self {
-            manager,
-            create_trigger,
         }
     }
 }

@@ -2167,7 +2167,8 @@ async fn build_snapshot_creation_config(
         #[cfg(feature = "turso")]
         Engine::Turso => AccelerationEngine::Turso,
         _ => {
-            // Currently this code is unreachable
+            // This code is unreachable since build_snapshot_creation_config is
+            // only called iff acceleration_file_path returned Some(<file_path>)
             return Err(Error::UnsupportedAccelerationEngineForSnapshots);
         }
     };
