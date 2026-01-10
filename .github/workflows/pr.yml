@@ -117,21 +117,20 @@ jobs:
       - name: Install golangci-lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          if ! command -v golangci-lint &> /dev/null ; then
-            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
-          fi
+          # Install golangci-lint v2.8.0+ which supports Go 1.25
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.8.0
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
-          os: 'linux'
+          os: 'macos'
 
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
           mkdir -p ${CARGO_HOME:-~/.cargo}/bin
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Check if sccache can be set up
         run: |
