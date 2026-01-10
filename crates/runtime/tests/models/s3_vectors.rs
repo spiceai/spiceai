@@ -114,17 +114,16 @@ pub(crate) mod search {
     async fn basic_functionality() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
 
-        let mut ds =
-            get_mega_science_dataset(
-                Some("qs"),
-                None,
-                Some(Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-                )),
-            );
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            None,
+            Some(Column::new("answer").with_embedding(
+                ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
+            )),
+        );
         ds.vectors = Some(init_vector_store("spice-ci-tests-s3-vectors-basic", true).await?);
         app = add_mega_science_view_from_ds(app, &ds).await?;
         app = app.with_dataset(ds);
@@ -145,19 +144,18 @@ pub(crate) mod search {
     async fn hybrid_w_vector_engine() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
-        let mut ds =
-            get_mega_science_dataset(
-                Some("qs"),
-                Some(
-                    Column::new("question")
-                        .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
-                ),
-                Some(Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-                )),
-            );
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            Some(
+                Column::new("question")
+                    .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+            ),
+            Some(Column::new("answer").with_embedding(
+                ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
+            )),
+        );
         ds.vectors = Some(init_vector_store("spice-ci-tests-s3-vectors-hybrid", true).await?);
         app = add_mega_science_view_from_ds(app, &ds).await?;
         app = app.with_dataset(ds);
@@ -258,19 +256,18 @@ pub(crate) mod search {
     async fn multiple_embeddings() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
 
-        let mut ds =
-            get_mega_science_dataset(
-                Some("qs"),
-                Some(Column::new("question").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-                )),
-                Some(Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-                )),
-            );
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            Some(Column::new("question").with_embedding(
+                ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
+            )),
+            Some(Column::new("answer").with_embedding(
+                ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
+            )),
+        );
         let vector_store = init_vector_store("spice-ci-tests-s3-vectors-hybrid", true).await?;
         ds.vectors = Some(vector_store);
 
@@ -336,14 +333,14 @@ pub(crate) mod search {
     async fn multi_column_primary_key() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
             Some(
                 Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                    ColumnLevelEmbeddingConfig::model("potion-base-2M")
                         .with_row_id("id")
                         .with_row_id("question"),
                 ),
@@ -393,14 +390,14 @@ pub(crate) mod search {
     async fn with_chunking_metadata() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
             Some(vectors_nonfilterable_col(
                 Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                    ColumnLevelEmbeddingConfig::model("potion-base-2M")
                         .with_row_id("id")
                         .chunking(
                             EmbeddingChunkConfig::enabled()
@@ -467,14 +464,14 @@ pub(crate) mod search {
     async fn with_chunking() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
             Some(
                 Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                    ColumnLevelEmbeddingConfig::model("potion-base-2M")
                         .with_row_id("id")
                         .chunking(
                             EmbeddingChunkConfig::enabled()
@@ -543,7 +540,7 @@ pub(crate) mod search {
     async fn metadata_columns() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
         // Metadata columns: question, subject (filterable), answer
         // Base columns:     reference_answer,source
@@ -553,7 +550,7 @@ pub(crate) mod search {
             Some(
                 Column::new("answer")
                     .with_embedding(
-                        ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                        ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
                     )
                     .with_metadata(
                         [(
@@ -667,6 +664,7 @@ pub(crate) mod search {
         let vector_store = init_vector_store(bucket_name, true).await?;
 
         // Use a single JSON file instead of the entire data/ directory to reduce embedding time
+        // This test uses HuggingFace minilm (GPU codepath) while most other tests use model2vec (CPU)
         let mut test_dataset =
             get_package_delivery_dataset("data/01.json", "delivery", None, "hf_minilm");
         test_dataset.vectors = Some(vector_store);
@@ -748,14 +746,15 @@ pub(crate) mod search {
         ] {
             let vector_store = init_vector_store(bucket_name, true).await?;
 
-            let mut ds = get_package_delivery_dataset(data_path, "delivery", None, "hf_minilm");
+            let mut ds =
+                get_package_delivery_dataset(data_path, "delivery", None, "potion-base-2M");
             ds.vectors = Some(vector_store);
 
             let app = AppBuilder::new("search_app")
                 .with_dataset(ds)
                 .with_embedding(get_model_to_vec_embeddings(
                     "minishlab/potion-base-2M",
-                    "hf_minilm",
+                    "potion-base-2M",
                 ))
                 .build();
 
@@ -816,7 +815,7 @@ pub(crate) mod search {
                 ds.vectors = Some(vector_store);
                 ds.columns = vec![
                     Column::new("answer").with_embeddings(vec![ColumnLevelEmbeddingConfig {
-                        model: "hf_minilm".to_string(),
+                        model: "potion-base-2M".to_string(),
                         chunking: None,
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
@@ -824,9 +823,9 @@ pub(crate) mod search {
 
                 let app = AppBuilder::new("search_app")
                     .with_dataset(ds)
-                    .with_embedding(get_huggingface_embeddings(
-                        "sentence-transformers/all-MiniLM-L6-v2",
-                        "hf_minilm",
+                    .with_embedding(get_model_to_vec_embeddings(
+                        "minishlab/potion-base-2M",
+                        "potion-base-2M",
                     ))
                     .build();
 
@@ -860,9 +859,10 @@ pub(crate) mod search {
         bucket_name: &str,
         predelete_index: bool,
     ) -> Result<VectorStore, anyhow::Error> {
+        // Use full u8 range (0-255) for index naming to reduce collision risk in parallel test runs
         init_vector_store_w_index_name(
             bucket_name,
-            format!("test-index-{}", rand::random::<u8>() % 11).as_str(),
+            format!("test-index-{}", rand::random::<u8>()).as_str(),
             predelete_index,
         )
         .await
