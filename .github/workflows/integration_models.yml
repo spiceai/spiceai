@@ -79,9 +79,8 @@ jobs:
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
@@ -123,9 +122,8 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -177,9 +175,8 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -270,9 +267,8 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -320,9 +316,8 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -366,9 +361,8 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -402,9 +396,8 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -453,10 +446,8 @@ jobs:
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
-      - name: Install Nextest
-        run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
@@ -495,10 +486,8 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Install Nextest
-        run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6

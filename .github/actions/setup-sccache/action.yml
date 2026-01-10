@@ -3,7 +3,7 @@ description: 'composite action'
 
 inputs:
   minio_endpoint:
-    description: 'MinIO endpoint (used for Linux)'
+    description: 'MinIO endpoint (used for Linux and self-hosted macOS)'
     required: false
     type: string
 
@@ -29,10 +29,13 @@ runs:
         region = "us-east-1"
         EOF
 
-    - name: Set up sccache (macOS)
-      if: runner.os == 'macOS'
+    - name: Set up sccache (macOS - self-hosted only)
+      if: runner.os == 'macOS' && inputs.minio_endpoint != ''
       shell: bash
       run: |
+        # Only self-hosted macOS runners use sccache (with localhost MinIO)
+        # GitHub-hosted macOS runners use actions cache instead
+
         # Verify sccache is installed
         if ! command -v sccache &> /dev/null; then
           echo "Error: sccache is not installed on this macOS runner"
@@ -40,15 +43,13 @@ runs:
         fi
         sccache --version
 
-        # SMB share is auto-mounted by the OS at /Volumes/ai_platform_dev
-        SCCACHE_DIR="/Volumes/ai_platform_dev/build/sccache"
-        mkdir -p "$SCCACHE_DIR"
-
-        # Configure sccache to use disk cache on the SMB mount
         rm -rf ~/.config/sccache/config
         mkdir -p ~/.config/sccache
         cat <<EOF > ~/.config/sccache/config
-        [cache.disk]
-        dir = "$SCCACHE_DIR"
-        size = 10737418240
+        [cache.s3]
+        bucket = "sccache"
+        endpoint = "http://localhost:9000"
+        server_side_encryption = false
+        no_credentials = false
+        region = "us-east-1"
         EOF
