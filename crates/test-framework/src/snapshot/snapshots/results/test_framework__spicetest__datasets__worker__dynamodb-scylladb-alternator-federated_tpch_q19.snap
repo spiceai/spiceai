@@ -1,10 +1,9 @@
 ---
 source: crates/test-framework/src/spicetest/datasets/worker.rs
-assertion_line: 742
-description: "Query: tpch_q17"
+description: "Query: tpch_q19"
 ---
 +--------------------+
-| avg_yearly         |
+| revenue            |
 +--------------------+
-| 191444.82571428572 |
+| 3083843.0578000005 |
 +--------------------+
