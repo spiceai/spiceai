@@ -33,7 +33,7 @@ pub(crate) mod search {
         configure_test_datafusion,
         models::{
             get_mega_science_dataset, get_mega_science_view,
-            hf::{get_huggingface_embeddings, get_model_to_vec_embeddings},
+            hf::get_model_to_vec_embeddings,
             s3_vectors::{
                 basic_vector_search_tests, basic_vector_search_tests_on_table, delete_index,
                 vectors_filterable_col,
@@ -664,16 +664,15 @@ pub(crate) mod search {
         let vector_store = init_vector_store(bucket_name, true).await?;
 
         // Use a single JSON file instead of the entire data/ directory to reduce embedding time
-        // This test uses HuggingFace minilm (GPU codepath) while most other tests use model2vec (CPU)
         let mut test_dataset =
-            get_package_delivery_dataset("data/01.json", "delivery", None, "hf_minilm");
+            get_package_delivery_dataset("data/01.json", "delivery", None, "potion-base-2M");
         test_dataset.vectors = Some(vector_store);
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
-            .with_embedding(get_huggingface_embeddings(
-                "sentence-transformers/all-MiniLM-L6-v2",
-                "hf_minilm",
+            .with_embedding(get_model_to_vec_embeddings(
+                "minishlab/potion-base-2M",
+                "potion-base-2M",
             ))
             .build();
 
