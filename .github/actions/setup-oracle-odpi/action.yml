@@ -7,7 +7,8 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y libaio1
+        # Ubuntu 24.04+ renamed libaio1 to libaio1t64 for 64-bit time_t transition
+        sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
 
         # Download and extract Oracle Instant Client
         curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip

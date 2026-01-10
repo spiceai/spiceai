@@ -14,11 +14,18 @@ concurrency:
 jobs:
   enforce-pull-with-spice:
     runs-on: self-hosted
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: spiceai/pulls-with-spice-action@8f7e144a912dc5ab3c36e9ad816ecb445f2d1427 # v1.0.7
+      - uses: spiceai/pulls-with-spice-action@61ef22e4a17be07209f0811fbfe4f0deb2e490a4 # v2.0.0
         if: github.event_name == 'pull_request_target'
         with:
           require_title_min_length: '10'
-          required_labels_any: 'kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization,kind/dependencies,kind/endgame,kind/task,kind/performance'
+          required_label_prefixes: 'kind/,area/'
           banned_labels: 'invalid,wontfix,nomerge,duplicate'
           require_assignee: 'true'
+          auto_label: 'true'
+          auto_label_size: 'true'
+          auto_label_type: 'true'
+          auto_assign_author: 'true'
