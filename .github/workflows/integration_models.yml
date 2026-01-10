@@ -511,7 +511,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration-linux.tar.zst -- search
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'
