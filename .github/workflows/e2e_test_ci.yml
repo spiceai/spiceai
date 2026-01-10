@@ -146,6 +146,11 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up static linking (Linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
+
       - name: Build spiced
         if: matrix.target.target_os != 'darwin'
         run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models"

@@ -191,6 +191,11 @@ jobs:
         run: |
           sudo apt-get install unixodbc unixodbc-dev -y
 
+      - name: Set up static linking (Linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
+
       - name: Install missing tools (Mac)
         if: matrix.target.target_os == 'darwin'
         run: |
