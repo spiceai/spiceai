@@ -20,7 +20,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
-use crate::accelerated_table::{self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig};
+use crate::accelerated_table::{
+    self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
+};
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
@@ -82,6 +84,7 @@ use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
+use spicepod::acceleration::SnapshotsTrigger;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
@@ -89,7 +92,6 @@ use tokio::sync::Notify;
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
-use spicepod::acceleration::SnapshotsTrigger;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -320,13 +322,19 @@ pub enum Error {
     #[snafu(display("Invalid snapshots_trigger_threshold value: expected integer"))]
     InvalidSnapshotCreationBatches { source: std::num::ParseIntError },
 
-    #[snafu(display("'stream_batches' is not supported for stream-backed datasets. Use 'refresh_complete' or 'time_interval' instead"))]
+    #[snafu(display(
+        "'stream_batches' is not supported for stream-backed datasets. Use 'refresh_complete' or 'time_interval' instead"
+    ))]
     UnsupportedStreamBatchesForBatchRefresh,
 
-    #[snafu(display("'refresh_complete' is not supported for stream-backed datasets. Use 'time_interval' or 'stream_batches' instead"))]
+    #[snafu(display(
+        "'refresh_complete' is not supported for stream-backed datasets. Use 'time_interval' or 'stream_batches' instead"
+    ))]
     UnsupportedRefreshCompleteForStream,
 
-    #[snafu(display("Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"))]
+    #[snafu(display(
+        "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
+    ))]
     UnsupportedAccelerationEngineForSnapshots,
 }
 
@@ -1189,7 +1197,8 @@ impl DataFusion {
 
         accelerated_table_builder.retention(retention);
 
-        accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results.clone());
+        accelerated_table_builder
+            .zero_results_action(acceleration_settings.on_zero_results.clone());
 
         accelerated_table_builder.refresh_on_startup(acceleration_settings.refresh_on_startup);
 
@@ -1223,13 +1232,22 @@ impl DataFusion {
 
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Ok(snapshot_path) = acceleration_file_path(dataset).await {
-                if let Some(snapshot_config) = build_snapshot_creation_config(dataset, &acceleration_settings, refresh_mode, snapshot_path).await? {
+                if let Some(snapshot_config) = build_snapshot_creation_config(
+                    dataset,
+                    &acceleration_settings,
+                    refresh_mode,
+                    snapshot_path,
+                )
+                .await?
+                {
                     accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
                 }
             } else {
-                tracing::warn!("Dataset {} is not file accelerated. Snapshot creation is not supported.", dataset.name);
+                tracing::warn!(
+                    "Dataset {} is not file accelerated. Snapshot creation is not supported.",
+                    dataset.name
+                );
             }
-
         }
 
         accelerated_table_builder.checkpointer_opt(
@@ -2067,7 +2085,8 @@ async fn build_snapshot_creation_config(
     let is_batch_refresh = matches!(refresh_mode, RefreshMode::Full | RefreshMode::Append)
         && dataset.time_column.is_none();
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
-    let snapshot_threshold: Option<String> = acceleration_settings.snapshots_trigger_threshold.clone();
+    let snapshot_threshold: Option<String> =
+        acceleration_settings.snapshots_trigger_threshold.clone();
 
     let parse_interval = |threshold: &Option<String>| -> Result<Duration> {
         match threshold {
@@ -2075,11 +2094,13 @@ async fn build_snapshot_creation_config(
                 // Check if string contains a valid time unit
                 if !s.chars().any(|c| c.is_alphabetic()) {
                     return Err(Error::InvalidSnapshotCreationInterval {
-                        source: fundu::ParseError::InvalidInput("duration must include a unit (e.g., ms, s, m, h)".into())
-                    }.into());
+                        source: fundu::ParseError::InvalidInput(
+                            "duration must include a unit (e.g., ms, s, m, h)".into(),
+                        ),
+                    }
+                    .into());
                 }
-                fundu::parse_duration(s)
-                    .context(InvalidSnapshotCreationIntervalSnafu)
+                fundu::parse_duration(s).context(InvalidSnapshotCreationIntervalSnafu)
             }
             None => Ok(DEFAULT_SNAPSHOT_CREATION_INTERVAL),
         }
@@ -2089,7 +2110,7 @@ async fn build_snapshot_creation_config(
         match threshold {
             Some(s) => s
                 .parse::<i64>()
-                .context(InvalidSnapshotCreationBatchesSnafu{}),
+                .context(InvalidSnapshotCreationBatchesSnafu),
             None => Ok(DEFAULT_SNAPSHOT_CREATION_BATCHES),
         }
     };
@@ -2104,7 +2125,7 @@ async fn build_snapshot_creation_config(
                 SnapshotCreateTrigger::Interval(interval)
             }
             Some(SnapshotsTrigger::StreamBatches) => {
-                return Err(Error::UnsupportedStreamBatchesForBatchRefresh)
+                return Err(Error::UnsupportedStreamBatchesForBatchRefresh);
             }
         }
     } else {
@@ -2114,7 +2135,7 @@ async fn build_snapshot_creation_config(
                 SnapshotCreateTrigger::Interval(interval)
             }
             Some(SnapshotsTrigger::RefreshComplete) => {
-                return Err(Error::UnsupportedRefreshCompleteForStream)
+                return Err(Error::UnsupportedRefreshCompleteForStream);
             }
             Some(SnapshotsTrigger::StreamBatches) => {
                 let batches = parse_batches(&snapshot_threshold)?;
@@ -2132,11 +2153,9 @@ async fn build_snapshot_creation_config(
         Engine::Turso => AccelerationEngine::Turso,
         _ => {
             // Currently this code is unreachable
-            return Err(Error::UnsupportedAccelerationEngineForSnapshots)
+            return Err(Error::UnsupportedAccelerationEngineForSnapshots);
         }
     };
-
-    println!("!!!! snapshot_creation_trigger: {snapshot_creation_trigger:?}");
 
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),
@@ -2144,10 +2163,8 @@ async fn build_snapshot_creation_config(
         snapshot_path.clone(),
         acceleration_engine,
     )
-        .await
-        .map(|sm| {
-            SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
-        }))
+    .await
+    .map(|sm| SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)))
 }
 
 #[cfg(test)]

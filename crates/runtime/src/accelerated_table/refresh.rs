@@ -37,9 +37,7 @@ use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::{
-    SnapshotManager, metrics as snapshot_metrics,
-};
+use runtime_acceleration::snapshot::{SnapshotManager, metrics as snapshot_metrics};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;

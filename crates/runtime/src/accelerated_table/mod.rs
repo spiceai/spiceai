@@ -281,7 +281,7 @@ pub struct SnapshotCreationConfig {
 }
 
 impl SnapshotCreationConfig {
-    #[must_use] 
+    #[must_use]
     pub fn new(manager: Arc<SnapshotManager>, create_trigger: SnapshotCreateTrigger) -> Self {
         Self {
             manager,

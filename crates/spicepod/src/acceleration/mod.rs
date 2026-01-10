@@ -281,7 +281,11 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots_trigger: Option<SnapshotsTrigger>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_string_or_number")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_string_or_number"
+    )]
     pub snapshots_trigger_threshold: Option<String>,
 }
 
