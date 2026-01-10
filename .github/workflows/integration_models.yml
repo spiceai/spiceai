@@ -73,8 +73,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'darwin'
 
       - name: Install Nextest
         run: |
@@ -427,8 +425,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Set up cc
         uses: ./.github/actions/setup-cc
@@ -470,8 +466,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Install Nextest
         run: |

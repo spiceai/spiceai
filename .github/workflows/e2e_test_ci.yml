@@ -213,8 +213,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: darwin
 
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
@@ -525,7 +523,6 @@ jobs:
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Prepare PostgreSQL dataset
@@ -712,7 +709,6 @@ jobs:
         if: matrix.acceleration.engine == 'postgres'
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Install MySQL (Linux)
@@ -1103,7 +1099,6 @@ jobs:
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Check PostgreSQL
