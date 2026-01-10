@@ -70,7 +70,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                builder: "spiceai-dev-runners",
+                builder: "ubuntu-22.04",
                 runner: "ubuntu-22.04",
                 target_os: "linux",
                 target_arch: "x86_64",
@@ -145,11 +145,6 @@ jobs:
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up static linking (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
 
       - name: Build spiced
         if: matrix.target.target_os != 'darwin'

@@ -76,7 +76,7 @@ jobs:
   build:
     name: Build Test Binary
     needs: check_changes
-    runs-on: spiceai-dev-runners
+    runs-on: ubuntu-22.04 # Build on same OS as test runners for GLIBC compatibility
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -105,11 +105,6 @@ jobs:
       - name: Set up cc
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
-
-      - name: Set up static linking (Linux)
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          echo "RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
 
       - name: Check if sccache can be set up
         if: needs.check_changes.outputs.relevant_changes == 'true'
