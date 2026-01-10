@@ -83,7 +83,7 @@ RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$
 # Preinstall Oracle ODPI-C (if enabled)
 RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
     set -euo pipefail; \
-    apt-get update && (apt-get install -y --no-install-recommends libaio1t64 unzip curl || apt-get install -y --no-install-recommends libaio1 unzip curl); \
+    apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "amd64" ]; then \
     : "${ORACLE_INSTANTCLIENT_SHA256_AMD64:?ORACLE_INSTANTCLIENT_SHA256_AMD64 must be set to the expected SHA256 checksum}"; \
@@ -107,14 +107,7 @@ RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
     /spice_sandbox/usr/lib && \
     ln -s libclntsh.so.23.1 /spice_sandbox/usr/lib/libclntsh.so && \
     ln -s libclntshcore.so.23.1 /spice_sandbox/usr/lib/libclntshcore.so && \
-    LIBAIO=$(find /usr/lib /lib -name 'libaio.so.1' 2>/dev/null | head -n 1); \
-    if [ -z "$LIBAIO" ]; then \
-      LIBAIO=$(find /usr/lib /lib -name 'libaio.so.1t64' 2>/dev/null | head -n 1); \
-      cp "$LIBAIO" /spice_sandbox/usr/lib/libaio.so.1t64 && \
-      ln -s libaio.so.1t64 /spice_sandbox/usr/lib/libaio.so.1; \
-    else \
-      cp "$LIBAIO" /spice_sandbox/usr/lib/libaio.so.1; \
-    fi && \
+    cp "$(find /usr/lib /lib -name 'libaio.so.1' | head -n 1)" /spice_sandbox/usr/lib && \
     cp "$(find /usr/lib /lib -name 'libresolv.so.2' | head -n 1)" /spice_sandbox/usr/lib && \
     rm -f basic.zip; \
     fi

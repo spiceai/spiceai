@@ -8,7 +8,7 @@ jobs:
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
     env:
-      GOVER: 1.25.5
+      GOVER: 1.25.3
       GOOS: ${{ matrix.target_os }}
       GOARCH: ${{ matrix.target_arch_go }}
 
@@ -116,7 +116,7 @@ jobs:
           ]
         target:
           - name: 'Linux x64'
-            runner: 'ubuntu-22.04'
+            runner: 'ubuntu-latest'
             target_os: 'linux'
             target_arch: 'x86_64'
             target_arch_go: 'amd64'
