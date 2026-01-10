@@ -14,10 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::any::Any;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
+use data_components::poly::PolyTableProvider;
 use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
@@ -39,19 +45,19 @@ use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
-use std::any::Any;
-use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator, upsert_dedup};
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior};
+
+/// Metadata key to identify the accelerator type in the schema metadata.
+const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -301,6 +307,18 @@ fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize 
         .unwrap_or(default)
 }
 
+/// Returns true if the path is a local filesystem path (not a remote object store).
+///
+/// Local paths include:
+/// - Absolute paths: `/data/cayenne`
+/// - Relative paths: `./data`
+/// - file:// URIs: `file:///data/cayenne`
+///
+/// Remote paths (S3, etc.) return false.
+fn is_local_path(path: &str) -> bool {
+    !path.contains("://") || path.starts_with("file://")
+}
+
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -380,6 +398,33 @@ impl CayenneAccelerator {
 
     fn resolve_default_data_path(dataset_name: &str) -> String {
         format!("{}/{dataset_name}/", spice_data_base_path())
+    }
+
+    /// Resolves the metadata directory for Cayenne catalog storage.
+    ///
+    /// Priority order:
+    /// 1. `cayenne_metadata_dir` - Explicit custom metadata directory
+    /// 2. `{cayenne_file_path}/metadata` - When `cayenne_file_path` is a local path (not S3)
+    /// 3. `{spice_data_base_path()}/metadata` - Default location
+    ///
+    /// Note: S3 paths are excluded because `SQLite` (used for metadata catalog) cannot run on object storage.
+    pub(crate) fn resolve_metadata_dir(acceleration: Option<&Acceleration>) -> String {
+        let Some(accel) = acceleration else {
+            return format!("{}/metadata", spice_data_base_path());
+        };
+
+        if let Some(custom_dir) = accel.params.get("cayenne_metadata_dir") {
+            return custom_dir.clone();
+        }
+
+        if let Some(file_path) = accel.params.get("cayenne_file_path")
+            && is_local_path(file_path)
+        {
+            let base = file_path.trim_end_matches('/');
+            return format!("{base}/metadata");
+        }
+
+        format!("{}/metadata", spice_data_base_path())
     }
 
     /// Returns true if the path is an S3 Express One Zone path.
@@ -1418,30 +1463,18 @@ impl CayenneAccelerator {
         schema: Arc<Schema>,
         source: &dyn AccelerationSource,
         retention_filters: Vec<Expr>,
-    ) -> Result<Arc<dyn TableProvider>> {
+    ) -> Result<Arc<cayenne::CayenneTableProvider>> {
         use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
 
-        // Get metastore type and custom metadata directory if provided
-        let (metadata_dir, metastore_type) = if let Some(acceleration) = source.acceleration() {
-            let metadata_dir =
-                if let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir") {
-                    custom_dir.clone()
-                } else {
-                    format!("{}/metadata", crate::spice_data_base_path())
-                };
+        tracing::debug!("create_cayenne_table_provider: starting for table {table_name}");
 
-            let metastore_type = acceleration
-                .params
-                .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str);
-
-            (metadata_dir, metastore_type.to_string())
-        } else {
-            (
-                format!("{}/metadata", crate::spice_data_base_path()),
-                "sqlite".to_string(),
-            )
-        };
+        // Get metastore type and metadata directory
+        let acceleration = source.acceleration();
+        let metadata_dir = Self::resolve_metadata_dir(acceleration);
+        let metastore_type = acceleration
+            .and_then(|a| a.params.get("cayenne_metastore"))
+            .map_or("sqlite", String::as_str)
+            .to_string();
 
         // Ensure metadata directory exists
         std::fs::create_dir_all(&metadata_dir).map_err(|e| Error::AccelerationCreationFailed {
@@ -1534,6 +1567,7 @@ impl CayenneAccelerator {
                 )),
             });
         }
+        tracing::debug!("create_cayenne_table_provider: calling builder.create for {table_name}");
         let cayenne_table =
             builder
                 .create(table_options)
@@ -1542,6 +1576,7 @@ impl CayenneAccelerator {
                     source: Box::new(e),
                 })?;
 
+        tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
         Ok(Arc::new(cayenne_table))
     }
 }
@@ -1628,15 +1663,26 @@ impl DataAccelerator for CayenneAccelerator {
         // S3 Express One Zone paths are always considered initialized
         // (the bucket/prefix is assumed to exist or will be created by the object store)
         if Self::is_s3_express_data_path(source) {
-            return true;
+            // For S3 Express, we need to check if the metadata database exists locally
+            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+            return PathBuf::from(metadata_db_path).exists();
         }
 
-        // otherwise, we're initialized if the directory exists
-        if let Ok(dir_path) = self.file_path(source) {
-            PathBuf::from(dir_path).exists()
-        } else {
-            false
+        // For local storage, check if both the data directory and metadata database exist
+        let Ok(dir_path) = self.file_path(source) else {
+            return false;
+        };
+
+        // Check if the data directory exists
+        if !PathBuf::from(&dir_path).exists() {
+            return false;
         }
+
+        // Also check if the metadata database exists (indicates proper initialization)
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+        PathBuf::from(metadata_db_path).exists()
     }
 
     /// Initializes a `Cayenne` database for the dataset
@@ -1758,7 +1804,7 @@ impl DataAccelerator for CayenneAccelerator {
             return Ok(());
         }
 
-        // If mode is FileCreate, delete the existing directory to start fresh
+        // If mode is FileCreate, delete the existing directory and metadata to start fresh
         if let Some(acceleration) = source.acceleration()
             && acceleration.mode == Mode::FileCreate
         {
@@ -1768,16 +1814,50 @@ impl DataAccelerator for CayenneAccelerator {
                     "Cayenne acceleration mode is 'file_create', removing existing directory: {}",
                     dir_path
                 );
-                std::fs::remove_dir_all(&path_buf).map_err(|err| {
+                tokio::fs::remove_dir_all(&path_buf).await.map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
+            }
+
+            // Also drop the table from metadata catalog to clean up stale metadata
+            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+
+            // Get or create catalog and drop the table if it exists
+            if let Ok(catalog) = self
+                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .await
+            {
+                let table_name = source.name().to_string();
+                match catalog.drop_table(&table_name).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            "Dropped existing Cayenne table metadata for '{}' (file_create mode)",
+                            table_name
+                        );
+                    }
+                    Ok(false) => {
+                        // Table didn't exist in metadata, nothing to drop
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to drop Cayenne table metadata for '{}': {e}. Continuing anyway.",
+                            table_name
+                        );
+                    }
+                }
             }
         }
 
         // Create the vortex data directory if it doesn't exist
         let path_buf = PathBuf::from(&dir_path);
         if !path_buf.exists() {
-            std::fs::create_dir_all(&path_buf)
+            tokio::fs::create_dir_all(&path_buf)
+                .await
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
 
@@ -1911,23 +1991,32 @@ impl DataAccelerator for CayenneAccelerator {
 
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
-            // Non-partitioned table - return base provider directly
-            Ok(cayenne_table)
+            // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
+            // Wrap with upsert deduplication if needed based on on_conflict settings
+            let (write_provider, delete_provider) =
+                upsert_dedup::wrap_with_upsert_dedup_if_needed(cayenne_table, &cmd.options);
+
+            let mut schema_metadata = HashMap::new();
+            schema_metadata.insert(
+                SPICE_ACCELERATOR_METADATA_KEY.to_string(),
+                "cayenne".to_string(),
+            );
+
+            let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
+                Arc::clone(&write_provider),
+                delete_provider,
+                write_provider,
+                schema_metadata,
+            ));
+
+            Ok(table_provider as Arc<dyn TableProvider>)
         } else {
             let partition_by_last = partition_by.last().cloned().ok_or_else(|| {
                 Box::new(Error::PartitionByRequired) as Box<dyn std::error::Error + Send + Sync>
             })?;
 
             // Get metadata catalog for partition tracking
-            let metadata_dir = if let Some(acceleration) = source.acceleration() {
-                if let Some(custom_dir) = acceleration.params.get("cayenne_metadata_dir") {
-                    custom_dir.clone()
-                } else {
-                    format!("{}/metadata", crate::spice_data_base_path())
-                }
-            } else {
-                format!("{}/metadata", crate::spice_data_base_path())
-            };
+            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
 
             // Ensure metadata directory exists
             std::fs::create_dir_all(&metadata_dir).map_err(|e| {
@@ -1976,6 +2065,43 @@ impl DataAccelerator for CayenneAccelerator {
                 );
             }
 
+            // Extract primary_key and on_conflict from acceleration settings for partitioned tables
+            let (primary_keys, on_conflict) = if let Some(acceleration) = source.acceleration() {
+                let pk_vec = acceleration
+                    .primary_key
+                    .as_ref()
+                    .map(|pk| pk.iter().map(std::string::ToString::to_string).collect())
+                    .unwrap_or_default();
+
+                let on_conflict = acceleration
+                    .on_conflict
+                    .iter()
+                    .map(|(col_ref, behavior)| {
+                        let col =
+                            datafusion_table_providers::util::column_reference::ColumnReference::new(
+                                col_ref
+                                    .iter()
+                                    .map(std::string::ToString::to_string)
+                                    .collect(),
+                            );
+                        match behavior {
+                            crate::component::dataset::acceleration::OnConflictBehavior::Drop => {
+                                datafusion_table_providers::util::on_conflict::OnConflict::DoNothing(
+                                    col,
+                                )
+                            }
+                            crate::component::dataset::acceleration::OnConflictBehavior::Upsert(
+                                _options,
+                            ) => datafusion_table_providers::util::on_conflict::OnConflict::Upsert(col),
+                        }
+                    })
+                    .next();
+
+                (pk_vec, on_conflict)
+            } else {
+                (Vec::new(), None)
+            };
+
             let creator = Arc::new(CayennePartitionCreator::new(
                 table_name,
                 PathBuf::from(&dir_path),
@@ -1987,16 +2113,35 @@ impl DataAccelerator for CayenneAccelerator {
                 retention_filters,
                 vortex_config,
                 object_store_config,
+                primary_keys,
+                on_conflict,
             ));
 
             // Wrap the base table provider with partitioning logic
-            let table_provider = Arc::new(
+            let partition_provider = Arc::new(
                 PartitionTableProvider::new(creator, partition_by, arrow_schema)
                     .await
                     .map_err(|e| Error::AccelerationCreationFailed {
                         source: Box::new(e),
                     })?,
             );
+
+            // Wrap with upsert deduplication if needed based on on_conflict settings
+            let (write_provider, delete_provider) =
+                upsert_dedup::wrap_with_upsert_dedup_if_needed(partition_provider, &cmd.options);
+
+            let mut schema_metadata = HashMap::new();
+            schema_metadata.insert(
+                SPICE_ACCELERATOR_METADATA_KEY.to_string(),
+                "cayenne".to_string(),
+            );
+
+            let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
+                Arc::clone(&write_provider),
+                delete_provider,
+                write_provider,
+                schema_metadata,
+            ));
 
             Ok(table_provider as Arc<dyn TableProvider>)
         }
@@ -2043,6 +2188,8 @@ struct CayennePartitionCreator {
     retention_filters: Vec<Expr>,
     vortex_config: cayenne::metadata::VortexConfig,
     object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
+    primary_key: Vec<String>,
+    on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
 }
 
 impl std::fmt::Debug for CayennePartitionCreator {
@@ -2058,6 +2205,8 @@ impl std::fmt::Debug for CayennePartitionCreator {
             .field("retention_filters", &self.retention_filters.len())
             .field("vortex_config", &"<VortexConfig>")
             .field("object_store_config", &self.object_store_config.is_some())
+            .field("primary_key", &self.primary_key)
+            .field("on_conflict", &self.on_conflict.is_some())
             .finish()
     }
 }
@@ -2075,6 +2224,8 @@ impl CayennePartitionCreator {
         retention_filters: Vec<Expr>,
         vortex_config: cayenne::metadata::VortexConfig,
         object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
+        primary_key: Vec<String>,
+        on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
     ) -> Self {
         Self {
             table_name,
@@ -2087,6 +2238,8 @@ impl CayennePartitionCreator {
             retention_filters,
             vortex_config,
             object_store_config,
+            primary_key,
+            on_conflict,
         }
     }
 
@@ -2157,8 +2310,8 @@ impl PartitionCreator for CayennePartitionCreator {
         let table_options = cayenne::metadata::CreateTableOptions {
             table_name: self.partition_table_name(&partition_value_str),
             schema: Arc::clone(&self.schema),
-            primary_key: vec![],
-            on_conflict: None,
+            primary_key: self.primary_key.clone(),
+            on_conflict: self.on_conflict.clone(),
             base_path: partition_path.clone(),
             partition_column: None, // Partitions themselves are not partitioned
             vortex_config: self.vortex_config.clone(),
@@ -2527,5 +2680,139 @@ mod tests {
             None
         );
         assert_eq!(CayenneAccelerator::derive_region_from_zone("invalid"), None);
+    }
+
+    #[test]
+    fn test_is_local_path() {
+        // Local absolute paths
+        assert!(is_local_path("/data/cayenne"));
+        assert!(is_local_path("/var/spice/data"));
+
+        // Local relative paths
+        assert!(is_local_path("./data"));
+        assert!(is_local_path("data/cayenne"));
+
+        // file:// URIs are local
+        assert!(is_local_path("file:///data/cayenne"));
+        assert!(is_local_path("file://localhost/data"));
+
+        // S3 paths are NOT local
+        assert!(!is_local_path("s3://bucket/prefix"));
+        assert!(!is_local_path("s3://bucket-usw2-az1-x-s3/prefix"));
+
+        // Other remote schemes are NOT local
+        assert!(!is_local_path("gs://bucket/prefix"));
+        assert!(!is_local_path("az://container/blob"));
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_with_explicit_metadata_dir() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_metadata_dir".to_string(),
+                "/custom/metadata".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            "/custom/metadata"
+        );
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_with_local_file_path() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_file_path".to_string(),
+                "/persistent/data".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            "/persistent/data/metadata"
+        );
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_excludes_s3_path() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_file_path".to_string(),
+                "s3://bucket--usw2-az1--x-s3/data".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        // Should fall back to default, not use S3 path
+        let result = CayenneAccelerator::resolve_metadata_dir(Some(&acceleration));
+        assert!(result.ends_with("/metadata"));
+        assert!(!result.starts_with("s3://"));
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_explicit_overrides_file_path() {
+        // When both are set, cayenne_metadata_dir takes priority
+        let acceleration = Acceleration {
+            params: [
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    "/explicit/metadata".to_string(),
+                ),
+                (
+                    "cayenne_file_path".to_string(),
+                    "/persistent/data".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            "/explicit/metadata"
+        );
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_default() {
+        // No acceleration - uses default
+        let result = CayenneAccelerator::resolve_metadata_dir(None);
+        assert!(
+            result.ends_with(".spice/data/metadata"),
+            "Expected path to end with '.spice/data/metadata', got: {result}"
+        );
+
+        // Empty acceleration params - uses default
+        let acceleration = Acceleration::default();
+        let result = CayenneAccelerator::resolve_metadata_dir(Some(&acceleration));
+        assert!(
+            result.ends_with(".spice/data/metadata"),
+            "Expected path to end with '.spice/data/metadata', got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_metadata_dir_trims_trailing_slash() {
+        let acceleration = Acceleration {
+            params: [(
+                "cayenne_file_path".to_string(),
+                "/persistent/data/".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        // Should not have double slashes
+        assert_eq!(
+            CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
+            "/persistent/data/metadata"
+        );
     }
 }

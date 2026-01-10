@@ -66,12 +66,10 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced
-        if: matrix.target.target_os != 'darwin'
         run: |
           make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
 
       - name: make spiced executable
-        if: matrix.target.target_os != 'windows'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced

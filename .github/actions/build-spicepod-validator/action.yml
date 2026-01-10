@@ -167,7 +167,7 @@ runs:
       shell: bash
       run: |
         mkdir -p /c/usr/local/bin
-        copy target/release/spicepod-validator.exe /c/usr/local/bin/spicepod-validator.exe
+        cp target/release/spicepod-validator.exe /c/usr/local/bin/spicepod-validator.exe
         chmod +x /c/usr/local/bin/spicepod-validator.exe
 
     - name: Set output path

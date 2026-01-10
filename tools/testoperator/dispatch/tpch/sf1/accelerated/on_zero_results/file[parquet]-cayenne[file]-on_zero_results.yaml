@@ -1,0 +1,6 @@
+tests:
+  bench:
+    spicepod_path: accelerated/on_zero_results/file[parquet]-cayenne[file]-on_zero_results.yaml
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+    validate_results: true

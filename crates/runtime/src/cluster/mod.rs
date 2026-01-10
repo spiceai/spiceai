@@ -55,6 +55,7 @@ use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::env;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -62,6 +63,7 @@ use tokio::sync::oneshot;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
 use uuid::Uuid;
+use x509_certificate::CapturedX509Certificate;
 
 type SchedulerEndpointOverride =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
@@ -97,6 +99,62 @@ impl ClusterTlsConfig {
         let ca_cert_pem = std::fs::read(ca_cert_path)?;
         let cert_pem = std::fs::read(cert_path)?;
         let key_pem = std::fs::read(key_path)?;
+
+        let ca_x509 = CapturedX509Certificate::from_pem(&ca_cert_pem).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse cluster CA certificate at {ca_cert_path}: {err}"),
+            )
+        })?;
+        let node_x509 = CapturedX509Certificate::from_pem(&cert_pem).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse cluster node certificate at {cert_path}: {err}"),
+            )
+        })?;
+
+        let ca_name = ca_x509.subject_name().user_friendly_str().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Failed to read subject name from cluster CA certificate at {ca_cert_path}: {err}"
+                ),
+            )
+        })?;
+        let node_issuer = node_x509.issuer_name().user_friendly_str().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Failed to read issuer name from cluster node certificate at {cert_path}: {err}"
+                ),
+            )
+        })?;
+
+        let node_cn = node_x509
+            .subject_common_name()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        tracing::info!(
+            "Cluster mTLS configured with CA {ca_name} and node certificate CN {node_cn}"
+        );
+
+        if node_issuer != ca_name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "The node certificate was not issued by the provided CA, expected {ca_name} but found issuer {node_issuer}"
+                ),
+            ));
+        }
+
+        if let Err(err) = node_x509.verify_signed_by_certificate(&ca_x509) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "The node certificate was not issued by the provided CA, signature verification failed for issuer {node_issuer}: {err}"
+                ),
+            ));
+        }
 
         let ca_certificate = Certificate::from_pem(&ca_cert_pem);
 
@@ -812,4 +870,211 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClusterTlsConfig;
+    use bcder::{Mode, encode::Values, string::BitString};
+    use bytes::Bytes;
+    use chrono::{Duration, Utc};
+    use tempfile::TempDir;
+    use x509_certificate::asn1time::Time;
+    use x509_certificate::rfc3280::Name;
+    use x509_certificate::rfc5280;
+    use x509_certificate::{
+        CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
+        X509Certificate,
+    };
+
+    fn create_signed_certificate(
+        subject_cn: &str,
+        issuer_cn: &str,
+        subject_key: &InMemorySigningKeyPair,
+        issuer_key: &InMemorySigningKeyPair,
+    ) -> CapturedX509Certificate {
+        let mut subject = Name::default();
+        subject
+            .append_common_name_utf8_string(subject_cn)
+            .expect("subject CN should be valid utf8");
+
+        let mut issuer = Name::default();
+        issuer
+            .append_common_name_utf8_string(issuer_cn)
+            .expect("issuer CN should be valid utf8");
+
+        let not_before = Utc::now();
+        let not_after = not_before + Duration::hours(1);
+
+        let signature_algorithm = issuer_key
+            .signature_algorithm()
+            .expect("issuer key should have signature algorithm");
+        let subject_key_algorithm = subject_key
+            .key_algorithm()
+            .expect("subject key should have key algorithm");
+
+        let tbs_certificate = rfc5280::TbsCertificate {
+            version: Some(rfc5280::Version::V3),
+            serial_number: 1.into(),
+            signature: signature_algorithm.into(),
+            issuer,
+            validity: rfc5280::Validity {
+                not_before: Time::from(not_before),
+                not_after: Time::from(not_after),
+            },
+            subject,
+            subject_public_key_info: rfc5280::SubjectPublicKeyInfo {
+                algorithm: subject_key_algorithm.into(),
+                subject_public_key: BitString::new(0, subject_key.public_key_data()),
+            },
+            issuer_unique_id: None,
+            subject_unique_id: None,
+            extensions: None,
+            raw_data: None,
+        };
+
+        let mut tbs_der = Vec::new();
+        tbs_certificate
+            .encode_ref()
+            .write_encoded(Mode::Der, &mut tbs_der)
+            .expect("tbs certificate should encode");
+
+        let signature = issuer_key
+            .try_sign(&tbs_der)
+            .expect("issuer key should sign certificate");
+        let signature_algorithm = issuer_key
+            .signature_algorithm()
+            .expect("issuer key should have signature algorithm");
+
+        let cert = rfc5280::Certificate {
+            tbs_certificate,
+            signature_algorithm: signature_algorithm.into(),
+            signature: BitString::new(0, Bytes::copy_from_slice(signature.as_ref())),
+        };
+
+        let cert = X509Certificate::from(cert);
+        let cert_der = cert.encode_der().expect("certificate should encode");
+        CapturedX509Certificate::from_der(cert_der).expect("certificate should parse")
+    }
+
+    fn write_cert(path: &std::path::Path, cert: &CapturedX509Certificate) {
+        std::fs::write(path, cert.encode_pem()).expect("certificate should write");
+    }
+
+    fn write_key(path: &std::path::Path, key: &InMemorySigningKeyPair) {
+        let key_der = key.to_pkcs8_one_asymmetric_key_der();
+        let key_pem = pem::Pem::new("PRIVATE KEY", key_der.as_slice().to_vec());
+        std::fs::write(path, key_pem.to_string()).expect("key should write");
+    }
+
+    fn generate_key() -> InMemorySigningKeyPair {
+        InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1))
+            .expect("key generation should succeed")
+    }
+
+    #[test]
+    fn cluster_tls_config_accepts_valid_node_certificate() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let ca_key = generate_key();
+        let ca_cert = create_signed_certificate("Spice Test CA", "Spice Test CA", &ca_key, &ca_key);
+
+        let node_key = generate_key();
+        let node_cert =
+            create_signed_certificate("Spice Test Node", "Spice Test CA", &node_key, &ca_key);
+
+        let ca_path = temp_dir.path().join("ca.pem");
+        let node_cert_path = temp_dir.path().join("node.pem");
+        let node_key_path = temp_dir.path().join("node.key");
+
+        write_cert(&ca_path, &ca_cert);
+        write_cert(&node_cert_path, &node_cert);
+        write_key(&node_key_path, &node_key);
+
+        ClusterTlsConfig::try_new(
+            ca_path.to_str().expect("ca path should be utf8"),
+            node_cert_path
+                .to_str()
+                .expect("node cert path should be utf8"),
+            node_key_path
+                .to_str()
+                .expect("node key path should be utf8"),
+        )
+        .expect("valid certificates should be accepted");
+    }
+
+    #[test]
+    fn cluster_tls_config_rejects_mismatched_issuer_name() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let ca_key = generate_key();
+        let ca_cert = create_signed_certificate("Spice Test CA", "Spice Test CA", &ca_key, &ca_key);
+
+        let node_key = generate_key();
+        let node_cert =
+            create_signed_certificate("Spice Test Node", "Other CA", &node_key, &ca_key);
+
+        let ca_path = temp_dir.path().join("ca.pem");
+        let node_cert_path = temp_dir.path().join("node.pem");
+        let node_key_path = temp_dir.path().join("node.key");
+
+        write_cert(&ca_path, &ca_cert);
+        write_cert(&node_cert_path, &node_cert);
+        write_key(&node_key_path, &node_key);
+
+        let err = ClusterTlsConfig::try_new(
+            ca_path.to_str().expect("ca path should be utf8"),
+            node_cert_path
+                .to_str()
+                .expect("node cert path should be utf8"),
+            node_key_path
+                .to_str()
+                .expect("node key path should be utf8"),
+        )
+        .expect_err("mismatched issuer should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("was not issued by the provided CA"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_tls_config_rejects_invalid_signature() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let ca_key = generate_key();
+        let ca_cert = create_signed_certificate("Spice Test CA", "Spice Test CA", &ca_key, &ca_key);
+
+        let node_key = generate_key();
+        let bad_signing_key = generate_key();
+        let node_cert = create_signed_certificate(
+            "Spice Test Node",
+            "Spice Test CA",
+            &node_key,
+            &bad_signing_key,
+        );
+
+        let ca_path = temp_dir.path().join("ca.pem");
+        let node_cert_path = temp_dir.path().join("node.pem");
+        let node_key_path = temp_dir.path().join("node.key");
+
+        write_cert(&ca_path, &ca_cert);
+        write_cert(&node_cert_path, &node_cert);
+        write_key(&node_key_path, &node_key);
+
+        let err = ClusterTlsConfig::try_new(
+            ca_path.to_str().expect("ca path should be utf8"),
+            node_cert_path
+                .to_str()
+                .expect("node cert path should be utf8"),
+            node_key_path
+                .to_str()
+                .expect("node key path should be utf8"),
+        )
+        .expect_err("invalid signature should be rejected");
+
+        assert!(
+            err.to_string().contains("signature verification failed"),
+            "unexpected error: {err}"
+        );
+    }
 }
