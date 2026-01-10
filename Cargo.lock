@@ -3165,6 +3165,7 @@ dependencies = [
  "test-framework",
  "test-log",
  "tokio",
+ "tokio-rusqlite",
  "tracing",
  "turso",
  "url",
