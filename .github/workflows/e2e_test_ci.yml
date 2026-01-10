@@ -1756,6 +1756,10 @@ jobs:
         with:
           build-path: ./build
 
+      - name: check installation
+        run: |
+          spice version
+
       - name: Install DuckDB CLI
         run: |
           curl https://install.duckdb.org | sh
@@ -1911,6 +1915,10 @@ jobs:
         uses: ./.github/actions/install-spice
         with:
           build-path: ./build
+
+      - name: check installation
+        run: |
+          spice version
 
       - name: Install oha (macOS)
         if: matrix.target.target_os == 'darwin'
