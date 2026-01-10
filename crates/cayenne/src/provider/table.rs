@@ -29,7 +29,7 @@ use super::delete::{
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::deletion::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
-use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata};
+use crate::metadata::{CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
@@ -64,8 +64,6 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::task;
-use vortex::compressor::CompactCompressor;
-use vortex::file::WriteStrategyBuilder;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormat;
 use vortex_session::VortexSession;
@@ -541,23 +539,15 @@ impl CayenneTableProvider {
 
     /// Create listing options for Vortex format with the given configuration.
     fn create_listing_options(vortex_config: &crate::metadata::VortexConfig) -> ListingOptions {
-        // Create a configured Vortex session with selected encodings
+        // Create a Vortex session
+        // TODO: Configure compression strategy with new Vortex API when available
         let vortex_session = VortexSession::default();
-
-        let vortex_session = if matches!(
-            vortex_config.compression_strategy,
-            CompressionStrategy::Zstd
-        ) {
-            vortex_session
-                .set(WriteStrategyBuilder::new().with_compressor(CompactCompressor::default()))
-        } else {
-            vortex_session
-        };
 
         // Configure VortexFormat with hardware-optimized settings
         let vortex_opts = vortex_datafusion::VortexOptions {
             footer_cache_size_mb: vortex_config.footer_cache_mb,
             segment_cache_size_mb: vortex_config.segment_cache_mb,
+            ..Default::default()
         };
 
         let format = Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts));
@@ -3386,7 +3376,7 @@ impl CayenneTableProvider {
 
         // Union the filtered existing data with new input
         let union_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![filtered_existing, new_input]));
+            UnionExec::try_new(vec![filtered_existing, new_input])?;
 
         // Generate a new snapshot ID
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -4563,7 +4553,7 @@ impl TableProvider for CayenneTableProvider {
             // UNION the filtered main plan with unfiltered protected snapshot plans
             let mut all_plans = vec![filtered_main_plan];
             all_plans.extend(protected_snapshot_plans);
-            let union_plan = Arc::new(UnionExec::new(all_plans));
+            let union_plan: Arc<dyn ExecutionPlan> = UnionExec::try_new(all_plans)?;
 
             // Strip extra PK columns if needed
             if need_projection_strip {

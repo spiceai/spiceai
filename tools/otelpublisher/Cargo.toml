@@ -10,7 +10,7 @@ version.workspace = true
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-opentelemetry-proto = { version = "0.30", features = [
+opentelemetry-proto = { version = "0.31", features = [
   "gen-tonic-messages",
   "gen-tonic",
   "metrics",

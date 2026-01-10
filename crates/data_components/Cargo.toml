@@ -64,7 +64,7 @@ indexmap.workspace = true
 logos.workspace = true
 mailparse = { workspace = true, optional = true }
 object_store = { workspace = true }
-opendal = "0.54"
+opendal = "0.55"
 oracle = { version = "0.6", optional = true }
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
@@ -105,9 +105,10 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
 clickhouse = ["dep:clickhouse-rs", "datafusion-table-providers/federation"]
+# TODO: Re-enable spark_connect once spark-connect-rs is updated for arrow 57 + tonic 0.14
 databricks = [
     "delta_lake",
-    "spark_connect",
+    # "spark_connect",
     "datafusion-table-providers/federation",
 ]
 debezium = ["dep:rdkafka"]
@@ -162,7 +163,7 @@ aws-smithy-types = { workspace = true }
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 ctor = "0.6.3"
-iceberg_test_utils = { version = "0.7.0", features = ["tests"] }
+iceberg_test_utils = { workspace = true, features = ["tests"] }
 insta.workspace = true
 object_store = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

@@ -19,9 +19,9 @@ use crate::metrics::telemetry::track_bytes_processed;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use datafusion::common::{DataFusionError, Result, exec_err};
+use datafusion::execution::{FunctionRegistry, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::ScalarUDF;
-use datafusion_expr::registry::FunctionRegistry;
 use datafusion_proto::generated::datafusion_common;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use prost::Message;
@@ -64,9 +64,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
         &self,
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
-        registry: &dyn FunctionRegistry,
+        ctx: &TaskContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if let Ok(plan) = self.inner.try_decode(buf, inputs, registry) {
+        if let Ok(plan) = self.inner.try_decode(buf, inputs, ctx) {
             return Ok(plan);
         }
 

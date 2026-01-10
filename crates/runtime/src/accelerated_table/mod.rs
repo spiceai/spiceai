@@ -1055,10 +1055,10 @@ impl TableProvider for AcceleratedTable {
             .await?;
 
         // Return the equivalent of a UNION ALL that inserts both into the acceleration and federated source tables.
-        let union_plan = Arc::new(UnionExec::new(vec![
+        let union_plan: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![
             accelerated_insert_plan,
             federated_insert_plan,
-        ]));
+        ])?;
 
         self.refresher().set_initial_load_completed(true);
 

@@ -115,10 +115,9 @@ impl SqliteAccelerator {
             sqlite3_auto_extension(Some(Self::sqlite3_decimal_init_wrapper));
         }
         Self {
+            // TODO: Add back with_decimal_between and with_function_support when datafusion-table-providers is updated
             sqlite_factory: SqliteTableProviderFactory::new()
-                .with_decimal_between(true)
-                .with_batch_insert_use_prepared_statements(true)
-                .with_function_support(deny_spice_specific_functions()),
+                .with_batch_insert_use_prepared_statements(true),
         }
     }
 

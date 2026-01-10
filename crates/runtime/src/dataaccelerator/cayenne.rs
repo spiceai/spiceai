@@ -1350,7 +1350,7 @@ impl CayenneAccelerator {
         cmd: &CreateExternalTable,
         source: &dyn AccelerationSource,
     ) -> Result<SchemaRef> {
-        let full_schema: arrow::datatypes::Schema = cmd.schema.as_ref().clone().into();
+        let full_schema: arrow::datatypes::Schema = cmd.schema.as_arrow().clone();
         let unsupported_type_action = Self::get_unsupported_type_action(source);
         let transformed_schema =
             transform_schema_for_vortex(&full_schema, unsupported_type_action)?;

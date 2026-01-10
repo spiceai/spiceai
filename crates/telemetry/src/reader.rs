@@ -49,7 +49,7 @@ impl MetricReader for InitialReader {
         self.reader.register_pipeline(pipeline);
     }
 
-    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::metrics::MetricResult<()> {
+    fn collect(&self, rm: &mut ResourceMetrics) -> OTelSdkResult {
         self.reader.collect(rm)
     }
 
@@ -59,6 +59,10 @@ impl MetricReader for InitialReader {
 
     fn shutdown(&self) -> OTelSdkResult {
         self.reader.shutdown()
+    }
+
+    fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> OTelSdkResult {
+        self.reader.shutdown_with_timeout(timeout)
     }
 
     fn temporality(&self, kind: InstrumentKind) -> Temporality {

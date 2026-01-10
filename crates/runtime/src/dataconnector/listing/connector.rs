@@ -107,7 +107,9 @@ impl LocationPruningListingTable {
     }
 
     fn metadata_columns(&self) -> &Vec<MetadataColumn> {
-        &self.inner.options().metadata_cols
+        // TODO: Port metadata_cols to DF51 fork's ListingOptions
+        static EMPTY: Vec<MetadataColumn> = Vec::new();
+        &EMPTY
     }
 
     fn object_store_url(&self) -> ObjectStoreUrl {
@@ -277,9 +279,8 @@ impl TableProvider for LocationPruningListingTable {
                 .with_file_groups(file_groups)
                 .with_table_partition_cols(partition_fields)
                 .with_projection(projection.cloned())
-                .with_limit(limit)
-                .with_metadata_cols(self.metadata_columns().clone())
-                .with_object_versioning_type(self.inner.options().object_versioning_type.clone());
+                .with_limit(limit);
+        // TODO: Port with_metadata_cols and with_object_versioning_type to DF51 fork
 
         if let Some(constraints) = self.inner.constraints() {
             builder = builder.with_constraints(constraints.clone());
@@ -925,7 +926,7 @@ pub trait ListingTableConnector: DataConnector {
         let session_state = ctx.state();
         let mut options = ListingOptions::new(file_format)
             .with_file_extension(extension)
-            .with_object_versioning_type(self.object_versioning_type())
+            // TODO: Port with_object_versioning_type to DF51 fork
             .with_session_config_options(session_state.config());
 
         let resolved_schema = options
@@ -1026,11 +1027,13 @@ pub trait ListingTableConnector: DataConnector {
             return Ok(Arc::new(cached_table));
         }
 
-        let has_location_metadata = table_arc
-            .options()
-            .metadata_cols
-            .iter()
-            .any(|c| matches!(c, MetadataColumn::Location(_)));
+        let has_location_metadata = false;
+        // TODO: Port metadata_cols to DF51 fork
+        // let has_location_metadata = table_arc
+        //     .options()
+        //     .metadata_cols
+        //     .iter()
+        //     .any(|c| matches!(c, MetadataColumn::Location(_)));
 
         if has_location_metadata {
             let wrapped = LocationPruningListingTable::new(
@@ -1176,7 +1179,8 @@ fn add_metadata_columns_if_required(
             dataset.name,
             columns
         );
-        options = options.with_metadata_cols(columns);
+        // TODO: Port with_metadata_cols to DF51 fork
+        let _ = columns;
     }
 
     options

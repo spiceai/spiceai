@@ -23,6 +23,7 @@ use arrow::{
 use arrow_cast::cast;
 use arrow_schema::Schema;
 use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
+use datafusion::common::metadata::ScalarAndMetadata;
 use snafu::{ResultExt, prelude::*};
 use std::sync::Arc;
 
@@ -227,7 +228,7 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
 
     // Fast path: empty batch
     if num_columns == 0 {
-        return Ok(ParamValues::List(Vec::new()));
+        return Ok(ParamValues::from(Vec::<ScalarValue>::new()));
     }
 
     let schema = batch.schema_ref();
@@ -274,7 +275,7 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
 
         // Extract just the values (compiler can optimize this to a move)
         Ok(ParamValues::List(
-            list_params.into_iter().map(|(_, value)| value).collect(),
+            list_params.into_iter().map(|(_, value)| ScalarAndMetadata::from(value)).collect(),
         ))
     } else {
         // Convert list_params back to named if we have mixed types
@@ -288,7 +289,7 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
                 named_params.push((format!("${index}"), value));
             }
         }
-        Ok(ParamValues::Map(named_params.into_iter().collect()))
+        Ok(ParamValues::Map(named_params.into_iter().map(|(k, v)| (k, ScalarAndMetadata::from(v))).collect()))
     }
 }
 
@@ -558,7 +559,7 @@ mod test {
         );
 
         let result = record_to_param_values(&batch).expect("record to param values");
-        let expected = ParamValues::List(vec![
+        let expected = ParamValues::from(vec![
             ScalarValue::Int32(Some(42)),
             ScalarValue::Utf8(Some("hello".to_string())),
         ]);
@@ -577,7 +578,7 @@ mod test {
         );
 
         let result = record_to_param_values(&batch).expect("record to param values");
-        let expected = ParamValues::List(vec![
+        let expected = ParamValues::from(vec![
             ScalarValue::Int32(Some(42)),
             ScalarValue::Utf8(Some("hello".to_string())),
         ]);
@@ -602,7 +603,7 @@ mod test {
             "param2".to_string(),
             ScalarValue::Utf8(Some("world".to_string())),
         );
-        let expected = ParamValues::Map(expected_map);
+        let expected = ParamValues::from(expected_map);
 
         assert_param_values_eq(result, expected);
     }
@@ -625,7 +626,7 @@ mod test {
             "param2".to_string(),
             ScalarValue::Utf8(Some("test".to_string())),
         );
-        let expected = ParamValues::Map(expected_map);
+        let expected = ParamValues::from(expected_map);
 
         assert_param_values_eq(result, expected);
     }
@@ -641,7 +642,7 @@ mod test {
         );
 
         let result = record_to_param_values(&batch).expect("record to param values");
-        let expected = ParamValues::List(vec![
+        let expected = ParamValues::from(vec![
             ScalarValue::Utf8(Some("first".to_string())),
             ScalarValue::Int32(Some(200)),
         ]);
@@ -657,7 +658,7 @@ mod test {
         );
 
         let result = record_to_param_values(&batch).expect("record to param values");
-        let expected = ParamValues::List(vec![ScalarValue::Int32(Some(1))]);
+        let expected = ParamValues::from(vec![ScalarValue::Int32(Some(1))]);
 
         assert_param_values_eq(result, expected);
     }
@@ -675,7 +676,7 @@ mod test {
             "x".to_string(),
             ScalarValue::Utf8(Some("value".to_string())),
         );
-        let expected = ParamValues::Map(expected_map);
+        let expected = ParamValues::from(expected_map);
 
         assert_param_values_eq(result, expected);
     }

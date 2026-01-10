@@ -68,8 +68,8 @@ impl PostgresAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            postgres_factory: PostgresTableProviderFactory::new()
-                .with_function_support(deny_spice_specific_functions()),
+            // TODO: Add back with_function_support when datafusion-table-providers is updated
+            postgres_factory: PostgresTableProviderFactory::new(),
         }
     }
 }

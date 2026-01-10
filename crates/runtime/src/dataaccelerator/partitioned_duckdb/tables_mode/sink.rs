@@ -177,13 +177,13 @@ impl DataSink for DuckDBPartitionedDataSink {
                     self.table_definition.constraints()
                 {
                     datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                        vec![batch],
+                        std::slice::from_ref(&batch),
                         constraints,
-                        &upsert_options,
                     )
                     .await
                     .context(ConstraintViolationSnafu)
-                    .map_err(to_datafusion_error)?
+                    .map_err(to_datafusion_error)?;
+                    vec![batch]
                 } else {
                     vec![batch]
                 };

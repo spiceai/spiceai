@@ -573,6 +573,7 @@ impl AcceleratorExternalTableBuilder {
             constraints,
             column_defaults: HashMap::default(),
             temporary: false,
+            or_replace: false,
         };
 
         Ok(external_table)

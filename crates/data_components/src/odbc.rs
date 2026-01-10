@@ -87,7 +87,7 @@ where
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;
 
-        let table = SqlTable::new("odbc", &dyn_pool, table_reference, Some(Engine::ODBC))
+        let table = SqlTable::new("odbc", &dyn_pool, table_reference)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 

@@ -32,7 +32,7 @@ use datafusion::{
     },
     sql::{
         TableReference,
-        sqlparser::ast::DataType,
+        sqlparser::ast::{DataType, ExactNumberInfo},
         unparser::{
             Unparser,
             dialect::{CustomDialect, CustomDialectBuilder},
@@ -103,7 +103,7 @@ impl SqlServerExecPlan {
 
     fn dialect() -> CustomDialect {
         CustomDialectBuilder::new()
-            .with_float64_ast_dtype(DataType::Float(None))
+            .with_float64_ast_dtype(DataType::Float(ExactNumberInfo::None))
             .build()
     }
 

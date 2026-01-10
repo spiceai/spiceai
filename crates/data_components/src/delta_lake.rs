@@ -1081,7 +1081,9 @@ fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
         | ScalarValue::DurationMicrosecond(_)
         | ScalarValue::DurationNanosecond(_)
         | ScalarValue::Union(_, _, _)
-        | ScalarValue::Dictionary(_, _) => None,
+        | ScalarValue::Dictionary(_, _)
+        | ScalarValue::Decimal32(_, _, _)
+        | ScalarValue::Decimal64(_, _, _) => None,
     }
 }
 

@@ -911,7 +911,7 @@ impl DataFusion {
             .await
             .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
-        Ok(Schema::from(data_frame.schema()))
+        Ok(data_frame.schema().as_arrow().clone())
     }
 
     #[must_use]

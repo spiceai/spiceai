@@ -388,7 +388,7 @@ mod tests {
         let data_source_1 = create_data_source_exec(files_1);
         let data_source_2 = create_data_source_exec(files_2);
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![data_source_1, data_source_2]));
+            Arc::new(UnionExec::try_new(vec![data_source_1, data_source_2])?);
         let projection_exec = ProjectionExec::try_new(
             vec![(
                 col("id", union_exec.schema().as_ref()).expect("Must bind expr"),
@@ -474,7 +474,7 @@ mod tests {
 
         // Create a UnionExec
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![data_source1, data_source2]));
+            Arc::new(UnionExec::try_new(vec![data_source1, data_source2])?);
 
         // Verify all schemas match
         assert_eq!(union_exec.schema().fields().len(), 3);
@@ -558,7 +558,7 @@ mod tests {
         };
 
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![data_source1, data_source2]));
+            Arc::new(UnionExec::try_new(vec![data_source1, data_source2])?);
 
         // Child projection outputs 3 columns from a 2-column input schema.
         let child_projection = ProjectionExec::try_new(

@@ -38,7 +38,7 @@ pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, Error> {
                 let scalar = json_to_scalar(&val)?;
                 vec.push(scalar);
             }
-            Ok(ParamValues::List(vec))
+            Ok(ParamValues::from(vec))
         }
         Value::Object(obj) => {
             let mut map = HashMap::new();
@@ -46,7 +46,7 @@ pub fn convert_json_to_param_values(json: Value) -> Result<ParamValues, Error> {
                 let scalar = json_to_scalar(&val)?;
                 map.insert(key, scalar);
             }
-            Ok(ParamValues::Map(map))
+            Ok(ParamValues::from(map))
         }
         _ => Err(Error::JsonArrayOrObjectRequired),
     }
@@ -112,7 +112,7 @@ mod tests {
     fn test_json_array() {
         let json = json!([1, "hello", true, null]);
         let got = convert_json_to_param_values(json).expect("convert to param values");
-        let want = ParamValues::List(vec![
+        let want = ParamValues::from(vec![
             ScalarValue::Int64(Some(1)),
             ScalarValue::Utf8(Some("hello".to_string())),
             ScalarValue::Boolean(Some(true)),
@@ -133,7 +133,7 @@ mod tests {
             ScalarValue::Utf8(Some("world".to_string())),
         );
         want.insert("z".to_string(), ScalarValue::Boolean(Some(false)));
-        assert_eq_param_values(&got, &ParamValues::Map(want));
+        assert_eq_param_values(&got, &ParamValues::from(want));
     }
 
     #[test]
@@ -161,14 +161,14 @@ mod tests {
     fn test_empty_array() {
         let json = json!([]);
         let result = convert_json_to_param_values(json).expect("convert to param values");
-        assert_eq_param_values(&result, &ParamValues::List(vec![]));
+        assert_eq_param_values(&result, &ParamValues::from(Vec::<ScalarValue>::new()));
     }
 
     #[test]
     fn test_empty_object() {
         let json = json!({});
         let result = convert_json_to_param_values(json).expect("convert to param values");
-        assert_eq_param_values(&result, &ParamValues::Map(HashMap::new()));
+        assert_eq_param_values(&result, &ParamValues::from(HashMap::<String, ScalarValue>::new()));
     }
 
     #[test]
@@ -177,7 +177,7 @@ mod tests {
         let result = convert_json_to_param_values(json).expect("convert to param values");
         assert_eq_param_values(
             &result,
-            &ParamValues::List(vec![ScalarValue::Utf8(None), ScalarValue::Utf8(None)]),
+            &ParamValues::from(vec![ScalarValue::Utf8(None), ScalarValue::Utf8(None)]),
         );
     }
 
@@ -188,7 +188,7 @@ mod tests {
         let mut expected_map = HashMap::new();
         expected_map.insert("a".to_string(), ScalarValue::Utf8(None));
         expected_map.insert("b".to_string(), ScalarValue::Utf8(None));
-        assert_eq_param_values(&result, &ParamValues::Map(expected_map));
+        assert_eq_param_values(&result, &ParamValues::from(expected_map));
     }
 
     #[test]
@@ -197,7 +197,7 @@ mod tests {
         let result = convert_json_to_param_values(json).expect("convert to param values");
         assert_eq_param_values(
             &result,
-            &ParamValues::List(vec![
+            &ParamValues::from(vec![
                 ScalarValue::Float64(Some(1.5)),
                 ScalarValue::Float64(Some(2.0)),
             ]),
@@ -211,7 +211,7 @@ mod tests {
         let mut expected_map = HashMap::new();
         expected_map.insert("pi".to_string(), ScalarValue::Float64(Some(PI)));
         expected_map.insert("e".to_string(), ScalarValue::Float64(Some(E)));
-        assert_eq_param_values(&result, &ParamValues::Map(expected_map));
+        assert_eq_param_values(&result, &ParamValues::from(expected_map));
     }
 
     #[test]
@@ -220,7 +220,7 @@ mod tests {
         let result = convert_json_to_param_values(json).expect("convert to param values");
         assert_eq_param_values(
             &result,
-            &ParamValues::List(vec![
+            &ParamValues::from(vec![
                 ScalarValue::Utf8(Some("test".to_string())),
                 ScalarValue::Boolean(Some(true)),
                 ScalarValue::Boolean(Some(false)),
@@ -238,7 +238,7 @@ mod tests {
             ScalarValue::Utf8(Some("Alice".to_string())),
         );
         expected_map.insert("is_active".to_string(), ScalarValue::Boolean(Some(true)));
-        assert_eq_param_values(&result, &ParamValues::Map(expected_map));
+        assert_eq_param_values(&result, &ParamValues::from(expected_map));
     }
 
     #[test]

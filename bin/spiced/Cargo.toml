@@ -65,7 +65,8 @@ default = [
     "sharepoint",
     "snapshots",
     "snowflake",
-    "spark",
+    # TODO: Re-enable spark once spark-connect-rs is updated for arrow 57 + tonic 0.14
+    # "spark",
     "ftp",
     "sftp",
     "debezium",
@@ -77,7 +78,8 @@ default = [
     "alloc-snmalloc",
     "oracle",
     "runtime/s3_vectors",
-    "mongodb",
+    # TODO: Re-enable mongodb once runtime/mongodb feature is re-enabled
+    # "mongodb",
     "iceberg-write",
     "turso",
     "smb",

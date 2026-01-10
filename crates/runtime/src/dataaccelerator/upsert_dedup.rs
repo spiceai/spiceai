@@ -249,36 +249,28 @@ impl ExecutionPlan for UpsertDedupExec {
         let constraints = self.constraints.clone();
         let upsert_options = self.upsert_options.clone();
 
-        // Create a stream that applies deduplication to each batch
-        let dedup_stream = input_stream.then(move |batch_result| {
+        // Create a stream that validates constraints on each batch
+        // TODO: Add back deduplication logic when datafusion-table-providers upsert API is ported
+        let validated_stream = input_stream.then(move |batch_result| {
             let constraints = constraints.clone();
-            let upsert_options = upsert_options.clone();
             async move {
                 let batch = batch_result?;
 
-                // Apply constraint validation with deduplication
-                let deduplicated_batches =
-                    datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                        vec![batch],
-                        &constraints,
-                        &upsert_options,
-                    )
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                // Apply constraint validation
+                datafusion_table_providers::util::constraints::validate_batch_with_constraints(
+                    std::slice::from_ref(&batch),
+                    &constraints,
+                )
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                Ok(deduplicated_batches)
+                Ok(batch)
             }
-        });
-
-        // Flatten the Vec<RecordBatch> results into individual batches
-        let flattened_stream = dedup_stream.flat_map(|result| match result {
-            Ok(batches) => stream::iter(batches.into_iter().map(Ok)).boxed(),
-            Err(e) => stream::once(async move { Err(e) }).boxed(),
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            flattened_stream,
+            validated_stream,
         )))
     }
 

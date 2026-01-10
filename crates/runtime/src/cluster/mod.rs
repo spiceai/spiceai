@@ -34,7 +34,6 @@ use ballista_core::serde::protobuf::scheduler_grpc_client::SchedulerGrpcClient;
 use ballista_core::serde::protobuf::{
     ExecutorRegistration, ExecutorResource, ExecutorSpecification,
 };
-use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
@@ -59,14 +58,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
 use uuid::Uuid;
 use x509_certificate::CapturedX509Certificate;
-
-type SchedulerEndpointOverride =
-    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
 
 pub mod datafusion;
 mod servers;
@@ -425,22 +420,12 @@ pub async fn initialize_cluster_executor(
     };
 
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
-    let tls_enabled = client_tls_config.is_some();
-    let config_producer_tls = client_tls_config.clone();
+    // Note: TLS configuration for executor-to-executor connections removed in ballista DF51 update.
+    // TLS support would need to be re-implemented if required.
 
-    // Configure mTLS for executor-to-executor gRPC connections (e.g., shuffle fetch)
+    // Configure executor session config
     let config_producer: ConfigProducer = Arc::new(move || {
-        let mut config = SessionConfig::new_with_ballista()
-            .with_option_extension(SpiceClusterConfig::default())
-            .with_ballista_use_tls(tls_enabled);
-
-        if let Some(tls_config) = config_producer_tls.clone() {
-            config = config.with_ballista_override_create_grpc_client_endpoint({
-                Arc::new(move |ep| ep.tls_config(tls_config.clone()).boxed())
-            });
-        }
-
-        config
+        SessionConfig::new_with_ballista().with_option_extension(SpiceClusterConfig::default())
     });
 
     // Generate executor_id early so we can use it for both the app definition request and executor registration
@@ -478,9 +463,8 @@ pub async fn initialize_cluster_executor(
 
     let app_def = Arc::new(app_def);
 
-    let scheduler_endpoint = create_grpc_client_endpoint(scheduler_url.to_string())
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
+    let scheduler_endpoint = tonic::transport::Endpoint::new(scheduler_url.to_string())
+        .map_err(|e| FailedToStartClusterExecutor { source: Box::new(e) })?;
     let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
         scheduler_endpoint
             .tls_config(tls_config)
@@ -616,22 +600,18 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    let (tx_ready, rx_ready) = oneshot::channel::<String>();
+    // Note: The ready signal channel was removed in ballista DF51 update.
+    // We now proceed without waiting for explicit readiness signal.
 
     let executor_poll_loop = tokio::spawn(
-        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec, Some(tx_ready)).map_err(
-            |e| FailedToStartClusterExecutor {
+        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec).map_err(|e| {
+            FailedToStartClusterExecutor {
                 source: Box::new(e),
-            },
-        ),
+            }
+        }),
     );
 
     Ok(async move {
-        let _ = rx_ready
-            .await
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
-
         // Bind the already-fetched app and initialize secrets for object store configuration
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
 
@@ -655,10 +635,8 @@ async fn create_scheduler_server(
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
 
-    let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
-    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
-        .clone()
-        .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
+    // Note: TLS configuration for scheduler gRPC connections removed in ballista DF51 update.
+    // TLS support would need to be re-implemented if required.
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -687,7 +665,6 @@ async fn create_scheduler_server(
                     .build(),
             )
         })),
-        override_create_grpc_client_endpoint,
         ..Default::default()
     };
 

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion_expr::LogicalPlan;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion_federation::{FederationAnalyzerForLogicalPlan, FederationProvider};
 
 #[derive(Debug)]
@@ -49,7 +49,7 @@ impl AcceleratedTableFederationProvider {
 }
 
 impl FederationProvider for AcceleratedTableFederationProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "FederationProviderForAcceleratedDataset"
     }
 

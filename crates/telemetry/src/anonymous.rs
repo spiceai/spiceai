@@ -143,17 +143,14 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
     // Send an initial telemetry event to indicate the start of telemetry collection
     crate::QUERY_COUNT.add(0, &[]);
 
-    let mut rm = ResourceMetrics {
-        resource,
-        scope_metrics: vec![],
-    };
+    let mut rm = ResourceMetrics::default();
 
     if let Err(err) = initial_reader.collect(&mut rm) {
         tracing::trace!("Failed to collect initial telemetry: {:?}", err);
     }
 
     oss_telemetry_exporter
-        .export(&mut rm)
+        .export(&rm)
         .await
         .unwrap_or_else(|err| {
             tracing::trace!("Failed to export initial telemetry: {:?}", err);

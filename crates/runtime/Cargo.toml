@@ -96,7 +96,7 @@ once_cell = "1.21.3"
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.30", features = [
+opentelemetry-proto = { version = "0.31", features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",
@@ -267,7 +267,8 @@ models = [
     "runtime-datafusion-udfs/models",
     "search/llms",
 ]
-mongodb = ["dep:mongodb", "data_components/mongodb"]
+# TODO: Re-enable after adding mongodb support to datafusion-table-providers fork
+# mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]
