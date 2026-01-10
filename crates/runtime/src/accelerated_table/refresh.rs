@@ -770,6 +770,12 @@ impl Refresher {
         };
         self.snapshot_interval_task = snapshot_interval_task;
 
+        if create_snapshot_after_refresh {
+            tracing::info!(
+                "Snapshots for dataset {dataset_name} will be created after every refresh"
+            );
+        }
+
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
         // The `select!` block handle waiting on both
         //   1. The manual refresh [`Receiver`] channel `on_start_refresh_external`

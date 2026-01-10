@@ -852,7 +852,6 @@ impl SnapshotManager {
         let dest_for_metrics = dest.clone();
         let dataset_name = self.dataset_name.clone();
 
-        tracing::info!("Compacting DuckDB snapshot. dataset={dataset_name}");
         let start = Instant::now();
 
         let source_size = fs::metadata(&source).await.map(|m| m.len()).unwrap_or(0);

@@ -2162,6 +2162,8 @@ async fn build_snapshot_creation_config(
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => AccelerationEngine::DuckDB,
+        #[cfg(feature = "duckdb")]
+        Engine::TableModePartitionedDuckDB => AccelerationEngine::DuckDB,
         #[cfg(feature = "sqlite")]
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
