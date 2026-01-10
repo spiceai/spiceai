@@ -1147,6 +1147,9 @@ mod tests {
             obj.get("field1"),
             Some(&serde_json::Value::String("value1".to_string()))
         );
-        assert_eq!(obj.get("field2").and_then(|v| v.as_f64()), Some(42.0));
+        assert_eq!(
+            obj.get("field2").and_then(serde_json::Value::as_f64),
+            Some(42.0)
+        );
     }
 }
