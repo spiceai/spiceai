@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! CQL (Cassandra Query Language) dialect for DataFusion unparser.
+//! CQL (Cassandra Query Language) dialect for `DataFusion` unparser.
 //!
 //! CQL is fundamentally different from SQL in several ways:
 //! - No `CASE WHEN` expressions
@@ -25,7 +25,7 @@ limitations under the License.
 //! - Different aggregate function syntax
 //! - Uses double quotes for identifiers
 //!
-//! This dialect configures the DataFusion unparser to generate CQL-compatible
+//! This dialect configures the `DataFusion` unparser to generate CQL-compatible
 //! syntax for the operations that CQL does support.
 
 use std::sync::Arc;
@@ -35,11 +35,11 @@ use datafusion::sql::{
     unparser::dialect::{DateFieldExtractStyle, Dialect, IntervalStyle},
 };
 
-/// CQL dialect for ScyllaDB/Cassandra.
+/// CQL dialect for `ScyllaDB`/Cassandra.
 ///
 /// This dialect generates CQL-compatible SQL for operations that CQL supports.
 /// Note: Many SQL constructs are not supported in CQL and will cause errors
-/// if pushed down to ScyllaDB. The federation layer should handle rejecting
+/// if pushed down to `ScyllaDB`. The federation layer should handle rejecting
 /// unsupported operations.
 #[derive(Debug, Default)]
 pub struct CqlDialect {}
@@ -118,7 +118,7 @@ impl Dialect for CqlDialect {
     }
 
     /// CQL does not support window functions with frames.
-    /// ScyllaDB doesn't have window functions at all.
+    /// `ScyllaDB` doesn't have window functions at all.
     fn window_func_support_window_frame(
         &self,
         _func_name: &str,
@@ -155,13 +155,7 @@ mod tests {
     #[test]
     fn test_cql_dialect_timestamp_type() {
         let dialect = CqlDialect::new();
-        let ts_type = dialect.timestamp_cast_dtype(
-            &arrow::datatypes::TimeUnit::Millisecond,
-            &None,
-        );
-        assert_eq!(
-            ts_type,
-            ast::DataType::Timestamp(None, TimezoneInfo::None)
-        );
+        let ts_type = dialect.timestamp_cast_dtype(&arrow::datatypes::TimeUnit::Millisecond, &None);
+        assert_eq!(ts_type, ast::DataType::Timestamp(None, TimezoneInfo::None));
     }
 }

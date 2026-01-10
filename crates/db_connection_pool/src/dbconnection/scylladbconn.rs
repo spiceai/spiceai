@@ -428,11 +428,7 @@ fn convert_cqlvalue_rows_to_record_batch(
                         } else if let CqlValue::Decimal(decimal) = value {
                             // Convert CqlDecimal to f64 (fallback for Float64 schema)
                             let (bytes, scale) = decimal.as_signed_be_bytes_slice_and_exponent();
-                            if let Some(f) = cql_decimal_to_f64(bytes, scale) {
-                                builder.append_value(f);
-                            } else {
-                                builder.append_null();
-                            }
+                            builder.append_value(cql_decimal_to_f64(bytes, scale));
                         } else {
                             builder.append_null();
                         }
@@ -447,16 +443,10 @@ fn convert_cqlvalue_rows_to_record_batch(
                     .with_precision_and_scale(*precision, *scale)
                     .unwrap_or_else(|_| Decimal128Builder::with_capacity(num_rows));
                 for row in rows {
-                    if let Some(Some(value)) = row.get(col_idx) {
-                        if let CqlValue::Decimal(decimal) = value {
-                            let (bytes, source_scale) =
-                                decimal.as_signed_be_bytes_slice_and_exponent();
-                            if let Some(mantissa) = cql_decimal_to_i128(bytes, source_scale, *scale)
-                            {
-                                builder.append_value(mantissa);
-                            } else {
-                                builder.append_null();
-                            }
+                    if let Some(Some(CqlValue::Decimal(decimal))) = row.get(col_idx) {
+                        let (bytes, source_scale) = decimal.as_signed_be_bytes_slice_and_exponent();
+                        if let Some(mantissa) = cql_decimal_to_i128(bytes, source_scale, *scale) {
+                            builder.append_value(mantissa);
                         } else {
                             builder.append_null();
                         }
@@ -515,7 +505,10 @@ fn convert_cqlvalue_rows_to_record_batch(
                             // Arrow Date32 is days since epoch (1970-01-01)
                             // Use wrapping subtraction to handle the offset correctly
                             // The wrap is intentional to convert from unsigned with offset to signed days
-                            #[allow(clippy::cast_possible_wrap)]
+                            #[expect(
+                                clippy::cast_possible_wrap,
+                                reason = "intentional wrap from unsigned offset to signed days"
+                            )]
                             let days = v.0.wrapping_sub(1u32 << 31) as i32;
                             builder.append_value(days);
                         } else {
@@ -581,11 +574,11 @@ fn convert_cqlvalue_rows_to_record_batch(
 
 /// Convert CQL decimal bytes (two's complement big-endian) with scale to f64.
 ///
-/// CqlDecimal represents: int_val / 10^scale
-/// where int_val is stored as two's complement big-endian bytes.
-fn cql_decimal_to_f64(bytes: &[u8], scale: i32) -> Option<f64> {
+/// `CqlDecimal` represents: `int_val` / `10^scale`
+/// where `int_val` is stored as two's complement big-endian bytes.
+fn cql_decimal_to_f64(bytes: &[u8], scale: i32) -> f64 {
     if bytes.is_empty() {
-        return Some(0.0);
+        return 0.0;
     }
 
     // Parse two's complement big-endian bytes to i128
@@ -600,24 +593,27 @@ fn cql_decimal_to_f64(bytes: &[u8], scale: i32) -> Option<f64> {
     }
 
     // Convert to f64 and apply scale
+    // Note: i128 to f64 can lose precision for very large values
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "decimal conversion accepts precision loss for very large values"
+    )]
     let float_value = value as f64;
 
     // Apply scale: result = int_val / 10^scale
-    if scale > 0 {
-        Some(float_value / 10_f64.powi(scale))
-    } else if scale < 0 {
-        Some(float_value * 10_f64.powi(-scale))
-    } else {
-        Some(float_value)
+    match scale.cmp(&0) {
+        std::cmp::Ordering::Greater => float_value / 10_f64.powi(scale),
+        std::cmp::Ordering::Less => float_value * 10_f64.powi(-scale),
+        std::cmp::Ordering::Equal => float_value,
     }
 }
 
 /// Convert CQL decimal bytes to i128 for Arrow Decimal128 with target scale.
 ///
-/// CqlDecimal represents: int_val / 10^source_scale
-/// Arrow Decimal128 stores: mantissa / 10^target_scale
+/// `CqlDecimal` represents: `int_val` / `10^source_scale`
+/// Arrow Decimal128 stores: mantissa / `10^target_scale`
 ///
-/// We need to rescale: mantissa = int_val * 10^(target_scale - source_scale)
+/// We need to rescale: mantissa = `int_val` * `10^(target_scale - source_scale)`
 fn cql_decimal_to_i128(bytes: &[u8], source_scale: i32, target_scale: i8) -> Option<i128> {
     if bytes.is_empty() {
         return Some(0);
@@ -638,18 +634,20 @@ fn cql_decimal_to_i128(bytes: &[u8], source_scale: i32, target_scale: i8) -> Opt
 
     // Rescale: multiply/divide to match target scale
     let scale_diff = i32::from(target_scale) - source_scale;
-    if scale_diff > 0 {
-        // Need more decimal places: multiply
-        value.checked_mul(10_i128.pow(scale_diff.unsigned_abs()))
-    } else if scale_diff < 0 {
-        // Need fewer decimal places: divide (rounds toward zero)
-        Some(value / 10_i128.pow((-scale_diff).unsigned_abs()))
-    } else {
-        Some(value)
+    match scale_diff.cmp(&0) {
+        std::cmp::Ordering::Greater => {
+            // Need more decimal places: multiply
+            value.checked_mul(10_i128.pow(scale_diff.unsigned_abs()))
+        }
+        std::cmp::Ordering::Less => {
+            // Need fewer decimal places: divide (rounds toward zero)
+            Some(value / 10_i128.pow((-scale_diff).unsigned_abs()))
+        }
+        std::cmp::Ordering::Equal => Some(value),
     }
 }
 
-/// Map CQL type string (from system_schema.columns) to Arrow DataType.
+/// Map CQL type string (from `system_schema.columns`) to Arrow `DataType`.
 fn map_scylladb_type_to_arrow(type_str: &str) -> DataType {
     let type_lower = type_str.to_lowercase();
     match type_lower.as_str() {
@@ -684,8 +682,11 @@ fn map_scylladb_type_to_arrow(type_str: &str) -> DataType {
     }
 }
 
-/// Map CQL ColumnType to Arrow DataType.
-#[allow(clippy::match_same_arms)]
+/// Map CQL `ColumnType` to Arrow `DataType`.
+#[expect(
+    clippy::match_same_arms,
+    reason = "clearer to list each CQL type explicitly even if mapping is same"
+)]
 fn map_cql_type_to_arrow(cql_type: &ColumnType<'_>) -> DataType {
     match cql_type {
         ColumnType::Native(native) => match native {
@@ -949,10 +950,7 @@ mod tests {
         ]));
 
         let rows: Vec<Vec<Option<CqlValue>>> = vec![
-            vec![
-                Some(CqlValue::Float(3.14)),
-                Some(CqlValue::Double(2.718281828)),
-            ],
+            vec![Some(CqlValue::Float(3.125)), Some(CqlValue::Double(2.5))],
             vec![
                 Some(CqlValue::Float(-0.0)),
                 Some(CqlValue::Double(f64::MAX)),
@@ -974,8 +972,8 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .expect("should be Float64Array");
 
-        assert!((f32_col.value(0) - 3.14).abs() < 0.001);
-        assert!((f64_col.value(0) - 2.718281828).abs() < 0.0001);
+        assert!((f32_col.value(0) - 3.125).abs() < 0.001);
+        assert!((f64_col.value(0) - 2.5).abs() < 0.0001);
     }
 
     #[test]
@@ -1092,12 +1090,12 @@ mod tests {
             .expect("should be TimestampMillisecondArray");
         assert_eq!(ts_col.value(0), 1_640_995_200_000);
 
-        let tm_col = batch
+        let time_col = batch
             .column(1)
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("should be TimestampMicrosecondArray");
-        assert_eq!(tm_col.value(0), 12 * 3600 * 1_000_000); // microseconds
+        assert_eq!(time_col.value(0), 12 * 3600 * 1_000_000); // microseconds
     }
 
     #[test]
@@ -1153,11 +1151,15 @@ mod tests {
         ]));
 
         // Create 10000 rows
-        let rows: Vec<Vec<Option<CqlValue>>> = (0..10000)
+        let rows: Vec<Vec<Option<CqlValue>>> = (0..10000_i64)
             .map(|i| {
                 vec![
                     Some(CqlValue::BigInt(i)),
-                    Some(CqlValue::Double(f64::from(i as i32) * 0.1)),
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "test data, precision loss acceptable"
+                    )]
+                    Some(CqlValue::Double(i as f64 * 0.1)),
                 ]
             })
             .collect();
@@ -1588,7 +1590,7 @@ mod tests {
             // All ones
             vec![Some(CqlValue::Blob(vec![0xFF; 1000]))],
             // Alternating pattern
-            vec![Some(CqlValue::Blob((0..256).map(|i| i as u8).collect()))],
+            vec![Some(CqlValue::Blob((0..=255_u8).collect()))],
             // Large blob
             vec![Some(CqlValue::Blob(vec![0xAB; 100_000]))],
         ];

@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! ScyllaDB connector module with CQL dialect support.
+//! `ScyllaDB` connector module with CQL dialect support.
 //!
-//! Note: Filter pushdown is disabled for ScyllaDB because CQL
+//! Note: Filter pushdown is disabled for `ScyllaDB` because CQL
 //! (Cassandra Query Language) doesn't support most SQL constructs like
 //! JOINs, subqueries, INTERVAL, CASE WHEN, CAST, window functions, etc.
-//! All query processing happens locally in DataFusion, with ScyllaDB
+//! All query processing happens locally in `DataFusion`, with `ScyllaDB`
 //! providing only the base table data via simple SELECT * queries.
 
 mod cql_dialect;
@@ -59,11 +59,11 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// ScyllaDB table wrapper that disables filter pushdown.
+/// `ScyllaDB` table wrapper that disables filter pushdown.
 ///
 /// CQL doesn't support most SQL filter expressions (CAST, INTERVAL, complex
-/// predicates), so we return `Unsupported` for all filters and let DataFusion
-/// handle filtering locally after fetching all data from ScyllaDB.
+/// predicates), so we return `Unsupported` for all filters and let `DataFusion`
+/// handle filtering locally after fetching all data from `ScyllaDB`.
 pub struct ScyllaDbTable {
     base_table: SqlTable<Arc<ScyllaSession>, &'static dyn Sync>,
 }
@@ -94,12 +94,12 @@ impl TableProvider for ScyllaDbTable {
         self.base_table.table_type()
     }
 
-    /// Disable all filter pushdown for ScyllaDB.
+    /// Disable all filter pushdown for `ScyllaDB`.
     ///
     /// CQL doesn't support most SQL filter expressions like CAST, INTERVAL,
     /// complex predicates, etc. Rather than trying to detect which filters
     /// CQL can handle (very few), we disable pushdown entirely and let
-    /// DataFusion filter results locally.
+    /// `DataFusion` filter results locally.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -119,9 +119,7 @@ impl TableProvider for ScyllaDbTable {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Always pass empty filters to the base table - we handle filtering in DataFusion
-        self.base_table
-            .scan(state, projection, &[], limit)
-            .await
+        self.base_table.scan(state, projection, &[], limit).await
     }
 }
 

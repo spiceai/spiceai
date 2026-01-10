@@ -107,7 +107,7 @@ mod tests {
             JoinPushDown::AllowedFor(ctx) => {
                 assert_eq!(ctx, compute_context);
             }
-            _ => panic!("Expected AllowedFor variant"),
+            JoinPushDown::Disallow => panic!("Expected AllowedFor variant"),
         }
     }
 
@@ -133,7 +133,7 @@ mod tests {
                 JoinPushDown::AllowedFor(stored_ctx) => {
                     assert_eq!(stored_ctx, ctx);
                 }
-                _ => panic!("Expected AllowedFor variant for context: {ctx}"),
+                JoinPushDown::Disallow => panic!("Expected AllowedFor variant for context: {ctx}"),
             }
         }
     }
@@ -145,7 +145,7 @@ mod tests {
             JoinPushDown::AllowedFor(ctx) => {
                 assert!(ctx.is_empty());
             }
-            _ => panic!("Expected AllowedFor variant"),
+            JoinPushDown::Disallow => panic!("Expected AllowedFor variant"),
         }
     }
 
@@ -158,7 +158,7 @@ mod tests {
             JoinPushDown::AllowedFor(ctx) => {
                 assert_eq!(ctx, unicode_ctx);
             }
-            _ => panic!("Expected AllowedFor variant"),
+            JoinPushDown::Disallow => panic!("Expected AllowedFor variant"),
         }
     }
 
@@ -174,13 +174,15 @@ mod tests {
         // Verify Result type alias works correctly
         let ok_result: Result<i32> = Ok(42);
         assert!(ok_result.is_ok());
-        assert_eq!(ok_result.expect("should be ok"), 42);
+        if let Ok(value) = ok_result {
+            assert_eq!(value, 42);
+        }
     }
 
     #[test]
     fn test_join_push_down_clone() {
         let ctx = "scylladb://user@host:9042/keyspace".to_string();
-        let push_down1 = JoinPushDown::AllowedFor(ctx.clone());
+        let push_down1 = JoinPushDown::AllowedFor(ctx);
         let push_down2 = push_down1.clone();
 
         match (push_down1, push_down2) {
@@ -202,7 +204,7 @@ mod tests {
             JoinPushDown::AllowedFor(stored_ctx) => {
                 assert_eq!(stored_ctx.len(), ctx.len());
             }
-            _ => panic!("Expected AllowedFor variant"),
+            JoinPushDown::Disallow => panic!("Expected AllowedFor variant"),
         }
     }
 
