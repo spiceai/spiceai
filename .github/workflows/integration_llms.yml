@@ -92,8 +92,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: darwin
 
       - name: Build LLMs integration test binary
         env:
