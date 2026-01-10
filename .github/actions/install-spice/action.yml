@@ -68,8 +68,12 @@ runs:
           exit 1
         fi
         echo "Spice binaries verified successfully"
-        # Show CLI version only (doesn't require spiced to run)
-        "$HOME/.spice/bin/spice" version --cli-only 2>/dev/null || "$HOME/.spice/bin/spice" help version 2>/dev/null || echo "CLI installed"
+        # Test spiced --version directly to debug any issues
+        echo "Testing spiced --version:"
+        "$HOME/.spice/bin/spiced" --version 2>&1 || echo "spiced --version failed with exit code $?"
+        # Show spice version (which calls spiced --version internally)
+        echo "Testing spice version:"
+        "$HOME/.spice/bin/spice" version 2>&1 || echo "spice version failed with exit code $?"
 
     - name: Verify Spice installation (Windows)
       if: runner.os == 'Windows'
