@@ -71,7 +71,7 @@ jobs:
               {
                 name: "Linux x64",
                 builder: "spiceai-dev-runners",
-                runner: "ubuntu-22.04",
+                runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
@@ -93,7 +93,7 @@ jobs:
     runs-on: ${{ matrix.target.builder }}
     needs: setup-matrix
     env:
-      GOVER: 1.25.5
+      GOVER: 1.25.3
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
 
@@ -186,7 +186,7 @@ jobs:
     if: github.event_name == 'pull_request'
     needs: setup-matrix
     env:
-      GOVER: 1.25.5
+      GOVER: 1.25.3
       GOOS: darwin
       GOARCH: arm64
 
