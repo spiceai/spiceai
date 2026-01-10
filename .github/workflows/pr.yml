@@ -74,9 +74,9 @@ jobs:
 
   lint:
     name: Run Go & Rust Linters and Build
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     env:
-      GOVER: 1.25.3
+      GOVER: 1.25.5
     needs: check_changes
 
     steps:
@@ -130,6 +130,7 @@ jobs:
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
+          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Check if sccache can be set up
