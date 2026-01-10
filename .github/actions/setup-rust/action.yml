@@ -1,15 +1,11 @@
 name: Sets up the Rust toolchain
 description: 'composite action'
-inputs:
-  os:
-    description: 'Operating system to set up the toolchain for'
-    default: 'linux' # 'linux', 'macos', 'windows'
 
 runs:
   using: 'composite'
   steps:
     - name: Install Rust if not installed (Linux/macOS)
-      if: inputs.os != 'windows'
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
@@ -22,7 +18,7 @@ runs:
         fi
 
     - name: Install Rust if not installed (Windows)
-      if: inputs.os == 'windows'
+      if: runner.os == 'Windows'
       shell: pwsh
       run: |
         if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
@@ -33,14 +29,14 @@ runs:
         }
 
     - name: Install latest Rust stable toolchain (Linux/macOS)
-      if: inputs.os != 'windows'
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         rustup toolchain install 1.91
         rustup default 1.91
 
     - name: Install latest Rust stable toolchain (Windows)
-      if: inputs.os == 'windows'
+      if: runner.os == 'Windows'
       shell: pwsh
       run: |
         rustup toolchain install 1.91
