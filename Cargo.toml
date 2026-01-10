@@ -220,6 +220,7 @@ opentelemetry_sdk = { version = "0.31", default-features = false, features = [
     "trace",
     "experimental_trace_batch_span_processor_with_async_runtime",
     "experimental_metrics_periodicreader_with_async_runtime",
+    "experimental_metrics_custom_reader",
 ] }
 parking_lot = "0.12"
 parquet = "57.0.0"
