@@ -126,9 +126,11 @@ impl SqliteMetastore {
             Ok::<_, rusqlite::Error>(())
         })
         .await
-        .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-            message: format!("Failed to configure SQLite pragmas: {e}"),
-        })?;
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to configure SQLite pragmas: {e}"),
+            },
+        )?;
 
         // Second check: re-acquire lock and store connection (or use existing if another task created one)
         let mut conn_guard = self.conn.lock().await;
@@ -346,9 +348,11 @@ impl MetastoreBackend for SqliteMetastore {
             Ok::<_, rusqlite::Error>(())
         })
         .await
-        .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-            message: format!("Failed to initialize schema: {e}"),
-        })?;
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to initialize schema: {e}"),
+            },
+        )?;
 
         Ok(())
     }
@@ -368,9 +372,11 @@ impl MetastoreBackend for SqliteMetastore {
             Ok::<_, rusqlite::Error>(())
         })
         .await
-        .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-            message: format!("Failed to execute statement: {e}"),
-        })?;
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to execute statement: {e}"),
+            },
+        )?;
 
         Ok(())
     }
@@ -384,9 +390,11 @@ impl MetastoreBackend for SqliteMetastore {
             Ok::<_, rusqlite::Error>(())
         })
         .await
-        .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-            message: format!("Failed to execute batch: {e}"),
-        })?;
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to execute batch: {e}"),
+            },
+        )?;
 
         Ok(())
     }
@@ -423,9 +431,11 @@ impl MetastoreBackend for SqliteMetastore {
             f(&sqlite_row).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         })
         .await
-        .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-            message: format!("Failed to query row: {e}"),
-        })
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to query row: {e}"),
+            },
+        )
     }
 
     async fn query<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>>
@@ -468,9 +478,11 @@ impl MetastoreBackend for SqliteMetastore {
             Ok::<Vec<T>, rusqlite::Error>(results)
         })
         .await
-        .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-            message: format!("Failed to query rows: {e}"),
-        })
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to query rows: {e}"),
+            },
+        )
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
@@ -499,9 +511,11 @@ impl MetastoreBackend for SqliteMetastore {
                 Ok::<_, rusqlite::Error>(())
             })
             .await
-            .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to shutdown catalog: {e}"),
-            })?;
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to shutdown catalog: {e}"),
+                },
+            )?;
         }
 
         Ok(())
