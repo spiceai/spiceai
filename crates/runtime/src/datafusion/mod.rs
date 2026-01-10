@@ -1221,9 +1221,6 @@ impl DataFusion {
                 .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
         }
 
-        println!("!! acceleration_settings.snapshot_behavior.create_enabled: {}", acceleration_settings.snapshot_behavior.create_enabled());
-        println!("!! snapshot_path: {:#?}", acceleration_file_path(dataset).await);
-
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Ok(snapshot_path) = acceleration_file_path(dataset).await {
                 if let Some(snapshot_config) = build_snapshot_creation_config(dataset, &acceleration_settings, refresh_mode, snapshot_path).await? {
@@ -2072,16 +2069,18 @@ async fn build_snapshot_creation_config(
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
     let snapshot_threshold: Option<String> = acceleration_settings.snapshots_trigger_threshold.clone();
 
-    println!("is_batch_refresh: {is_batch_refresh:#?}");
-    println!("snapshot_trigger: {snapshot_trigger:#?}");
-    println!("snapshot_threshold: {snapshot_threshold:#?}");
-
-    println!("foo: {:#?}", fundu::parse_duration("1000"));
-
     let parse_interval = |threshold: &Option<String>| -> Result<Duration> {
         match threshold {
-            Some(s) => fundu::parse_duration(s)
-                .context(InvalidSnapshotCreationIntervalSnafu),
+            Some(s) => {
+                // Check if string contains a valid time unit
+                if !s.chars().any(|c| c.is_alphabetic()) {
+                    return Err(Error::InvalidSnapshotCreationInterval {
+                        source: fundu::ParseError::InvalidInput("duration must include a unit (e.g., ms, s, m, h)".into())
+                    }.into());
+                }
+                fundu::parse_duration(s)
+                    .context(InvalidSnapshotCreationIntervalSnafu)
+            }
             None => Ok(DEFAULT_SNAPSHOT_CREATION_INTERVAL),
         }
     };
