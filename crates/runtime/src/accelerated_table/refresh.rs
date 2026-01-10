@@ -976,7 +976,7 @@ fn spawn_snapshot_interval_task(
 }
 
 fn create_periodic_snapshot_callback(
-    threshold: i64,
+    batches: i64,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     snapshot_manager: Option<Arc<SnapshotManager>>,
     accelerator_write_mutex: Arc<Mutex<()>>,
@@ -988,7 +988,7 @@ fn create_periodic_snapshot_callback(
             let dataset_name = dataset_name.clone();
 
             tracing::info!(
-                "Snapshots for dataset {dataset_name} will be created every {threshold} batch updates"
+                "Snapshots for dataset {dataset_name} will be created every {batches} batch updates"
             );
 
             // Track number of processed batches since last snapshot
@@ -1006,7 +1006,7 @@ fn create_periodic_snapshot_callback(
                     let mut batches_processed_value = batches_processed.write().await;
 
                     *batches_processed_value += 1;
-                    if *batches_processed_value >= threshold {
+                    if *batches_processed_value >= batches {
                         *batches_processed_value = 0;
 
                         create_checkpoint_and_snapshot(

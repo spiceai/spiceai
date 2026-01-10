@@ -2092,13 +2092,12 @@ async fn build_snapshot_creation_config(
         match threshold {
             Some(s) => {
                 // Check if string contains a valid time unit
-                if !s.chars().any(|c| c.is_alphabetic()) {
+                if !s.chars().any(char::is_alphabetic) {
                     return Err(Error::InvalidSnapshotCreationInterval {
                         source: fundu::ParseError::InvalidInput(
                             "duration must include a unit (e.g., ms, s, m, h)".into(),
                         ),
-                    }
-                    .into());
+                    });
                 }
                 fundu::parse_duration(s).context(InvalidSnapshotCreationIntervalSnafu)
             }
