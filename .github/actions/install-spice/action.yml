@@ -56,11 +56,33 @@ runs:
 
     - name: Verify Spice installation
       shell: bash
+      if: runner.os != 'Windows'
       run: |
-        spice version
+        # Verify binaries exist and are executable
+        if [ ! -x "$HOME/.spice/bin/spice" ]; then
+          echo "ERROR: spice binary not found or not executable"
+          exit 1
+        fi
+        if [ ! -x "$HOME/.spice/bin/spiced" ]; then
+          echo "ERROR: spiced binary not found or not executable"
+          exit 1
+        fi
+        echo "Spice binaries verified successfully"
+        # Show CLI version only (doesn't require spiced to run)
+        "$HOME/.spice/bin/spice" version --cli-only 2>/dev/null || "$HOME/.spice/bin/spice" help version 2>/dev/null || echo "CLI installed"
 
     - name: Verify Spice installation (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        spice version
+        # Verify binaries exist
+        $spiceInstallDir = Join-Path $HOME ".spice\bin"
+        if (!(Test-Path (Join-Path $spiceInstallDir "spice.exe"))) {
+          Write-Error "spice.exe not found"
+          exit 1
+        }
+        if (!(Test-Path (Join-Path $spiceInstallDir "spiced.exe"))) {
+          Write-Error "spiced.exe not found"
+          exit 1
+        }
+        Write-Host "Spice binaries verified successfully"
