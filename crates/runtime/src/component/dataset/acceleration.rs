@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::{SnapshotCreateTrigger, SnapshotCreationConfig};
+use crate::accelerated_table::SnapshotCreateTrigger;
 #[cfg(feature = "duckdb")]
 use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 use datafusion_table_providers::util::{
@@ -28,6 +28,7 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
+use spicepod::acceleration::SnapshotsTrigger;
 
 pub mod constraints;
 pub mod on_conflict;
@@ -360,7 +361,9 @@ pub struct Acceleration {
 
     pub snapshot_behavior: SnapshotBehavior,
 
-    pub snapshot_creation_trigger: Option<SnapshotCreateTrigger>,
+    pub snapshots_trigger: Option<SnapshotsTrigger>,
+
+    pub snapshots_trigger_threshold: Option<String>,
 }
 
 impl Acceleration {
@@ -458,10 +461,6 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
-        // TODO: Create snapshot_creation_trigger
-        let snapshot_creation_trigger = Some(SnapshotCreateTrigger::RefreshComplete);
-        let snapshots_trigger_threshold = parse_snapshots_trigger_threshold(&mut params)?;
-        let snapshots_create_interval = parse_snapshots_create_interval(&mut params)?;
 
         let caching_ttl = parse_caching_ttl(&mut params)?;
         let caching_stale_while_revalidate_ttl =
@@ -521,7 +520,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             on_conflict,
             partition_by: acceleration.partition_by,
             snapshot_behavior: SnapshotBehavior::disabled(),
-            snapshot_creation_trigger,
+            snapshots_trigger: acceleration.snapshots_trigger,
+            snapshots_trigger_threshold: acceleration.snapshots_trigger_threshold,
         })
     }
 }
@@ -558,7 +558,8 @@ impl Default for Acceleration {
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
             snapshot_behavior: SnapshotBehavior::Disabled,
-            snapshot_creation_trigger: None,
+            snapshots_trigger: None,
+            snapshots_trigger_threshold: None,
         }
     }
 }
@@ -581,66 +582,6 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
         }
     }
     Ok(false)
-}
-
-#[expect(clippy::result_large_err)]
-fn parse_snapshots_trigger_threshold(
-    params: &mut Option<Params>,
-) -> Result<Option<i64>, crate::Error> {
-    if let Some(params) = params
-        && let Some(value) = params.data.remove("snapshots_trigger_threshold")
-    {
-        match value {
-            spicepod::param::ParamValue::Int(s) => {
-                Ok(Some(s))
-            }
-            _ => Err(crate::Error::InvalidAccelerationConfiguration {
-                source: format!(
-                    "Invalid 'snapshots_trigger_threshold' param value: {value:?}. Expected an integer number."
-                ).into(),
-            }),
-        }
-    } else {
-        Ok(None)
-    }
-}
-
-#[expect(clippy::result_large_err)]
-fn parse_snapshots_create_interval(
-    params: &mut Option<Params>,
-) -> Result<Option<Duration>, crate::Error> {
-    let Some(params) = params else {
-        return Ok(None);
-    };
-    let Some(value) = params.data.remove("snapshots_create_interval") else {
-        return Ok(None);
-    };
-
-    match value {
-        spicepod::param::ParamValue::String(s) => {
-            let interval =
-                fundu::parse_duration(&s).map_err(|e| crate::Error::InvalidSpicepodDataset {
-                    source: super::Error::UnableToParseFieldAsDuration {
-                        source: e,
-                        field: "snapshots_create_interval".into(),
-                    },
-                })?;
-            if interval.is_zero() {
-                return Err(crate::Error::InvalidAccelerationConfiguration {
-                    source:
-                        "Invalid 'snapshots_create_interval' param value: duration must be greater than zero."
-                            .into(),
-                });
-            }
-            Ok(Some(interval))
-        }
-        _ => Err(crate::Error::InvalidAccelerationConfiguration {
-            source: format!(
-                "Invalid 'snapshots_create_interval' param value: {value:?}. Expected a duration string."
-            )
-            .into(),
-        }),
-    }
 }
 
 /// Parse `caching_ttl` duration from params for caching mode.

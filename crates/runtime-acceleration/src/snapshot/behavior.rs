@@ -15,7 +15,6 @@ use runtime_secrets::Secrets;
 use spicepod::acceleration as spicepod_acceleration;
 use spicepod::component::snapshot::Snapshots;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 

@@ -23,7 +23,6 @@ use crate::{
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use std::{collections::HashMap, fmt::Display};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -150,6 +149,18 @@ fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
     *b == SnapshotBehavior::Disabled
 }
 
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsTrigger {
+    /// After each refresh is complete (default).
+    RefreshComplete,
+    // Periodically based on time interval
+    TimeInterval,
+    // Periodically based on stream batch processing
+    StreamBatches,
+}
+
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -248,6 +259,12 @@ pub struct Acceleration {
     /// `create_only` will only create snapshots, it won't attempt to bootstrap from one.
     #[serde(default, skip_serializing_if = "is_default_snapshot_behavior")]
     pub snapshots: SnapshotBehavior,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots_trigger: Option<SnapshotsTrigger>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots_trigger_threshold: Option<String>,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -290,6 +307,8 @@ impl Default for Acceleration {
             metrics: None,
             partition_by: vec![],
             snapshots: SnapshotBehavior::Disabled,
+            snapshots_trigger: None,
+            snapshots_trigger_threshold: None,
         }
     }
 }

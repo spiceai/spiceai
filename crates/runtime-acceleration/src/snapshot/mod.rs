@@ -720,7 +720,7 @@ impl SnapshotManager {
 
         let mut upload = self
             .object_store
-            .put_multipart(&destination_location)
+            .put_multipart(destination_location)
             .await
             .context(StartUploadSnafu {
                 path: destination_location_path.clone(),
@@ -789,7 +789,7 @@ impl SnapshotManager {
                     });
                 }
                 return Err(SnapshotUploadError::UploadPart {
-                    path: destination_location_path.to_string(),
+                    path: destination_location_path.clone(),
                     source,
                 });
             }
@@ -817,14 +817,14 @@ impl SnapshotManager {
                     });
                 }
                 Err(SnapshotUploadError::CompleteUpload {
-                    path: destination_location_path.to_string(),
+                    path: destination_location_path.clone(),
                     source,
                 })
             }
         }
     }
 
-    /// Prepares the file for upload, running compaction for DuckDB.
+    /// Prepares the file for upload, running compaction for `DuckDB`.
     async fn prepare_upload_file(
         &self,
         source_path: &PathBuf,
@@ -840,7 +840,7 @@ impl SnapshotManager {
         }
     }
 
-    /// Compacts a DuckDB database using COPY FROM DATABASE.
+    /// Compacts a `DuckDB` database using COPY FROM DATABASE.
     #[cfg(feature = "duckdb")]
     async fn compact_duckdb(
         &self,
@@ -1639,6 +1639,7 @@ mod tests {
     use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
     use tempfile::{NamedTempFile, TempDir};
     use tokio::fs;
+    use tokio::sync::Mutex;
 
     const DATASET_NAME: &str = "dataset";
     const SNAPSHOT_URI_PREFIX: &str = "memory://snapshots";
@@ -1934,8 +1935,11 @@ mod tests {
             &schema,
         );
 
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.clone().lock_owned().await;
+
         let uploaded_path = manager
-            .create_snapshot(&schema)
+            .create_snapshot(&schema, lock_guard)
             .await
             .expect("create snapshot");
 

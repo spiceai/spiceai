@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
 use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
@@ -44,7 +43,7 @@ use datafusion::{
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager};
+use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
@@ -282,6 +281,7 @@ pub struct SnapshotCreationConfig {
 }
 
 impl SnapshotCreationConfig {
+    #[must_use] 
     pub fn new(manager: Arc<SnapshotManager>, create_trigger: SnapshotCreateTrigger) -> Self {
         Self {
             manager,

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -39,7 +38,7 @@ use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{
-    SnapshotBehavior, SnapshotManager, metrics as snapshot_metrics,
+    SnapshotManager, metrics as snapshot_metrics,
 };
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -681,7 +680,7 @@ impl Refresher {
                     None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
                     Some(SnapshotCreateTrigger::Interval(duration)) => (
                         spawn_snapshot_interval_task(
-                            Some(duration.clone()),
+                            Some(*duration),
                             checkpointer.clone(),
                             snapshot_manager.clone(),
                             Arc::clone(&self.accelerator_write_mutex),
@@ -757,7 +756,7 @@ impl Refresher {
             Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
             Some(SnapshotCreateTrigger::Interval(duration)) => (
                 spawn_snapshot_interval_task(
-                    Some(duration.clone()),
+                    Some(*duration),
                     checkpointer.clone(),
                     snapshot_manager.clone(),
                     Arc::clone(&self.accelerator_write_mutex),
@@ -828,7 +827,7 @@ impl Refresher {
 
                             if create_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
                                 create_checkpoint_and_snapshot(
-                                    &checkpointer,
+                                    checkpointer,
                                     snapshot_manager.as_ref(),
                                     &federated_schema,
                                     &snapshot_mutex,
@@ -1038,15 +1037,15 @@ async fn create_checkpoint_and_snapshot(
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
 ) {
-    let _lock_guard = Arc::clone(&accelerator_write_mutex).lock_owned().await;
-    if let Err(e) = checkpointer.checkpoint(&federated_schema).await {
+    let _lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
+    if let Err(e) = checkpointer.checkpoint(federated_schema).await {
         tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
         return;
     }
 
     if let Some(snapshot_manager) = snapshot_manager {
         if let Err(e) = snapshot_manager
-            .create_snapshot(&federated_schema, _lock_guard)
+            .create_snapshot(federated_schema, _lock_guard)
             .await
         {
             let dataset_label = dataset_name.to_string();
