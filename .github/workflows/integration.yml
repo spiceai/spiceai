@@ -76,7 +76,7 @@ jobs:
   build:
     name: Build Test Binary
     needs: check_changes
-    runs-on: ubuntu-22.04 # Build on same OS as test runners for GLIBC compatibility
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -106,8 +106,11 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      # sccache is only available on self-hosted runners with access to MinIO
-      # Since this job runs on ubuntu-22.04 (GitHub hosted), skip sccache setup
+      - name: Set up sccache
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
       - name: Install Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -120,6 +123,9 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: sccache
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           set -euo pipefail
 
