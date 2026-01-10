@@ -671,8 +671,8 @@ pub(crate) mod search {
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
-            .with_embedding(get_huggingface_embeddings(
-                "sentence-transformers/all-MiniLM-L6-v2",
+            .with_embedding(get_model_to_vec_embeddings(
+                "minishlab/potion-base-2M",
                 "hf_minilm",
             ))
             .build();
