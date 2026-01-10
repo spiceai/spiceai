@@ -153,8 +153,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
 
       - name: Set up wget
         if: matrix.target.target_os == 'linux'
