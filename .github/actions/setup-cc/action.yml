@@ -4,17 +4,8 @@ description: 'composite action'
 runs:
   using: 'composite'
   steps:
-    - name: Install cc (Linux)
-      if: runner.os == 'Linux'
+    - name: Install cc
       shell: bash
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential cmake pkg-config libssl-dev unixodbc unixodbc-dev protobuf-compiler libclang-dev libnfs-dev
-
-    - name: Install cc (macOS)
-      if: runner.os == 'macOS'
-      shell: bash
-      run: |
-        # macOS typically has build tools via Xcode Command Line Tools
-        # Install additional dependencies via Homebrew if needed
-        brew install cmake pkg-config openssl unixodbc protobuf llvm libnfs || true

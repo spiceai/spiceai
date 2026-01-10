@@ -78,7 +78,6 @@ jobs:
 
       - name: Install Nextest
         run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       # Build the test binary without running tests
@@ -117,7 +116,6 @@ jobs:
 
       - name: Install Nextest
         run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
@@ -169,7 +167,6 @@ jobs:
 
       - name: Install Nextest
         run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
@@ -260,7 +257,6 @@ jobs:
 
       - name: Install Nextest
         run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
@@ -308,7 +304,6 @@ jobs:
 
       - name: Install Nextest
         run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
@@ -352,7 +347,6 @@ jobs:
 
       - name: Install Nextest
         run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
@@ -386,7 +380,6 @@ jobs:
 
       - name: Install Nextest
         run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
@@ -435,7 +428,6 @@ jobs:
 
       - name: Install Nextest
         run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       # Build the test binary without running tests
@@ -470,7 +462,6 @@ jobs:
 
       - name: Install Nextest
         run: |
-          mkdir -p ${CARGO_HOME:-~/.cargo}/bin
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Download test archive
