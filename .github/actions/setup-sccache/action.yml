@@ -6,14 +6,12 @@ inputs:
     description: 'MinIO endpoint (used for Linux and self-hosted macOS)'
     required: false
     type: string
-  os:
-    description: 'Operating system to set up the toolchain for'
-    default: 'linux' # 'linux', 'darwin', 'windows'
+
 runs:
   using: 'composite'
   steps:
     - name: Set up sccache (Linux)
-      if: inputs.os == 'linux'
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update && sudo apt-get install wget -y
@@ -32,7 +30,7 @@ runs:
         EOF
 
     - name: Set up sccache (macOS - self-hosted only)
-      if: inputs.os == 'darwin' && inputs.minio_endpoint != ''
+      if: runner.os == 'macOS' && inputs.minio_endpoint != ''
       shell: bash
       run: |
         # Only self-hosted macOS runners use sccache (with localhost MinIO)

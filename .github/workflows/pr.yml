@@ -137,7 +137,6 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -169,14 +168,14 @@ jobs:
         run: bash .github/scripts/validate_table_providers_commit.sh
 
       - name: Show sccache stats
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
   # Build and test after linting passes
   build-test:
     name: Build and Test
     runs-on: spiceai-dev-runners
-    needs: [check_changes, lint-rust]
+    needs: [check_changes, lint-go, lint-rust]
     env:
       GOVER: 1.25.3
 
@@ -211,9 +210,21 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
 
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          fi
+
       - name: Set up sccache
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'

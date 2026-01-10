@@ -78,7 +78,6 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'darwin'
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -443,7 +442,6 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
