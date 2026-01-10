@@ -72,12 +72,16 @@ impl SqliteMetastore {
     /// - NORMAL synchronous mode (safe with WAL)
     /// - Memory cache and temp storage for performance
     /// - Foreign keys enabled
+    ///
+    /// Uses double-checked locking to avoid holding the mutex across `.await` points.
     async fn get_conn(&self) -> CatalogResult<tokio_rusqlite::Connection> {
-        let mut conn_guard = self.conn.lock().await;
-
-        if let Some(conn) = conn_guard.as_ref() {
-            return Ok(conn.clone());
-        }
+        // First check: try to get existing connection without holding lock across await
+        {
+            let conn_guard = self.conn.lock().await;
+            if let Some(conn) = conn_guard.as_ref() {
+                return Ok(conn.clone());
+            }
+        } // Lock dropped here before any async operations
 
         // Create parent directory if it doesn't exist
         let db_path = self.db_path();
@@ -92,14 +96,14 @@ impl SqliteMetastore {
             tokio::fs::create_dir_all(db_dir).await?;
         }
 
-        // Open connection with tokio-rusqlite
+        // Open connection with tokio-rusqlite (no lock held)
         let conn = tokio_rusqlite::Connection::open(db_path)
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to open SQLite database: {e}"),
             })?;
 
-        // Configure pragmas for performance
+        // Configure pragmas for performance (no lock held)
         conn.call(|conn| {
             // Enable WAL mode for better concurrent access
             conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -126,6 +130,12 @@ impl SqliteMetastore {
             message: format!("Failed to configure SQLite pragmas: {e}"),
         })?;
 
+        // Second check: re-acquire lock and store connection (or use existing if another task created one)
+        let mut conn_guard = self.conn.lock().await;
+        if let Some(existing_conn) = conn_guard.as_ref() {
+            // Another task initialized the connection while we were setting up
+            return Ok(existing_conn.clone());
+        }
         *conn_guard = Some(conn.clone());
         Ok(conn)
     }
@@ -410,7 +420,7 @@ impl MetastoreBackend for SqliteMetastore {
             })?;
 
             let sqlite_row = SqliteRow { values: row_values };
-            f(&sqlite_row).map_err(|_e| rusqlite::Error::InvalidQuery)
+            f(&sqlite_row).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         })
         .await
         .map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
@@ -451,7 +461,7 @@ impl MetastoreBackend for SqliteMetastore {
             for row_result in rows {
                 let row = row_result?;
                 results.push(
-                    f(&row).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    f(&row).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                 );
             }
 
@@ -464,9 +474,13 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
-        // Get the connection if it exists
-        let conn_guard = self.conn.lock().await;
-        if let Some(conn) = conn_guard.as_ref() {
+        // Clone the connection before dropping the lock to avoid holding it across await
+        let conn = {
+            let conn_guard = self.conn.lock().await;
+            conn_guard.clone()
+        };
+
+        if let Some(conn) = conn.as_ref() {
             conn.call(|conn| {
                 // Check if WAL mode is enabled
                 let journal_mode: String =
