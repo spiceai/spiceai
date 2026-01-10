@@ -113,6 +113,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
       - name: Install Nextest
         run: |
           mkdir -p ${CARGO_HOME:-~/.cargo}/bin
@@ -164,6 +167,9 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Install Nextest
         run: |
@@ -256,6 +262,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
       - name: Install Nextest
         run: |
           mkdir -p ${CARGO_HOME:-~/.cargo}/bin
@@ -304,6 +313,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
       - name: Install Nextest
         run: |
           mkdir -p ${CARGO_HOME:-~/.cargo}/bin
@@ -348,6 +360,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
       - name: Install Nextest
         run: |
           mkdir -p ${CARGO_HOME:-~/.cargo}/bin
@@ -381,6 +396,9 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Install Nextest
         run: |
