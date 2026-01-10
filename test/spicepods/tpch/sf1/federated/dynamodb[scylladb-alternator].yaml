@@ -26,7 +26,7 @@ definitions:
     # Set SCYLLADB_ALTERNATOR_ENDPOINT=http://localhost:8000 in your environment
     endpoint_url: ${env:SCYLLADB_ALTERNATOR_ENDPOINT}
     # Disable parallel segment scanning for ScyllaDB Alternator compatibility
-    scan_segments: 1
+    scan_segments: "1"
 
 datasets:
   - from: dynamodb:tpch_customer
