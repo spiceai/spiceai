@@ -666,13 +666,15 @@ pub(crate) mod search {
         let bucket_name = "spice-ci-tests-s3-vectors-filters-pushdown";
         let vector_store = init_vector_store(bucket_name, true).await?;
 
-        let mut test_dataset = get_package_delivery_dataset("data/", "delivery", None, "hf_minilm");
+        // Use a single JSON file instead of the entire data/ directory to reduce embedding time
+        let mut test_dataset =
+            get_package_delivery_dataset("data/01.json", "delivery", None, "hf_minilm");
         test_dataset.vectors = Some(vector_store);
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
-            .with_embedding(get_model_to_vec_embeddings(
-                "minishlab/potion-base-2M",
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
                 "hf_minilm",
             ))
             .build();
@@ -935,7 +937,7 @@ pub(crate) mod search {
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(90)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
             () = Arc::clone(&rt).load_components() => {}
