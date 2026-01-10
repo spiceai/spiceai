@@ -24,7 +24,7 @@ env:
 jobs:
   build:
     name: Features Check
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
