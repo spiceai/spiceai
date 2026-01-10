@@ -325,6 +325,21 @@ pub trait MetadataCatalog: Send + Sync {
     async fn shutdown(&self) -> CatalogResult<()> {
         Ok(())
     }
+
+    /// Drop a table and all its associated metadata (delete files, insert records,
+    /// snapshot sequences, partitions).
+    ///
+    /// This is used for `file_create` mode to clean up existing table metadata
+    /// before recreating the table fresh.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_name` - The name of the table to drop
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(true)` if the table was dropped, `Ok(false)` if the table didn't exist.
+    async fn drop_table(&self, table_name: &str) -> CatalogResult<bool>;
 }
 
 /// Factory trait for creating catalog instances.
