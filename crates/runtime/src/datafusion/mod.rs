@@ -29,7 +29,7 @@ use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::{self, AccelerationSource};
+use crate::dataaccelerator::{self};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_file_path};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
@@ -90,7 +90,6 @@ use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use spicepod::acceleration::SnapshotsTrigger;
-use spicepod::param::Params;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
@@ -315,35 +314,20 @@ pub enum Error {
         index_type: String,
     },
 
-    #[snafu(display("Invalid snapshots_trigger_threshold value for dataset '{dataset_name}': expected time interval"))]
-    InvalidSnapshotCreationInterval {
-        source: fundu::ParseError,
-        dataset_name: String,
-    },
+    #[snafu(display("Invalid snapshots_trigger_threshold value: expected time interval"))]
+    InvalidSnapshotCreationInterval { source: fundu::ParseError },
 
-    #[snafu(display("Invalid snapshots_trigger_threshold value for dataset '{dataset_name}': expected integer"))]
-    InvalidSnapshotCreationBatches {
-        source: std::num::ParseIntError,
-        dataset_name: String,
-    },
+    #[snafu(display("Invalid snapshots_trigger_threshold value: expected integer"))]
+    InvalidSnapshotCreationBatches { source: std::num::ParseIntError },
 
-    // TODO
-    #[snafu(display(" for dataset '{dataset_name}': expected integer"))]
-    UnsupportedStreamBatchesForBatchRefresh {
-        dataset_name: String,
-    },
+    #[snafu(display("'stream_batches' is not supported for stream-backed datasets. Use 'refresh_complete' or 'time_interval' instead"))]
+    UnsupportedStreamBatchesForBatchRefresh,
 
-    // TODO
-    #[snafu(display(" for dataset '{dataset_name}': expected integer"))]
-    UnsupportedRefreshCompleteForStream {
-        dataset_name: String,
-    },
+    #[snafu(display("'refresh_complete' is not supported for stream-backed datasets. Use 'time_interval' or 'stream_batches' instead"))]
+    UnsupportedRefreshCompleteForStream,
 
-    // TODO
-    #[snafu(display(" for dataset '{dataset_name}': expected integer"))]
-    UnsupportedAccelerationEngineForSnapshots {
-        dataset_name: String,
-    },
+    #[snafu(display("Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"))]
+    UnsupportedAccelerationEngineForSnapshots,
 }
 
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
@@ -1237,11 +1221,18 @@ impl DataFusion {
                 .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
         }
 
-        if acceleration_settings.snapshot_behavior.create_enabled()
-            && let Ok(snapshot_path) = acceleration_file_path(dataset).await
-            && let Some(snapshot_config) = build_snapshot_creation_config(dataset, &acceleration_settings, refresh_mode, snapshot_path).await?
-        {
-            accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
+        println!("!! acceleration_settings.snapshot_behavior.create_enabled: {}", acceleration_settings.snapshot_behavior.create_enabled());
+        println!("!! snapshot_path: {:#?}", acceleration_file_path(dataset).await);
+
+        if acceleration_settings.snapshot_behavior.create_enabled() {
+            if let Ok(snapshot_path) = acceleration_file_path(dataset).await {
+                if let Some(snapshot_config) = build_snapshot_creation_config(dataset, &acceleration_settings, refresh_mode, snapshot_path).await? {
+                    accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
+                }
+            } else {
+                tracing::warn!("Dataset {} is not file accelerated. Snapshot creation is not supported.", dataset.name);
+            }
+
         }
 
         accelerated_table_builder.checkpointer_opt(
@@ -2080,12 +2071,17 @@ async fn build_snapshot_creation_config(
         && dataset.time_column.is_none();
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
     let snapshot_threshold: Option<String> = acceleration_settings.snapshots_trigger_threshold.clone();
-    let dataset_name = "foo".to_string();
+
+    println!("is_batch_refresh: {is_batch_refresh:#?}");
+    println!("snapshot_trigger: {snapshot_trigger:#?}");
+    println!("snapshot_threshold: {snapshot_threshold:#?}");
+
+    println!("foo: {:#?}", fundu::parse_duration("1000"));
 
     let parse_interval = |threshold: &Option<String>| -> Result<Duration> {
         match threshold {
             Some(s) => fundu::parse_duration(s)
-                .context(InvalidSnapshotCreationIntervalSnafu { dataset_name: dataset_name.clone() }),
+                .context(InvalidSnapshotCreationIntervalSnafu),
             None => Ok(DEFAULT_SNAPSHOT_CREATION_INTERVAL),
         }
     };
@@ -2094,7 +2090,7 @@ async fn build_snapshot_creation_config(
         match threshold {
             Some(s) => s
                 .parse::<i64>()
-                .context(InvalidSnapshotCreationBatchesSnafu { dataset_name: dataset_name.clone() }),
+                .context(InvalidSnapshotCreationBatchesSnafu{}),
             None => Ok(DEFAULT_SNAPSHOT_CREATION_BATCHES),
         }
     };
@@ -2109,7 +2105,7 @@ async fn build_snapshot_creation_config(
                 SnapshotCreateTrigger::Interval(interval)
             }
             Some(SnapshotsTrigger::StreamBatches) => {
-                return Err(Error::UnsupportedStreamBatchesForBatchRefresh {dataset_name: dataset_name.clone()})
+                return Err(Error::UnsupportedStreamBatchesForBatchRefresh)
             }
         }
     } else {
@@ -2119,7 +2115,7 @@ async fn build_snapshot_creation_config(
                 SnapshotCreateTrigger::Interval(interval)
             }
             Some(SnapshotsTrigger::RefreshComplete) => {
-                return Err(Error::UnsupportedRefreshCompleteForStream {dataset_name: dataset_name.clone()})
+                return Err(Error::UnsupportedRefreshCompleteForStream)
             }
             Some(SnapshotsTrigger::StreamBatches) => {
                 let batches = parse_batches(&snapshot_threshold)?;
@@ -2135,10 +2131,13 @@ async fn build_snapshot_creation_config(
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
         Engine::Turso => AccelerationEngine::Turso,
-        other => {
-            return Err(Error::UnsupportedAccelerationEngineForSnapshots {dataset_name: dataset_name.clone()})
+        _ => {
+            // Currently this code is unreachable
+            return Err(Error::UnsupportedAccelerationEngineForSnapshots)
         }
     };
+
+    println!("!!!! snapshot_creation_trigger: {snapshot_creation_trigger:?}");
 
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),

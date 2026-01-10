@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::SnapshotCreateTrigger;
 #[cfg(feature = "duckdb")]
 use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 use datafusion_table_providers::util::{
