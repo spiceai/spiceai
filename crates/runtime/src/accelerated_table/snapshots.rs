@@ -10,16 +10,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::accelerated_table::SnapshotCreateTrigger;
+use arrow_schema::Schema;
+use datafusion::common::TableReference;
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::snapshot::{SnapshotManager, metrics as snapshot_metrics};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use arrow_schema::Schema;
-use datafusion::common::TableReference;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
-use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::{SnapshotManager, metrics as snapshot_metrics};
-use crate::accelerated_table::SnapshotCreateTrigger;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotCreationConfig {
@@ -81,7 +81,7 @@ pub fn spawn_snapshot_interval_task(
                 &accelerator_write_mutex,
                 &dataset_name,
             )
-                .await;
+            .await;
 
             sleep(interval).await;
         }
@@ -129,7 +129,7 @@ pub fn create_periodic_snapshot_callback(
                             &accelerator_write_mutex,
                             &dataset_name,
                         )
-                            .await;
+                        .await;
                     }
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>
             })

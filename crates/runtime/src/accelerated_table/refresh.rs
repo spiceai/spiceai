@@ -24,7 +24,10 @@ use super::refresh_task_runner::RefreshTaskRunner;
 use super::synchronized_table::SynchronizedTable;
 use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
 use crate::accelerated_table::refresh_task::RefreshTask;
-use crate::accelerated_table::snapshots::{create_checkpoint_and_snapshot, create_periodic_snapshot_callback, spawn_snapshot_interval_task, SnapshotCallback};
+use crate::accelerated_table::snapshots::{
+    SnapshotCallback, create_checkpoint_and_snapshot, create_periodic_snapshot_callback,
+    spawn_snapshot_interval_task,
+};
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
 use crate::federated_table::FederatedTable;

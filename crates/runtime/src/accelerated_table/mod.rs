@@ -64,8 +64,8 @@ pub mod refresh_task;
 mod refresh_task_runner;
 mod retention;
 mod sink;
-mod synchronized_table;
 mod snapshots;
+mod synchronized_table;
 mod timestamp_metrics_utils;
 
 pub use refresh_task_runner::RefreshTaskRunner;
