@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc, time::Duration};
 
-use crate::accelerated_table::snapshots::SnapshotCreationConfig;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::get_primary_keys_from_constraints;
@@ -70,6 +69,7 @@ mod snapshots;
 mod timestamp_metrics_utils;
 
 pub use refresh_task_runner::RefreshTaskRunner;
+pub use snapshots::SnapshotCreationConfig;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

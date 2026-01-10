@@ -11,8 +11,8 @@ use crate::accelerated_table::SnapshotCreateTrigger;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotCreationConfig {
-    manager: Arc<SnapshotManager>,
-    create_trigger: SnapshotCreateTrigger,
+    pub manager: Arc<SnapshotManager>,
+    pub create_trigger: SnapshotCreateTrigger,
 }
 
 impl SnapshotCreationConfig {
