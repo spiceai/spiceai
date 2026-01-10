@@ -18,7 +18,7 @@ jobs:
     name: make install*
     runs-on: spiceai-dev-runners
     env:
-      GOVER: 1.25.5
+      GOVER: 1.25.3
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
