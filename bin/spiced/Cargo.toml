@@ -65,8 +65,7 @@ default = [
     "sharepoint",
     "snapshots",
     "snowflake",
-    # TODO: Re-enable spark once spark-connect-rs is updated for arrow 57 + tonic 0.14
-    # "spark",
+    "spark",
     "ftp",
     "sftp",
     "debezium",
