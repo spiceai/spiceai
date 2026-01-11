@@ -73,12 +73,12 @@ impl TextToSqlArgs {
             serde_json::from_str(queryset).map_err(anyhow::Error::new)
         } else {
             Ok(vec![])
-        };
+        }?;
 
         if let Some(limit) = self.limit {
-            queries.into_iter().take(limit).collect()
+            Ok(queries.into_iter().take(limit).collect())
         } else {
-            queries
+            Ok(queries)
         }
     }
 
