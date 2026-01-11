@@ -140,7 +140,6 @@ impl SpiceTest<Completed> {
         Ok(TextToSqlRunMetric::new(
             self.get_p95_response_time_metric(),
             self.get_median_response_time_metric(),
-            self.get_average_attempts_metric(),
             self.get_exact_match_count(),
             self.get_error_rate(),
             self.get_mean_sql_query_count(),
@@ -222,11 +221,6 @@ impl SpiceTest<Completed> {
 
     fn get_median_response_time_metric(&self) -> f64 {
         1000.0 * self.percentile(|result| result.duration.as_secs_f64(), 50.0)
-    }
-
-    #[expect(clippy::cast_precision_loss)]
-    fn get_average_attempts_metric(&self) -> f64 {
-        self.mean(|result| result.query_count as f64)
     }
 
     #[expect(clippy::cast_precision_loss)]

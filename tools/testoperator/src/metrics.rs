@@ -189,15 +189,6 @@ pub static SCORE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
 
 // Text to Sql specific metrics
 // Aggregate Text to Sql specific metrics (run-level)
-pub static AVERAGE_TEXT_TO_SQL_ATTEMPTS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
-    METER
-        .f64_gauge("text_to_sql_attempts")
-        .with_description(
-            "The average number of internal SQL queries performed to perform a text-to-SQL",
-        )
-        .with_unit("queries")
-        .build()
-});
 pub static TEXT_TO_SQL_EXACT_MATCH_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("text_to_sql_exact_match_rate")

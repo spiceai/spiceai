@@ -240,7 +240,6 @@ impl TextToSqlMetric {
 pub struct TextToSqlRunMetric {
     pub p95_latency_ms: f64,
     pub median_latency_ms: f64,
-    pub avg_attempts: f64,
     pub exact_match_rate: f64,
     pub error_rate: f64,
 
@@ -260,7 +259,6 @@ impl ExtendedMetrics for TextToSqlRunMetric {
         vec![
             Field::new("p95_latency_ms", DataType::Float64, false),
             Field::new("median_latency_ms", DataType::Float64, false),
-            Field::new("avg_attempts", DataType::Float64, false),
             Field::new("exact_match_rate", DataType::Float64, false),
             Field::new("error_rate", DataType::Float64, false),
             Field::new("mean_sql_query_count", DataType::Float64, false),
@@ -281,10 +279,6 @@ impl ExtendedMetrics for TextToSqlRunMetric {
             ),
             (
                 "median_latency_ms".to_string(),
-                Builder::Float64(Float64Builder::new()),
-            ),
-            (
-                "avg_attempts".to_string(),
                 Builder::Float64(Float64Builder::new()),
             ),
             (
@@ -330,7 +324,6 @@ impl ExtendedMetrics for TextToSqlRunMetric {
         Ok(vec![
             BuilderTarget::Float64(("p95_latency_ms".to_string(), self.p95_latency_ms)),
             BuilderTarget::Float64(("median_latency_ms".to_string(), self.median_latency_ms)),
-            BuilderTarget::Float64(("avg_attempts".to_string(), self.avg_attempts)),
             BuilderTarget::Float64(("exact_match_rate".to_string(), self.exact_match_rate)),
             BuilderTarget::Float64(("error_rate".to_string(), self.error_rate)),
             BuilderTarget::Float64((
@@ -368,7 +361,6 @@ impl TextToSqlRunMetric {
     pub fn new(
         p95_latency_ms: f64,
         median_latency_ms: f64,
-        avg_attempts: f64,
         exact_match_rate: f64,
         error_rate: f64,
         mean_sql_query_count: f64,
@@ -378,7 +370,6 @@ impl TextToSqlRunMetric {
         Self {
             p95_latency_ms,
             median_latency_ms,
-            avg_attempts,
             exact_match_rate,
             error_rate,
             mean_sql_query_count,

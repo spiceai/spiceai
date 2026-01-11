@@ -155,7 +155,6 @@ async fn emit_telemetry(
     if let Some(run_metrics) = &metrics.run_metric {
         crate::metrics::TEXT_TO_SQL_ERROR_RATE.record(run_metrics.error_rate, &[]);
         crate::metrics::TEXT_TO_SQL_EXACT_MATCH_RATE.record(run_metrics.exact_match_rate, &[]);
-        crate::metrics::AVERAGE_TEXT_TO_SQL_ATTEMPTS.record(run_metrics.avg_attempts, &[]);
         crate::metrics::P95_DURATION.record(run_metrics.p95_latency_ms as u64, &[]);
         crate::metrics::MEDIAN_DURATION.record(run_metrics.median_latency_ms as u64, &[]);
         crate::metrics::TEXT_TO_SQL_MEAN_SQL_QUERY_COUNT
