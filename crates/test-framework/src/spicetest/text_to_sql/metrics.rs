@@ -357,7 +357,6 @@ impl ExtendedMetrics for TextToSqlRunMetric {
 
 impl TextToSqlRunMetric {
     #[must_use]
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         p95_latency_ms: f64,
         median_latency_ms: f64,
