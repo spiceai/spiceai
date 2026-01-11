@@ -81,6 +81,7 @@ default = [
     "iceberg-write",
     "turso",
     "smb",
+    "mem0",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -94,6 +95,7 @@ imap = ["runtime/imap"]
 kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
+mem0 = ["runtime/mem0"]
 metal = ["runtime/metal"]
 models = ["runtime/models"]
 mongodb = ["runtime/mongodb"]

@@ -24,6 +24,8 @@ pub mod catalog;
 pub mod factory;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "mem0")]
+pub mod mem0;
 pub mod memory;
 pub mod options;
 pub mod utils;

@@ -259,6 +259,7 @@ imap = ["data_components/imap", "dep:imap"]
 kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "tools/mcp"]
+mem0 = []
 metal = ["llms/metal"]
 models = [
     "model_components/full",

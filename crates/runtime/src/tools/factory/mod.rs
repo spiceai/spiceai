@@ -91,12 +91,17 @@ pub async fn register_all_factories(rt: Arc<Runtime>) {
     );
     registry.insert(
         "memory".to_string(),
-        ToolFactory::Tool(Arc::new(MemoryToolCatalog::new(rt))),
+        ToolFactory::Tool(Arc::new(MemoryToolCatalog::new(Arc::clone(&rt)))),
     );
     #[cfg(feature = "mcp")]
     registry.insert(
         "mcp".to_string(),
         ToolFactory::Catalog(Arc::new(McpCatalogFactory {})),
+    );
+    #[cfg(feature = "mem0")]
+    registry.insert(
+        "mem0".to_string(),
+        ToolFactory::Catalog(Arc::new(super::mem0::factory::Mem0CatalogFactory {})),
     );
 }
 

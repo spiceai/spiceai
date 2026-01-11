@@ -68,6 +68,8 @@ mod iceberg_api;
 
 #[cfg(feature = "kafka")]
 mod kafka;
+#[cfg(feature = "mem0")]
+mod mem0;
 mod metadata;
 #[cfg(feature = "mongodb")]
 mod mongo;
