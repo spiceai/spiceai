@@ -42,36 +42,19 @@ env:
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
-  # a sucess when skipped).
+  # a success when skipped).
   check_changes:
     runs-on: spiceai-dev-runners
     outputs:
-      relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
+      relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 0
 
-      - name: Detect all code changes
-        id: changed-code-files
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
-        with:
-          filters: |
-            code_changes:
-              - 'crates/**'
-              - 'bin/**'
-              - 'test/**'
-              - 'tools/**'
-              - 'install/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'go.mod'
-              - 'go.sum'
-
-      - name: Check for relevant changes
-        id: check_changes
-        run: |
-          echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
 
   build:
     name: Build Test Binary
@@ -122,12 +105,10 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
 
-      - name: Install Nextest
+      - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: ./.github/actions/setup-nextest
 
       # Build the test binaries without running tests
       - name: Build integration test archives
@@ -233,10 +214,9 @@ jobs:
           name: integration-test-archive
           path: ./integration_test
 
-      - name: Install Nextest
+      - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -403,9 +383,8 @@ jobs:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
@@ -444,9 +423,8 @@ jobs:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
@@ -489,9 +467,8 @@ jobs:
           name: integration-data-components-test-archive
           path: ./data_components_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Run data components integration test
         env:
@@ -519,9 +496,8 @@ jobs:
           name: integration-partition-table-test-archive
           path: ./partition_table_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
@@ -540,7 +516,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst
-      
+
       - name: Configure Git
         if: github.event.inputs.update_snapshots == 'always'
         run: |
