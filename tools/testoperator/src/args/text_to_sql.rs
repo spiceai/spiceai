@@ -50,9 +50,9 @@ pub struct TextToSqlArgs {
     #[arg(long, default_value = "both")]
     pub(crate) return_sql: ReturnSqlOption,
 
-    /// Limit the number of text-to-SQL operations to run.
+    /// Limit the number of text-to-SQL queries to run.
     ///
-    /// If `--return-sql` or `--sample-data-enabled` are set to `both`, the limit applies after the Cartesian product is taken.
+    /// If `--return-sql` or `--sample-data-enabled` are set to `both`, the limit applies before the Cartesian product is taken.
     #[arg(short('n'), long)]
     pub(crate) limit: Option<usize>,
 
@@ -63,7 +63,7 @@ pub struct TextToSqlArgs {
 
 impl TextToSqlArgs {
     pub(crate) fn load_queries(&self) -> Result<Vec<TextToSqlQuery>, anyhow::Error> {
-        if let Some(file_path) = &self.queryset_file {
+        let queries = if let Some(file_path) = &self.queryset_file {
             fs::read_to_string(file_path)?
                 .lines()
                 .filter(|line| !line.trim().is_empty())
@@ -73,6 +73,12 @@ impl TextToSqlArgs {
             serde_json::from_str(queryset).map_err(anyhow::Error::new)
         } else {
             Ok(vec![])
+        };
+
+        if let Some(limit) = self.limit {
+            queries.into_iter().take(limit).collect()
+        } else {
+            queries
         }
     }
 
@@ -107,13 +113,7 @@ impl TextToSqlArgs {
                 },
             );
 
-        let requests: Vec<_> = if let Some(limit) = self.limit {
-            requests_iter.take(limit).collect()
-        } else {
-            requests_iter.collect()
-        };
-
-        Ok(TextToSqlConfig::new(requests))
+        Ok(TextToSqlConfig::new(requests_iter.collect()))
     }
 
     /// Returns the configuration name for this test run.
