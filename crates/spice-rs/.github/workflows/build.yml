@@ -23,10 +23,12 @@ jobs:
           - beta
           - nightly
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        # actions-rs/toolchain v1.0.7
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af
         with:
           profile: minimal
           toolchain: ${{ matrix.toolchain }}
@@ -43,7 +45,8 @@ jobs:
         continue-on-error: true
 
       - name: Upload analysis results to GitHub
-        uses: github/codeql-action/upload-sarif@v1
+        # github/codeql-action v3.28.1
+        uses: github/codeql-action/upload-sarif@48ab28a6f5dbc2a99bf1e0131198dd8f1df78169
         with:
           sarif_file: rust-clippy-results.sarif
           wait-for-processing: true
@@ -54,15 +57,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os:
+          [
+            ubuntu-latest,
+            ubuntu-22.04,
+            macos-latest,
+            macos-14,
+            windows-latest,
+            windows-2022,
+          ]
         toolchain:
           - stable
           - beta
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        # actions-rs/toolchain v1.0.7
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af
         with:
           profile: minimal
           toolchain: ${{ matrix.toolchain }}
@@ -73,7 +86,7 @@ jobs:
         run: cargo clippy --all-features
 
       - name: Install Spice (https://install.spiceai.org) (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -82,7 +95,7 @@ jobs:
           $HOME/.spice/bin/spice install
 
       - name: Install Spice (https://install.spiceai.org) (MacOS)
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.os, 'macos')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -90,18 +103,18 @@ jobs:
           spice install
 
       - name: install Spice (Windows)
-        if: matrix.os == 'windows-latest'
+        if: startsWith(matrix.os, 'windows')
         run: |
           curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 
       - name: add Spice bin to PATH (Windows)
-        if: matrix.os == 'windows-latest'
+        if: startsWith(matrix.os, 'windows')
         run: |
           Add-Content $env:GITHUB_PATH (Join-Path $HOME ".spice\bin")
         shell: pwsh
 
       - name: Init and start spice app
-        if: matrix.os != 'windows-latest'
+        if: "!startsWith(matrix.os, 'windows')"
         run: |
           spice init spice_qs
           cd spice_qs
@@ -111,7 +124,7 @@ jobs:
           sleep 10
 
       - name: Init and start spice app (Windows)
-        if: matrix.os == 'windows-latest'
+        if: startsWith(matrix.os, 'windows')
         run: |
           spice init spice_qs
           cd spice_qs
@@ -124,11 +137,11 @@ jobs:
       - name: Run tests
         run: cargo test
         env:
-          API_KEY: ${{ secrets.SPICEAI_API_KEY }}
+          SCP_SPICEAI_TPCH_API_KEY: ${{ secrets.SCP_SPICEAI_TPCH_API_KEY }}
 
       - name: Stop spice and check logs
         working-directory: spice_qs
-        if: matrix.os != 'windows-latest' && always()
+        if: "!startsWith(matrix.os, 'windows') && always()"
         run: |
           killall spice || true
           cat spice.log

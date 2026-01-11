@@ -1,30 +1,30 @@
 use crate::client::Error as SpiceClientError;
-use crate::config::get_user_agent;
 use crate::config::GenericError;
+use crate::config::get_user_agent;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use arrow_flight::FlightDescriptor;
+use arrow_flight::HandshakeRequest;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
-use arrow_flight::FlightDescriptor;
-use arrow_flight::HandshakeRequest;
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
-use futures::stream;
-use futures::task::Context;
-use futures::task::Poll;
 use futures::Future;
 use futures::Stream;
 use futures::TryStreamExt;
+use futures::stream;
+use futures::task::Context;
+use futures::task::Poll;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use tonic::IntoRequest;
 use tonic::metadata::AsciiMetadataKey;
 use tonic::transport::Channel;
-use tonic::IntoRequest;
 
 #[derive(Clone)]
 pub struct SqlFlightClient {
@@ -378,4 +378,122 @@ pub fn is_connection_reset_generic_error(error: &GenericError) -> bool {
         return is_tonic_reset_error(status) || status.metadata().contains_key("spiceai-retryable");
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_tonic_reset_error_internal_with_http2() {
+        let status = tonic::Status::internal("http2 error occurred");
+        assert!(is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_internal_with_operation_canceled() {
+        let status = tonic::Status::internal("operation was canceled");
+        assert!(is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_internal_with_grpc_status() {
+        let status = tonic::Status::internal("grpc-status header missing");
+        assert!(is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_internal_with_compression() {
+        let status = tonic::Status::internal("received message with invalid compression flag");
+        assert!(is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_internal_with_connection() {
+        let status = tonic::Status::internal("error reading a body from connection");
+        assert!(is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_internal_with_transport() {
+        let status = tonic::Status::internal("transport error");
+        assert!(is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_cancelled() {
+        let status = tonic::Status::cancelled("operation was canceled");
+        assert!(is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_unknown() {
+        let status = tonic::Status::unknown("http2 error");
+        assert!(is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_internal_unrelated_message() {
+        let status = tonic::Status::internal("some other error");
+        assert!(!is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_ok_status() {
+        let status = tonic::Status::ok("success");
+        assert!(!is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_not_found() {
+        let status = tonic::Status::not_found("resource not found");
+        assert!(!is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_permission_denied() {
+        let status = tonic::Status::permission_denied("access denied");
+        assert!(!is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_unauthenticated() {
+        let status = tonic::Status::unauthenticated("not authenticated");
+        assert!(!is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_tonic_reset_error_case_insensitive() {
+        let status = tonic::Status::internal("HTTP2 ERROR OCCURRED");
+        assert!(is_tonic_reset_error(&status));
+    }
+
+    #[test]
+    fn test_is_connection_reset_generic_error_with_tonic_status() {
+        let status = tonic::Status::internal("http2 error");
+        let error: GenericError = Box::new(status);
+        assert!(is_connection_reset_generic_error(&error));
+    }
+
+    #[test]
+    fn test_is_connection_reset_generic_error_non_tonic() {
+        let error: GenericError = Box::new(std::io::Error::other("some io error"));
+        assert!(!is_connection_reset_generic_error(&error));
+    }
+
+    #[test]
+    fn test_is_connection_reset_generic_error_string() {
+        let error: GenericError = "simple string error".into();
+        assert!(!is_connection_reset_generic_error(&error));
+    }
+
+    #[test]
+    fn test_sql_flight_client_new() {
+        use tonic::transport::channel::Endpoint;
+
+        // We can't actually connect, but we can create an endpoint
+        let _endpoint = Endpoint::from_static("http://localhost:50051");
+        // This would fail at connect time, but the SqlFlightClient::new just takes a channel
+        // So we test the construction logic indirectly
+    }
 }

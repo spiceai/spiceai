@@ -1,8 +1,8 @@
 use crate::flight::RetryableQueryStream;
-use crate::util::{retry, FibonacciBackoffBuilder, RetryError};
+use crate::util::{FibonacciBackoffBuilder, RetryError, retry};
 use crate::{
     config::{GenericError, SPICE_CLOUD_FLIGHT_ADDR, SPICE_LOCAL_FLIGHT_ADDR},
-    flight::{is_connection_reset_generic_error, SqlFlightClient},
+    flight::{SqlFlightClient, is_connection_reset_generic_error},
     tls::{ensure_crypto_provider, new_tls_flight_channel},
 };
 use arrow::record_batch::RecordBatch;
@@ -291,5 +291,226 @@ impl SpiceClientBuilder {
                 self.max_retries,
             )),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_builder_default() {
+        let builder = SpiceClientBuilder::default();
+        assert!(builder.api_key.is_none());
+        assert!(builder.user_agent.is_none());
+        assert!(builder.flight_url.is_none());
+        assert!(builder.cache_control.is_none());
+        assert_eq!(builder.max_retries, MAX_RETRIES);
+    }
+
+    #[test]
+    fn test_client_builder_new() {
+        let builder = SpiceClientBuilder::new();
+        assert!(builder.api_key.is_none());
+        assert!(builder.user_agent.is_none());
+        assert!(builder.flight_url.is_none());
+        assert!(builder.cache_control.is_none());
+        assert_eq!(builder.max_retries, MAX_RETRIES);
+    }
+
+    #[test]
+    fn test_client_builder_api_key() {
+        let builder = SpiceClientBuilder::new().api_key("test_key");
+        assert_eq!(builder.api_key, Some("test_key".to_string()));
+    }
+
+    #[test]
+    fn test_client_builder_user_agent() {
+        let builder = SpiceClientBuilder::new().user_agent("custom-agent/1.0");
+        assert_eq!(builder.user_agent, Some("custom-agent/1.0".to_string()));
+    }
+
+    #[test]
+    fn test_client_builder_flight_url() {
+        let builder = SpiceClientBuilder::new().flight_url("https://custom.endpoint.io");
+        assert_eq!(
+            builder.flight_url,
+            Some("https://custom.endpoint.io".to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_builder_max_retries() {
+        let builder = SpiceClientBuilder::new().max_retries(10);
+        assert_eq!(builder.max_retries, 10);
+    }
+
+    #[test]
+    fn test_client_builder_cache_control() {
+        let builder = SpiceClientBuilder::new().cache_control("no-cache");
+        assert_eq!(builder.cache_control, Some("no-cache".to_string()));
+    }
+
+    #[test]
+    fn test_client_builder_use_spiceai_cloud() {
+        let builder = SpiceClientBuilder::new().use_spiceai_cloud();
+        assert_eq!(
+            builder.flight_url,
+            Some(SPICE_CLOUD_FLIGHT_ADDR.to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_builder_chaining() {
+        let builder = SpiceClientBuilder::new()
+            .api_key("my_api_key")
+            .user_agent("my-agent/2.0")
+            .max_retries(5)
+            .cache_control("max-age=3600")
+            .use_spiceai_cloud();
+
+        assert_eq!(builder.api_key, Some("my_api_key".to_string()));
+        assert_eq!(builder.user_agent, Some("my-agent/2.0".to_string()));
+        assert_eq!(builder.max_retries, 5);
+        assert_eq!(builder.cache_control, Some("max-age=3600".to_string()));
+        assert_eq!(
+            builder.flight_url,
+            Some(SPICE_CLOUD_FLIGHT_ADDR.to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_builder_flight_url_overrides_cloud() {
+        let builder = SpiceClientBuilder::new()
+            .use_spiceai_cloud()
+            .flight_url("https://custom.endpoint.io");
+
+        // flight_url should override the cloud endpoint
+        assert_eq!(
+            builder.flight_url,
+            Some("https://custom.endpoint.io".to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_builder_cloud_overrides_flight_url() {
+        let builder = SpiceClientBuilder::new()
+            .flight_url("https://custom.endpoint.io")
+            .use_spiceai_cloud();
+
+        // use_spiceai_cloud should override custom flight_url
+        assert_eq!(
+            builder.flight_url,
+            Some(SPICE_CLOUD_FLIGHT_ADDR.to_string())
+        );
+    }
+
+    #[test]
+    fn test_spice_client_has_builder() {
+        let builder = SpiceClient::builder();
+        assert!(builder.api_key.is_none());
+    }
+
+    #[test]
+    fn test_error_display_query() {
+        let error = Error::Query {
+            source: "test error".into(),
+        };
+        let display = format!("{error}");
+        assert!(display.contains("Query execution failed"));
+    }
+
+    #[test]
+    fn test_error_display_connection_reset() {
+        let error = Error::ConnectionReset {
+            message: "connection lost".to_string(),
+        };
+        let display = format!("{error}");
+        assert!(display.contains("Connection reset"));
+        assert!(display.contains("connection lost"));
+    }
+
+    // Edge case tests
+
+    #[test]
+    fn test_client_builder_empty_api_key() {
+        let builder = SpiceClientBuilder::new().api_key("");
+        assert_eq!(builder.api_key, Some(String::new()));
+    }
+
+    #[test]
+    fn test_client_builder_empty_user_agent() {
+        let builder = SpiceClientBuilder::new().user_agent("");
+        assert_eq!(builder.user_agent, Some(String::new()));
+    }
+
+    #[test]
+    fn test_client_builder_empty_flight_url() {
+        let builder = SpiceClientBuilder::new().flight_url("");
+        assert_eq!(builder.flight_url, Some(String::new()));
+    }
+
+    #[test]
+    fn test_client_builder_zero_max_retries() {
+        let builder = SpiceClientBuilder::new().max_retries(0);
+        assert_eq!(builder.max_retries, 0);
+    }
+
+    #[test]
+    fn test_client_builder_max_retries_u32_max() {
+        let builder = SpiceClientBuilder::new().max_retries(u32::MAX);
+        assert_eq!(builder.max_retries, u32::MAX);
+    }
+
+    #[test]
+    fn test_client_builder_special_chars_in_api_key() {
+        let api_key = "abc123!@#$%^&*()_+-=[]{}|;':\",./<>?";
+        let builder = SpiceClientBuilder::new().api_key(api_key);
+        assert_eq!(builder.api_key, Some(api_key.to_string()));
+    }
+
+    #[test]
+    fn test_client_builder_unicode_user_agent() {
+        let user_agent = "测试-agent/1.0 🚀";
+        let builder = SpiceClientBuilder::new().user_agent(user_agent);
+        assert_eq!(builder.user_agent, Some(user_agent.to_string()));
+    }
+
+    #[test]
+    fn test_client_builder_multiple_calls_same_method() {
+        let builder = SpiceClientBuilder::new()
+            .api_key("first")
+            .api_key("second")
+            .api_key("third");
+        assert_eq!(builder.api_key, Some("third".to_string()));
+    }
+
+    #[test]
+    fn test_error_query_stream() {
+        let error = Error::QueryStream {
+            source: FlightError::NotYetImplemented("test".to_string()),
+        };
+        let display = format!("{error}");
+        assert!(display.contains("Failed to process query stream"));
+    }
+
+    #[test]
+    fn test_client_builder_cache_control_variations() {
+        // Test various cache control header values
+        let cases = ["no-cache", "max-age=0", "no-store", "private, max-age=3600"];
+
+        for case in cases {
+            let builder = SpiceClientBuilder::new().cache_control(case);
+            assert_eq!(builder.cache_control, Some(case.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_client_builder_whitespace_in_values() {
+        let builder = SpiceClientBuilder::new()
+            .api_key("  key with spaces  ")
+            .user_agent("  agent  ");
+        assert_eq!(builder.api_key, Some("  key with spaces  ".to_string()));
+        assert_eq!(builder.user_agent, Some("  agent  ".to_string()));
     }
 }

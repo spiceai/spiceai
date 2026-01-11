@@ -1,20 +1,20 @@
 [package]
 name = "spiceai"
-version = "3.1.0"
-edition = "2021"
+version = "3.2.0"
+edition = "2024"
 description = "SDK for Spice.ai, an open-source runtime and platform for building AI-driven software."
 license = "Apache-2.0"
 
 [dependencies]
-arrow = { version = "56", features = ["prettyprint"] }
-arrow-flight = { version = "56", features = ["flight-sql-experimental"] }
+arrow = { version = "57", features = ["prettyprint"] }
+arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
 bytes = "1.6.0"
-prost = "0.12.4"
-prost-types = "0.12.4"
+prost = { version = "0.14.1", features = ["derive"] }
+prost-types = "0.14.1"
 rustls = "0.23.5"
 tokio = { version = "1.37.0", features = ["rt-multi-thread"] }
 rustls-native-certs = "0.8.1"
-tonic = { version = "0.13", default-features = false, features = [
+tonic = { version = "0.14", default-features = false, features = [
   "transport",
   "tls-ring",
   "tls-native-roots",

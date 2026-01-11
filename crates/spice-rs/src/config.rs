@@ -78,4 +78,90 @@ mod test {
             "expected user agent to match regex, but got {user_agent}"
         );
     }
+
+    #[test]
+    fn test_spice_cloud_flight_addr() {
+        assert_eq!(SPICE_CLOUD_FLIGHT_ADDR, "https://flight.spiceai.io");
+        assert!(SPICE_CLOUD_FLIGHT_ADDR.starts_with("https://"));
+    }
+
+    #[test]
+    fn test_spice_local_flight_addr() {
+        assert_eq!(SPICE_LOCAL_FLIGHT_ADDR, "http://localhost:50051");
+        assert!(SPICE_LOCAL_FLIGHT_ADDR.starts_with("http://"));
+        assert!(SPICE_LOCAL_FLIGHT_ADDR.contains("localhost"));
+    }
+
+    #[test]
+    fn test_user_agent_contains_version() {
+        let user_agent = get_user_agent();
+        assert!(user_agent.starts_with("spice-rs/"));
+        assert!(user_agent.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn test_user_agent_contains_os_info() {
+        let user_agent = get_user_agent();
+        // Should contain OS type (Darwin, Linux, Windows)
+        assert!(
+            user_agent.contains("Darwin")
+                || user_agent.contains("Linux")
+                || user_agent.contains("Windows")
+        );
+        // Should contain architecture (x86_64, aarch64, i386)
+        assert!(
+            user_agent.contains("x86_64")
+                || user_agent.contains("aarch64")
+                || user_agent.contains("i386")
+        );
+    }
+
+    #[test]
+    fn test_get_os_release_returns_string() {
+        let result = get_os_release();
+        assert!(result.is_ok());
+        let release = result.expect("should get os release");
+        assert!(!release.is_empty());
+    }
+
+    // Edge case tests
+
+    #[test]
+    fn test_user_agent_format_structure() {
+        let user_agent = get_user_agent();
+
+        // Should have format: spice-rs/VERSION (OS/RELEASE ARCH)
+        assert!(user_agent.contains("spice-rs/"));
+        assert!(user_agent.contains('('));
+        assert!(user_agent.contains(')'));
+        assert!(user_agent.contains('/'));
+    }
+
+    #[test]
+    fn test_spice_cloud_flight_addr_is_valid_url() {
+        // Ensure it's a valid URL format
+        assert!(SPICE_CLOUD_FLIGHT_ADDR.starts_with("https://"));
+        assert!(!SPICE_CLOUD_FLIGHT_ADDR.ends_with('/'));
+        assert!(SPICE_CLOUD_FLIGHT_ADDR.contains('.'));
+    }
+
+    #[test]
+    fn test_spice_local_flight_addr_port() {
+        // Verify the local address has the expected port
+        assert!(SPICE_LOCAL_FLIGHT_ADDR.contains(":50051"));
+    }
+
+    #[test]
+    fn test_user_agent_no_newlines() {
+        let user_agent = get_user_agent();
+        assert!(!user_agent.contains('\n'));
+        assert!(!user_agent.contains('\r'));
+    }
+
+    #[test]
+    fn test_user_agent_not_empty() {
+        let user_agent = get_user_agent();
+        assert!(!user_agent.is_empty());
+        assert!(user_agent.len() > 10); // Should have substantial content
+    }
 }

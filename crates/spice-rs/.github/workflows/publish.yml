@@ -13,15 +13,17 @@ jobs:
     permissions:
       id-token: write # Required for OIDC token exchange with crates.io
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      # Using a tag for a 3rd party Action that is not pinned to a commit can lead to executing an untrusted Action through a supply chain attack.
+      # rust-lang/crates-io-auth-action v1.0.1
       # https://github.com/rust-lang/crates-io-auth-action/releases/tag/v1.0.1
       - uses: rust-lang/crates-io-auth-action@e919bc7605cde86df457cf5b93c5e103838bd879
         id: auth
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        # actions-rs/toolchain v1.0.7
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af
         with:
           profile: minimal
           toolchain: stable
