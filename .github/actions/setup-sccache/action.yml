@@ -3,17 +3,15 @@ description: 'composite action'
 
 inputs:
   minio_endpoint:
-    description: 'MinIO endpoint'
-    required: true
+    description: 'MinIO endpoint (used for Linux and self-hosted macOS)'
+    required: false
     type: string
-  os:
-    description: 'Operating system to set up the toolchain for'
-    default: 'linux' # 'linux', 'darwin', 'windows'
+
 runs:
   using: 'composite'
   steps:
-    - name: Set up sccache
-      if: inputs.os == 'linux'
+    - name: Set up sccache (Linux)
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update && sudo apt-get install wget -y
@@ -26,6 +24,31 @@ runs:
         [cache.s3]
         bucket = "sccache"
         endpoint = "${{ inputs.minio_endpoint }}"
+        server_side_encryption = false
+        no_credentials = false
+        region = "us-east-1"
+        EOF
+
+    - name: Set up sccache (macOS - self-hosted only)
+      if: runner.os == 'macOS' && inputs.minio_endpoint != ''
+      shell: bash
+      run: |
+        # Only self-hosted macOS runners use sccache (with localhost MinIO)
+        # GitHub-hosted macOS runners use actions cache instead
+
+        # Verify sccache is installed
+        if ! command -v sccache &> /dev/null; then
+          echo "Error: sccache is not installed on this macOS runner"
+          exit 1
+        fi
+        sccache --version
+
+        rm -rf ~/.config/sccache/config
+        mkdir -p ~/.config/sccache
+        cat <<EOF > ~/.config/sccache/config
+        [cache.s3]
+        bucket = "sccache"
+        endpoint = "http://localhost:9000"
         server_side_encryption = false
         no_credentials = false
         region = "us-east-1"
