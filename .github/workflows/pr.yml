@@ -92,6 +92,9 @@ jobs:
             curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
           fi
 
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
       - name: Run Go lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: make lint-go
