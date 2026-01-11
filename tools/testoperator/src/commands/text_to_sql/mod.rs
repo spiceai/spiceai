@@ -52,7 +52,7 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
         });
 
     let test = SpiceTest::new(
-        app.name.clone(),
+        args.get_configuration_name(&app.name),
         NotStarted::new().with_config(
             args.construct_requests()
                 .context("Cannot make text-to-SQL test cases")?,
