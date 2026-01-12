@@ -20,7 +20,7 @@ require (
 	github.com/spf13/viper v1.21.0
 	github.com/spiceai/gospice/v8 v8.0.1
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/mod v0.31.0
+	golang.org/x/mod v0.32.0
 )
 
 require (
