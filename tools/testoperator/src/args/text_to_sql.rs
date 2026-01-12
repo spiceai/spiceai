@@ -49,6 +49,16 @@ pub struct TextToSqlArgs {
     /// Whether to use the Accept: application/sql HTTP header in the v1/nsql endpoint
     #[arg(long, default_value = "both")]
     pub(crate) return_sql: ReturnSqlOption,
+
+    /// Limit the number of text-to-SQL operations to run.
+    ///
+    /// If `--return-sql` or `--sample-data-enabled` are set to `both`, the limit applies after the Cartesian product is taken.
+    #[arg(short('n'), long)]
+    pub(crate) limit: Option<usize>,
+
+    /// Unique name for the configured testoperator run. Used to identify/group runs in telemetry. If not provided, the `.name` from the spicepod will be used.
+    #[arg(long)]
+    pub(crate) configuration_name: Option<String>,
 }
 
 impl TextToSqlArgs {
@@ -68,23 +78,23 @@ impl TextToSqlArgs {
 
     /// Loads queries based on flags and generates independent [`TextToSqlRequests`].
     pub fn construct_requests(&self) -> Result<TextToSqlConfig, anyhow::Error> {
-        Ok(TextToSqlConfig::new(
-            self.load_queries()?
-                .into_iter()
-                .cartesian_product(self.sample_data_enabled.values())
-                .cartesian_product(self.return_sql.values())
-                .map(
-                    |(
-                        (
-                            TextToSqlQuery {
-                                question,
-                                expected_sql,
-                            },
-                            sample_data,
-                        ),
-                        return_sql,
-                    )| {
-                        TextToSqlRequest::new(
+        let requests_iter = self
+            .load_queries()?
+            .into_iter()
+            .cartesian_product(self.sample_data_enabled.values())
+            .cartesian_product(self.return_sql.values())
+            .map(
+                |(
+                    (
+                        TextToSqlQuery {
+                            question,
+                            expected_sql,
+                        },
+                        sample_data,
+                    ),
+                    return_sql,
+                )| {
+                    TextToSqlRequest::new(
                         format!(
                             "sample_data={sample_data},return_sql={return_sql},question={question}",
                         ),
@@ -94,10 +104,25 @@ impl TextToSqlArgs {
                     )
                     .with_sample_data_enabled(sample_data)
                     .with_return_sql(return_sql)
-                    },
-                )
-                .collect(),
-        ))
+                },
+            );
+
+        let requests: Vec<_> = if let Some(limit) = self.limit {
+            requests_iter.take(limit).collect()
+        } else {
+            requests_iter.collect()
+        };
+
+        Ok(TextToSqlConfig::new(requests))
+    }
+
+    /// Returns the configuration name for this test run.
+    /// If `configuration_name` is set, it is used; otherwise, the spicepod name is used.
+    #[must_use]
+    pub fn get_configuration_name(&self, spicepod_name: &str) -> String {
+        self.configuration_name
+            .clone()
+            .unwrap_or_else(|| spicepod_name.to_string())
     }
 }
 

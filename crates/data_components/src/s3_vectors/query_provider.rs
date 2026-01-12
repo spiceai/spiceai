@@ -394,14 +394,14 @@ async fn query_vector_stream(
         top_k = limit
     );
 
-    let mut query_vectors = query_vectors_call(Arc::clone(&client), &idx, query, filters, limit)
+    let query_vectors = query_vectors_call(Arc::clone(&client), &idx, query, filters, limit)
         .instrument(combined_span.clone())
         .await?;
 
     // Only fetch vector data if the embeddings column is in the projection.
     // Check if "data" column is present in the schema.
-    if schema.column_with_name(S3_VECTOR_EMBEDDING_NAME).is_some() {
-        let mut vector_data = get_vectors_call(
+    let vector_data = if schema.column_with_name(S3_VECTOR_EMBEDDING_NAME).is_some() {
+        let vector_data = get_vectors_call(
             Arc::clone(&client),
             &idx,
             query_vectors.iter().map(|v| v.key.clone()).collect(),
@@ -409,14 +409,11 @@ async fn query_vector_stream(
         .instrument(combined_span.clone())
         .await?;
 
-        let mut missing_keys = Vec::new();
-        for query_vector in &mut query_vectors {
-            if let Some(output_vector) = vector_data.remove(&query_vector.key) {
-                query_vector.data = Some(output_vector);
-            } else {
-                missing_keys.push(&query_vector.key);
-            }
-        }
+        let missing_keys: Vec<_> = query_vectors
+            .iter()
+            .filter(|v| !vector_data.contains_key(&v.key))
+            .map(|v| &v.key)
+            .collect();
 
         // Warn if GetVectors returned incomplete data
         if !missing_keys.is_empty() {
@@ -426,9 +423,18 @@ async fn query_vector_stream(
                 missing_keys
             );
         }
-    }
+        Some(vector_data)
+    } else {
+        None
+    };
 
-    let rows: Vec<_> = query_vectors.into_iter().map(to_flat_value).collect();
+    let rows: Vec<_> = query_vectors
+        .into_iter()
+        .map(|v| {
+            let data = vector_data.as_ref().and_then(|vd| vd.get(&v.key).cloned());
+            to_flat_value(v, data)
+        })
+        .collect();
     decoder.serialize(rows.as_slice()).map_err(|e| {
         DataFusionError::ArrowError(
             Box::new(e),
@@ -460,10 +466,9 @@ async fn query_vector_stream(
 }
 
 /// Converts a `QueryOutputVector` into a flat JSON value (i.e unnest metadata fields).
-fn to_flat_value(output: QueryOutputVector) -> serde_json::Value {
+fn to_flat_value(output: QueryOutputVector, data: Option<VectorData>) -> serde_json::Value {
     let QueryOutputVector {
         metadata,
-        data,
         key,
         distance,
         ..
@@ -504,6 +509,7 @@ mod tests {
 
     use crate::s3_vectors::MetadataColumns;
     use crate::s3_vectors::spill::query_provider::S3VectorsSpillQueryTable;
+    use s3_vectors::QueryOutputVector;
 
     use super::*;
 
@@ -1038,5 +1044,112 @@ mod tests {
 
         // The limit should be S3_VECTOR_MAX_TOPK (100)
         assert_eq!(exec.limit, S3_VECTOR_MAX_TOPK);
+    }
+
+    #[test]
+    fn test_to_flat_value_with_vector_data() {
+        // Test that to_flat_value correctly includes vector data when provided
+        let query_output = QueryOutputVector::builder()
+            .key("test-key".to_string())
+            .distance(0.5_f32)
+            .build()
+            .expect("build");
+
+        let vector_data = VectorData::Float32(vec![1.0, 2.0, 3.0]);
+        let result = super::to_flat_value(query_output, Some(vector_data));
+
+        let obj = result.as_object().expect("should be object");
+
+        // Verify key is present
+        assert_eq!(
+            obj.get(S3_VECTOR_PRIMARY_KEY_NAME),
+            Some(&serde_json::Value::String("test-key".to_string()))
+        );
+
+        // Verify distance is present
+        let distance = obj.get(S3_VECTOR_DISTANCE_NAME).expect("distance");
+        assert_eq!(distance.as_f64(), Some(0.5));
+
+        // Verify vector data is present
+        let embedding = obj
+            .get(S3_VECTOR_EMBEDDING_NAME)
+            .expect("embedding should be present");
+        let arr = embedding.as_array().expect("should be array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].as_f64(), Some(1.0));
+        assert_eq!(arr[1].as_f64(), Some(2.0));
+        assert_eq!(arr[2].as_f64(), Some(3.0));
+    }
+
+    #[test]
+    fn test_to_flat_value_without_vector_data() {
+        // Test that to_flat_value correctly excludes vector data when not provided
+        let query_output = QueryOutputVector::builder()
+            .key("test-key".to_string())
+            .distance(0.75_f32)
+            .build()
+            .expect("build");
+
+        let result = super::to_flat_value(query_output, None);
+
+        let obj = result.as_object().expect("should be object");
+
+        // Verify key is present
+        assert_eq!(
+            obj.get(S3_VECTOR_PRIMARY_KEY_NAME),
+            Some(&serde_json::Value::String("test-key".to_string()))
+        );
+
+        // Verify distance is present
+        let distance = obj.get(S3_VECTOR_DISTANCE_NAME).expect("distance");
+        assert_eq!(distance.as_f64(), Some(0.75));
+
+        // Verify vector data is NOT present
+        assert!(
+            obj.get(S3_VECTOR_EMBEDDING_NAME).is_none(),
+            "embedding should not be present when data is None"
+        );
+    }
+
+    #[test]
+    fn test_to_flat_value_with_metadata() {
+        use aws_smithy_types::{Document, Number};
+
+        // Test that metadata fields are correctly flattened
+        let metadata = Document::Object(
+            vec![
+                ("field1".to_string(), Document::String("value1".to_string())),
+                ("field2".to_string(), Document::Number(Number::Float(42.0))),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let query_output = QueryOutputVector::builder()
+            .key("meta-key".to_string())
+            .distance(0.1_f32)
+            .metadata(metadata)
+            .build()
+            .expect("build");
+
+        let result = super::to_flat_value(query_output, None);
+
+        let obj = result.as_object().expect("should be object");
+
+        // Verify key is present
+        assert_eq!(
+            obj.get(S3_VECTOR_PRIMARY_KEY_NAME),
+            Some(&serde_json::Value::String("meta-key".to_string()))
+        );
+
+        // Verify metadata fields are flattened
+        assert_eq!(
+            obj.get("field1"),
+            Some(&serde_json::Value::String("value1".to_string()))
+        );
+        assert_eq!(
+            obj.get("field2").and_then(serde_json::Value::as_f64),
+            Some(42.0)
+        );
     }
 }

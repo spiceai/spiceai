@@ -48,6 +48,14 @@ on:
         options:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
+      limit:
+        description: 'Limit the number of text-to-SQL operations to run'
+        required: false
+        type: number
+      configuration_name:
+        description: 'Unique name for the configured testoperator run. Used to identify/group runs in telemetry.'
+        required: false
+        type: string
 
 jobs:
   run-bench:
@@ -145,10 +153,22 @@ jobs:
             exit 1
           fi
 
+          LIMIT_ARG=""
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            LIMIT_ARG="-n ${{ github.event.inputs.limit }}"
+          fi
+
+          CONFIG_NAME_ARG=""
+          if [ -n "${{ github.event.inputs.configuration_name }}" ]; then
+            CONFIG_NAME_ARG="--configuration-name ${{ github.event.inputs.configuration_name }}"
+          fi
+
           testoperator run text-to-sql \
             --ready-wait 1800 \
             $QUERYSET_ARG \
             $SPICEPOD_DEPENDENCY \
+            $LIMIT_ARG \
+            $CONFIG_NAME_ARG \
             -d /opt/spiced/data \
             --model ${{ github.event.inputs.model_name }} \
             -p "${{ github.event.inputs.spicepod_path }}"
