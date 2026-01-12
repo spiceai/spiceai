@@ -1,0 +1,289 @@
+name: spiced_docker_dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g., my-feature). Will be published as ghcr.io/spiceai/spiceai-dev:<tag>'
+        required: true
+        type: string
+      variant:
+        description: 'Which image variant to build'
+        required: false
+        type: choice
+        options:
+          - 'models'
+          - 'default'
+        default: 'models'
+      target:
+        description: 'Build for specific architecture(s)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'amd64'
+          - 'arm64'
+        default: 'all'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      rel_version: ${{ steps.set_version.outputs.rel_version }}
+      dev_label: ${{ steps.set_version.outputs.dev_label }}
+      run_amd64: ${{ steps.set_targets.outputs.run_amd64 }}
+      run_arm64: ${{ steps.set_targets.outputs.run_arm64 }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set version
+        id: set_version
+        run: |
+          commit_hash=$(git rev-parse --short HEAD)
+          branch_name="${GITHUB_REF_NAME}"
+          # Sanitize branch name for use in version string
+          safe_branch=$(echo "$branch_name" | sed 's/[^a-zA-Z0-9]/-/g' | head -c 20)
+          date="$(date +%Y%m%d)"
+          version="${date}-${safe_branch}-${commit_hash}"
+          dev_label="dev.${date}.${commit_hash}"
+          echo "rel_version=${version}" >> $GITHUB_OUTPUT
+          echo "dev_label=${dev_label}" >> $GITHUB_OUTPUT
+          echo "Building dev image with version: \"${version}\""
+
+      - name: Set target architectures
+        id: set_targets
+        run: |
+          target="${{ inputs.target }}"
+          case "$target" in
+            all)
+              echo "run_amd64=true" >> $GITHUB_OUTPUT
+              echo "run_arm64=true" >> $GITHUB_OUTPUT
+              ;;
+            amd64)
+              echo "run_amd64=true" >> $GITHUB_OUTPUT
+              echo "run_arm64=false" >> $GITHUB_OUTPUT
+              ;;
+            arm64)
+              echo "run_amd64=false" >> $GITHUB_OUTPUT
+              echo "run_arm64=true" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+  build-arm64:
+    needs: setup
+    if: needs.setup.outputs.run_arm64 == 'true'
+    runs-on: hosted-linux-arm-runner
+    env:
+      RUST_PROFILE: release
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Add dev postfix to version in Cargo.toml
+        env:
+          DEV_LABEL: ${{ needs.setup.outputs.dev_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$DEV_LABEL"
+          else
+            new_version="${current_version}-$DEV_LABEL"
+          fi
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Install docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg lsb-release
+          sudo mkdir -m 0755 -p /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(lsb_release -i | awk '{ print tolower($3) }') $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+      - name: Start Docker service
+        run: |
+          sudo systemctl start docker
+          sudo systemctl status docker
+
+      - name: chown /var/run/docker.sock to current user
+        run: |
+          sudo chown $USER /var/run/docker.sock
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+
+      - name: Set cargo features
+        run: |
+          variant="${{ inputs.variant }}"
+          if [ "$variant" = "models" ]; then
+            echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+          else
+            echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+          fi
+
+      - name: Build ARM64 image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/arm64
+          outputs: type=docker,name=localhost:5000/spiceai:dev-arm64,dest=/tmp/image-arm64.tar
+          cache-from: type=gha,scope=build-dev-arm64
+          cache-to: type=gha,scope=build-dev-arm64,mode=max
+          build-args: |
+            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
+
+      - name: Upload ARM64 artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: image-arm64
+          path: /tmp/image-arm64.tar
+
+  build-amd64:
+    needs: setup
+    if: needs.setup.outputs.run_amd64 == 'true'
+    runs-on: spiceai-dev-runners
+    env:
+      RUST_PROFILE: release
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Add dev postfix to version in Cargo.toml
+        env:
+          DEV_LABEL: ${{ needs.setup.outputs.dev_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$DEV_LABEL"
+          else
+            new_version="${current_version}-$DEV_LABEL"
+          fi
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+
+      - name: Set cargo features
+        run: |
+          variant="${{ inputs.variant }}"
+          if [ "$variant" = "models" ]; then
+            echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+          else
+            echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+          fi
+
+      - name: Build AMD64 image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          outputs: type=docker,name=localhost:5000/spiceai:dev-amd64,dest=/tmp/image-amd64.tar
+          cache-from: type=gha,scope=build-dev-amd64
+          cache-to: type=gha,scope=build-dev-amd64,mode=max
+          build-args: |
+            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
+
+      - name: Upload AMD64 artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: image-amd64
+          path: /tmp/image-amd64.tar
+
+  publish:
+    needs: [setup, build-amd64, build-arm64]
+    if: always() && (needs.build-amd64.result == 'success' || needs.build-arm64.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        with:
+          path: /tmp
+          pattern: image-*
+          merge-multiple: true
+
+      - name: Verify artifacts
+        run: |
+          ls -l /tmp
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Start local registry
+        run: |
+          docker run -d -p 5000:5000 --restart=always --name registry registry:2
+
+      - name: Login to GitHub Package Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Import images and create manifest
+        env:
+          IMAGE_TAG: ${{ inputs.tag }}
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+          RUN_AMD64: ${{ needs.setup.outputs.run_amd64 }}
+          RUN_ARM64: ${{ needs.setup.outputs.run_arm64 }}
+        run: |
+          echo "IMAGE_TAG=${IMAGE_TAG}"
+          echo "REL_VERSION=${REL_VERSION}"
+
+          sources=""
+
+          if [ -f /tmp/image-amd64.tar ]; then
+            echo "Loading AMD64 image"
+            docker load -i /tmp/image-amd64.tar
+            docker push localhost:5000/spiceai:dev-amd64
+            sources="$sources localhost:5000/spiceai:dev-amd64"
+          fi
+
+          if [ -f /tmp/image-arm64.tar ]; then
+            echo "Loading ARM64 image"
+            docker load -i /tmp/image-arm64.tar
+            docker push localhost:5000/spiceai:dev-arm64
+            sources="$sources localhost:5000/spiceai:dev-arm64"
+          fi
+
+          if [ -z "$sources" ]; then
+            echo "No images to publish!"
+            exit 1
+          fi
+
+          echo "Creating and pushing multi-arch manifest"
+          docker buildx imagetools create \
+            -t ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG} \
+            -t ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}-${REL_VERSION} \
+            $sources
+
+          echo "Verifying image:"
+          docker buildx imagetools inspect ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}
+
+      - name: Summary
+        env:
+          IMAGE_TAG: ${{ inputs.tag }}
+          REL_VERSION: ${{ needs.setup.outputs.rel_version }}
+        run: |
+          echo "## 🐳 Dev Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Images:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}-${REL_VERSION}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Pull command:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ghcr.io/spiceai/spiceai-dev:${IMAGE_TAG}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
