@@ -76,13 +76,14 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
         .collect(TestType::TextToSql)?
         .with_run_metric(test.get_run_metrics()?);
 
-    metrics.show_run(metrics.run_metric.as_ref().map(|m| {
-        if m.error_rate > 0.0 {
+    let run_status = metrics.run_metric.as_ref().map(|rm| {
+        if rm.error_rate > 0.0 {
             QueryStatus::Failed(None)
         } else {
             QueryStatus::Passed
         }
-    }))?;
+    });
+    metrics.show_run(run_status)?;
     let () = emit_telemetry(telemetry, &metrics, memory_usage_opt).await?;
 
     let mut spiced_instance = test.end()?;
@@ -123,12 +124,45 @@ async fn emit_telemetry(
         crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
     }
 
+    // Record metrics, per query
+    metrics
+        .metrics
+        .iter()
+        .filter_map(|qm| qm.extended_metrics.as_ref())
+        .for_each(|qm| {
+            let attributes = vec![KeyValue::new("query_id", qm.question.clone())];
+
+            crate::metrics::TEXT_TO_SQL_LATENCY.record(qm.latency_ms, &attributes);
+            crate::metrics::TEXT_TO_SQL_SQL_DURATION.record(qm.sql_duration_ms, &attributes);
+            crate::metrics::TEXT_TO_SQL_SQL_QUERY_COUNT
+                .record(qm.sql_query_count as u64, &attributes);
+            crate::metrics::TEXT_TO_SQL_LLM_DURATION.record(qm.llm_duration_ms, &attributes);
+            crate::metrics::TEXT_TO_SQL_LLM_COUNT.record(qm.llm_count as u64, &attributes);
+            crate::metrics::TEXT_TO_SQL_LLM_INPUT_TOKENS.record(qm.llm_input_tokens, &attributes);
+            crate::metrics::TEXT_TO_SQL_LLM_OUTPUT_TOKENS.record(qm.llm_output_tokens, &attributes);
+            crate::metrics::TEXT_TO_SQL_EXACT_MATCH.record(qm.exact_match, &attributes);
+            crate::metrics::TEXT_TO_SQL_EXACT_LOGICAL_PLAN_MATCH
+                .record(qm.exact_logical_plan_match, &attributes);
+            crate::metrics::TEXT_TO_SQL_ERROR.record(u64::from(qm.is_error), &attributes);
+            crate::metrics::TEXT_TO_SQL_CORRECT_TABLES.record(qm.correct_tables, &attributes);
+            crate::metrics::TEXT_TO_SQL_CORRECT_TABLE_PROJECTIONS
+                .record(qm.correct_table_projections, &attributes);
+            crate::metrics::TEXT_TO_SQL_CORRECT_OUTPUT_SCHEMA
+                .record(qm.correct_output_schema, &attributes);
+        });
+
+    // Record metrics, aggregate run-level
     if let Some(run_metrics) = &metrics.run_metric {
         crate::metrics::TEXT_TO_SQL_ERROR_RATE.record(run_metrics.error_rate, &[]);
         crate::metrics::TEXT_TO_SQL_EXACT_MATCH_RATE.record(run_metrics.exact_match_rate, &[]);
-        crate::metrics::AVERAGE_TEXT_TO_SQL_ATTEMPTS.record(run_metrics.avg_attempts, &[]);
         crate::metrics::P95_DURATION.record(run_metrics.p95_latency_ms as u64, &[]);
         crate::metrics::MEDIAN_DURATION.record(run_metrics.median_latency_ms as u64, &[]);
+        crate::metrics::TEXT_TO_SQL_MEAN_SQL_QUERY_COUNT
+            .record(run_metrics.mean_sql_query_count, &[]);
+        crate::metrics::TEXT_TO_SQL_MEAN_LLM_INPUT_TOKENS
+            .record(run_metrics.mean_llm_input_tokens, &[]);
+        crate::metrics::TEXT_TO_SQL_MEAN_LLM_OUTPUT_TOKENS
+            .record(run_metrics.mean_llm_output_tokens, &[]);
     }
 
     telemetry.emit().await?;
