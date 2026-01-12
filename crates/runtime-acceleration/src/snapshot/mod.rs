@@ -2331,14 +2331,6 @@ mod tests {
             .len();
 
         let schema = sample_schema();
-        let schema_for_factory = Arc::clone(&schema);
-        let factory: DatasetCheckpointerFactory = Arc::new(move || {
-            let schema = Arc::clone(&schema_for_factory);
-            Box::pin(async move {
-                Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(StaticSchemaCheckpointer { schema }))
-            })
-        });
-
         let manager = build_manager(
             Arc::clone(&store),
             local_path.clone(),
