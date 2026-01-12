@@ -168,7 +168,7 @@ git2 = { version = "0.20", default-features = false, features = [
     "ssh",
 ] }
 globset = "0.4.16"
-governor = "0.10.2"
+governor = "0.10.4"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.4", features = ["tokio"] }
