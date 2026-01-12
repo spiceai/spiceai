@@ -21,10 +21,10 @@ use std::{
 
 use anyhow::Result;
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
-use crate::spicetest::text_to_sql::task_history::find_task_history_metrics;
+use crate::spicetest::text_to_sql::{parse::logical_plan, task_history::find_task_history_metrics};
 
 #[derive(Debug, Clone)]
 pub struct TextToSqlRequest {
@@ -87,6 +87,8 @@ pub struct TextToSqlResult {
     pub question: String,
     pub generated_sql: String,
     pub expected_sql: String,
+    pub generated_logical_plan: Value,
+    pub expected_logical_plan: Value,
     pub is_error: bool,
     pub duration: Duration,
     pub sample_data_enabled: bool,
@@ -152,6 +154,28 @@ impl TextToSqlWorker {
                     .map_err(|e| {
                         anyhow::anyhow!("could not find task history metrics. Error: {e}")
                     })?;
+                let generated_sql = generated_sql.or(sql).unwrap_or_default();
+
+                // Compute Logical Plans
+                let generate_lp = logical_plan(
+                    self.http_client.clone(),
+                    self.http_base_url.clone(),
+                    &generated_sql,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("could not compute generated logical plan. Error: {e}")
+                })?;
+
+                let expected_lp = logical_plan(
+                    self.http_client.clone(),
+                    self.http_base_url.clone(),
+                    &request.expected_sql,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("could not compute generated logical plan. Error: {e}")
+                })?;
 
                 results.insert(
                     request.id.clone(),
@@ -159,6 +183,8 @@ impl TextToSqlWorker {
                         question: request.question,
                         generated_sql: generated_sql.or(sql).unwrap_or_default(),
                         expected_sql: request.expected_sql,
+                        generated_logical_plan: generate_lp,
+                        expected_logical_plan: expected_lp,
                         duration,
                         is_error,
                         query_count: task_metrics.sql_count,

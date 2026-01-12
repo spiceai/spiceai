@@ -14,21 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashSet;
-
-use datafusion::sql::sqlparser::{
-    ast::{Expr, Query, SelectItem, SetExpr, Statement, TableFactor},
-    dialect::PostgreSqlDialect,
-    parser::Parser,
-};
 use reqwest::Client;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
-pub async fn tables_and_projection(
+// Logical plan extracted from `EXPLAIN FORMAT PGJSON <sql>`.
+pub async fn logical_plan(
     http_client: Client,
     http_base_url: impl Into<String>,
     sql: &str,
-) -> Result<(Vec<String>, Vec<String>), anyhow::Error> {
+) -> Result<Value, anyhow::Error> {
     let url = format!("{}/v1/sql", http_base_url.into());
 
     let response = http_client
@@ -56,6 +51,17 @@ pub async fn tables_and_projection(
         .first()
         .and_then(|v| v.get("Plan"))
         .ok_or_else(|| anyhow::anyhow!("Failed to extract Plan from response"))?;
+
+    Ok(root_plan.clone())
+}
+
+pub async fn tables_and_projection(
+    http_client: Client,
+    http_base_url: impl Into<String>,
+    sql: &str,
+) -> Result<(Vec<String>, Vec<String>), anyhow::Error> {
+    let http_base_url = http_base_url.into();
+    let lp = logical_plan(http_client.clone(), http_base_url.clone(), sql).await?;
 
     let mut tables = HashSet::new();
     let mut projections = HashSet::new();
