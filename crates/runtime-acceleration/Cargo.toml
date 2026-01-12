@@ -16,7 +16,11 @@ aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
-duckdb = { workspace = true, optional = true }
+duckdb = { workspace = true, features = [
+    "bundled",
+    "r2d2",
+    "extensions-full",
+], optional = true }
 fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
@@ -34,7 +38,6 @@ url.workspace = true
 util = { path = "../util" }
 
 [features]
-cayenne = []
 default = []
 duckdb = ["dep:duckdb"]
 snapshots = []

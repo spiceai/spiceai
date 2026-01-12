@@ -1678,6 +1678,7 @@ mod tests {
         local_path: PathBuf,
         behavior: BootstrapOnFailureBehavior,
         schema: &SchemaRef,
+        compaction_enabled: bool,
     ) -> SnapshotManager {
         let schema_for_factory = Arc::clone(schema);
         let factory: DatasetCheckpointerFactory = Arc::new(move || {
@@ -1694,10 +1695,11 @@ mod tests {
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             local_path,
-            engine: AccelerationEngine::Sqlite,
+            engine: AccelerationEngine::DuckDB,
             object_store,
             bootstrap_failure_behavior: behavior,
             checkpointer_factory: Some(factory),
+            compaction_enabled,
         }
     }
 
@@ -1750,6 +1752,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
 
         let result = manager
@@ -1810,6 +1813,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
 
         let info = manager
@@ -1896,6 +1900,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
+            false,
         );
 
         let info = manager
@@ -1929,6 +1934,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
+            false,
         );
 
         let mutex = Arc::new(Mutex::new(()));
@@ -2027,6 +2033,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
         let factory = Arc::clone(
             manager
@@ -2090,6 +2097,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
         let factory = Arc::clone(
             manager
@@ -2153,6 +2161,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
         let factory = Arc::clone(
             manager
@@ -2223,6 +2232,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &runtime_schema,
+            false,
         );
         let factory = Arc::clone(
             manager
@@ -2250,6 +2260,7 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
 
         let uri = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/day=01/dataset=dataset/file.db");
@@ -2272,6 +2283,7 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
 
         let uri = "memory://other-prefix/path/to/file.db";
@@ -2280,5 +2292,136 @@ mod tests {
             .expect("convert uri to path");
 
         assert_eq!(path.to_string(), "snapshots/other-prefix/path/to/file.db");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn create_snapshot_with_compaction() {
+        use duckdb::Connection;
+
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.duckdb");
+
+        println!("!! local_path: {}", local_path.to_string_lossy());
+
+        // Create a fragmented DuckDB database
+        {
+            let conn = Connection::open(&local_path).expect("open duckdb");
+
+            conn.execute(
+                "CREATE TABLE test_data (id INTEGER, padding VARCHAR)",
+                [],
+            )
+                .expect("create table");
+
+            // Insert data with padding to make file size significant
+            conn.execute(
+                "INSERT INTO test_data
+                 SELECT i, REPEAT('x', 500)
+                 FROM generate_series(1, 2000000) AS t(i)",
+                [],
+            )
+                .expect("insert data");
+
+            // Delete most rows to create dead tuples (fragmentation)
+            conn.execute("DELETE FROM test_data WHERE id > 50", [])
+                .expect("delete data");
+
+            conn.execute("CHECKPOINT", []).expect("checkpoint");
+        }
+
+        let fragmented_size = std::fs::metadata(&local_path)
+            .expect("get fragmented size")
+            .len();
+
+        let schema = sample_schema();
+        let schema_for_factory = Arc::clone(&schema);
+        let factory: DatasetCheckpointerFactory = Arc::new(move || {
+            let schema = Arc::clone(&schema_for_factory);
+            Box::pin(async move {
+                Ok::<Arc<dyn DatasetCheckpointer>, _>(Arc::new(StaticSchemaCheckpointer { schema }))
+            })
+        });
+
+        let manager = SnapshotManager {
+            dataset_name: DATASET_NAME.to_string(),
+            snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
+            snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
+            local_path: local_path.clone(),
+            engine: AccelerationEngine::DuckDB,
+            object_store: store.clone(),
+            bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
+            checkpointer_factory: Some(factory),
+            compaction_enabled: true, // Enable compaction
+        };
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
+        let uploaded_path = manager
+            .create_snapshot(&schema, lock_guard)
+            .await
+            .expect("create snapshot");
+
+        // Verify snapshot was uploaded to object store
+        let stored = store
+            .get(&uploaded_path)
+            .await
+            .expect("snapshot stored")
+            .bytes()
+            .await
+            .expect("read stored snapshot");
+
+        let uploaded_size = stored.len() as u64;
+
+        // Compacted snapshot should be smaller than fragmented source
+        assert!(
+            uploaded_size < fragmented_size,
+            "compacted snapshot ({uploaded_size} bytes) should be smaller than \
+             fragmented source ({fragmented_size} bytes)"
+        );
+
+        // Verify metadata was updated correctly
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_bytes = store
+            .get(&metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let metadata: SnapshotMetadata =
+            serde_json::from_slice(&metadata_bytes).expect("parse metadata");
+
+        let dataset = metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset metadata present");
+        assert_eq!(dataset.snapshots.len(), 1);
+        assert_eq!(dataset.current_snapshot_id, Some(0));
+
+        let entry = dataset.snapshots.first().expect("snapshot entry");
+        assert_eq!(entry.snapshot_size, uploaded_size);
+        assert_eq!(entry.snapshot_checksum, compute_sha256_hex(&stored));
+        assert_eq!(
+            entry.snapshot_checksum_algorithm,
+            SNAPSHOT_CHECKSUM_ALGORITHM
+        );
+        assert_eq!(entry.snapshot, snapshot_uri(&uploaded_path));
+
+        // Verify uploaded snapshot contains valid data
+        let verify_path = temp_dir.path().join("verify.duckdb");
+        std::fs::write(&verify_path, &stored).expect("write verify file");
+
+        {
+            let conn = Connection::open(&verify_path).expect("open verify db");
+
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM test_data", [], |row| row.get(0))
+                .expect("count rows");
+
+            assert_eq!(count, 50, "compacted snapshot should have 50 rows");
+        }
     }
 }
