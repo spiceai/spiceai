@@ -25,6 +25,7 @@ pkcs8 = { version = "0.10.2", features = [
   "pem",
   "3des",
 ], optional = true }
+scylla = { workspace = true, optional = true }
 secrecy.workspace = true
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
@@ -63,6 +64,7 @@ postgres = [
   "datafusion-table-providers/postgres",
   "datafusion-table-providers/postgres-federation",
 ]
+scylladb = ["dep:scylla", "dep:async-stream"]
 snowflake = ["dep:snowflake-api", "dep:pkcs8", "dep:serde_json"]
 sqlite = [
   "datafusion-table-providers/sqlite",

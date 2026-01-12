@@ -57,6 +57,8 @@ pub mod refresh_skip;
 pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
+#[cfg(feature = "scylladb")]
+pub mod scylladb;
 
 #[cfg(feature = "sharepoint")]
 pub mod sharepoint;

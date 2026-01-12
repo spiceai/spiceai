@@ -81,6 +81,7 @@ default = [
     "iceberg-write",
     "turso",
     "smb",
+    "scylladb",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -105,6 +106,7 @@ oracle = ["runtime/oracle"]
 postgres = ["runtime/postgres"]
 postgres-write = ["runtime/postgres-write"]
 release = []
+scylladb = ["runtime/scylladb"]
 sftp = ["runtime/sftp"]
 sharepoint = ["runtime/sharepoint"]
 smb = ["runtime/smb"]
