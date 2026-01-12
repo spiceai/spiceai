@@ -13,15 +13,6 @@ limitations under the License.
 
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
-use std::{
-    collections::HashMap,
-    fmt::Write,
-    path::PathBuf,
-    str::FromStr,
-    sync::{Arc, LazyLock},
-    time::Instant,
-};
-use std::path::Path;
 use arrow_schema::{Schema, SchemaRef};
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use bytes::BytesMut;
@@ -38,6 +29,15 @@ use serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
+use std::path::Path;
+use std::{
+    collections::HashMap,
+    fmt::Write,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+    time::Instant,
+};
 use tokio::sync::OwnedMutexGuard;
 use tokio::{
     fs,
@@ -827,7 +827,7 @@ impl SnapshotManager {
     /// Prepares the file for upload, running compaction for `DuckDB`.
     async fn prepare_upload_file(
         &self,
-        source_path: &PathBuf,
+        source_path: &Path,
     ) -> Result<PathBuf, SnapshotUploadError> {
         match self.engine {
             #[cfg(feature = "duckdb")]
@@ -836,20 +836,15 @@ impl SnapshotManager {
                 self.compact_duckdb(source_path, &compacted_path).await?;
                 Ok(compacted_path)
             }
-            _ => Ok(source_path.clone()),
+            _ => Ok(source_path.to_path_buf()),
         }
     }
 
     /// Compacts a `DuckDB` database using COPY FROM DATABASE.
     #[cfg(feature = "duckdb")]
-    async fn compact_duckdb(
-        &self,
-        source: &Path,
-        dest: &Path,
-    ) -> Result<(), SnapshotUploadError> {
+    async fn compact_duckdb(&self, source: &Path, dest: &Path) -> Result<(), SnapshotUploadError> {
         let source = source.to_path_buf();
         let dest = dest.to_path_buf();
-        let dest_for_metrics = dest.clone();
         let dataset_name = self.dataset_name.clone();
 
         tokio::task::spawn_blocking(move || {
