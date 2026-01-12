@@ -15,11 +15,17 @@ limitations under the License.
 */
 
 use std::sync::LazyLock;
-
+use async_graphql::InputType;
 use opentelemetry::{
     global,
     metrics::{Counter, Gauge, Histogram, Meter},
 };
+
+pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
+    0.0, 100.0, 250.0, 500.0, 750.0,
+    1000.0, 2500.0, 5000.0, 7500.0, 10000.0,
+    25000.0, 50000.0, 100000.0, 250000.0, 500000.0
+];
 
 pub const METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS: &str =
     "dataset_acceleration_max_timestamp_before_refresh_ms";
@@ -58,11 +64,7 @@ pub(crate) static REFRESH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(
         .f64_histogram("dataset_acceleration_refresh_duration_ms")
         .with_description("Duration in milliseconds to load a full or appended refresh data.")
         .with_unit("ms")
-        .with_boundaries(vec![
-            0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0,
-            1000.0, 2500.0, 5000.0, 7500.0, 10000.0,
-            25000.0, 50000.0, 100000.0, 250000.0, 500000.0
-        ])
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 
