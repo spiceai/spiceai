@@ -165,8 +165,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
 
       - name: Set up make
         if: matrix.target.target_os == 'linux'

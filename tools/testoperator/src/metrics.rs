@@ -188,16 +188,7 @@ pub static SCORE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
 });
 
 // Text to Sql specific metrics
-
-pub static AVERAGE_TEXT_TO_SQL_ATTEMPTS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
-    METER
-        .f64_gauge("text_to_sql_attempts")
-        .with_description(
-            "The average number of internal SQL queries performed to perform a text-to-SQL",
-        )
-        .with_unit("queries")
-        .build()
-});
+// Aggregate Text to Sql specific metrics (run-level)
 pub static TEXT_TO_SQL_EXACT_MATCH_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("text_to_sql_exact_match_rate")
@@ -212,6 +203,134 @@ pub static TEXT_TO_SQL_ERROR_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .f64_gauge("text_to_sql_error_rate")
         .with_description("The rate at which a text-to-SQL operation returns an error externally")
         .with_unit("ratio")
+        .build()
+});
+pub static TEXT_TO_SQL_MEAN_SQL_QUERY_COUNT: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_mean_sql_query_count")
+        .with_description("Mean number of sql_query operations per text-to-SQL request")
+        .with_unit("queries")
+        .build()
+});
+pub static TEXT_TO_SQL_MEAN_LLM_INPUT_TOKENS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_mean_llm_input_tokens")
+        .with_description("Mean LLM input tokens per text-to-SQL request")
+        .with_unit("tokens")
+        .build()
+});
+pub static TEXT_TO_SQL_MEAN_LLM_OUTPUT_TOKENS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_mean_llm_output_tokens")
+        .with_description("Mean LLM output tokens per text-to-SQL request")
+        .with_unit("tokens")
+        .build()
+});
+
+// Individual Text to Sql specific metrics (operation-level)
+pub static TEXT_TO_SQL_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_latency_ms")
+        .with_description("Client-side text-to-SQL HTTP duration")
+        .with_unit("ms")
+        .build()
+});
+
+pub static TEXT_TO_SQL_SQL_DURATION: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_sql_duration_ms")
+        .with_description("Summation of sql_query operation durations within text-to-SQL operation")
+        .with_unit("ms")
+        .build()
+});
+
+pub static TEXT_TO_SQL_SQL_QUERY_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("text_to_sql_sql_query_count")
+        .with_description("Number of sql_query operations within text-to-SQL operation")
+        .with_unit("queries")
+        .build()
+});
+
+pub static TEXT_TO_SQL_LLM_DURATION: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_llm_duration_ms")
+        .with_description(
+            "Summation of ai_completion operation durations within text-to-SQL operation",
+        )
+        .with_unit("ms")
+        .build()
+});
+
+pub static TEXT_TO_SQL_LLM_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("text_to_sql_llm_count")
+        .with_description("Number of ai_completion operations within text-to-SQL operation")
+        .with_unit("completions")
+        .build()
+});
+
+pub static TEXT_TO_SQL_LLM_INPUT_TOKENS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("text_to_sql_llm_input_tokens")
+        .with_description("Summation of input tokens used across all ai_completion operations within text-to-SQL operation")
+        .with_unit("tokens")
+        .build()
+});
+
+pub static TEXT_TO_SQL_LLM_OUTPUT_TOKENS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("text_to_sql_llm_output_tokens")
+        .with_description("Summation of output tokens used across all ai_completion operations within text-to-SQL operation")
+        .with_unit("tokens")
+        .build()
+});
+
+pub static TEXT_TO_SQL_EXACT_MATCH: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("text_to_sql_exact_match")
+        .with_description("the produced SQL matches the expected (string equality)")
+        .with_unit("1")
+        .build()
+});
+
+pub static TEXT_TO_SQL_EXACT_LOGICAL_PLAN_MATCH: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("text_to_sql_exact_logical_plan_match")
+        .with_description("the produced logical plan matches that derived from the expected SQL")
+        .with_unit("1")
+        .build()
+});
+
+pub static TEXT_TO_SQL_ERROR: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("text_to_sql_error")
+        .with_description("the text-to-SQL operation returned an HTTP error")
+        .with_unit("1")
+        .build()
+});
+
+pub static TEXT_TO_SQL_CORRECT_TABLES: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_correct_tables")
+        .with_description("Jaccard similarity of tables scanned in the expected and produced SQL")
+        .with_unit("1")
+        .build()
+});
+
+pub static TEXT_TO_SQL_CORRECT_TABLE_PROJECTIONS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_correct_table_projections")
+        .with_description("Jaccard similarity of the table-qualified column names requested for each table from expected and produced SQL")
+        .with_unit("1")
+        .build()
+});
+
+pub static TEXT_TO_SQL_CORRECT_OUTPUT_SCHEMA: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_correct_output_schema")
+        .with_description("Jaccard similarity of the fields from the output SQL schema from expected and produced SQL")
+        .with_unit("1")
         .build()
 });
 
