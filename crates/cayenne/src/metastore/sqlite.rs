@@ -26,8 +26,7 @@ use super::{
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::OnceCell;
 
 /// `SQLite`-based metastore backend with a persistent connection.
 ///
@@ -35,8 +34,9 @@ use tokio::sync::Mutex;
 /// eliminating the overhead of opening/closing connections for each operation.
 pub struct SqliteMetastore {
     connection_string: String,
-    /// Cached connection - lazily initialized on first use
-    conn: Arc<Mutex<Option<tokio_rusqlite::Connection>>>,
+    /// Cached connection - lazily initialized on first use via `OnceCell`
+    /// ensuring exactly one connection is created even under concurrent access.
+    conn: OnceCell<tokio_rusqlite::Connection>,
 }
 
 impl std::fmt::Debug for SqliteMetastore {
@@ -53,7 +53,7 @@ impl SqliteMetastore {
     pub fn new(connection_string: impl Into<String>) -> Self {
         Self {
             connection_string: connection_string.into(),
-            conn: Arc::new(Mutex::new(None)),
+            conn: OnceCell::new(),
         }
     }
 
@@ -73,73 +73,63 @@ impl SqliteMetastore {
     /// - Memory cache and temp storage for performance
     /// - Foreign keys enabled
     ///
-    /// Uses double-checked locking to avoid holding the mutex across `.await` points.
+    /// Uses `OnceCell` to ensure the connection is created exactly once,
+    /// even when multiple tasks call this method concurrently.
     async fn get_conn(&self) -> CatalogResult<tokio_rusqlite::Connection> {
-        // First check: try to get existing connection without holding lock across await
-        {
-            let conn_guard = self.conn.lock().await;
-            if let Some(conn) = conn_guard.as_ref() {
-                return Ok(conn.clone());
-            }
-        } // Lock dropped here before any async operations
-
-        // Create parent directory if it doesn't exist
-        let db_path = self.db_path();
-        let db_dir =
-            Path::new(db_path)
-                .parent()
-                .ok_or_else(|| CatalogError::InvalidDatabasePath {
-                    path: db_path.to_string(),
+        self.conn
+            .get_or_try_init(|| async {
+                // Create parent directory if it doesn't exist
+                let db_path = self.db_path();
+                let db_dir = Path::new(db_path).parent().ok_or_else(|| {
+                    CatalogError::InvalidDatabasePath {
+                        path: db_path.to_string(),
+                    }
                 })?;
 
-        if !db_dir.exists() {
-            tokio::fs::create_dir_all(db_dir).await?;
-        }
+                if !db_dir.exists() {
+                    tokio::fs::create_dir_all(db_dir).await?;
+                }
 
-        // Open connection with tokio-rusqlite (no lock held)
-        let conn = tokio_rusqlite::Connection::open(db_path)
+                // Open connection with tokio-rusqlite
+                let conn = tokio_rusqlite::Connection::open(db_path)
+                    .await
+                    .map_err(|e| CatalogError::Database {
+                        message: format!("Failed to open SQLite database: {e}"),
+                    })?;
+
+                // Configure pragmas for performance
+                conn.call(|conn| {
+                    // Enable WAL mode for better concurrent access
+                    conn.pragma_update(None, "journal_mode", "WAL")?;
+
+                    // SQLite will wait 5 seconds to obtain a lock before returning SQLITE_BUSY errors
+                    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
+                    // NORMAL synchronous mode is safe with WAL and more performant than FULL
+                    conn.pragma_update(None, "synchronous", "NORMAL")?;
+
+                    // 32MB cache size (negative number means kilobytes)
+                    conn.pragma_update(None, "cache_size", -32000)?;
+
+                    // Enable foreign keys (disabled by default for historical reasons)
+                    conn.pragma_update(None, "foreign_keys", true)?;
+
+                    // Store temporary tables in memory for better performance
+                    conn.pragma_update(None, "temp_store", "memory")?;
+
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .await
+                .map_err(
+                    |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                        message: format!("Failed to configure SQLite pragmas: {e}"),
+                    },
+                )?;
+
+                Ok(conn)
+            })
             .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to open SQLite database: {e}"),
-            })?;
-
-        // Configure pragmas for performance (no lock held)
-        conn.call(|conn| {
-            // Enable WAL mode for better concurrent access
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-
-            // SQLite will wait 5 seconds to obtain a lock before returning SQLITE_BUSY errors
-            conn.busy_timeout(std::time::Duration::from_secs(5))?;
-
-            // NORMAL synchronous mode is safe with WAL and more performant than FULL
-            conn.pragma_update(None, "synchronous", "NORMAL")?;
-
-            // 32MB cache size (negative number means kilobytes)
-            conn.pragma_update(None, "cache_size", -32000)?;
-
-            // Enable foreign keys (disabled by default for historical reasons)
-            conn.pragma_update(None, "foreign_keys", true)?;
-
-            // Store temporary tables in memory for better performance
-            conn.pragma_update(None, "temp_store", "memory")?;
-
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to configure SQLite pragmas: {e}"),
-            },
-        )?;
-
-        // Second check: re-acquire lock and store connection (or use existing if another task created one)
-        let mut conn_guard = self.conn.lock().await;
-        if let Some(existing_conn) = conn_guard.as_ref() {
-            // Another task initialized the connection while we were setting up
-            return Ok(existing_conn.clone());
-        }
-        *conn_guard = Some(conn.clone());
-        Ok(conn)
+            .cloned()
     }
 
     /// Schema for the `cayenne_table` table.
@@ -409,33 +399,36 @@ impl MetastoreBackend for SqliteMetastore {
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
 
-        conn.call(move |conn| {
-            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
-                .iter()
-                .map(|v| v as &dyn rusqlite::ToSql)
-                .collect();
+        // Execute query and extract row values inside the closure
+        let row_values = conn
+            .call(move |conn| {
+                let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
+                    .iter()
+                    .map(|v| v as &dyn rusqlite::ToSql)
+                    .collect();
 
-            let row_values = conn.query_row(&sql, params_refs.as_slice(), |row| {
-                let column_count = row.as_ref().column_count();
-                let mut values = Vec::with_capacity(column_count);
+                conn.query_row(&sql, params_refs.as_slice(), |row| {
+                    let column_count = row.as_ref().column_count();
+                    let mut values = Vec::with_capacity(column_count);
 
-                for i in 0..column_count {
-                    let value = row.get_ref(i)?;
-                    values.push(convert_sqlite_value(value));
-                }
+                    for i in 0..column_count {
+                        let value = row.get_ref(i)?;
+                        values.push(convert_sqlite_value(value));
+                    }
 
-                Ok(values)
-            })?;
+                    Ok(values)
+                })
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to query row: {e}"),
+                },
+            )?;
 
-            let sqlite_row = SqliteRow { values: row_values };
-            f(&sqlite_row).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-        })
-        .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to query row: {e}"),
-            },
-        )
+        // Apply the callback outside the rusqlite closure to preserve CatalogError
+        let sqlite_row = SqliteRow { values: row_values };
+        f(&sqlite_row)
     }
 
     async fn query<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>>
@@ -448,51 +441,54 @@ impl MetastoreBackend for SqliteMetastore {
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
 
-        conn.call(move |conn| {
-            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
-                .iter()
-                .map(|v| v as &dyn rusqlite::ToSql)
-                .collect();
+        // Execute query and collect all row values inside the closure
+        let all_row_values = conn
+            .call(move |conn| {
+                let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
+                    .iter()
+                    .map(|v| v as &dyn rusqlite::ToSql)
+                    .collect();
 
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                let column_count = row.as_ref().column_count();
-                let mut values = Vec::with_capacity(column_count);
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_refs.as_slice(), |row| {
+                    let column_count = row.as_ref().column_count();
+                    let mut values = Vec::with_capacity(column_count);
 
-                for i in 0..column_count {
-                    let value = row.get_ref(i)?;
-                    values.push(convert_sqlite_value(value));
+                    for i in 0..column_count {
+                        let value = row.get_ref(i)?;
+                        values.push(convert_sqlite_value(value));
+                    }
+
+                    Ok(values)
+                })?;
+
+                let mut collected_rows = Vec::new();
+                for row_result in rows {
+                    collected_rows.push(row_result?);
                 }
 
-                Ok(SqliteRow { values })
-            })?;
+                Ok::<Vec<Vec<MetastoreValue>>, rusqlite::Error>(collected_rows)
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to query rows: {e}"),
+                },
+            )?;
 
-            let mut results = Vec::new();
-            for row_result in rows {
-                let row = row_result?;
-                results.push(
-                    f(&row).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                );
-            }
+        // Apply the callback outside the rusqlite closure to preserve CatalogError
+        let mut results = Vec::with_capacity(all_row_values.len());
+        for row_values in all_row_values {
+            let sqlite_row = SqliteRow { values: row_values };
+            results.push(f(&sqlite_row)?);
+        }
 
-            Ok::<Vec<T>, rusqlite::Error>(results)
-        })
-        .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to query rows: {e}"),
-            },
-        )
+        Ok(results)
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
-        // Clone the connection before dropping the lock to avoid holding it across await
-        let conn = {
-            let conn_guard = self.conn.lock().await;
-            conn_guard.clone()
-        };
-
-        if let Some(conn) = conn.as_ref() {
+        // Get the existing connection if it was initialized
+        if let Some(conn) = self.conn.get() {
             conn.call(|conn| {
                 // Check if WAL mode is enabled
                 let journal_mode: String =
