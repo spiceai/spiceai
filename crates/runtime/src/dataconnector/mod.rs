@@ -177,6 +177,8 @@ pub mod parameters;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
+#[cfg(feature = "scylladb")]
+pub mod scylladb;
 #[cfg(feature = "ftp")]
 pub mod sftp;
 #[cfg(feature = "sharepoint")]
