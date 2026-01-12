@@ -73,12 +73,14 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'darwin'
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
@@ -114,9 +116,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -165,9 +169,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -255,9 +261,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -302,9 +310,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -345,9 +355,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -378,9 +390,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -411,7 +425,7 @@ jobs:
 
   build-linux:
     name: Build Test Binary (Linux)
-    runs-on: 'spiceai-dev-runners'
+    runs-on: 'spicehq-dev-runners'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -420,15 +434,17 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
@@ -454,15 +470,17 @@ jobs:
   test-search:
     name: Test Search
     needs: build-linux
-    runs-on: 'spiceai-dev-runners'
+    runs-on: 'spicehq-dev-runners'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
