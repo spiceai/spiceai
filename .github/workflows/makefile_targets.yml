@@ -31,8 +31,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: "linux"
 
       - name: Set up make
         uses: ./.github/actions/setup-make

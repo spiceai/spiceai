@@ -1,0 +1,62 @@
+version: v1
+kind: Spicepod
+name: dynamodb-scylladb-alternator-federated
+
+# This spicepod demonstrates using the DynamoDB connector with ScyllaDB Alternator.
+# ScyllaDB's Alternator is a DynamoDB-compatible API that allows applications
+# written for DynamoDB to run unmodified against ScyllaDB.
+#
+# Requirements:
+# - ScyllaDB with Alternator enabled (default port 8000)
+# - Set alternator_port and alternator_write_isolation in scylla.yaml
+#
+# See: https://opensource.docs.scylladb.com/stable/alternator/alternator.html
+
+# Define common anchors
+definitions:
+  # Common ScyllaDB Alternator parameters
+  - &scylladb_alternator_params # Use a dummy region (required by AWS SDK but not used by Alternator)
+    dynamodb_aws_region: us-east-1
+    # Alternator doesn't require AWS credentials by default
+    # Set aws_auth to 'key' with dummy values or configure Alternator auth
+    dynamodb_aws_auth: key
+    dynamodb_aws_access_key_id: ${env:SCYLLADB_ALTERNATOR_ACCESS_KEY_ID}
+    dynamodb_aws_secret_access_key: ${env:SCYLLADB_ALTERNATOR_SECRET_ACCESS_KEY}
+    # Point to ScyllaDB Alternator endpoint (default port 8000)
+    # Set SCYLLADB_ALTERNATOR_ENDPOINT=http://localhost:8000 in your environment
+    endpoint_url: ${env:SCYLLADB_ALTERNATOR_ENDPOINT}
+    # Disable parallel segment scanning for ScyllaDB Alternator compatibility
+    scan_segments: "1"
+
+datasets:
+  - from: dynamodb:tpch_customer
+    name: customer
+    params: *scylladb_alternator_params
+
+  - from: dynamodb:tpch_lineitem
+    name: lineitem
+    params: *scylladb_alternator_params
+
+  - from: dynamodb:tpch_nation
+    name: nation
+    params: *scylladb_alternator_params
+
+  - from: dynamodb:tpch_orders
+    name: orders
+    params: *scylladb_alternator_params
+
+  - from: dynamodb:tpch_part
+    name: part
+    params: *scylladb_alternator_params
+
+  - from: dynamodb:tpch_partsupp
+    name: partsupp
+    params: *scylladb_alternator_params
+
+  - from: dynamodb:tpch_region
+    name: region
+    params: *scylladb_alternator_params
+
+  - from: dynamodb:tpch_supplier
+    name: supplier
+    params: *scylladb_alternator_params
