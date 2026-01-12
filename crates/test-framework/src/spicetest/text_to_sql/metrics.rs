@@ -24,12 +24,32 @@ use arrow::{
 };
 
 pub struct TextToSqlMetric {
+    pub question: String,
     pub generated_sql: String,
     pub expected_sql: String,
-    pub number_of_attempts: usize,
     pub sample_data_enabled: bool,
     pub return_sql: bool,
     pub is_error: bool,
+
+    // Non-functional metrics
+    pub latency_ms: f64,
+    pub sql_duration_ms: f64,
+    pub sql_query_count: usize,
+    pub llm_duration_ms: f64,
+    pub llm_count: usize,
+    pub llm_input_tokens: u64,
+    pub llm_output_tokens: u64,
+
+    // Functional metrics
+    pub exact_match: u64,
+    // TODO: Requires LogicalPlan/AST parsing
+    pub exact_logical_plan_match: u64,
+    // TODO: Requires LogicalPlan/AST parsing
+    pub correct_tables: f64,
+    // TODO: Requires LogicalPlan/AST parsing
+    pub correct_table_projections: f64,
+    // TODO: Requires LogicalPlan/AST parsing
+    pub correct_output_schema: f64,
 }
 
 impl ExtendedMetrics for TextToSqlMetric {
@@ -37,9 +57,23 @@ impl ExtendedMetrics for TextToSqlMetric {
         vec![
             Field::new("generated_sql", DataType::Utf8, false),
             Field::new("expected_sql", DataType::Utf8, false),
-            Field::new("number_of_attempts", DataType::UInt64, false),
+            Field::new("sql_query_count", DataType::UInt64, false),
             Field::new("sample_data_enabled", DataType::Utf8, false),
             Field::new("return_sql", DataType::Utf8, false),
+            Field::new("is_error", DataType::Utf8, false),
+            // Non-functional metrics
+            Field::new("latency_ms", DataType::Float64, false),
+            Field::new("sql_duration_ms", DataType::Float64, false),
+            Field::new("llm_duration_ms", DataType::Float64, false),
+            Field::new("llm_count", DataType::UInt64, false),
+            Field::new("llm_input_tokens", DataType::UInt64, false),
+            Field::new("llm_output_tokens", DataType::UInt64, false),
+            // Functional metrics
+            Field::new("exact_match", DataType::UInt64, false),
+            Field::new("exact_logical_plan_match", DataType::UInt64, false),
+            Field::new("correct_tables", DataType::Float64, false),
+            Field::new("correct_table_projections", DataType::Float64, false),
+            Field::new("correct_output_schema", DataType::Float64, false),
         ]
     }
 
@@ -54,7 +88,7 @@ impl ExtendedMetrics for TextToSqlMetric {
                 Builder::String(StringBuilder::new()),
             ),
             (
-                "number_of_attempts".to_string(),
+                "sql_query_count".to_string(),
                 Builder::UInt64(UInt64Builder::new()),
             ),
             (
@@ -65,6 +99,60 @@ impl ExtendedMetrics for TextToSqlMetric {
                 "return_sql".to_string(),
                 Builder::String(StringBuilder::new()),
             ),
+            (
+                "is_error".to_string(),
+                Builder::String(StringBuilder::new()),
+            ),
+            // Non-functional metrics
+            (
+                "latency_ms".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "sql_duration_ms".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "llm_duration_ms".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "llm_count".to_string(),
+                Builder::UInt64(UInt64Builder::new()),
+            ),
+            (
+                "sql_query_count".to_string(),
+                Builder::UInt64(UInt64Builder::new()),
+            ),
+            (
+                "llm_input_tokens".to_string(),
+                Builder::UInt64(UInt64Builder::new()),
+            ),
+            (
+                "llm_output_tokens".to_string(),
+                Builder::UInt64(UInt64Builder::new()),
+            ),
+            // Functional metrics
+            (
+                "exact_match".to_string(),
+                Builder::UInt64(UInt64Builder::new()),
+            ),
+            (
+                "exact_logical_plan_match".to_string(),
+                Builder::UInt64(UInt64Builder::new()),
+            ),
+            (
+                "correct_tables".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "correct_table_projections".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "correct_output_schema".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
         ])
     }
 
@@ -72,36 +160,79 @@ impl ExtendedMetrics for TextToSqlMetric {
         Ok(vec![
             BuilderTarget::String(("generated_sql".to_string(), self.generated_sql.clone())),
             BuilderTarget::String(("expected_sql".to_string(), self.expected_sql.clone())),
-            BuilderTarget::UInt64((
-                "number_of_attempts".to_string(),
-                self.number_of_attempts as u64,
-            )),
+            BuilderTarget::UInt64(("sql_query_count".to_string(), self.sql_query_count as u64)),
             BuilderTarget::String((
                 "sample_data_enabled".to_string(),
                 self.sample_data_enabled.to_string(),
             )),
             BuilderTarget::String(("return_sql".to_string(), self.return_sql.to_string())),
+            BuilderTarget::String(("is_error".to_string(), self.is_error.to_string())),
+            // Non-functional metrics
+            BuilderTarget::Float64(("latency_ms".to_string(), self.latency_ms)),
+            BuilderTarget::Float64(("sql_duration_ms".to_string(), self.sql_duration_ms)),
+            BuilderTarget::Float64(("llm_duration_ms".to_string(), self.llm_duration_ms)),
+            BuilderTarget::UInt64(("llm_count".to_string(), self.llm_count as u64)),
+            BuilderTarget::UInt64(("llm_input_tokens".to_string(), self.llm_input_tokens)),
+            BuilderTarget::UInt64(("llm_output_tokens".to_string(), self.llm_output_tokens)),
+            // Functional metrics
+            BuilderTarget::UInt64(("exact_match".to_string(), self.exact_match)),
+            BuilderTarget::UInt64((
+                "exact_logical_plan_match".to_string(),
+                self.exact_logical_plan_match,
+            )),
+            BuilderTarget::Float64(("correct_tables".to_string(), self.correct_tables)),
+            BuilderTarget::Float64((
+                "correct_table_projections".to_string(),
+                self.correct_table_projections,
+            )),
+            BuilderTarget::Float64((
+                "correct_output_schema".to_string(),
+                self.correct_output_schema,
+            )),
         ])
     }
 }
 
 impl TextToSqlMetric {
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
+        question: String,
         generated_sql: String,
         expected_sql: String,
-        number_of_attempts: usize,
+        sql_query_count: usize,
         sample_data_enabled: bool,
         return_sql: bool,
         is_error: bool,
+        latency_ms: f64,
+        sql_duration_ms: f64,
+        llm_duration_ms: f64,
+        llm_count: usize,
+        llm_input_tokens: u64,
+        llm_output_tokens: u64,
     ) -> Self {
+        let exact_match = (generated_sql.trim() == expected_sql.trim()).into();
+
         Self {
+            question,
             generated_sql,
             expected_sql,
-            number_of_attempts,
+            sql_query_count,
             sample_data_enabled,
             return_sql,
             is_error,
+            latency_ms,
+            sql_duration_ms,
+            llm_duration_ms,
+            llm_count,
+            llm_input_tokens,
+            llm_output_tokens,
+            exact_match,
+            // TODO: Requires LogicalPlan/AST parsing
+            exact_logical_plan_match: 0,
+            correct_tables: 0.0,
+            correct_table_projections: 0.0,
+            correct_output_schema: 0.0,
         }
     }
 }
@@ -109,9 +240,18 @@ impl TextToSqlMetric {
 pub struct TextToSqlRunMetric {
     pub p95_latency_ms: f64,
     pub median_latency_ms: f64,
-    pub avg_attempts: f64,
     pub exact_match_rate: f64,
     pub error_rate: f64,
+
+    // New aggregate metrics
+    pub mean_sql_query_count: f64,
+    pub mean_llm_input_tokens: f64,
+    pub mean_llm_output_tokens: f64,
+    // TODO: Requires LogicalPlan/AST parsing
+    pub exact_logical_plan_match_rate: f64,
+    pub mean_correct_tables: f64,
+    pub mean_correct_table_projections: f64,
+    pub mean_correct_output_schema: f64,
 }
 
 impl ExtendedMetrics for TextToSqlRunMetric {
@@ -119,9 +259,15 @@ impl ExtendedMetrics for TextToSqlRunMetric {
         vec![
             Field::new("p95_latency_ms", DataType::Float64, false),
             Field::new("median_latency_ms", DataType::Float64, false),
-            Field::new("avg_attempts", DataType::Float64, false),
             Field::new("exact_match_rate", DataType::Float64, false),
             Field::new("error_rate", DataType::Float64, false),
+            Field::new("mean_sql_query_count", DataType::Float64, false),
+            Field::new("mean_llm_input_tokens", DataType::Float64, false),
+            Field::new("mean_llm_output_tokens", DataType::Float64, false),
+            Field::new("exact_logical_plan_match_rate", DataType::Float64, false),
+            Field::new("mean_correct_tables", DataType::Float64, false),
+            Field::new("mean_correct_table_projections", DataType::Float64, false),
+            Field::new("mean_correct_output_schema", DataType::Float64, false),
         ]
     }
 
@@ -136,15 +282,39 @@ impl ExtendedMetrics for TextToSqlRunMetric {
                 Builder::Float64(Float64Builder::new()),
             ),
             (
-                "avg_attempts".to_string(),
-                Builder::Float64(Float64Builder::new()),
-            ),
-            (
                 "exact_match_rate".to_string(),
                 Builder::Float64(Float64Builder::new()),
             ),
             (
                 "error_rate".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "mean_sql_query_count".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "mean_llm_input_tokens".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "mean_llm_output_tokens".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "exact_logical_plan_match_rate".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "mean_correct_tables".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "mean_correct_table_projections".to_string(),
+                Builder::Float64(Float64Builder::new()),
+            ),
+            (
+                "mean_correct_output_schema".to_string(),
                 Builder::Float64(Float64Builder::new()),
             ),
         ])
@@ -154,9 +324,33 @@ impl ExtendedMetrics for TextToSqlRunMetric {
         Ok(vec![
             BuilderTarget::Float64(("p95_latency_ms".to_string(), self.p95_latency_ms)),
             BuilderTarget::Float64(("median_latency_ms".to_string(), self.median_latency_ms)),
-            BuilderTarget::Float64(("avg_attempts".to_string(), self.avg_attempts)),
             BuilderTarget::Float64(("exact_match_rate".to_string(), self.exact_match_rate)),
             BuilderTarget::Float64(("error_rate".to_string(), self.error_rate)),
+            BuilderTarget::Float64((
+                "mean_sql_query_count".to_string(),
+                self.mean_sql_query_count,
+            )),
+            BuilderTarget::Float64((
+                "mean_llm_input_tokens".to_string(),
+                self.mean_llm_input_tokens,
+            )),
+            BuilderTarget::Float64((
+                "mean_llm_output_tokens".to_string(),
+                self.mean_llm_output_tokens,
+            )),
+            BuilderTarget::Float64((
+                "exact_logical_plan_match_rate".to_string(),
+                self.exact_logical_plan_match_rate,
+            )),
+            BuilderTarget::Float64(("mean_correct_tables".to_string(), self.mean_correct_tables)),
+            BuilderTarget::Float64((
+                "mean_correct_table_projections".to_string(),
+                self.mean_correct_table_projections,
+            )),
+            BuilderTarget::Float64((
+                "mean_correct_output_schema".to_string(),
+                self.mean_correct_output_schema,
+            )),
         ])
     }
 }
@@ -166,16 +360,25 @@ impl TextToSqlRunMetric {
     pub fn new(
         p95_latency_ms: f64,
         median_latency_ms: f64,
-        avg_attempts: f64,
         exact_match_rate: f64,
         error_rate: f64,
+        mean_sql_query_count: f64,
+        mean_llm_input_tokens: f64,
+        mean_llm_output_tokens: f64,
     ) -> Self {
         Self {
             p95_latency_ms,
             median_latency_ms,
-            avg_attempts,
             exact_match_rate,
             error_rate,
+            mean_sql_query_count,
+            mean_llm_input_tokens,
+            mean_llm_output_tokens,
+            // TODO: Requires LogicalPlan/AST parsing
+            exact_logical_plan_match_rate: 0.0,
+            mean_correct_tables: 0.0,
+            mean_correct_table_projections: 0.0,
+            mean_correct_output_schema: 0.0,
         }
     }
 }

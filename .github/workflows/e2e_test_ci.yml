@@ -71,7 +71,7 @@ jobs:
               {
                 name: "Linux x64",
                 builder: "spiceai-dev-runners",
-                runner: "ubuntu-22.04",
+                runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
@@ -93,7 +93,7 @@ jobs:
     runs-on: ${{ matrix.target.builder }}
     needs: setup-matrix
     env:
-      GOVER: 1.25.5
+      GOVER: 1.25.3
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
 
@@ -126,8 +126,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
 
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
@@ -176,77 +174,6 @@ jobs:
         if: matrix.target.target_os != 'windows'
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: |
-            spice
-            spiced
-
-  build-macos-pr:
-    name: Build macOS aarch64 binaries (PR)
-    runs-on: spiceai-macos
-    if: github.event_name == 'pull_request'
-    needs: setup-matrix
-    env:
-      GOVER: 1.25.5
-      GOOS: darwin
-      GOARCH: arm64
-
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 1
-
-      - name: Configure Cargo directories (self-hosted macOS)
-        run: |
-          set -euo pipefail
-          cargo_home="${{ runner.temp }}/cargo-${{ github.run_id }}-${{ github.job }}"
-          mkdir -p "$cargo_home/bin"
-          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
-
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      - name: Set up Go
-        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
-        with:
-          go-version: ${{ env.GOVER }}
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: darwin
-
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/trunk' }}
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build spiced (macOS)
-        env:
-          MISTRALRS_METAL_PRECOMPILE: 0
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,metal"
-
-      - name: Build spice
-        run: make -C bin/spice
-
-      - name: make spiced executable
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: make spice executable
-        run: |
-          mv target/release/spice spice
-          chmod +x spice
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
-        with:
-          name: build_darwin_aarch64
           path: |
             spice
             spiced

@@ -2,21 +2,21 @@ name: Installs the make tool
 description: 'composite action'
 inputs:
   os:
-    description: 'Operating system to install make for (deprecated - auto-detected)'
-    default: '' # Auto-detect from runner.os
+    description: 'Operating system to install make for'
+    default: 'linux' # 'linux', 'windows','macos'
 
 runs:
   using: 'composite'
   steps:
     - name: Install make (Linux)
-      if: runner.os == 'Linux'
+      if: inputs.os == 'linux'
       shell: bash
       run: |
         sudo apt-get update
         sudo apt-get install -y make
 
     - name: Install make (Windows)
-      if: runner.os == 'Windows'
+      if: inputs.os == 'windows'
       shell: pwsh
       run: |
         # use choco to install make
@@ -27,7 +27,7 @@ runs:
         choco install make -y
 
     - name: Install make (macOS)
-      if: runner.os == 'macOS'
+      if: inputs.os == 'macos'
       shell: bash
       run: |
         # Check if make is already installed
