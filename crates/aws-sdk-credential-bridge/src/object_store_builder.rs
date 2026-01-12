@@ -377,8 +377,8 @@ async fn apply_sdk_credentials(mut builder: AmazonS3Builder) -> Result<AmazonS3B
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_builder_from_url() {
+    #[tokio::test]
+    async fn test_builder_from_url() {
         let url = Url::parse("s3://my-bucket/path/to/data").expect("valid url");
         let builder =
             S3ObjectStoreBuilder::from_url(&url, Handle::current()).expect("should create builder");
@@ -386,8 +386,8 @@ mod tests {
         assert_eq!(builder.bucket_name, "my-bucket");
     }
 
-    #[test]
-    fn test_builder_from_url_with_params() {
+    #[tokio::test]
+    async fn test_builder_from_url_with_params() {
         let url =
             Url::parse("s3://my-bucket/path#region=us-west-2&client_timeout=30s&allow_http=true")
                 .expect("valid url");
@@ -400,8 +400,8 @@ mod tests {
         assert_eq!(builder.allow_http, Some(true));
     }
 
-    #[test]
-    fn test_builder_with_s3_prefixed_params() {
+    #[tokio::test]
+    async fn test_builder_with_s3_prefixed_params() {
         let url =
             Url::parse("s3://my-bucket/path#s3_region=eu-west-1&s3_endpoint=http://localhost:9000")
                 .expect("valid url");
@@ -412,15 +412,15 @@ mod tests {
         assert_eq!(builder.endpoint, Some("http://localhost:9000".to_string()));
     }
 
-    #[test]
-    fn test_builder_missing_bucket() {
+    #[tokio::test]
+    async fn test_builder_missing_bucket() {
         let url = Url::parse("s3:///path/to/data").expect("valid url");
         let result = S3ObjectStoreBuilder::from_url(&url, Handle::current());
         let _ = result.expect_err("should fail with missing bucket");
     }
 
-    #[test]
-    fn test_builder_fluent_api() {
+    #[tokio::test]
+    async fn test_builder_fluent_api() {
         let url = Url::parse("s3://my-bucket/path").expect("valid url");
         let builder = S3ObjectStoreBuilder::from_url(&url, Handle::current())
             .expect("should create builder")
