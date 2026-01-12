@@ -458,6 +458,8 @@ pub struct ResolvedClusterConfig {
     scheduler_url: Option<String>,
     /// Resolved scheduler address URL (with scheme inferred if omitted).
     scheduler_address_url: Option<Url>,
+    /// Advertise address with port stripped (if present in the original input).
+    node_advertise_host: Option<String>,
 }
 
 impl ResolvedClusterConfig {
@@ -523,9 +525,9 @@ impl ResolvedClusterConfig {
 
         // Pre-compute scheduler URL from advertise address
         let bind_port = config.node_bind_address.port();
-        let scheduler_url = config.node_advertise_address.as_ref().map(|addr| {
+        let node_advertise_host = config.node_advertise_address.as_ref().map(|addr| {
             // Extract just the host, ignoring any port - always use bind_port
-            let host = if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+            if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
                 // Full socket address - strip the port with deprecation warning
                 tracing::warn!("Port in --node-advertise-address will be ignored. Using port {bind_port} from --node-bind-address.");
                 socket_addr.ip().to_string()
@@ -541,9 +543,11 @@ impl ResolvedClusterConfig {
             } else {
                 // No colon - just a hostname
                 addr.clone()
-            };
-            format!("{inferred_scheme}://{host}:{bind_port}")
+            }
         });
+        let scheduler_url = node_advertise_host
+            .as_ref()
+            .map(|host| format!("{inferred_scheme}://{host}:{bind_port}"));
 
         // Resolve scheduler address URL, inferring scheme if omitted and default port if not provided
         let scheduler_address_url = config
@@ -582,6 +586,7 @@ impl ResolvedClusterConfig {
             tls_config,
             scheduler_url,
             scheduler_address_url,
+            node_advertise_host,
         })
     }
 
@@ -629,10 +634,10 @@ impl ResolvedClusterConfig {
         self.scheduler_url.as_deref()
     }
 
-    /// Returns the advertise address.
+    /// Returns the advertise address (host only, with any port stripped).
     #[must_use]
     pub fn node_advertise_address(&self) -> Option<&str> {
-        self.config.node_advertise_address.as_deref()
+        self.node_advertise_host.as_deref()
     }
 
     /// Returns the cluster TLS config if configured.
@@ -803,44 +808,19 @@ pub async fn initialize_cluster_executor(
     };
 
     // Determine the advertise host and port for executor registration
-    let (advertise_host, advertise_port) = if let Some(advertise_addr) =
-        rt.df.cluster_config.node_advertise_address()
-    {
-        // Extract just the host, ignoring any port - always use bind_addr port
-        let host = if let Ok(socket_addr) = advertise_addr.parse::<SocketAddr>() {
-            // Full socket address - strip the port with deprecation warning
-            tracing::warn!(
-                "Port in --node-advertise-address will be ignored. Using port {} from --node-bind-address.",
-                bind_addr.port()
-            );
-            socket_addr.ip().to_string()
-        } else if let Some((host_part, port_part)) = advertise_addr.rsplit_once(':') {
-            // Check if this looks like host:port
-            if port_part.parse::<u16>().is_ok() && !host_part.is_empty() {
-                tracing::warn!(
-                    "Port in --node-advertise-address will be ignored. Using port {} from --node-bind-address.",
-                    bind_addr.port()
-                );
-                host_part.trim_matches(['[', ']']).to_string()
-            } else {
-                // Not a valid port, use as-is (e.g. IPv6 without brackets)
-                advertise_addr.to_string()
-            }
+    // node_advertise_address() returns host-only (port already stripped during config resolution)
+    let (advertise_host, advertise_port) =
+        if let Some(advertise_host) = rt.df.cluster_config.node_advertise_address() {
+            (advertise_host.to_string(), bind_addr.port())
         } else {
-            // No colon - just a hostname
-            advertise_addr.to_string()
-        };
-        (host, bind_addr.port())
-    } else {
-        // Fall back to hostname and bind_addr port
-        let hostname =
-            gethostname::gethostname()
-                .into_string()
-                .map_err(|_| FailedToStartClusterExecutor {
+            // Fall back to hostname and bind_addr port
+            let hostname = gethostname::gethostname().into_string().map_err(|_| {
+                FailedToStartClusterExecutor {
                     source: "Unable to determine executor hostname".to_string().into(),
-                })?;
-        (hostname, bind_addr.port())
-    };
+                }
+            })?;
+            (hostname, bind_addr.port())
+        };
 
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
