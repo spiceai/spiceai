@@ -303,7 +303,7 @@ vortex-session = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250
 vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
 x509-certificate = "0.25.0"
 # TODO: Switch to official crate once spice-rs is released
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae189bc4297350cba7265e9c6036188b" }
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", tag = "v3.1.0" }
 
 [profile.release-lto]
 inherits = "release"
