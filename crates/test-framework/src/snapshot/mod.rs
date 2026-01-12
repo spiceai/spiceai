@@ -162,15 +162,15 @@ fn sort_partitioned_union_children(explain_plan: &str) -> String {
 
             // Sort all subtrees by their string representation
             subtrees.sort_by(|a, b| {
-                let a_str: String = a.join("\n");
-                let b_str: String = b.join("\n");
+                let a_str = a.join("\n");
+                let b_str = b.join("\n");
                 a_str.cmp(&b_str)
             });
 
             // Add sorted subtrees to result
             for subtree in &subtrees {
                 for subtree_line in subtree {
-                    result.push(subtree_line.to_string());
+                    result.push((*subtree_line).to_string());
                 }
             }
 
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn test_sort_partitioned_union_children_plain_format() {
         // Plain format (non-table) with out-of-order children
-        let input = r#"SchemaCastScanExec
+        let input = r"SchemaCastScanExec
   PartitionedUnionExec
     CayenneAccelerationExec partition=3
       BytesProcessedExec
@@ -319,10 +319,10 @@ mod tests {
     CayenneAccelerationExec partition=2
       BytesProcessedExec
         DataSourceExec
-  SomeOtherExec"#;
+  SomeOtherExec";
 
         // All children sorted alphabetically (1, 2, 3)
-        let expected = r#"SchemaCastScanExec
+        let expected = r"SchemaCastScanExec
   PartitionedUnionExec
     CayenneAccelerationExec partition=1
       BytesProcessedExec
@@ -333,7 +333,7 @@ mod tests {
     CayenneAccelerationExec partition=3
       BytesProcessedExec
         DataSourceExec
-  SomeOtherExec"#;
+  SomeOtherExec";
 
         let result = super::sort_partitioned_union_children(input);
         assert_eq!(result, expected);
@@ -342,9 +342,9 @@ mod tests {
     #[test]
     fn test_sort_partitioned_union_children_no_union() {
         // Plan without PartitionedUnionExec should be unchanged
-        let input = r#"|               |   ProjectionExec                    |
+        let input = r"|               |   ProjectionExec                    |
 |               |     SortExec                        |
-|               |       AggregateExec                 |"#;
+|               |       AggregateExec                 |";
 
         let result = super::sort_partitioned_union_children(input);
         assert_eq!(result, input);
@@ -374,9 +374,9 @@ mod tests {
     #[test]
     fn test_sort_partitioned_union_children_empty() {
         // PartitionedUnionExec with no children (sibling follows at same indent)
-        let input = r#"|               |                                       PartitionedUnionExec                                   |
+        let input = r"|               |                                       PartitionedUnionExec                                   |
 |               |                         AggregateExec: mode=Final                                                  |
-|               |                           ProjectionExec                                                           |"#;
+|               |                           ProjectionExec                                                           |";
 
         // Should remain unchanged - no children to sort
         let result = super::sort_partitioned_union_children(input);
@@ -386,16 +386,16 @@ mod tests {
     #[test]
     fn test_sort_partitioned_union_children_trailing_empty_line() {
         // Table format with trailing empty line in last child - should be preserved at end
-        let input = r#"|               |                                       PartitionedUnionExec                                   |
+        let input = r"|               |                                       PartitionedUnionExec                                   |
 |               |                                         CooperativeExec partition=2                                |
 |               |                                         CooperativeExec partition=1                                |
-|               |                                                                                                    |"#;
+|               |                                                                                                    |";
 
         // Children sorted (1, 2), trailing empty line stays at end
-        let expected = r#"|               |                                       PartitionedUnionExec                                   |
+        let expected = r"|               |                                       PartitionedUnionExec                                   |
 |               |                                         CooperativeExec partition=1                                |
 |               |                                         CooperativeExec partition=2                                |
-|               |                                                                                                    |"#;
+|               |                                                                                                    |";
 
         let result = super::sort_partitioned_union_children(input);
         assert_eq!(result, expected);
