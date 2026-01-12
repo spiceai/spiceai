@@ -45,6 +45,16 @@ pub enum Error {
 
     #[snafu(display("Failed to build HTTP client: {message}"))]
     ClientBuildFailed { message: String },
+
+    #[snafu(display(
+        "Mem0 API rate limit exceeded after {retries} retries. Consider reducing request frequency. See: https://docs.mem0.ai/platform/quickstart"
+    ))]
+    RateLimitExceeded { retries: usize },
+
+    #[snafu(display(
+        "All {max_retries} retry attempts failed for mem0 API request. Check network connectivity and mem0 service availability."
+    ))]
+    AllRetriesFailed { max_retries: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

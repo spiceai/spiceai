@@ -123,6 +123,7 @@ impl MemoryEngine for Mem0MemoryEngine {
             page_size: None,
             org_id: None,
             project_id: None,
+            enable_graph: None, // Use client config default
         };
 
         let memories = self

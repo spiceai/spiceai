@@ -338,6 +338,7 @@ impl SpiceModelTool for GetMemoriesTool {
                 page_size: params.page_size,
                 org_id: None,
                 project_id: None,
+                enable_graph: None, // Use client config default
             };
 
             let memories = self.client.get_memories(request).await.boxed()?;
