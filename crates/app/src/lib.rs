@@ -182,40 +182,6 @@ impl AppBuilder {
         self
     }
 
-    pub async fn with_spicepod_dependency(
-        mut self,
-        path: impl Into<PathBuf>,
-    ) -> spicepod::Result<AppBuilder> {
-        let path = path.into();
-        let path_str = path.to_string_lossy();
-        let dependent_spicepod = Spicepod::load(path.clone()).await?;
-        if dependent_spicepod.runtime != Runtime::default() {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "Spicepod dependency '{path_str}' has 'runtime' field(s) defined. Runtime configuration must be set in primary spicepod. '{path_str}' runtime configuration will be ignored."
-                );
-            });
-        }
-
-        if dependent_spicepod.management.is_some() {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "Spicepod dependency '{path_str}' has 'management' field(s) defined. Management configuration must be set in primary spicepod. '{path_str}' management configuration will be ignored."
-                );
-            });
-        }
-
-        if dependent_spicepod.snapshots.is_some() {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "Spicepod dependency '{path_str}' has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. '{path_str}' snapshots configuration will be ignored."
-                );
-            });
-        }
-        self = self.with_spicepod(dependent_spicepod);
-        Ok(self)
-    }
-
     #[must_use]
     pub fn with_extension(mut self, name: String, extension: Extension) -> AppBuilder {
         self.extensions.insert(name, extension);

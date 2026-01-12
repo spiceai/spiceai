@@ -22,10 +22,6 @@ use arrow::{
     array::{Float64Builder, StringBuilder, UInt64Builder},
     datatypes::{DataType, Field},
 };
-use datafusion::{
-    prelude::SessionContext,
-    sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser},
-};
 
 pub struct TextToSqlMetric {
     pub question: String,
