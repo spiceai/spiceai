@@ -38,6 +38,7 @@ pub const ROWS_RETURNED_HISTOGRAM_BUCKETS: [f64; 18] = [
     50000.0, 100000.0, 250000.0, 500000.0,
 ];
 
+// Extended default buckets for duration histogram: 25000.0, 50000.0, 100000.0, 250000.0, 500000.0
 pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
     0.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0,
     100000.0, 250000.0, 500000.0,
