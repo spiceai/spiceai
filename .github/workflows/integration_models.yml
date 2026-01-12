@@ -425,7 +425,7 @@ jobs:
 
   build-linux:
     name: Build Test Binary (Linux)
-    runs-on: 'spiceai-dev-runners'
+    runs-on: 'spicehq-dev-runners'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -470,7 +470,7 @@ jobs:
   test-search:
     name: Test Search
     needs: build-linux
-    runs-on: 'spiceai-dev-runners'
+    runs-on: 'spicehq-dev-runners'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:

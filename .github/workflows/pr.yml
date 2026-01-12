@@ -105,7 +105,7 @@ jobs:
   # Run Rust linting in parallel with Go linting
   lint-rust:
     name: Rust Lint
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     needs: check_changes
 
     steps:
@@ -180,7 +180,7 @@ jobs:
   # Build and test after linting passes
   build-test:
     name: Build and Test
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     needs: [check_changes, lint-go, lint-rust]
     env:
       GOVER: 1.25.3

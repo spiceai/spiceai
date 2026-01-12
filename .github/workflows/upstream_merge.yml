@@ -231,7 +231,7 @@ jobs:
         run: |
           # Find all GitHub workflow YAML files and replace runner references
           find .github/workflows -type f \( -name "*.yml" -o -name "*.yaml" \) -exec sed -i '' \
-            -e 's/spiceai-dev-runners/spicehq-dev-runners/g' \
+            -e 's/spicehq-dev-runners/spicehq-dev-runners/g' \
             -e 's/spiceai-dev-large-runners/spicehq-dev-large-runners/g' \
             {} +
 
