@@ -426,7 +426,7 @@ impl<'a> SnapshotPathLayout<'a> {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum AccelerationEngine {
     Cayenne,
     #[cfg(feature = "duckdb")]
@@ -448,6 +448,7 @@ pub struct SnapshotManager {
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
+    compaction_enabled: bool,
 }
 
 impl std::fmt::Debug for SnapshotManager {
@@ -550,16 +551,16 @@ impl SnapshotManager {
         local_path: PathBuf,
         engine: AccelerationEngine,
     ) -> Option<Self> {
-        let (snapshot_config, secrets, io_runtime) = match snapshots {
+        let (snapshot_config, secrets, io_runtime, compaction_enabled) = match snapshots {
             SnapshotBehavior::Disabled => {
                 tracing::debug!("Snapshots are disabled for {dataset_name}");
                 return None;
             }
-            SnapshotBehavior::Enabled(s, secrets, io_runtime)
-            | SnapshotBehavior::BootstrapOnly(s, secrets, io_runtime)
-            | SnapshotBehavior::CreateOnly(s, secrets, io_runtime) => {
-                (s, secrets.upgrade()?, io_runtime)
+            SnapshotBehavior::Enabled(s, secrets, io_runtime, compaction_enabled)
+            | SnapshotBehavior::CreateOnly(s, secrets, io_runtime, compaction_enabled) => {
+                (s, secrets.upgrade()?, io_runtime, compaction_enabled)
             }
+            SnapshotBehavior::BootstrapOnly(s, secrets, io_runtime) => (s, secrets.upgrade()?, io_runtime, false)
         };
         tracing::debug!("Snapshots are enabled for {dataset_name}");
 
@@ -603,6 +604,20 @@ impl SnapshotManager {
             _ => object_store::parse_url(&snapshots_location_url).ok()?,
         };
 
+        if compaction_enabled {
+            match &engine {
+                #[cfg(feature = "duckdb")]
+                AccelerationEngine::DuckDB => {
+                    tracing::info!("Snapshot compaction is enabled for dataset {dataset_name}")
+                },
+                engine => {
+                    tracing::warn!(
+                        "Snapshot compaction is enabled for dataset {dataset_name} but engine {engine:?} does not support compaction"
+                    );
+                }
+            }
+        }
+
         Some(Self {
             dataset_name,
             snapshots_location: path,
@@ -612,6 +627,7 @@ impl SnapshotManager {
             object_store: store.into(),
             checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
+            compaction_enabled,
         })
     }
 
@@ -832,9 +848,13 @@ impl SnapshotManager {
         match self.engine {
             #[cfg(feature = "duckdb")]
             AccelerationEngine::DuckDB => {
-                let compacted_path = source_path.with_extension("compacted");
-                self.compact_duckdb(source_path, &compacted_path).await?;
-                Ok(compacted_path)
+                if self.compaction_enabled {
+                    let compacted_path = source_path.with_extension("compacted");
+                    self.compact_duckdb(source_path, &compacted_path).await?;
+                    Ok(compacted_path)
+                } else {
+                    Ok(source_path.to_path_buf())
+                }
             }
             _ => Ok(source_path.to_path_buf()),
         }

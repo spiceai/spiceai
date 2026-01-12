@@ -149,6 +149,11 @@ fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
     *b == SnapshotBehavior::Disabled
 }
 
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshot_compaction(c: &SnapshotsCompaction) -> bool {
+    *c == SnapshotsCompaction::Disabled
+}
+
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +183,16 @@ where
         None => Ok(None),
     }
 }
+
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsCompaction {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
 
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -287,6 +302,9 @@ pub struct Acceleration {
         deserialize_with = "deserialize_string_or_number"
     )]
     pub snapshots_trigger_threshold: Option<String>,
+
+    #[serde(default, skip_serializing_if = "is_default_snapshot_compaction")]
+    pub snapshots_compaction: SnapshotsCompaction,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -331,6 +349,7 @@ impl Default for Acceleration {
             snapshots: SnapshotBehavior::Disabled,
             snapshots_trigger: None,
             snapshots_trigger_threshold: None,
+            snapshots_compaction: SnapshotsCompaction::Disabled,
         }
     }
 }

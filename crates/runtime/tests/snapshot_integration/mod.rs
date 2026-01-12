@@ -39,9 +39,7 @@ use object_store::{
     path::{Path as ObjectPath, PathPart},
 };
 use runtime::{Runtime, status::ComponentStatus};
-use runtime_acceleration::snapshot::{
-    SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
-};
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager};
 use serde_json::{Value, json};
 use spicepod::{
     acceleration::{
@@ -965,12 +963,14 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 runtime_snapshots,
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
+                false,
             );
 
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
                 fixture.local_db_path.clone(),
+                AccelerationEngine::DuckDB,
             )
             .await
             .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for concurrent test"))?;
@@ -978,7 +978,11 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             let snapshot_results = try_join_all((0..10).map(|_| {
                 let manager_clone = manager.clone();
                 let schema = Arc::clone(&schema);
-                async move { manager_clone.create_snapshot(&schema).await }
+                async move {
+                    let mutex = Arc::new(Mutex::new(()));
+                    let lock_guard = mutex.lock_owned().await;
+                    manager_clone.create_snapshot(&schema, lock_guard).await
+                }
             }))
             .await
             .context("Creating snapshots concurrently")?;
@@ -1046,11 +1050,12 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .and_then(|app| app.snapshots.clone())
                 .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
             let snapshot_behavior =
-                RuntimeSnapshotBehavior::enabled(runtime_snapshots, runtime.secrets_weak(), runtime.tokio_io_runtime());
+                RuntimeSnapshotBehavior::enabled(runtime_snapshots, runtime.secrets_weak(), runtime.tokio_io_runtime(), false);
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
                 fixture.local_db_path.clone(),
+                AccelerationEngine::DuckDB,
             )
             .await
             .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?;
@@ -1082,8 +1087,11 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .context("Cleaning up temporary snapshot modification table")?;
             drop(conn);
 
+            let mutex = Arc::new(Mutex::new(()));
+            let lock_guard = mutex.lock_owned().await;
+
             manager
-                .create_snapshot(&schema)
+                .create_snapshot(&schema, lock_guard)
                 .await
                 .context("Creating modified snapshot after deleting data")?;
 

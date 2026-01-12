@@ -21,7 +21,7 @@ use datafusion_table_providers::util::{
 };
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
-use spicepod::acceleration::SnapshotsTrigger;
+use spicepod::acceleration::{SnapshotsCompaction, SnapshotsTrigger};
 use spicepod::{
     acceleration::{self as spicepod_acceleration},
     param::Params,
@@ -363,6 +363,8 @@ pub struct Acceleration {
     pub snapshots_trigger: Option<SnapshotsTrigger>,
 
     pub snapshots_trigger_threshold: Option<String>,
+
+    pub snapshots_compaction: SnapshotsCompaction,
 }
 
 impl Acceleration {
@@ -521,6 +523,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             snapshot_behavior: SnapshotBehavior::disabled(),
             snapshots_trigger: acceleration.snapshots_trigger,
             snapshots_trigger_threshold: acceleration.snapshots_trigger_threshold,
+            snapshots_compaction: acceleration.snapshots_compaction,
         })
     }
 }
@@ -559,6 +562,7 @@ impl Default for Acceleration {
             snapshot_behavior: SnapshotBehavior::Disabled,
             snapshots_trigger: None,
             snapshots_trigger_threshold: None,
+            snapshots_compaction: SnapshotsCompaction::Disabled,
         }
     }
 }

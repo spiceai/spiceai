@@ -2284,7 +2284,7 @@ mod tests {
                 app: Arc::new(app::App::default()),
                 unsupported_type_action: None,
                 ready_state: ReadyState::OnRegistration,
-                metrics: Default::default(),
+                metrics: Metrics::default(),
                 runtime: Arc::new(runtime),
                 vectors: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
@@ -2303,6 +2303,7 @@ mod tests {
                 }),
                 Arc::downgrade(secrets),
                 Handle::current(),
+                true,
             )
         }
 
@@ -2370,8 +2371,7 @@ mod tests {
             // StreamBatches should work for streaming mode
             assert!(
                 result.is_ok(),
-                "Expected Ok for streaming with StreamBatches, got: {:?}",
-                result
+                "Expected Ok for streaming with StreamBatches, got: {result:?}",
             );
             let config = result
                 .expect("config should exist")
@@ -2380,7 +2380,7 @@ mod tests {
                 SnapshotCreateTrigger::Batches(count) => {
                     assert_eq!(count, 25, "Expected 25 batches");
                 }
-                other => panic!("Expected Batches trigger, got: {:?}", other),
+                other => panic!("Expected Batches trigger, got: {other:?}"),
             }
         }
 
@@ -2408,8 +2408,7 @@ mod tests {
             // StreamBatches should work for streaming mode
             assert!(
                 result.is_ok(),
-                "Expected Ok for streaming with StreamBatches, got: {:?}",
-                result
+                "Expected Ok for streaming with StreamBatches, got: {result:?}",
             );
             let config = result
                 .expect("config should exist")
@@ -2418,7 +2417,7 @@ mod tests {
                 SnapshotCreateTrigger::Batches(count) => {
                     assert_eq!(count, 25, "Expected 25 batches");
                 }
-                other => panic!("Expected Batches trigger, got: {:?}", other),
+                other => panic!("Expected Batches trigger, got: {other:?}"),
             }
         }
 
@@ -2450,8 +2449,7 @@ mod tests {
             );
             assert!(
                 matches!(result, Err(Error::UnsupportedStreamBatchesForBatchRefresh)),
-                "Expected UnsupportedRefreshCompleteForStream error, got: {:?}",
-                result
+                "Expected UnsupportedRefreshCompleteForStream error, got: {result:?}",
             );
         }
 
@@ -2483,8 +2481,7 @@ mod tests {
             );
             assert!(
                 matches!(result, Err(Error::UnsupportedStreamBatchesForBatchRefresh)),
-                "Expected UnsupportedRefreshCompleteForStream error, got: {:?}",
-                result
+                "Expected UnsupportedRefreshCompleteForStream error, got: {result:?}",
             );
         }
 
@@ -2516,7 +2513,7 @@ mod tests {
                 SnapshotCreateTrigger::Batches(count) => {
                     assert_eq!(count, 100, "Expected 25 batches");
                 }
-                other => panic!("Expected Batches trigger, got: {:?}", other),
+                other => panic!("Expected Batches trigger, got: {other:?}"),
             }
         }
 
@@ -2547,8 +2544,7 @@ mod tests {
                     result,
                     Err(Error::SnapshotCreationBatchesShouldBePositive { .. })
                 ),
-                "Expected SnapshotCreationBatchesShouldBePositive error, got: {:?}",
-                result
+                "Expected SnapshotCreationBatchesShouldBePositive error, got: {result:?}"
             );
         }
 
@@ -2579,8 +2575,7 @@ mod tests {
                     result,
                     Err(Error::SnapshotCreationBatchesShouldBePositive { .. })
                 ),
-                "Expected SnapshotCreationBatchesShouldBePositive error, got: {:?}",
-                result
+                "Expected SnapshotCreationBatchesShouldBePositive error, got: {result:?}",
             );
         }
 
@@ -2608,8 +2603,7 @@ mod tests {
             assert!(result.is_err(), "Empty string should fail interval parsing");
             assert!(
                 matches!(result, Err(Error::InvalidSnapshotCreationInterval { .. })),
-                "Expected InvalidSnapshotCreationInterval error, got: {:?}",
-                result
+                "Expected InvalidSnapshotCreationInterval error, got: {result:?}",
             );
         }
 
@@ -2637,8 +2631,7 @@ mod tests {
             assert!(result.is_err(), "Empty string should fail batch parsing");
             assert!(
                 matches!(result, Err(Error::InvalidSnapshotCreationBatches { .. })),
-                "Expected InvalidSnapshotCreationBatches error, got: {:?}",
-                result
+                "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
             );
         }
     }

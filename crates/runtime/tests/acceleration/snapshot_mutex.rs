@@ -33,10 +33,10 @@ use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::federated_table::FederatedTable;
 use runtime::status;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::SnapshotBehavior as RuntimeSnapshotBehavior;
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager};
 use spicepod::component::snapshot::Snapshots;
 use tokio::sync::{Mutex, RwLock, mpsc};
-
+use runtime::accelerated_table::{SnapshotCreateTrigger, SnapshotCreationConfig};
 use crate::init_tracing;
 
 struct MockCheckpointer;
@@ -120,6 +120,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
         Arc::new(snapshots),
         runtime.secrets_weak(),
         runtime.tokio_io_runtime(),
+        false,
     );
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -153,12 +154,16 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
         Arc::clone(&accelerator_write_mutex),
     );
 
+    let snapshot_manager = SnapshotManager::try_new(
+        "snapshot_mutex_test".to_string(),
+        snapshot_behavior,
+        local_snapshot_file.clone(),
+        AccelerationEngine::DuckDB,
+    ).await.expect("Failed to create snapshot manager");
+
     refresher.checkpointer(Some(Arc::new(MockCheckpointer)));
     refresher.with_snapshot_creation_config(
-        snapshot_behavior,
-        Some(local_snapshot_file.clone()),
-        None,
-        Some(Duration::from_millis(200)),
+        Some(SnapshotCreationConfig {manager: Arc::new(snapshot_manager), create_trigger: SnapshotCreateTrigger::RefreshComplete})
     );
 
     let (_start_refresh, on_start_refresh) = mpsc::channel(1);
