@@ -2315,7 +2315,7 @@ mod tests {
             secrets: &Arc<TokioRwLock<Secrets>>,
         ) -> Acceleration {
             Acceleration {
-                snapshot_behavior: create_snapshots_behavior(snapshot_location, &secrets),
+                snapshot_behavior: create_snapshots_behavior(snapshot_location, secrets),
                 engine,
                 snapshots_trigger: trigger,
                 snapshots_trigger_threshold: threshold,
@@ -2540,10 +2540,7 @@ mod tests {
 
             assert!(result.is_err(), "Empty string should fail interval parsing");
             assert!(
-                matches!(
-                    result,
-                    Err(Error::SnapshotCreationBatchesShouldBePositive { .. })
-                ),
+                matches!(result, Err(Error::SnapshotCreationBatchesShouldBePositive)),
                 "Expected SnapshotCreationBatchesShouldBePositive error, got: {result:?}"
             );
         }
@@ -2571,10 +2568,7 @@ mod tests {
 
             assert!(result.is_err(), "Empty string should fail interval parsing");
             assert!(
-                matches!(
-                    result,
-                    Err(Error::SnapshotCreationBatchesShouldBePositive { .. })
-                ),
+                matches!(result, Err(Error::SnapshotCreationBatchesShouldBePositive)),
                 "Expected SnapshotCreationBatchesShouldBePositive error, got: {result:?}",
             );
         }
@@ -2602,7 +2596,7 @@ mod tests {
 
             assert!(result.is_err(), "Empty string should fail interval parsing");
             assert!(
-                matches!(result, Err(Error::InvalidSnapshotCreationInterval { .. })),
+                matches!(result, Err(Error::InvalidSnapshotCreationInterval)),
                 "Expected InvalidSnapshotCreationInterval error, got: {result:?}",
             );
         }
@@ -2630,7 +2624,7 @@ mod tests {
 
             assert!(result.is_err(), "Empty string should fail batch parsing");
             assert!(
-                matches!(result, Err(Error::InvalidSnapshotCreationBatches { .. })),
+                matches!(result, Err(Error::InvalidSnapshotCreationBatches)),
                 "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
             );
         }

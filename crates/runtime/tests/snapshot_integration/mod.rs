@@ -1185,6 +1185,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
 }
 
 #[cfg(feature = "duckdb")]
+#[expect(clippy::cast_precision_loss)]
 #[tokio::test]
 async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
@@ -1280,7 +1281,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
 
             // Create snapshot behavior with compaction ENABLED (last param = true)
             let snapshot_behavior_with_compaction = RuntimeSnapshotBehavior::enabled(
-                runtime_snapshots.clone(),
+                Arc::clone(&runtime_snapshots),
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
                 true, // compaction_enabled = true
