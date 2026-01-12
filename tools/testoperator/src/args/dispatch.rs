@@ -280,6 +280,14 @@ pub struct TextToSqlArgs {
 
     #[serde(flatten)]
     pub queryset_source: QuerysetSource,
+
+    /// Limit the number of text-to-SQL operations to run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+
+    /// Unique name for the configured testoperator run. Used to identify/group runs in telemetry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
