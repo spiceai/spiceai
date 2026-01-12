@@ -61,7 +61,7 @@ jobs:
     runs-on: spiceai-dev-runners
     needs: check_changes
     env:
-      GOVER: 1.25.3
+      GOVER: 1.25.5
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -91,6 +91,12 @@ jobs:
           if ! command -v golangci-lint &> /dev/null ; then
             curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
           fi
+
+      - name: Install make
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make
 
       - name: Run Go lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
