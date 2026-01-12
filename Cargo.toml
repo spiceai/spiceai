@@ -296,11 +296,11 @@ url = "2.5"
 util = { path = "crates/util" }
 uuid = "1"
 # We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
-vortex = { git = "https://github.com/spiceai/vortex", rev = "c2899d24c2c619c89f3c7a5f176060de3d6496f4" }
-vortex-array = { git = "https://github.com/spiceai/vortex", rev = "c2899d24c2c619c89f3c7a5f176060de3d6496f4" }
-vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "c2899d24c2c619c89f3c7a5f176060de3d6496f4" }
-vortex-session = { git = "https://github.com/spiceai/vortex", rev = "c2899d24c2c619c89f3c7a5f176060de3d6496f4" }
-vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "c2899d24c2c619c89f3c7a5f176060de3d6496f4" }
+vortex = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
+vortex-array = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
+vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
+vortex-session = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
+vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
 x509-certificate = "0.25.0"
 # TODO: Switch to official crate once spice-rs is released
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae189bc4297350cba7265e9c6036188b" }
@@ -308,6 +308,15 @@ spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae18
 [profile.release-lto]
 inherits = "release"
 lto = true
+
+# Production-like profile with debug symbols for crash investigation
+[profile.release-debug]
+inherits = "release"
+panic = "abort"           # Abort on panic (cleaner crash, prevents undefined behavior from double-panic)
+debug = 1                 # DWARF symbols for readable stack traces
+strip = "none"            # Ensure symbols not stripped
+incremental = false       # Deterministic builds
+lto = "thin"              # Keep prod-like LTO (thin is fast + optimized)
 
 [profile.lint]
 debug = "line-tables-only"
