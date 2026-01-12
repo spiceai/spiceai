@@ -882,14 +882,17 @@ impl SnapshotManager {
             })?;
 
             let source_str = source.to_string_lossy();
-            conn.execute(&format!("ATTACH '{source_str}' AS source (READ_ONLY)"), [])
-                .map_err(|e| SnapshotUploadError::CompactionAttach {
-                    path: source.clone(),
-                    source: e,
-                })?;
+            conn.execute(
+                "ATTACH ? AS source (READ_ONLY)",
+                duckdb::params![source_str.as_ref()],
+            )
+            .map_err(|e| SnapshotUploadError::CompactionAttach {
+                path: source.clone(),
+                source: e,
+            })?;
 
             let dest_str = dest.to_string_lossy();
-            conn.execute(&format!("ATTACH '{dest_str}' AS dest"), [])
+            conn.execute("ATTACH ? AS dest", duckdb::params![dest_str.as_ref()])
                 .map_err(|e| SnapshotUploadError::CompactionAttach {
                     path: dest.clone(),
                     source: e,
