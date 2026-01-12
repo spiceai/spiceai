@@ -121,12 +121,13 @@ bb8-postgres = "0.9"
 bigdecimal = "0.4.7"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-core" }
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-kernels" }
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-metal-kernels" }
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-nn" }
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" }
+# candle: spiceai-0.9.1 branch
+candle = { git = "https://github.com/spiceai/candle.git", rev = "72d58cd1cf0db1acd70a5895e380bf12283947d3", package = "candle-core" }
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "72d58cd1cf0db1acd70a5895e380bf12283947d3" }
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "72d58cd1cf0db1acd70a5895e380bf12283947d3", package = "candle-kernels" }
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "72d58cd1cf0db1acd70a5895e380bf12283947d3", package = "candle-metal-kernels" }
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "72d58cd1cf0db1acd70a5895e380bf12283947d3", package = "candle-nn" }
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "72d58cd1cf0db1acd70a5895e380bf12283947d3", package = "candle-transformers" }
 charset = "0.1.5"
 chrono = "0.4.42"
 clap = { version = "4.5.54", features = ["derive", "env"] }
