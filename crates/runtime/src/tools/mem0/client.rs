@@ -57,33 +57,39 @@ impl Mem0Config {
     }
 
     pub fn from_params(params: &HashMap<String, SecretString>) -> Result<Self> {
-        let api_key = params
-            .get("api_key")
-            .or_else(|| params.get("mem0_api_key"))
-            .cloned()
-            .ok_or_else(|| Error::MissingRequiredParameter {
-                param: "api_key".to_string(),
-            })?;
+        // Helper to get param with mem0_ prefix (primary) or fallback to non-prefixed
+        let get_param = |name: &str| -> Option<&SecretString> {
+            params
+                .get(&format!("mem0_{name}"))
+                .or_else(|| params.get(name))
+        };
+
+        let api_key =
+            get_param("api_key")
+                .cloned()
+                .ok_or_else(|| Error::MissingRequiredParameter {
+                    param: "mem0_api_key".to_string(),
+                })?;
 
         let mut config = Self::new(api_key);
 
-        if let Some(org_id) = params.get("org_id") {
+        if let Some(org_id) = get_param("org_id") {
             config.org_id = Some(org_id.expose_secret().to_string());
         }
 
-        if let Some(project_id) = params.get("project_id") {
+        if let Some(project_id) = get_param("project_id") {
             config.project_id = Some(project_id.expose_secret().to_string());
         }
 
-        if let Some(base_url) = params.get("base_url") {
+        if let Some(base_url) = get_param("base_url") {
             config.base_url = base_url.expose_secret().to_string();
         }
 
-        if let Some(user_id) = params.get("user_id") {
+        if let Some(user_id) = get_param("user_id") {
             config.user_id = Some(user_id.expose_secret().to_string());
         }
 
-        if let Some(agent_id) = params.get("agent_id") {
+        if let Some(agent_id) = get_param("agent_id") {
             config.agent_id = Some(agent_id.expose_secret().to_string());
         }
 
@@ -154,7 +160,7 @@ impl Default for AddMemoryRequest {
     }
 }
 
-/// Response from adding memories.
+/// Response from adding memories (synchronous mode - `async_mode`: false).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AddMemoryEvent {
     pub id: String,
@@ -165,6 +171,23 @@ pub struct AddMemoryEvent {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AddMemoryData {
     pub memory: String,
+}
+
+/// Response from adding memories (asynchronous mode - `async_mode`: true).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AddMemoryPending {
+    pub message: String,
+    pub status: String,
+    pub event_id: String,
+}
+
+/// Response from adding memories - can be either sync or async format.
+#[derive(Debug, Clone)]
+pub enum AddMemoryResponse {
+    /// Synchronous response with completed memory events
+    Sync(Vec<AddMemoryEvent>),
+    /// Asynchronous response indicating background processing
+    Async(Vec<AddMemoryPending>),
 }
 
 /// Request body for searching memories.
@@ -320,7 +343,10 @@ impl Mem0Client {
     }
 
     /// Add memories from messages.
-    pub async fn add_memories(&self, mut request: AddMemoryRequest) -> Result<Vec<AddMemoryEvent>> {
+    ///
+    /// When `async_mode` is `true` (default), returns `AddMemoryResponse::Async` with pending status.
+    /// When `async_mode` is `false`, returns `AddMemoryResponse::Sync` with completed memory events.
+    pub async fn add_memories(&self, mut request: AddMemoryRequest) -> Result<AddMemoryResponse> {
         // Apply default user_id and agent_id from config if not set
         if request.user_id.is_none() {
             request.user_id.clone_from(&self.config.user_id);
@@ -335,6 +361,7 @@ impl Mem0Client {
             request.project_id.clone_from(&self.config.project_id);
         }
 
+        let is_async = request.async_mode;
         let url = format!("{}/v1/memories/", self.config.base_url);
 
         let response = self
@@ -353,7 +380,15 @@ impl Mem0Client {
             });
         }
 
-        response.json().await.context(ResponseParseFailedSnafu)
+        if is_async {
+            let pending: Vec<AddMemoryPending> =
+                response.json().await.context(ResponseParseFailedSnafu)?;
+            Ok(AddMemoryResponse::Async(pending))
+        } else {
+            let events: Vec<AddMemoryEvent> =
+                response.json().await.context(ResponseParseFailedSnafu)?;
+            Ok(AddMemoryResponse::Sync(events))
+        }
     }
 
     /// Search memories with a query.
@@ -365,7 +400,7 @@ impl Mem0Client {
             request.project_id.clone_from(&self.config.project_id);
         }
 
-        let url = format!("{}/v2/memories/search", self.config.base_url);
+        let url = format!("{}/v2/memories/search/", self.config.base_url);
 
         let response = self
             .client
@@ -500,11 +535,14 @@ mod tests {
     #[test]
     fn test_mem0_config_from_params() {
         let mut params = HashMap::new();
-        params.insert("api_key".to_string(), SecretString::from("test-key"));
-        params.insert("org_id".to_string(), SecretString::from("my-org"));
-        params.insert("project_id".to_string(), SecretString::from("my-project"));
-        params.insert("user_id".to_string(), SecretString::from("user123"));
-        params.insert("agent_id".to_string(), SecretString::from("agent456"));
+        params.insert("mem0_api_key".to_string(), SecretString::from("test-key"));
+        params.insert("mem0_org_id".to_string(), SecretString::from("my-org"));
+        params.insert(
+            "mem0_project_id".to_string(),
+            SecretString::from("my-project"),
+        );
+        params.insert("mem0_user_id".to_string(), SecretString::from("user123"));
+        params.insert("mem0_agent_id".to_string(), SecretString::from("agent456"));
 
         let config = Mem0Config::from_params(&params).expect("should parse config");
 
@@ -515,9 +553,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mem0_config_from_params_alternate_key_name() {
+    fn test_mem0_config_from_params_fallback_key_name() {
+        // Test backward compatibility with non-prefixed params
         let mut params = HashMap::new();
-        params.insert("mem0_api_key".to_string(), SecretString::from("test-key"));
+        params.insert("api_key".to_string(), SecretString::from("test-key"));
 
         let config = Mem0Config::from_params(&params).expect("should parse config");
         assert_eq!(config.api_key.expose_secret(), "test-key");
@@ -530,15 +569,20 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.expect_err("should fail without API key");
-        assert!(matches!(err, Error::MissingRequiredParameter { .. }));
+        match &err {
+            Error::MissingRequiredParameter { param } => {
+                assert_eq!(param, "mem0_api_key");
+            }
+            _ => panic!("Expected MissingRequiredParameter error"),
+        }
     }
 
     #[test]
     fn test_mem0_config_from_params_custom_base_url() {
         let mut params = HashMap::new();
-        params.insert("api_key".to_string(), SecretString::from("test-key"));
+        params.insert("mem0_api_key".to_string(), SecretString::from("test-key"));
         params.insert(
-            "base_url".to_string(),
+            "mem0_base_url".to_string(),
             SecretString::from("https://custom.mem0.ai"),
         );
 

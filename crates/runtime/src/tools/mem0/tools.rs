@@ -27,8 +27,8 @@ use tracing_futures::Instrument;
 use crate::tools::SpiceModelTool;
 
 use super::client::{
-    AddMemoryRequest, DeleteMemoryRequest, GetMemoriesRequest, Mem0Client, Message,
-    SearchMemoryRequest,
+    AddMemoryRequest, AddMemoryResponse, DeleteMemoryRequest, GetMemoriesRequest, Mem0Client,
+    Message, SearchMemoryRequest,
 };
 
 /// Parameters for the add memory tool.
@@ -116,16 +116,24 @@ impl SpiceModelTool for AddMemoryTool {
                     v.as_object()
                         .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 }),
+                async_mode: false, // Use sync mode to get immediate results
                 ..Default::default()
             };
 
-            let events = self.client.add_memories(request).await.boxed()?;
+            let response = self.client.add_memories(request).await.boxed()?;
 
-            Ok(json!({
-                "success": true,
-                "memories_added": events.len(),
-                "events": events
-            }))
+            match response {
+                AddMemoryResponse::Sync(events) => Ok(json!({
+                    "success": true,
+                    "memories_added": events.len(),
+                    "events": events
+                })),
+                AddMemoryResponse::Async(pending) => Ok(json!({
+                    "success": true,
+                    "status": "pending",
+                    "pending_events": pending
+                })),
+            }
         }
         .instrument(span.clone())
         .await;

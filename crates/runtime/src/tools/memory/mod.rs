@@ -19,13 +19,20 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampSecondArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::sql::TableReference;
+use spicepod::component::memory::Memory;
 use uuid::Uuid;
 
 use crate::{Runtime, component::validate_identifier};
 
+pub mod builtin;
 pub mod catalog;
+pub mod engine;
 pub mod load;
+#[cfg(feature = "mem0")]
+pub mod mem0_engine;
 pub mod store;
+
+pub use engine::{MemoryEngine, get_memory_engine};
 
 pub static MEMORY_TABLE_SCHEMA: std::sync::LazyLock<SchemaRef> = std::sync::LazyLock::new(|| {
     Schema::new(vec![
@@ -99,4 +106,11 @@ async fn memory_table_name(
             "No memory table found",
         )),
     }
+}
+
+/// Get the memory configuration from the runtime.
+pub async fn get_memory_config(rt: &Arc<Runtime>) -> Option<Memory> {
+    let app_lock = rt.app.read().await;
+    let app = app_lock.as_deref()?;
+    app.memory.clone()
 }

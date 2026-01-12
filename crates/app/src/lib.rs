@@ -30,6 +30,7 @@ use spicepod::{
         embeddings::Embeddings,
         eval::Eval,
         management::Management,
+        memory::Memory,
         model::Model,
         runtime::{CorsConfig, Runtime, TlsConfig},
         secret::Secret,
@@ -75,6 +76,8 @@ pub struct App {
     pub management: Option<Management>,
 
     pub snapshots: Option<Arc<Snapshots>>,
+
+    pub memory: Option<Memory>,
 }
 
 impl App {
@@ -107,6 +110,7 @@ impl Default for App {
             runtime: Runtime::default(),
             management: None,
             snapshots: None,
+            memory: None,
         }
     }
 }
@@ -138,6 +142,7 @@ pub struct AppBuilder {
     runtime: Runtime,
     management: Option<Management>,
     snapshots: Option<Snapshots>,
+    memory: Option<Memory>,
 }
 
 impl AppBuilder {
@@ -158,6 +163,7 @@ impl AppBuilder {
             runtime: Runtime::default(),
             management: None,
             snapshots: None,
+            memory: None,
         }
     }
 
@@ -169,6 +175,9 @@ impl AppBuilder {
         self.management.clone_from(&spicepod.management);
         if let Some(ref snapshot) = spicepod.snapshots {
             self.snapshots = Some(snapshot.clone());
+        }
+        if let Some(ref memory) = spicepod.memory {
+            self.memory = Some(memory.clone());
         }
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
@@ -303,6 +312,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_memory(mut self, memory: Memory) -> AppBuilder {
+        self.memory = Some(memory);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
@@ -320,6 +335,7 @@ impl AppBuilder {
             runtime: self.runtime,
             management: self.management,
             snapshots: self.snapshots.map(Arc::new),
+            memory: self.memory,
         }
     }
 
@@ -338,6 +354,7 @@ impl AppBuilder {
         let extensions = spicepod.extensions.clone();
         let management = spicepod.management.clone();
         let snapshots = spicepod.snapshots.clone();
+        let memory = spicepod.memory.clone();
         let mut catalogs: Vec<Catalog> = vec![];
         let mut datasets: Vec<Dataset> = vec![];
         let mut views: Vec<View> = vec![];
@@ -442,6 +459,14 @@ impl AppBuilder {
                 });
             }
 
+            if dependent_spicepod.memory.is_some() {
+                in_tracing_context(|| {
+                    tracing::warn!(
+                        "Spicepod dependency '{dependency}' has 'memory' field(s) defined. Memory configuration must be set in primary spicepod. '{dependency}' memory configuration will be ignored."
+                    );
+                });
+            }
+
             spicepods.push(dependent_spicepod);
         }
 
@@ -471,6 +496,7 @@ impl AppBuilder {
             runtime,
             management,
             snapshots: snapshots.map(Arc::new),
+            memory,
         })
     }
 }

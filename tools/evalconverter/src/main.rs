@@ -147,5 +147,6 @@ fn spicepod_definition(datasets: Vec<Dataset>, evals: Vec<Eval>) -> SpicepodDefi
         workers: Vec::default(),
         embeddings: Vec::default(),
         dependencies: Vec::default(),
+        memory: None,
     }
 }

@@ -33,6 +33,7 @@ pub mod dataset;
 pub mod embeddings;
 pub mod eval;
 pub mod management;
+pub mod memory;
 pub mod model;
 pub mod runtime;
 pub mod secret;

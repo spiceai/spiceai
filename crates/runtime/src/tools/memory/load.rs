@@ -14,12 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{AsArray, RecordBatch};
 use async_trait::async_trait;
-use futures::TryStreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
@@ -29,7 +27,7 @@ use crate::{
     tools::{SpiceModelTool, utils::parameters},
 };
 
-use super::memory_table_name;
+use super::get_memory_engine;
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LoadMemoryParams {
@@ -79,45 +77,11 @@ impl SpiceModelTool for LoadMemoryTool {
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::load_memory", tool = self.name().to_string(), input = arg);
 
-        let table_name = memory_table_name(&self.rt).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let params: LoadMemoryParams = serde_json::from_str(arg).boxed()?;
-            let last_interval = fundu::parse_duration(params.last.as_str()).boxed()?;
+            let engine = get_memory_engine(Arc::clone(&self.rt)).await?;
 
-            let batches = self.rt
-                .datafusion()
-                .query_builder(
-                    &format!(
-                        "SELECT value FROM {table_name} WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",
-                        last_interval.as_secs()
-                    ),
-                )
-                .build()
-                .run()
-                .await
-                .boxed()?
-                .data
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .boxed()?;
-
-            let history = batches
-                .iter()
-                .filter_map(|b| {
-                    if let Some(s) = b.column(0).as_string_opt::<i32>() {
-                        Some(s.iter().map(Option::unwrap_or_default).collect::<Vec<_>>())
-                    } else {
-                        tracing::trace!(
-                            "Using tool={}, failed to convert record batch to string",
-                            self.name()
-                        );
-                        None
-                    }
-                })
-                .flatten()
-                .collect::<Vec<_>>();
-
-            Ok(json!(history))
+            engine.load(&params.last).await
         }
         .instrument(span.clone())
         .await;
