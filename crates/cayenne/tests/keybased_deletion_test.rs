@@ -83,7 +83,8 @@ async fn setup_string_pk_table(
     let table_options = CreateTableOptions {
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["code".to_string()], // String PK -> RowConverter strategy
+        primary_key: vec!["code".to_string()],
+        on_conflict: None, // String PK -> RowConverter strategy
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -107,7 +108,8 @@ async fn setup_composite_pk_table(
     let table_options = CreateTableOptions {
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
-        primary_key: vec!["region".to_string(), "id".to_string()], // Composite PK -> RowConverter strategy
+        primary_key: vec!["region".to_string(), "id".to_string()],
+        on_conflict: None, // Composite PK -> RowConverter strategy
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -684,6 +686,7 @@ async fn test_composite_pk_persistence_after_delete_impl(fixture: TestFixture) -
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec!["region".to_string(), "id".to_string()],
+        on_conflict: None,
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),

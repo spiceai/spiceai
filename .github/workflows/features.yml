@@ -31,8 +31,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -55,7 +53,6 @@ jobs:
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
 
       # Putting this into a GitHub Actions matrix will run a separate job per matrix item, whereas in theory
       # this can re-use the existing build cache to go faster.

@@ -37,8 +37,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'darwin'
 
       - name: Set up API Keys
         run: |

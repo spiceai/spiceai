@@ -17,8 +17,11 @@ limitations under the License.
 use arrow_schema::TimeUnit;
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, TimeZone as _, Utc};
+use data_components::delete::{
+    DeletionExec, DeletionSink, DeletionTableProvider, DeletionTableProviderAdapter,
+};
 use datafusion::arrow::array::{
-    ArrayRef, Int32Array, Int64Array, StringArray, TimestampNanosecondArray,
+    Array, ArrayRef, Int32Array, Int64Array, StringArray, TimestampNanosecondArray, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -31,7 +34,7 @@ use datafusion::execution::context::{ExecutionProps, SessionContext};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, TableProviderFilterPushDown};
 use datafusion::physical_expr::create_physical_expr;
-use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties, collect};
 use datafusion::scalar::ScalarValue;
 use datafusion::{arrow, prelude::*};
 use runtime_datafusion_udfs::{bucket, truncate};
@@ -1445,6 +1448,853 @@ async fn test_bucket_partition_inequality_snapshot() -> Result<(), Box<dyn std::
     lines[1..].sort_unstable();
     explain_plan = lines.join("\n") + "\n";
     insta::assert_snapshot!("bucket_inequality_unbounded", explain_plan);
+
+    Ok(())
+}
+
+// ============================================================================
+// Deletion Tests for PartitionTableProvider implementing DeletionTableProvider
+// ============================================================================
+
+/// A `MemTable` wrapper that implements `DeletionTableProvider` for testing purposes
+#[derive(Debug)]
+struct DeletablePartitionMemTable {
+    mem_table: Arc<MemTable>,
+    #[expect(dead_code)]
+    partition_value: ScalarValue,
+    deleted_count: Arc<RwLock<u64>>,
+}
+
+impl DeletablePartitionMemTable {
+    fn new(mem_table: Arc<MemTable>, partition_value: ScalarValue) -> Self {
+        Self {
+            mem_table,
+            partition_value,
+            deleted_count: Arc::new(RwLock::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for DeletablePartitionMemTable {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.mem_table.schema()
+    }
+
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        self.mem_table.table_type()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.mem_table.scan(state, projection, filters, limit).await
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.mem_table.insert_into(state, input, insert_op).await
+    }
+}
+
+/// Mock deletion sink that simulates deletion and tracks deleted count
+struct MockDeletionSink {
+    deleted_count: Arc<RwLock<u64>>,
+    count_to_delete: u64,
+}
+
+#[async_trait]
+impl DeletionSink for MockDeletionSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let mut guard = self.deleted_count.write().await;
+        *guard += self.count_to_delete;
+        Ok(self.count_to_delete)
+    }
+}
+
+#[async_trait]
+impl DeletionTableProvider for DeletablePartitionMemTable {
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        _filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Simulate deleting 10 rows per partition
+        let deletion_sink = Arc::new(MockDeletionSink {
+            deleted_count: Arc::clone(&self.deleted_count),
+            count_to_delete: 10,
+        });
+
+        Ok(Arc::new(DeletionExec::new(
+            deletion_sink,
+            &self.mem_table.schema(),
+        )))
+    }
+}
+
+/// Partition creator that creates `DeletablePartitionMemTable` instances
+#[derive(Debug)]
+struct DeletableTestPartitionCreator {
+    schema: SchemaRef,
+    partitions: Arc<RwLock<HashMap<String, Arc<DeletablePartitionMemTable>>>>,
+}
+
+impl DeletableTestPartitionCreator {
+    fn new(schema: SchemaRef) -> Self {
+        Self {
+            schema,
+            partitions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn get_partitions(&self) -> HashMap<String, Arc<DeletablePartitionMemTable>> {
+        self.partitions.read().await.clone()
+    }
+}
+
+#[async_trait]
+impl PartitionCreator for DeletableTestPartitionCreator {
+    async fn create_partition(
+        &self,
+        partition_value: ScalarValue,
+    ) -> Result<Partition, creator::Error> {
+        let empty_columns: Vec<ArrayRef> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| arrow::array::new_empty_array(f.data_type()))
+            .collect();
+
+        let empty_batch = RecordBatch::try_new(Arc::clone(&self.schema), empty_columns)
+            .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+
+        let mem_table = Arc::new(
+            MemTable::try_new(Arc::clone(&self.schema), vec![vec![empty_batch]])
+                .map_err(|e| creator::Error::CreatePartition { source: e.into() })?,
+        );
+        let deletable_mem_table = Arc::new(DeletablePartitionMemTable::new(
+            mem_table,
+            partition_value.clone(),
+        ));
+        self.partitions.write().await.insert(
+            partition_value.to_string(),
+            Arc::clone(&deletable_mem_table),
+        );
+        // Wrap in DeletionTableProviderAdapter so get_deletion_provider can find it
+        let adapted_table: Arc<dyn TableProvider> =
+            Arc::new(DeletionTableProviderAdapter::new(deletable_mem_table));
+        Ok(Partition {
+            partition_value,
+            table_provider: adapted_table,
+        })
+    }
+
+    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
+        Ok(vec![])
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+    }
+}
+
+#[tokio::test]
+async fn test_deletion_table_provider_single_partition() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data into a single partition
+    let df = ctx.read_batch(RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(StringArray::from(vec![
+                "us-east", "us-east", "us-east", "us-east", "us-east",
+            ])),
+            Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])),
+        ],
+    )?)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Verify we have 1 partition
+    let partitions = creator.get_partitions().await;
+    assert_eq!(partitions.len(), 1, "Expected 1 partition");
+
+    // Access PartitionTableProvider directly to call delete_from
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let delete_plan = partition_provider.delete_from(&state, &[]).await?;
+
+    // Execute the deletion plan
+    let result = collect(delete_plan, ctx.task_ctx()).await?;
+
+    // Check the result - should have deleted 10 rows (mocked)
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        10,
+        "Expected 10 deleted rows from single partition"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_deletion_table_provider_multiple_partitions() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data into multiple partitions
+    let regions = vec!["us-east", "us-west", "eu-west"];
+    for region in &regions {
+        let df = ctx.read_batch(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![*region, *region, *region])),
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+            ],
+        )?)?;
+        df.write_table("test_table", DataFrameWriteOptions::new())
+            .await?;
+    }
+
+    // Verify we have 3 partitions
+    let partitions = creator.get_partitions().await;
+    assert_eq!(partitions.len(), 3, "Expected 3 partitions");
+
+    // Get the table provider and call delete_from
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let delete_plan = partition_provider.delete_from(&state, &[]).await?;
+
+    // Execute the deletion plan
+    let result = collect(delete_plan, ctx.task_ctx()).await?;
+
+    // Check the result - should have deleted 30 rows total (10 per partition * 3 partitions)
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        30,
+        "Expected 30 deleted rows from 3 partitions"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_deletion_table_provider_with_filters() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data into partitions
+    let df = ctx.read_batch(RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["us-east", "us-west"])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+        ],
+    )?)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Get the table provider and call delete_from with a filter
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    // Filter: value > 100 (this filter is passed to delete_from but currently mock doesn't use it)
+    let filters = vec![col("value").gt(lit(100i64))];
+    let delete_plan = partition_provider.delete_from(&state, &filters).await?;
+
+    // Execute the deletion plan
+    let result = collect(delete_plan, ctx.task_ctx()).await?;
+
+    // The mock still deletes 10 per partition, so expect 20 total
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        20,
+        "Expected 20 deleted rows from 2 partitions"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_deletion_table_provider_empty_partitions() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Don't insert any data - partitions map should be empty
+
+    // Get the table provider and call delete_from
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let delete_plan = partition_provider.delete_from(&state, &[]).await?;
+
+    // Execute the deletion plan
+    let result = collect(delete_plan, ctx.task_ctx()).await?;
+
+    // Should delete 0 rows since there are no partitions
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        0,
+        "Expected 0 deleted rows from empty partitions"
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Additional Edge Case Tests for PartitionTableProvider
+// ============================================================================
+
+/// Test that a partition provider without deletion support logs a warning and continues
+/// (non-deletable partition creator that returns regular `MemTable` without `DeletionTableProviderAdapter`)
+#[derive(Debug)]
+struct NonDeletablePartitionCreator {
+    schema: SchemaRef,
+}
+
+impl NonDeletablePartitionCreator {
+    fn new(schema: SchemaRef) -> Self {
+        Self { schema }
+    }
+}
+
+#[async_trait]
+impl PartitionCreator for NonDeletablePartitionCreator {
+    async fn create_partition(
+        &self,
+        partition_value: ScalarValue,
+    ) -> Result<Partition, creator::Error> {
+        let empty_columns: Vec<ArrayRef> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| arrow::array::new_empty_array(f.data_type()))
+            .collect();
+
+        let empty_batch = RecordBatch::try_new(Arc::clone(&self.schema), empty_columns)
+            .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+
+        let mem_table = Arc::new(
+            MemTable::try_new(Arc::clone(&self.schema), vec![vec![empty_batch]])
+                .map_err(|e| creator::Error::CreatePartition { source: e.into() })?,
+        );
+        // Return MemTable directly without wrapping - doesn't support deletion
+        Ok(Partition {
+            partition_value,
+            table_provider: mem_table,
+        })
+    }
+
+    async fn infer_existing_partitions(&self) -> Result<Vec<Partition>, creator::Error> {
+        Ok(vec![])
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+    }
+}
+
+/// Test deletion with partitions that don't support deletion (should return 0 and log warning)
+#[tokio::test]
+async fn test_deletion_with_non_deletable_partitions() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+
+    let creator = Arc::new(NonDeletablePartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert some data to create a partition
+    let df = ctx.read_batch(RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["us-east", "us-east", "us-east"])),
+        ],
+    )?)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Get the table provider and call delete_from
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let delete_plan = partition_provider.delete_from(&state, &[]).await?;
+
+    // Execute the deletion plan
+    let result = collect(delete_plan, ctx.task_ctx()).await?;
+
+    // Should return 0 since the partition doesn't support deletion
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        0,
+        "Expected 0 deleted rows from non-deletable partition"
+    );
+
+    Ok(())
+}
+
+/// Test deletion with many partitions (stress test)
+#[tokio::test]
+async fn test_deletion_many_partitions() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("partition_key", DataType::Utf8, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "partition_key".to_string(),
+        expression: col("partition_key"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Create 20 partitions
+    let num_partitions: usize = 20;
+    for i in 0..num_partitions {
+        let partition_key = format!("partition_{i}");
+        #[expect(clippy::cast_possible_wrap)]
+        let i_val = i as i64;
+        let df = ctx.read_batch(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![i_val])),
+                Arc::new(StringArray::from(vec![partition_key.as_str()])),
+            ],
+        )?)?;
+        df.write_table("test_table", DataFrameWriteOptions::new())
+            .await?;
+    }
+
+    // Verify we have 20 partitions
+    let partitions = creator.get_partitions().await;
+    assert_eq!(
+        partitions.len(),
+        num_partitions,
+        "Expected {num_partitions} partitions"
+    );
+
+    // Get the table provider and call delete_from
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let delete_plan = partition_provider.delete_from(&state, &[]).await?;
+
+    // Execute the deletion plan
+    let result = collect(delete_plan, ctx.task_ctx()).await?;
+
+    // Should have deleted 10 rows per partition * 20 partitions = 200 total
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        200,
+        "Expected 200 deleted rows from 20 partitions"
+    );
+
+    Ok(())
+}
+
+/// Test deletion with complex filter expressions
+#[tokio::test]
+async fn test_deletion_complex_filters() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("status", DataType::Utf8, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data
+    let df = ctx.read_batch(RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["us-east", "eu-west", "asia"])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+            Arc::new(StringArray::from(vec!["active", "inactive", "active"])),
+        ],
+    )?)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Get the table provider and call delete_from with complex filters
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    // Complex filter: (value > 100 AND status = 'active') OR id = 1
+    let filters = vec![
+        col("value")
+            .gt(lit(100i64))
+            .and(col("status").eq(lit("active")))
+            .or(col("id").eq(lit(1i64))),
+    ];
+    let delete_plan = partition_provider.delete_from(&state, &filters).await?;
+
+    // Execute the deletion plan
+    let result = collect(delete_plan, ctx.task_ctx()).await?;
+
+    // Mock deletes 10 per partition, we have 3 partitions = 30
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(count_array.value(0), 30, "Expected 30 deleted rows");
+
+    Ok(())
+}
+
+/// Test deletion with NULL partition values
+#[tokio::test]
+async fn test_deletion_with_null_partition_value() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, true), // nullable
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data with some NULL region values
+    let df = ctx.read_batch(RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                Some("us-east"),
+                None,
+                Some("eu-west"),
+            ])),
+        ],
+    )?)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Verify we have 3 partitions (including null partition)
+    let partitions = creator.get_partitions().await;
+    assert_eq!(partitions.len(), 3, "Expected 3 partitions including null");
+
+    // Get the table provider and call delete_from
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let delete_plan = partition_provider.delete_from(&state, &[]).await?;
+
+    // Execute the deletion plan
+    let result = collect(delete_plan, ctx.task_ctx()).await?;
+
+    // Should delete from all 3 partitions including the null one
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        30,
+        "Expected 30 deleted rows from 3 partitions"
+    );
+
+    Ok(())
+}
+
+/// Test repeated deletion calls (idempotency)
+#[tokio::test]
+async fn test_deletion_repeated_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data
+    let df = ctx.read_batch(RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["us-east"])),
+        ],
+    )?)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+    let state = ctx.state();
+
+    // Call delete_from multiple times
+    for i in 0..3 {
+        let delete_plan = partition_provider.delete_from(&state, &[]).await?;
+        let result = collect(delete_plan, ctx.task_ctx()).await?;
+
+        assert_eq!(result.len(), 1, "Iteration {i}: Expected 1 result batch");
+        let count_col = result[0]
+            .column_by_name("count")
+            .expect("Expected count column");
+        let count_array = count_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("Expected UInt64Array");
+        // Mock always returns 10, so each call should return 10
+        assert_eq!(
+            count_array.value(0),
+            10,
+            "Iteration {i}: Expected 10 deleted rows"
+        );
+    }
 
     Ok(())
 }

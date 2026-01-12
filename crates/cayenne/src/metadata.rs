@@ -17,6 +17,7 @@ limitations under the License.
 //! Data structures for Cayenne metadata.
 
 use arrow_schema::SchemaRef;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
 
 /// Metadata about a table in the catalog.
@@ -36,6 +37,8 @@ pub struct TableMetadata {
     pub schema: SchemaRef,
     /// Primary key columns (for deletion vector support)
     pub primary_key: Vec<String>,
+    /// Configured on-conflict behavior for primary key uniqueness enforcement.
+    pub on_conflict: Option<OnConflict>,
     /// Current snapshot ID (`UUIDv7`, changes on overwrite/delete operations)
     /// All tables are created with an initial snapshot.
     pub current_snapshot_id: String,
@@ -211,6 +214,8 @@ pub struct CreateTableOptions {
     pub schema: SchemaRef,
     /// Primary key columns (for deletion vector support)
     pub primary_key: Vec<String>,
+    /// Optional on-conflict behavior for enforcing primary key uniqueness.
+    pub on_conflict: Option<OnConflict>,
     /// Base path for storing table data (can be local path or S3 URL)
     pub base_path: String,
     /// Optional partition column name (for partitioned tables)

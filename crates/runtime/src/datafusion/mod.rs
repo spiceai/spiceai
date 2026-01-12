@@ -977,21 +977,31 @@ impl DataFusion {
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
-        let source_table_provider = match dataset.access() {
-            AccessMode::Read => Arc::new(federated_read_table),
-            AccessMode::ReadWrite => {
-                let read_write_provider = source
-                    .read_write_provider(dataset)
-                    .await
-                    .ok_or_else(|| {
-                        WriteProviderNotImplementedSnafu {
-                            table_name: dataset.name.to_string(),
-                        }
-                        .build()
-                    })?
-                    .context(UnableToResolveTableProviderSnafu)?;
-                Arc::new(FederatedTable::new_unchecked(read_write_provider))
-            }
+
+        // For accelerated tables with on_conflict configured, the source doesn't need
+        // to support writes - writes go to the accelerated table only.
+        // Only require a read-write source when replication is enabled and no on_conflict
+        // is configured (writes need to go back to the source).
+        let has_on_conflict = dataset
+            .acceleration
+            .as_ref()
+            .is_some_and(|acc| !acc.on_conflict.is_empty());
+        let needs_source_writes = dataset.access() == AccessMode::ReadWrite && !has_on_conflict;
+
+        let source_table_provider = if needs_source_writes {
+            let read_write_provider = source
+                .read_write_provider(dataset)
+                .await
+                .ok_or_else(|| {
+                    WriteProviderNotImplementedSnafu {
+                        table_name: dataset.name.to_string(),
+                    }
+                    .build()
+                })?
+                .context(UnableToResolveTableProviderSnafu)?;
+            Arc::new(FederatedTable::new_unchecked(read_write_provider))
+        } else {
+            Arc::new(federated_read_table)
         };
 
         let source_schema = source_table_provider.schema();
@@ -1270,6 +1280,12 @@ impl DataFusion {
         if dataset.source() == LOCALPOD_DATACONNECTOR {
             self.attempt_to_synchronize_accelerated_table(&mut accelerated_table_builder, dataset)
                 .await;
+        }
+
+        // When on_conflict is configured, writes go to the accelerated table only,
+        // not to the federated source (which may not support writes).
+        if has_on_conflict {
+            accelerated_table_builder.write_to_accelerator_only();
         }
 
         accelerated_table_builder

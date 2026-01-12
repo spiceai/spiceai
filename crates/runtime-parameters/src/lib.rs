@@ -52,11 +52,19 @@ impl Parameters {
             key_to_use = &key[full_prefix.len()..];
         }
 
-        let spec = all_params.iter().find(|p| p.name == key_to_use);
+        // Find the non-deprecated spec matching the unprefixed key name
+        let spec = all_params
+            .iter()
+            .find(|p| p.name == key_to_use && p.deprecation_message.is_none());
 
-        // Try again with the full key if the unprefixed key was not found
+        // Find deprecated spec matching the unprefixed key name (for backwards compat)
+        // e.g., component("tools").deprecated(...) allows "openai_tools" to work
+        let deprecated_spec = all_params
+            .iter()
+            .find(|p| p.name == key_to_use && p.deprecation_message.is_some());
+
+        // If no match found for unprefixed key, check for exact match on full key
         if spec.is_none() && all_params.iter().any(|p| p.name == key) {
-            // Early exit to avoid checks below.
             return Some(key.to_string());
         }
 
@@ -73,6 +81,10 @@ impl Parameters {
         }
 
         if prefix_removed && !spec.r#type.is_prefixed() {
+            // Allow if there's a deprecated spec for backwards compat
+            if deprecated_spec.is_some() {
+                return Some(key_to_use.to_string());
+            }
             tracing::warn!(
                 "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
             );
@@ -92,6 +104,20 @@ impl Parameters {
         secrets: Arc<RwLock<Secrets>>,
         all_params: &'static [ParameterSpec],
     ) -> AnyErrorResult<Self> {
+        // Check for deprecated parameters using the original user-provided keys
+        // before normalization strips prefixes.
+        let original_keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+        for parameter in all_params {
+            if let Some(deprecation_message) = parameter.deprecation_message {
+                let user_key = parameter.display_name(prefix);
+                if original_keys.contains(&user_key.as_str()) {
+                    tracing::warn!(
+                        "Parameter '{user_key}' is deprecated for {component_name}: {deprecation_message}",
+                    );
+                }
+            }
+        }
+
         // Convert the user-provided parameters into the format expected by the component
         let mut params: Vec<(String, SecretString)> = params
             .into_iter()
@@ -124,19 +150,6 @@ impl Parameters {
                 );
                 // Insert without the prefix into the params
                 params.push((secret_key.name.to_string(), secret));
-            }
-        }
-
-        // Check for deprecated parameters
-        for parameter in all_params {
-            // Must be deprecated and present in user-provided params.
-            if let Some(deprecation_message) = parameter.deprecation_message
-                && params.iter().any(|p| p.0 == parameter.name)
-            {
-                tracing::warn!(
-                    "Parameter '{}' is deprecated for {component_name}: {deprecation_message}",
-                    parameter.display_name(prefix)
-                );
             }
         }
 

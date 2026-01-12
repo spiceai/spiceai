@@ -1,0 +1,21 @@
+tests:
+  bench:
+    spicepod_path: accelerated/s3[parquet]-cayenne[file].yaml
+    query_set: tpcds
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 1200
+    scale_factor: 10
+    validate_results: true
+  throughput:
+    spicepod_path: accelerated/s3[parquet]-cayenne[file].yaml
+    query_set: tpcds
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 1200
+    scale_factor: 10
+  load:
+    spicepod_path: accelerated/s3[parquet]-cayenne[file].yaml
+    query_set: tpcds
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 1200
+    scale_factor: 10
+    duration: 28800
