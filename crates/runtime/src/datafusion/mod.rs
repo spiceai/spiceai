@@ -2596,7 +2596,10 @@ mod tests {
 
             assert!(result.is_err(), "Empty string should fail interval parsing");
             assert!(
-                matches!(result, Err(Error::InvalidSnapshotCreationInterval)),
+                matches!(
+                    result,
+                    Err(Error::InvalidSnapshotCreationInterval { source: _ })
+                ),
                 "Expected InvalidSnapshotCreationInterval error, got: {result:?}",
             );
         }
@@ -2624,7 +2627,10 @@ mod tests {
 
             assert!(result.is_err(), "Empty string should fail batch parsing");
             assert!(
-                matches!(result, Err(Error::InvalidSnapshotCreationBatches)),
+                matches!(
+                    result,
+                    Err(Error::InvalidSnapshotCreationBatches { source: _ })
+                ),
                 "Expected InvalidSnapshotCreationBatches error, got: {result:?}",
             );
         }
