@@ -50,15 +50,6 @@ Vortex is Arrow-native by design. Data decompresses directly to Arrow arrays wit
 - **Polars** — Native Rust + Arrow compatibility
 - **PyArrow** — Python data science workflows
 
-### Rust Foundation
-
-Written entirely in Rust, Vortex benefits from:
-
-- Memory safety without garbage collection overhead
-- Fearless concurrency for parallel decode
-- Zero-cost abstractions for SIMD operations
-- Cargo ecosystem for dependency management
-
 ### Cloud Object Stores
 
 Vortex files work with any object store:
@@ -70,9 +61,79 @@ Vortex files work with any object store:
 
 ## Who's Using Vortex?
 
-### Spice AI
+### DuckDB
 
-We use Vortex as the storage layer for Cayenne, our data accelerator. Cayenne combines SQLite for metadata with Vortex for data, delivering better-than-DuckDB query performance without single-file limitations.
+[DuckDB announced native Vortex support](https://duckdb.org/2026/01/23/duckdb-vortex-extension) in January 2026, making Vortex a first-class citizen alongside Parquet, CSV, and JSON. The SpiralDB team built the extension, partnering with DuckDB Labs to deliver it as a core extension.
+
+**Performance results** from TPC-H SF100 benchmarks:
+
+- **18% faster** than Parquet v2 (geometric mean)
+- **35% faster** than Parquet v1
+- Significantly lower standard deviation across query runs
+
+```sql
+INSTALL vortex;
+LOAD vortex;
+
+SELECT * FROM read_vortex('my.vortex');
+
+COPY (SELECT * FROM my_table)
+TO 'output.vortex' (FORMAT vortex);
+```
+
+DuckDB highlights three key Vortex use cases:
+
+1. **SQL analytics** — Late decompression and compute on compressed data reduces IO
+2. **ML preprocessing** — Wide encoding support for audio, text, images, vectors
+3. **AI model training** — Efficient GPU data transfer via FastLanes encoding
+
+### Spice AI (Cayenne)
+
+[Spice Cayenne](https://spice.ai/blog/introducing-spice-cayenne-data-accelerator) is our next-generation data accelerator built on Vortex for multi-terabyte, low-latency workloads. Cayenne combines Vortex columnar storage with an embedded SQLite metadata layer.
+
+**Benchmark results** (TPC-H SF100, ClickBench):
+
+- **1.4x faster** than DuckDB file mode on TPC-H
+- **~3x lower memory usage** than DuckDB
+- **14% faster** on ClickBench with 3.4x less memory
+
+Vortex advantages in Cayenne:
+
+- **100x faster random access** than Parquet
+- **10–20x faster full scans**
+- **5x faster writes**
+- Zero-copy Arrow compatibility
+
+```yaml
+datasets:
+  - from: s3://my-bucket/data/
+    name: analytics_data
+    acceleration:
+      engine: cayenne
+      mode: file
+```
+
+### Polar Signals
+
+[Polar Signals switched from Parquet to Vortex](https://www.polarsignals.com/blog/posts/2025/11/25/interface-parquet-vortex) for their profiling database, achieving dramatic performance improvements:
+
+- **70% average performance improvement** across all queries
+- **10% better uncompressed storage size**
+- Only **3% larger compressed size** vs. snappy-compressed Parquet
+
+Their key insight: Parquet's conversion to Arrow dominated query CPU time. Vortex's design—late decompression, compute pushdown on compressed data, and zero-copy Arrow conversion—eliminated this bottleneck.
+
+> "Finding Vortex was like finding a pair of nice-fitting shoes after walking around in a size too small for longer than we could remember." — Alfonso Subiotto Marqués, Polar Signals
+
+### NVIDIA GPU Acceleration
+
+Vortex includes native CUDA support through dedicated GPU crates (`vortex-cuda`, `vortex-gpu`, `vortex-gpu-kernels`). Recent development integrates [NVIDIA nvCOMP](https://developer.nvidia.com/nvcomp) for GPU-accelerated decompression, enabling:
+
+- **Direct S3-to-GPU data transfer** — Skip CPU entirely for AI training pipelines
+- **FastLanes GPU encoding** — SIMD-friendly integer compression optimized for GPU saturation
+- **Zstd CUDA decompression** — Hardware-accelerated decompression via nvCOMP
+
+This positions Vortex as a key format for GPU-intensive workloads, bridging storage and compute for AI/ML pipelines.
 
 ### Research Institutions
 
@@ -148,80 +209,108 @@ The Vortex project represents the future of columnar storage: research-grade alg
 
 ## LinkedIn Post (~3000 characters)
 
-🌐 The Vortex Ecosystem: Who's Building the Future of Columnar Storage?
+🌐 The Vortex Ecosystem Is Ready
 
-When we bet on Vortex at Spice AI, we weren't just evaluating the technology—we were evaluating the ecosystem. Here's what convinced us:
+In August 2024, Vortex was donated to the Linux Foundation. Eighteen months later, the ecosystem has matured into something production-ready. Here's the full picture.
 
-Linux Foundation Stewardship
+Linux Foundation Governance
 
-In 2024, Vortex moved to the Linux Foundation. This wasn't just PR—it fundamentally changed the governance model. No single vendor controls the roadmap. Contributors know their code won't be relicensed. Enterprise legal teams trust LF projects.
+Vortex now sits alongside projects like PyTorch and ONNX under the LF AI & Data Foundation. This matters for enterprise adoption:
 
-For infrastructure you're building on, governance matters as much as code quality.
+• Neutral governance—no single vendor controls the roadmap
+• Long-term stability—foundation outlives any company
+• Enterprise trust—legal teams know what they're getting
 
-Spiral: The Company Behind Vortex
+Spiral, the company behind Vortex (founded by ex-Google/Meta columnar systems engineers), provides commercial support while contributing to the open-source core. The proven open-core model aligns incentives—Spiral wins when Vortex adoption grows.
 
-Spiral (formerly Vortex Labs) employs the core maintainers and offers commercial support. Founded by ex-Google and ex-Meta engineers, they know columnar systems deeply.
+Why Vortex Exists
 
-The business model is proven open-core: open-source the format, commercialize managed services. This aligns incentives—Spiral wins when Vortex adoption grows.
+Parquet has been the columnar format for a decade. But "efficient storage" doesn't mean "efficient querying." Reading Parquet means decompressing blocks, then converting to Arrow for computation. That conversion dominates CPU time.
 
-Arrow-Native Architecture
+Vortex takes a different approach: late decompression and compute pushdown. Filter expressions execute directly on compressed data. When you do decompress, encodings like ALP (floats), FSST (strings), and FastLanes (integers) are SIMD-friendly and decode directly to Arrow with zero copies.
 
-Vortex was designed for the Arrow ecosystem, not retrofitted. Zero-copy decompression to Arrow arrays means seamless integration with DataFusion, DuckDB, Polars, and PyArrow. If you're in the Arrow world, Vortex just works.
+The result: 100x faster random access, 10-20x faster scans, Arrow-native from the ground up.
 
-Rust Foundation
+Ecosystem Integrations
 
-Pure Rust implementation means memory safety without GC pauses, fearless concurrency for parallel decode, and first-class SIMD support. The Cargo ecosystem handles dependencies cleanly.
+The integration story is strong and growing:
+
+• DataFusion—native TableProvider via vortex-datafusion
+• DuckDB—core extension with full read/write support
+• Polars—Rust + Arrow compatibility
+• PyArrow—Python data science workflows
+• NVIDIA nvCOMP—GPU-accelerated decompression for AI/ML pipelines
+
+DuckDB's adoption as a core extension in January 2026 signals Vortex is ready for mainstream use.
+
+Real-World Results
+
+Early adopters are seeing consistent improvements across independent evaluations:
+
+DuckDB benchmarks (TPC-H SF100):
+• 18% faster than Parquet v2 (geometric mean)
+• 35% faster than Parquet v1
+
+Polar Signals (profiling database):
+• 70% query performance improvement
+• 10% better uncompressed storage size
+
+Spice AI Cayenne (data accelerator):
+• 1.4x faster than DuckDB on TPC-H
+• ~3x lower memory usage
+
+These numbers come from three independent teams—this isn't one vendor's marketing.
 
 Where Vortex Fits
 
-The columnar format landscape is crowded:
-• Parquet: Universal but slow to decode
-• Arrow IPC: Fast but uncompressed
-• ORC: Mature but Java-centric
+Vortex isn't replacing Parquet everywhere. It's the right choice for:
 
-Vortex is the Arrow-native, fast-decode, compressed option. More compact than Arrow IPC, faster than Parquet, simpler than Iceberg.
+• Latency-sensitive workloads on object storage
+• Multi-terabyte datasets with sub-second query requirements
+• Arrow-native applications (DataFusion, DuckDB, Polars)
+• ML/AI pipelines needing efficient GPU data transfer
 
-Who's Using It?
+For archival storage or maximum interoperability, Parquet remains the safe choice. But for hot data acceleration? The ecosystem has shifted.
 
-At Spice AI, Vortex powers Cayenne, our data accelerator. Academic groups reference it as a production-ready BtrBlocks implementation. Arrow-ecosystem startups adopt it when they need compressed columnar storage with fast decode.
+We've built Spice Cayenne on Vortex and contribute improvements upstream. The combination of research-grade algorithms, production-quality code, and sustainable governance is rare.
 
-The ecosystem is young but growing with the right foundations: neutral governance, commercial backing, and architectural fit with the Arrow world.
-
-Our Contribution
-
-We maintain a Vortex fork aligned with our Arrow/DataFusion versions, contributing improvements upstream. Open source works when users invest back.
-
-If you're evaluating columnar storage for Arrow-native workloads, Vortex deserves serious consideration. The combination of research-grade algorithms, production-quality code, and sustainable governance is rare.
-
-What formats are you building on? We'd love to compare notes.
+What columnar formats are you building on?
 
 ---
 
 ## X Post (280 characters)
 
-🌐 Vortex ecosystem update:
+🌐 Vortex ecosystem is production-ready:
 
-✅ Linux Foundation governance (neutral, trusted)
-✅ Spiral backing (ex-Google/Meta team)
-✅ Arrow-native (zero-copy decode)
-✅ Pure Rust (safe + fast)
+✅ DuckDB core extension (18-35% faster)
+✅ NVIDIA nvCOMP GPU acceleration
+✅ Spice Cayenne (1.4x faster)
+✅ Polar Signals (70% speedup)
+✅ Linux Foundation governance
 
-The columnar format for the Arrow age. We're all in.
+The Arrow-native columnar format.
 
 ---
 
 ## Reply with References
 
 References:
-• Vortex GitHub: github.com/vortex-data/vortex
-• Spiral: spiraldb.com
-• Linux Foundation: linuxfoundation.org
-• Apache Arrow: arrow.apache.org
-• Apache DataFusion: datafusion.apache.org
-• DuckDB: duckdb.org
-• Polars: pola.rs
-• Apache Parquet: parquet.apache.org
-• Apache Iceberg: iceberg.apache.org
-• Spice AI Vortex fork: github.com/spiceai/vortex
-• Part 1 (Research): [link to Part 1 post]
-• Part 2 (Use Cases): [link to Part 2 post]
+
+- Vortex GitHub: <https://github.com/vortex-data/vortex>
+- Spiral: <https://spiraldb.com>
+- Linux Foundation Announcement: <https://www.linuxfoundation.org/press/lf-ai-data-foundation-hosts-vortex-project-to-power-high-performance-data-access-for-ai-and-analytics>
+- DuckDB Vortex Extension: <https://duckdb.org/2026/01/23/duckdb-vortex-extension>
+- Spice Cayenne: <https://spice.ai/blog/introducing-spice-cayenne-data-accelerator>
+- Polar Signals Vortex: <https://www.polarsignals.com/blog/posts/2025/11/25/interface-parquet-vortex>
+- Vortex CUDA (nvCOMP): <https://github.com/vortex-data/vortex/tree/develop/vortex-cuda>
+- Vortex Benchmarks: <https://bench.vortex.dev>
+- Spice AI Vortex fork: <https://github.com/spiceai/vortex>
+
+Previous posts in this series:
+
+- Part 1 (Research): <https://www.linkedin.com/posts/lukekim_datafusion-spiceai-data-activity-7417019189477126144-1TRe>
+- Part 2 (Use Cases): <https://www.linkedin.com/posts/lukekim_vortex-efficient-columnar-storage-for-hot-activity-7419472524750798848-lZC6>
+
+Related:
+
+- Vortex at Spice AI: <https://www.linkedin.com/posts/lukekim_datafusion-developers-ai-activity-7417649503291498496-TD5_>
