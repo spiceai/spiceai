@@ -2347,7 +2347,7 @@ mod tests {
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             local_path: local_path.clone(),
             engine: AccelerationEngine::DuckDB,
-            object_store: store.clone(),
+            object_store: Arc::clone(&store),
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
             checkpointer_factory: Some(factory),
             compaction_enabled: true, // Enable compaction
