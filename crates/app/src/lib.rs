@@ -161,14 +161,28 @@ impl AppBuilder {
         }
     }
 
+    /// Load a spicepod dependency into the app builder.
+    ///
+    /// As a dependency, `.runtime`, `.management`, and `.snapshots` configurations will be ignored.
     #[must_use]
-    pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
-        self.runtime = spicepod.runtime.clone();
+    pub fn with_spicepod_dependency(mut self, spicepod: Spicepod) -> AppBuilder {
+        if spicepod.runtime != Runtime::default() {
+            println!(
+                "Spicepod dependency has 'runtime' field(s) defined. Runtime configuration must be set in primary spicepod. runtime configuration from dependency will be ignored."
+            );
+        }
         self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
-        self.management.clone_from(&spicepod.management);
-        if let Some(ref snapshot) = spicepod.snapshots {
-            self.snapshots = Some(snapshot.clone());
+
+        if spicepod.management.is_some() {
+            println!(
+                "Spicepod dependency has 'management' field(s) defined. Management configuration must be set in primary spicepod. management configuration from dependency will be ignored."
+            );
+        }
+        if spicepod.snapshots.is_some() {
+            println!(
+                "Spicepod dependency has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. snapshots configuration from dependency will be ignored."
+            );
         }
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());

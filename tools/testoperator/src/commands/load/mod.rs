@@ -51,7 +51,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         );
         let spicepod = Spicepod::load_exact(args.test_args.common.spicepod_path.clone()).await?;
         let app = AppBuilder::new(spicepod.name.clone())
-            .with_spicepod(spicepod)
+            .with_spicepod_dependency(spicepod)
             .build();
         let instance = SpicedInstance::external(&args.test_args.common.spiced_path);
         (app, instance)
