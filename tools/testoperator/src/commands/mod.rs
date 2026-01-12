@@ -106,7 +106,7 @@ pub(crate) async fn run_or_connect_spiced(
         );
         let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
         let app = AppBuilder::new(spicepod.name.clone())
-            .with_spicepod_dependency(spicepod)
+            .with_spicepod(spicepod)
             .build();
         let instance = SpicedInstance::external(&args.spiced_path);
         (app, instance)
@@ -131,8 +131,7 @@ pub(crate) async fn get_app_and_start_request(
     }
 
     let mut spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
-    let mut app_builder =
-        AppBuilder::new(spicepod.name.clone()).with_spicepod_dependency(spicepod.clone());
+    let mut app_builder = AppBuilder::new(spicepod.name.clone()).with_spicepod(spicepod.clone());
 
     if let Some(dependencies_root) = &args.spicepod_dependencies {
         for dependency in &spicepod.dependencies {
