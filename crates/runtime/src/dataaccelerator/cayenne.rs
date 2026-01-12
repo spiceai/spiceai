@@ -1747,7 +1747,10 @@ impl DataAccelerator for CayenneAccelerator {
 
             // Validate that snapshots are not enabled
             if !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
-                tracing::warn!("Dataset {}: Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: disabled' or remove the snapshots configuration", source.name());
+                tracing::warn!(
+                    "Dataset {}: Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: disabled' or remove the snapshots configuration",
+                    source.name()
+                );
             }
         }
 

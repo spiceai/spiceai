@@ -2101,8 +2101,8 @@ async fn build_snapshot_creation_config(
     refresh_mode: RefreshMode,
     snapshot_path: PathBuf,
 ) -> Result<Option<SnapshotCreationConfig>> {
-    let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes) || (matches!(refresh_mode, RefreshMode::Append)
-        && dataset.time_column.is_none());
+    let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
+        || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
     let snapshot_threshold: Option<String> =
         acceleration_settings.snapshots_trigger_threshold.clone();
@@ -2135,7 +2135,7 @@ async fn build_snapshot_creation_config(
                 } else {
                     Ok(batches)
                 }
-            },
+            }
             None => Ok(DEFAULT_SNAPSHOT_CREATION_BATCHES),
         }
     };
@@ -2154,7 +2154,6 @@ async fn build_snapshot_creation_config(
                 SnapshotCreateTrigger::Batches(batches)
             }
         }
-
     } else {
         match snapshot_trigger {
             None | Some(SnapshotsTrigger::RefreshComplete) => {
@@ -2259,11 +2258,11 @@ mod tests {
         use super::*;
         use crate::component::dataset::Dataset;
         use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
+        use runtime_acceleration::snapshot::SnapshotBehavior;
         use spicepod::acceleration::SnapshotsTrigger;
+        use spicepod::component::snapshot::Snapshots;
         use std::sync::Arc;
         use tempfile::TempDir;
-        use spicepod::component::snapshot::Snapshots;
-        use runtime_acceleration::snapshot::SnapshotBehavior;
 
         async fn create_test_dataset(time_column: Option<String>) -> Dataset {
             let runtime = crate::Runtime::builder().build().await;
@@ -2297,7 +2296,11 @@ mod tests {
             secrets: &Arc<TokioRwLock<Secrets>>,
         ) -> SnapshotBehavior {
             SnapshotBehavior::enabled(
-                Arc::new(Snapshots{location, enabled: true, ..Snapshots::default()}),
+                Arc::new(Snapshots {
+                    location,
+                    enabled: true,
+                    ..Snapshots::default()
+                }),
                 Arc::downgrade(secrets),
                 Handle::current(),
             )
@@ -2322,7 +2325,13 @@ mod tests {
         #[tokio::test]
         async fn test_default() {
             let dataset = create_test_dataset(None).await;
-            let acceleration = create_acceleration_with_trigger(None, Engine::DuckDB, None, None, &dataset.runtime().secrets());
+            let acceleration = create_acceleration_with_trigger(
+                None,
+                Engine::DuckDB,
+                None,
+                None,
+                &dataset.runtime().secrets(),
+            );
             let temp_dir = TempDir::new().expect("Failed to create temp dir");
             let snapshot_path = temp_dir.path().join("snapshot.db");
 
@@ -2332,7 +2341,7 @@ mod tests {
                 RefreshMode::Full,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             assert!(result.expect("config should exist").is_none());
         }
@@ -2356,10 +2365,14 @@ mod tests {
                 RefreshMode::Append,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             // StreamBatches should work for streaming mode
-            assert!(result.is_ok(), "Expected Ok for streaming with StreamBatches, got: {:?}", result);
+            assert!(
+                result.is_ok(),
+                "Expected Ok for streaming with StreamBatches, got: {:?}",
+                result
+            );
             let config = result
                 .expect("config should exist")
                 .expect("config should be Some");
@@ -2390,10 +2403,14 @@ mod tests {
                 RefreshMode::Changes,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             // StreamBatches should work for streaming mode
-            assert!(result.is_ok(), "Expected Ok for streaming with StreamBatches, got: {:?}", result);
+            assert!(
+                result.is_ok(),
+                "Expected Ok for streaming with StreamBatches, got: {:?}",
+                result
+            );
             let config = result
                 .expect("config should exist")
                 .expect("config should be Some");
@@ -2424,10 +2441,13 @@ mod tests {
                 RefreshMode::Full,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             // RefreshComplete should fail for streaming mode
-            assert!(result.is_err(), "Expected error: Full + time_column should be streaming");
+            assert!(
+                result.is_err(),
+                "Expected error: Full + time_column should be streaming"
+            );
             assert!(
                 matches!(result, Err(Error::UnsupportedStreamBatchesForBatchRefresh)),
                 "Expected UnsupportedRefreshCompleteForStream error, got: {:?}",
@@ -2454,10 +2474,13 @@ mod tests {
                 RefreshMode::Append,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             // RefreshComplete should fail for streaming mode
-            assert!(result.is_err(), "Expected error: Full + time_column should be streaming");
+            assert!(
+                result.is_err(),
+                "Expected error: Full + time_column should be streaming"
+            );
             assert!(
                 matches!(result, Err(Error::UnsupportedStreamBatchesForBatchRefresh)),
                 "Expected UnsupportedRefreshCompleteForStream error, got: {:?}",
@@ -2484,7 +2507,7 @@ mod tests {
                 RefreshMode::Append,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             let config = result
                 .expect("config should exist")
@@ -2500,7 +2523,8 @@ mod tests {
         #[tokio::test]
         async fn test_negative_batch_count() {
             let dataset = create_test_dataset(None).await;
-            let acceleration = create_acceleration_with_trigger(None,
+            let acceleration = create_acceleration_with_trigger(
+                None,
                 Engine::DuckDB,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("-10".to_string()),
@@ -2515,11 +2539,14 @@ mod tests {
                 RefreshMode::Append,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             assert!(result.is_err(), "Empty string should fail interval parsing");
             assert!(
-                matches!(result, Err(Error::SnapshotCreationBatchesShouldBePositive { .. })),
+                matches!(
+                    result,
+                    Err(Error::SnapshotCreationBatchesShouldBePositive { .. })
+                ),
                 "Expected SnapshotCreationBatchesShouldBePositive error, got: {:?}",
                 result
             );
@@ -2528,7 +2555,8 @@ mod tests {
         #[tokio::test]
         async fn test_zero_batch_count() {
             let dataset = create_test_dataset(None).await;
-            let acceleration = create_acceleration_with_trigger(None,
+            let acceleration = create_acceleration_with_trigger(
+                None,
                 Engine::DuckDB,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some("0".to_string()),
@@ -2543,11 +2571,14 @@ mod tests {
                 RefreshMode::Append,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             assert!(result.is_err(), "Empty string should fail interval parsing");
             assert!(
-                matches!(result, Err(Error::SnapshotCreationBatchesShouldBePositive { .. })),
+                matches!(
+                    result,
+                    Err(Error::SnapshotCreationBatchesShouldBePositive { .. })
+                ),
                 "Expected SnapshotCreationBatchesShouldBePositive error, got: {:?}",
                 result
             );
@@ -2556,7 +2587,8 @@ mod tests {
         #[tokio::test]
         async fn test_empty_string_threshold_for_interval() {
             let dataset = create_test_dataset(Some("ts".to_string())).await;
-            let acceleration = create_acceleration_with_trigger(None,
+            let acceleration = create_acceleration_with_trigger(
+                None,
                 Engine::DuckDB,
                 Some(SnapshotsTrigger::TimeInterval),
                 Some(String::new()),
@@ -2571,7 +2603,7 @@ mod tests {
                 RefreshMode::Full,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             assert!(result.is_err(), "Empty string should fail interval parsing");
             assert!(
@@ -2584,7 +2616,8 @@ mod tests {
         #[tokio::test]
         async fn test_empty_string_threshold_for_batches() {
             let dataset = create_test_dataset(None).await;
-            let acceleration = create_acceleration_with_trigger(None,
+            let acceleration = create_acceleration_with_trigger(
+                None,
                 Engine::DuckDB,
                 Some(SnapshotsTrigger::StreamBatches),
                 Some(String::new()),
@@ -2599,7 +2632,7 @@ mod tests {
                 RefreshMode::Changes,
                 snapshot_path,
             )
-                .await;
+            .await;
 
             assert!(result.is_err(), "Empty string should fail batch parsing");
             assert!(
