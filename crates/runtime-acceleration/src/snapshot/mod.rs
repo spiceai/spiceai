@@ -2309,10 +2309,7 @@ mod tests {
         {
             let conn = Connection::open(&local_path).expect("open duckdb");
 
-            conn.execute(
-                "CREATE TABLE test_data (id INTEGER, padding VARCHAR)",
-                [],
-            )
+            conn.execute("CREATE TABLE test_data (id INTEGER, padding VARCHAR)", [])
                 .expect("create table");
 
             // Insert data with padding to make file size significant
@@ -2322,7 +2319,7 @@ mod tests {
                  FROM generate_series(1, 2000000) AS t(i)",
                 [],
             )
-                .expect("insert data");
+            .expect("insert data");
 
             // Delete most rows to create dead tuples (fragmentation)
             conn.execute("DELETE FROM test_data WHERE id > 50", [])
