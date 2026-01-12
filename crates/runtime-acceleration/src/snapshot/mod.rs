@@ -2303,8 +2303,6 @@ mod tests {
         let temp_dir = TempDir::new().expect("create temp dir");
         let local_path = temp_dir.path().join("snapshot.duckdb");
 
-        println!("!! local_path: {}", local_path.to_string_lossy());
-
         // Create a fragmented DuckDB database
         {
             let conn = Connection::open(&local_path).expect("open duckdb");
@@ -2341,17 +2339,13 @@ mod tests {
             })
         });
 
-        let manager = SnapshotManager {
-            dataset_name: DATASET_NAME.to_string(),
-            snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
-            snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
-            local_path: local_path.clone(),
-            engine: AccelerationEngine::DuckDB,
-            object_store: Arc::clone(&store),
-            bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
-            checkpointer_factory: Some(factory),
-            compaction_enabled: true, // Enable compaction
-        };
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            true,
+        );
 
         let mutex = Arc::new(Mutex::new(()));
         let lock_guard = mutex.lock_owned().await;
