@@ -27,6 +27,9 @@ pub use worker::{TextToSqlConfig, TextToSqlRequest, TextToSqlResult};
 use worker::{TextToSqlWorker, TextToSqlWorkerResult};
 mod task_history;
 
+mod parse;
+pub use parse::{table_projections, tables, tables_and_projection};
+
 #[derive(Default)]
 pub struct NotStarted {
     config: TextToSqlConfig,
