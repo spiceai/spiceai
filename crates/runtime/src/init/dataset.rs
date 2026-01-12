@@ -695,7 +695,11 @@ impl Runtime {
                 })?;
         let accelerator_engine = acceleration_settings.engine;
 
-        if ds.access() == AccessMode::ReadWrite && !replicate {
+        // Allow ReadWrite access when:
+        // 1. Replication is enabled (changes are synced back to source), OR
+        // 2. on_conflict is configured (accelerator supports local writes via upsert/drop)
+        let has_on_conflict = !acceleration_settings.on_conflict.is_empty();
+        if ds.access() == AccessMode::ReadWrite && !replicate && !has_on_conflict {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 
