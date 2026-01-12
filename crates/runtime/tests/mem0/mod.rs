@@ -89,7 +89,7 @@ fn create_test_client() -> Option<Mem0Client> {
 
 /// Generate a unique test user ID to avoid conflicts between test runs.
 fn test_user_id() -> String {
-    format!("test-user-{}", uuid::Uuid::new_v4())
+    format!("test-user-{}", uuid::Uuid::now_v7())
 }
 
 /// Helper to clean up a user's memories, ignoring errors

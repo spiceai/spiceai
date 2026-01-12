@@ -56,7 +56,7 @@ impl MemoryEngine for BuiltinMemoryEngine {
         let table_name = memory_table_name(&self.rt).await?;
 
         let batch = try_from(&[MemoryTableElement {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             value: value.to_string(),
             created_by: created_by.map(ToString::to_string),
             created_at: Utc::now().timestamp(),

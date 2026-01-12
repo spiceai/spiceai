@@ -200,7 +200,6 @@ pub struct AddMemoryRequest {
     pub enable_graph: Option<bool>,
 }
 
-#[expect(dead_code, reason = "Required by serde default attribute")]
 fn default_true() -> bool {
     true
 }
@@ -282,7 +281,6 @@ pub struct SearchMemoryRequest {
     pub enable_graph: Option<bool>,
 }
 
-#[expect(dead_code, reason = "Required by serde default attribute")]
 fn default_version() -> String {
     "v2".to_string()
 }
