@@ -20,6 +20,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::init_tracing;
 use arrow::array::Int32Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -29,15 +30,16 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use runtime::Runtime;
 use runtime::accelerated_table::refresh::{AccelerationRefreshMode, Refresh, Refresher};
+use runtime::accelerated_table::{SnapshotCreateTrigger, SnapshotCreationConfig};
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::federated_table::FederatedTable;
 use runtime::status;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager};
+use runtime_acceleration::snapshot::{
+    AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
+};
 use spicepod::component::snapshot::Snapshots;
 use tokio::sync::{Mutex, RwLock, mpsc};
-use runtime::accelerated_table::{SnapshotCreateTrigger, SnapshotCreationConfig};
-use crate::init_tracing;
 
 struct MockCheckpointer;
 
@@ -159,12 +161,15 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
         snapshot_behavior,
         local_snapshot_file.clone(),
         AccelerationEngine::DuckDB,
-    ).await.expect("Failed to create snapshot manager");
+    )
+    .await
+    .expect("Failed to create snapshot manager");
 
     refresher.checkpointer(Some(Arc::new(MockCheckpointer)));
-    refresher.with_snapshot_creation_config(
-        Some(SnapshotCreationConfig {manager: Arc::new(snapshot_manager), create_trigger: SnapshotCreateTrigger::RefreshComplete})
-    );
+    refresher.with_snapshot_creation_config(Some(SnapshotCreationConfig {
+        manager: Arc::new(snapshot_manager),
+        create_trigger: SnapshotCreateTrigger::RefreshComplete,
+    }));
 
     let (_start_refresh, on_start_refresh) = mpsc::channel(1);
     let refresh_handle = refresher

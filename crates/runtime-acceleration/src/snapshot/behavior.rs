@@ -41,7 +41,10 @@ impl PartialEq for SnapshotBehavior {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (SnapshotBehavior::Disabled, SnapshotBehavior::Disabled) => true,
-            (SnapshotBehavior::Enabled(snap1, _, _, _), SnapshotBehavior::Enabled(snap2, _, _, _))
+            (
+                SnapshotBehavior::Enabled(snap1, _, _, _),
+                SnapshotBehavior::Enabled(snap2, _, _, _),
+            )
             | (
                 SnapshotBehavior::CreateOnly(snap1, _, _, _),
                 SnapshotBehavior::CreateOnly(snap2, _, _, _),
@@ -172,7 +175,15 @@ impl SnapshotBehavior {
                     return SnapshotBehavior::Disabled;
                 }
 
-                SnapshotBehavior::Enabled(snapshots, secrets, io_runtime, matches!(compaction, spicepod_acceleration::SnapshotsCompaction::Enabled))
+                SnapshotBehavior::Enabled(
+                    snapshots,
+                    secrets,
+                    io_runtime,
+                    matches!(
+                        compaction,
+                        spicepod_acceleration::SnapshotsCompaction::Enabled
+                    ),
+                )
             }
             spicepod_acceleration::SnapshotBehavior::BootstrapOnly => {
                 if !snapshots.enabled {
@@ -192,7 +203,15 @@ impl SnapshotBehavior {
                     return SnapshotBehavior::Disabled;
                 }
 
-                SnapshotBehavior::CreateOnly(snapshots, secrets, io_runtime, matches!(compaction, spicepod_acceleration::SnapshotsCompaction::Enabled))
+                SnapshotBehavior::CreateOnly(
+                    snapshots,
+                    secrets,
+                    io_runtime,
+                    matches!(
+                        compaction,
+                        spicepod_acceleration::SnapshotsCompaction::Enabled
+                    ),
+                )
             }
         }
     }

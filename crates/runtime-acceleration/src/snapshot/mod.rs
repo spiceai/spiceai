@@ -560,7 +560,9 @@ impl SnapshotManager {
             | SnapshotBehavior::CreateOnly(s, secrets, io_runtime, compaction_enabled) => {
                 (s, secrets.upgrade()?, io_runtime, compaction_enabled)
             }
-            SnapshotBehavior::BootstrapOnly(s, secrets, io_runtime) => (s, secrets.upgrade()?, io_runtime, false)
+            SnapshotBehavior::BootstrapOnly(s, secrets, io_runtime) => {
+                (s, secrets.upgrade()?, io_runtime, false)
+            }
         };
         tracing::debug!("Snapshots are enabled for {dataset_name}");
 
@@ -608,8 +610,8 @@ impl SnapshotManager {
             match &engine {
                 #[cfg(feature = "duckdb")]
                 AccelerationEngine::DuckDB => {
-                    tracing::info!("Snapshot compaction is enabled for dataset {dataset_name}")
-                },
+                    tracing::info!("Snapshot compaction is enabled for dataset {dataset_name}");
+                }
                 engine => {
                     tracing::warn!(
                         "Snapshot compaction is enabled for dataset {dataset_name} but engine {engine:?} does not support compaction"

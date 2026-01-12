@@ -39,7 +39,9 @@ use object_store::{
     path::{Path as ObjectPath, PathPart},
 };
 use runtime::{Runtime, status::ComponentStatus};
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager};
+use runtime_acceleration::snapshot::{
+    AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
+};
 use serde_json::{Value, json};
 use spicepod::{
     acceleration::{
