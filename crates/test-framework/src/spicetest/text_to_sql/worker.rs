@@ -154,6 +154,7 @@ impl TextToSqlWorker {
                     .map_err(|e| {
                         anyhow::anyhow!("could not find task history metrics. Error: {e}")
                     })?;
+
                 let generated_sql = generated_sql.or(sql).unwrap_or_default();
 
                 // Compute Logical Plans

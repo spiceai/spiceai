@@ -150,6 +150,7 @@ search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
 secrecy.workspace = true
+scylla = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
@@ -284,6 +285,11 @@ s3_vectors = [
     "data_components/s3_vectors",
     "dep:s3_vectors",
     "search/s3_vectors",
+]
+scylladb = [
+    "dep:scylla",
+    "db_connection_pool/scylladb",
+    "data_components/scylladb",
 ]
 sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]

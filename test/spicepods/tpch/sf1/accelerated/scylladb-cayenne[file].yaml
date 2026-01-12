@@ -1,0 +1,56 @@
+version: v1
+kind: Spicepod
+name: scylladb-cayenne[file]
+
+# Define common anchors
+definitions:
+  # Common ScyllaDB parameters
+  - &scylladb_params
+    scylladb_host: ${ env:SCYLLADB_HOST }
+    scylladb_port: ${ env:SCYLLADB_PORT }
+    scylladb_keyspace: ${ env:SCYLLADB_KEYSPACE }
+  - &acceleration
+    enabled: true
+    engine: cayenne
+    mode: file
+
+datasets:
+  - from: scylladb:customer
+    name: customer
+    params: *scylladb_params
+    acceleration: *acceleration
+
+  - from: scylladb:lineitem
+    name: lineitem
+    params: *scylladb_params
+    acceleration: *acceleration
+
+  - from: scylladb:nation
+    name: nation
+    params: *scylladb_params
+    acceleration: *acceleration
+
+  - from: scylladb:orders
+    name: orders
+    params: *scylladb_params
+    acceleration: *acceleration
+
+  - from: scylladb:part
+    name: part
+    params: *scylladb_params
+    acceleration: *acceleration
+
+  - from: scylladb:partsupp
+    name: partsupp
+    params: *scylladb_params
+    acceleration: *acceleration
+
+  - from: scylladb:region
+    name: region
+    params: *scylladb_params
+    acceleration: *acceleration
+
+  - from: scylladb:supplier
+    name: supplier
+    params: *scylladb_params
+    acceleration: *acceleration
