@@ -1,0 +1,10 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+assertion_line: 742
+description: "Query: tpch_q17"
+---
++-------------------+
+| avg_yearly        |
++-------------------+
+| 348406.0542857143 |
++-------------------+

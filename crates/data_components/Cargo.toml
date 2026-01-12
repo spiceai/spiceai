@@ -74,6 +74,7 @@ runtime-rate-control = { path = "../runtime-rate-control" }
 rusqlite = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
+scylla = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -143,6 +144,7 @@ postgres = [
     "datafusion-table-providers/postgres-federation",
 ]
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
+scylladb = ["dep:scylla", "datafusion-table-providers/federation"]
 sharepoint = ["dep:graph-rs-sdk"]
 snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation"]
 spark_connect = ["dep:spark-connect-rs"]
