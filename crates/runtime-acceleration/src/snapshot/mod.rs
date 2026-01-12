@@ -21,7 +21,7 @@ use std::{
     sync::{Arc, LazyLock},
     time::Instant,
 };
-
+use std::path::Path;
 use arrow_schema::{Schema, SchemaRef};
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use bytes::BytesMut;
@@ -844,17 +844,13 @@ impl SnapshotManager {
     #[cfg(feature = "duckdb")]
     async fn compact_duckdb(
         &self,
-        source: &PathBuf,
-        dest: &PathBuf,
+        source: &Path,
+        dest: &Path,
     ) -> Result<(), SnapshotUploadError> {
-        let source = source.clone();
-        let dest = dest.clone();
+        let source = source.to_path_buf();
+        let dest = dest.to_path_buf();
         let dest_for_metrics = dest.clone();
         let dataset_name = self.dataset_name.clone();
-
-        let start = Instant::now();
-
-        let source_size = fs::metadata(&source).await.map(|m| m.len()).unwrap_or(0);
 
         tokio::task::spawn_blocking(move || {
             // Remove destination if it exists
@@ -895,22 +891,6 @@ impl SnapshotManager {
             dataset: self.dataset_name.clone(),
             source: e,
         })??;
-
-        let dest_size = fs::metadata(&dest_for_metrics)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let reduction_pct = if source_size > 0 {
-            (1.0 - (dest_size as f64 / source_size as f64)) * 100.0
-        } else {
-            0.0
-        };
-
-        tracing::info!(
-            "DuckDB compaction complete. dataset={} duration={:?} source_size={source_size} dest_size={dest_size} reduction={reduction_pct:.1}%",
-            self.dataset_name,
-            start.elapsed()
-        );
 
         Ok(())
     }
@@ -1935,7 +1915,7 @@ mod tests {
         );
 
         let mutex = Arc::new(Mutex::new(()));
-        let lock_guard = mutex.clone().lock_owned().await;
+        let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
             .create_snapshot(&schema, lock_guard)
