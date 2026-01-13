@@ -351,10 +351,10 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "7b3
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c4d7a7278de15533ba3252b7eb334ea63fd4f6c4" } # spiceai-51 (DF51 + spice features)
 
-# TODO: cherry-pick spice patches (TLS, API key auth, UDF sync) onto spiceai-51 from spiceai-50
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "ec4a720d62de6ffc7072b264ea649a2f63f56b50" }           # spiceai:spiceai-51 (upstream main)
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", rev = "ec4a720d62de6ffc7072b264ea649a2f63f56b50" }   # spiceai:spiceai-51
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "ec4a720d62de6ffc7072b264ea649a2f63f56b50" } # spiceai:spiceai-51
+# spiceai-51: DF51 base + TLS, API key auth, UDF sync patches
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "94db4f96e2874fa4117b80fb7e50ec1f41f55e8e" }      # spiceai-51
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", rev = "94db4f96e2874fa4117b80fb7e50ec1f41f55e8e" } # spiceai-51
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "94db4f96e2874fa4117b80fb7e50ec1f41f55e8e" } # spiceai-51
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "923c33ede98429f6b5e9692fa9680ac455708c32" } # spiceai-57

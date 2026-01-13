@@ -33,7 +33,6 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
-use futures::TryFutureExt;
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{
     metrics::{

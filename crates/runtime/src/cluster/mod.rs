@@ -604,11 +604,8 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    // Note: The ready signal channel was removed in ballista DF51 update.
-    // We now proceed without waiting for explicit readiness signal.
-
     let executor_poll_loop = tokio::spawn(
-        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec).map_err(|e| {
+        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec, None).map_err(|e| {
             FailedToStartClusterExecutor {
                 source: Box::new(e),
             }
