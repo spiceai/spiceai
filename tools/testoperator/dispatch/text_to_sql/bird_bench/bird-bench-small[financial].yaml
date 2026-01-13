@@ -4,7 +4,21 @@ tests:
       benchmark_queryset: bird-bench-small[financial]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: financial
     - model_name: claude-sonnet-4-5
       benchmark_queryset: bird-bench-small[financial]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: financial
+    - model_name: grok41
+      benchmark_queryset: bird-bench-small[financial]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: financial-evidence
+      use_evidence: true
+    - model_name: claude-sonnet-4-5
+      benchmark_queryset: bird-bench-small[financial]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: financial-evidence
+      use_evidence: true
