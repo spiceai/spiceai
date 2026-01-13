@@ -204,7 +204,11 @@ fn create_test_parquet_file(path: &std::path::Path, values: Vec<i32>) -> Result<
     use datafusion::parquet::arrow::ArrowWriter;
     use std::fs::File;
 
-    let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int32, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int32,
+        false,
+    )]));
 
     let array = Int32Array::from(values);
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)])
