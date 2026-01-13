@@ -13,6 +13,7 @@ export SPICE_OPENAI_API_KEY="your-openai-api-key"
 export SPICE_ANTHROPIC_API_KEY="your-anthropic-api-key"
 export SPICE_XAI_API_KEY="your-xai-api-key"
 export SPICE_HUGGINGFACE_API_KEY="your-huggingface-api-key"  # Required for local model test
+export SPICE_GOOGLE_API_KEY="your-google-api-key"           # Required for Gemini tests
 ```
 
 ### Models Used
@@ -20,9 +21,23 @@ export SPICE_HUGGINGFACE_API_KEY="your-huggingface-api-key"  # Required for loca
 The tests use the following models:
 
 - **OpenAI**: `gpt-4o-mini`
-- **xAI**: `grok-4-fast-non-reasoning`
+- **xAI**: `grok-4-1-fast-non-reasoning`
 - **Anthropic**: `claude-3-5-haiku-latest`
 - **Local**: `llama3` (Phi-3.5-mini-instruct from HuggingFace)
+
+### Model Verification
+
+Before each test runs, the test harness verifies that all required models are available from their respective providers. This "fail fast" approach helps identify issues with model availability or API credentials before the full test suite runs.
+
+The verification checks:
+
+- **OpenAI**: Calls the `/v1/models/{model_id}` endpoint to verify model exists
+- **xAI**: Calls the `/v1/models/{model_id}` endpoint to verify model exists
+- **Anthropic**: Sends a minimal message request to verify model is accessible
+- **Google Gemini**: Calls the models API to verify model exists
+- **Bedrock**: Validates model ID format (actual access verified at runtime)
+
+If any model verification fails, the test will fail immediately with a descriptive error message indicating which model(s) are unavailable and why.
 
 ## Running the Tests
 

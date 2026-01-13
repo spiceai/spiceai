@@ -26,7 +26,10 @@ use runtime_rate_control::{JitterConfig, RateController};
 
 pub mod chat;
 pub mod embed;
+pub mod list_models;
 pub mod responses;
+
+pub use list_models::OpenAiModelLister;
 
 pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 

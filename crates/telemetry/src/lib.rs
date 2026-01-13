@@ -32,8 +32,16 @@ pub mod reader;
 
 // As recommended by the OpenTelemetry Semantic Conventions:
 // https://opentelemetry.io/docs/specs/semconv/database/database-metrics/#metric-dbclientresponsereturned_rows
-pub const ROWS_RETURNED_HISTOGRAM_BUCKETS: [f64; 13] = [
-    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+// We added following buckets: 25000.0, 50000.0, 100000.0, 250000.0, 500000.0
+pub const ROWS_RETURNED_HISTOGRAM_BUCKETS: [f64; 18] = [
+    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 25000.0,
+    50000.0, 100_000.0, 250_000.0, 500_000.0,
+];
+
+// Extended default buckets for duration histogram: 25000.0, 50000.0, 100000.0, 250000.0, 500000.0
+pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
+    0.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0,
+    100_000.0, 250_000.0, 500_000.0,
 ];
 
 static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -110,6 +118,7 @@ static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
             "The total amount of time spent planning and executing queries in milliseconds.",
         )
         .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 
