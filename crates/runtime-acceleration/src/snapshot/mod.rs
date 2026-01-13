@@ -881,18 +881,18 @@ impl SnapshotManager {
                 }
             })?;
 
-            let source_str = source.to_string_lossy();
+            let source_escaped = escape_duckdb_string(&source.to_string_lossy());
             conn.execute(
-                "ATTACH ? AS source (READ_ONLY)",
-                duckdb::params![source_str.as_ref()],
+                &format!("ATTACH '{source_escaped}' AS source (READ_ONLY)"),
+                [],
             )
             .map_err(|e| SnapshotUploadError::CompactionAttach {
                 path: source.clone(),
                 source: e,
             })?;
 
-            let dest_str = dest.to_string_lossy();
-            conn.execute("ATTACH ? AS dest", duckdb::params![dest_str.as_ref()])
+            let dest_escaped = escape_duckdb_string(&dest.to_string_lossy());
+            conn.execute(&format!("ATTACH '{dest_escaped}' AS dest"), [])
                 .map_err(|e| SnapshotUploadError::CompactionAttach {
                     path: dest.clone(),
                     source: e,
@@ -1468,6 +1468,10 @@ impl SnapshotManager {
             }
         }
     }
+}
+
+fn escape_duckdb_string(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 #[cfg(test)]
