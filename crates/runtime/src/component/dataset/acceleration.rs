@@ -28,6 +28,10 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
+use snafu::ResultExt;
+use crate::AcceleratorEngineNotAvailableSnafu;
+
+pub use runtime_acceleration::Engine;
 
 pub mod constraints;
 pub mod on_conflict;
@@ -138,61 +142,6 @@ impl Display for ZeroResultsAction {
             ZeroResultsAction::ReturnEmpty => write!(f, "return_empty"),
             ZeroResultsAction::UseSource => write!(f, "use_source"),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-pub enum Engine {
-    #[default]
-    Arrow,
-    DuckDB,
-    PartitionedDuckDB,
-    TableModePartitionedDuckDB,
-    Sqlite,
-    Turso,
-    PostgreSQL,
-    Cayenne,
-}
-
-impl Display for Engine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Engine::Arrow => write!(f, "arrow"),
-            Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-                write!(f, "duckdb")
-            }
-            Engine::Sqlite => write!(f, "sqlite"),
-            Engine::Turso => write!(f, "turso"),
-            Engine::PostgreSQL => write!(f, "postgres"),
-            Engine::Cayenne => write!(f, "cayenne"),
-        }
-    }
-}
-
-impl TryFrom<&str> for Engine {
-    type Error = crate::Error;
-
-    fn try_from(engine: &str) -> std::result::Result<Self, Self::Error> {
-        match engine.to_lowercase().as_str() {
-            "arrow" => Ok(Engine::Arrow),
-            "duckdb" => Ok(Engine::DuckDB),
-            "sqlite" => Ok(Engine::Sqlite),
-            "turso" => Ok(Engine::Turso),
-            "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
-            "cayenne" | "vortex" => Ok(Engine::Cayenne),
-            _ => crate::AcceleratorEngineNotAvailableSnafu {
-                name: engine.to_string(),
-            }
-            .fail(),
-        }
-    }
-}
-
-impl TryFrom<String> for Engine {
-    type Error = crate::Error;
-
-    fn try_from(engine: String) -> std::result::Result<Self, Self::Error> {
-        Engine::try_from(engine.as_str())
     }
 }
 
@@ -434,7 +383,9 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let mut params = acceleration.params.clone();
 
         let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
-        let engine = match Engine::try_from(engine_str)? {
+        let engine = match Engine::try_from(engine_str)
+            .map_err(|_| crate::Error::AcceleratorEngineNotAvailable { name: engine_str.to_string() })?
+        {
             #[cfg(feature = "duckdb")]
             Engine::DuckDB if !acceleration.partition_by.is_empty() => {
                 match get_duckdb_partition_mode(&params) {
