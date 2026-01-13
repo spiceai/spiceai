@@ -37,6 +37,7 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         $mcPath = "$env:USERPROFILE\mc"
         New-Item -ItemType Directory -Force -Path $mcPath | Out-Null
         Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" -OutFile "$mcPath\mc.exe"
@@ -52,4 +53,6 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        & "$env:USERPROFILE\mc\mc.exe" alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}
+        $ErrorActionPreference = 'Stop'
+        $mcExePath = Join-Path $env:USERPROFILE 'mc\mc.exe'
+        & $mcExePath alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}

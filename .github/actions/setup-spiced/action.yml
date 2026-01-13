@@ -48,6 +48,7 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         echo "os=windows" >> $env:GITHUB_OUTPUT
         echo "arch=x86_64" >> $env:GITHUB_OUTPUT
         echo "ext=zip" >> $env:GITHUB_OUTPUT
@@ -86,6 +87,7 @@ runs:
       if: ${{ !inputs.spiced_commit && runner.os == 'Windows' }}
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         git fetch --depth=10 origin ${{ inputs.ref }}
         Write-Host "Fetching latest 10 commits from ${{ inputs.ref }}"
 
@@ -102,11 +104,13 @@ runs:
 
         foreach ($hash in $commitHashes) {
           Write-Host "Checking $hash in MinIO for $platform"
-          $result = mc stat "spice-minio/artifacts/spiced/$platform/$hash/spiced_${features}_${platform}.${ext}" 2>&1
+          $statOutput = mc stat "spice-minio/artifacts/spiced/$platform/$hash/spiced_${features}_${platform}.${ext}" 2>&1
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $env:GITHUB_ENV
             exit 0
+          } else {
+            Write-Host "mc stat failed for $hash on $platform: $statOutput"
           }
         }
 
@@ -123,6 +127,7 @@ runs:
       shell: pwsh
       if: ${{ inputs.spiced_commit && runner.os == 'Windows' }}
       run: |
+        $ErrorActionPreference = 'Stop'
         echo "SPICED_COMMIT=${{ inputs.spiced_commit }}" >> $env:GITHUB_ENV
 
     - name: Output SPICED_COMMIT (Linux/macOS)
@@ -135,7 +140,9 @@ runs:
       id: output_spiced_commit_windows
       if: runner.os == 'Windows'
       shell: pwsh
-      run: echo "SPICED_COMMIT=$env:SPICED_COMMIT" >> $env:GITHUB_OUTPUT
+      run: |
+        $ErrorActionPreference = 'Stop'
+        echo "SPICED_COMMIT=$env:SPICED_COMMIT" >> $env:GITHUB_OUTPUT
 
     - name: Download spiced from MinIO (Linux/macOS)
       if: runner.os != 'Windows'
@@ -156,6 +163,7 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         if ("${{ inputs.with_odbc }}" -eq "true") {
           $features = "odbc_models"
         } else {

@@ -58,6 +58,7 @@ runs:
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         # Download and install sccache
         $sccacheVersion = "v0.9.1"
         $sccacheUrl = "https://github.com/mozilla/sccache/releases/download/$sccacheVersion/sccache-$sccacheVersion-x86_64-pc-windows-msvc.zip"
@@ -66,8 +67,13 @@ runs:
 
         Invoke-WebRequest -Uri $sccacheUrl -OutFile $sccacheZip
         Expand-Archive -Path $sccacheZip -DestinationPath $sccacheDir -Force
-        $sccacheBin = Get-ChildItem -Path $sccacheDir -Recurse -Filter "sccache.exe" | Select-Object -First 1
-        $sccacheBinDir = $sccacheBin.DirectoryName
+        $sccacheExtractedDir = Join-Path $sccacheDir "sccache-$sccacheVersion-x86_64-pc-windows-msvc"
+        $sccacheExePath = Join-Path $sccacheExtractedDir "sccache.exe"
+        if (-not (Test-Path $sccacheExePath)) {
+          Write-Error "sccache.exe not found at expected path: $sccacheExePath"
+          exit 1
+        }
+        $sccacheBinDir = Split-Path $sccacheExePath -Parent
         echo "$sccacheBinDir" >> $env:GITHUB_PATH
 
         # Configure sccache

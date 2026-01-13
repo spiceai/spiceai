@@ -21,16 +21,16 @@ runs:
       run: |
         sudo rm -rf /opt/spiced/data
         sudo mkdir -p /opt/spiced/data
-        sudo chown $(whoami) -R /opt/spiced/data
+        sudo chown "$(whoami):$(id -gn)" -R /opt/spiced/data
 
     - name: Prepare file-based data directory (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         $dataDir = "C:\spiced\data"
         if (Test-Path $dataDir) { Remove-Item -Recurse -Force $dataDir }
         New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-        echo "SPICED_DATA_DIR=$dataDir" >> $env:GITHUB_ENV
 
     - name: Download DuckDB TPCH Data (Linux/macOS)
       shell: bash
@@ -43,6 +43,7 @@ runs:
       shell: pwsh
       if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os == 'Windows'
       run: |
+        $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
         mc cp spice-minio/benchmarks/tpch_sf1/tpch.db ./
 
@@ -57,6 +58,7 @@ runs:
       shell: pwsh
       if: inputs.query_set == 'tpcds' && runner.os == 'Windows'
       run: |
+        $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
         mc cp spice-minio/benchmarks/tpcds_sf1/tpcds.db ./
 
@@ -71,6 +73,7 @@ runs:
       shell: pwsh
       if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os == 'Windows'
       run: |
+        $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
         mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
 
@@ -88,6 +91,7 @@ runs:
       shell: pwsh
       if: inputs.query_set == 'tpcds' && runner.os == 'Windows'
       run: |
+        $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
         mc cp --recursive spice-minio/benchmarks/tpcds_sf1/ ./
         New-Item -ItemType Directory -Force -Path .\sf0_01 | Out-Null
@@ -106,6 +110,7 @@ runs:
       shell: pwsh
       if: inputs.query_set == 'clickbench' && runner.os == 'Windows'
       run: |
+        $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
         mc cp spice-minio/benchmarks/clickbench/hits_0.parquet ./
         mc cp spice-minio/benchmarks/clickbench/hits.parquet ./

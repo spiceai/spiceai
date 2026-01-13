@@ -29,7 +29,7 @@ runs:
       run: |
         sudo rm -rf "${{ inputs.data_directory }}"
         sudo mkdir -p "${{ inputs.data_directory }}"
-        sudo chown $(whoami) -R "${{ inputs.data_directory }}"
+        sudo chown "$(whoami):$(id -gn)" -R "${{ inputs.data_directory }}"
 
     - name: Prepare file-based data directory (Windows)
       if: runner.os == 'Windows'
@@ -87,12 +87,14 @@ runs:
             sudo apt-get update
             sudo apt-get install -y jq
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            brew install jq
+            if ! brew list jq &> /dev/null; then
+              brew install jq
+            fi
           fi
         fi
 
         sudo mkdir -p /opt/spiced/data
-        sudo chown $(whoami) /opt/spiced/data
+        sudo chown "$(whoami):$(id -gn)" /opt/spiced/data
 
         if [ "${{ inputs.use_evidence }}" = "true" ]; then
           jq -c --arg db "$BIRD_BENCH_DATASET" \
@@ -129,6 +131,7 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         $birdBenchDir = "$env:GITHUB_WORKSPACE\bird-bench\dev_20240627"
         # Parse `bird-bench-small[<dataset>]` -> `<dataset>`
         $birdBenchDataset = "${{ inputs.queryset_name }}"
@@ -138,21 +141,27 @@ runs:
         # Install jq via choco if not available
         if (-not (Get-Command jq -ErrorAction SilentlyContinue)) {
           choco install jq -y
+          refreshenv
         }
 
-        $dataDir = "C:\spiced\data"
+        $dataDir = "${{ inputs.data_directory }}"
         New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
         $devJson = "$birdBenchDir\dev.json"
         if ("${{ inputs.use_evidence }}" -eq "true") {
-          Get-Content $devJson | jq -c --arg db $birdBenchDataset '.[] | select(.db_id == $db) | { sql: .SQL, question: (.question + .evidence) }' | Out-File -FilePath "$dataDir\queryset.json" -Encoding utf8
+          Get-Content $devJson | jq -c --arg db $birdBenchDataset '.[] | select(.db_id == $db) | { sql: .SQL, question: (.question + .evidence) }' | Set-Content -Path "$dataDir\queryset.json" -Encoding utf8
         } else {
-          Get-Content $devJson | jq -c --arg db $birdBenchDataset '.[] | select(.db_id == $db) | { sql: .SQL, question: .question }' | Out-File -FilePath "$dataDir\queryset.json" -Encoding utf8
+          Get-Content $devJson | jq -c --arg db $birdBenchDataset '.[] | select(.db_id == $db) | { sql: .SQL, question: .question }' | Set-Content -Path "$dataDir\queryset.json" -Encoding utf8
         }
 
-        Move-Item -Path $birdBenchDir -Destination "${{ inputs.data_directory }}"
+        $destinationDir = Join-Path "${{ inputs.data_directory }}" "dev_20240627"
+        if (-not (Test-Path $destinationDir)) {
+          Move-Item -Path $birdBenchDir -Destination "${{ inputs.data_directory }}"
+        } else {
+          Write-Host "Destination $destinationDir already exists. Skipping Move-Item."
+        }
 
-        $datasetSpicepod = "${{ inputs.data_directory }}dev_20240627\spicepods\$birdBenchDataset\spicepod.yaml"
+        $datasetSpicepod = Join-Path "${{ inputs.data_directory }}" "dev_20240627\spicepods\$birdBenchDataset\spicepod.yaml"
         if (-not (Test-Path $datasetSpicepod)) {
           Write-Host "Error: Spicepod file not found at $datasetSpicepod"
           exit 1

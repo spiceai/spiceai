@@ -21,6 +21,7 @@ runs:
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         # Install Visual Studio Build Tools if not present (handled by setup-vs-buildtools action)
         # Install additional dependencies via choco
         if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
