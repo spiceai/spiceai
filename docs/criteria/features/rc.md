@@ -38,7 +38,7 @@ All criteria must be met for the feature to be considered [RC](../definitions.md
 
 - [ ] All Beta observability criteria continue to pass
 - [ ] Relevant metrics and queries are added to example dashboards
-- [ ] Any anonymous usage telemetry we want to collect has been added
+- [ ] Anonymous usage telemetry, if applicable, has been added
 
 ### Compatibility
 
