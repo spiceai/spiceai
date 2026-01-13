@@ -2259,7 +2259,7 @@ mod tests {
         use crate::component::dataset::Dataset;
         use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
         use runtime_acceleration::snapshot::SnapshotBehavior;
-        use spicepod::acceleration::SnapshotsTrigger;
+        use spicepod::acceleration::{SnapshotsCompaction, SnapshotsTrigger};
         use spicepod::component::snapshot::Snapshots;
         use std::sync::Arc;
         use tempfile::TempDir;
@@ -2303,7 +2303,7 @@ mod tests {
                 }),
                 Arc::downgrade(secrets),
                 Handle::current(),
-                true,
+                SnapshotsCompaction::Enabled,
             )
         }
 

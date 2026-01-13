@@ -53,6 +53,7 @@ use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 mod behavior;
 pub mod metrics;
 pub use behavior::SnapshotBehavior;
+use spicepod::acceleration::SnapshotsCompaction;
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -556,9 +557,9 @@ impl SnapshotManager {
                 tracing::debug!("Snapshots are disabled for {dataset_name}");
                 return None;
             }
-            SnapshotBehavior::Enabled(s, secrets, io_runtime, compaction_enabled)
-            | SnapshotBehavior::CreateOnly(s, secrets, io_runtime, compaction_enabled) => {
-                (s, secrets.upgrade()?, io_runtime, compaction_enabled)
+            SnapshotBehavior::Enabled(s, secrets, io_runtime, compaction)
+            | SnapshotBehavior::CreateOnly(s, secrets, io_runtime, compaction) => {
+                (s, secrets.upgrade()?, io_runtime, matches!(compaction, SnapshotsCompaction::Enabled))
             }
             SnapshotBehavior::BootstrapOnly(s, secrets, io_runtime) => {
                 (s, secrets.upgrade()?, io_runtime, false)

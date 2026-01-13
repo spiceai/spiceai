@@ -60,7 +60,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use uuid::Uuid;
-
+use spicepod::acceleration::SnapshotsCompaction;
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{run_query, runtime_ready_check, test_request_context},
@@ -965,7 +965,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 runtime_snapshots,
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
-                false,
+                SnapshotsCompaction::Disabled,
             );
 
             let manager = SnapshotManager::try_new(
@@ -1052,7 +1052,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .and_then(|app| app.snapshots.clone())
                 .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
             let snapshot_behavior =
-                RuntimeSnapshotBehavior::enabled(runtime_snapshots, runtime.secrets_weak(), runtime.tokio_io_runtime(), false);
+                RuntimeSnapshotBehavior::enabled(runtime_snapshots, runtime.secrets_weak(), runtime.tokio_io_runtime(), SnapshotsCompaction::Disabled);
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
@@ -1284,7 +1284,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
                 Arc::clone(&runtime_snapshots),
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
-                true, // compaction_enabled = true
+                SnapshotsCompaction::Enabled,
             );
 
             let manager_with_compaction = SnapshotManager::try_new(

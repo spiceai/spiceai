@@ -40,6 +40,7 @@ use runtime_acceleration::snapshot::{
 };
 use spicepod::component::snapshot::Snapshots;
 use tokio::sync::{Mutex, RwLock, mpsc};
+use spicepod::acceleration::SnapshotsCompaction;
 
 struct MockCheckpointer;
 
@@ -122,7 +123,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
         Arc::new(snapshots),
         runtime.secrets_weak(),
         runtime.tokio_io_runtime(),
-        false,
+        SnapshotsCompaction::Disabled,
     );
 
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
