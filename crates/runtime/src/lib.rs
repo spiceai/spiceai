@@ -753,7 +753,7 @@ impl Runtime {
                 )
             };
 
-        // If this is an executor, we only need the shutdown signal and flight server
+        // If this is an executor, we only need the shutdown signal, flight server, and health endpoint
         if matches!(
             self.df.cluster_config.effective_role(),
             Some(ClusterRole::Executor)
@@ -766,8 +766,25 @@ impl Runtime {
                 });
             };
 
-            return tokio::try_join!(shutdown_signal_future, executor_future, flight_future,)
-                .map(|_| ());
+            // Start health-only HTTP server for executor
+            let http_shutdown = CancellationToken::new();
+            let http_bind_address = config.http_bind_address;
+            let health_http_future = self
+                .start_runtime_task(
+                    HTTP_SERVER,
+                    Some(http_shutdown.clone()),
+                    http::start_health_only(http_bind_address, Some(http_shutdown))
+                        .map_err(Error::from),
+                )
+                .await;
+
+            return tokio::try_join!(
+                shutdown_signal_future,
+                executor_future,
+                flight_future,
+                health_http_future,
+            )
+            .map(|_| ());
         }
 
         // Start Http server
