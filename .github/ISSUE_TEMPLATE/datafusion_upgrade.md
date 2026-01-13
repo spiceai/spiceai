@@ -218,6 +218,115 @@ These forks may not require changes for every DataFusion upgrade but should be v
 - [ ] Build the branch version and test with test operator, updating snapshots if needed.
 - [ ] Merge PR. 🎉
 
+## Forked Dependency Test Coverage
+
+This section documents which tests in the Spice test suite verify the functionality of each forked dependency. **If a fork's patches are missing or incompatible after an upgrade, these tests should fail.**
+
+When upgrading, ensure all these tests pass. If adding a new patch to a fork, add corresponding test coverage.
+
+### DataFusion (`spiceai/datafusion`)
+
+| Patch/Feature                                   | Test Location                         | What It Verifies                                                                                                 |
+| ----------------------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| UDTF args in TableScan name (cache correctness) | `crates/runtime/tests/results_cache/` | Different UDTF calls (e.g., `read_parquet('/a')` vs `read_parquet('/b')`) don't incorrectly share cached results |
+| Core query execution                            | All integration tests                 | DataFusion query planning and execution                                                                          |
+| UDF/UDAF support                                | `crates/runtime/tests/` (various)     | User-defined functions work correctly                                                                            |
+
+### Ballista (`spiceai/datafusion-ballista`)
+
+| Patch/Feature              | Test Location               | What It Verifies                            |
+| -------------------------- | --------------------------- | ------------------------------------------- |
+| mTLS cluster communication | `crates/runtime/tests/tls/` | Secure scheduler-executor connections       |
+| UDF synchronization        | Cluster mode tests          | UDFs available across distributed executors |
+| Catalog synchronization    | Cluster mode tests          | Tables visible across cluster               |
+
+### DataFusion Federation (`spiceai/datafusion-federation`)
+
+| Patch/Feature            | Test Location                                          | What It Verifies                      |
+| ------------------------ | ------------------------------------------------------ | ------------------------------------- |
+| Federated query pushdown | `crates/runtime/tests/acceleration/query_push_down.rs` | Queries pushed to source databases    |
+| Multi-source federation  | Various connector tests                                | Joining across different data sources |
+
+### DataFusion Table Providers (`datafusion-contrib/datafusion-table-providers`)
+
+| Patch/Feature        | Test Location                    | What It Verifies                |
+| -------------------- | -------------------------------- | ------------------------------- |
+| PostgreSQL connector | `crates/runtime/tests/postgres/` | PostgreSQL table provider works |
+| MySQL connector      | `crates/runtime/tests/mysql/`    | MySQL table provider works      |
+| SQLite connector     | `crates/runtime/tests/sqlite/`   | SQLite table provider works     |
+| DuckDB connector     | `crates/runtime/tests/duckdb/`   | DuckDB table provider works     |
+
+### Vortex (`spiceai/vortex`)
+
+| Patch/Feature                 | Test Location                   | What It Verifies                                |
+| ----------------------------- | ------------------------------- | ----------------------------------------------- |
+| Vortex-DataFusion integration | `crates/runtime/tests/cayenne/` | Cayenne accelerator with Vortex columnar format |
+| Vortex array operations       | `crates/cayenne/` benchmarks    | Compressed array read/write                     |
+
+### Iceberg-Rust (`spiceai/iceberg-rust`)
+
+| Patch/Feature                  | Test Location                       | What It Verifies                   |
+| ------------------------------ | ----------------------------------- | ---------------------------------- |
+| Iceberg-DataFusion integration | `crates/runtime/tests/iceberg/`     | Iceberg table scans via DataFusion |
+| Glue catalog support           | `crates/runtime/tests/glue/`        | AWS Glue Iceberg catalog           |
+| REST catalog support           | `crates/runtime/tests/iceberg_api/` | Iceberg REST catalog               |
+
+### Arrow-RS (`spiceai/arrow-rs`)
+
+| Patch/Feature         | Test Location                  | What It Verifies            |
+| --------------------- | ------------------------------ | --------------------------- |
+| Arrow IPC / Flight    | `crates/runtime/tests/flight/` | Arrow Flight protocol       |
+| Parquet read/write    | All accelerator tests          | Parquet file operations     |
+| Core array operations | All tests                      | Fundamental data operations |
+
+### DuckDB-RS (`spiceai/duckdb-rs`)
+
+| Patch/Feature       | Test Location                       | What It Verifies              |
+| ------------------- | ----------------------------------- | ----------------------------- |
+| DuckDB accelerator  | `crates/runtime/tests/duckdb/`      | DuckDB as acceleration engine |
+| Arrow compatibility | `crates/runtime/tests/rehydration/` | Arrow<->DuckDB data transfer  |
+| Connection pooling  | DuckDB accelerator tests            | Concurrent DuckDB access      |
+
+### Delta Kernel (`spiceai/delta-kernel-rs`)
+
+| Patch/Feature    | Test Location                             | What It Verifies               |
+| ---------------- | ----------------------------------------- | ------------------------------ |
+| Delta Lake reads | `crates/runtime/tests/delta_lake/`        | Reading Delta tables           |
+| Databricks Delta | `crates/runtime/tests/databricks_delta*/` | Databricks-hosted Delta tables |
+
+### Snowflake-RS (`spiceai/snowflake-rs`)
+
+| Patch/Feature       | Test Location                     | What It Verifies         |
+| ------------------- | --------------------------------- | ------------------------ |
+| Snowflake connector | `crates/runtime/tests/snowflake/` | Snowflake table provider |
+
+### Spark Connect (`spiceai/spark-connect-rs`)
+
+| Patch/Feature    | Test Location                             | What It Verifies                       |
+| ---------------- | ----------------------------------------- | -------------------------------------- |
+| Spark connector  | `crates/runtime/tests/spark/`             | Spark table provider via Spark Connect |
+| Databricks Spark | `crates/runtime/tests/databricks_spark*/` | Databricks-hosted Spark                |
+
+### Dotenvy (`spiceai/dotenvy`)
+
+| Patch/Feature                 | Test Location                                                                     | What It Verifies                                 |
+| ----------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------ |
+| Disable variable substitution | `crates/runtime-secrets/src/stores/env.rs::test_dotenvy_no_variable_substitution` | `.env` values with `$` chars preserved literally |
+
+### Rusqlite (`spiceai/rusqlite`)
+
+| Patch/Feature      | Test Location                   | What It Verifies              |
+| ------------------ | ------------------------------- | ----------------------------- |
+| SQLite accelerator | `crates/runtime/tests/sqlite/`  | SQLite as acceleration engine |
+| Cayenne metastore  | `crates/runtime/tests/cayenne/` | SQLite metadata storage       |
+
+### Candle (`spiceai/candle`)
+
+| Patch/Feature        | Test Location                           | What It Verifies             |
+| -------------------- | --------------------------------------- | ---------------------------- |
+| ML model inference   | `crates/runtime/tests/models/`          | Local ML model execution     |
+| Embedding generation | `crates/runtime/tests/models/search.rs` | Vector embeddings for search |
+
 ## Common API Changes Reference
 
 This section documents breaking API changes encountered during upgrades. Update this list as new patterns emerge.

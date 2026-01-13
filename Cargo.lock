@@ -14448,6 +14448,7 @@ dependencies = [
  "serde_json",
  "snafu",
  "spicepod",
+ "tempfile",
  "tokio",
  "tracing",
 ]
