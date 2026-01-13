@@ -22,8 +22,8 @@ use arrow::{
 };
 use arrow_cast::cast;
 use arrow_schema::Schema;
-use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
 use datafusion::common::metadata::ScalarAndMetadata;
+use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
 use snafu::{ResultExt, prelude::*};
 use std::sync::Arc;
 
@@ -275,7 +275,10 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
 
         // Extract just the values (compiler can optimize this to a move)
         Ok(ParamValues::List(
-            list_params.into_iter().map(|(_, value)| ScalarAndMetadata::from(value)).collect(),
+            list_params
+                .into_iter()
+                .map(|(_, value)| ScalarAndMetadata::from(value))
+                .collect(),
         ))
     } else {
         // Convert list_params back to named if we have mixed types
@@ -289,7 +292,12 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
                 named_params.push((format!("${index}"), value));
             }
         }
-        Ok(ParamValues::Map(named_params.into_iter().map(|(k, v)| (k, ScalarAndMetadata::from(v))).collect()))
+        Ok(ParamValues::Map(
+            named_params
+                .into_iter()
+                .map(|(k, v)| (k, ScalarAndMetadata::from(v)))
+                .collect(),
+        ))
     }
 }
 
@@ -529,15 +537,18 @@ mod test {
             (ParamValues::List(result_vec), ParamValues::List(expected_vec)) => {
                 assert_eq!(result_vec.len(), expected_vec.len(), "List lengths differ");
                 for (r, e) in result_vec.iter().zip(expected_vec.iter()) {
-                    assert_eq!(r, e, "ScalarValue mismatch");
+                    // ScalarAndMetadata doesn't impl PartialEq, compare the value field
+                    assert_eq!(r.value(), e.value(), "ScalarValue mismatch");
                 }
             }
             (ParamValues::Map(result_map), ParamValues::Map(expected_map)) => {
                 assert_eq!(result_map.len(), expected_map.len(), "Map lengths differ");
                 for (key, expected_value) in expected_map {
                     let result_value = result_map.get(&key).expect("key in result map");
+                    // ScalarAndMetadata doesn't impl PartialEq, compare the value field
                     assert_eq!(
-                        result_value, &expected_value,
+                        result_value.value(),
+                        expected_value.value(),
                         "ScalarValue mismatch for key {key}",
                     );
                 }

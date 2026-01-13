@@ -319,7 +319,7 @@ impl DeltaTable {
             Arc::new(parquet_source),
         )
         .with_limit(limit)
-        .with_projection(new_projections)
+        .with_projection_indices(new_projections)
         .with_table_partition_cols(partition_cols.to_vec())
         .with_file_group(FileGroup::new(partitioned_files.to_vec()));
 

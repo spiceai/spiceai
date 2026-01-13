@@ -165,12 +165,9 @@ impl Telemetry {
                     // Note: In OpenTelemetry SDK 0.31+, ResourceMetrics.resource is set by the
                     // pipeline during collection and cannot be overridden.
 
-                    telemetry_exporter
-                        .export(&mut rm)
-                        .await
-                        .unwrap_or_else(|err| {
-                            println!("Failed to export initial telemetry: {err:?}");
-                        });
+                    telemetry_exporter.export(&rm).await.unwrap_or_else(|err| {
+                        println!("Failed to export initial telemetry: {err:?}");
+                    });
                 } else {
                     println!("No API key provided, telemetry is disabled");
                 }
@@ -186,7 +183,7 @@ impl Telemetry {
                     .with_endpoint(config.endpoint.as_ref())
                     .build()?;
                 exporter
-                    .export(&mut rm)
+                    .export(&rm)
                     .await
                     .unwrap_or_else(|err| println!("Failed to export OTLP telemetry: {err:?}"));
             }

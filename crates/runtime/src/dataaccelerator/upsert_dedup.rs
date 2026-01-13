@@ -38,7 +38,7 @@ use datafusion::{
     },
 };
 use datafusion_table_providers::util::constraints::UpsertOptions;
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 
 /// A wrapper `TableProvider` that applies batch deduplication based on `UpsertOptions`
 /// before passing data to the underlying provider.
@@ -247,7 +247,7 @@ impl ExecutionPlan for UpsertDedupExec {
         let input_stream = self.input.execute(partition, context)?;
         let schema = self.schema();
         let constraints = self.constraints.clone();
-        let upsert_options = self.upsert_options.clone();
+        let _upsert_options = self.upsert_options.clone();
 
         // Create a stream that validates constraints on each batch
         // TODO: Add back deduplication logic when datafusion-table-providers upsert API is ported

@@ -64,7 +64,7 @@ async fn test_postgres_types() -> Result<(), anyhow::Error> {
             )
             .await.expect("inserted data");
         let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
-        let table = SqlTable::new("postgres", &sqltable_pool, "test", None)
+        let table = SqlTable::new("postgres", &sqltable_pool, "test")
             .await
             .expect("table can be created");
         ctx.register_table("test_datafusion", Arc::new(table))
@@ -145,7 +145,7 @@ CREATE TABLE test_jsonb (
                 .expect("table is created");
 
             let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
-            let table = SqlTable::new("postgres", &sqltable_pool, "test_jsonb", None)
+            let table = SqlTable::new("postgres", &sqltable_pool, "test_jsonb")
                 .await
                 .expect("table can be created");
             ctx.register_table("test_datafusion", Arc::new(table))

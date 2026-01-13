@@ -97,10 +97,19 @@ mod tests {
     fn assert_eq_param_values(a: &ParamValues, b: &ParamValues) {
         match (a, b) {
             (ParamValues::Map(map_a), ParamValues::Map(map_b)) => {
-                assert_eq!(map_a, map_b);
+                // ScalarAndMetadata doesn't impl PartialEq, compare the value fields
+                assert_eq!(map_a.len(), map_b.len());
+                for (key, val_a) in map_a {
+                    let val_b = map_b.get(key).expect("key in both maps");
+                    assert_eq!(val_a.value(), val_b.value(), "mismatch for key {key}");
+                }
             }
             (ParamValues::List(vec_a), ParamValues::List(vec_b)) => {
-                assert_eq!(vec_a, vec_b);
+                // ScalarAndMetadata doesn't impl PartialEq, compare the value fields
+                assert_eq!(vec_a.len(), vec_b.len());
+                for (val_a, val_b) in vec_a.iter().zip(vec_b.iter()) {
+                    assert_eq!(val_a.value(), val_b.value(), "list element mismatch");
+                }
             }
             _ => {
                 panic!("ParamValues are different types: {a:?} and {b:?}");
@@ -168,7 +177,10 @@ mod tests {
     fn test_empty_object() {
         let json = json!({});
         let result = convert_json_to_param_values(json).expect("convert to param values");
-        assert_eq_param_values(&result, &ParamValues::from(HashMap::<String, ScalarValue>::new()));
+        assert_eq_param_values(
+            &result,
+            &ParamValues::from(HashMap::<String, ScalarValue>::new()),
+        );
     }
 
     #[test]

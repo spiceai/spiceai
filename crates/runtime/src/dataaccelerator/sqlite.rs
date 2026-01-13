@@ -34,7 +34,6 @@ use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
-    datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
@@ -410,6 +409,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,

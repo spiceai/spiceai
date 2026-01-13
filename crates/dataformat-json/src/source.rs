@@ -115,7 +115,7 @@ impl FileSource for SpiceJsonSource {
     ) -> Arc<dyn FileOpener> {
         Arc::new(SpiceJsonOpener {
             batch_size: self.batch_size.or(base_config.batch_size).unwrap_or(8192),
-            base_flattened_schema: Arc::clone(&base_config.file_schema()),
+            base_flattened_schema: Arc::clone(base_config.file_schema()),
             projected_schema: base_config.projected_file_schema(),
             file_compression_type: base_config.file_compression_type,
             object_store,
@@ -227,7 +227,9 @@ impl FileOpener for SpiceJsonOpener {
                 ..Default::default()
             };
 
-            let result = store.get_opts(&partitioned_file.object_meta.location, options).await?;
+            let result = store
+                .get_opts(&partitioned_file.object_meta.location, options)
+                .await?;
 
             match result.payload {
                 #[cfg(not(target_arch = "wasm32"))]

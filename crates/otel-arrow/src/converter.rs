@@ -38,7 +38,7 @@ use crate::{
     resource_fields, scope_fields, temporality_to_i32,
 };
 
-/// Errors that can occur during OTel to Arrow conversion.
+/// Errors that can occur during `OTel` to Arrow conversion.
 #[derive(Debug)]
 pub struct ConversionError(String);
 
@@ -426,9 +426,7 @@ impl OtelToArrowConverter {
             return Err(ConversionError("Could not convert data number".into()));
         };
         let Some(data_histogram) = self.data_histogram_builder.finish() else {
-            return Err(ConversionError(
-                "Could not convert data histogram".into(),
-            ));
+            return Err(ConversionError("Could not convert data histogram".into()));
         };
 
         let arrays: Vec<Arc<dyn Array>> = vec![

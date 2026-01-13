@@ -22,11 +22,9 @@ use crate::token_providers::databricks::{
 };
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::databricks::{
-    DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse,
-};
 #[cfg(feature = "spark")]
 use data_components::databricks::DatabricksSparkConnect;
+use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
 use data_components::unity_catalog::Endpoint;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -203,7 +201,8 @@ impl Databricks {
             }
             #[cfg(not(feature = "spark"))]
             "spark_connect" => Err(Error::InvalidMode {
-                value: "spark_connect (feature disabled - requires spark-connect-rs with arrow 57)".to_string(),
+                value: "spark_connect (feature disabled - requires spark-connect-rs with arrow 57)"
+                    .to_string(),
             }),
             _ => Err(Error::InvalidMode {
                 value: mode.to_string(),

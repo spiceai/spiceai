@@ -463,8 +463,12 @@ pub async fn initialize_cluster_executor(
 
     let app_def = Arc::new(app_def);
 
-    let scheduler_endpoint = tonic::transport::Endpoint::new(scheduler_url.to_string())
-        .map_err(|e| FailedToStartClusterExecutor { source: Box::new(e) })?;
+    let scheduler_endpoint =
+        tonic::transport::Endpoint::new(scheduler_url.to_string()).map_err(|e| {
+            FailedToStartClusterExecutor {
+                source: Box::new(e),
+            }
+        })?;
     let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
         scheduler_endpoint
             .tls_config(tls_config)

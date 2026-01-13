@@ -26,8 +26,8 @@ use datafusion::{
     prelude::Expr,
 };
 use datafusion_federation::{
-    FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
-    FederationAnalyzerForLogicalPlan,
+    FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
+    FederationProvider,
 };
 use std::collections::HashMap;
 use std::{any::Any, borrow::Cow, sync::Arc};
@@ -110,7 +110,7 @@ impl DeletionTableProvider for PolyTableProvider {
 }
 
 impl FederationProvider for PolyTableProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "FederationProviderForPolyTableProvider"
     }
 

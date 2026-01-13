@@ -566,6 +566,7 @@ impl AcceleratorExternalTableBuilder {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -573,7 +574,6 @@ impl AcceleratorExternalTableBuilder {
             constraints,
             column_defaults: HashMap::default(),
             temporary: false,
-            or_replace: false,
         };
 
         Ok(external_table)
@@ -941,6 +941,7 @@ mod accelerator_compat_tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -2197,6 +2198,7 @@ mod accelerator_compat_tests {
                     file_type: String::new(),
                     table_partition_cols: vec![],
                     if_not_exists: true,
+                    or_replace: false,
                     definition: None,
                     order_exprs: vec![],
                     unbounded: false,

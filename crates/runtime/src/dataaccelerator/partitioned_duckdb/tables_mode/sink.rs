@@ -165,7 +165,7 @@ impl DataSink for DuckDBPartitionedDataSink {
 
         let partitioner = Arc::clone(&self.partitioner);
 
-        let upsert_options = self.upsert_options.clone();
+        let _upsert_options = self.upsert_options.clone();
 
         while let Some(batch) = data.next().await {
             let batch = batch.map_err(check_and_mark_retriable_error)?;

@@ -49,7 +49,7 @@ impl AcceleratedTableFederationProvider {
 }
 
 impl FederationProvider for AcceleratedTableFederationProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "FederationProviderForAcceleratedDataset"
     }
 

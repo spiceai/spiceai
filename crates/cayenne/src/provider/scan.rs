@@ -209,6 +209,8 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 }
 
+// TODO: Uncomment optimizer_rules module in lib.rs to use this
+#[expect(dead_code)]
 pub(crate) trait IsCayenneAccelerationExec {
     /// Returns true if the execution plan is a `CayenneAccelerationExec`
     fn is_cayenne_acceleration_exec(&self) -> bool;

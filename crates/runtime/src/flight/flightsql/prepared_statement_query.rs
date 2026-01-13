@@ -258,13 +258,17 @@ mod param_values_serde {
                 let fields: Vec<Field> = values
                     .iter()
                     .enumerate()
-                    .map(|(i, v)| Field::new(format!("${}", i + 1), v.value().data_type(), v.value().is_null()))
+                    .map(|(i, v)| {
+                        Field::new(
+                            format!("${}", i + 1),
+                            v.value().data_type(),
+                            v.value().is_null(),
+                        )
+                    })
                     .collect();
 
-                let arrays: Result<Vec<ArrayRef>, _> = values
-                    .iter()
-                    .map(|v| v.value().to_array())
-                    .collect();
+                let arrays: Result<Vec<ArrayRef>, _> =
+                    values.iter().map(|v| v.value().to_array()).collect();
 
                 RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
             }
@@ -274,7 +278,9 @@ mod param_values_serde {
 
                 let fields: Vec<Field> = entries
                     .iter()
-                    .map(|(name, v)| Field::new(name.as_str(), v.value().data_type(), v.value().is_null()))
+                    .map(|(name, v)| {
+                        Field::new(name.as_str(), v.value().data_type(), v.value().is_null())
+                    })
                     .collect();
 
                 let arrays: Result<Vec<ArrayRef>, _> =

@@ -74,6 +74,7 @@ impl FilteringExporter {
     }
 
     /// Returns true if the metric should be exported based on the whitelist.
+    #[expect(dead_code)]
     fn should_export(&self, metric_name: &str) -> bool {
         self.whitelist.is_empty() || self.whitelist.contains(metric_name)
     }

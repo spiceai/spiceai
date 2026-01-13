@@ -232,13 +232,14 @@ impl IcebergDataConnector {
         let table_identifier = TableIdent::new(namespace_ident, table_name);
 
         // Load the Iceberg table from the catalog
-        let iceberg_table = catalog_client.load_table(&table_identifier).await.map_err(|e| {
-            Error::UnableToGetReadProvider {
+        let iceberg_table = catalog_client
+            .load_table(&table_identifier)
+            .await
+            .map_err(|e| Error::UnableToGetReadProvider {
                 dataconnector: "iceberg".into(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(e),
-            }
-        })?;
+            })?;
 
         // Create a DataFusion TableProvider from the Iceberg table
         let table_provider = IcebergStaticTableProvider::try_new_from_table(iceberg_table)
@@ -293,15 +294,14 @@ impl IcebergDataConnector {
                 })?;
 
         // Load the Iceberg table from the catalog
-        let iceberg_table =
-            catalog_client
-                .load_table(&table_identifier)
-                .await
-                .map_err(|e| Error::UnableToGetReadProvider {
-                    dataconnector: "iceberg".into(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                })?;
+        let iceberg_table = catalog_client
+            .load_table(&table_identifier)
+            .await
+            .map_err(|e| Error::UnableToGetReadProvider {
+                dataconnector: "iceberg".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            })?;
 
         // Create a DataFusion TableProvider from the Iceberg table
         let table_provider = IcebergStaticTableProvider::try_new_from_table(iceberg_table)

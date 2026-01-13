@@ -150,7 +150,7 @@ impl Read for ScyllaDbTableFactory {
         let pool = Arc::clone(&self.pool);
 
         // Create the base SqlTable with CQL dialect
-        let base_table = SqlTable::new("scylladb", &pool, table_reference.clone(), None)
+        let base_table = SqlTable::new("scylladb", &pool, table_reference.clone())
             .await
             .context(UnableToConstructSQLTableSnafu)?
             .with_dialect(Arc::new(CqlDialect::new()));

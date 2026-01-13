@@ -216,13 +216,10 @@ impl IcebergSchemaProvider {
             .map_err(|e| Error::SemaphoreError { source: e })?;
 
         match catalog.load_table(&table_name).await {
-            Ok(table) => {
-                match IcebergStaticTableProvider::try_new_from_table(table).await
-                {
-                    Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
-                    Err(e) => Err(handle_iceberg_error(e)),
-                }
-            }
+            Ok(table) => match IcebergStaticTableProvider::try_new_from_table(table).await {
+                Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
+                Err(e) => Err(handle_iceberg_error(e)),
+            },
             Err(e) => {
                 // If the table doesn't exist, return None instead of an error
                 let err_msg = e.to_string();
