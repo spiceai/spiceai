@@ -29,7 +29,6 @@ use serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
-use std::path::Path;
 use std::{
     collections::HashMap,
     fmt::Write,
