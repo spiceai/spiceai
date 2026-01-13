@@ -28,6 +28,7 @@ use std::time::Duration;
 
 pub struct Huggingface {}
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl ModelSource for Huggingface {
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {
