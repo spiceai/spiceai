@@ -38,9 +38,9 @@ use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{
     AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
+use spicepod::acceleration::SnapshotsCompaction;
 use spicepod::component::snapshot::Snapshots;
 use tokio::sync::{Mutex, RwLock, mpsc};
-use spicepod::acceleration::SnapshotsCompaction;
 
 struct MockCheckpointer;
 

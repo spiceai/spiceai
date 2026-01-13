@@ -22,6 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{run_query, runtime_ready_check, test_request_context},
+};
 use anyhow::{Context, Result, anyhow};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -43,6 +47,7 @@ use runtime_acceleration::snapshot::{
     AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
 use serde_json::{Value, json};
+use spicepod::acceleration::SnapshotsCompaction;
 use spicepod::{
     acceleration::{
         Acceleration, Mode, RefreshOnStartup, SnapshotBehavior as DatasetSnapshotBehavior,
@@ -60,11 +65,6 @@ use tokio::{
     time::{sleep, timeout},
 };
 use uuid::Uuid;
-use spicepod::acceleration::SnapshotsCompaction;
-use crate::{
-    configure_test_datafusion, init_tracing,
-    utils::{run_query, runtime_ready_check, test_request_context},
-};
 
 const SNAPSHOT_BUCKET: &str = "spiceai-snapshot-integration-tests";
 const SNAPSHOT_REGION: &str = "us-west-2";

@@ -30,11 +30,21 @@ pub enum SnapshotBehavior {
     #[default]
     Disabled,
     /// Enable both creating and bootstrapping from snapshots.
-    Enabled(Arc<Snapshots>, Weak<RwLock<Secrets>>, Handle, spicepod_acceleration::SnapshotsCompaction),
+    Enabled(
+        Arc<Snapshots>,
+        Weak<RwLock<Secrets>>,
+        Handle,
+        spicepod_acceleration::SnapshotsCompaction,
+    ),
     /// Only bootstrap from existing snapshots, don't attempt to create new ones.
     BootstrapOnly(Arc<Snapshots>, Weak<RwLock<Secrets>>, Handle),
     /// Only create new snapshots.
-    CreateOnly(Arc<Snapshots>, Weak<RwLock<Secrets>>, Handle, spicepod_acceleration::SnapshotsCompaction),
+    CreateOnly(
+        Arc<Snapshots>,
+        Weak<RwLock<Secrets>>,
+        Handle,
+        spicepod_acceleration::SnapshotsCompaction,
+    ),
 }
 
 impl PartialEq for SnapshotBehavior {
@@ -175,12 +185,7 @@ impl SnapshotBehavior {
                     return SnapshotBehavior::Disabled;
                 }
 
-                SnapshotBehavior::Enabled(
-                    snapshots,
-                    secrets,
-                    io_runtime,
-                    compaction,
-                )
+                SnapshotBehavior::Enabled(snapshots, secrets, io_runtime, compaction)
             }
             spicepod_acceleration::SnapshotBehavior::BootstrapOnly => {
                 if !snapshots.enabled {
@@ -200,12 +205,7 @@ impl SnapshotBehavior {
                     return SnapshotBehavior::Disabled;
                 }
 
-                SnapshotBehavior::CreateOnly(
-                    snapshots,
-                    secrets,
-                    io_runtime,
-                    compaction,
-                )
+                SnapshotBehavior::CreateOnly(snapshots, secrets, io_runtime, compaction)
             }
         }
     }

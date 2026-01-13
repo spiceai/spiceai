@@ -558,9 +558,12 @@ impl SnapshotManager {
                 return None;
             }
             SnapshotBehavior::Enabled(s, secrets, io_runtime, compaction)
-            | SnapshotBehavior::CreateOnly(s, secrets, io_runtime, compaction) => {
-                (s, secrets.upgrade()?, io_runtime, matches!(compaction, SnapshotsCompaction::Enabled))
-            }
+            | SnapshotBehavior::CreateOnly(s, secrets, io_runtime, compaction) => (
+                s,
+                secrets.upgrade()?,
+                io_runtime,
+                matches!(compaction, SnapshotsCompaction::Enabled),
+            ),
             SnapshotBehavior::BootstrapOnly(s, secrets, io_runtime) => {
                 (s, secrets.upgrade()?, io_runtime, false)
             }
