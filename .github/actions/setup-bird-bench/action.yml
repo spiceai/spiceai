@@ -9,6 +9,11 @@ inputs:
     description: name of the queryset to load
     required: true
     type: string
+  use_evidence:
+    description: whether to include evidence in the question
+    required: false
+    default: 'false'
+    type: string
 
 outputs:
   spicepod_dependency:
@@ -57,9 +62,15 @@ runs:
         sudo mkdir -p /opt/spiced/data
         sudo chown runner:runner /opt/spiced/data
 
-        jq -c --arg db "$BIRD_BENCH_DATASET" \
-          '.[] | select(.db_id == $db) | { sql: .SQL, question: .question }' "$BIRD_BENCH_DIR/dev.json" \
-          > /opt/spiced/data/queryset.json
+        if [ "${{ inputs.use_evidence }}" = "true" ]; then
+          jq -c --arg db "$BIRD_BENCH_DATASET" \
+            '.[] | select(.db_id == $db) | { sql: .SQL, question: (.question + .evidence) }' "$BIRD_BENCH_DIR/dev.json" \
+            > /opt/spiced/data/queryset.json
+        else
+          jq -c --arg db "$BIRD_BENCH_DATASET" \
+            '.[] | select(.db_id == $db) | { sql: .SQL, question: .question }' "$BIRD_BENCH_DIR/dev.json" \
+            > /opt/spiced/data/queryset.json
+        fi
 
         mv "$BIRD_BENCH_DIR" "${{ inputs.data_directory }}"
 
