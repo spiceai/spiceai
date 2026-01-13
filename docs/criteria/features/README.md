@@ -26,7 +26,8 @@ When promoting a feature to a new release stage:
 | Unit tests                         | ✓ | ✓ |       ✓       | ✓ |
 | Integration tests                  | Basic | Comprehensive | Comprehensive | Comprehensive |
 | Covered by E2E test infrastructure | | |       ✓       | ✓ |
-| Verified in production             | | |               | ✓ |
+| Running in Production deployments | | |       ✓       | ✓ |
+| Verified in production <br/> across multiple enterprises at scale      | | |               | ✓ |
 | No known major bugs                | | ✓ |       ✓       | ✓ |
 | Basic documentation                | ✓ | ✓ |       ✓       | ✓ |
 | Complete documentation             | | ✓ |       ✓       | ✓ |

@@ -34,5 +34,5 @@ All criteria must be met for the feature to be considered Stable, with exception
 
 ### Operational Readiness
 
-- [ ] Feature has been validated in multiple production environments
+- [ ] Feature has been validated in production environments across multiple enterprises at scale
 

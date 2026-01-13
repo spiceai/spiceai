@@ -44,3 +44,8 @@ All criteria must be met for the feature to be considered [RC](../definitions.md
 
 - [ ] Backward compatibility with Beta configuration verified
 - [ ] Interoperability with related features tested
+
+### Operational Readiness
+
+- [ ] Feature has been running in Production deployments
+
