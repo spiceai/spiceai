@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! xAI (Grok) LLM provider.
+
+#![allow(clippy::missing_errors_doc)]
+
+mod list_models;
+
+pub use list_models::XaiModelLister;
+
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -26,7 +34,6 @@ use async_openai::{
     },
 };
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::chat::{Chat, Error, nsql::SqlGeneration};
@@ -107,15 +114,6 @@ impl Xai {
 
         req
     }
-}
-
-#[expect(dead_code)]
-#[derive(Serialize, Deserialize, Debug)]
-struct Model {
-    id: String,
-    created: u64,
-    object: String,
-    owned_by: String,
 }
 
 #[async_trait]

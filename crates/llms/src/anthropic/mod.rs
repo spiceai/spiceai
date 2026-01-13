@@ -19,9 +19,11 @@ use reqwest::header::HeaderValue;
 use types::validate_model_variant;
 
 mod chat;
+mod list_models;
 mod types;
 mod types_stream;
 
+pub use list_models::AnthropicModelLister;
 pub use types::AnthropicModelVariant;
 
 use crate::config::{GenericAuthMechanism, HostedModelConfig};

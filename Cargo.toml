@@ -103,7 +103,7 @@ aws-sdk-cognitoidentityprovider = "1.105.0"
 aws-sdk-dynamodb = "1.100.0"
 aws-sdk-dynamodbstreams = "1.87.0"
 aws-sdk-glue = "1.132.0"
-aws-sdk-s3 = "1.115.0"
+aws-sdk-s3 = "1.119.0"
 aws-sdk-s3vectors = "1.17.0"
 aws-sdk-secretsmanager = "1.95.0"
 aws-sdk-sts = "1.94.0"
@@ -168,7 +168,7 @@ git2 = { version = "0.20", default-features = false, features = [
     "ssh",
 ] }
 globset = "0.4.16"
-governor = "0.10.2"
+governor = "0.10.4"
 graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df260146b313461029d41c4a021306832b8" }
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.4", features = ["tokio"] }
@@ -277,7 +277,7 @@ tokio-postgres = { version = "0.7.15", features = [
 ] }
 tokio-rusqlite = "0.7"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-tokio-util = { version = "0.7.16", features = ["compat"] }
+tokio-util = { version = "0.7.18", features = ["compat"] }
 tonic = { version = "0.13", features = [
     "gzip",
     "tls-ring",
