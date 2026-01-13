@@ -23,6 +23,7 @@ use app::App;
 use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::{
     ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
+    GetSchedulersRequest, GetSchedulersResponse, SchedulerInstance,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -30,17 +31,31 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
+use crate::cluster::SchedulerPeers;
+
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
     app: Arc<RwLock<Option<Arc<App>>>>,
     secrets: Arc<RwLock<Secrets>>,
+    advertise_address: String,
+    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 }
 
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
-    pub fn new(app: Arc<RwLock<Option<Arc<App>>>>, secrets: Arc<RwLock<Secrets>>) -> Self {
-        Self { app, secrets }
+    pub fn new(
+        app: Arc<RwLock<Option<Arc<App>>>>,
+        secrets: Arc<RwLock<Secrets>>,
+        advertise_address: String,
+        scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+    ) -> Self {
+        Self {
+            app,
+            secrets,
+            advertise_address,
+            scheduler_peers,
+        }
     }
 }
 
@@ -115,5 +130,39 @@ impl ClusterService for ClusterServiceImpl {
             key: request.key,
             value: exposed.to_string(),
         }))
+    }
+
+    async fn get_schedulers(
+        &self,
+        _request: Request<GetSchedulersRequest>,
+    ) -> Result<Response<GetSchedulersResponse>, Status> {
+        tracing::debug!("ClusterService::get_schedulers request");
+
+        let peers = self.scheduler_peers.read().await;
+        let mut schedulers = peers
+            .values()
+            .map(|record| SchedulerInstance {
+                advertise_address: record.advertise_address.clone(),
+                labels: record.labels.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        if schedulers.is_empty() {
+            schedulers.push(SchedulerInstance {
+                advertise_address: self.advertise_address.clone(),
+                labels: std::collections::HashMap::new(),
+            });
+        }
+
+        let scheduler_addresses = schedulers
+            .iter()
+            .map(|scheduler| scheduler.advertise_address.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::debug!(
+            "ClusterService::get_schedulers response schedulers=[{scheduler_addresses}]"
+        );
+
+        Ok(Response::new(GetSchedulersResponse { schedulers }))
     }
 }
