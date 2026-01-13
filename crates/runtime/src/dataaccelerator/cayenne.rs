@@ -303,8 +303,14 @@ fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize 
     acceleration
         .params
         .get(key)
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default)
+        .map_or(default, |v| {
+            v.parse::<usize>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                );
+                default
+            })
+        })
 }
 
 /// Returns true if the path is a local filesystem path (not a remote object store).
