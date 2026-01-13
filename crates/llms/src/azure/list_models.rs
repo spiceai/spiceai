@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Model listing functionality for Azure OpenAI provider.
+//! Model listing functionality for Azure `OpenAI` provider.
 
 use async_trait::async_trait;
 use reqwest::header::CONTENT_TYPE;
@@ -40,7 +40,7 @@ struct Model {
     id: String,
 }
 
-/// Azure OpenAI model lister that fetches available models/deployments from the API.
+/// Azure `OpenAI` model lister that fetches available models/deployments from the API.
 pub struct AzureModelLister {
     endpoint: String,
     api_key: Option<SecretString>,
@@ -68,10 +68,10 @@ impl AzureModelLister {
             });
         }
 
-        let api_version = params
-            .get("azure_api_version")
-            .map(|s| s.expose_secret().to_string())
-            .unwrap_or_else(|| DEFAULT_API_VERSION.to_string());
+        let api_version = params.get("azure_api_version").map_or_else(
+            || DEFAULT_API_VERSION.to_string(),
+            |s| s.expose_secret().to_string(),
+        );
 
         Ok(Self {
             endpoint,
@@ -128,19 +128,25 @@ impl ListModels for AzureModelLister {
             );
         }
 
-        let response = request.send().await.map_err(|e| ListModelsError::NetworkError {
-            provider: PROVIDER_NAME.to_string(),
-            message: e.to_string(),
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| ListModelsError::NetworkError {
+                provider: PROVIDER_NAME.to_string(),
+                message: e.to_string(),
+            })?;
 
         if !response.status().is_success() {
             return Err(map_status_to_error(response.status(), PROVIDER_NAME));
         }
 
-        let body = response.text().await.map_err(|e| ListModelsError::NetworkError {
-            provider: PROVIDER_NAME.to_string(),
-            message: e.to_string(),
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| ListModelsError::NetworkError {
+                provider: PROVIDER_NAME.to_string(),
+                message: e.to_string(),
+            })?;
 
         let models: ModelsResponse =
             serde_json::from_str(&body).map_err(|e| ListModelsError::NetworkError {
@@ -160,7 +166,10 @@ mod tests {
     fn test_from_params_missing_endpoint() {
         let params = HashMap::new();
         let result = AzureModelLister::from_params(&params);
-        assert!(matches!(result, Err(ListModelsError::MissingParameter { .. })));
+        assert!(matches!(
+            result,
+            Err(ListModelsError::MissingParameter { .. })
+        ));
     }
 
     #[test]
@@ -168,10 +177,13 @@ mod tests {
         let mut params = HashMap::new();
         params.insert(
             "azure_endpoint".to_string(),
-            SecretString::new("https://test.openai.azure.com".to_string()),
+            SecretString::from("https://test.openai.azure.com"),
         );
         let result = AzureModelLister::from_params(&params);
-        assert!(matches!(result, Err(ListModelsError::MissingParameter { .. })));
+        assert!(matches!(
+            result,
+            Err(ListModelsError::MissingParameter { .. })
+        ));
     }
 
     #[test]
@@ -179,14 +191,11 @@ mod tests {
         let mut params = HashMap::new();
         params.insert(
             "azure_endpoint".to_string(),
-            SecretString::new("https://test.openai.azure.com".to_string()),
+            SecretString::from("https://test.openai.azure.com"),
         );
-        params.insert(
-            "azure_api_key".to_string(),
-            SecretString::new("test-key".to_string()),
-        );
+        params.insert("azure_api_key".to_string(), SecretString::from("test-key"));
         let result = AzureModelLister::from_params(&params);
-        assert!(result.is_ok());
+        result.expect("should succeed with api_key");
     }
 
     #[test]
@@ -194,13 +203,13 @@ mod tests {
         let mut params = HashMap::new();
         params.insert(
             "azure_endpoint".to_string(),
-            SecretString::new("https://test.openai.azure.com".to_string()),
+            SecretString::from("https://test.openai.azure.com"),
         );
         params.insert(
             "azure_entra_token".to_string(),
-            SecretString::new("test-token".to_string()),
+            SecretString::from("test-token"),
         );
         let result = AzureModelLister::from_params(&params);
-        assert!(result.is_ok());
+        result.expect("should succeed with entra_token");
     }
 }

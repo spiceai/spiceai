@@ -44,10 +44,10 @@ impl BedrockModelLister {
     /// Optional parameter: `aws_region` (defaults to us-east-1)
     #[must_use]
     pub fn from_params(params: &HashMap<String, SecretString>) -> Self {
-        let region = params
-            .get("aws_region")
-            .map(|s| s.expose_secret().to_string())
-            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+        let region = params.get("aws_region").map_or_else(
+            || DEFAULT_REGION.to_string(),
+            |s| s.expose_secret().to_string(),
+        );
 
         Self { region }
     }
@@ -127,10 +127,7 @@ mod tests {
     #[test]
     fn test_from_params_with_region() {
         let mut params = HashMap::new();
-        params.insert(
-            "aws_region".to_string(),
-            SecretString::new("eu-west-1".to_string()),
-        );
+        params.insert("aws_region".to_string(), SecretString::from("eu-west-1"));
         let lister = BedrockModelLister::from_params(&params);
         assert_eq!(lister.region(), "eu-west-1");
     }

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Azure OpenAI LLM provider.
+//! Azure `OpenAI` LLM provider.
 //!
-//! Azure OpenAI uses deployments rather than model names directly.
+//! Azure `OpenAI` uses deployments rather than model names directly.
 //! The deployment name is what you configure when accessing the model.
 
 #![allow(clippy::missing_errors_doc)]

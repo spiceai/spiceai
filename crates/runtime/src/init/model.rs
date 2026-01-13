@@ -179,13 +179,12 @@ impl Runtime {
                     || error_msg.contains("not found")
                     || error_msg.contains("ModelNotFound");
 
-                if is_model_not_found {
-                    if let Some(model_source) = &source {
-                        if let Some(hint) = get_available_models_hint(model_source, &params).await {
-                            tracing::warn!("{e}{hint}");
-                            return;
-                        }
-                    }
+                if is_model_not_found
+                    && let Some(model_source) = &source
+                    && let Some(hint) = get_available_models_hint(model_source, &params).await
+                {
+                    tracing::warn!("{e}{hint}");
+                    return;
                 }
 
                 tracing::warn!("{e}");

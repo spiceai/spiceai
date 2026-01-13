@@ -114,10 +114,13 @@ impl ListModels for DatabricksModelLister {
             return Err(map_status_to_error(response.status(), PROVIDER_NAME));
         }
 
-        let body = response.text().await.map_err(|e| ListModelsError::NetworkError {
-            provider: PROVIDER_NAME.to_string(),
-            message: e.to_string(),
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| ListModelsError::NetworkError {
+                provider: PROVIDER_NAME.to_string(),
+                message: e.to_string(),
+            })?;
 
         let endpoints: EndpointsResponse =
             serde_json::from_str(&body).map_err(|e| ListModelsError::NetworkError {
@@ -150,10 +153,13 @@ mod tests {
         let mut params = HashMap::new();
         params.insert(
             "databricks_token".to_string(),
-            SecretString::new("test-token".to_string()),
+            SecretString::from("test-token"),
         );
         let result = DatabricksModelLister::from_params(&params);
-        assert!(matches!(result, Err(ListModelsError::MissingParameter { .. })));
+        assert!(matches!(
+            result,
+            Err(ListModelsError::MissingParameter { .. })
+        ));
     }
 
     #[test]
@@ -161,10 +167,13 @@ mod tests {
         let mut params = HashMap::new();
         params.insert(
             "databricks_endpoint".to_string(),
-            SecretString::new("https://test.databricks.com".to_string()),
+            SecretString::from("https://test.databricks.com"),
         );
         let result = DatabricksModelLister::from_params(&params);
-        assert!(matches!(result, Err(ListModelsError::MissingParameter { .. })));
+        assert!(matches!(
+            result,
+            Err(ListModelsError::MissingParameter { .. })
+        ));
     }
 
     #[test]
@@ -172,14 +181,14 @@ mod tests {
         let mut params = HashMap::new();
         params.insert(
             "databricks_endpoint".to_string(),
-            SecretString::new("https://test.databricks.com".to_string()),
+            SecretString::from("https://test.databricks.com"),
         );
         params.insert(
             "databricks_token".to_string(),
-            SecretString::new("test-token".to_string()),
+            SecretString::from("test-token"),
         );
         let result = DatabricksModelLister::from_params(&params);
-        assert!(result.is_ok());
+        result.expect("should succeed");
     }
 
     #[test]

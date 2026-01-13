@@ -75,7 +75,9 @@ pub trait ListModels: Send + Sync {
     /// Returns a formatted hint string for error messages.
     async fn get_models_hint(&self) -> Option<String> {
         match self.list_models().await {
-            Ok(models) if !models.is_empty() => Some(format_models_hint(&models, self.provider_name())),
+            Ok(models) if !models.is_empty() => {
+                Some(format_models_hint(&models, self.provider_name()))
+            }
             Ok(_) => None,
             Err(e) => {
                 tracing::debug!("Failed to list models from {}: {}", self.provider_name(), e);
@@ -105,7 +107,8 @@ pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
         display_models.join(", ")
     );
     if remaining > 0 {
-        hint.push_str(&format!(" (and {remaining} more)"));
+        use std::fmt::Write;
+        let _ = write!(hint, " (and {remaining} more)");
     }
     hint
 }
@@ -141,13 +144,20 @@ pub fn map_status_to_error(status: StatusCode, provider: &str) -> ListModelsErro
 }
 
 /// Helper to get a required parameter from a params map.
+///
+/// # Errors
+///
+/// Returns `ListModelsError::MissingParameter` if the key is not found.
+#[expect(clippy::implicit_hasher)]
 pub fn get_required_param<'a>(
     params: &'a HashMap<String, SecretString>,
     key: &str,
 ) -> ListModelsResult<&'a SecretString> {
-    params.get(key).ok_or_else(|| ListModelsError::MissingParameter {
-        param: key.to_string(),
-    })
+    params
+        .get(key)
+        .ok_or_else(|| ListModelsError::MissingParameter {
+            param: key.to_string(),
+        })
 }
 
 #[cfg(test)]

@@ -16,57 +16,55 @@ limitations under the License.
 
 //! Model listing functionality for Spice Cloud provider.
 
+use async_openai::Client;
 use async_trait::async_trait;
-use reqwest::header::CONTENT_TYPE;
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::provider::{
-    ListModels, ListModelsError, ListModelsResult, create_http_client, get_required_param,
-    map_status_to_error,
-};
+use crate::config::HostedModelConfig;
+use crate::provider::{ListModels, ListModelsError, ListModelsResult, get_required_param};
 
 const PROVIDER_NAME: &str = "Spice Cloud";
 const DEFAULT_ENDPOINT: &str = "https://data.spiceai.io";
 
-#[derive(Debug, Deserialize)]
-struct ModelsResponse {
-    data: Vec<Model>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Model {
-    id: String,
-}
-
-/// Spice Cloud model lister that fetches available models from the API.
+/// Spice Cloud model lister that fetches available models using the SDK.
 pub struct SpiceAiModelLister {
-    api_key: SecretString,
-    endpoint: String,
+    client: Client<HostedModelConfig>,
 }
 
 impl SpiceAiModelLister {
     /// Creates a new model lister from parameters.
     ///
     /// Required parameter: `spiceai_api_key`
-    /// Optional parameter: `spiceai_endpoint` (defaults to https://data.spiceai.io)
+    /// Optional parameter: `spiceai_endpoint` (defaults to <https://data.spiceai.io>)
     pub fn from_params(params: &HashMap<String, SecretString>) -> ListModelsResult<Self> {
-        let api_key = get_required_param(params, "spiceai_api_key")?.clone();
-        let endpoint = params
-            .get("spiceai_endpoint")
-            .map(|s| s.expose_secret().to_string())
-            .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+        let api_key = get_required_param(params, "spiceai_api_key")?;
+        let endpoint = params.get("spiceai_endpoint").map_or_else(
+            || format!("{DEFAULT_ENDPOINT}/v1"),
+            |s| format!("{}/v1", s.expose_secret().trim_end_matches('/')),
+        );
 
-        Ok(Self { api_key, endpoint })
+        let config =
+            HostedModelConfig::from_url(&endpoint).with_api_key(Some(api_key.expose_secret()));
+
+        Ok(Self {
+            client: Client::with_config(config),
+        })
     }
 
     /// Creates a new model lister with explicit credentials.
     #[must_use]
-    pub fn new(api_key: SecretString, endpoint: Option<String>) -> Self {
+    pub fn new(api_key: &SecretString, endpoint: Option<&str>) -> Self {
+        let base_url = endpoint.map_or_else(
+            || format!("{DEFAULT_ENDPOINT}/v1"),
+            |e| format!("{}/v1", e.trim_end_matches('/')),
+        );
+
+        let config =
+            HostedModelConfig::from_url(&base_url).with_api_key(Some(api_key.expose_secret()));
+
         Self {
-            api_key,
-            endpoint: endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string()),
+            client: Client::with_config(config),
         }
     }
 
@@ -89,43 +87,30 @@ impl ListModels for SpiceAiModelLister {
     }
 
     async fn list_models(&self) -> ListModelsResult<Vec<String>> {
-        let client = create_http_client().ok_or_else(|| ListModelsError::NetworkError {
-            provider: PROVIDER_NAME.to_string(),
-            message: "Failed to create HTTP client".to_string(),
+        let response = self.client.models().list().await.map_err(|e| {
+            let message = e.to_string();
+            if message.contains("401") || message.contains("Unauthorized") {
+                ListModelsError::InvalidCredentials {
+                    provider: PROVIDER_NAME.to_string(),
+                }
+            } else if message.contains("429") || message.contains("rate") {
+                ListModelsError::RateLimited {
+                    provider: PROVIDER_NAME.to_string(),
+                }
+            } else {
+                ListModelsError::NetworkError {
+                    provider: PROVIDER_NAME.to_string(),
+                    message,
+                }
+            }
         })?;
 
-        let url = format!("{}/v1/models", self.endpoint.trim_end_matches('/'));
+        let models: Vec<String> = response.data.into_iter().map(|m| m.id).collect();
 
-        let response = client
-            .get(&url)
-            .header("X-API-Key", self.api_key.expose_secret())
-            .header(CONTENT_TYPE, "application/json")
-            .send()
-            .await
-            .map_err(|e| ListModelsError::NetworkError {
-                provider: PROVIDER_NAME.to_string(),
-                message: e.to_string(),
-            })?;
-
-        if !response.status().is_success() {
-            return Err(map_status_to_error(response.status(), PROVIDER_NAME));
-        }
-
-        let body = response.text().await.map_err(|e| ListModelsError::NetworkError {
-            provider: PROVIDER_NAME.to_string(),
-            message: e.to_string(),
-        })?;
-
-        let models: ModelsResponse =
-            serde_json::from_str(&body).map_err(|e| ListModelsError::NetworkError {
-                provider: PROVIDER_NAME.to_string(),
-                message: format!("Failed to parse response: {e}"),
-            })?;
-
-        if models.data.is_empty() {
+        if models.is_empty() {
             Ok(Self::common_models())
         } else {
-            Ok(models.data.into_iter().map(|m| m.id).collect())
+            Ok(models)
         }
     }
 }
@@ -138,7 +123,10 @@ mod tests {
     fn test_from_params_missing_key() {
         let params = HashMap::new();
         let result = SpiceAiModelLister::from_params(&params);
-        assert!(matches!(result, Err(ListModelsError::MissingParameter { .. })));
+        assert!(matches!(
+            result,
+            Err(ListModelsError::MissingParameter { .. })
+        ));
     }
 
     #[test]
@@ -146,25 +134,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert(
             "spiceai_api_key".to_string(),
-            SecretString::new("test-key".to_string()),
+            SecretString::from("test-key"),
         );
         let result = SpiceAiModelLister::from_params(&params);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_from_params_with_custom_endpoint() {
-        let mut params = HashMap::new();
-        params.insert(
-            "spiceai_api_key".to_string(),
-            SecretString::new("test-key".to_string()),
-        );
-        params.insert(
-            "spiceai_endpoint".to_string(),
-            SecretString::new("https://custom.spiceai.io".to_string()),
-        );
-        let lister = SpiceAiModelLister::from_params(&params).expect("should succeed");
-        assert_eq!(lister.endpoint, "https://custom.spiceai.io");
+        result.expect("should succeed");
     }
 
     #[test]

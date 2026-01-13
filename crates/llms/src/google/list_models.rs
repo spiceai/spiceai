@@ -55,8 +55,7 @@ impl GoogleModelLister {
         let api_key = get_required_param(params, "google_api_key")?.clone();
         let api_base = params
             .get("google_api_base")
-            .map(|s| s.expose_secret().to_string())
-            .unwrap_or_else(|| API_BASE.to_string());
+            .map_or_else(|| API_BASE.to_string(), |s| s.expose_secret().to_string());
 
         Ok(Self { api_key, api_base })
     }
@@ -103,10 +102,13 @@ impl ListModels for GoogleModelLister {
             return Err(map_status_to_error(response.status(), PROVIDER_NAME));
         }
 
-        let body = response.text().await.map_err(|e| ListModelsError::NetworkError {
-            provider: PROVIDER_NAME.to_string(),
-            message: e.to_string(),
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| ListModelsError::NetworkError {
+                provider: PROVIDER_NAME.to_string(),
+                message: e.to_string(),
+            })?;
 
         let models: ModelsResponse =
             serde_json::from_str(&body).map_err(|e| ListModelsError::NetworkError {
@@ -139,17 +141,17 @@ mod tests {
     fn test_from_params_missing_key() {
         let params = HashMap::new();
         let result = GoogleModelLister::from_params(&params);
-        assert!(matches!(result, Err(ListModelsError::MissingParameter { .. })));
+        assert!(matches!(
+            result,
+            Err(ListModelsError::MissingParameter { .. })
+        ));
     }
 
     #[test]
     fn test_from_params_with_key() {
         let mut params = HashMap::new();
-        params.insert(
-            "google_api_key".to_string(),
-            SecretString::new("test-key".to_string()),
-        );
+        params.insert("google_api_key".to_string(), SecretString::from("test-key"));
         let result = GoogleModelLister::from_params(&params);
-        assert!(result.is_ok());
+        result.expect("should succeed");
     }
 }

@@ -26,7 +26,7 @@ use opentelemetry_sdk::{
     runtime::TokioCurrentThread,
     trace::{SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor},
 };
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use runtime::{Runtime, task_history::otel_exporter::TaskHistoryExporter};
 use serde::Deserialize;
 use spicepod::component::runtime::TaskHistoryCapturedOutput;
@@ -251,14 +251,14 @@ pub(crate) async fn verify_xai_model_available(model_id: &str) -> Result<(), Str
         Ok(())
     } else {
         // Try to parse error response for better error message
-        if let Ok(error_resp) = serde_json::from_str::<XaiErrorResponse>(&body) {
-            if let Some(error) = error_resp.error {
-                return Err(format!(
-                    "xAI model '{model_id}' not available: {} (code: {})",
-                    error.message,
-                    error.code.unwrap_or_else(|| "unknown".to_string())
-                ));
-            }
+        if let Ok(error_resp) = serde_json::from_str::<XaiErrorResponse>(&body)
+            && let Some(error) = error_resp.error
+        {
+            return Err(format!(
+                "xAI model '{model_id}' not available: {} (code: {})",
+                error.message,
+                error.code.unwrap_or_else(|| "unknown".to_string())
+            ));
         }
         Err(format!(
             "xAI model '{model_id}' not available (HTTP {status}): {body}"
@@ -293,31 +293,20 @@ pub(crate) async fn list_xai_models() -> Result<Vec<String>, String> {
             .map_err(|e| format!("Failed to parse xAI models response: {e}. Body: {body}"))?;
         Ok(models.data.into_iter().map(|m| m.id).collect())
     } else {
-        if let Ok(error_resp) = serde_json::from_str::<XaiErrorResponse>(&body) {
-            if let Some(error) = error_resp.error {
-                return Err(format!(
-                    "Failed to list xAI models: {} (code: {})",
-                    error.message,
-                    error.code.unwrap_or_else(|| "unknown".to_string())
-                ));
-            }
+        if let Ok(error_resp) = serde_json::from_str::<XaiErrorResponse>(&body)
+            && let Some(error) = error_resp.error
+        {
+            return Err(format!(
+                "Failed to list xAI models: {} (code: {})",
+                error.message,
+                error.code.unwrap_or_else(|| "unknown".to_string())
+            ));
         }
         Err(format!("Failed to list xAI models (HTTP {status}): {body}"))
     }
 }
 
-/// Response structure for OpenAI models list API
-#[derive(Debug, Deserialize)]
-struct OpenAIModelsResponse {
-    data: Vec<OpenAIModel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIModel {
-    id: String,
-}
-
-/// Verify that a specific model is available from OpenAI.
+/// Verify that a specific model is available from `OpenAI`.
 #[expect(dead_code)]
 pub(crate) async fn verify_openai_model_available(model_id: &str) -> Result<(), String> {
     let api_key = std::env::var("SPICE_OPENAI_API_KEY")
@@ -497,7 +486,7 @@ pub(crate) async fn list_google_models() -> Result<Vec<String>, String> {
 /// matches known Bedrock model patterns.
 /// For runtime verification, the actual health check happens when the model is loaded.
 #[expect(dead_code)]
-pub(crate) async fn verify_bedrock_model_available(model_id: &str) -> Result<(), String> {
+pub(crate) fn verify_bedrock_model_available(model_id: &str) -> Result<(), String> {
     // Bedrock model IDs follow specific patterns
     // Examples: amazon.titan-embed-text-v1, anthropic.claude-3-sonnet-20240229-v1:0
     let valid_prefixes = [
@@ -543,7 +532,7 @@ pub(crate) async fn verify_models_available(
                 "anthropic" => verify_anthropic_model_available(model_id).await,
                 "xai" => verify_xai_model_available(model_id).await,
                 "google" | "gemini" => verify_google_model_available(model_id).await,
-                "bedrock" => verify_bedrock_model_available(model_id).await,
+                "bedrock" => verify_bedrock_model_available(model_id),
                 _ => Err(format!("Unknown provider: {provider}")),
             };
             (format!("{provider}:{model_id}"), result)

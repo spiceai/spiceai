@@ -37,15 +37,13 @@ pub async fn get_available_models_hint(
     params: &HashMap<String, SecretString>,
 ) -> Option<String> {
     let lister: Box<dyn ListModels> = match source {
-        ModelSource::OpenAi => {
-            match llms::openai::OpenAiModelLister::from_params(params) {
-                Ok(lister) => Box::new(lister),
-                Err(e) => {
-                    tracing::debug!("Cannot create OpenAI model lister: {e}");
-                    return None;
-                }
+        ModelSource::OpenAi => match llms::openai::OpenAiModelLister::from_params(params) {
+            Ok(lister) => Box::new(lister),
+            Err(e) => {
+                tracing::debug!("Cannot create OpenAI model lister: {e}");
+                return None;
             }
-        }
+        },
         ModelSource::Anthropic => {
             match llms::anthropic::AnthropicModelLister::from_params(params) {
                 Ok(lister) => Box::new(lister),
@@ -55,34 +53,28 @@ pub async fn get_available_models_hint(
                 }
             }
         }
-        ModelSource::Xai => {
-            match llms::xai::XaiModelLister::from_params(params) {
-                Ok(lister) => Box::new(lister),
-                Err(e) => {
-                    tracing::debug!("Cannot create xAI model lister: {e}");
-                    return None;
-                }
+        ModelSource::Xai => match llms::xai::XaiModelLister::from_params(params) {
+            Ok(lister) => Box::new(lister),
+            Err(e) => {
+                tracing::debug!("Cannot create xAI model lister: {e}");
+                return None;
             }
-        }
-        ModelSource::Google => {
-            match llms::google::GoogleModelLister::from_params(params) {
-                Ok(lister) => Box::new(lister),
-                Err(e) => {
-                    tracing::debug!("Cannot create Google model lister: {e}");
-                    return None;
-                }
+        },
+        ModelSource::Google => match llms::google::GoogleModelLister::from_params(params) {
+            Ok(lister) => Box::new(lister),
+            Err(e) => {
+                tracing::debug!("Cannot create Google model lister: {e}");
+                return None;
             }
-        }
+        },
         ModelSource::Bedrock => Box::new(llms::bedrock::BedrockModelLister::from_params(params)),
-        ModelSource::Azure => {
-            match llms::azure::AzureModelLister::from_params(params) {
-                Ok(lister) => Box::new(lister),
-                Err(e) => {
-                    tracing::debug!("Cannot create Azure model lister: {e}");
-                    return None;
-                }
+        ModelSource::Azure => match llms::azure::AzureModelLister::from_params(params) {
+            Ok(lister) => Box::new(lister),
+            Err(e) => {
+                tracing::debug!("Cannot create Azure model lister: {e}");
+                return None;
             }
-        }
+        },
         ModelSource::Databricks => {
             match llms::databricks::DatabricksModelLister::from_params(params) {
                 Ok(lister) => Box::new(lister),
@@ -93,15 +85,13 @@ pub async fn get_available_models_hint(
             }
         }
         ModelSource::Perplexity => Box::new(llms::perplexity::PerplexityModelLister::new()),
-        ModelSource::SpiceAI => {
-            match llms::spiceai::SpiceAiModelLister::from_params(params) {
-                Ok(lister) => Box::new(lister),
-                Err(e) => {
-                    tracing::debug!("Cannot create Spice Cloud model lister: {e}");
-                    return None;
-                }
+        ModelSource::SpiceAI => match llms::spiceai::SpiceAiModelLister::from_params(params) {
+            Ok(lister) => Box::new(lister),
+            Err(e) => {
+                tracing::debug!("Cannot create Spice Cloud model lister: {e}");
+                return None;
             }
-        }
+        },
         _ => {
             tracing::debug!("Model source {:?} does not support model listing", source);
             return None;
