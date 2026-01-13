@@ -39,6 +39,20 @@ pub struct SqliteMetastore {
     conn: OnceCell<tokio_rusqlite::Connection>,
 }
 
+/// Convert a `tokio_rusqlite::Error` to a `CatalogError`, preserving the underlying
+/// `rusqlite::Error` when possible for better error matching.
+fn convert_tokio_rusqlite_error(
+    e: tokio_rusqlite::Error<rusqlite::Error>,
+    context: &str,
+) -> CatalogError {
+    match e {
+        tokio_rusqlite::Error::Error(sqlite_err) => CatalogError::Sqlite { source: sqlite_err },
+        other => CatalogError::Database {
+            message: format!("{context}: {other}"),
+        },
+    }
+}
+
 impl std::fmt::Debug for SqliteMetastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteMetastore")
@@ -362,11 +376,7 @@ impl MetastoreBackend for SqliteMetastore {
             Ok::<_, rusqlite::Error>(())
         })
         .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to execute statement: {e}"),
-            },
-        )?;
+        .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
 
         Ok(())
     }
