@@ -318,7 +318,7 @@ impl<'a> AsyncDbConnection<Arc<Session>, &'a dyn Sync> for ScyllaDbConnection {
 }
 
 /// Convert rows of `Option<CqlValue>` to an Arrow `RecordBatch`.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, reason = "Large function due to API upgrade")]
 fn convert_cqlvalue_rows_to_record_batch(
     rows: &[Vec<Option<CqlValue>>],
     schema: &SchemaRef,
