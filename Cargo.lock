@@ -545,7 +545,7 @@ dependencies = [
  "once_cell",
  "paste",
  "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost-types",
  "tonic",
  "tonic-prost",
 ]
@@ -2125,7 +2125,7 @@ dependencies = [
  "object_store",
  "parking_lot 0.12.5",
  "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost-types",
  "rand 0.9.2",
  "rustc_version",
  "serde",
@@ -2187,7 +2187,7 @@ dependencies = [
  "object_store",
  "parking_lot 0.12.5",
  "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost-types",
  "rand 0.9.2",
  "serde",
  "tokio",
@@ -8100,7 +8100,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -8144,7 +8144,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -12857,16 +12857,6 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deb1435c188b76130da55f17a466d252ff7b1418b2ad3e037d127b94e3411f29"
-dependencies = [
- "bytes",
- "prost-derive 0.12.6",
-]
-
-[[package]]
-name = "prost"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7231bd9b3d3d33c86b58adbac74b5ec0ad9f496b19d22801d773636feaa95f3d"
@@ -12881,15 +12871,15 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac6c3320f9abac597dcbc668774ef006702672474aad53c6d596b62e487b40b1"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.12.1",
+ "heck 0.4.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
  "petgraph 0.7.1",
  "prettyplease",
  "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost-types",
  "pulldown-cmark 0.13.0",
  "pulldown-cmark-to-cmark",
  "regex",
@@ -12912,37 +12902,15 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
-dependencies = [
- "anyhow",
- "itertools 0.12.1",
- "proc-macro2",
- "quote",
- "syn 2.0.114",
-]
-
-[[package]]
-name = "prost-derive"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
-]
-
-[[package]]
-name = "prost-types"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9091c90b0a32608e984ff2fa4091273cbdd755d54935c51d520887f4a1dbd5b0"
-dependencies = [
- "prost 0.12.6",
 ]
 
 [[package]]
@@ -13205,7 +13173,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.36",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -13242,7 +13210,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -15953,7 +15921,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
@@ -16074,7 +16042,7 @@ dependencies = [
  "chrono",
  "parking_lot 0.12.5",
  "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost-types",
  "rand 0.8.5",
  "serde_json",
  "tokio",
@@ -16123,8 +16091,8 @@ dependencies = [
 
 [[package]]
 name = "spiceai"
-version = "3.1.0"
-source = "git+https://github.com/spiceai/spice-rs.git?rev=1caae7832314fe8e353893a4ae48e963ea7beda0#1caae7832314fe8e353893a4ae48e963ea7beda0"
+version = "3.2.0"
+source = "git+https://github.com/spiceai/spice-rs.git?tag=v3.1.0#0195105ec217dd4ee9701d8d1d69bedf3f812595"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -16134,8 +16102,8 @@ dependencies = [
  "chrono",
  "dotenv",
  "futures",
- "prost 0.12.6",
- "prost-types 0.12.6",
+ "prost 0.14.1",
+ "prost-types",
  "rand 0.9.2",
  "reqwest",
  "rustls 0.23.36",
@@ -17303,7 +17271,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.16.1",
+ "hashbrown 0.15.5",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",
@@ -17935,7 +17903,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "prost-build",
- "prost-types 0.14.1",
+ "prost-types",
  "quote",
  "syn 2.0.114",
  "tempfile",
@@ -19513,7 +19481,7 @@ version = "0.1.0"
 source = "git+https://github.com/spiceai/vortex?rev=0b2060685cb1db9da24995161847a14050fe7242#0b2060685cb1db9da24995161847a14050fe7242"
 dependencies = [
  "prost 0.14.1",
- "prost-types 0.14.1",
+ "prost-types",
 ]
 
 [[package]]
@@ -19939,7 +19907,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
