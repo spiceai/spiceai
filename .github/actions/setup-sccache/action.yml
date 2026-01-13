@@ -53,3 +53,32 @@ runs:
         no_credentials = false
         region = "us-east-1"
         EOF
+
+    - name: Set up sccache (Windows)
+      if: runner.os == 'Windows' && inputs.minio_endpoint != ''
+      shell: pwsh
+      run: |
+        # Download and install sccache
+        $sccacheVersion = "v0.9.1"
+        $sccacheUrl = "https://github.com/mozilla/sccache/releases/download/$sccacheVersion/sccache-$sccacheVersion-x86_64-pc-windows-msvc.zip"
+        $sccacheZip = "$env:TEMP\sccache.zip"
+        $sccacheDir = "$env:USERPROFILE\sccache"
+
+        Invoke-WebRequest -Uri $sccacheUrl -OutFile $sccacheZip
+        Expand-Archive -Path $sccacheZip -DestinationPath $sccacheDir -Force
+        $sccacheBin = Get-ChildItem -Path $sccacheDir -Recurse -Filter "sccache.exe" | Select-Object -First 1
+        $sccacheBinDir = $sccacheBin.DirectoryName
+        echo "$sccacheBinDir" >> $env:GITHUB_PATH
+
+        # Configure sccache
+        $configDir = "$env:APPDATA\Mozilla\sccache"
+        New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+        $config = @"
+        [cache.s3]
+        bucket = "sccache"
+        endpoint = "${{ inputs.minio_endpoint }}"
+        server_side_encryption = false
+        no_credentials = false
+        region = "us-east-1"
+        "@
+        $config | Out-File -FilePath "$configDir\config" -Encoding utf8
