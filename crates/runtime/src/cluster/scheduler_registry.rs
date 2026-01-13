@@ -15,9 +15,11 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use app::App;
 use app::spicepod::component::runtime::Scheduler as SchedulerConfig;
 use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
 use datafusion::execution::object_store::ObjectStoreRegistry;
@@ -28,6 +30,7 @@ use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -107,6 +110,22 @@ pub struct SchedulerRecord {
 struct ClusterMetadata {
     schema_version: u32,
     created_at_ms: u64,
+    /// Spicepod generation number. Increments when spicepod content changes.
+    #[serde(default)]
+    spicepod_generation: u64,
+    /// SHA256 hash of the serialized spicepod JSON.
+    #[serde(default)]
+    spicepod_content_hash: String,
+    /// Timestamp when the spicepod generation was last updated.
+    #[serde(default)]
+    spicepod_updated_at_ms: u64,
+}
+
+/// Current spicepod generation state, shared with the cluster service.
+#[derive(Debug, Clone, Default)]
+pub struct SpicepodGeneration {
+    pub generation: u64,
+    pub content_hash: String,
 }
 
 pub type SchedulerPeers = HashMap<String, SchedulerRecord>;
@@ -120,6 +139,14 @@ struct SchedulerRegistryRunner {
     record: SchedulerRecord,
     update_version: Option<UpdateVersion>,
     peers: Arc<RwLock<SchedulerPeers>>,
+    /// Content hash of this scheduler's spicepod.
+    local_content_hash: String,
+    /// Generation number when this scheduler started.
+    startup_generation: u64,
+    /// Shared flag indicating this scheduler is outdated (newer generation exists).
+    outdated: Arc<AtomicBool>,
+    /// Shared current generation state for the cluster service.
+    current_generation: Arc<RwLock<SpicepodGeneration>>,
 }
 
 pub async fn start_scheduler_registry(
@@ -127,6 +154,8 @@ pub async fn start_scheduler_registry(
     config: &SchedulerConfig,
     cancel: CancellationToken,
     peers: Arc<RwLock<SchedulerPeers>>,
+    outdated: Arc<AtomicBool>,
+    current_generation: Arc<RwLock<SpicepodGeneration>>,
 ) -> Result<()> {
     let state_url = Url::parse(&config.state_location).context(InvalidStateLocationSnafu {
         location: config.state_location.clone(),
@@ -160,24 +189,39 @@ pub async fn start_scheduler_registry(
         labels: HashMap::new(),
     };
 
+    // Compute content hash from the current app definition
+    let app_guard = rt.app.read().await;
+    let local_content_hash = match &*app_guard {
+        Some(app) => compute_spicepod_hash(app),
+        None => String::new(),
+    };
+    drop(app_guard);
+
     let runner = SchedulerRegistryRunner::new(
         store,
         &base_prefix,
         scheduler_id,
         record,
         Arc::clone(&peers),
+        local_content_hash,
+        outdated,
+        current_generation,
     );
 
     runner.run(cancel).await
 }
 
 impl SchedulerRegistryRunner {
+    #[expect(clippy::too_many_arguments)]
     fn new(
         store: Arc<dyn ObjectStore>,
         base_prefix: &str,
         scheduler_id: String,
         record: SchedulerRecord,
         peers: Arc<RwLock<SchedulerPeers>>,
+        local_content_hash: String,
+        outdated: Arc<AtomicBool>,
+        current_generation: Arc<RwLock<SpicepodGeneration>>,
     ) -> Self {
         let metadata_path = join_path(base_prefix, "metadata/cluster.json");
         let record_path = join_path(base_prefix, &format!("schedulers/{scheduler_id}.json"));
@@ -192,6 +236,10 @@ impl SchedulerRegistryRunner {
             record,
             update_version: None,
             peers,
+            local_content_hash,
+            startup_generation: 0, // Will be set in ensure_cluster_metadata
+            outdated,
+            current_generation,
         }
     }
 
@@ -219,6 +267,10 @@ impl SchedulerRegistryRunner {
                     if let Err(err) = self.refresh_peers().await {
                         tracing::warn!("Scheduler discovery failed: {err}");
                     }
+                    // Also check if generation has advanced
+                    if let Err(err) = self.check_generation().await {
+                        tracing::warn!("Generation check failed: {err}");
+                    }
                 }
             }
         }
@@ -226,26 +278,190 @@ impl SchedulerRegistryRunner {
         Ok(())
     }
 
-    async fn ensure_cluster_metadata(&self) -> Result<()> {
-        let metadata = ClusterMetadata {
-            schema_version: CLUSTER_SCHEMA_VERSION,
-            created_at_ms: now_ms()?,
-        };
-        let payload = serde_json::to_vec(&metadata).context(SerializeStateSnafu)?;
+    async fn ensure_cluster_metadata(&mut self) -> Result<()> {
+        let now = now_ms()?;
 
+        // First, try to read existing metadata
+        match self.read_cluster_metadata().await {
+            Ok(existing) => {
+                // Metadata exists - check if our content hash matches
+                if existing.spicepod_content_hash == self.local_content_hash {
+                    // Same spicepod, use existing generation
+                    self.startup_generation = existing.spicepod_generation;
+                    self.update_current_generation(
+                        existing.spicepod_generation,
+                        existing.spicepod_content_hash,
+                    )
+                    .await;
+                    tracing::info!(
+                        "Joined cluster with existing spicepod generation {}",
+                        self.startup_generation
+                    );
+                    return Ok(());
+                }
+
+                // Different content hash - need to update generation
+                let new_generation = existing.spicepod_generation.saturating_add(1);
+                let updated_metadata = ClusterMetadata {
+                    schema_version: CLUSTER_SCHEMA_VERSION,
+                    created_at_ms: existing.created_at_ms,
+                    spicepod_generation: new_generation,
+                    spicepod_content_hash: self.local_content_hash.clone(),
+                    spicepod_updated_at_ms: now,
+                };
+
+                if self.try_update_cluster_metadata(&updated_metadata).await? {
+                    self.startup_generation = new_generation;
+                    self.update_current_generation(new_generation, self.local_content_hash.clone())
+                        .await;
+                    tracing::info!(
+                        "Updated cluster to spicepod generation {} (content hash changed)",
+                        new_generation
+                    );
+                } else {
+                    // Another scheduler won the race - re-read and accept their generation
+                    let refreshed = self.read_cluster_metadata().await?;
+                    self.startup_generation = refreshed.spicepod_generation;
+                    self.update_current_generation(
+                        refreshed.spicepod_generation,
+                        refreshed.spicepod_content_hash,
+                    )
+                    .await;
+                    tracing::info!(
+                        "Accepted cluster spicepod generation {} from peer",
+                        self.startup_generation
+                    );
+                }
+                Ok(())
+            }
+            Err(Error::ObjectStoreRead {
+                source: ObjectStoreError::NotFound { .. },
+            }) => {
+                // No metadata exists - try to create it
+                let metadata = ClusterMetadata {
+                    schema_version: CLUSTER_SCHEMA_VERSION,
+                    created_at_ms: now,
+                    spicepod_generation: 1,
+                    spicepod_content_hash: self.local_content_hash.clone(),
+                    spicepod_updated_at_ms: now,
+                };
+                let payload = serde_json::to_vec(&metadata).context(SerializeStateSnafu)?;
+
+                let put_result = self
+                    .store
+                    .put_opts(
+                        &self.metadata_path,
+                        payload.into(),
+                        PutOptions::from(PutMode::Create),
+                    )
+                    .await;
+
+                match put_result {
+                    Ok(_) => {
+                        self.startup_generation = 1;
+                        self.update_current_generation(1, self.local_content_hash.clone())
+                            .await;
+                        tracing::info!("Created cluster with spicepod generation 1");
+                        Ok(())
+                    }
+                    Err(ObjectStoreError::AlreadyExists { .. }) => {
+                        // Lost the race - re-read and use existing
+                        let existing = self.read_cluster_metadata().await?;
+                        self.startup_generation = existing.spicepod_generation;
+                        self.update_current_generation(
+                            existing.spicepod_generation,
+                            existing.spicepod_content_hash,
+                        )
+                        .await;
+                        tracing::info!(
+                            "Lost race to create cluster metadata, using generation {}",
+                            self.startup_generation
+                        );
+                        Ok(())
+                    }
+                    Err(err) => Err(Error::ObjectStoreWrite { source: err }),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn read_cluster_metadata(&self) -> Result<ClusterMetadata> {
+        let result = self
+            .store
+            .get(&self.metadata_path)
+            .await
+            .map_err(|source| Error::ObjectStoreRead { source })?;
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|source| Error::ObjectStoreRead { source })?;
+        serde_json::from_slice(&bytes).context(DeserializeStateSnafu)
+    }
+
+    async fn try_update_cluster_metadata(&self, metadata: &ClusterMetadata) -> Result<bool> {
+        // Read current metadata to get version for conditional update
+        let get_result = self
+            .store
+            .get(&self.metadata_path)
+            .await
+            .map_err(|source| Error::ObjectStoreRead { source })?;
+        let version = UpdateVersion {
+            e_tag: get_result.meta.e_tag,
+            version: get_result.meta.version,
+        };
+
+        let payload = serde_json::to_vec(metadata).context(SerializeStateSnafu)?;
         let put_result = self
             .store
             .put_opts(
                 &self.metadata_path,
                 payload.into(),
-                PutOptions::from(PutMode::Create),
+                PutOptions::from(PutMode::Update(version)),
             )
             .await;
 
         match put_result {
-            Ok(_) | Err(ObjectStoreError::AlreadyExists { .. }) => Ok(()),
+            Ok(_) => Ok(true),
+            Err(ObjectStoreError::Precondition { .. }) => Ok(false),
             Err(err) => Err(Error::ObjectStoreWrite { source: err }),
         }
+    }
+
+    async fn check_generation(&mut self) -> Result<()> {
+        let metadata = match self.read_cluster_metadata().await {
+            Ok(m) => m,
+            Err(Error::ObjectStoreRead {
+                source: ObjectStoreError::NotFound { .. },
+            }) => return Ok(()), // Metadata disappeared, ignore
+            Err(err) => return Err(err),
+        };
+
+        // Update shared current generation state
+        self.update_current_generation(
+            metadata.spicepod_generation,
+            metadata.spicepod_content_hash.clone(),
+        )
+        .await;
+
+        if metadata.spicepod_generation > self.startup_generation
+            && !self.outdated.load(Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "Scheduler is outdated: cluster generation {} > startup generation {}. This scheduler will refuse GetAppDefinition requests.",
+                metadata.spicepod_generation,
+                self.startup_generation
+            );
+            self.outdated.store(true, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
+    async fn update_current_generation(&self, generation: u64, content_hash: String) {
+        let mut gen_state = self.current_generation.write().await;
+        gen_state.generation = generation;
+        gen_state.content_hash = content_hash;
     }
 
     async fn bootstrap_record(&mut self) -> Result<()> {
@@ -523,4 +739,13 @@ fn now_ms() -> Result<u64> {
             source: Box::new(source),
         },
     })
+}
+
+/// Computes a SHA256 hash of the serialized spicepod for generation tracking.
+#[must_use]
+pub fn compute_spicepod_hash(app: &App) -> String {
+    let json = serde_json::to_string(app).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(json.as_bytes());
+    format!("{:x}", hasher.finalize())
 }

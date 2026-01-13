@@ -50,7 +50,7 @@ use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
-use runtime_proto::{GetAppDefinitionRequest, GetSchedulersRequest};
+use runtime_proto::{GetAppDefinitionRequest, GetClusterStateRequest};
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
@@ -70,9 +70,19 @@ use x509_certificate::CapturedX509Certificate;
 
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
+const EXECUTOR_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Exit code used when executor exits due to spicepod generation change.
+const GENERATION_CHANGE_EXIT_CODE: i32 = 42;
 
 type SchedulerEndpointOverride =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
+
+/// Result from fetching cluster state, including scheduler membership and generation info.
+struct ClusterStateResult {
+    scheduler_addresses: Vec<String>,
+    spicepod_generation: u64,
+    spicepod_content_hash: String,
+}
 
 struct SchedulerPollHandle {
     cancel: CancellationToken,
@@ -256,10 +266,10 @@ fn spawn_scheduler_poll_loop(
     SchedulerPollHandle { cancel, task }
 }
 
-async fn fetch_scheduler_membership(
+async fn fetch_cluster_state(
     scheduler_url: &Url,
     client_tls_config: Option<ClientTlsConfig>,
-) -> Option<Vec<String>> {
+) -> Option<ClusterStateResult> {
     let mut cluster_client =
         match create_cluster_service_client(scheduler_url, client_tls_config.clone()).await {
             Ok(client) => client,
@@ -269,17 +279,25 @@ async fn fetch_scheduler_membership(
             }
         };
 
-    match cluster_client.get_schedulers(GetSchedulersRequest {}).await {
+    match cluster_client
+        .get_cluster_state(GetClusterStateRequest {})
+        .await
+    {
         Ok(response) => {
-            let schedulers = response.into_inner().schedulers;
-            let scheduler_addresses = schedulers
+            let inner = response.into_inner();
+            let scheduler_addresses = inner
+                .schedulers
                 .iter()
                 .map(|scheduler| scheduler.advertise_address.clone())
                 .collect::<Vec<_>>();
-            Some(scheduler_addresses)
+            Some(ClusterStateResult {
+                scheduler_addresses,
+                spicepod_generation: inner.spicepod_generation,
+                spicepod_content_hash: inner.spicepod_content_hash,
+            })
         }
         Err(status) => {
-            tracing::warn!("Failed to get scheduler membership from scheduler: {status}");
+            tracing::warn!("Failed to get cluster state from scheduler: {status}");
             None
         }
     }
@@ -342,7 +360,9 @@ mod servers;
 mod service;
 
 pub use scheduler_registry::start_scheduler_registry;
-pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
+pub use scheduler_registry::{
+    SchedulerPeers, SchedulerRecord, SpicepodGeneration, compute_spicepod_hash,
+};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::ClusterServiceImpl;
 
@@ -731,22 +751,24 @@ pub async fn initialize_cluster_executor(
     let mut cluster_client =
         create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
 
-    let initial_scheduler_addresses =
-        match cluster_client.get_schedulers(GetSchedulersRequest {}).await {
-            Ok(response) => {
-                let schedulers = response.into_inner().schedulers;
-                let scheduler_addresses = schedulers
-                    .iter()
-                    .map(|scheduler| scheduler.advertise_address.clone())
-                    .collect::<Vec<_>>();
-                tracing::info!("Scheduler membership: {:?}", scheduler_addresses);
-                scheduler_addresses
-            }
-            Err(status) => {
-                tracing::warn!("Failed to get scheduler membership from scheduler: {status}");
-                Vec::new()
-            }
-        };
+    let initial_scheduler_addresses = match cluster_client
+        .get_cluster_state(GetClusterStateRequest {})
+        .await
+    {
+        Ok(response) => {
+            let schedulers = response.into_inner().schedulers;
+            let scheduler_addresses = schedulers
+                .iter()
+                .map(|scheduler| scheduler.advertise_address.clone())
+                .collect::<Vec<_>>();
+            tracing::info!("Scheduler membership: {:?}", scheduler_addresses);
+            scheduler_addresses
+        }
+        Err(status) => {
+            tracing::warn!("Failed to get scheduler membership from scheduler: {status}");
+            Vec::new()
+        }
+    };
 
     let app_definition_request = GetAppDefinitionRequest {
         executor_id: executor_id.clone(),
@@ -759,7 +781,16 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to get app definition from scheduler: {status}").into(),
         })?;
 
-    let app_json = response.into_inner().app_json;
+    let response_inner = response.into_inner();
+    let app_json = response_inner.app_json;
+    let expected_generation = response_inner.spicepod_generation;
+    let expected_content_hash = response_inner.spicepod_content_hash;
+
+    tracing::info!(
+        "Executor received spicepod generation {} (hash {})",
+        expected_generation,
+        expected_content_hash
+    );
 
     let app_def: App = serde_json::from_str(&app_json)
         .boxed()
@@ -871,6 +902,8 @@ pub async fn initialize_cluster_executor(
     let executor_for_manager = Arc::clone(&executor);
     let codec_for_manager = codec;
     let initial_scheduler_addresses_for_manager = initial_scheduler_addresses.clone();
+    let expected_generation_for_manager = expected_generation;
+    let expected_content_hash_for_manager = expected_content_hash.clone();
 
     let poll_manager = tokio::spawn(async move {
         let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
@@ -894,12 +927,45 @@ pub async fn initialize_cluster_executor(
         let mut refresh = tokio::time::interval(SCHEDULER_REFRESH_INTERVAL);
         loop {
             refresh.tick().await;
-            if let Some(addresses) = fetch_scheduler_membership(
+            if let Some(cluster_state) = fetch_cluster_state(
                 &scheduler_url_for_manager,
                 client_tls_config_for_manager.clone(),
             )
             .await
             {
+                // Check if generation has changed
+                if cluster_state.spicepod_generation > expected_generation_for_manager
+                    || (cluster_state.spicepod_generation == expected_generation_for_manager
+                        && cluster_state.spicepod_content_hash != expected_content_hash_for_manager)
+                {
+                    tracing::warn!(
+                        "Spicepod configuration changed: cluster generation {} (hash {}) vs expected {} (hash {}). Initiating graceful drain and restart.",
+                        cluster_state.spicepod_generation,
+                        cluster_state.spicepod_content_hash,
+                        expected_generation_for_manager,
+                        expected_content_hash_for_manager,
+                    );
+
+                    // Cancel all scheduler poll loops to stop accepting new work
+                    for (_address, handle) in pollers.drain() {
+                        handle.cancel.cancel();
+                    }
+
+                    // Wait for in-flight tasks to complete (drain timeout)
+                    tracing::info!(
+                        "Draining in-flight tasks (timeout: {:?})...",
+                        EXECUTOR_DRAIN_TIMEOUT
+                    );
+                    tokio::time::sleep(EXECUTOR_DRAIN_TIMEOUT).await;
+
+                    tracing::info!(
+                        "Drain complete. Exiting with code {} for orchestrator restart.",
+                        GENERATION_CHANGE_EXIT_CODE
+                    );
+                    std::process::exit(GENERATION_CHANGE_EXIT_CODE);
+                }
+
+                let addresses = cluster_state.scheduler_addresses;
                 if addresses.is_empty() {
                     tracing::warn!(
                         "Scheduler membership refresh returned empty list; keeping existing schedulers"

@@ -23,15 +23,17 @@ use app::App;
 use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::{
     ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
-    GetSchedulersRequest, GetSchedulersResponse, SchedulerInstance,
+    GetClusterStateRequest, GetClusterStateResponse, SchedulerInstance,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use crate::cluster::SchedulerPeers;
+use crate::cluster::scheduler_registry::SpicepodGeneration;
 
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
@@ -39,6 +41,10 @@ pub struct ClusterServiceImpl {
     secrets: Arc<RwLock<Secrets>>,
     advertise_address: String,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+    /// Whether this scheduler is outdated (newer generation exists in cluster).
+    outdated: Arc<AtomicBool>,
+    /// Current spicepod generation state.
+    current_generation: Arc<RwLock<SpicepodGeneration>>,
 }
 
 impl ClusterServiceImpl {
@@ -49,12 +55,16 @@ impl ClusterServiceImpl {
         secrets: Arc<RwLock<Secrets>>,
         advertise_address: String,
         scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+        outdated: Arc<AtomicBool>,
+        current_generation: Arc<RwLock<SpicepodGeneration>>,
     ) -> Self {
         Self {
             app,
             secrets,
             advertise_address,
             scheduler_peers,
+            outdated,
+            current_generation,
         }
     }
 }
@@ -71,6 +81,17 @@ impl ClusterService for ClusterServiceImpl {
             request.executor_id
         );
 
+        // If this scheduler is outdated, refuse to serve app definitions
+        if self.outdated.load(Ordering::Relaxed) {
+            tracing::warn!(
+                "Refusing GetAppDefinition for executor {} - scheduler is outdated",
+                request.executor_id
+            );
+            return Err(Status::unavailable(
+                "Scheduler has outdated spicepod configuration. Please retry with another scheduler.",
+            ));
+        }
+
         let app_guard = self.app.read().await;
         let Some(ref app) = *app_guard else {
             return Err(Status::internal("App context not available"));
@@ -79,7 +100,17 @@ impl ClusterService for ClusterServiceImpl {
         let app_json = serde_json::to_string(app.as_ref())
             .map_err(|e| Status::internal(format!("Failed to serialize app: {e}")))?;
 
-        Ok(Response::new(GetAppDefinitionResponse { app_json }))
+        // Get current generation info
+        let gen_state = self.current_generation.read().await;
+        let spicepod_generation = gen_state.generation;
+        let spicepod_content_hash = gen_state.content_hash.clone();
+        drop(gen_state);
+
+        Ok(Response::new(GetAppDefinitionResponse {
+            app_json,
+            spicepod_generation,
+            spicepod_content_hash,
+        }))
     }
 
     async fn expand_secret(
@@ -132,11 +163,11 @@ impl ClusterService for ClusterServiceImpl {
         }))
     }
 
-    async fn get_schedulers(
+    async fn get_cluster_state(
         &self,
-        _request: Request<GetSchedulersRequest>,
-    ) -> Result<Response<GetSchedulersResponse>, Status> {
-        tracing::debug!("ClusterService::get_schedulers request");
+        _request: Request<GetClusterStateRequest>,
+    ) -> Result<Response<GetClusterStateResponse>, Status> {
+        tracing::debug!("ClusterService::get_cluster_state request");
 
         let peers = self.scheduler_peers.read().await;
         let mut schedulers = peers
@@ -159,10 +190,21 @@ impl ClusterService for ClusterServiceImpl {
             .map(|scheduler| scheduler.advertise_address.as_str())
             .collect::<Vec<_>>()
             .join(",");
+
+        // Get current generation info
+        let gen_state = self.current_generation.read().await;
+        let spicepod_generation = gen_state.generation;
+        let spicepod_content_hash = gen_state.content_hash.clone();
+        drop(gen_state);
+
         tracing::debug!(
-            "ClusterService::get_schedulers response schedulers=[{scheduler_addresses}]"
+            "ClusterService::get_cluster_state response schedulers=[{scheduler_addresses}], generation={spicepod_generation}"
         );
 
-        Ok(Response::new(GetSchedulersResponse { schedulers }))
+        Ok(Response::new(GetClusterStateResponse {
+            schedulers,
+            spicepod_generation,
+            spicepod_content_hash,
+        }))
     }
 }

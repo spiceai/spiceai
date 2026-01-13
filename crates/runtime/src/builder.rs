@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::cluster::ResolvedClusterConfig;
+use crate::cluster::SpicepodGeneration;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
 use crate::{
@@ -33,6 +34,7 @@ use crate::{
 };
 use app::App;
 use spicepod::component::caching::Caching;
+use std::sync::atomic::AtomicBool;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -294,6 +296,8 @@ impl RuntimeBuilder {
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
             scheduler_peers: Arc::new(RwLock::new(HashMap::new())),
+            scheduler_outdated: Arc::new(AtomicBool::new(false)),
+            scheduler_generation: Arc::new(RwLock::new(SpicepodGeneration::default())),
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };

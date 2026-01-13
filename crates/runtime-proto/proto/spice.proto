@@ -10,15 +10,16 @@ option java_outer_classname = "SpiceProto";
 service ClusterService {
     // Get the app definition (Spicepod) from the scheduler.
     // Called by executors during initialization.
+    // Returns UNAVAILABLE if the scheduler has an outdated spicepod generation.
     rpc GetAppDefinition(GetAppDefinitionRequest) returns (GetAppDefinitionResponse);
 
     // Expand a secret value from the scheduler's secret store.
     // Called by executors when they need to resolve secrets.
     rpc ExpandSecret(ExpandSecretRequest) returns (ExpandSecretResponse);
 
-    // Get the scheduler membership list.
-    // Called by executors during initialization.
-    rpc GetSchedulers(GetSchedulersRequest) returns (GetSchedulersResponse);
+    // Get the cluster state including scheduler membership and spicepod generation.
+    // Called by executors during initialization and periodically to detect config changes.
+    rpc GetClusterState(GetClusterStateRequest) returns (GetClusterStateResponse);
 }
 
 // Request message for GetAppDefinition RPC.
@@ -30,6 +31,10 @@ message GetAppDefinitionRequest {
 message GetAppDefinitionResponse {
     // JSON-serialized app definition.
     string app_json = 1;
+    // Spicepod generation number. Executors should monitor for changes.
+    uint64 spicepod_generation = 2;
+    // SHA256 hash of the serialized spicepod for verification.
+    string spicepod_content_hash = 3;
 }
 
 // Request message for ExpandSecret RPC.
@@ -44,8 +49,8 @@ message ExpandSecretResponse {
     string value = 2;
 }
 
-// Request message for GetSchedulers RPC.
-message GetSchedulersRequest {}
+// Request message for GetClusterState RPC.
+message GetClusterStateRequest {}
 
 // Scheduler instance information.
 message SchedulerInstance {
@@ -53,9 +58,14 @@ message SchedulerInstance {
     map<string, string> labels = 2;
 }
 
-// Response message for GetSchedulers RPC.
-message GetSchedulersResponse {
+// Response message for GetClusterState RPC.
+message GetClusterStateResponse {
+    // List of known scheduler instances in the cluster.
     repeated SchedulerInstance schedulers = 1;
+    // Current spicepod generation number. Executors should exit when this changes.
+    uint64 spicepod_generation = 2;
+    // SHA256 hash of the current spicepod content.
+    string spicepod_content_hash = 3;
 }
 
 // Physical plan

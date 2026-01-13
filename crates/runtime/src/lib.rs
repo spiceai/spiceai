@@ -25,6 +25,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
@@ -75,7 +76,7 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
-use crate::cluster::SchedulerPeers;
+use crate::cluster::{SchedulerPeers, SpicepodGeneration};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 pub mod accelerated_table;
@@ -483,6 +484,11 @@ pub struct Runtime {
 
     schedulers: Arc<ScheduleRegistry>,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+    /// Shared flag indicating this scheduler is outdated (newer generation exists).
+    /// Used to refuse `GetAppDefinition` requests when the scheduler has stale config.
+    scheduler_outdated: Arc<AtomicBool>,
+    /// Shared current spicepod generation state for cluster coordination.
+    scheduler_generation: Arc<RwLock<SpicepodGeneration>>,
 
     resource_monitor: resource_monitor::ResourceMonitor,
 
@@ -575,6 +581,16 @@ impl Runtime {
     #[must_use]
     pub fn scheduler_peers(&self) -> Arc<RwLock<SchedulerPeers>> {
         Arc::clone(&self.scheduler_peers)
+    }
+
+    #[must_use]
+    pub fn scheduler_outdated(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.scheduler_outdated)
+    }
+
+    #[must_use]
+    pub fn scheduler_generation(&self) -> Arc<RwLock<SpicepodGeneration>> {
+        Arc::clone(&self.scheduler_generation)
     }
 
     #[must_use]
@@ -704,6 +720,8 @@ impl Runtime {
                             let registry_shutdown = CancellationToken::new();
                             let registry_shutdown_for_task = registry_shutdown.clone();
                             let peers = self.scheduler_peers();
+                            let outdated = self.scheduler_outdated();
+                            let generation = self.scheduler_generation();
                             let self_ref = Arc::clone(&self);
                             let registry_task = async move {
                                 cluster::start_scheduler_registry(
@@ -711,6 +729,8 @@ impl Runtime {
                                     &config,
                                     registry_shutdown.clone(),
                                     peers,
+                                    outdated,
+                                    generation,
                                 )
                                 .await
                                 .map_err(|err| {
