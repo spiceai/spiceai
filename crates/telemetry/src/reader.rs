@@ -61,6 +61,11 @@ impl MetricReader for InitialReader {
         self.reader.shutdown()
     }
 
+    /// Delegates to the inner `ManualReader`'s timeout-aware shutdown.
+    ///
+    /// Simple delegation is appropriate here because `InitialReader` is a thin wrapper
+    /// that adds no state requiring cleanup beyond what `ManualReader` handles. The
+    /// inner reader manages all pipeline state and timeout logic.
     fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> OTelSdkResult {
         self.reader.shutdown_with_timeout(timeout)
     }
