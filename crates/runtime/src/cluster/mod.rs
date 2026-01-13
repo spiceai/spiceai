@@ -47,31 +47,302 @@ use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use futures::TryFutureExt;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
-use runtime_proto::GetAppDefinitionRequest;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
+use runtime_proto::{GetAppDefinitionRequest, GetSchedulersRequest};
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
+use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 use uuid::Uuid;
 use x509_certificate::CapturedX509Certificate;
+
+const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 type SchedulerEndpointOverride =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
 
+struct SchedulerPollHandle {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
+    if address.starts_with("http://") || address.starts_with("https://") {
+        return address.to_string();
+    }
+
+    let scheme = if tls_enabled { "https" } else { "http" };
+    format!("{scheme}://{address}")
+}
+
+/// Represents the connection state machine for the scheduler poll loop.
+///
+/// This enum tracks progress through connection establishment, avoiding redundant
+/// work when only later stages fail (e.g., retrying `connect()` without recreating
+/// the endpoint).
+#[expect(clippy::large_enum_variant)]
+enum SchedulerConnectionState {
+    /// Initial state: need to create endpoint URL and gRPC endpoint
+    NeedsEndpoint,
+    /// Endpoint created and TLS configured, ready to connect
+    ReadyToConnect {
+        endpoint: Endpoint,
+        endpoint_url: String,
+    },
+}
+
+fn spawn_scheduler_poll_loop(
+    scheduler_address: String,
+    client_tls_config: Option<ClientTlsConfig>,
+    executor: Arc<Executor>,
+    codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
+    readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+) -> SchedulerPollHandle {
+    let cancel = CancellationToken::new();
+    let token = cancel.clone();
+    let tls_enabled = client_tls_config.is_some();
+
+    let task = tokio::spawn(async move {
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_duration(Some(SCHEDULER_BACKOFF_MAX))
+            .build();
+
+        let mut state = SchedulerConnectionState::NeedsEndpoint;
+
+        loop {
+            if token.is_cancelled() {
+                tracing::debug!("Stopping scheduler poll loop for {scheduler_address} (cancelled)");
+                break;
+            }
+
+            // Build the endpoint if we don't have one yet
+            let (endpoint, endpoint_url) = match state {
+                SchedulerConnectionState::NeedsEndpoint => {
+                    let endpoint_url =
+                        normalize_scheduler_endpoint(&scheduler_address, tls_enabled);
+                    let scheduler_endpoint = match create_grpc_client_endpoint(endpoint_url.clone())
+                    {
+                        Ok(endpoint) => endpoint,
+                        Err(err) => {
+                            tracing::warn!(
+                                "Failed to create scheduler endpoint {endpoint_url}: {err}"
+                            );
+                            if let Some(delay) = backoff.next_duration() {
+                                tokio::select! {
+                                    () = token.cancelled() => break,
+                                    () = tokio::time::sleep(delay) => {}
+                                }
+                            }
+                            continue;
+                        }
+                    };
+
+                    let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
+                        match scheduler_endpoint.tls_config(tls_config) {
+                            Ok(endpoint) => endpoint,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed to configure TLS for scheduler endpoint {endpoint_url}: {err}"
+                                );
+                                if let Some(delay) = backoff.next_duration() {
+                                    tokio::select! {
+                                        () = token.cancelled() => break,
+                                        () = tokio::time::sleep(delay) => {}
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        scheduler_endpoint
+                    };
+
+                    // Cache the endpoint for future retries
+                    state = SchedulerConnectionState::ReadyToConnect {
+                        endpoint: scheduler_endpoint.clone(),
+                        endpoint_url: endpoint_url.clone(),
+                    };
+                    (scheduler_endpoint, endpoint_url)
+                }
+                SchedulerConnectionState::ReadyToConnect {
+                    ref endpoint,
+                    ref endpoint_url,
+                } => (endpoint.clone(), endpoint_url.clone()),
+            };
+
+            let scheduler_connection = match endpoint.connect().await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    tracing::warn!("Unable to connect to scheduler at {endpoint_url}: {err}");
+                    if let Some(delay) = backoff.next_duration() {
+                        tokio::select! {
+                            () = token.cancelled() => break,
+                            () = tokio::time::sleep(delay) => {}
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            backoff.reset();
+            let scheduler = SchedulerGrpcClient::new(scheduler_connection)
+                .max_encoding_message_size(usize::MAX)
+                .max_decoding_message_size(usize::MAX);
+
+            let (tx_ready, rx_ready) = oneshot::channel();
+            let readiness_sender = Arc::clone(&readiness_sender);
+            let readiness_task = tokio::spawn(async move {
+                if let Ok(executor_id) = rx_ready.await {
+                    let sender = if let Ok(mut sender) = readiness_sender.lock() {
+                        sender.take()
+                    } else {
+                        tracing::warn!(
+                            "Readiness sender lock poisoned while handling executor readiness"
+                        );
+                        None
+                    };
+                    if let Some(sender) = sender {
+                        let _ = sender.send(executor_id);
+                    }
+                }
+            });
+
+            let poll_future = execution_loop::poll_loop(
+                scheduler,
+                Arc::clone(&executor),
+                codec.clone(),
+                Some(tx_ready),
+            );
+
+            tokio::select! {
+                () = token.cancelled() => {
+                    readiness_task.abort();
+                    tracing::debug!(
+                        "Stopping scheduler poll loop for {scheduler_address} (cancelled)"
+                    );
+                    break;
+                }
+                result = poll_future => {
+                    readiness_task.abort();
+                    if let Err(err) = result {
+                        tracing::warn!(
+                            "Scheduler poll loop ended for {scheduler_address}: {err}"
+                        );
+                    }
+                    if let Some(delay) = backoff.next_duration() {
+                        tokio::select! {
+                            () = token.cancelled() => break,
+                            () = tokio::time::sleep(delay) => {}
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    SchedulerPollHandle { cancel, task }
+}
+
+async fn fetch_scheduler_membership(
+    scheduler_url: &Url,
+    client_tls_config: Option<ClientTlsConfig>,
+) -> Option<Vec<String>> {
+    let mut cluster_client =
+        match create_cluster_service_client(scheduler_url, client_tls_config.clone()).await {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!("Failed to create scheduler membership client: {err}");
+                return None;
+            }
+        };
+
+    match cluster_client.get_schedulers(GetSchedulersRequest {}).await {
+        Ok(response) => {
+            let schedulers = response.into_inner().schedulers;
+            let scheduler_addresses = schedulers
+                .iter()
+                .map(|scheduler| scheduler.advertise_address.clone())
+                .collect::<Vec<_>>();
+            Some(scheduler_addresses)
+        }
+        Err(status) => {
+            tracing::warn!("Failed to get scheduler membership from scheduler: {status}");
+            None
+        }
+    }
+}
+
+fn update_scheduler_pollers(
+    pollers: &mut HashMap<String, SchedulerPollHandle>,
+    known_schedulers: &mut HashSet<String>,
+    addresses: Vec<String>,
+    client_tls_config: Option<&ClientTlsConfig>,
+    executor: &Arc<Executor>,
+    codec: &BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
+    readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
+) {
+    let next_schedulers: HashSet<String> = addresses.into_iter().collect();
+
+    let added: Vec<String> = next_schedulers
+        .difference(known_schedulers)
+        .cloned()
+        .collect();
+    let removed: Vec<String> = known_schedulers
+        .difference(&next_schedulers)
+        .cloned()
+        .collect();
+
+    if !added.is_empty() || !removed.is_empty() {
+        let added_list = added.join(",");
+        let removed_list = removed.join(",");
+        tracing::debug!(
+            "Scheduler membership updated; added=[{added_list}], removed=[{removed_list}]"
+        );
+    }
+
+    for address in added {
+        let handle = spawn_scheduler_poll_loop(
+            address.clone(),
+            client_tls_config.cloned(),
+            Arc::clone(executor),
+            codec.clone(),
+            Arc::clone(readiness_sender),
+        );
+        pollers.insert(address, handle);
+    }
+
+    for address in removed {
+        if let Some(handle) = pollers.remove(&address) {
+            handle.cancel.cancel();
+            tokio::spawn(async move {
+                let _ = handle.task.await;
+            });
+        }
+    }
+
+    *known_schedulers = next_schedulers;
+}
+
 pub mod datafusion;
+mod scheduler_registry;
 mod servers;
 mod service;
 
+pub use scheduler_registry::start_scheduler_registry;
+pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::ClusterServiceImpl;
 
@@ -187,6 +458,8 @@ pub struct ResolvedClusterConfig {
     scheduler_url: Option<String>,
     /// Resolved scheduler address URL (with scheme inferred if omitted).
     scheduler_address_url: Option<Url>,
+    /// Advertise address with port stripped (if present in the original input).
+    node_advertise_host: Option<String>,
 }
 
 impl ResolvedClusterConfig {
@@ -252,9 +525,9 @@ impl ResolvedClusterConfig {
 
         // Pre-compute scheduler URL from advertise address
         let bind_port = config.node_bind_address.port();
-        let scheduler_url = config.node_advertise_address.as_ref().map(|addr| {
+        let node_advertise_host = config.node_advertise_address.as_ref().map(|addr| {
             // Extract just the host, ignoring any port - always use bind_port
-            let host = if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+            if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
                 // Full socket address - strip the port with deprecation warning
                 tracing::warn!("Port in --node-advertise-address will be ignored. Using port {bind_port} from --node-bind-address.");
                 socket_addr.ip().to_string()
@@ -270,9 +543,11 @@ impl ResolvedClusterConfig {
             } else {
                 // No colon - just a hostname
                 addr.clone()
-            };
-            format!("{inferred_scheme}://{host}:{bind_port}")
+            }
         });
+        let scheduler_url = node_advertise_host
+            .as_ref()
+            .map(|host| format!("{inferred_scheme}://{host}:{bind_port}"));
 
         // Resolve scheduler address URL, inferring scheme if omitted and default port if not provided
         let scheduler_address_url = config
@@ -311,6 +586,7 @@ impl ResolvedClusterConfig {
             tls_config,
             scheduler_url,
             scheduler_address_url,
+            node_advertise_host,
         })
     }
 
@@ -358,10 +634,10 @@ impl ResolvedClusterConfig {
         self.scheduler_url.as_deref()
     }
 
-    /// Returns the advertise address.
+    /// Returns the advertise address (host only, with any port stripped).
     #[must_use]
     pub fn node_advertise_address(&self) -> Option<&str> {
-        self.config.node_advertise_address.as_deref()
+        self.node_advertise_host.as_deref()
     }
 
     /// Returns the cluster TLS config if configured.
@@ -451,6 +727,23 @@ pub async fn initialize_cluster_executor(
     let mut cluster_client =
         create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
 
+    let initial_scheduler_addresses =
+        match cluster_client.get_schedulers(GetSchedulersRequest {}).await {
+            Ok(response) => {
+                let schedulers = response.into_inner().schedulers;
+                let scheduler_addresses = schedulers
+                    .iter()
+                    .map(|scheduler| scheduler.advertise_address.clone())
+                    .collect::<Vec<_>>();
+                tracing::info!("Scheduler membership: {:?}", scheduler_addresses);
+                scheduler_addresses
+            }
+            Err(status) => {
+                tracing::warn!("Failed to get scheduler membership from scheduler: {status}");
+                Vec::new()
+            }
+        };
+
     let app_definition_request = GetAppDefinitionRequest {
         executor_id: executor_id.clone(),
     };
@@ -477,31 +770,6 @@ pub async fn initialize_cluster_executor(
         .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string());
 
     let app_def = Arc::new(app_def);
-
-    let scheduler_endpoint = create_grpc_client_endpoint(scheduler_url.to_string())
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
-    let scheduler_endpoint = if let Some(tls_config) = client_tls_config.clone() {
-        scheduler_endpoint
-            .tls_config(tls_config)
-            .map_err(|e| FailedToStartClusterExecutor {
-                source: Box::new(e),
-            })?
-    } else {
-        scheduler_endpoint
-    };
-
-    let scheduler_connection =
-        scheduler_endpoint
-            .connect()
-            .await
-            .map_err(|e| FailedToStartClusterExecutor {
-                source: format!("Unable to connect to scheduler at {scheduler_url}: {e}").into(),
-            })?;
-
-    let scheduler = SchedulerGrpcClient::new(scheduler_connection)
-        .max_encoding_message_size(usize::MAX)
-        .max_decoding_message_size(usize::MAX);
 
     // Use the configured node_bind_address for the executor flight server.
     // Fall back to dynamic port assignment if binding fails (e.g., port already in use).
@@ -540,44 +808,19 @@ pub async fn initialize_cluster_executor(
     };
 
     // Determine the advertise host and port for executor registration
-    let (advertise_host, advertise_port) = if let Some(advertise_addr) =
-        rt.df.cluster_config.node_advertise_address()
-    {
-        // Extract just the host, ignoring any port - always use bind_addr port
-        let host = if let Ok(socket_addr) = advertise_addr.parse::<SocketAddr>() {
-            // Full socket address - strip the port with deprecation warning
-            tracing::warn!(
-                "Port in --node-advertise-address will be ignored. Using port {} from --node-bind-address.",
-                bind_addr.port()
-            );
-            socket_addr.ip().to_string()
-        } else if let Some((host_part, port_part)) = advertise_addr.rsplit_once(':') {
-            // Check if this looks like host:port
-            if port_part.parse::<u16>().is_ok() && !host_part.is_empty() {
-                tracing::warn!(
-                    "Port in --node-advertise-address will be ignored. Using port {} from --node-bind-address.",
-                    bind_addr.port()
-                );
-                host_part.trim_matches(['[', ']']).to_string()
-            } else {
-                // Not a valid port, use as-is (e.g. IPv6 without brackets)
-                advertise_addr.to_string()
-            }
+    // node_advertise_address() returns host-only (port already stripped during config resolution)
+    let (advertise_host, advertise_port) =
+        if let Some(advertise_host) = rt.df.cluster_config.node_advertise_address() {
+            (advertise_host.to_string(), bind_addr.port())
         } else {
-            // No colon - just a hostname
-            advertise_addr.to_string()
-        };
-        (host, bind_addr.port())
-    } else {
-        // Fall back to hostname and bind_addr port
-        let hostname =
-            gethostname::gethostname()
-                .into_string()
-                .map_err(|_| FailedToStartClusterExecutor {
+            // Fall back to hostname and bind_addr port
+            let hostname = gethostname::gethostname().into_string().map_err(|_| {
+                FailedToStartClusterExecutor {
                     source: "Unable to determine executor hostname".to_string().into(),
-                })?;
-        (hostname, bind_addr.port())
-    };
+                }
+            })?;
+            (hostname, bind_addr.port())
+        };
 
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
@@ -617,14 +860,60 @@ pub async fn initialize_cluster_executor(
         .context(FailedToStartClusterExecutorSnafu)?;
 
     let (tx_ready, rx_ready) = oneshot::channel::<String>();
+    let readiness_sender = Arc::new(Mutex::new(Some(tx_ready)));
 
-    let executor_poll_loop = tokio::spawn(
-        execution_loop::poll_loop(scheduler, Arc::clone(&executor), codec, Some(tx_ready)).map_err(
-            |e| FailedToStartClusterExecutor {
-                source: Box::new(e),
-            },
-        ),
-    );
+    let scheduler_url_for_manager = scheduler_url.clone();
+    let client_tls_config_for_manager = client_tls_config.clone();
+    let executor_for_manager = Arc::clone(&executor);
+    let codec_for_manager = codec;
+    let initial_scheduler_addresses_for_manager = initial_scheduler_addresses.clone();
+
+    let poll_manager = tokio::spawn(async move {
+        let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
+        let mut known_schedulers: HashSet<String> = HashSet::new();
+
+        let mut current_addresses = initial_scheduler_addresses_for_manager;
+        if current_addresses.is_empty() {
+            current_addresses.push(scheduler_url_for_manager.to_string());
+        }
+
+        update_scheduler_pollers(
+            &mut pollers,
+            &mut known_schedulers,
+            current_addresses,
+            client_tls_config_for_manager.as_ref(),
+            &executor_for_manager,
+            &codec_for_manager,
+            &readiness_sender,
+        );
+
+        let mut refresh = tokio::time::interval(SCHEDULER_REFRESH_INTERVAL);
+        loop {
+            refresh.tick().await;
+            if let Some(addresses) = fetch_scheduler_membership(
+                &scheduler_url_for_manager,
+                client_tls_config_for_manager.clone(),
+            )
+            .await
+            {
+                if addresses.is_empty() {
+                    tracing::warn!(
+                        "Scheduler membership refresh returned empty list; keeping existing schedulers"
+                    );
+                    continue;
+                }
+                update_scheduler_pollers(
+                    &mut pollers,
+                    &mut known_schedulers,
+                    addresses,
+                    client_tls_config_for_manager.as_ref(),
+                    &executor_for_manager,
+                    &codec_for_manager,
+                    &readiness_sender,
+                );
+            }
+        }
+    });
 
     Ok(async move {
         let _ = rx_ready
@@ -639,7 +928,7 @@ pub async fn initialize_cluster_executor(
 
         rt.status.update_cluster("executor", ComponentStatus::Ready);
 
-        executor_poll_loop
+        poll_manager
             .await
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?

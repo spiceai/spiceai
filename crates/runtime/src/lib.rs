@@ -75,6 +75,7 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
+use crate::cluster::SchedulerPeers;
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 pub mod accelerated_table;
@@ -424,10 +425,16 @@ pub enum Error {
     FailedToStartClusterExecutor {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Failed to register scheduler: {source}"))]
+    FailedToRegisterScheduler {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
+const CLUSTER_SCHEDULER_REGISTRY: &str = "cluster_scheduler_registry";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
@@ -475,6 +482,7 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 
     resource_monitor: resource_monitor::ResourceMonitor,
 
@@ -562,6 +570,11 @@ impl Runtime {
     #[must_use]
     pub fn schedulers(&self) -> Arc<ScheduleRegistry> {
         Arc::clone(&self.schedulers)
+    }
+
+    #[must_use]
+    pub fn scheduler_peers(&self) -> Arc<RwLock<SchedulerPeers>> {
+        Arc::clone(&self.scheduler_peers)
     }
 
     #[must_use]
@@ -676,15 +689,59 @@ impl Runtime {
                         .context(UnableToStartClusterServerSnafu)
                     };
                     let self_for_task = Arc::clone(&self);
-                    Some(Box::pin(
-                        self_for_task
-                            .start_runtime_task(
-                                CLUSTER_INTERNAL_SERVER,
-                                Some(internal_server_shutdown),
-                                internal_server_fut,
+                    let internal_server_future = self_for_task
+                        .start_runtime_task(
+                            CLUSTER_INTERNAL_SERVER,
+                            Some(internal_server_shutdown),
+                            internal_server_fut,
+                        )
+                        .await;
+
+                    let scheduler_registry_future = {
+                        let app = self.app.read().await;
+                        let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
+                        if let Some(config) = config {
+                            let registry_shutdown = CancellationToken::new();
+                            let registry_shutdown_for_task = registry_shutdown.clone();
+                            let peers = self.scheduler_peers();
+                            let self_ref = Arc::clone(&self);
+                            let registry_task = async move {
+                                cluster::start_scheduler_registry(
+                                    self_ref,
+                                    &config,
+                                    registry_shutdown.clone(),
+                                    peers,
+                                )
+                                .await
+                                .map_err(|err| {
+                                    Error::FailedToRegisterScheduler {
+                                        source: Box::new(err),
+                                    }
+                                })
+                            };
+                            Some(
+                                self_for_task
+                                    .start_runtime_task(
+                                        CLUSTER_SCHEDULER_REGISTRY,
+                                        Some(registry_shutdown_for_task),
+                                        registry_task,
+                                    )
+                                    .await,
                             )
-                            .await,
-                    ))
+                        } else {
+                            None
+                        }
+                    };
+
+                    let cluster_future = async move {
+                        if let Some(registry_future) = scheduler_registry_future {
+                            tokio::try_join!(internal_server_future, registry_future).map(|_| ())
+                        } else {
+                            internal_server_future.await
+                        }
+                    };
+
+                    Some(Box::pin(cluster_future))
                 }
                 Some(ClusterRole::Executor) => {
                     let executor_fut =
@@ -1162,7 +1219,7 @@ impl Runtime {
     }
 
     /// Spawns and registers a runtime task with optional cancellation support.
-    async fn start_runtime_task<F>(
+    pub(crate) async fn start_runtime_task<F>(
         self: &Arc<Self>,
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
