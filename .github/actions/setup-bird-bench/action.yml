@@ -18,19 +18,30 @@ inputs:
 outputs:
   spicepod_dependency:
     description: 'Path to the spicepod dependency'
-    value: ${{ steps.configure_bird_bench.outputs.spicepod_dependency }}
+    value: ${{ steps.configure_bird_bench.outputs.spicepod_dependency || steps.configure_bird_bench_windows.outputs.spicepod_dependency }}
 
 runs:
   using: composite
   steps:
-    - name: Prepare file-based data directory
+    - name: Prepare file-based data directory (Linux/macOS)
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         sudo rm -rf "${{ inputs.data_directory }}"
         sudo mkdir -p "${{ inputs.data_directory }}"
-        sudo chown runner:runner -R "${{ inputs.data_directory }}"
+        sudo chown "$(whoami):$(id -gn)" -R "${{ inputs.data_directory }}"
+
+    - name: Prepare file-based data directory (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $dataDir = "${{ inputs.data_directory }}"
+        if (Test-Path $dataDir) { Remove-Item -Recurse -Force $dataDir }
+        New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+
     # actions/checkout should not be used with composite actions. Would reset workspace/github repo state.
-    - name: Clone bird-bench repo (no checkout action)
+    - name: Clone bird-bench repo (no checkout action) (Linux/macOS)
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         set -euxo pipefail
@@ -44,8 +55,22 @@ runs:
         cd bird-bench
         git sparse-checkout set dev_20240627
 
-    - name: Configure Bird-Bench Data
+    - name: Clone bird-bench repo (no checkout action) (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        git clone `
+          --depth 1 `
+          --filter=blob:none `
+          --sparse `
+          https://github.com/spiceai/spice-bird-bench.git bird-bench
+
+        cd bird-bench
+        git sparse-checkout set dev_20240627
+
+    - name: Configure Bird-Bench Data (Linux/macOS)
       id: configure_bird_bench
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         set -euxo pipefail
@@ -56,11 +81,20 @@ runs:
         BIRD_BENCH_DATASET="${BIRD_BENCH_DATASET#bird-bench-small[}"
         BIRD_BENCH_DATASET="${BIRD_BENCH_DATASET%]}"
 
-        sudo apt-get update
-        sudo apt-get install -y jq
+        # Install jq if not available
+        if ! command -v jq &> /dev/null; then
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            if ! brew list jq &> /dev/null; then
+              brew install jq
+            fi
+          fi
+        fi
 
         sudo mkdir -p /opt/spiced/data
-        sudo chown runner:runner /opt/spiced/data
+        sudo chown "$(whoami):$(id -gn)" /opt/spiced/data
 
         if [ "${{ inputs.use_evidence }}" = "true" ]; then
           jq -c --arg db "$BIRD_BENCH_DATASET" \
@@ -80,8 +114,61 @@ runs:
           exit 1
         fi
 
-        sudo sed -i \
-          's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' "$DATASET_SPICEPOD"
+        # sed -i syntax differs between Linux and macOS
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
+          sudo sed -i '' \
+            's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' "$DATASET_SPICEPOD"
+        else
+          sudo sed -i \
+            's|from: file:\./dev_databases/|from: file:./data/dev_databases/|g' "$DATASET_SPICEPOD"
+        fi
 
         # Output DATASET_SPICEPOD from action
         echo "spicepod_dependency=$DATASET_SPICEPOD" >> "$GITHUB_OUTPUT"
+
+    - name: Configure Bird-Bench Data (Windows)
+      id: configure_bird_bench_windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $birdBenchDir = "$env:GITHUB_WORKSPACE\bird-bench\dev_20240627"
+        # Parse `bird-bench-small[<dataset>]` -> `<dataset>`
+        $birdBenchDataset = "${{ inputs.queryset_name }}"
+        $birdBenchDataset = $birdBenchDataset -replace '^bird-bench-small\[', ''
+        $birdBenchDataset = $birdBenchDataset -replace '\]$', ''
+
+        # Install jq via choco if not available
+        if (-not (Get-Command jq -ErrorAction SilentlyContinue)) {
+          choco install jq -y
+          refreshenv
+        }
+
+        $dataDir = "${{ inputs.data_directory }}"
+        New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+
+        $devJson = "$birdBenchDir\dev.json"
+        if ("${{ inputs.use_evidence }}" -eq "true") {
+          Get-Content $devJson | jq -c --arg db $birdBenchDataset '.[] | select(.db_id == $db) | { sql: .SQL, question: (.question + .evidence) }' | Set-Content -Path "$dataDir\queryset.json" -Encoding utf8
+        } else {
+          Get-Content $devJson | jq -c --arg db $birdBenchDataset '.[] | select(.db_id == $db) | { sql: .SQL, question: .question }' | Set-Content -Path "$dataDir\queryset.json" -Encoding utf8
+        }
+
+        $destinationDir = Join-Path "${{ inputs.data_directory }}" "dev_20240627"
+        if (-not (Test-Path $destinationDir)) {
+          Move-Item -Path $birdBenchDir -Destination "${{ inputs.data_directory }}"
+        } else {
+          Write-Host "Destination $destinationDir already exists. Skipping Move-Item."
+        }
+
+        $datasetSpicepod = Join-Path "${{ inputs.data_directory }}" "dev_20240627\spicepods\$birdBenchDataset\spicepod.yaml"
+        if (-not (Test-Path $datasetSpicepod)) {
+          Write-Host "Error: Spicepod file not found at $datasetSpicepod"
+          exit 1
+        }
+
+        # Update path in spicepod
+        (Get-Content $datasetSpicepod) -replace 'from: file:\./dev_databases/', 'from: file:./data/dev_databases/' | Set-Content $datasetSpicepod
+
+        # Output DATASET_SPICEPOD from action
+        echo "spicepod_dependency=$datasetSpicepod" >> $env:GITHUB_OUTPUT
