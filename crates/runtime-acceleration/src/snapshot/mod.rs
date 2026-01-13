@@ -51,8 +51,10 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
 mod behavior;
+mod engine;
 pub mod metrics;
 pub use behavior::SnapshotBehavior;
+use engine::{SnapshotEngine, create_snapshot_engine};
 use spicepod::acceleration::SnapshotsCompaction;
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
@@ -368,30 +370,8 @@ pub enum SnapshotUploadError {
         dest_path: PathBuf,
         source: std::io::Error,
     },
-    #[snafu(display("Failed to open DuckDB for compaction: {path:?}"))]
-    #[cfg(feature = "duckdb")]
-    CompactionConnect {
-        path: PathBuf,
-        source: duckdb::Error,
-    },
-    #[snafu(display("Failed to attach database for compaction: {path:?}"))]
-    #[cfg(feature = "duckdb")]
-    CompactionAttach {
-        path: PathBuf,
-        source: duckdb::Error,
-    },
-    #[snafu(display("Failed to run COPY FROM DATABASE for {dataset}"))]
-    #[cfg(feature = "duckdb")]
-    CompactionCopy {
-        dataset: String,
-        source: duckdb::Error,
-    },
-    #[snafu(display("Compaction task panicked for {dataset}"))]
-    #[cfg(feature = "duckdb")]
-    CompactionJoin {
-        dataset: String,
-        source: tokio::task::JoinError,
-    },
+    #[snafu(display("Failed to prepare snapshot for upload: {source}"))]
+    PrepareUpload { source: engine::SnapshotEngineError },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -445,11 +425,10 @@ pub struct SnapshotManager {
     snapshots_location: object_store::path::Path,
     snapshot_location_uri: String,
     local_path: PathBuf,
-    engine: AccelerationEngine,
+    snapshot_engine: Arc<dyn SnapshotEngine>,
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
-    compaction_enabled: bool,
 }
 
 impl std::fmt::Debug for SnapshotManager {
@@ -610,17 +589,15 @@ impl SnapshotManager {
             _ => object_store::parse_url(&snapshots_location_url).ok()?,
         };
 
+        let snapshot_engine = create_snapshot_engine(&engine, compaction_enabled);
+
         if compaction_enabled {
-            match &engine {
-                #[cfg(feature = "duckdb")]
-                AccelerationEngine::DuckDB => {
-                    tracing::info!("Snapshot compaction is enabled for dataset {dataset_name}");
-                }
-                engine => {
-                    tracing::warn!(
-                        "Snapshot compaction is enabled for dataset {dataset_name} but engine {engine:?} does not support compaction"
-                    );
-                }
+            if snapshot_engine.supports_compaction() {
+                tracing::info!("Snapshot compaction is enabled for dataset {dataset_name}");
+            } else {
+                tracing::warn!(
+                    "Snapshot compaction is enabled for dataset {dataset_name} but engine does not support compaction"
+                );
             }
         }
 
@@ -629,11 +606,10 @@ impl SnapshotManager {
             snapshots_location: path,
             snapshot_location_uri,
             local_path,
-            engine,
+            snapshot_engine,
             object_store: store.into(),
             checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
-            compaction_enabled,
         })
     }
 
@@ -683,8 +659,11 @@ impl SnapshotManager {
             self.dataset_name
         );
 
-        // Step 3: Compact if DuckDB, otherwise use the copy directly
-        let final_source_local_path = self.prepare_upload_file(&temp_copy_path).await?;
+        // Step 3: Prepare a snapshot using engine-specific logic
+        let final_source_local_path = self.snapshot_engine
+            .prepare_for_upload(&temp_copy_path, &self.dataset_name)
+            .await
+            .context(PrepareUploadSnafu)?;
 
         // Step 4: Upload the file
         let upload_result = self
@@ -844,79 +823,6 @@ impl SnapshotManager {
                 })
             }
         }
-    }
-
-    /// Prepares the file for upload, running compaction for `DuckDB`.
-    async fn prepare_upload_file(
-        &self,
-        source_path: &Path,
-    ) -> Result<PathBuf, SnapshotUploadError> {
-        match self.engine {
-            #[cfg(feature = "duckdb")]
-            AccelerationEngine::DuckDB => {
-                if self.compaction_enabled {
-                    let compacted_path = source_path.with_extension("compacted");
-                    self.compact_duckdb(source_path, &compacted_path).await?;
-                    Ok(compacted_path)
-                } else {
-                    Ok(source_path.to_path_buf())
-                }
-            }
-            _ => Ok(source_path.to_path_buf()),
-        }
-    }
-
-    /// Compacts a `DuckDB` database using COPY FROM DATABASE.
-    #[cfg(feature = "duckdb")]
-    async fn compact_duckdb(&self, source: &Path, dest: &Path) -> Result<(), SnapshotUploadError> {
-        let source = source.to_path_buf();
-        let dest = dest.to_path_buf();
-        let dataset_name = self.dataset_name.clone();
-
-        tokio::task::spawn_blocking(move || {
-            // Remove destination if it exists
-            let _ = std::fs::remove_file(&dest);
-
-            // Open DuckDB in-memory, attach source as read-only and dest for writing
-            let conn = duckdb::Connection::open_in_memory().map_err(|e| {
-                SnapshotUploadError::CompactionConnect {
-                    path: source.clone(),
-                    source: e,
-                }
-            })?;
-
-            let source_escaped = escape_duckdb_string(&source.to_string_lossy());
-            conn.execute(
-                &format!("ATTACH '{source_escaped}' AS source (READ_ONLY)"),
-                [],
-            )
-            .map_err(|e| SnapshotUploadError::CompactionAttach {
-                path: source.clone(),
-                source: e,
-            })?;
-
-            let dest_escaped = escape_duckdb_string(&dest.to_string_lossy());
-            conn.execute(&format!("ATTACH '{dest_escaped}' AS dest"), [])
-                .map_err(|e| SnapshotUploadError::CompactionAttach {
-                    path: dest.clone(),
-                    source: e,
-                })?;
-
-            conn.execute("COPY FROM DATABASE source TO dest", [])
-                .map_err(|e| SnapshotUploadError::CompactionCopy {
-                    dataset: dataset_name.clone(),
-                    source: e,
-                })?;
-
-            Ok::<_, SnapshotUploadError>(())
-        })
-        .await
-        .map_err(|e| SnapshotUploadError::CompactionJoin {
-            dataset: self.dataset_name.clone(),
-            source: e,
-        })??;
-
-        Ok(())
     }
 
     /// Attempts to download the latest snapshot, returning details if successful.
@@ -1474,10 +1380,6 @@ impl SnapshotManager {
     }
 }
 
-fn escape_duckdb_string(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
 #[cfg(test)]
 fn compute_sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -1638,6 +1540,7 @@ async fn build_s3_parameters(
 mod tests {
     use super::*;
     use crate::dataset_checkpoint::{DatasetCheckpointer, Result as DatasetCheckpointResult};
+    use crate::snapshot::engine::DuckDBSnapshotEngine;
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
@@ -1701,16 +1604,18 @@ mod tests {
 
         let object_store: Arc<dyn ObjectStore> = store;
 
+        let snapshot_engine =
+            Arc::new(DuckDBSnapshotEngine::new(compaction_enabled));
+
         SnapshotManager {
             dataset_name: DATASET_NAME.to_string(),
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             local_path,
-            engine: AccelerationEngine::DuckDB,
+            snapshot_engine,
             object_store,
             bootstrap_failure_behavior: behavior,
             checkpointer_factory: Some(factory),
-            compaction_enabled,
         }
     }
 
