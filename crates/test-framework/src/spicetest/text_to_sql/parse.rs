@@ -19,7 +19,9 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;
 
-// Logical plan extracted from `EXPLAIN FORMAT PGJSON <sql>`.
+// Logical plan by running `EXPLAIN FORMAT PGJSON <sql>` against `v1/sql`.
+//
+// Return is in PGJSON format.
 pub async fn logical_plan(
     http_client: Client,
     http_base_url: impl Into<String>,
