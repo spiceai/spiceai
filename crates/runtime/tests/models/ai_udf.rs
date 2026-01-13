@@ -20,7 +20,10 @@ use crate::{
         create_api_bindings_config, get_anthropic_model, get_local_model, get_mega_science_dataset,
         get_xai_model, openai::get_openai_model,
     },
-    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
+    utils::{
+        ModelVerificationBuilder, runtime_ready_check, test_request_context,
+        verify_env_secret_exists,
+    },
 };
 use app::AppBuilder;
 use datafusion::common::DataFusionError;
@@ -34,10 +37,19 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
+            // Verify API keys exist
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
             verify_env_secret_exists("SPICE_ANTHROPIC_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            // Verify models are available before starting the test
+            ModelVerificationBuilder::new()
+                .openai("gpt-4o-mini")
+                .anthropic("claude-3-5-haiku-latest")
+                .verify()
                 .await
                 .map_err(anyhow::Error::msg)?;
 
@@ -142,6 +154,7 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
+            // Verify API keys exist
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -152,10 +165,19 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
+            // Verify models are available before starting the test
+            ModelVerificationBuilder::new()
+                .openai("gpt-4o-mini")
+                .xai("grok-4-1-fast-non-reasoning")
+                .anthropic("claude-3-5-haiku-latest")
+                .verify()
+                .await
+                .map_err(anyhow::Error::msg)?;
+
             let app = AppBuilder::new("ai_udf_test")
                 .with_dataset(get_mega_science_dataset(None, None, None))
                 .with_model(get_openai_model("gpt-4o-mini", "gpt-4o-mini"))
-                .with_model(get_xai_model("grok-4-fast-non-reasoning", "grok-4"))
+                .with_model(get_xai_model("grok-4-1-fast-non-reasoning", "grok-4"))
                 .with_model(get_anthropic_model("claude-3-5-haiku-latest", "claude-haiku"))
                 .build();
 
@@ -209,6 +231,7 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
+            // Verify API keys exist
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -219,9 +242,18 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
+            // Verify models are available before starting the test
+            ModelVerificationBuilder::new()
+                .openai("gpt-4o-mini")
+                .xai("grok-4-1-fast-non-reasoning")
+                .anthropic("claude-3-5-haiku-latest")
+                .verify()
+                .await
+                .map_err(anyhow::Error::msg)?;
+
             let app = AppBuilder::new("ai_udf_test")
                 .with_model(get_openai_model("gpt-4o-mini", "gpt-4o-mini"))
-                .with_model(get_xai_model("grok-4-fast-non-reasoning", "grok-4"))
+                .with_model(get_xai_model("grok-4-1-fast-non-reasoning", "grok-4"))
                 .with_model(get_anthropic_model("claude-3-5-haiku-latest", "claude-haiku"))
                 .build();
 

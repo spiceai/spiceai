@@ -293,6 +293,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            scheduler_peers: Arc::new(RwLock::new(HashMap::new())),
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };

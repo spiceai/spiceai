@@ -23,14 +23,13 @@ use std::{
 };
 
 use arrow_schema::{Schema, SchemaRef};
-use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
+use aws_sdk_credential_bridge::object_store_builder::{
+    S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
+};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use object_store::{
-    ClientOptions, ObjectStore, PutMode, PutPayload, UpdateVersion, aws::AmazonS3Builder,
-    client::SpawnedReqwestConnector, path::Path as ObjectPath,
-};
+use object_store::{ObjectStore, PutMode, PutPayload, UpdateVersion, path::Path as ObjectPath};
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use serde::{Deserialize, Serialize};
@@ -537,26 +536,26 @@ impl SnapshotManager {
             }
         };
 
-        let (store, path) = match (
+        let (store, path): (Arc<dyn ObjectStore>, _) = if let ("s3", path) = (
             snapshots_location_url.scheme(),
             snapshots_location_url.path(),
         ) {
-            ("s3", path) => {
-                let store = build_s3_object_store(
-                    &snapshots_location_url,
-                    secrets,
-                    snapshot_config.params.as_ref().map(Params::as_string_map),
-                    io_runtime,
-                )
-                .await
-                .inspect_err(|e| {
-                    tracing::error!("Error connecting to S3 snapshot location: {e}");
-                })
-                .ok()?;
-                let path = object_store::path::Path::from(path);
-                (store, path)
-            }
-            _ => object_store::parse_url(&snapshots_location_url).ok()?,
+            let store = build_s3_object_store(
+                &snapshots_location_url,
+                secrets,
+                snapshot_config.params.as_ref().map(Params::as_string_map),
+                io_runtime,
+            )
+            .await
+            .inspect_err(|e| {
+                tracing::error!("Error connecting to S3 snapshot location: {e}");
+            })
+            .ok()?;
+            let path = object_store::path::Path::from(path);
+            (store, path)
+        } else {
+            let (store, path) = object_store::parse_url(&snapshots_location_url).ok()?;
+            (store.into(), path)
         };
 
         Some(Self {
@@ -564,7 +563,7 @@ impl SnapshotManager {
             snapshots_location: path,
             snapshot_location_uri,
             local_path,
-            object_store: store.into(),
+            object_store: store,
             checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
         })
@@ -1326,24 +1325,8 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
 
 #[derive(Debug, Snafu)]
 enum S3ObjectStoreError {
-    #[snafu(transparent)]
-    InvalidBucketName {
-        source: aws_sdk_credential_bridge::Error,
-    },
-
-    #[snafu(display("Unable to parse client_timeout: {source}"))]
-    ClientTimeoutParse { source: fundu::ParseError },
-
-    #[snafu(display("Unexpected S3 auth method: {method}"))]
-    UnexpectedS3AuthMethod { method: String },
-
-    #[snafu(display("Unable to load S3 credentials from environment: {source}"))]
-    EnvLoad {
-        source: aws_sdk_credential_bridge::Error,
-    },
-
-    #[snafu(transparent)]
-    ObjectStore { source: object_store::Error },
+    #[snafu(display("Failed to build S3 object store: {source}"))]
+    BuilderError { source: S3ObjectStoreBuilderError },
 }
 
 async fn build_s3_object_store(
@@ -1351,78 +1334,16 @@ async fn build_s3_object_store(
     secrets: Arc<RwLock<Secrets>>,
     params: Option<HashMap<String, String>>,
     io_runtime: Handle,
-) -> Result<Box<dyn ObjectStore>, S3ObjectStoreError> {
+) -> Result<Arc<dyn ObjectStore>, S3ObjectStoreError> {
     let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref()).await;
 
-    let s3_region = s3_params.get("region").expose().ok();
-    let allow_http = s3_params
-        .get("allow_http")
-        .expose()
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(false);
-    let s3_endpoint = s3_params.get("endpoint").expose().ok();
-    let client_timeout = s3_params.get("client_timeout").expose().ok();
-    let bucket_name = get_bucket_name(snapshots_url)?;
-
-    let mut s3_builder = AmazonS3Builder::from_env()
-        .with_bucket_name(bucket_name)
-        .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
-        .with_allow_http(allow_http);
-    let mut client_options = ClientOptions::default();
-
-    if let Some(region) = s3_region {
-        s3_builder = s3_builder.with_region(region);
-    }
-    if let Some(endpoint) = s3_endpoint {
-        s3_builder = s3_builder.with_endpoint(endpoint);
-        if endpoint.starts_with("http://") {
-            client_options = client_options.with_allow_http(true);
-        }
-    }
-    if let Some(timeout) = client_timeout {
-        client_options = client_options
-            .with_timeout(fundu::parse_duration(timeout).context(ClientTimeoutParseSnafu)?);
-    }
-    let mut load_credentials_from_environment = true;
-
-    if let (Some(key), Some(secret)) = (
-        s3_params.get("key").expose().ok(),
-        s3_params.get("secret").expose().ok(),
-    ) {
-        s3_builder = s3_builder.with_access_key_id(key);
-        s3_builder = s3_builder.with_secret_access_key(secret);
-        if let Some(token) = s3_params.get("session_token").expose().ok() {
-            s3_builder = s3_builder.with_token(token);
-        }
-        load_credentials_from_environment = false;
-    }
-    s3_builder = s3_builder.with_client_options(client_options);
-
-    if load_credentials_from_environment {
-        tracing::trace!("Loading S3 credentials from environment");
-        match aws_sdk_credential_bridge::get_or_init_sdk_config().await {
-            Ok(Some(sdk_config)) => {
-                if sdk_config.credentials_provider().is_some() {
-                    tracing::trace!("Using S3 credentials provider from SDK config");
-                    s3_builder = s3_builder.with_credentials(Arc::new(
-                        S3CredentialProvider::from_config(sdk_config.as_ref())
-                            .context(EnvLoadSnafu)?,
-                    ));
-                }
-            }
-            Ok(None) => {
-                tracing::trace!(
-                    "No AWS SDK credentials available for snapshot store; assuming public access"
-                );
-            }
-            Err(err) => {
-                tracing::warn!("Unable to initialize AWS credentials for snapshot store: {err}");
-            }
-        }
-    }
-
-    Ok(Box::new(s3_builder.build()?))
+    S3ObjectStoreBuilder::from_url(snapshots_url, io_runtime)
+        .context(BuilderSnafu)?
+        .with_secret_params(&s3_params.to_secret_map())
+        .context(BuilderSnafu)?
+        .build()
+        .await
+        .context(BuilderSnafu)
 }
 
 async fn build_s3_parameters(
