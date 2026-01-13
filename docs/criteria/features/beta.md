@@ -12,7 +12,7 @@ All criteria must be met for the feature to be considered Beta, with exceptions 
 
 ### Functionality
 
-- [ ] All [Alpha criteria](#alpha-release-criteria) continue to pass
+- [ ] All [Alpha criteria](./alpha.md#alpha-release-criteria) continue to pass
 - [ ] Edge cases are handled gracefully (invalid input, boundary conditions, concurrent access)
 - [ ] No known major bugs
 - [ ] All minor bugs are documented with workarounds (if applicable)
@@ -43,7 +43,7 @@ All criteria must be met for the feature to be considered Beta, with exceptions 
 - [ ] All Alpha observability criteria continue to pass
 - [ ] Metrics follow established naming conventions
 - [ ] Tracing is implemented for key operations
-- [ ] Error messages follow [error handling guidelines](./dev/error_handling.md)
+- [ ] Error messages follow [error handling guidelines](../../dev/error_handling.md)
 
 ### UX
 

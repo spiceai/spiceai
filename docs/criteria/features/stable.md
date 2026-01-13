@@ -12,7 +12,7 @@ All criteria must be met for the feature to be considered Stable, with exception
 
 ### Functionality
 
-- [ ] All [RC criteria](#release-candidate-rc-criteria) continue to pass
+- [ ] All [RC criteria](./rc.md#release-candidate-rc-criteria) continue to pass
 - [ ] Feature has been running in production for a defined stabilization period
 
 ### Testing

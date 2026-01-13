@@ -12,7 +12,7 @@ All criteria must be met for the feature to be considered [RC](../definitions.md
 
 ### Functionality
 
-- [ ] All [Beta criteria](#beta-release-criteria) continue to pass
+- [ ] All [Beta criteria](./beta.md#beta-release-criteria) continue to pass
 - [ ] No known major bugs
 - [ ] No known minor bugs that significantly impact user experience
 - [ ] Performance meets documented requirements/SLAs
