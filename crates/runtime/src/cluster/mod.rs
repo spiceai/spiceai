@@ -708,7 +708,11 @@ pub async fn initialize_cluster_executor(
     let config_producer: ConfigProducer = Arc::new(move || {
         let mut config = SessionConfig::new_with_ballista()
             .with_option_extension(SpiceClusterConfig::default())
-            .with_ballista_use_tls(tls_enabled);
+            .with_ballista_use_tls(tls_enabled)
+            // Use 100MB max message size to match other gRPC configurations in the codebase.
+            // The default Ballista config is 16MB which is too small for shuffle operations
+            // with large batches.
+            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024);
 
         if let Some(tls_config) = config_producer_tls.clone() {
             config = config.with_ballista_override_create_grpc_client_endpoint({
