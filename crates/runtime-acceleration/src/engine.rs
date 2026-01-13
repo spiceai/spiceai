@@ -10,8 +10,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::fmt::Display;
 use crate::AcceleratorEngineNotAvailableSnafu;
+use std::fmt::Display;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum Engine {
@@ -55,7 +55,7 @@ impl TryFrom<&str> for Engine {
             _ => AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
-                .fail(),
+            .fail(),
         }
     }
 }

@@ -659,7 +659,8 @@ impl SnapshotManager {
         );
 
         // Step 3: Prepare a snapshot using engine-specific logic
-        let final_source_local_path = self.snapshot_engine
+        let final_source_local_path = self
+            .snapshot_engine
             .prepare_for_upload(&temp_copy_path, &self.dataset_name)
             .await
             .context(PrepareUploadSnafu)?;
@@ -1603,8 +1604,7 @@ mod tests {
 
         let object_store: Arc<dyn ObjectStore> = store;
 
-        let snapshot_engine =
-            Arc::new(DuckDBSnapshotEngine::new(compaction_enabled));
+        let snapshot_engine = Arc::new(DuckDBSnapshotEngine::new(compaction_enabled));
 
         SnapshotManager {
             dataset_name: DATASET_NAME.to_string(),
