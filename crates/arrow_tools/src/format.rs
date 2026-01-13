@@ -38,6 +38,7 @@ pub enum FormatOperation {
     TruncateListLength(usize),
 }
 
+#[expect(clippy::too_many_lines)]
 pub(crate) fn format_column_data(
     column: ArrayRef,
     field: &Arc<Field>,

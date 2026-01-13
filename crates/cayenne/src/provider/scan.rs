@@ -209,6 +209,9 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 }
 
+// TODO(df51): Used by optimizer_rules module which is temporarily disabled pending
+// CollectLeftAccumulator trait in spiceai DataFusion fork
+#[expect(dead_code)]
 pub(crate) trait IsCayenneAccelerationExec {
     /// Returns true if the execution plan is a `CayenneAccelerationExec`
     fn is_cayenne_acceleration_exec(&self) -> bool;
