@@ -6,19 +6,6 @@ All criteria must be met for the feature to be considered Beta, with exceptions 
 
 ---
 
-## Definitions
-
-### Release Stages
-
-| Stage | Summary | API/Config Stability | Production Use |
-|-------|---------|---------------------|----------------|
-| **Alpha** | It's working | Breaking changes expected | Not recommended |
-| **Beta** | It's working well | Breaking changes unlikely | Early adopters only |
-| **RC** | It's ready for release | Frozen (no breaking changes) | Suitable for production |
-| **Stable** | It's running in production | Backward compatible only | Fully supported |
-
----
-
 ## Beta Release Criteria
 
 > *"It's working well"* — The feature handles edge cases reliably. Configuration changes are unlikely.
@@ -48,7 +35,7 @@ All criteria must be met for the feature to be considered Beta, with exceptions 
 - [ ] All Alpha documentation criteria continue to pass
 - [ ] Comprehensive documentation including all configuration options
 - [ ] Feature has an easy to follow cookbook recipe
-- [ ] Feature is marked as "Beta" in all public-facing documentation
+  - [ ] Cookbook recipe is added to our list of [endgame release](https://github.com/spiceai/spiceai/blob/trunk/.github/ISSUE_TEMPLATE/end_game.md) testing cookbooks.
 - [ ] Any exceptions to Beta quality are explicitly documented
 
 ### Observability

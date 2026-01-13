@@ -6,19 +6,6 @@ All criteria must be met for the feature to be considered [RC](../definitions.md
 
 ---
 
-## Definitions
-
-### Release Stages
-
-| Stage | Summary | API/Config Stability | Production Use |
-|-------|---------|---------------------|----------------|
-| **Alpha** | It's working | Breaking changes expected | Not recommended |
-| **Beta** | It's working well | Breaking changes unlikely | Early adopters only |
-| **RC** | It's ready for release | Frozen (no breaking changes) | Suitable for production |
-| **Stable** | It's running in production | Backward compatible only | Fully supported |
-
----
-
 ## Release Candidate (RC) Criteria
 
 > *"It's ready for release"* — The feature has passed comprehensive testing and is ready for production use. Configuration is frozen.
@@ -29,6 +16,7 @@ All criteria must be met for the feature to be considered [RC](../definitions.md
 - [ ] No known major bugs
 - [ ] No known minor bugs that significantly impact user experience
 - [ ] Performance meets documented requirements/SLAs
+- [ ] The preview warning message is removed from the code
 
 ### Testing
 
@@ -44,11 +32,13 @@ All criteria must be met for the feature to be considered [RC](../definitions.md
 ### Documentation
 
 - [ ] All Beta documentation criteria continue to pass
+- [ ] Documentation has been updated to remove preview warning/label
 
 ### Observability
 
 - [ ] All Beta observability criteria continue to pass
 - [ ] Relevant metrics and queries are added to example dashboards
+- [ ] Any anonymous usage telemetry we want to collect has been added
 
 ### Compatibility
 

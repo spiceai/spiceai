@@ -1,6 +1,13 @@
-## Promotion Process
+## Release Stages
 
-### Promotion Checklist
+| Stage | Summary | API/Config Stability | Production Use |
+|-------|---------|---------------------|----------------|
+| **Alpha** | It's working | Breaking changes expected | Not recommended |
+| **Beta** | It's working well | Breaking changes unlikely | Early adopters only |
+| **RC** | It's ready for release | Frozen (no breaking changes) | Suitable for production |
+| **Stable** | It's running in production | Backward compatible only | Fully supported |
+
+## Promotion Checklist
 
 When promoting a feature to a new release stage:
 
@@ -9,17 +16,6 @@ When promoting a feature to a new release stage:
 3. **Obtain sign-off**: DRI (Directly Responsible Individual) must approve the promotion
 4. **Update documentation**: Change release stage labels in all documentation
 5. **Announce**: Include promotion in release notes
-
-### Demotion Policy
-
-A feature may be demoted to a lower release stage if:
-
-- A major bug is discovered that cannot be quickly resolved
-- Security vulnerability is identified
-- Breaking change is required to fix a critical issue
-
-Demotions must be announced in release notes with migration guidance.
-
 
 ## Quick Reference Matrix
 
@@ -35,7 +31,8 @@ Demotions must be announced in release notes with migration guidance.
 | Basic documentation                | ✓ | ✓ |       ✓       | ✓ |
 | Complete documentation             | | ✓ |       ✓       | ✓ |
 | Error handling guidelines          | | ✓ |       ✓       | ✓ |
-| Example dashboard coverage          | |  |       ✓       | ✓ |
+| Example dashboard coverage         | |  |       ✓       | ✓ |
 | Metrics & tracing                  | Basic | ✓ |       ✓       | ✓ |
+| Anonymous Telemetry                |  |  |       ✓       | ✓ |
 | Config breaking changes            | Expected | Unlikely |    Frozen     | Backward compatible only |
 | Production use                     | Not recommended | Early adopters |   Suitable    | Fully supported |

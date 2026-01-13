@@ -6,19 +6,6 @@ All criteria must be met for the feature to be considered Stable, with exception
 
 ---
 
-## Definitions
-
-### Release Stages
-
-| Stage | Summary | API/Config Stability | Production Use |
-|-------|---------|---------------------|----------------|
-| **Alpha** | It's working | Breaking changes expected | Not recommended |
-| **Beta** | It's working well | Breaking changes unlikely | Early adopters only |
-| **RC** | It's ready for release | Frozen (no breaking changes) | Suitable for production |
-| **Stable** | It's running in production | Backward compatible only | Fully supported |
-
----
-
 ## Stable Release Criteria
 
 > *"It's running in production"* — The feature is fully supported and proven in production environments. Only backward-compatible changes are permitted.

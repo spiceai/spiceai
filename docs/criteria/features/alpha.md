@@ -6,19 +6,6 @@ All criteria must be met for the feature to be considered Alpha. As Alpha signif
 
 ---
 
-## Definitions
-
-### Release Stages
-
-| Stage | Summary | API/Config Stability | Production Use |
-|-------|---------|---------------------|----------------|
-| **Alpha** | It's working | Breaking changes expected | Not recommended |
-| **Beta** | It's working well | Breaking changes unlikely | Early adopters only |
-| **RC** | It's ready for release | Frozen (no breaking changes) | Suitable for production |
-| **Stable** | It's running in production | Backward compatible only | Fully supported |
-
----
-
 ## Alpha Release Criteria
 
 > *"It's working"* — The feature functions in basic scenarios. Configuration and API are subject to change.
@@ -29,6 +16,7 @@ All criteria must be met for the feature to be considered Alpha. As Alpha signif
 - [ ] Feature can be enabled and configured (even if configuration is minimal)
 - [ ] No crashes or panics under normal operation
 - [ ] Errors are returned (not swallowed) and include actionable information
+- [ ] A warning is logged when the feature is enabled indicating it is in preview
 
 ### Testing
 
@@ -46,7 +34,7 @@ All criteria must be met for the feature to be considered Alpha. As Alpha signif
 
 - [ ] Basic usage documentation exists (README or docs page)
 - [ ] Known limitations are documented
-- [ ] Feature is marked as "Alpha" in all public-facing documentation
+- [ ] Feature is marked as "Preview" in all public-facing documentation
 
 ### Observability
 
