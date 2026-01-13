@@ -107,21 +107,19 @@ async fn execute_query_and_check_cache_status(
     Ok(records)
 }
 
-/// Test that verifies UDTF arguments are included in TableScan names for cache correctness.
+/// Test that verifies UDTF arguments are included in `TableScan` names for cache correctness.
 ///
-/// **Critical for**: DataFusion fork (`spiceai/datafusion`, spiceai-51-patches)
+/// **Critical for**: `DataFusion` fork (`spiceai/datafusion`, spiceai-51-patches)
 ///
 /// This test ensures that different UDTF invocations (e.g., `read_parquet('/path1')`
-/// vs `read_parquet('/path2')`) don't incorrectly share cached results. The DataFusion
-/// patch includes UDTF arguments in the TableScan node name, which is used as part of
+/// vs `read_parquet('/path2')`) don't incorrectly share cached results. The `DataFusion`
+/// patch includes UDTF arguments in the `TableScan` node name, which is used as part of
 /// the cache key.
 ///
 /// **What happens without the patch**: Both queries would return the same cached result
-/// because the TableScan name wouldn't distinguish between different file paths.
+/// because the `TableScan` name wouldn't distinguish between different file paths.
 #[tokio::test]
 async fn test_udtf_cache_key_includes_arguments() -> Result<(), String> {
-    use arrow::array::Int32Array;
-
     let _tracing = init_tracing(None);
 
     test_request_context()
@@ -159,7 +157,7 @@ async fn test_udtf_cache_key_includes_arguments() -> Result<(), String> {
                 file1_path.to_string_lossy()
             );
             let result1 = execute_query_collect(&rt, &query1).await?;
-            let values1 = extract_int_column(&result1)?;
+            let values1 = extract_int_column(&result1);
 
             // Query file2 - should return 100, 200, 300 (NOT cached result from file1)
             let query2 = format!(
@@ -167,11 +165,11 @@ async fn test_udtf_cache_key_includes_arguments() -> Result<(), String> {
                 file2_path.to_string_lossy()
             );
             let result2 = execute_query_collect(&rt, &query2).await?;
-            let values2 = extract_int_column(&result2)?;
+            let values2 = extract_int_column(&result2);
 
             // Query file1 again - verify it returns correct cached result
             let result1_cached = execute_query_collect(&rt, &query1).await?;
-            let values1_cached = extract_int_column(&result1_cached)?;
+            let values1_cached = extract_int_column(&result1_cached);
 
             // Verify the results are distinct and correct
             assert_eq!(values1, vec![1, 2, 3], "File1 should contain [1, 2, 3]");
@@ -243,7 +241,7 @@ async fn execute_query_collect(rt: &Arc<Runtime>, query: &str) -> Result<Vec<Rec
         .map_err(|e| format!("Failed to collect query results: {e}"))
 }
 
-fn extract_int_column(batches: &[RecordBatch]) -> Result<Vec<i32>, String> {
+fn extract_int_column(batches: &[RecordBatch]) -> Vec<i32> {
     use arrow::array::Int32Array;
 
     let mut values = Vec::new();
@@ -259,5 +257,5 @@ fn extract_int_column(batches: &[RecordBatch]) -> Result<Vec<i32>, String> {
             }
         }
     }
-    Ok(values)
+    values
 }
