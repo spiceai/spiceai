@@ -62,7 +62,7 @@ use crate::{
     register_data_accelerator, spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, DataAccelerator, WasBootstrapped, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -438,10 +438,11 @@ impl DataAccelerator for TursoAccelerator {
     ///
     /// Returns `Error::RemoteDatabaseNotSupported` if `turso_url` or `turso_auth_token`
     /// parameters are provided in the acceleration configuration.
+    /// Returns `Ok(true)` if a snapshot was bootstrapped, `Ok(false)` otherwise.
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
         // Reject remote database configurations (not supported as accelerators)
         // Note: This is an accelerator-specific limitation. Remote databases will be
         // supported when Turso is used as a data connector.
@@ -459,10 +460,11 @@ impl DataAccelerator for TursoAccelerator {
             // Initialize the shared pool to verify connectivity
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
-            return Ok(());
+            return Ok(WasBootstrapped::No);
         }
 
         // Handle file mode: validate path and setup file-based database
+        let mut was_bootstrapped = WasBootstrapped::No;
         if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("turso_file") {
                 make_spice_data_directory()
@@ -498,7 +500,7 @@ impl DataAccelerator for TursoAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(
+            was_bootstrapped = download_snapshot_if_needed(
                 acceleration,
                 source,
                 PathBuf::from(path),
@@ -511,7 +513,7 @@ impl DataAccelerator for TursoAccelerator {
             pool.connect().await?;
         }
 
-        Ok(())
+        Ok(was_bootstrapped)
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.

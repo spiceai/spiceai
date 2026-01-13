@@ -370,12 +370,13 @@ pub trait DataAccelerator: Send + Sync {
     /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
 
-    /// Initialize the accelerator for a component
+    /// Initialize the accelerator for a component.
+    /// Returns `Ok(true)` if a snapshot was bootstrapped, `Ok(false)` otherwise.
     async fn init(
         &self,
         _source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
+    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(WasBootstrapped::No)
     }
 
     /// Check if the accelerator is initialized for a component
@@ -606,6 +607,19 @@ pub trait AccelerationSource: Send + Sync {
 
     /// Returns a reference to `Any` for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+// Whether an accelerated table was bootstrapped or not during initialization.
+#[derive(Debug)]
+pub(crate) enum WasBootstrapped {
+    Yes,
+    No,
+}
+
+impl WasBootstrapped {
+    pub fn is_yes(&self) -> bool {
+        matches!(self, WasBootstrapped::Yes)
+    }
 }
 
 pub async fn acceleration_file_path(

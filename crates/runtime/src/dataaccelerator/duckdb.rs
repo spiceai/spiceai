@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator, WasBootstrapped};
 use crate::{
     App, Runtime,
     component::{
@@ -341,13 +341,14 @@ impl DataAccelerator for DuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Ok(WasBootstrapped::No);
         }
 
         let path = self.file_path(source)?;
 
+        let mut was_bootstrapped = WasBootstrapped::No;
         if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("duckdb_file") {
                 make_spice_data_directory().map_err(|err| {
@@ -384,7 +385,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(
+            was_bootstrapped = download_snapshot_if_needed(
                 acceleration,
                 source,
                 PathBuf::from(path),
@@ -395,7 +396,7 @@ impl DataAccelerator for DuckDBAccelerator {
             self.get_shared_pool(source).await?;
         }
 
-        Ok(())
+        Ok(was_bootstrapped)
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.

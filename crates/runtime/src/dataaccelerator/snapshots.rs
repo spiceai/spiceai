@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
+use crate::dataaccelerator::WasBootstrapped;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
@@ -30,14 +31,16 @@ use runtime_acceleration::{
 };
 use snafu::ResultExt;
 
+/// Downloads a snapshot if needed for bootstrapping.
+/// Returns `WasBootstrapped`::`Yes` if a snapshot was successfully downloaded.
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
     path: PathBuf,
     engine: AccelerationEngine,
-) {
+) -> WasBootstrapped {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
-        return;
+        return WasBootstrapped::No;
     }
 
     if path.exists() {
@@ -45,7 +48,7 @@ pub(super) async fn download_snapshot_if_needed(
             "Acceleration already exists at {}, skipping snapshot download",
             path.display()
         );
-        return;
+        return WasBootstrapped::No;
     }
 
     let dataset_name = source.name().to_string();
@@ -88,6 +91,7 @@ pub(super) async fn download_snapshot_if_needed(
                     bytes_downloaded,
                     &checksum,
                 );
+                return WasBootstrapped::Yes;
             }
             Ok(None) => {}
             Err(e) => {
@@ -95,6 +99,7 @@ pub(super) async fn download_snapshot_if_needed(
             }
         }
     }
+    WasBootstrapped::No
 }
 
 pub(crate) async fn validate_snapshot_paths(sources: Vec<Arc<dyn AccelerationSource>>) {

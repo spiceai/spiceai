@@ -350,6 +350,7 @@ pub enum Table {
         federated_read_table: FederatedTable,
         accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
+        was_bootstrapped: bool,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -542,6 +543,7 @@ impl DataFusion {
                 federated_read_table,
                 accelerated_table,
                 secrets,
+                was_bootstrapped,
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
@@ -569,8 +571,14 @@ impl DataFusion {
                         });
                     None
                 } else {
-                    self.register_accelerated_table(dataset, source, federated_read_table, secrets)
-                        .await?
+                    self.register_accelerated_table(
+                        dataset,
+                        source,
+                        federated_read_table,
+                        secrets,
+                        was_bootstrapped,
+                    )
+                    .await?
                 }
             }
             Table::Federated {
@@ -806,6 +814,7 @@ impl DataFusion {
             sink_connector,
             federated_table,
             Arc::clone(&pending_registration.secrets),
+            false, // Sink datasets don't bootstrap from snapshots
         )
         .await?;
 
@@ -1007,6 +1016,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
+        was_bootstrapped: bool,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -1330,6 +1340,8 @@ impl DataFusion {
             accelerated_table_builder.write_to_accelerator_only();
         }
 
+        accelerated_table_builder.was_bootstrapped(was_bootstrapped);
+
         accelerated_table_builder
             .build()
             .await
@@ -1422,9 +1434,16 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
+        was_bootstrapped: bool,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
-            .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
+            .create_accelerated_table(
+                &dataset,
+                Arc::clone(&source),
+                federated_read_table,
+                secrets,
+                was_bootstrapped,
+            )
             .await?;
         let notifier = accelerated_table.refresher().on_complete_notification();
 

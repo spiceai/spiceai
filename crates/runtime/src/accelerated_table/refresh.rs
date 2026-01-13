@@ -478,6 +478,8 @@ pub struct Refresher {
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
     /// Shared with `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
+    /// Whether the dataset was bootstrapped from a snapshot during initialization.
+    was_bootstrapped: bool,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -528,6 +530,7 @@ impl Refresher {
             io_runtime,
             resource_monitor: None,
             accelerator_write_mutex,
+            was_bootstrapped: false,
         }
     }
 
@@ -607,6 +610,13 @@ impl Refresher {
         self
     }
 
+    /// Set whether the dataset was bootstrapped from a snapshot.
+    /// This delays the first snapshot creation by the full interval after bootstrap.
+    pub fn set_was_bootstrapped(&mut self, was_bootstrapped: bool) -> &mut Self {
+        self.was_bootstrapped = was_bootstrapped;
+        self
+    }
+
     /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
     fn compute_delay(period: Duration, max_jitter: Option<Duration>) -> Duration {
         match max_jitter {
@@ -676,6 +686,7 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
+                let on_complete_for_snapshots = self.on_complete_notification.clone();
                 let (snapshot_interval_task, on_batch_process_callback) = match snapshot_trigger {
                     None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
                     Some(SnapshotCreateTrigger::Interval(duration)) => (
@@ -686,6 +697,8 @@ impl Refresher {
                             Arc::clone(&self.accelerator_write_mutex),
                             dataset_name.clone(),
                             Arc::clone(&federated_schema),
+                            on_complete_for_snapshots,
+                            self.was_bootstrapped,
                         ),
                         None,
                     ),
@@ -698,6 +711,7 @@ impl Refresher {
                             Arc::clone(&self.accelerator_write_mutex),
                             &self.dataset_name,
                             self.federated.schema(),
+                            on_complete_for_snapshots,
                         ),
                     ),
                 };
@@ -751,6 +765,7 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
 
+        let on_complete_for_snapshots = self.on_complete_notification.clone();
         let (snapshot_interval_task, create_snapshot_after_refresh) = match snapshot_trigger {
             None | Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
             Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
@@ -762,6 +777,8 @@ impl Refresher {
                     Arc::clone(&self.accelerator_write_mutex),
                     dataset_name.clone(),
                     Arc::clone(&federated_schema),
+                    on_complete_for_snapshots,
+                    self.was_bootstrapped,
                 ),
                 false,
             ),

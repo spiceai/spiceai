@@ -48,7 +48,7 @@ use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, DataAccelerator, WasBootstrapped, upsert_dedup};
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
@@ -1688,6 +1688,7 @@ impl DataAccelerator for CayenneAccelerator {
     /// Initializes a `Cayenne` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
+    /// Returns `Ok(true)` if a snapshot was bootstrapped, `Ok(false)` otherwise.
     #[expect(
         clippy::too_many_lines,
         reason = "Initialization requires extensive validation, S3 bucket setup, and directory management"
@@ -1695,7 +1696,7 @@ impl DataAccelerator for CayenneAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
         tracing::warn!(
             "Cayenne data accelerator (Alpha) is in preview and should not be used in production."
         );
@@ -1800,7 +1801,8 @@ impl DataAccelerator for CayenneAccelerator {
                 }
             }
 
-            return Ok(());
+            // S3 Express One Zone does not support snapshot bootstrapping
+            return Ok(WasBootstrapped::No);
         }
 
         // If mode is FileCreate, delete the existing directory and metadata to start fresh
@@ -1860,17 +1862,14 @@ impl DataAccelerator for CayenneAccelerator {
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
 
-        if let Some(acceleration) = source.acceleration() {
-            download_snapshot_if_needed(
-                acceleration,
-                source,
-                path_buf,
-                AccelerationEngine::Cayenne,
-            )
-            .await;
-        }
+        let was_bootstrapped = if let Some(acceleration) = source.acceleration() {
+            download_snapshot_if_needed(acceleration, source, path_buf, AccelerationEngine::Cayenne)
+                .await
+        } else {
+            WasBootstrapped::No
+        };
 
-        Ok(())
+        Ok(was_bootstrapped)
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.

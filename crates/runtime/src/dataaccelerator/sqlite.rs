@@ -40,7 +40,7 @@ use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, DataAccelerator, WasBootstrapped, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -227,16 +227,18 @@ impl DataAccelerator for SqliteAccelerator {
     /// If the dataset is not file-accelerated, this is a no-op
     /// This step is required for federation, as `SQLite` connections attach to all other configured `SQLite` databases.
     /// Federation then requires that all attached databases exist before dataset registration.
+    /// Returns `Ok(true)` if a snapshot was bootstrapped, `Ok(false)` otherwise.
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Ok(WasBootstrapped::No);
         }
 
         let path = self.file_path(source)?;
 
+        let mut was_bootstrapped = WasBootstrapped::No;
         if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("sqlite_file") {
                 make_spice_data_directory()
@@ -272,7 +274,7 @@ impl DataAccelerator for SqliteAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(
+            was_bootstrapped = download_snapshot_if_needed(
                 acceleration,
                 source,
                 PathBuf::from(path),
@@ -283,7 +285,7 @@ impl DataAccelerator for SqliteAccelerator {
             self.get_shared_pool(source).await?;
         }
 
-        Ok(())
+        Ok(was_bootstrapped)
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
