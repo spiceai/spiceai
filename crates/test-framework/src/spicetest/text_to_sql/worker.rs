@@ -21,10 +21,12 @@ use std::{
 
 use anyhow::Result;
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::task::JoinHandle;
 
-use crate::spicetest::text_to_sql::{parse::logical_plan, task_history::find_task_history_metrics};
+use crate::spicetest::text_to_sql::{
+    TextToSqlMetric, parse::logical_plan, task_history::find_task_history_metrics,
+};
 
 #[derive(Debug, Clone)]
 pub struct TextToSqlRequest {
@@ -80,27 +82,7 @@ impl TextToSqlConfig {
 }
 
 pub(crate) struct TextToSqlWorkerResult {
-    pub(crate) results: BTreeMap<String, TextToSqlResult>,
-}
-
-pub struct TextToSqlResult {
-    pub question: String,
-    pub generated_sql: String,
-    pub expected_sql: String,
-    pub generated_logical_plan: Value,
-    pub expected_logical_plan: Value,
-    pub is_error: bool,
-    pub duration: Duration,
-    pub sample_data_enabled: bool,
-    pub return_sql: bool,
-
-    // Non-functional metrics from task_history
-    pub query_count: usize,
-    pub sql_duration_ms: f64,
-    pub llm_duration_ms: f64,
-    pub llm_count: usize,
-    pub llm_input_tokens: u64,
-    pub llm_output_tokens: u64,
+    pub(crate) results: BTreeMap<String, TextToSqlMetric>,
 }
 
 pub(crate) struct TextToSqlWorker {
@@ -127,7 +109,7 @@ impl TextToSqlWorker {
 
     pub fn start(self) -> JoinHandle<Result<TextToSqlWorkerResult>> {
         tokio::spawn(async move {
-            let mut results: BTreeMap<String, TextToSqlResult> = BTreeMap::new();
+            let mut results: BTreeMap<String, TextToSqlMetric> = BTreeMap::new();
             let total_requests = self.config.requests.len();
             let mut last_progress_time = Instant::now();
 
@@ -136,10 +118,10 @@ impl TextToSqlWorker {
             for (index, request) in self.config.requests.into_iter().enumerate() {
                 let start = Instant::now();
                 let mut is_error = false;
-                let mut generated_sql: Option<String> = None;
+                let mut generated_sql_opt: Option<String> = None;
                 match nsql_request(&self.http_client, &self.http_base_url, &request).await {
                     Ok(sql) if request.return_sql => {
-                        generated_sql = Some(sql);
+                        generated_sql_opt = Some(sql);
                     }
                     Ok(_) => {} // NSQL returned data. Must get SQL from task_history
                     Err(_) => {
@@ -149,26 +131,16 @@ impl TextToSqlWorker {
 
                 let duration = start.elapsed();
 
-                let (sql, task_metrics) = find_task_history_metrics(&self.spice_client)
+                let (sql, task_history_metrics) = find_task_history_metrics(&self.spice_client)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("could not find task history metrics. Error: {e}")
                     })?;
 
-                let generated_sql = generated_sql.or(sql).unwrap_or_default();
+                let generated_sql = generated_sql_opt.or(sql).unwrap_or_default();
 
                 // Compute Logical Plans
-                let generate_lp = logical_plan(
-                    self.http_client.clone(),
-                    self.http_base_url.clone(),
-                    &generated_sql,
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("could not compute generated logical plan. Error: {e}")
-                })?;
-
-                let expected_lp = logical_plan(
+                let expected_logical_plan = logical_plan(
                     self.http_client.clone(),
                     self.http_base_url.clone(),
                     &request.expected_sql,
@@ -178,25 +150,28 @@ impl TextToSqlWorker {
                     anyhow::anyhow!("could not compute generated logical plan. Error: {e}")
                 })?;
 
+                let generated_logical_plan = logical_plan(
+                    self.http_client.clone(),
+                    self.http_base_url.clone(),
+                    &generated_sql,
+                )
+                .await
+                .ok();
+
                 results.insert(
                     request.id.clone(),
-                    TextToSqlResult {
-                        question: request.question,
-                        generated_sql: generated_sql.or(sql).unwrap_or_default(),
-                        expected_sql: request.expected_sql,
-                        generated_logical_plan: generate_lp,
-                        expected_logical_plan: expected_lp,
-                        duration,
+                    TextToSqlMetric::try_new(
+                        request.question,
+                        &generated_sql,
+                        &request.expected_sql,
+                        &expected_logical_plan,
+                        generated_logical_plan.as_ref(),
                         is_error,
-                        query_count: task_metrics.sql_count,
-                        sample_data_enabled: request.sample_data_enabled,
-                        return_sql: request.return_sql,
-                        sql_duration_ms: task_metrics.sql_duration_ms,
-                        llm_duration_ms: task_metrics.llm_duration_ms,
-                        llm_count: task_metrics.llm_count,
-                        llm_input_tokens: task_metrics.llm_input_tokens,
-                        llm_output_tokens: task_metrics.llm_output_tokens,
-                    },
+                        duration,
+                        request.sample_data_enabled,
+                        request.return_sql,
+                        &task_history_metrics,
+                    )?,
                 );
 
                 if last_progress_time.elapsed() >= Duration::from_secs(10) {

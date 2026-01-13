@@ -24,7 +24,7 @@ use futures::TryStreamExt;
 
 /// Metrics from `runtime.task_history` for a `nsql` operation.
 #[derive(Debug, Clone)]
-pub(crate) struct TaskHistoryMetrics {
+pub struct TaskHistoryMetrics {
     pub sql_duration_ms: f64,
     pub sql_count: usize,
     pub llm_duration_ms: f64,
@@ -36,6 +36,7 @@ pub(crate) struct TaskHistoryMetrics {
 /// Fetches metrics from `runtime.task_history` for the most recent nsql operation.
 ///
 /// Returns: `(generated_sql, task_history_metrics)`
+#[expect(clippy::too_many_lines)]
 pub(super) async fn find_task_history_metrics(
     spice_client: &spiceai::Client,
 ) -> Result<(Option<String>, TaskHistoryMetrics)> {
