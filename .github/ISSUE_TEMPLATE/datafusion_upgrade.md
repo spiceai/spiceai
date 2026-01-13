@@ -47,7 +47,14 @@ graph TD
 For all forked dependencies, we use a two-branch strategy:
 
 1. **Feature branch** (`spiceai-<version>`): Created directly from the upstream tag (e.g., `51.0.0`). This branch tracks the exact upstream release with no modifications.
-2. **Patch branch** (`spiceai-<version>-patches`): Created from the feature branch. All Spice-specific patches are applied here via PRs against the feature branch.
+2. **Patch branch** (`spiceai-<version>-patches`): Created from the feature branch. All Spice-specific patches are cherry-picked and applied here.
+
+**CRITICAL: All patches must be cherry-picked individually to the `-patches` branch**, resolving any merge conflicts in the cherry-pick commit itself. This ensures:
+
+- Each patch is a discrete commit that can be tracked and reviewed
+- Conflicts are resolved once and documented in commit history
+- Future upgrades can easily identify which patches need porting
+- Git blame accurately reflects patch authorship
 
 **Example workflow for DataFusion v51:**
 
@@ -58,17 +65,23 @@ git checkout -b spiceai-51 51.0.0           # Create feature branch from upstrea
 git push origin spiceai-51
 
 git checkout -b spiceai-51-patches spiceai-51  # Create patch branch
-# Apply patches...
-git push origin spiceai-51-patches
 
-# Create PRs from spiceai-51-patches -> spiceai-51 for review
+# Cherry-pick each patch from previous version, resolving conflicts
+git cherry-pick <commit-hash-from-spiceai-50>
+# If conflicts, resolve them and: git cherry-pick --continue
+# Repeat for each patch...
+
+git push origin spiceai-51-patches
 ```
+
+**Do NOT squash or batch patches together** - each original patch should remain as a separate cherry-picked commit.
 
 This allows:
 
 - Clear tracking of which patches are applied on top of which upstream version
 - Easy rebasing when upstream releases patch versions (e.g., 51.0.1)
-- PR-based review of all Spice-specific changes
+- Individual review of each patch's conflict resolution
+- Simple diff comparison between patch branches across versions
 
 ## Pre-upgrade Tasks
 
@@ -95,11 +108,13 @@ This allows:
   ```
 
 - [ ] Run `cargo test` to confirm that all upstream tests pass, or make note of which tests fail for reference.
-- [ ] View the previous patch branch (i.e., `spiceai-<X-1>-patches`) commit history. For every commit after the upstream (previous) release commit:
-  - Confirm the commit has been merged upstream and is in the new release **OR**
-  - Cherry-pick the commit onto `spiceai-X-patches`. This may involve resolving merge conflicts.
-  - Create a PR from the cherry-picked commit to `spiceai-X` for review (or batch multiple related patches).
-  - Rerun `cargo test` confirming there are no new failed tests. If there are failed tests, fix them and amend the cherry-picked commit so that the fixes live with the patch.
+- [ ] **Cherry-pick each patch individually** from the previous patch branch (`spiceai-<X-1>-patches` or `spiceai-<X-1>`). For every Spice-specific commit after the upstream release commit:
+
+  1. **Check if merged upstream**: Search the new release for the PR number or commit message. Example: `git log X.Y.Z --oneline --grep="<PR-number-or-keyword>"`
+  2. **If NOT merged upstream**: Cherry-pick the commit individually. Resolve any conflicts and continue: `git cherry-pick <commit-hash>`
+  3. **After each cherry-pick**: Run `cargo test` to confirm no regressions. If tests fail, fix them and amend the cherry-picked commit: `git commit --amend --no-edit`
+  4. **Document skipped patches**: If a patch is no longer needed (merged upstream or obsolete), note it in the PR description
+
 - [ ] Push `spiceai-X-patches` and record the commit hash for `Cargo.toml`.
 - [ ] If there are no commits that need to be cherry-picked, the upstream repository tag can be used directly.
 

@@ -18,10 +18,7 @@ pub mod allowlist;
 pub mod config;
 pub mod execution_plan;
 pub mod extension;
-// TODO(df51): Re-enable join_accumulator once spiceai-51 DataFusion fork is ready
-// This module requires custom CollectLeftAccumulator and ColumnBounds traits from
-// the spiceai DataFusion fork.
-// pub mod join_accumulator;
+pub mod join_accumulator;
 pub mod optimizer_rule;
 pub mod schema_provider;
 use snafu::prelude::*;
