@@ -617,16 +617,120 @@
             "layout": {
               "x": 0,
               "y": 0,
-              "width": 6,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 304,
+            "definition": {
+              "title": "Refresh Duration (p99)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "number_format": {
+                        "unit": {
+                          "type": "canonical_unit",
+                          "unit_name": "millisecond"
+                        }
+                      },
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "p99:spice.dataset_acceleration_refresh_duration_ms{$service.instance.id,!dataset:runtime.*} by {dataset}"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "line"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 4,
+              "y": 0,
+              "width": 4,
+              "height": 3
+            }
+          },
+          {
+            "id": 305,
+            "definition": {
+              "title": "Refresh Errors",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "auto",
+              "legend_columns": [
+                "sum",
+                "value"
+              ],
+              "type": "timeseries",
+              "requests": [
+                {
+                  "formulas": [
+                    {
+                      "formula": "query1"
+                    }
+                  ],
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "query1",
+                      "query": "sum:spice.dataset_acceleration_refresh_errors{$service.instance.id} by {dataset}.as_count()"
+                    }
+                  ],
+                  "response_format": "timeseries",
+                  "style": {
+                    "palette": "warm",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  },
+                  "display_type": "bars"
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 8,
+              "y": 0,
+              "width": 4,
               "height": 3
             }
           },
           {
             "id": 303,
             "definition": {
-              "title": "Ingestion Lag",
+              "title": "Dataset Ingestion Lag (ms)",
               "title_size": "16",
               "title_align": "left",
+              "time": {},
               "type": "toplist",
               "requests": [
                 {
@@ -682,130 +786,31 @@
               "style": {}
             },
             "layout": {
-              "x": 6,
-              "y": 0,
+              "x": 0,
+              "y": 3,
               "width": 6,
               "height": 3
             }
           },
           {
-            "id": 304,
+            "id": 358266188692798,
             "definition": {
-              "title": "Refresh Duration (p99)",
+              "title": "Refresh Timestamp Lag",
               "title_size": "16",
               "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "avg",
-                "max",
-                "value"
-              ],
-              "type": "timeseries",
+              "time": {},
+              "type": "toplist",
               "requests": [
                 {
-                  "formulas": [
-                    {
-                      "number_format": {
-                        "unit": {
-                          "type": "canonical_unit",
-                          "unit_name": "millisecond"
-                        }
-                      },
-                      "formula": "query1"
-                    }
-                  ],
                   "queries": [
                     {
-                      "data_source": "metrics",
                       "name": "query1",
-                      "query": "p99:spice.dataset_acceleration_refresh_duration_ms{$service.instance.id,!dataset:runtime.*} by {dataset}"
-                    }
-                  ],
-                  "response_format": "timeseries",
-                  "style": {
-                    "palette": "dog_classic",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "line"
-                }
-              ],
-              "yaxis": {
-                "include_zero": true,
-                "scale": "linear"
-              }
-            },
-            "layout": {
-              "x": 0,
-              "y": 3,
-              "width": 4,
-              "height": 3
-            }
-          },
-          {
-            "id": 305,
-            "definition": {
-              "title": "Refresh Errors",
-              "title_size": "16",
-              "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "sum",
-                "value"
-              ],
-              "type": "timeseries",
-              "requests": [
-                {
-                  "formulas": [
-                    {
-                      "formula": "query1"
-                    }
-                  ],
-                  "queries": [
-                    {
                       "data_source": "metrics",
-                      "name": "query1",
-                      "query": "sum:spice.dataset_acceleration_refresh_errors{$service.instance.id} by {dataset}.as_count()"
+                      "query": "avg:spice.dataset_acceleration_refresh_lag_ms{$service.instance.id,!dataset:runtime.*} by {dataset}",
+                      "aggregator": "avg"
                     }
                   ],
-                  "response_format": "timeseries",
-                  "style": {
-                    "palette": "warm",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "bars"
-                }
-              ],
-              "yaxis": {
-                "include_zero": true,
-                "scale": "linear"
-              }
-            },
-            "layout": {
-              "x": 4,
-              "y": 3,
-              "width": 4,
-              "height": 3
-            }
-          },
-          {
-            "id": 306,
-            "definition": {
-              "title": "Refresh Lag (Data Freshness)",
-              "title_size": "16",
-              "title_align": "left",
-              "show_legend": true,
-              "legend_layout": "auto",
-              "legend_columns": [
-                "avg",
-                "value"
-              ],
-              "type": "timeseries",
-              "requests": [
-                {
+                  "response_format": "scalar",
                   "formulas": [
                     {
                       "formula": "query1",
@@ -817,31 +822,28 @@
                       }
                     }
                   ],
-                  "queries": [
-                    {
-                      "data_source": "metrics",
-                      "name": "query1",
-                      "query": "avg:spice.dataset_acceleration_refresh_lag_ms{$service.instance.id,!dataset:runtime.*} by {dataset}"
-                    }
-                  ],
-                  "response_format": "timeseries",
-                  "style": {
-                    "palette": "dog_classic",
-                    "line_type": "solid",
-                    "line_width": "normal"
-                  },
-                  "display_type": "line"
+                  "sort": {
+                    "count": 10,
+                    "order_by": [
+                      {
+                        "type": "formula",
+                        "index": 0,
+                        "order": "desc"
+                      }
+                    ]
+                  }
                 }
               ],
-              "yaxis": {
-                "include_zero": true,
-                "scale": "linear"
+              "style": {
+                "display": {
+                  "type": "stacked"
+                }
               }
             },
             "layout": {
-              "x": 8,
+              "x": 6,
               "y": 3,
-              "width": 4,
+              "width": 6,
               "height": 3
             }
           }
@@ -868,7 +870,6 @@
               "title": "Cache Hit Rate",
               "title_size": "16",
               "title_align": "left",
-              "time": {},
               "type": "query_value",
               "requests": [
                 {
@@ -1208,7 +1209,6 @@
                 "value",
                 "sum"
               ],
-              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1263,7 +1263,6 @@
                 "value",
                 "sum"
               ],
-              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1312,7 +1311,6 @@
                 "value",
                 "sum"
               ],
-              "time": {},
               "type": "timeseries",
               "requests": [
                 {
@@ -1358,7 +1356,7 @@
         "x": 0,
         "y": 27,
         "width": 12,
-        "height": 1
+        "height": 4
       }
     },
     {
@@ -1470,7 +1468,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 28,
+        "y": 31,
         "width": 12,
         "height": 1
       }
@@ -1749,7 +1747,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 29,
+        "y": 32,
         "width": 12,
         "height": 1
       }
@@ -1861,7 +1859,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 30,
+        "y": 33,
         "width": 12,
         "height": 1
       }
@@ -2071,7 +2069,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 31,
+        "y": 34,
         "width": 12,
         "height": 1
       }
@@ -2294,7 +2292,7 @@
       },
       "layout": {
         "x": 0,
-        "y": 32,
+        "y": 35,
         "width": 12,
         "height": 1
       }
