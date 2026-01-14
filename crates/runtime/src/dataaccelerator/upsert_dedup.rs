@@ -268,10 +268,9 @@ impl ExecutionPlan for UpsertDedupExec {
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 // Return the first batch (we passed in one batch)
-                validated_batches
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| DataFusionError::Internal("Expected validated batch".to_string()))
+                validated_batches.into_iter().next().ok_or_else(|| {
+                    DataFusionError::Internal("Expected validated batch".to_string())
+                })
             }
         });
 
