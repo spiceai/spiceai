@@ -50,7 +50,7 @@ pub async fn logical_plan(
         .and_then(|v| v.get("Plan"))
         .ok_or_else(|| anyhow::anyhow!("Failed to extract Plan from response"))?;
 
-    Ok(root_plan)
+    Ok(root_plan.clone())
 }
 
 pub fn extract_tables_and_projection(

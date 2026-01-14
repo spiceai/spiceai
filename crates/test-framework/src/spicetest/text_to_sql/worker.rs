@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, time::Instant};
 
 use anyhow::Result;
 use arrow::datatypes::{Field, Schema};
@@ -118,7 +115,6 @@ impl TextToSqlWorker {
 
     pub fn start(self) -> JoinHandle<Result<TextToSqlWorkerResult>> {
         tokio::spawn(async move {
-
             let mut results: BTreeMap<String, TextToSqlMetric> = BTreeMap::new();
             let mut processed_count = 0usize;
 
@@ -130,6 +126,8 @@ impl TextToSqlWorker {
 
                 let trace_id = random_trace_id();
                 match nsql_request(&self.http_client, &self.http_base_url, &request, &trace_id)
+                    .await
+                {
                     Ok(NSQLResponse::Sql(sql)) => {
                         generated_sql_opt = Some(sql);
                     }
@@ -143,11 +141,12 @@ impl TextToSqlWorker {
 
                 let duration = start.elapsed();
 
-                let (sql, task_history_metrics) = find_task_history_metrics(&self.spice_client, &trace_id)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("could not find task history metrics. Error: {e}")
-                    })?;
+                let (sql, task_history_metrics) =
+                    find_task_history_metrics(&self.spice_client, &trace_id)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("could not find task history metrics. Error: {e}")
+                        })?;
 
                 let generated_sql = generated_sql_opt.or(sql).unwrap_or_default();
 
@@ -241,7 +240,7 @@ async fn nsql_request(
     http_base_url: &str,
     req: &TextToSqlRequest,
     trace_id: &TraceId,
-) -> Result<String, reqwest::Error> {
+) -> Result<NSQLResponse, reqwest::Error> {
     let TextToSqlRequest {
         question,
         model,
