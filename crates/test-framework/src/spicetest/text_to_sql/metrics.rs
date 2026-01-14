@@ -215,8 +215,7 @@ impl TextToSqlMetric {
         task_history_metrics: &TaskHistoryMetrics,
     ) -> Result<Self, anyhow::Error> {
         let expected = extract_tables_and_projection(expected_logical_plan);
-        let generated = generated_logical_plan
-            .map(extract_tables_and_projection);
+        let generated = generated_logical_plan.map(extract_tables_and_projection);
 
         Ok(Self {
             question,

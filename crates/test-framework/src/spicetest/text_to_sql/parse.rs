@@ -67,21 +67,22 @@ fn extract_table_scans(
     projections: &mut HashSet<Column>,
 ) {
     if let Some(node_type) = plan.get("Node Type").and_then(Value::as_str)
-        && node_type == "TableScan" {
-            let mut relation_opt: Option<TableReference> = None;
-            if let Some(relation_name) = plan.get("Relation Name").and_then(Value::as_str) {
-                let tbl = TableReference::parse_str(relation_name);
-                tables.insert(tbl.clone());
-                relation_opt = Some(tbl);
-            }
-            if let Some(output) = plan.get("Output").and_then(Value::as_array) {
-                for col in output {
-                    if let Some(col_str) = col.as_str() {
-                        projections.insert(Column::new(relation_opt.clone(), col_str));
-                    }
+        && node_type == "TableScan"
+    {
+        let mut relation_opt: Option<TableReference> = None;
+        if let Some(relation_name) = plan.get("Relation Name").and_then(Value::as_str) {
+            let tbl = TableReference::parse_str(relation_name);
+            tables.insert(tbl.clone());
+            relation_opt = Some(tbl);
+        }
+        if let Some(output) = plan.get("Output").and_then(Value::as_array) {
+            for col in output {
+                if let Some(col_str) = col.as_str() {
+                    projections.insert(Column::new(relation_opt.clone(), col_str));
                 }
             }
         }
+    }
 
     if let Some(plans) = plan.get("Plans").and_then(Value::as_array) {
         for sub_plan in plans {
