@@ -64,4 +64,4 @@ pub mod provider;
 pub use catalog::MetadataCatalog;
 pub use cayenne_catalog::CayenneCatalog;
 pub use metadata::{DataFile, DeleteFile, ObjectStoreConfig, PartitionMetadata, TableMetadata};
-pub use provider::{CayenneTableProvider, CayenneTableProviderBuilder};
+pub use provider::{CayenneContext, CayenneTableProvider, CayenneTableProviderBuilder};

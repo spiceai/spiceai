@@ -23,6 +23,7 @@ use super::{
     default_true, is_default, is_default_or_none,
 };
 use crate::metric::Metrics;
+use crate::param::Params;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,9 @@ pub struct Runtime {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<Scheduler>,
 }
 
 impl Runtime {
@@ -650,6 +654,18 @@ pub enum SpillCompression {
     Uncompressed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Scheduler {
+    /// Root URI for shared cluster state.
+    pub state_location: String,
+
+    /// Optional object store params for the shared cluster state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+}
+
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Debug, Deserialize)]
@@ -701,6 +717,8 @@ pub struct RuntimeDeserializer {
     pub query: Option<Query>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<Scheduler>,
 }
 
 #[expect(deprecated)]
@@ -760,6 +778,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
                 Some(query)
             },
             metrics: deserializer.metrics,
+            scheduler: deserializer.scheduler,
         })
     }
 }
