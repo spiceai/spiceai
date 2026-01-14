@@ -727,7 +727,7 @@
           {
             "id": 303,
             "definition": {
-              "title": "Refresh Staleness",
+              "title": "Dataset Ingestion Lag (ms)",
               "title_size": "16",
               "title_align": "left",
               "time": {},
@@ -795,7 +795,7 @@
           {
             "id": 358266188692798,
             "definition": {
-              "title": "Refresh Timestamp Advancement",
+              "title": "Refresh Timestamp Lag",
               "title_size": "16",
               "title_align": "left",
               "time": {},
