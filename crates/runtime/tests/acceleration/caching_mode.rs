@@ -912,7 +912,7 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
                 .await?
                 .limit(0, Some(1))?;
             let empty_batches = df.collect().await?;
-            let empty_row_count: usize = empty_batches.iter().map(|b| b.num_rows()).sum();
+            let empty_row_count: usize = empty_batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
             assert_eq!(empty_row_count, 0, "Empty cache should return no rows");
 
             // Populate the cache with a filtered query
