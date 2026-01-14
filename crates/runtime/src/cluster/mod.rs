@@ -1137,6 +1137,14 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
         // keys match the spec expected by the S3 connector and `SpiceObjectRegistry`.
         params.parameters.canonicalize_s3_fragments();
 
+        // Canonicalize Azure parameters (e.g., `azure_storage_account_name` -> `account`)
+        // for Delta Lake and other connectors that use Azure-prefixed parameter names.
+        params.parameters.canonicalize_azure_fragments();
+
+        // Canonicalize GCS parameters (e.g., `google_service_account` -> `service_account`)
+        // for Delta Lake and other connectors that use GCS-prefixed parameter names.
+        params.parameters.canonicalize_gcs_fragments();
+
         let unprefixed = params
             .parameters
             .into_iter()
