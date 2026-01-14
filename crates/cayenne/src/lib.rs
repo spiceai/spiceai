@@ -58,8 +58,7 @@ pub mod cayenne_catalog;
 pub mod deletion;
 pub mod metadata;
 pub mod metastore;
-// TODO(df51): Re-enable optimizer_rules once spiceai-51 DataFusion fork has CollectLeftAccumulator trait
-// pub mod optimizer_rules;
+pub mod optimizer_rules;
 pub mod provider;
 
 pub use catalog::MetadataCatalog;
