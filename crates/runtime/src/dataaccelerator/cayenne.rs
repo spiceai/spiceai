@@ -303,8 +303,14 @@ fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize 
     acceleration
         .params
         .get(key)
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default)
+        .map_or(default, |v| {
+            v.parse::<usize>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                );
+                default
+            })
+        })
 }
 
 /// Returns true if the path is a local filesystem path (not a remote object store).
@@ -2189,6 +2195,8 @@ struct CayennePartitionCreator {
     object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
     primary_key: Vec<String>,
     on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
+    /// Shared Cayenne context with cache, created once and shared across all partitions.
+    context: Arc<cayenne::CayenneContext>,
 }
 
 impl std::fmt::Debug for CayennePartitionCreator {
@@ -2206,6 +2214,7 @@ impl std::fmt::Debug for CayennePartitionCreator {
             .field("object_store_config", &self.object_store_config.is_some())
             .field("primary_key", &self.primary_key)
             .field("on_conflict", &self.on_conflict.is_some())
+            .field("context", &"<CayenneContext>")
             .finish()
     }
 }
@@ -2226,6 +2235,11 @@ impl CayennePartitionCreator {
         primary_key: Vec<String>,
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
     ) -> Self {
+        // Create shared Cayenne context with cache once, to be shared across all partitions.
+        // This ensures all partitions share the same footer/segment caches instead of
+        // each partition creating its own cache.
+        let context = cayenne::CayenneContext::new(&vortex_config);
+
         Self {
             table_name,
             base_path,
@@ -2239,6 +2253,7 @@ impl CayennePartitionCreator {
             object_store_config,
             primary_key,
             on_conflict,
+            context,
         }
     }
 
@@ -2316,9 +2331,11 @@ impl PartitionCreator for CayennePartitionCreator {
             vortex_config: self.vortex_config.clone(),
         };
 
-        // Create Cayenne table provider for this partition with S3 support
+        // Create Cayenne table provider for this partition with S3 support.
+        // Use the shared context to share footer/segment caches across partitions.
         let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&self.catalog))
-            .with_retention_filters(self.retention_filters.clone());
+            .with_retention_filters(self.retention_filters.clone())
+            .with_context(Arc::clone(&self.context));
         if let Some(ref object_store) = self.object_store_config {
             builder = builder.with_object_store(object_store.clone());
         }
@@ -2368,9 +2385,11 @@ impl PartitionCreator for CayennePartitionCreator {
             // Create Cayenne table provider for this partition
             let partition_table_name = self.partition_table_name(&partition_meta.partition_value);
 
-            // Use builder pattern to pass object store config for S3 support
+            // Use builder pattern to pass object store config for S3 support.
+            // Use the shared context to share footer/segment caches across partitions.
             let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&self.catalog))
-                .with_retention_filters(self.retention_filters.clone());
+                .with_retention_filters(self.retention_filters.clone())
+                .with_context(Arc::clone(&self.context));
             if let Some(ref object_store) = self.object_store_config {
                 builder = builder.with_object_store(object_store.clone());
             }

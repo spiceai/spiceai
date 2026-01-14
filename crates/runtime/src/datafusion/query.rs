@@ -189,7 +189,11 @@ impl Query {
             .ctx
             .copied_config()
             .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec())
-            .with_ballista_use_tls(tls_enabled);
+            .with_ballista_use_tls(tls_enabled)
+            // Use 100MB max message size to match other gRPC configurations in the codebase
+            // (see flight_client::MAX_DECODING_MESSAGE_SIZE). The default Ballista config
+            // is 16MB which is too small for queries returning large batches.
+            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024);
 
         if let Some(tls_config) = client_tls_config {
             cfg = cfg.with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {

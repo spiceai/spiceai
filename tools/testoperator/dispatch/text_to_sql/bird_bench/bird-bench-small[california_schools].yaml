@@ -4,7 +4,21 @@ tests:
       benchmark_queryset: bird-bench-small[california_schools]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: california_schools
     - model_name: claude-sonnet-4-5
       benchmark_queryset: bird-bench-small[california_schools]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: california_schools
+    - model_name: grok41
+      benchmark_queryset: bird-bench-small[california_schools]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: california_schools-evidence
+      use_evidence: true
+    - model_name: claude-sonnet-4-5
+      benchmark_queryset: bird-bench-small[california_schools]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: california_schools-evidence
+      use_evidence: true

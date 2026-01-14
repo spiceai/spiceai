@@ -16,6 +16,7 @@ limitations under the License.
 
 pub mod accumulate;
 pub mod anthropic;
+pub mod azure;
 pub mod bedrock;
 pub mod chat;
 pub mod config;
@@ -26,7 +27,9 @@ pub mod model2vec;
 pub mod openai;
 pub mod perplexity;
 pub mod progress;
+pub mod provider;
 pub mod responses;
+pub mod spiceai;
 pub mod streaming_utils;
 pub mod xai;
 

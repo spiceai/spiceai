@@ -17,6 +17,9 @@ limitations under the License.
 
 mod chat;
 mod embed;
+mod list_models;
+
+pub use list_models::GoogleModelLister;
 
 use std::sync::Arc;
 
