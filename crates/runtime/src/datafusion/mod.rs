@@ -31,7 +31,7 @@ use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::{self};
+use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_file_path};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
@@ -350,7 +350,7 @@ pub enum Table {
         federated_read_table: FederatedTable,
         accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
-        was_bootstrapped: bool,
+        bootstrap_status: BootstrapStatus,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -543,7 +543,7 @@ impl DataFusion {
                 federated_read_table,
                 accelerated_table,
                 secrets,
-                was_bootstrapped,
+                bootstrap_status,
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
@@ -576,7 +576,7 @@ impl DataFusion {
                         source,
                         federated_read_table,
                         secrets,
-                        was_bootstrapped,
+                        bootstrap_status,
                     )
                     .await?
                 }
@@ -814,7 +814,7 @@ impl DataFusion {
             sink_connector,
             federated_table,
             Arc::clone(&pending_registration.secrets),
-            false, // Sink datasets don't bootstrap from snapshots
+            BootstrapStatus::None, // Sink datasets don't bootstrap from snapshots
         )
         .await?;
 
@@ -1016,7 +1016,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
-        was_bootstrapped: bool,
+        bootstrap_status: BootstrapStatus,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -1340,7 +1340,7 @@ impl DataFusion {
             accelerated_table_builder.write_to_accelerator_only();
         }
 
-        accelerated_table_builder.was_bootstrapped(was_bootstrapped);
+        accelerated_table_builder.bootstrap_status(bootstrap_status);
 
         accelerated_table_builder
             .build()
@@ -1434,7 +1434,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
-        was_bootstrapped: bool,
+        bootstrap_status: BootstrapStatus,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
             .create_accelerated_table(
@@ -1442,7 +1442,7 @@ impl DataFusion {
                 Arc::clone(&source),
                 federated_read_table,
                 secrets,
-                was_bootstrapped,
+                bootstrap_status,
             )
             .await?;
         let notifier = accelerated_table.refresher().on_complete_notification();

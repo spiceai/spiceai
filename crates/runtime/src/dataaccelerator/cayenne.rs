@@ -48,7 +48,7 @@ use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use super::{AccelerationSource, DataAccelerator, BootstrapStatus, upsert_dedup};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;

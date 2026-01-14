@@ -52,7 +52,7 @@ use snafu::{OptionExt, prelude::*};
 use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
-    AccelerationSource, DataAccelerator, BootstrapStatus,
+    AccelerationSource, BootstrapStatus, DataAccelerator,
     duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
 };
 use crate::{

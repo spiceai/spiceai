@@ -29,6 +29,7 @@ use crate::accelerated_table::snapshots::{
 };
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
+use crate::dataaccelerator::BootstrapStatus;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
@@ -478,8 +479,8 @@ pub struct Refresher {
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
     /// Shared with `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
-    /// Whether the dataset was bootstrapped from a snapshot during initialization.
-    was_bootstrapped: bool,
+    /// The bootstrap status from dataset initialization.
+    bootstrap_status: BootstrapStatus,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -530,7 +531,7 @@ impl Refresher {
             io_runtime,
             resource_monitor: None,
             accelerator_write_mutex,
-            was_bootstrapped: false,
+            bootstrap_status: BootstrapStatus::None,
         }
     }
 
@@ -610,9 +611,9 @@ impl Refresher {
         self
     }
 
-    /// Set whether the dataset was bootstrapped from a snapshot.
-    pub fn set_was_bootstrapped(&mut self, was_bootstrapped: bool) -> &mut Self {
-        self.was_bootstrapped = was_bootstrapped;
+    /// Set the bootstrap status from dataset initialization.
+    pub fn set_bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
+        self.bootstrap_status = bootstrap_status;
         self
     }
 
@@ -697,7 +698,7 @@ impl Refresher {
                             dataset_name.clone(),
                             Arc::clone(&federated_schema),
                             on_complete_for_snapshots,
-                            self.was_bootstrapped,
+                            self.bootstrap_status,
                         ),
                         None,
                     ),
@@ -777,7 +778,7 @@ impl Refresher {
                     dataset_name.clone(),
                     Arc::clone(&federated_schema),
                     on_complete_for_snapshots,
-                    self.was_bootstrapped,
+                    self.bootstrap_status,
                 ),
                 false,
             ),

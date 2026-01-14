@@ -47,8 +47,8 @@ pub type SnapshotCallback =
 /// before starting the snapshot interval loop. This prevents creating snapshots before
 /// the dataset has finished its initial load or bootstrap.
 ///
-/// If `was_bootstrapped` is true, the first snapshot will be delayed by the full interval
-/// after the dataset becomes ready (to avoid creating a snapshot immediately after bootstrap).
+/// If `bootstrap_status` indicates the dataset was bootstrapped, the first snapshot will be delayed
+/// by the full interval after the dataset becomes ready (to avoid creating a snapshot immediately after bootstrap).
 #[expect(clippy::too_many_arguments)]
 pub fn spawn_snapshot_interval_task(
     snapshots_create_interval: Option<Duration>,
@@ -58,7 +58,7 @@ pub fn spawn_snapshot_interval_task(
     dataset_name: TableReference,
     federated_schema: Arc<Schema>,
     dataset_ready_notify: Option<Arc<Notify>>,
-    was_bootstrapped: bool,
+    bootstrap_status: crate::dataaccelerator::BootstrapStatus,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
     let checkpointer = checkpointer?;
@@ -82,7 +82,7 @@ pub fn spawn_snapshot_interval_task(
         }
 
         // Determine initial delay based on bootstrapping status and checkpoint time
-        let initial_delay = if was_bootstrapped {
+        let initial_delay = if bootstrap_status.is_bootstrapped() {
             // If dataset was bootstrapped, create a snapshot after the full interval after dataset is ready
             let mut delay = interval_duration;
             if let Ok(Some(last_checkpoint_time)) = checkpointer.last_checkpoint_time().await

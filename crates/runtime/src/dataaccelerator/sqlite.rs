@@ -40,7 +40,7 @@ use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
-use super::{AccelerationSource, DataAccelerator, BootstrapStatus, upsert_dedup};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

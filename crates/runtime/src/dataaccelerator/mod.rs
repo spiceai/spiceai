@@ -608,14 +608,15 @@ pub trait AccelerationSource: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-// Whether an accelerated table was bootstrapped not during initialization.
-#[derive(Debug)]
-pub(crate) enum BootstrapStatus {
+/// Whether an accelerated table was bootstrapped during initialization.
+#[derive(Debug, Clone, Copy)]
+pub enum BootstrapStatus {
     Bootstrapped,
     None,
 }
 
 impl BootstrapStatus {
+    #[must_use] 
     pub fn is_bootstrapped(&self) -> bool {
         matches!(self, BootstrapStatus::Bootstrapped)
     }

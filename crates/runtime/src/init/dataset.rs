@@ -14,13 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
+use crate::dataaccelerator::BootstrapStatus;
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
@@ -82,32 +78,42 @@ impl Runtime {
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
 
-        let (initialized_datasets, bootstrapped_datasets) =
-            self.initialize_datasets_accelerators(&valid_datasets).await;
+        let init_results = self.initialize_datasets_accelerators(&valid_datasets).await;
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
         let mut localpod_datasets = Vec::new();
 
         // First create futures for non-localpod datasets
-        for ds in initialized_datasets {
+        for ds in &valid_datasets {
+            let bootstrap_status = match init_results.get(&ds.name) {
+                Some(Ok(status)) => *status,
+                Some(Err(_)) => {
+                    // Error already logged in initialize_datasets_accelerators
+                    continue;
+                }
+                None => {
+                    tracing::error!("Dataset {} missing from initialization results", ds.name);
+                    continue;
+                }
+            };
+
             if ds.source() == LOCALPOD_DATACONNECTOR {
-                localpod_datasets.push(ds);
+                localpod_datasets.push((Arc::clone(ds), bootstrap_status));
                 continue;
             }
 
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            let ds_clone = Arc::clone(&ds);
+            let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
-            let was_bootstrapped = bootstrapped_datasets.contains(&ds.name);
             let future: Pin<Box<dyn Future<Output = ()> + Send>> =
-                Box::pin(async move { cloned_self.load_dataset(ds_clone, was_bootstrapped).await })
+                Box::pin(async move { cloned_self.load_dataset(ds_clone, bootstrap_status).await })
                     as Pin<Box<dyn Future<Output = ()> + Send>>;
             dataset_futures.insert(ds.name.clone(), future);
         }
 
         // For each localpod dataset, chain it after its parent's future
-        for ds in localpod_datasets {
+        for (ds, bootstrap_status) in localpod_datasets {
             self.status
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
 
@@ -118,12 +124,11 @@ impl Runtime {
             // Find and remove the parent dataset's future
             if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
                 let ds_clone = Arc::clone(&ds);
-                let was_bootstrapped = bootstrapped_datasets.contains(&ds.name);
                 let cloned_self = Arc::clone(&self);
                 // Chain the localpod dataset load after its parent
                 let chained_future = Box::pin(async move {
                     parent_future.await;
-                    cloned_self.load_dataset(ds_clone, was_bootstrapped).await;
+                    cloned_self.load_dataset(ds_clone, bootstrap_status).await;
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>;
 
                 // Replace parent future with the chained future
@@ -257,7 +262,7 @@ impl Runtime {
     }
 
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
-    async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>, was_bootstrapped: bool) {
+    async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>, bootstrap_status: BootstrapStatus) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         if let Err(err) = validate_dataset(&ds) {
@@ -295,7 +300,7 @@ impl Runtime {
             };
 
             if let Err(err) = Arc::clone(&runtime)
-                .register_loaded_dataset(Arc::clone(&ds), connector, None, was_bootstrapped)
+                .register_loaded_dataset(Arc::clone(&ds), connector, None, bootstrap_status)
                 .await
             {
                 if runtime.status.is_shutdown() {
@@ -315,7 +320,7 @@ impl Runtime {
         ds: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<Arc<AcceleratedTable>>,
-        was_bootstrapped: bool,
+        bootstrap_status: BootstrapStatus,
     ) -> Result<()> {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
@@ -374,7 +379,7 @@ impl Runtime {
                     federated_read_table: federated_table,
                     source: source.to_string(),
                     accelerated_table,
-                    was_bootstrapped,
+                    bootstrap_status,
                 },
             )
             .await
@@ -511,7 +516,12 @@ impl Runtime {
                     .await;
 
                 if Arc::clone(&self)
-                    .register_loaded_dataset(Arc::clone(&ds), Arc::clone(&connector), None, false)
+                    .register_loaded_dataset(
+                        Arc::clone(&ds),
+                        Arc::clone(&connector),
+                        None,
+                        BootstrapStatus::None,
+                    )
                     .await
                     .is_err()
                 {
@@ -583,7 +593,7 @@ impl Runtime {
                     Arc::clone(&connector),
                     federated_table,
                     self.secrets(),
-                    false,
+                    BootstrapStatus::None,
                 )
                 .await
                 .context(UnableToCreateAcceleratedTableSnafu {
@@ -606,8 +616,13 @@ impl Runtime {
         tracing::debug!("Accelerated table for dataset {} is ready", ds.name);
 
         // Hot reload doesn't bootstrap from snapshot
-        self.register_loaded_dataset(ds, Arc::clone(&connector), Some(accelerated_table), false)
-            .await?;
+        self.register_loaded_dataset(
+            ds,
+            Arc::clone(&connector),
+            Some(accelerated_table),
+            BootstrapStatus::None,
+        )
+        .await?;
 
         Ok(())
     }
@@ -671,7 +686,7 @@ impl Runtime {
             federated_read_table,
             source,
             accelerated_table,
-            was_bootstrapped,
+            bootstrap_status,
         } = register_dataset_ctx;
 
         let replicate = ds.replication.as_ref().is_some_and(|r| r.enabled);
@@ -741,7 +756,7 @@ impl Runtime {
                     federated_read_table,
                     accelerated_table,
                     secrets: self.secrets(),
-                    was_bootstrapped,
+                    bootstrap_status,
                 },
             )
             .await
@@ -772,20 +787,32 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
-        let (initialized_datasets, bootstrapped_datasets) =
-            self.initialize_datasets_accelerators(&valid_datasets).await;
+        let init_results = self.initialize_datasets_accelerators(&valid_datasets).await;
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
-        for ds in initialized_datasets {
+        for ds in &valid_datasets {
+            let bootstrap_status = match init_results.get(&ds.name) {
+                Some(Ok(status)) => *status,
+                Some(Err(_)) => {
+                    // Error already logged in initialize_datasets_accelerators
+                    continue;
+                }
+                None => {
+                    tracing::error!("Dataset {} missing from initialization results", ds.name);
+                    continue;
+                }
+            };
+
             if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
-                if ds != *current_ds {
-                    Arc::clone(&self).update_dataset(ds).await;
+                if ds != current_ds {
+                    Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
                 }
             } else {
                 self.status
                     .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                let was_bootstrapped = bootstrapped_datasets.contains(&ds.name);
-                Arc::clone(&self).load_dataset(ds, was_bootstrapped).await;
+                Arc::clone(&self)
+                    .load_dataset(Arc::clone(ds), bootstrap_status)
+                    .await;
             }
         }
 
@@ -829,20 +856,20 @@ impl Runtime {
     /// Initialize datasets configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
-    /// Returns a tuple of (`initialized_datasets`, `bootstrapped_datasets`) where `bootstrapped_datasets`
-    /// contains the names of datasets that were bootstrapped from snapshots.
+    /// Returns a `HashMap` mapping each dataset name to its initialization result, which contains
+    /// the `BootstrapStatus` on success or an error on failure.
     async fn initialize_datasets_accelerators(
         &self,
         datasets: &[Arc<Dataset>],
-    ) -> (Vec<Arc<Dataset>>, HashSet<TableReference>) {
+    ) -> HashMap<TableReference, Result<BootstrapStatus>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        let mut initialized_datasets = vec![];
-        let mut bootstrapped_datasets = HashSet::new();
+        let mut init_results = HashMap::new();
+
         for ds in datasets {
             // Non-accelerated datasets or disabled acceleration are always successfully initialized
             if ds.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
-                initialized_datasets.push(Arc::clone(ds));
+                init_results.insert(ds.name.clone(), Ok(BootstrapStatus::None));
                 continue;
             }
 
@@ -864,6 +891,7 @@ impl Runtime {
                         .update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    init_results.insert(ds.name.clone(), Err(err));
                     continue;
                 }
             };
@@ -874,10 +902,7 @@ impl Runtime {
                 },
             ) {
                 Ok(bootstrap_status) => {
-                    if bootstrap_status.is_bootstrapped() {
-                        bootstrapped_datasets.insert(ds.name.clone());
-                    }
-                    initialized_datasets.push(Arc::clone(ds));
+                    init_results.insert(ds.name.clone(), Ok(bootstrap_status));
                 }
                 Err(err) => {
                     let ds_name = &ds.name;
@@ -885,17 +910,19 @@ impl Runtime {
                         .update_dataset(ds_name, status::ComponentStatus::Error);
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                    init_results.insert(ds.name.clone(), Err(err));
                 }
             }
         }
 
-        let snapshot_sources: Vec<Arc<dyn AccelerationSource>> = initialized_datasets
+        let initialized_datasets: Vec<Arc<dyn AccelerationSource>> = datasets
             .iter()
+            .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
             .map(|ds| ds.clone_arc())
             .collect();
-        validate_snapshot_paths(snapshot_sources).await;
+        validate_snapshot_paths(initialized_datasets).await;
 
-        (initialized_datasets, bootstrapped_datasets)
+        init_results
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
@@ -931,8 +958,8 @@ pub struct RegisterDatasetContext {
     federated_read_table: FederatedTable,
     source: String,
     accelerated_table: Option<Arc<AcceleratedTable>>,
-    /// Whether the dataset was bootstrapped from a snapshot during initialization.
-    was_bootstrapped: bool,
+    /// The bootstrap status from dataset initialization.
+    bootstrap_status: BootstrapStatus,
 }
 
 #[expect(clippy::result_large_err)]
