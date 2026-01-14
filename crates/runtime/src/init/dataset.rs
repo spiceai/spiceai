@@ -864,56 +864,58 @@ impl Runtime {
     ) -> HashMap<TableReference, Result<BootstrapStatus>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
-        let mut init_results = HashMap::new();
+        let init_futures = datasets.iter().map(|ds| {
+            let ds = Arc::clone(ds);
+            let spaced_tracer = Arc::clone(&spaced_tracer);
+            let status = Arc::clone(&self.status);
+            let accelerator_engine_registry = Arc::clone(&self.accelerator_engine_registry);
 
-        for ds in datasets {
-            // Non-accelerated datasets or disabled acceleration are always successfully initialized
-            if ds.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
-                init_results.insert(ds.name.clone(), Ok(BootstrapStatus::None));
-                continue;
-            }
-
-            let Some(acceleration_settings) = &ds.acceleration else {
-                unreachable!("acceleration is Some and enabled");
-            };
-
-            let accelerator = match self
-                .accelerator_engine_registry
-                .get_accelerator_engine(acceleration_settings.engine)
-                .await
-                .context(AcceleratorEngineNotAvailableSnafu {
-                    name: acceleration_settings.engine.to_string(),
-                }) {
-                Ok(accelerator) => accelerator,
-                Err(err) => {
-                    let ds_name = &ds.name;
-                    self.status
-                        .update_dataset(ds_name, status::ComponentStatus::Error);
-                    metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                    init_results.insert(ds.name.clone(), Err(err));
-                    continue;
+            async move {
+                // Non-accelerated datasets or disabled acceleration are always successfully initialized
+                if ds.acceleration.as_ref().is_none_or(|acc| !acc.enabled) {
+                    return (ds.name.clone(), Ok(BootstrapStatus::None));
                 }
-            };
 
-            match accelerator.init(ds.as_ref()).await.context(
-                AcceleratorInitializationFailedSnafu {
-                    name: acceleration_settings.engine.to_string(),
-                },
-            ) {
-                Ok(bootstrap_status) => {
-                    init_results.insert(ds.name.clone(), Ok(bootstrap_status));
-                }
-                Err(err) => {
-                    let ds_name = &ds.name;
-                    self.status
-                        .update_dataset(ds_name, status::ComponentStatus::Error);
-                    metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
-                    init_results.insert(ds.name.clone(), Err(err));
+                let Some(acceleration_settings) = &ds.acceleration else {
+                    unreachable!("acceleration is Some and enabled");
+                };
+
+                let accelerator = match accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+                    .context(AcceleratorEngineNotAvailableSnafu {
+                        name: acceleration_settings.engine.to_string(),
+                    }) {
+                    Ok(accelerator) => accelerator,
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status.update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                        return (ds.name.clone(), Err(err));
+                    }
+                };
+
+                match accelerator.init(ds.as_ref()).await.context(
+                    AcceleratorInitializationFailedSnafu {
+                        name: acceleration_settings.engine.to_string(),
+                    },
+                ) {
+                    Ok(bootstrap_status) => (ds.name.clone(), Ok(bootstrap_status)),
+                    Err(err) => {
+                        let ds_name = &ds.name;
+                        status.update_dataset(ds_name, status::ComponentStatus::Error);
+                        metrics::datasets::LOAD_ERROR.add(1, &[]);
+                        warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
+                        (ds.name.clone(), Err(err))
+                    }
                 }
             }
-        }
+        });
+
+        let results = join_all(init_futures).await;
+        let init_results: HashMap<TableReference, Result<BootstrapStatus>> =
+            results.into_iter().collect();
 
         let initialized_datasets: Vec<Arc<dyn AccelerationSource>> = datasets
             .iter()

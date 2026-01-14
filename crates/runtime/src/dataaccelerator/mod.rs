@@ -616,7 +616,7 @@ pub enum BootstrapStatus {
 }
 
 impl BootstrapStatus {
-    #[must_use] 
+    #[must_use]
     pub fn is_bootstrapped(&self) -> bool {
         matches!(self, BootstrapStatus::Bootstrapped)
     }
