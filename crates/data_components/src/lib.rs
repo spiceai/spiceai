@@ -41,9 +41,8 @@ pub mod flightsql;
 pub mod iceberg;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
-// TODO: Re-enable after mongodb support is added to datafusion-table-providers spiceai branch
-// #[cfg(feature = "mongodb")]
-// pub mod mongodb;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 #[cfg(feature = "mssql")]
 pub mod mssql;
 #[cfg(feature = "mysql")]
