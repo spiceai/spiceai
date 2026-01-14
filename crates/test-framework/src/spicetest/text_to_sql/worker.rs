@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -111,7 +110,6 @@ pub(crate) struct TextToSqlWorker {
     http_base_url: String,
     spice_client: spiceai::Client,
     request_rx: Receiver<TextToSqlRequest>,
-    total_requests: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TextToSqlWorker {
@@ -121,7 +119,6 @@ impl TextToSqlWorker {
         http_base_url: impl Into<String>,
         spice_client: spiceai::Client,
         request_rx: Receiver<TextToSqlRequest>,
-        total_requests: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         Self {
             id,
@@ -129,7 +126,6 @@ impl TextToSqlWorker {
             http_base_url: http_base_url.into(),
             spice_client,
             request_rx,
-            total_requests,
         }
     }
 
@@ -184,10 +180,7 @@ impl TextToSqlWorker {
                 );
 
                 processed_count += 1;
-                let total = self
-                    .total_requests
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if processed_count % 10 == 0 || processed_count == total {
+                if processed_count % 10 == 0 {
                     println!(
                         "[TextToSqlWorker-{}]: processed {processed_count} requests",
                         self.id

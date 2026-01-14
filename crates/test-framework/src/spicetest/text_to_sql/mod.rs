@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+use std::{collections::BTreeMap, time::SystemTime};
 
 use crate::metrics::{MetricCollector, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms};
 use anyhow::{Context, Result};
@@ -88,19 +88,20 @@ impl SpiceTest<NotStarted> {
         }
 
         let requests = self.state.config.requests;
-        let total_requests = Arc::new(std::sync::atomic::AtomicUsize::new(requests.len()));
 
-        // Create a shared channel for work distribution - faster workers pull more work
-        let (tx, rx) = async_channel::bounded::<TextToSqlRequest>(requests.len().max(1));
+        // Use a smaller buffer to limit memory usage - workers pull concurrently
+        let buffer_size = (self.state.parallel_count * 2).max(1);
+        let (tx, rx) = async_channel::bounded::<TextToSqlRequest>(buffer_size);
 
-        // Send all requests to the channel
-        for request in requests {
-            tx.send(request)
-                .await
-                .context("Failed to send request to channel")?;
-        }
-        // Close the sender to signal no more work
-        tx.close();
+        // Add tasks to channel.
+        tokio::spawn(async move {
+            for request in requests {
+                if let Err(e) = tx.send(request).await {
+                    eprintln!("Failed to send request to workers: {e}");
+                    break;
+                }
+            }
+        });
 
         // Create workers, each pulling from the shared channel
         let mut workers = Vec::with_capacity(self.state.parallel_count);
@@ -113,15 +114,8 @@ impl SpiceTest<NotStarted> {
             let http_base_url = spiced_instance.http_base_url().to_string();
 
             workers.push(
-                TextToSqlWorker::new(
-                    id,
-                    http_client,
-                    http_base_url,
-                    spice_client,
-                    rx.clone(),
-                    Arc::clone(&total_requests),
-                )
-                .start(),
+                TextToSqlWorker::new(id, http_client, http_base_url, spice_client, rx.clone())
+                    .start(),
             );
         }
 
