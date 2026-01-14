@@ -212,19 +212,13 @@ impl CacheRefreshHelper {
         // Collect all stale rows from accelerator
         let stale_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
 
-        // Extract filter sets from all stale rows
-        let mut filter_sets: Vec<Vec<Expr>> = Vec::new();
-        for batch in &stale_batches {
-            for row_idx in 0..batch.num_rows() {
-                let row_filters = Self::extract_filters_from_row(batch, row_idx)?;
-                filter_sets.push(row_filters);
-            }
-        }
+        // Extract unique filter sets from stale rows
+        let filter_sets = Self::extract_unique_filter_sets(&stale_batches)?;
 
+        let total_stale_rows: usize = stale_batches.iter().map(RecordBatch::num_rows).sum();
         tracing::debug!(
-            "Found {} stale rows to refresh for dataset {}",
-            filter_sets.len(),
-            dataset_name
+            "Found {total_stale_rows} stale rows ({} unique filter sets) to refresh for dataset {dataset_name}",
+            filter_sets.len()
         );
 
         if filter_sets.is_empty() {
@@ -330,6 +324,29 @@ impl CacheRefreshHelper {
             filters.len()
         );
         Ok(filters)
+    }
+
+    /// Extract unique filter sets from batches, deduplicating rows with identical
+    /// `(request_path, request_query, request_body)` values.
+    ///
+    /// This is needed because HTTP connector JSON array responses are stored as multiple rows
+    /// with identical request parameters. Without deduplication, refreshing N rows from the
+    /// same JSON array would trigger N identical HTTP requests.
+    fn extract_unique_filter_sets(batches: &[RecordBatch]) -> DataFusionResult<Vec<Vec<Expr>>> {
+        let mut seen_filter_keys = std::collections::HashSet::new();
+        let mut filter_sets: Vec<Vec<Expr>> = Vec::new();
+
+        for batch in batches {
+            for row_idx in 0..batch.num_rows() {
+                let row_filters = Self::extract_filters_from_row(batch, row_idx)?;
+                let cache_key = compute_cache_key_from_filters(&row_filters);
+                if seen_filter_keys.insert(cache_key) {
+                    filter_sets.push(row_filters);
+                }
+            }
+        }
+
+        Ok(filter_sets)
     }
 
     /// Overwrite the data in the accelerator with the provided batches
@@ -1766,6 +1783,67 @@ mod tests {
             freshness,
             CacheFreshness::Fresh,
             "Empty batches should be considered fresh (nothing to check)"
+        );
+    }
+
+    /// Test that `extract_unique_filter_sets` correctly deduplicates rows with identical
+    /// (`request_path`, `request_query`, `request_body`) values from actual `RecordBatches`.
+    #[test]
+    fn test_extract_unique_filter_sets() {
+        use arrow::array::StringBuilder;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // Create a schema with request columns (simulating HTTP connector cache)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+            Field::new("data", DataType::Utf8, true), // Simulated response data column
+        ]));
+
+        // Build arrays - simulating 5 rows from a JSON array (same request params)
+        // plus 1 row from a different request
+        let mut path_builder = StringBuilder::new();
+        let mut query_builder = StringBuilder::new();
+        let mut body_builder = StringBuilder::new();
+        let mut data_builder = StringBuilder::new();
+
+        // 5 rows with identical request params (like JSON array elements)
+        for i in 0..5 {
+            path_builder.append_value("/api/people");
+            query_builder.append_value("search=luke");
+            body_builder.append_value("");
+            data_builder.append_value(format!("person_{i}"));
+        }
+
+        // 1 row with different request params
+        path_builder.append_value("/api/shows");
+        query_builder.append_value("search=breaking");
+        body_builder.append_value("");
+        data_builder.append_value("show_1");
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(path_builder.finish()),
+                Arc::new(query_builder.finish()),
+                Arc::new(body_builder.finish()),
+                Arc::new(data_builder.finish()),
+            ],
+        )
+        .expect("Should create batch");
+
+        assert_eq!(batch.num_rows(), 6, "Should have 6 rows total");
+
+        // Extract unique filter sets
+        let filter_sets = CacheRefreshHelper::extract_unique_filter_sets(&[batch])
+            .expect("Should extract filter sets");
+
+        // Should only have 2 unique filter sets (5 duplicates + 1 unique)
+        assert_eq!(
+            filter_sets.len(),
+            2,
+            "Should deduplicate 5 identical rows + 1 different row into 2 filter sets"
         );
     }
 }
