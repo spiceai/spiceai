@@ -174,8 +174,8 @@ impl SpiceTest<Completed> {
     pub fn get_run_metrics(&self) -> Result<TextToSqlRunMetric> {
         #[expect(clippy::cast_precision_loss)]
         Ok(TextToSqlRunMetric::new(
-            1000.0 * self.percentile(|result| result.latency_ms, 95.0),
-            1000.0 * self.percentile(|result| result.latency_ms, 50.0),
+            self.percentile(|result| result.latency_ms, 95.0),
+            self.percentile(|result| result.latency_ms, 50.0),
             self.mean(|result| result.generated_sql.trim() == result.expected_sql.trim()),
             self.mean(|result| result.is_error),
             self.mean(|result| result.sql_query_count as f64),
