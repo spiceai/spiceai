@@ -1787,7 +1787,7 @@ mod tests {
     }
 
     /// Test that `extract_unique_filter_sets` correctly deduplicates rows with identical
-    /// (request_path, request_query, request_body) values from actual RecordBatches.
+    /// (`request_path`, `request_query`, `request_body`) values from actual `RecordBatches`.
     #[test]
     fn test_extract_unique_filter_sets() {
         use arrow::array::StringBuilder;
