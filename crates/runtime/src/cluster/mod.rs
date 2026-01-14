@@ -71,9 +71,6 @@ use x509_certificate::CapturedX509Certificate;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-type SchedulerEndpointOverride =
-    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
-
 struct SchedulerPollHandle {
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
@@ -863,7 +860,7 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    let (tx_ready, rx_ready) = oneshot::channel::<String>();
+    let (tx_ready, _rx_ready) = oneshot::channel::<String>();
     let readiness_sender = Arc::new(Mutex::new(Some(tx_ready)));
 
     let scheduler_url_for_manager = scheduler_url.clone();
