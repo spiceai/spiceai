@@ -868,7 +868,8 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
                 vec![(
                     "allowed_request_paths".to_string(),
                     "/search/people".to_string(),
-                )]
+                ),
+                 ("request_query_filters".to_string(), "enabled".to_string()),]
                 .into_iter()
                 .collect(),
             ));
@@ -903,7 +904,27 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&status).await;
 
-            // Query without filters - should still cache based on request metadata
+            // Query empty cache - should return no rows
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .limit(0, Some(1))?;
+            let empty_batches = df.collect().await?;
+            let empty_row_count: usize = empty_batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+            assert_eq!(empty_row_count, 0, "Empty cache should return no rows");
+
+            // Populate the cache with a filtered query
+            let sql = "SELECT * FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=test'";
+            let df = status.datafusion().ctx.sql(sql).await?;
+            let initial_batches = df.collect().await?;
+            assert!(
+                !initial_batches.is_empty(),
+                "Should have results from HTTP request"
+            );
+
+            // Query cache again - should now return cached data
             let df = status
                 .datafusion()
                 .ctx
