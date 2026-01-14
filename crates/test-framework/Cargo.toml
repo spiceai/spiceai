@@ -13,6 +13,7 @@ anyhow.workspace = true
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
 arrow-json.workspace = true
+async-channel = "2.3"
 async-openai.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
