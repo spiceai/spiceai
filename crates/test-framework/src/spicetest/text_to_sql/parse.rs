@@ -20,15 +20,15 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;
 
-// Logical plan by running `EXPLAIN FORMAT PGJSON <sql>` against `v1/sql`.
+// Fetches the logical plan by running `EXPLAIN FORMAT PGJSON <sql>` against `v1/sql`.
 //
-// Return is in PGJSON format.
+// Returns the logical plan in PGJSON format.
 pub async fn logical_plan(
     http_client: Client,
-    http_base_url: impl Into<String>,
+    http_base_url: &str,
     sql: &str,
 ) -> Result<Value, anyhow::Error> {
-    let url = format!("{}/v1/sql", http_base_url.into());
+    let url = format!("{http_base_url}/v1/sql");
 
     let response = http_client
         .post(&url)
@@ -50,7 +50,7 @@ pub async fn logical_plan(
         .and_then(|v| v.get("Plan"))
         .ok_or_else(|| anyhow::anyhow!("Failed to extract Plan from response"))?;
 
-    Ok(root_plan.clone())
+    Ok(root_plan)
 }
 
 pub fn extract_tables_and_projection(
@@ -99,10 +99,10 @@ fn extract_table_scans(
 /// Attempts to use more efficient SQL with equivalent outputs.
 pub async fn sql_schema(
     http_client: Client,
-    http_base_url: impl Into<String>,
+    http_base_url: &str,
     sql: &str,
 ) -> Result<Schema, anyhow::Error> {
-    let url = format!("{}/v1/sql", http_base_url.into());
+    let url = format!("{http_base_url}/v1/sql");
 
     let response = http_client
         .post(&url)
@@ -112,14 +112,14 @@ pub async fn sql_schema(
         .send()
         .await?;
 
-    let json: Value = response.json().await?;
-    let Some(schema) = json.get("schema") else {
+    let mut json: Value = response.json().await?;
+    let Some(schema) = json.get_mut("schema") else {
         return Err(anyhow::anyhow!("Failed to extract schema from response"));
     };
-    let Some(f) = schema.get("fields") else {
+    let Some(f) = schema.get_mut("fields") else {
         return Err(anyhow::anyhow!("Failed to extract fields from schema"));
     };
-    let fields: Vec<Field> = serde_json::from_value(f.clone())
+    let fields: Vec<Field> = serde_json::from_value(f.take())
         .map_err(|e| anyhow::anyhow!("Failed to deserialize fields from schema: {e}"))?;
     Ok(Schema::new(fields))
 }

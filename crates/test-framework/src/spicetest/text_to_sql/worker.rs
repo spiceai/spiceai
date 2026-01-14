@@ -151,7 +151,7 @@ impl TextToSqlWorker {
                     Some(schema) => Some(schema),
                     None => sql_schema(
                         self.http_client.clone(),
-                        self.http_base_url.clone(),
+                        &self.http_base_url,
                         &generated_sql,
                     )
                     .await
@@ -160,7 +160,7 @@ impl TextToSqlWorker {
 
                 let generated_logical_plan = logical_plan(
                     self.http_client.clone(),
-                    self.http_base_url.clone(),
+                    &self.http_base_url,
                     &generated_sql,
                 )
                 .await
@@ -169,19 +169,19 @@ impl TextToSqlWorker {
                 // Calculate expected schema & logical plan if absent.
                 let expected_schema = sql_schema(
                     self.http_client.clone(),
-                    self.http_base_url.clone(),
+                    &self.http_base_url,
                     &request.expected_sql,
                 )
                 .await?;
 
                 let expected_logical_plan = logical_plan(
                     self.http_client.clone(),
-                    self.http_base_url.clone(),
+                    &self.http_base_url,
                     &request.expected_sql,
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!("could not compute generated logical plan. Error: {e}")
+                    anyhow::anyhow!("could not compute expected logical plan. Error: {e}")
                 })?;
 
                 results.insert(
