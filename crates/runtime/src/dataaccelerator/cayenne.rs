@@ -54,7 +54,7 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior};
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -1753,11 +1753,10 @@ impl DataAccelerator for CayenneAccelerator {
 
             // Validate that snapshots are not enabled
             if !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: false' or remove the snapshots configuration",
-                    ),
-                }));
+                tracing::warn!(
+                    "Dataset {}: Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: disabled' or remove the snapshots configuration",
+                    source.name()
+                );
             }
         }
 
@@ -1868,7 +1867,13 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            download_snapshot_if_needed(acceleration, source, path_buf).await;
+            download_snapshot_if_needed(
+                acceleration,
+                source,
+                path_buf,
+                AccelerationEngine::Cayenne,
+            )
+            .await;
         }
 
         Ok(())
