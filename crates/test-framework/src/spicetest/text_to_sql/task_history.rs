@@ -21,6 +21,7 @@ use tokio::time::sleep;
 use anyhow::Result;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
+use opentelemetry::trace::TraceId;
 
 /// Metrics from `runtime.task_history` for a `nsql` operation.
 #[derive(Debug, Clone)]
@@ -33,28 +34,21 @@ pub(crate) struct TaskHistoryMetrics {
     pub llm_output_tokens: u64,
 }
 
-/// Fetches metrics from `runtime.task_history` for the most recent nsql operation.
+/// Fetches metrics from `runtime.task_history` for an nsql operation with the given `trace_id`.
 ///
 /// Returns: `(generated_sql, task_history_metrics)`
 pub(super) async fn find_task_history_metrics(
     spice_client: &spiceai::Client,
+    trace_id: &TraceId,
 ) -> Result<(Option<String>, TaskHistoryMetrics)> {
-    let data = retry_query_expecting_results(
-        spice_client,
+    let query = format!(
         "
-WITH latest_nsql AS (
-    SELECT trace_id
-    FROM runtime.task_history
-    WHERE task = 'nsql'
-    ORDER BY start_time DESC
-    LIMIT 1
-),
-sql_stats AS (
+WITH sql_stats AS (
     SELECT
         COUNT(*) AS sql_count,
         COALESCE(SUM(execution_duration_ms), 0) AS sql_duration_ms
     FROM runtime.task_history
-    WHERE trace_id = (SELECT trace_id FROM latest_nsql)
+    WHERE trace_id = '{trace_id}'
       AND task = 'sql_query'
 ),
 llm_stats AS (
@@ -64,13 +58,13 @@ llm_stats AS (
         SUM(CAST(COALESCE(labels['prompt_tokens'], '0') AS BIGINT)) AS llm_input_tokens,
         SUM(CAST(COALESCE(labels['completion_tokens'], '0') AS BIGINT)) AS llm_output_tokens
     FROM runtime.task_history
-    WHERE trace_id = (SELECT trace_id FROM latest_nsql)
+    WHERE trace_id = '{trace_id}'
       AND task = 'ai_completion'
 ),
 last_sql AS (
     SELECT COALESCE(input, '')  AS generated_sql
     FROM runtime.task_history
-    WHERE trace_id = (SELECT trace_id FROM latest_nsql)
+    WHERE trace_id = '{trace_id}'
       AND task = 'sql_query'
     ORDER BY end_time DESC
     LIMIT 1
@@ -86,10 +80,9 @@ SELECT
 FROM sql_stats s
 LEFT JOIN last_sql ls ON 1=1
 LEFT JOIN llm_stats l ON 1=1
-",
-        Duration::from_secs(15),
-    )
-    .await;
+"
+    );
+    let data = retry_query_expecting_results(spice_client, &query, Duration::from_secs(15)).await;
 
     let Some(rb) = data.as_ref().and_then(|s| s.first()) else {
         return Err(anyhow::anyhow!(

@@ -296,11 +296,11 @@ url = "2.5"
 util = { path = "crates/util" }
 uuid = "1"
 # We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
-vortex = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
-vortex-array = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
-vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
-vortex-session = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
-vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "96950b8c250e7409bca5cd7cb723e10d9db37785" }
+vortex = { git = "https://github.com/spiceai/vortex", rev = "f258e7b427377084f9f1f6c4d5f271be04522c5d" }
+vortex-array = { git = "https://github.com/spiceai/vortex", rev = "f258e7b427377084f9f1f6c4d5f271be04522c5d" }
+vortex-datafusion = { git = "https://github.com/spiceai/vortex", rev = "f258e7b427377084f9f1f6c4d5f271be04522c5d" }
+vortex-session = { git = "https://github.com/spiceai/vortex", rev = "f258e7b427377084f9f1f6c4d5f271be04522c5d" }
+vortex-utils = { git = "https://github.com/spiceai/vortex", rev = "f258e7b427377084f9f1f6c4d5f271be04522c5d" }
 x509-certificate = "0.25.0"
 # TODO: Switch to official crate once spice-rs is released
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "0ca5a48dae189bc4297350cba7265e9c6036188b" }
