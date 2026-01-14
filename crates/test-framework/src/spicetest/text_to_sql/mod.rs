@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, time::SystemTime};
+use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
 use crate::metrics::{MetricCollector, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms};
 use anyhow::{Context, Result};
@@ -30,17 +30,27 @@ mod task_history;
 #[derive(Default)]
 pub struct NotStarted {
     config: TextToSqlConfig,
+    parallel_count: usize,
 }
 
 impl NotStarted {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            config: TextToSqlConfig::default(),
+            parallel_count: 1,
+        }
     }
 
     #[must_use]
     pub fn with_config(mut self, config: TextToSqlConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_parallel_count(mut self, parallel_count: usize) -> Self {
+        self.parallel_count = parallel_count;
         self
     }
 }
@@ -72,12 +82,48 @@ impl SpiceTest<NotStarted> {
             .spiced_instance
             .as_ref()
             .context("Spiced instance should be present")?;
-        let spice_client = spiced_instance
-            .spice_client(self.api_key.clone(), true)
-            .await
-            .context("Failed to create Spice client")?;
-        let http_client = spiced_instance.http_client()?;
-        let http_base_url = spiced_instance.http_base_url().to_string();
+
+        if self.state.parallel_count == 0 {
+            return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
+        }
+
+        let requests = self.state.config.requests;
+        let total_requests = Arc::new(std::sync::atomic::AtomicUsize::new(requests.len()));
+
+        // Create a shared channel for work distribution - faster workers pull more work
+        let (tx, rx) = async_channel::bounded::<TextToSqlRequest>(requests.len().max(1));
+
+        // Send all requests to the channel
+        for request in requests {
+            tx.send(request)
+                .await
+                .context("Failed to send request to channel")?;
+        }
+        // Close the sender to signal no more work
+        tx.close();
+
+        // Create workers, each pulling from the shared channel
+        let mut workers = Vec::with_capacity(self.state.parallel_count);
+        for id in 0..self.state.parallel_count {
+            let spice_client = spiced_instance
+                .spice_client(self.api_key.clone(), true)
+                .await
+                .context("Failed to create Spice client")?;
+            let http_client = spiced_instance.http_client()?;
+            let http_base_url = spiced_instance.http_base_url().to_string();
+
+            workers.push(
+                TextToSqlWorker::new(
+                    id,
+                    http_client,
+                    http_base_url,
+                    spice_client,
+                    rx.clone(),
+                    Arc::clone(&total_requests),
+                )
+                .start(),
+            );
+        }
 
         Ok(SpiceTest {
             name: self.name,
@@ -87,17 +133,7 @@ impl SpiceTest<NotStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
-            state: Running {
-                workers: vec![
-                    TextToSqlWorker::new(
-                        http_client,
-                        http_base_url,
-                        spice_client,
-                        self.state.config,
-                    )
-                    .start(),
-                ],
-            },
+            state: Running { workers },
         })
     }
 }
