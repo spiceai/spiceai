@@ -29,7 +29,7 @@ use super::delete::{
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::deletion::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
-use crate::metadata::{CompressionStrategy, CreateTableOptions, TableMetadata};
+use crate::metadata::{CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
@@ -37,6 +37,7 @@ use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionTableProvider};
+use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -64,11 +65,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::task;
-use vortex::compressor::CompactCompressor;
-use vortex::file::WriteStrategyBuilder;
-use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormat;
-use vortex_session::VortexSession;
+
+use super::context::CayenneContext;
 
 /// Extension trait to extract `UpsertOptions` from `OnConflict`.
 ///
@@ -127,8 +126,10 @@ pub struct CayenneTableProvider {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
-    /// Vortex encoding configuration for hardware-accelerated compression
-    vortex_config: crate::metadata::VortexConfig,
+    /// Context containing Vortex format with caches and configuration.
+    /// If the same context is reused across multiple instances, all internal operations
+    /// share the same footer and segment caches, enabling shared memory management.
+    context: Arc<CayenneContext>,
     /// Cached deletion vectors (deleted row IDs) for position-based deletion.
     /// Used for tables WITHOUT a primary key.
     ///
@@ -232,6 +233,7 @@ pub struct CayenneTableProviderBuilder {
     catalog: Arc<dyn MetadataCatalog>,
     retention_filters: Vec<Expr>,
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    context: Option<Arc<CayenneContext>>,
 }
 
 impl CayenneTableProviderBuilder {
@@ -242,6 +244,7 @@ impl CayenneTableProviderBuilder {
             catalog,
             retention_filters: Vec::new(),
             object_store_config: None,
+            context: None,
         }
     }
 
@@ -265,6 +268,16 @@ impl CayenneTableProviderBuilder {
         self
     }
 
+    /// Set a shared [`CayenneContext`] for this table provider.
+    ///
+    /// Use this to share a single context (with caches) across multiple table providers
+    /// This avoids creating separate caches per partition
+    #[must_use]
+    pub fn with_context(mut self, context: Arc<CayenneContext>) -> Self {
+        self.context = Some(context);
+        self
+    }
+
     /// Open an existing table by name.
     ///
     /// # Errors
@@ -277,6 +290,7 @@ impl CayenneTableProviderBuilder {
             self.catalog,
             self.retention_filters,
             self.object_store_config,
+            self.context,
         )
         .await
     }
@@ -294,6 +308,7 @@ impl CayenneTableProviderBuilder {
             self.catalog,
             self.retention_filters,
             self.object_store_config,
+            self.context,
         )
         .await
     }
@@ -507,7 +522,7 @@ impl CayenneTableProvider {
     ///
     /// * `snapshot_dir_url` - URL string for the snapshot directory (local path or S3 URL)
     /// * `schema` - Arrow schema for the table
-    /// * `vortex_config` - Vortex encoding configuration
+    /// * `vortex_format` - Vortex format
     ///
     /// # Errors
     ///
@@ -515,7 +530,7 @@ impl CayenneTableProvider {
     fn create_listing_table(
         snapshot_dir_url: &str,
         schema: SchemaRef,
-        vortex_config: &crate::metadata::VortexConfig,
+        vortex_format: &Arc<VortexFormat>,
     ) -> CatalogResult<Arc<ListingTable>> {
         let table_url = ListingTableUrl::parse(snapshot_dir_url).map_err(|e| {
             CatalogError::InvalidOperation {
@@ -524,7 +539,7 @@ impl CayenneTableProvider {
             }
         })?;
 
-        let listing_options = Self::create_listing_options(vortex_config);
+        let listing_options = Self::create_listing_options(vortex_format);
 
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
@@ -539,29 +554,10 @@ impl CayenneTableProvider {
         Ok(Arc::new(listing_table))
     }
 
-    /// Create listing options for Vortex format with the given configuration.
-    fn create_listing_options(vortex_config: &crate::metadata::VortexConfig) -> ListingOptions {
-        // Create a configured Vortex session with selected encodings
-        let vortex_session = VortexSession::default();
-
-        let vortex_session = if matches!(
-            vortex_config.compression_strategy,
-            CompressionStrategy::Zstd
-        ) {
-            vortex_session
-                .set(WriteStrategyBuilder::new().with_compressor(CompactCompressor::default()))
-        } else {
-            vortex_session
-        };
-
-        // Configure VortexFormat with hardware-optimized settings
-        let vortex_opts = vortex_datafusion::VortexOptions {
-            footer_cache_size_mb: vortex_config.footer_cache_mb,
-            segment_cache_size_mb: vortex_config.segment_cache_mb,
-        };
-
-        let format = Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts));
-        ListingOptions::new(format).with_session_config_options(&SessionConfig::default())
+    /// Create listing options for Vortex format.
+    fn create_listing_options(vortex_format: &Arc<VortexFormat>) -> ListingOptions {
+        ListingOptions::new(Arc::clone(vortex_format) as Arc<dyn FileFormat>)
+            .with_session_config_options(&SessionConfig::default())
     }
 
     /// Construct the snapshot directory URL string.
@@ -765,6 +761,7 @@ impl CayenneTableProvider {
         catalog: Arc<dyn MetadataCatalog>,
         retention_filters: Vec<Expr>,
         object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+        context: Option<Arc<CayenneContext>>,
     ) -> CatalogResult<Self> {
         let table_metadata = catalog.get_table(table_name).await?;
 
@@ -786,12 +783,13 @@ impl CayenneTableProvider {
             &table_metadata.current_snapshot_id,
         );
 
-        let vortex_config = table_metadata.vortex_config.clone();
+        // Use provided context or create a new one from table metadata config
+        let context = context.unwrap_or_else(|| CayenneContext::new(&table_metadata.vortex_config));
 
         let listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
-            &vortex_config,
+            context.file_format(),
         )?;
 
         // Determine if this table has a primary key for key-based deletion
@@ -879,7 +877,7 @@ impl CayenneTableProvider {
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
             retention_filters,
-            vortex_config,
+            context,
             // Wrap in Arc for zero-copy sharing across concurrent scans
             cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(deleted_row_ids))),
             cached_deleted_pk_i64: Arc::new(RwLock::new(Arc::new(deleted_pk_i64))),
@@ -1070,7 +1068,7 @@ impl CayenneTableProvider {
                 .await;
         }
 
-        let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
+        let target_size_bytes = self.context.target_file_size_bytes();
 
         // If a primary key is configured, enforce on_conflict behavior by materializing
         // the incoming stream, validating keys, and preparing deletion vectors.
@@ -1168,7 +1166,7 @@ impl CayenneTableProvider {
         // - Streaming external merge sort for efficient memory usage
         // - SIMD-optimized kernels (NEON on arm64, AVX2/AVX-512 on amd64)
         // - Configurable compression for spill files (zstd, lz4_frame, uncompressed)
-        if !self.vortex_config.sort_columns.is_empty() {
+        if self.context.has_sort_columns() {
             self.sort_and_rewrite_data(target_size_bytes).await?;
         }
 
@@ -1196,7 +1194,7 @@ impl CayenneTableProvider {
         stream: SendableRecordBatchStream,
         sequence_number: i64,
     ) -> CatalogResult<u64> {
-        let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
+        let target_size_bytes = self.context.target_file_size_bytes();
 
         // Generate a new snapshot ID
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -1274,7 +1272,7 @@ impl CayenneTableProvider {
     fn create_multi_path_listing_table(
         urls: &[&str],
         schema: SchemaRef,
-        vortex_config: &crate::metadata::VortexConfig,
+        vortex_format: &Arc<VortexFormat>,
     ) -> CatalogResult<Arc<ListingTable>> {
         let listing_urls: Vec<ListingTableUrl> = urls
             .iter()
@@ -1286,7 +1284,7 @@ impl CayenneTableProvider {
             })
             .collect::<CatalogResult<Vec<_>>>()?;
 
-        let listing_options = Self::create_listing_options(vortex_config);
+        let listing_options = Self::create_listing_options(vortex_format);
         let config = ListingTableConfig::new_with_multi_paths(listing_urls)
             .with_listing_options(listing_options)
             .with_schema(schema);
@@ -1560,7 +1558,7 @@ impl CayenneTableProvider {
         let snapshot_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             Arc::clone(&self.table_metadata.schema),
-            &self.vortex_config,
+            self.context.file_format(),
         )?;
 
         // Bounded parallelism: max 4 concurrent writes to avoid overwhelming I/O
@@ -1816,7 +1814,7 @@ impl CayenneTableProvider {
             table_metadata: self.table_metadata.clone(),
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
-            vortex_config: self.vortex_config.clone(),
+            context: Arc::clone(&self.context),
             retention_filters: Vec::new(), // Applied once after all chunks complete, not per-chunk
             cached_deleted_row_ids: Arc::clone(&self.cached_deleted_row_ids),
             cached_deleted_pk_i64: Arc::clone(&self.cached_deleted_pk_i64),
@@ -2595,13 +2593,13 @@ impl CayenneTableProvider {
 
         tracing::debug!(
             "Sorting refresh data by columns {:?} for table {} using DataFusion SortExec with disk spilling support",
-            self.vortex_config.sort_columns,
+            self.context.sort_columns(),
             self.table_metadata.table_name
         );
 
         // Use the common stream sorting utility
         let sorted_stream =
-            util::stream_utils::sort_stream(stream, &self.vortex_config.sort_columns, &task_ctx)
+            util::stream_utils::sort_stream(stream, self.context.sort_columns(), &task_ctx)
                 .map_err(|e| CatalogError::InvalidOperation {
                     message: "Failed to execute sort.".to_string(),
                     source: Box::new(e),
@@ -2627,7 +2625,7 @@ impl CayenneTableProvider {
         tracing::info!(
             "Sorting and rewriting data for table {} by columns {:?}",
             self.table_metadata.table_name,
-            self.vortex_config.sort_columns
+            self.context.sort_columns()
         );
 
         // Read all data from the current listing table
@@ -3412,7 +3410,7 @@ impl CayenneTableProvider {
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             Arc::clone(&self.table_metadata.schema),
-            &self.vortex_config,
+            self.context.file_format(),
         )
         .map_err(|e| {
             datafusion_common::DataFusionError::Execution(format!(
@@ -3708,7 +3706,7 @@ impl CayenneTableProvider {
         }
 
         // Write all batches to new snapshot
-        let target_size_bytes = self.vortex_config.target_vortex_file_size_mb * 1024 * 1024;
+        let target_size_bytes = self.context.target_file_size_bytes();
 
         // Create a stream from the batches
         let schema = Arc::clone(&self.table_metadata.schema);
@@ -3745,7 +3743,7 @@ impl CayenneTableProvider {
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             Arc::clone(&self.table_metadata.schema),
-            &self.vortex_config,
+            self.context.file_format(),
         )?;
 
         // Atomically update the catalog snapshot and clear delete files.
@@ -3860,7 +3858,7 @@ impl CayenneTableProvider {
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
-            &self.vortex_config,
+            self.context.file_format(),
         )?;
 
         // Update the listing table with write lock
@@ -4229,7 +4227,7 @@ impl CayenneTableProvider {
             let listing_table = Self::create_listing_table(
                 &snapshot_url,
                 Arc::clone(&self.table_metadata.schema),
-                &self.vortex_config,
+                self.context.file_format(),
             )
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -4806,7 +4804,7 @@ impl TableProvider for CayenneTableProvider {
             let new_listing_table = Self::create_listing_table(
                 &snapshot_dir_url,
                 Arc::clone(&self.table_metadata.schema),
-                &self.vortex_config,
+                self.context.file_format(),
             )
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -5168,7 +5166,7 @@ impl DeletionTableProvider for CayenneTableProvider {
                 let listing_table = Self::create_listing_table(
                     &snapshot_url,
                     Arc::clone(&self.table_metadata.schema),
-                    &self.vortex_config,
+                    self.context.file_format(),
                 )
                 .map_err(|e| {
                     datafusion_common::DataFusionError::Execution(format!(

@@ -20,6 +20,9 @@ use std::{
 };
 
 use anyhow::Result;
+use async_channel::Receiver;
+use opentelemetry::trace::TraceId;
+use rand::RngCore;
 use reqwest::Client;
 use serde_json::json;
 use tokio::task::JoinHandle;
@@ -102,40 +105,44 @@ pub struct TextToSqlResult {
 }
 
 pub(crate) struct TextToSqlWorker {
+    id: usize,
     http_client: Client,
     http_base_url: String,
     spice_client: spiceai::Client,
-    config: TextToSqlConfig,
+    request_rx: Receiver<TextToSqlRequest>,
 }
 
 impl TextToSqlWorker {
     pub fn new(
+        id: usize,
         http_client: Client,
         http_base_url: impl Into<String>,
         spice_client: spiceai::Client,
-        config: TextToSqlConfig,
+        request_rx: Receiver<TextToSqlRequest>,
     ) -> Self {
         Self {
+            id,
             http_client,
             http_base_url: http_base_url.into(),
             spice_client,
-            config,
+            request_rx,
         }
     }
 
     pub fn start(self) -> JoinHandle<Result<TextToSqlWorkerResult>> {
         tokio::spawn(async move {
             let mut results: BTreeMap<String, TextToSqlResult> = BTreeMap::new();
-            let total_requests = self.config.requests.len();
-            let mut last_progress_time = Instant::now();
+            let mut processed_count = 0usize;
 
-            println!("[TextToSqlWorker] STARTED, {total_requests} remaining");
-
-            for (index, request) in self.config.requests.into_iter().enumerate() {
+            while let Ok(request) = self.request_rx.recv().await {
                 let start = Instant::now();
                 let mut is_error = false;
                 let mut generated_sql: Option<String> = None;
-                match nsql_request(&self.http_client, &self.http_base_url, &request).await {
+
+                let trace_id = random_trace_id();
+                match nsql_request(&self.http_client, &self.http_base_url, &request, &trace_id)
+                    .await
+                {
                     Ok(sql) if request.return_sql => {
                         generated_sql = Some(sql);
                     }
@@ -147,7 +154,7 @@ impl TextToSqlWorker {
 
                 let duration = start.elapsed();
 
-                let (sql, task_metrics) = find_task_history_metrics(&self.spice_client)
+                let (sql, task_metrics) = find_task_history_metrics(&self.spice_client, &trace_id)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("could not find task history metrics. Error: {e}")
@@ -172,18 +179,19 @@ impl TextToSqlWorker {
                     },
                 );
 
-                if last_progress_time.elapsed() >= Duration::from_secs(10) {
-                    let completed = index + 1;
-                    #[expect(clippy::cast_precision_loss)]
-                    let completed_percent = (completed as f64 / total_requests as f64) * 100.0;
+                processed_count += 1;
+                if processed_count.is_multiple_of(10) {
                     println!(
-                        "[TextToSqlWorker]: {completed}/{total_requests} completed ({completed_percent:.1}%)"
+                        "[TextToSqlWorker-{}]: processed {processed_count} requests",
+                        self.id
                     );
-                    last_progress_time = Instant::now();
                 }
             }
 
-            println!("[TextToSqlWorker]: DONE, {total_requests} completed");
+            println!(
+                "[TextToSqlWorker-{}]: DONE, {processed_count} completed",
+                self.id
+            );
 
             Ok(TextToSqlWorkerResult { results })
         })
@@ -195,6 +203,7 @@ async fn nsql_request(
     client: &Client,
     http_base_url: &str,
     req: &TextToSqlRequest,
+    trace_id: &TraceId,
 ) -> Result<String, reqwest::Error> {
     let body = json!({
         "query": req.question,
@@ -212,9 +221,40 @@ async fn nsql_request(
         .post(format!("{http_base_url}/v1/nsql"))
         .header("Content-Type", "application/json")
         .header("Accept", accept_header)
+        .header("traceparent", format_traceparent(trace_id))
         .body(body.to_string())
         .send()
         .await?
         .text()
         .await
+}
+
+/// Generates a random W3C Trace ID.
+fn random_trace_id() -> TraceId {
+    let mut bytes = [0u8; 16];
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut bytes);
+
+    // Ensure the TraceId is not all zeros
+    if bytes.iter().all(|&b| b == 0) {
+        return random_trace_id();
+    }
+
+    TraceId::from_bytes(bytes)
+}
+
+/// Formats a W3C traceparent header value.
+fn format_traceparent(trace_id: &TraceId) -> String {
+    use std::fmt::Write;
+    // Format: version-traceid-parentid-flags
+    // version: 00, parentid: random 16 hex chars, flags: 01 (sampled)
+    let mut parent_bytes = [0u8; 8];
+    rand::rng().fill_bytes(&mut parent_bytes);
+    let parent_id = parent_bytes
+        .iter()
+        .fold(String::with_capacity(16), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+    format!("00-{trace_id}-{parent_id}-01")
 }

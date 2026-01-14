@@ -4,7 +4,21 @@ tests:
       benchmark_queryset: bird-bench-small[european_football2]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: european_football2
     - model_name: claude-sonnet-4-5
       benchmark_queryset: bird-bench-small[european_football2]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: european_football2
+    - model_name: grok41
+      benchmark_queryset: bird-bench-small[european_football2]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: european_football2-evidence
+      use_evidence: true
+    - model_name: claude-sonnet-4-5
+      benchmark_queryset: bird-bench-small[european_football2]
+      runner_type: spiceai-dev-runners
+      spicepod_path: test/spicepods/models/text-to-sql.yaml
+      configuration_name: european_football2-evidence
+      use_evidence: true

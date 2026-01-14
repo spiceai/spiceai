@@ -15,6 +15,10 @@ service ClusterService {
     // Expand a secret value from the scheduler's secret store.
     // Called by executors when they need to resolve secrets.
     rpc ExpandSecret(ExpandSecretRequest) returns (ExpandSecretResponse);
+
+    // Get the scheduler membership list.
+    // Called by executors during initialization.
+    rpc GetSchedulers(GetSchedulersRequest) returns (GetSchedulersResponse);
 }
 
 // Request message for GetAppDefinition RPC.
@@ -38,6 +42,20 @@ message ExpandSecretRequest {
 message ExpandSecretResponse {
     string key = 1;
     string value = 2;
+}
+
+// Request message for GetSchedulers RPC.
+message GetSchedulersRequest {}
+
+// Scheduler instance information.
+message SchedulerInstance {
+    string advertise_address = 1;
+    map<string, string> labels = 2;
+}
+
+// Response message for GetSchedulers RPC.
+message GetSchedulersResponse {
+    repeated SchedulerInstance schedulers = 1;
 }
 
 // Physical plan
