@@ -198,7 +198,7 @@ impl TextToSqlWorker {
                         request.return_sql,
                         &task_history_metrics,
                         generated_schema
-                            .map(|s| (s == expected_schema) as u8)
+                            .map(|s| u8::from(s == expected_schema))
                             .unwrap_or_default()
                             .into(),
                     )?,
@@ -278,8 +278,7 @@ async fn nsql_request(
                 ),
                 _ => None,
             })
-            .map(|f| Schema::new(f))
-            .unwrap_or(Schema::empty());
+            .map_or(Schema::empty(), Schema::new);
         Ok(NSQLResponse::Data(schema))
     }
 }
