@@ -58,8 +58,8 @@ pub use extract::{
     KeyExtractor, PrimitiveKeyExtractor, RowConverterKeyExtractor, Utf8KeyExtractor,
 };
 pub use index::{
-    HashIndex, HashIndexBuilder, RowLocation, INDEX_THRESHOLD_MULTIPLIER, hash_key,
-    hash_key_bytes, index_threshold,
+    HashIndex, HashIndexBuilder, INDEX_THRESHOLD_MULTIPLIER, RowLocation, hash_key, hash_key_bytes,
+    index_threshold,
 };
 
 use snafu::prelude::*;
