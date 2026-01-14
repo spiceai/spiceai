@@ -88,6 +88,9 @@ jobs:
           # Metal runners do not have `xcrun metal`
           # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
           MISTRALRS_METAL_PRECOMPILE: 0
+          RUSTC_WRAPPER: sccache
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           FEATURES="flightsql,models,metal,s3_vectors,kafka"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -423,9 +426,9 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  build-linux:
-    name: Build Test Binary (Linux)
-    runs-on: 'spiceai-dev-runners'
+  build-extended:
+    name: Build Test Binary (Extended)
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -448,6 +451,10 @@ jobs:
 
       # Build the test binary without running tests
       - name: Build AI integration test binary
+        env:
+          RUSTC_WRAPPER: sccache
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           FEATURES="flightsql,models,s3_vectors,kafka"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -457,20 +464,20 @@ jobs:
             echo "Excluding extended_tests"
           fi
 
-          cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration-linux.tar.zst
+          cargo nextest archive -p runtime --test integration_models --features ${FEATURES} --archive-file integration-extended.tar.zst
 
       # Upload the test archive as an artifact
       - name: Upload test archive
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
-          name: ai-integration-test-archive-linux
-          path: ./integration-linux.tar.zst
+          name: ai-integration-test-archive-extended
+          path: ./integration-extended.tar.zst
           retention-days: 1
 
   test-search:
     name: Test Search
-    needs: build-linux
-    runs-on: 'spiceai-dev-runners'
+    needs: build
+    runs-on: 'spiceai-macos'
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -485,7 +492,7 @@ jobs:
       - name: Download test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
-          name: ai-integration-test-archive-linux
+          name: ai-integration-test-archive
           path: ./integration_test
 
       - name: Set up Open.ai API Key
@@ -503,7 +510,7 @@ jobs:
             echo "Error: OpenAI API key is not defined."
             exit 1
           fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration-linux.tar.zst -- search
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
 
       - name: Push snapshots to branch
         if: github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule'

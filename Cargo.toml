@@ -349,9 +349,9 @@ datafusion-table-providers = { git = "https://github.com/datafusion-contrib/data
 
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "afcbd1ce99703f1322d176fc1b99745f647234d0" } # spiceai:spiceai-50
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "9c17685db62a1511ecf2e90aa72b19feabdea1cb" }           # spiceai:spiceai-50
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", rev = "9c17685db62a1511ecf2e90aa72b19feabdea1cb" }   # spiceai:spiceai-50
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "9c17685db62a1511ecf2e90aa72b19feabdea1cb" } # spiceai:spiceai-50
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "b9b273d45111438116a0496480c425e94f2e9ed8" }           # spiceai:spiceai-50
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", rev = "b9b273d45111438116a0496480c425e94f2e9ed8" }   # spiceai:spiceai-50
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "b9b273d45111438116a0496480c425e94f2e9ed8" } # spiceai:spiceai-50
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "8477c0ba72bc14e31bf829e0ea9b7b217b6e3e5d" } # spiceai-0.16.0
 
