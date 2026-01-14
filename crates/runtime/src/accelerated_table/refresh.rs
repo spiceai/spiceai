@@ -752,6 +752,7 @@ impl Refresher {
         let synchronize_with = self.synchronize_with.clone();
 
         let (snapshot_interval_task, create_checkpoint_snapshot_after_refresh) =
+            #[expect(clippy::match_same_arms)]
             match snapshot_trigger {
                 // This will only create checkpoint - default behavior when snapshots are not configured
                 None => (None, true),
