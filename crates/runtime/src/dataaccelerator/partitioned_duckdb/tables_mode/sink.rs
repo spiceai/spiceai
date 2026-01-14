@@ -165,7 +165,7 @@ impl DataSink for DuckDBPartitionedDataSink {
 
         let partitioner = Arc::clone(&self.partitioner);
 
-        let _upsert_options = self.upsert_options.clone();
+        let upsert_options = self.upsert_options.clone();
 
         while let Some(batch) = data.next().await {
             let batch = batch.map_err(check_and_mark_retriable_error)?;
@@ -177,13 +177,13 @@ impl DataSink for DuckDBPartitionedDataSink {
                     self.table_definition.constraints()
                 {
                     datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                        std::slice::from_ref(&batch),
+                        vec![batch],
                         constraints,
+                        &upsert_options,
                     )
                     .await
                     .context(ConstraintViolationSnafu)
-                    .map_err(to_datafusion_error)?;
-                    vec![batch]
+                    .map_err(to_datafusion_error)?
                 } else {
                     vec![batch]
                 };

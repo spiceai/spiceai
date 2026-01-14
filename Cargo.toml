@@ -150,7 +150,7 @@ datafusion-physical-plan = "51.0.0"
 datafusion-proto = { version = "51.0.0", features = ["json"] }
 datafusion-pruning = "51.0.0"
 datafusion-spark = "51.0.0"
-datafusion-table-providers = "0.9.2"
+datafusion-table-providers = "0.1.0"  # Using spiceai branch with DF51 support
 delta_kernel = { version = "0.17.0", features = [
     "default-engine-rustls",
     "arrow-57",
@@ -348,7 +348,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "7b381a37f5846820de51c993797b0c700c40d29b" }               # spiceai-51-patches
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "7b381a37f5846820de51c993797b0c700c40d29b" }                   # spiceai-51-patches
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "c4d7a7278de15533ba3252b7eb334ea63fd4f6c4" } # spiceai-51 (DF51 + spice features)
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "82ccd89d3b21231f29d0dc7ace0a94470c562a89" } # spiceai (DF51 + spice features)
 
 # spiceai-51: DF51 base + TLS, API key auth, UDF sync patches
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "94db4f96e2874fa4117b80fb7e50ec1f41f55e8e" }      # spiceai:spiceai-51 (DF51 + spice patches)

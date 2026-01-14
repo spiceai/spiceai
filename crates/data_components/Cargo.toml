@@ -130,7 +130,8 @@ dynamodb = [
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
-mongodb = ["datafusion-table-providers/mongodb"]
+# TODO: Re-enable after adding mongodb support to datafusion-table-providers fork
+# mongodb = ["datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = [
     "datafusion-table-providers/mysql",

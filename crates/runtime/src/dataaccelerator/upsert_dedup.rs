@@ -247,24 +247,31 @@ impl ExecutionPlan for UpsertDedupExec {
         let input_stream = self.input.execute(partition, context)?;
         let schema = self.schema();
         let constraints = self.constraints.clone();
-        let _upsert_options = self.upsert_options.clone();
+        let upsert_options = self.upsert_options.clone();
 
         // Create a stream that validates constraints on each batch
         // TODO: Add back deduplication logic when datafusion-table-providers upsert API is ported
         let validated_stream = input_stream.then(move |batch_result| {
             let constraints = constraints.clone();
+            let upsert_options = upsert_options.clone();
             async move {
                 let batch = batch_result?;
 
                 // Apply constraint validation
-                datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                    std::slice::from_ref(&batch),
-                    &constraints,
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let validated_batches =
+                    datafusion_table_providers::util::constraints::validate_batch_with_constraints(
+                        vec![batch],
+                        &constraints,
+                        &upsert_options,
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                Ok(batch)
+                // Return the first batch (we passed in one batch)
+                validated_batches
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| DataFusionError::Internal("Expected validated batch".to_string()))
             }
         });
 
