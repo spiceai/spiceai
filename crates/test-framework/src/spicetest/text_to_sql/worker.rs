@@ -20,12 +20,15 @@ use std::{
 };
 
 use anyhow::Result;
+use arrow::datatypes::{Field, Schema};
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use crate::spicetest::text_to_sql::{
-    TextToSqlMetric, parse::logical_plan, task_history::find_task_history_metrics,
+    TextToSqlMetric,
+    parse::{logical_plan, sql_schema},
+    task_history::find_task_history_metrics,
 };
 
 #[derive(Debug, Clone)]
@@ -119,11 +122,15 @@ impl TextToSqlWorker {
                 let start = Instant::now();
                 let mut is_error = false;
                 let mut generated_sql_opt: Option<String> = None;
+                let mut generated_schema_opt: Option<Schema> = None;
+
                 match nsql_request(&self.http_client, &self.http_base_url, &request).await {
-                    Ok(sql) if request.return_sql => {
+                    Ok(NSQLResponse::Sql(sql)) => {
                         generated_sql_opt = Some(sql);
                     }
-                    Ok(_) => {} // NSQL returned data. Must get SQL from task_history
+                    Ok(NSQLResponse::Data(schema)) => {
+                        generated_schema_opt = Some(schema);
+                    }
                     Err(_) => {
                         is_error = true;
                     }
@@ -139,7 +146,34 @@ impl TextToSqlWorker {
 
                 let generated_sql = generated_sql_opt.or(sql).unwrap_or_default();
 
-                // Compute Logical Plans
+                // Calculate generated schema & logical plan if absent.
+                let generated_schema = match generated_schema_opt {
+                    Some(schema) => Some(schema),
+                    None => sql_schema(
+                        self.http_client.clone(),
+                        self.http_base_url.clone(),
+                        &generated_sql,
+                    )
+                    .await
+                    .ok(),
+                };
+
+                let generated_logical_plan = logical_plan(
+                    self.http_client.clone(),
+                    self.http_base_url.clone(),
+                    &generated_sql,
+                )
+                .await
+                .ok();
+
+                // Calculate expected schema & logical plan if absent.
+                let expected_schema = sql_schema(
+                    self.http_client.clone(),
+                    self.http_base_url.clone(),
+                    &request.expected_sql,
+                )
+                .await?;
+
                 let expected_logical_plan = logical_plan(
                     self.http_client.clone(),
                     self.http_base_url.clone(),
@@ -149,14 +183,6 @@ impl TextToSqlWorker {
                 .map_err(|e| {
                     anyhow::anyhow!("could not compute generated logical plan. Error: {e}")
                 })?;
-
-                let generated_logical_plan = logical_plan(
-                    self.http_client.clone(),
-                    self.http_base_url.clone(),
-                    &generated_sql,
-                )
-                .await
-                .ok();
 
                 results.insert(
                     request.id.clone(),
@@ -171,6 +197,10 @@ impl TextToSqlWorker {
                         request.sample_data_enabled,
                         request.return_sql,
                         &task_history_metrics,
+                        generated_schema
+                            .map(|s| (s == expected_schema) as u8)
+                            .unwrap_or_default()
+                            .into(),
                     )?,
                 );
 
@@ -192,31 +222,64 @@ impl TextToSqlWorker {
     }
 }
 
+/// The data returned from `v1/nsql` endpoint.
+/// Determined by [`TextToSqlRequest::return_sql`] (specifically the `Accept` HTTP header).
+pub enum NSQLResponse {
+    Sql(String),
+    Data(Schema),
+}
+
 /// Runs a text to SQL HTTP operation. Returns the generated SQL or generated data (based on [`TextToSqlRequest::return_sql`]).
 async fn nsql_request(
     client: &Client,
     http_base_url: &str,
     req: &TextToSqlRequest,
-) -> Result<String, reqwest::Error> {
+) -> Result<NSQLResponse, reqwest::Error> {
+    let TextToSqlRequest {
+        question,
+        model,
+        sample_data_enabled,
+        return_sql,
+        ..
+    } = req;
     let body = json!({
-        "query": req.question,
-        "model": req.model,
-        "sample_data_enabled": req.sample_data_enabled,
+        "query": question,
+        "model": model,
+        "sample_data_enabled": sample_data_enabled,
         "stream": false
     });
-    let accept_header = if req.return_sql {
+    let accept_header = if *return_sql {
         "application/sql"
     } else {
-        "application/json"
+        "application/vnd.spiceai.nsql.v1+json"
     };
 
-    client
+    let resp = client
         .post(format!("{http_base_url}/v1/nsql"))
         .header("Content-Type", "application/json")
         .header("Accept", accept_header)
         .body(body.to_string())
         .send()
-        .await?
-        .text()
-        .await
+        .await?;
+
+    if *return_sql {
+        resp.text().await.map(NSQLResponse::Sql)
+    } else {
+        let schema = resp
+            .json::<serde_json::Value>()
+            .await?
+            .get("schema")
+            .and_then(|s| s.get("fields"))
+            .and_then(|fields| match fields {
+                Value::Array(arr) if !arr.is_empty() => Some(
+                    arr.iter()
+                        .filter_map(|a| serde_json::from_value(a.clone()).ok())
+                        .collect::<Vec<Field>>(),
+                ),
+                _ => None,
+            })
+            .map(|f| Schema::new(f))
+            .unwrap_or(Schema::empty());
+        Ok(NSQLResponse::Data(schema))
+    }
 }

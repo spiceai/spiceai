@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::datatypes::{Field, Schema};
 use datafusion::{common::Column, sql::TableReference};
 use reqwest::Client;
 use serde_json::Value;
@@ -91,4 +92,34 @@ fn extract_table_scans(
             extract_table_scans(sub_plan, tables, projections);
         }
     }
+}
+
+/// Finds the SQL query's schema by running the SQL against `v1/sql` endpoint.
+///
+/// Attempts to use more efficient SQL with equivalent outputs.
+pub async fn sql_schema(
+    http_client: Client,
+    http_base_url: impl Into<String>,
+    sql: &str,
+) -> Result<Schema, anyhow::Error> {
+    let url = format!("{}/v1/sql", http_base_url.into());
+
+    let response = http_client
+        .post(&url)
+        .body(format!("SELECT * FROM ({sql}) LIMIT 1"))
+        .header("Content-Type", "text/plain")
+        .header("Accept", "application/vnd.spiceai.nsql.v1+json")
+        .send()
+        .await?;
+
+    let json: Value = response.json().await?;
+    let Some(schema) = json.get("schema") else {
+        return Err(anyhow::anyhow!("Failed to extract schema from response"));
+    };
+    let Some(f) = schema.get("fields") else {
+        return Err(anyhow::anyhow!("Failed to extract fields from schema"));
+    };
+    let fields: Vec<Field> = serde_json::from_value(f.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to deserialize fields from schema: {e}"))?;
+    Ok(Schema::new(fields))
 }

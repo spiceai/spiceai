@@ -49,13 +49,9 @@ pub struct TextToSqlMetric {
 
     // Functional metrics
     pub exact_match: u64,
-    // TODO: Requires LogicalPlan/AST parsing
     pub exact_logical_plan_match: u64,
-    // TODO: Requires LogicalPlan/AST parsing
     pub correct_tables: f64,
-    // TODO: Requires LogicalPlan/AST parsing
     pub correct_table_projections: f64,
-    // TODO: Requires LogicalPlan/AST parsing
     pub correct_output_schema: f64,
 }
 
@@ -213,6 +209,7 @@ impl TextToSqlMetric {
         sample_data_enabled: bool,
         return_sql: bool,
         task_history_metrics: &TaskHistoryMetrics,
+        correct_output_schema: f64,
     ) -> Result<Self, anyhow::Error> {
         let expected = extract_tables_and_projection(expected_logical_plan);
         let generated = generated_logical_plan.map(extract_tables_and_projection);
@@ -244,8 +241,7 @@ impl TextToSqlMetric {
                 .as_ref()
                 .map(|g| intersection_over_union(&expected.1, &g.1))
                 .unwrap_or_default(),
-            // TODO: Requires LogicalPlan/AST parsing
-            correct_output_schema: 0.0,
+            correct_output_schema,
         })
     }
 }
@@ -260,7 +256,7 @@ pub struct TextToSqlRunMetric {
     pub mean_sql_query_count: f64,
     pub mean_llm_input_tokens: f64,
     pub mean_llm_output_tokens: f64,
-    // TODO: Requires LogicalPlan/AST parsing
+
     pub exact_logical_plan_match_rate: f64,
     pub mean_correct_tables: f64,
     pub mean_correct_table_projections: f64,
@@ -382,6 +378,7 @@ impl TextToSqlRunMetric {
         exact_logical_plan_match_rate: f64,
         mean_correct_tables: f64,
         mean_correct_table_projections: f64,
+        mean_correct_output_schema: f64,
     ) -> Self {
         Self {
             p95_latency_ms,
@@ -394,8 +391,7 @@ impl TextToSqlRunMetric {
             exact_logical_plan_match_rate,
             mean_correct_tables,
             mean_correct_table_projections,
-            // TODO: Requires LogicalPlan/AST parsing
-            mean_correct_output_schema: 0.0,
+            mean_correct_output_schema,
         }
     }
 }

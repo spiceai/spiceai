@@ -154,6 +154,7 @@ impl SpiceTest<Completed> {
             self.mean(|result| result.exact_logical_plan_match as f64),
             self.mean(|result| result.correct_tables),
             self.mean(|result| result.correct_table_projections),
+            self.mean(|result| result.correct_output_schema),
         ))
     }
 
