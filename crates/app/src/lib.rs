@@ -163,6 +163,8 @@ impl AppBuilder {
     #[must_use]
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
         self.runtime = spicepod.runtime.clone();
+        self.secrets.extend(spicepod.secrets.clone());
+        self.extensions.extend(spicepod.extensions.clone());
         if let Some(ref management) = spicepod.management {
             self.management = Some(management.clone());
         }
