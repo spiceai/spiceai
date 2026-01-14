@@ -153,9 +153,9 @@ runs:
         else
           features="models"
         fi
-        PLATFORM="${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}"
+        PLATFORM="${{ steps.platform.outputs.os }}_${{ steps.platform.outputs.arch }}"
         EXT="${{ steps.platform.outputs.ext }}"
-        mc cp spice-minio/artifacts/spiced/${PLATFORM}/$SPICED_COMMIT/spiced_${features}_${PLATFORM}.${EXT} spiced_${features}_${PLATFORM}.${EXT}
+        mc cp "spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$SPICED_COMMIT/spiced_${features}_${PLATFORM}.${EXT}" spiced_${features}_${PLATFORM}.${EXT}
         tar -xzf spiced_${features}_${PLATFORM}.${EXT}
         sudo cp ./spiced /usr/local/bin/spiced
 
