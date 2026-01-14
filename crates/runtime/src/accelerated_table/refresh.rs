@@ -751,24 +751,27 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
 
-        let (snapshot_interval_task, create_snapshot_after_refresh) = match snapshot_trigger {
-            None | Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
-            Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
-            Some(SnapshotCreateTrigger::Interval(duration)) => (
-                spawn_snapshot_interval_task(
-                    Some(*duration),
-                    checkpointer.clone(),
-                    snapshot_manager.clone(),
-                    Arc::clone(&self.accelerator_write_mutex),
-                    dataset_name.clone(),
-                    Arc::clone(&federated_schema),
+        let (snapshot_interval_task, create_checkpoint_snapshot_after_refresh) =
+            match snapshot_trigger {
+                // This will only create checkpoint - default behavior when snapshots are not configured
+                None => (None, true),
+                Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
+                Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
+                Some(SnapshotCreateTrigger::Interval(duration)) => (
+                    spawn_snapshot_interval_task(
+                        Some(*duration),
+                        checkpointer.clone(),
+                        snapshot_manager.clone(),
+                        Arc::clone(&self.accelerator_write_mutex),
+                        dataset_name.clone(),
+                        Arc::clone(&federated_schema),
+                    ),
+                    false,
                 ),
-                false,
-            ),
-        };
+            };
         self.snapshot_interval_task = snapshot_interval_task;
 
-        if create_snapshot_after_refresh {
+        if create_checkpoint_snapshot_after_refresh && snapshot_manager.is_some() {
             tracing::info!(
                 "Snapshots for dataset {dataset_name} will be created after every refresh"
             );
@@ -831,7 +834,7 @@ impl Refresher {
                                     }
                             }
 
-                            if create_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
+                            if create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
                                 create_checkpoint_and_snapshot(
                                     checkpointer,
                                     snapshot_manager.as_ref(),
