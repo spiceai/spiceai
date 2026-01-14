@@ -77,8 +77,7 @@ default = [
     "alloc-snmalloc",
     "oracle",
     "runtime/s3_vectors",
-    # TODO: Re-enable mongodb once runtime/mongodb feature is re-enabled
-    # "mongodb",
+    "mongodb",
     "iceberg-write",
     "turso",
     "smb",

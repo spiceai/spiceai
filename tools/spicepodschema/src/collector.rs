@@ -72,9 +72,8 @@ use runtime::dataconnector::kafka as _;
 use runtime::dataconnector::localpod as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::memory as _;
-// TODO: Re-enable after adding mongodb support to datafusion-table-providers fork
-// #[expect(unused_imports)]
-// use runtime::dataconnector::mongodb as _;
+#[expect(unused_imports)]
+use runtime::dataconnector::mongodb as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::mssql as _;
 #[expect(unused_imports)]

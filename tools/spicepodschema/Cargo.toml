@@ -30,7 +30,7 @@ runtime = { path = "../../crates/runtime", features = [
     "ftp",
     "imap",
     "kafka",
-    # "mongodb", # TODO: Re-enable after adding mongodb support to datafusion-table-providers fork
+    "mongodb",
     "mssql",
     "mysql",
     # "odbc",
