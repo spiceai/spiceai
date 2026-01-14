@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+    "License"); you may not use this file except in compliance
+    with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing,
+    software distributed under the License is distributed on an
+    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+    KIND, either express or implied.  See the License for the
+    specific language governing permissions and limitations
+    under the License.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000pt" height="1000pt" viewBox="0 0 1000 1000" version="1.1">
+<g id="surface1">
+<path style=" stroke:none;fill-rule:nonzero;fill:rgb(33.299255%,67.498779%,93.299866%);fill-opacity:1;" d="M 375.007812 498.863281 L 252.613281 586.578125 L 311.058594 646.273438 L 434.609375 549.871094 L 375.007812 498.863281 M 697.5625 267.691406 L 397.355469 482.84375 L 457.074219 532.34375 L 755.898438 299.246094 L 697.5625 267.691406 M 533.703125 288.480469 L 182.832031 515.363281 L 234.335938 567.949219 L 587.402344 321.589844 L 533.703125 288.480469 M 625.835938 228.910156 L 549.972656 277.96875 L 603.609375 310.28125 L 679.007812 257.667969 L 625.835938 228.910156 M 580.953125 467.296875 L 331.851562 667.496094 L 398.777344 735.796875 L 648.023438 515.363281 L 580.953125 467.296875 M 776.296875 310.28125 L 599.765625 452.175781 L 666.679688 498.863281 L 840.589844 345.050781 L 776.296875 310.28125 M 361.859375 310.28125 L 120.9375 452.175781 L 166.691406 498.886719 L 410.378906 345.050781 L 361.859375 310.28125 M 863.109375 357.246094 L 422.683594 760.230469 L 500 839.164062 L 934.320312 395.761719 L 863.109375 357.246094 M 560.242188 193.421875 L 380.597656 299.246094 L 429.210938 333.164062 L 608.90625 219.742188 L 560.242188 193.421875 M 500 160.835938 L 544.703125 185.03125 L 106.554688 437.488281 L 65.679688 395.761719 Z M 500 160.835938 "/>
+</g>
+</svg>
