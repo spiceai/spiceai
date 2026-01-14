@@ -1103,6 +1103,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
         // Execute the accelerator scan
         let accelerator_stream = self.input.execute(partition, Arc::clone(&context))?;
+
+        // When no filters are provided (e.g., SELECT *), return cached data directly
+        // without triggering HTTP requests to the federated source or staleness checks.
+        if self.filters.is_empty() {
+           tracing::debug!(
+                "CachingAccelerationScanExec::execute: No filters for dataset={}, returning accelerator stream directly",
+                self.dataset_name
+            );
+            return Ok(accelerator_stream);
+        }
+
         let schema = accelerator_stream.schema();
         let schema_clone = Arc::clone(&schema);
 
@@ -1208,7 +1219,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 )
                 .await
             } else {
-                // Cache miss - no data in accelerator - retrieve from source and store in accelerator
+                // Cache miss - retrieve from source and store in accelerator
                 tracing::debug!(
                     "No cached data for dataset={dataset_name}, treating as cache miss (insert)"
                 );
