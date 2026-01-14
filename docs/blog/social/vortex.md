@@ -7,169 +7,65 @@ By Luke Kim, Founder.
 
 ## LinkedIn
 
-**Vortex: Encoding-Efficient Columnar Storage for Hot Data**
+🌪️ Vortex: The Bet on Encoding-Efficient Columnar Storage for Hot Data
 
-Columnar file formats face a fundamental tradeoff: compression ratio vs. decode speed. Parquet compresses well but decodes slowly. Arrow IPC decodes instantly but doesn't compress. Vortex offers a middle ground—encoding-efficient compression that decodes fast.
+After years building data infra with Apache Arrow, Parquet, and DuckDB, here's what we've learned about columnar formats and why we're investing in Vortex.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              COLUMNAR FORMAT TRADEOFFS                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   PARQUET:                                                       │
-│   ┌───────────────────────────────────────────────────────────┐  │
-│   │ Block compression (Snappy, Zstd, LZ4)                     │  │
-│   │                                                           │  │
-│   │ Write: Data → Encode → Compress block → File             │  │
-│   │ Read:  File → Decompress block → Decode → Arrow          │  │
-│   │                                                           │  │
-│   │ Compression ratio: Excellent (~0.3x raw size)            │  │
-│   │ Decode speed:      Slow (decompress + decode)             │  │
-│   │ Best for:          Cold data, network transfer            │  │
-│   └───────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│   ARROW IPC:                                                     │
-│   ┌───────────────────────────────────────────────────────────┐  │
-│   │ Uncompressed Arrow buffers                                │  │
-│   │                                                           │  │
-│   │ Write: Arrow buffers → File (direct)                     │  │
-│   │ Read:  File → Arrow buffers (zero-copy possible)         │  │
-│   │                                                           │  │
-│   │ Compression ratio: None (1.0x raw size)                  │  │
-│   │ Decode speed:      Instant (zero decode)                  │  │
-│   │ Best for:          Hot data, memory-mapped access         │  │
-│   └───────────────────────────────────────────────────────────┘  │
-│                                                                  │
-│   VORTEX:                                                        │
-│   ┌───────────────────────────────────────────────────────────┐  │
-│   │ Encoding-efficient compression (per column type)         │  │
-│   │                                                           │  │
-│   │ Write: Data → Column-specific encoding → File            │  │
-│   │ Read:  File → SIMD decode → Arrow buffers                │  │
-│   │                                                           │  │
-│   │ Compression ratio: Very good (~0.4x raw size)            │  │
-│   │ Decode speed:      Fast (lightweight decode, SIMD)        │  │
-│   │ Best for:          Hot data needing compression           │  │
-│   └───────────────────────────────────────────────────────────┘  │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+⚖️ THE PROBLEM: COMPRESSION VS. DECODE SPEED
 
-**How encoding-efficient compression works:**
+Every columnar format makes a tradeoff. When your app queries data repeatedly (hot data), this becomes critical:
 
-Instead of applying general-purpose compression (Snappy, Zstd) to entire blocks, Vortex uses specialized encodings for each column type:
+PARQUET uses block compression (Snappy, Zstd). Data is encoded, then compressed. To read, you decompress the entire block, then decode. Compression is excellent (~0.3x), but decode is slow. Great for cold data and archival.
 
-**Dictionary encoding**: Low-cardinality strings (country codes, status values). Store unique values once, reference by integer index. Decode: array lookup.
+ARROW IPC stores uncompressed Arrow buffers directly. Write is a memcpy. Read can be zero-copy via memory mapping. No compression (1.0x), but decode is instant. Ideal for IPC and memory-mapped access.
 
-**Delta encoding**: Sorted or nearly-sorted integers (timestamps, auto-incrementing IDs). Store differences instead of absolute values. Decode: cumulative sum.
+VORTEX sits in the middle. Instead of block compression, it uses encoding-efficient compression tailored to each column's type. Compression is good (~0.4x), decode is fast because encodings are designed for SIMD. The sweet spot for hot data needing both compression and fast repeated access.
 
-**Run-length encoding (RLE)**: Repeated values (null runs, constant columns). Store value + count. Decode: expand runs.
+➡️ Running 100 queries/sec against the same dataset? With Parquet, you decompress the same blocks 100 times. With Arrow, you use 3x storage. Vortex gives 80% of Parquet's compression with 10x faster decode.
 
-**Bitpacking**: Small integers. If values fit in 12 bits, store 12 bits—not 64. Decode: bit unpacking (SIMD-friendly).
+🧠 ENCODING-EFFICIENT COMPRESSION
 
-**Why these encodings decode fast:**
+Vortex selects the best encoding per column:
 
-- Simple operations (array lookup, addition, bit manipulation)
-- SIMD-vectorizable (process multiple values per instruction)
-- Direct to Arrow buffers (no intermediate format)
+• DICTIONARY: Low-cardinality strings (country codes, status values). Store once, reference by index. Decode is an array lookup.
+• DELTA: Sorted integers (timestamps, IDs). Store differences. Decode is cumulative sum, trivially SIMD-vectorizable.
+• RLE: Repeated values (null runs, booleans). Store run counts. Excellent for sparse data.
+• BITPACKING: Small integers. If values fit in 12 bits, why store 64? SIMD-friendly unpacking.
 
-**Cayenne: Lakehouse architecture on Vortex**
+All decode directly to Arrow. No intermediate format, no extra copies.
 
-Vortex is a file format. Cayenne is a lakehouse built on Vortex:
+🔄 WHY WE'RE SHIFTING FROM DUCKDB
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    CAYENNE ARCHITECTURE                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌──────────────────────┐    ┌──────────────────────────────┐  │
-│   │   SQLite Metastore   │    │      Vortex Data Lake        │  │
-│   │   ────────────────   │    │      ─────────────────       │  │
-│   │   • Table schemas    │    │   snapshot_v1/               │  │
-│   │   • Snapshot history │    │     ├─ file_001.vortex       │  │
-│   │   • File references  │    │     └─ file_002.vortex       │  │
-│   │   • Statistics       │    │   snapshot_v2/               │  │
-│   │   • Deletion vectors │    │     └─ file_003.vortex       │  │
-│   └──────────────────────┘    └──────────────────────────────┘  │
-│                                                                  │
-│   WRITE PATH:                                                    │
-│   1. Write new Vortex files (immutable)                          │
-│   2. Atomic metadata commit in SQLite                           │
-│   3. No file rewrites, no lock contention on data               │
-│                                                                  │
-│   READ PATH:                                                     │
-│   1. Query SQLite for current snapshot's file list              │
-│   2. Read Vortex files directly (SIMD decode to Arrow)          │
-│   3. Snapshot isolation: readers see consistent state           │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+DuckDB is excellent. But at scale, we hit limits:
 
-**Why SQLite + Vortex (vs. DuckDB):**
+• FILE SCALING: Single-file architecture struggles >100GB. Cayenne uses multiple immutable files.
+• WRITE CONCURRENCY: Lock contention with continuous ingestion. Cayenne's append-only design eliminates this.
+• MEMORY: In-memory structures cause pressure in dense K8s deployments. Vortex files are self-contained; 1/3 memory usage.
+• QUERY SPEED: Comparable, within 5% on TPC-H.
 
-We invested heavily in DuckDB for local acceleration. It worked well—until deployments scaled:
+DuckDB remains right for <100GB and low concurrency. For production acceleration with continuous ingestion at scale, Cayenne/Vortex is our path forward.
 
-| Challenge         | DuckDB                        | Cayenne/Vortex                     |
-| ----------------- | ----------------------------- | ---------------------------------- |
-| File scaling      | Single file, contention >50GB | Multiple files, horizontal         |
-| Write concurrency | Lock contention               | New files + atomic commit          |
-| Memory overhead   | In-memory structures          | Minimal (files are self-contained) |
-| Query speed       | Excellent                     | Comparable (within 5%)             |
+🎯 WHEN TO USE WHAT
 
-**When to use which:**
+PARQUET: Cold data, archival, network transfer
+ARROW IPC: In-memory, IPC, zero-copy
+DUCKDB: <100GB, low concurrency
+VORTEX/CAYENNE: Production acceleration, continuous ingestion, scale beyond 100GB
 
-- **Parquet**: Cold data, archival, network transfer
-- **Arrow IPC**: Hot data in memory, IPC between processes
-- **DuckDB**: Ad-hoc analysis, embedded <50GB, single-user
-- **Vortex/Cayenne**: Production acceleration, continuous ingestion, scale
+The right format depends on access patterns. Hot data needing compression + continuous writes? That's Vortex.
 
-The right format depends on your access patterns. Hot data that needs compression and continuous writes? That's where Vortex fits.
+#datafusion #spiceai #data #arrow #parquet #duckdb 
 
 ---
 
 ## X
 
-Why we're shifting investment from DuckDB to Cayenne/Vortex for acceleration:
+🌪️ Why Vortex for hot data?
 
-DuckDB limitations at scale:
-- Single-file architecture (>50GB = problems)
-- Write lock contention (continuous ingestion + reads)
-- Memory overhead (dense deployments struggle)
+Parquet: great compression, slow decode
+Arrow: instant decode, no compression
+Vortex: both—encoding-efficient compression with SIMD decode to Arrow
 
-Cayenne architecture:
-```
-┌─────────────────────────────────────────────────────────┐
-│  SQLite Metastore    │    Vortex Data Lake              │
-│  ─────────────────   │    ──────────────────            │
-│  • snapshots         │    snapshot_001/                 │
-│  • schemas           │      ├─ file_001.vortex         │
-│  • file refs         │      └─ file_002.vortex         │
-│  • deletion vectors  │    snapshot_002/                 │
-│                      │      └─ file_003.vortex         │
-│                      │                                  │
-│  Writes = new files + atomic metadata commit            │
-│  No file rewrites. No lock contention.                  │
-└─────────────────────────────────────────────────────────┘
-```
+80% of Parquet's compression, 10x faster decode.
 
-Vortex encoding-efficient compression:
-- Dictionary (low-cardinality strings)
-- Delta (timestamps, IDs)
-- RLE (repeated values)
-- Bitpacking (small integers)
-
-All decode directly to Arrow via SIMD.
-
-Benchmarks (100GB TPC-H):
-
-| Metric             | DuckDB   | Cayenne   |
-| ------------------ | -------- | --------- |
-| Query latency      | baseline | ≈ same    |
-| Ingestion speed    | baseline | 3x faster |
-| Memory usage       | baseline | 40% less  |
-| Max practical size | ~100GB   | unlimited |
-
-DuckDB: still great for <50GB, ad-hoc, embedded.
-Cayenne: production acceleration at scale.
-
-The right tool changes as constraints change.
+spiceai.org
