@@ -180,7 +180,7 @@ impl TextToSqlWorker {
                 );
 
                 processed_count += 1;
-                if processed_count % 10 == 0 {
+                if processed_count.is_multiple_of(10) {
                     println!(
                         "[TextToSqlWorker-{}]: processed {processed_count} requests",
                         self.id
