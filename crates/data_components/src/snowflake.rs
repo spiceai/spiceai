@@ -76,7 +76,7 @@ impl Read for SnowflakeTableFactory {
 
         let pool = Arc::clone(&self.pool);
         let table_provider = Arc::new(
-            SqlTable::new("snowflake", &pool, table_reference)
+            SqlTable::new("snowflake", &pool, table_reference, None)
                 .await
                 .context(UnableToConstructSQLTableSnafu)?
                 .with_dialect(dialect),
