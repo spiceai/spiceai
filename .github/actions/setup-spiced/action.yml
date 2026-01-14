@@ -20,12 +20,41 @@ inputs:
     type: boolean
 outputs:
   spiced_commit:
-    value: ${{ steps.output_spiced_commit.outputs.spiced_commit }}
+    value: ${{ steps.output_spiced_commit.outputs.SPICED_COMMIT || steps.output_spiced_commit_windows.outputs.SPICED_COMMIT }}
 runs:
   using: 'composite'
   steps:
-    - name: Find the latest built spiced commit
-      if: ${{ !inputs.spiced_commit }}
+    - name: Determine platform (Linux/macOS)
+      id: platform
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          echo "os=linux" >> $GITHUB_OUTPUT
+          echo "arch=x86_64" >> $GITHUB_OUTPUT
+          echo "ext=tar.gz" >> $GITHUB_OUTPUT
+        elif [[ "$RUNNER_OS" == "macOS" ]]; then
+          echo "os=darwin" >> $GITHUB_OUTPUT
+          echo "ext=tar.gz" >> $GITHUB_OUTPUT
+          if [[ "$(uname -m)" == "arm64" ]]; then
+            echo "arch=aarch64" >> $GITHUB_OUTPUT
+          else
+            echo "arch=x86_64" >> $GITHUB_OUTPUT
+          fi
+        fi
+
+    - name: Determine platform (Windows)
+      id: platform-windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        echo "os=windows" >> $env:GITHUB_OUTPUT
+        echo "arch=x86_64" >> $env:GITHUB_OUTPUT
+        echo "ext=zip" >> $env:GITHUB_OUTPUT
+
+    - name: Find the latest built spiced commit (Linux/macOS)
+      if: ${{ !inputs.spiced_commit && runner.os != 'Windows' }}
       shell: bash
       run: |
         git fetch --depth=10 origin ${{ inputs.ref }}
@@ -39,30 +68,84 @@ runs:
           features="models"
         fi
 
+        PLATFORM="${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}"
+        EXT="${{ steps.platform.outputs.ext }}"
+
         for hash in "${commit_hashes[@]}"; do
-          echo "Checking $hash in MinIO"
-          if mc stat spice-minio/artifacts/spiced/linux-x86_64/$hash/spiced_${features}_linux_x86_64.tar.gz; then
+          echo "Checking $hash in MinIO for $PLATFORM"
+          if mc stat spice-minio/artifacts/spiced/${PLATFORM}/$hash/spiced_${features}_${PLATFORM}.${EXT}; then
             echo "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
             exit 0
           fi
         done
 
-        echo "Could not find any recently built spiced commit in MinIO"
+        echo "Could not find any recently built spiced commit in MinIO for $PLATFORM"
         exit 1
 
-    - name: Set SPICED_COMMIT from workflow input
+    - name: Find the latest built spiced commit (Windows)
+      if: ${{ !inputs.spiced_commit && runner.os == 'Windows' }}
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        git fetch --depth=10 origin ${{ inputs.ref }}
+        Write-Host "Fetching latest 10 commits from ${{ inputs.ref }}"
+
+        $commitHashes = git log FETCH_HEAD --pretty=format:"%H" -n 10 | ForEach-Object { $_.Trim() }
+
+        if ("${{ inputs.with_odbc }}" -eq "true") {
+          $features = "odbc_models"
+        } else {
+          $features = "models"
+        }
+
+        $platform = "${{ steps.platform-windows.outputs.os }}-${{ steps.platform-windows.outputs.arch }}"
+        $ext = "${{ steps.platform-windows.outputs.ext }}"
+
+        foreach ($hash in $commitHashes) {
+          Write-Host "Checking $hash in MinIO for $platform"
+          $statOutput = mc stat "spice-minio/artifacts/spiced/$platform/$hash/spiced_${features}_${platform}.${ext}" 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Found $hash in MinIO"
+            echo "SPICED_COMMIT=$hash" >> $env:GITHUB_ENV
+            exit 0
+          } else {
+            Write-Host "mc stat failed for $hash on $platform: $statOutput"
+          }
+        }
+
+        Write-Host "Could not find any recently built spiced commit in MinIO for $platform"
+        exit 1
+
+    - name: Set SPICED_COMMIT from workflow input (Linux/macOS)
       shell: bash
-      if: ${{ inputs.spiced_commit }}
+      if: ${{ inputs.spiced_commit && runner.os != 'Windows' }}
       run: |
         echo "SPICED_COMMIT=${{ inputs.spiced_commit }}" >> $GITHUB_ENV
 
-    - name: Output SPICED_COMMIT
+    - name: Set SPICED_COMMIT from workflow input (Windows)
+      shell: pwsh
+      if: ${{ inputs.spiced_commit && runner.os == 'Windows' }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        echo "SPICED_COMMIT=${{ inputs.spiced_commit }}" >> $env:GITHUB_ENV
+
+    - name: Output SPICED_COMMIT (Linux/macOS)
       id: output_spiced_commit
+      if: runner.os != 'Windows'
       shell: bash
       run: echo "SPICED_COMMIT=$SPICED_COMMIT" >> $GITHUB_OUTPUT
 
-    - name: Download spiced from MinIO
+    - name: Output SPICED_COMMIT (Windows)
+      id: output_spiced_commit_windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        echo "SPICED_COMMIT=$env:SPICED_COMMIT" >> $env:GITHUB_OUTPUT
+
+    - name: Download spiced from MinIO (Linux/macOS)
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
@@ -70,6 +153,28 @@ runs:
         else
           features="models"
         fi
-        mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_${features}_linux_x86_64.tar.gz spiced_${features}_linux_x86_64.tar.gz
-        tar -xzf spiced_${features}_linux_x86_64.tar.gz
+        PLATFORM="${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}"
+        EXT="${{ steps.platform.outputs.ext }}"
+        mc cp spice-minio/artifacts/spiced/${PLATFORM}/$SPICED_COMMIT/spiced_${features}_${PLATFORM}.${EXT} spiced_${features}_${PLATFORM}.${EXT}
+        tar -xzf spiced_${features}_${PLATFORM}.${EXT}
         sudo cp ./spiced /usr/local/bin/spiced
+
+    - name: Download spiced from MinIO (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if ("${{ inputs.with_odbc }}" -eq "true") {
+          $features = "odbc_models"
+        } else {
+          $features = "models"
+        }
+        $platform = "${{ steps.platform-windows.outputs.os }}-${{ steps.platform-windows.outputs.arch }}"
+        $ext = "${{ steps.platform-windows.outputs.ext }}"
+        $artifact = "spiced_${features}_${platform}.${ext}"
+        mc cp "spice-minio/artifacts/spiced/$platform/$env:SPICED_COMMIT/$artifact" $artifact
+        Expand-Archive -Path $artifact -DestinationPath . -Force
+        $spicedDir = "$env:USERPROFILE\spiced"
+        New-Item -ItemType Directory -Force -Path $spicedDir | Out-Null
+        Copy-Item -Path .\spiced.exe -Destination "$spicedDir\spiced.exe"
+        echo "$spicedDir" >> $env:GITHUB_PATH

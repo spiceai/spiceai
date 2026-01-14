@@ -1394,9 +1394,11 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
+ "fundu",
  "iceberg",
  "object_store",
  "reqwest",
+ "secrecy",
  "snafu",
  "tempfile",
  "tokio",
@@ -14531,9 +14533,9 @@ dependencies = [
 
 [[package]]
 name = "rust_decimal"
-version = "1.39.0"
+version = "1.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35affe401787a9bd846712274d97654355d21b2a2c092a3139aabe31e9022282"
+checksum = "61f703d19852dbf87cbc513643fa81428361eb6940f1ac14fd58155d295a3eb0"
 dependencies = [
  "arrayvec",
  "borsh",
@@ -17061,6 +17063,7 @@ dependencies = [
  "app",
  "arrow",
  "arrow-json",
+ "async-channel 2.5.0",
  "async-openai",
  "async-trait",
  "chrono",

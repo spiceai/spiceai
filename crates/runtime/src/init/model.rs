@@ -17,7 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    Runtime, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status, timing::TimeMeasurement,
+    Runtime, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE,
+    model::provider_models::get_available_models_hint, status, timing::TimeMeasurement,
 };
 use app::App;
 use model_components::model::Model;
@@ -120,7 +121,7 @@ impl Runtime {
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
         let result: Result<(), Error> = match model_type {
-            Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
+            Some(ModelType::Llm) => match self.load_llm(m.clone(), params.clone()).await {
                 Ok((completions_model, Some(responses_model))) => {
                     let mut llm_map = self.completion_llms.write().await;
                     llm_map.insert(m.name.clone(), completions_model);
@@ -139,7 +140,7 @@ impl Runtime {
                     source: Box::new(e),
                 }),
             },
-            Some(ModelType::Ml) => match Model::load(m.clone(), params).await {
+            Some(ModelType::Ml) => match Model::load(m.clone(), params.clone()).await {
                 Ok(in_m) => {
                     let mut model_map = self.models.write().await;
                     model_map.insert(m.name.clone(), in_m);
@@ -171,6 +172,21 @@ impl Runtime {
                 metrics::models::LOAD_ERROR.add(1, &[]);
                 self.status
                     .update_model(&model.name, status::ComponentStatus::Error);
+
+                // Try to fetch available models to help user debug the issue
+                let error_msg = e.to_string();
+                let is_model_not_found = error_msg.contains("not valid")
+                    || error_msg.contains("not found")
+                    || error_msg.contains("ModelNotFound");
+
+                if is_model_not_found
+                    && let Some(model_source) = &source
+                    && let Some(hint) = get_available_models_hint(model_source, &params).await
+                {
+                    tracing::warn!("{e}{hint}");
+                    return;
+                }
+
                 tracing::warn!("{e}");
             }
         }

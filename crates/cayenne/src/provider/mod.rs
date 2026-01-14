@@ -39,8 +39,10 @@ limitations under the License.
 //! - [`streaming`]: Streaming execution plan for write operations
 //! - [`utils`]: Numeric conversion utilities
 //! - [`constants`]: Shared constants
+//! - [`context`]: Shared context for Cayenne operations
 
 pub(crate) mod constants;
+pub(crate) mod context;
 pub(crate) mod delete;
 pub(crate) mod scan;
 pub(crate) mod streaming;
@@ -48,6 +50,7 @@ pub(crate) mod table;
 pub(crate) mod utils;
 
 // Re-export the main type at the module level for convenience
+pub use context::CayenneContext;
 pub use scan::CayenneAccelerationExec;
 pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
 
