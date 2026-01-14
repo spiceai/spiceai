@@ -48,7 +48,7 @@ use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use super::{AccelerationSource, DataAccelerator, WasBootstrapped, upsert_dedup};
+use super::{AccelerationSource, DataAccelerator, BootstrapStatus, upsert_dedup};
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
@@ -1688,7 +1688,6 @@ impl DataAccelerator for CayenneAccelerator {
     /// Initializes a `Cayenne` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
-    /// Returns `Ok(true)` if a snapshot was bootstrapped, `Ok(false)` otherwise.
     #[expect(
         clippy::too_many_lines,
         reason = "Initialization requires extensive validation, S3 bucket setup, and directory management"
@@ -1696,7 +1695,7 @@ impl DataAccelerator for CayenneAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         tracing::warn!(
             "Cayenne data accelerator (Alpha) is in preview and should not be used in production."
         );
@@ -1802,7 +1801,7 @@ impl DataAccelerator for CayenneAccelerator {
             }
 
             // S3 Express One Zone does not support snapshot bootstrapping
-            return Ok(WasBootstrapped::No);
+            return Ok(BootstrapStatus::None);
         }
 
         // If mode is FileCreate, delete the existing directory and metadata to start fresh
@@ -1866,7 +1865,7 @@ impl DataAccelerator for CayenneAccelerator {
             download_snapshot_if_needed(acceleration, source, path_buf, AccelerationEngine::Cayenne)
                 .await
         } else {
-            WasBootstrapped::No
+            BootstrapStatus::None
         };
 
         Ok(was_bootstrapped)

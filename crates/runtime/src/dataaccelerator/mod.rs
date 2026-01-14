@@ -371,12 +371,11 @@ pub trait DataAccelerator: Send + Sync {
     fn parameters(&self) -> &'static [ParameterSpec];
 
     /// Initialize the accelerator for a component.
-    /// Returns `Ok(true)` if a snapshot was bootstrapped, `Ok(false)` otherwise.
     async fn init(
         &self,
         _source: &dyn AccelerationSource,
-    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(WasBootstrapped::No)
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(BootstrapStatus::None)
     }
 
     /// Check if the accelerator is initialized for a component
@@ -609,16 +608,16 @@ pub trait AccelerationSource: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-// Whether an accelerated table was bootstrapped or not during initialization.
+// Whether an accelerated table was bootstrapped not during initialization.
 #[derive(Debug)]
-pub(crate) enum WasBootstrapped {
-    Yes,
-    No,
+pub(crate) enum BootstrapStatus {
+    Bootstrapped,
+    None,
 }
 
-impl WasBootstrapped {
-    pub fn is_yes(&self) -> bool {
-        matches!(self, WasBootstrapped::Yes)
+impl BootstrapStatus {
+    pub fn is_bootstrapped(&self) -> bool {
+        matches!(self, BootstrapStatus::Bootstrapped)
     }
 }
 

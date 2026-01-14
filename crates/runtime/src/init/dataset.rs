@@ -829,7 +829,7 @@ impl Runtime {
     /// Initialize datasets configured with accelerators before registering the datasets.
     /// This ensures that the required resources for acceleration are available before registration,
     /// which is important for acceleration federation for some acceleration engines (e.g. `SQLite`).
-    /// Returns a tuple of (initialized_datasets, bootstrapped_datasets) where bootstrapped_datasets
+    /// Returns a tuple of (`initialized_datasets`, `bootstrapped_datasets`) where `bootstrapped_datasets`
     /// contains the names of datasets that were bootstrapped from snapshots.
     async fn initialize_datasets_accelerators(
         &self,
@@ -873,8 +873,8 @@ impl Runtime {
                     name: acceleration_settings.engine.to_string(),
                 },
             ) {
-                Ok(was_bootstrapped) => {
-                    if was_bootstrapped.is_yes() {
+                Ok(bootstrap_status) => {
+                    if bootstrap_status.is_bootstrapped() {
                         bootstrapped_datasets.insert(ds.name.clone());
                     }
                     initialized_datasets.push(Arc::clone(ds));

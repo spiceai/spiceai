@@ -62,7 +62,7 @@ use crate::{
     register_data_accelerator, spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator, WasBootstrapped, upsert_dedup};
+use super::{AccelerationSource, DataAccelerator, BootstrapStatus, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -438,11 +438,10 @@ impl DataAccelerator for TursoAccelerator {
     ///
     /// Returns `Error::RemoteDatabaseNotSupported` if `turso_url` or `turso_auth_token`
     /// parameters are provided in the acceleration configuration.
-    /// Returns `Ok(true)` if a snapshot was bootstrapped, `Ok(false)` otherwise.
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         // Reject remote database configurations (not supported as accelerators)
         // Note: This is an accelerator-specific limitation. Remote databases will be
         // supported when Turso is used as a data connector.
@@ -460,11 +459,11 @@ impl DataAccelerator for TursoAccelerator {
             // Initialize the shared pool to verify connectivity
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
-            return Ok(WasBootstrapped::No);
+            return Ok(BootstrapStatus::None);
         }
 
         // Handle file mode: validate path and setup file-based database
-        let mut was_bootstrapped = WasBootstrapped::No;
+        let mut was_bootstrapped = BootstrapStatus::None;
         if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("turso_file") {
                 make_spice_data_directory()

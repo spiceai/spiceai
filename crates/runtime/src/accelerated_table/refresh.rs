@@ -611,7 +611,6 @@ impl Refresher {
     }
 
     /// Set whether the dataset was bootstrapped from a snapshot.
-    /// This delays the first snapshot creation by the full interval after bootstrap.
     pub fn set_was_bootstrapped(&mut self, was_bootstrapped: bool) -> &mut Self {
         self.was_bootstrapped = was_bootstrapped;
         self

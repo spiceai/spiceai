@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{AccelerationSource, DataAccelerator, WasBootstrapped};
+use super::{AccelerationSource, DataAccelerator, BootstrapStatus};
 use crate::{
     App, Runtime,
     component::{
@@ -341,14 +341,14 @@ impl DataAccelerator for DuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Ok(WasBootstrapped::No);
+            return Ok(BootstrapStatus::None);
         }
 
         let path = self.file_path(source)?;
 
-        let mut was_bootstrapped = WasBootstrapped::No;
+        let mut was_bootstrapped = BootstrapStatus::None;
         if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("duckdb_file") {
                 make_spice_data_directory().map_err(|err| {
