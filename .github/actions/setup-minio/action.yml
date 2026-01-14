@@ -33,7 +33,26 @@ runs:
         brew update
         brew install minio/stable/mc
 
-    - name: Set MinIO alias
+    - name: Install MinIO on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $mcPath = "$env:USERPROFILE\mc"
+        New-Item -ItemType Directory -Force -Path $mcPath | Out-Null
+        Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" -OutFile "$mcPath\mc.exe"
+        echo "$mcPath" >> $env:GITHUB_PATH
+
+    - name: Set MinIO alias (Linux/macOS)
+      if: runner.os != 'Windows'
       shell: bash
       run: |
         mc alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}
+
+    - name: Set MinIO alias (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $mcExePath = Join-Path $env:USERPROFILE 'mc\mc.exe'
+        & $mcExePath alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}
