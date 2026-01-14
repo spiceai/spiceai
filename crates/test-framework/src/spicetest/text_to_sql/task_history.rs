@@ -37,7 +37,6 @@ pub struct TaskHistoryMetrics {
 /// Fetches metrics from `runtime.task_history` for an nsql operation with the given `trace_id`.
 ///
 /// Returns: `(generated_sql, task_history_metrics)`
-#[expect(clippy::too_many_lines)]
 pub(super) async fn find_task_history_metrics(
     spice_client: &spiceai::Client,
     trace_id: &TraceId,
