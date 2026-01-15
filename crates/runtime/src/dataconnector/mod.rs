@@ -139,8 +139,6 @@ pub mod dremio;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
-#[cfg(feature = "flightsql")]
-pub mod flightsql;
 #[cfg(feature = "ftp")]
 pub mod ftp;
 pub mod git;

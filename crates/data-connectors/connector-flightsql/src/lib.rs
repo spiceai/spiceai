@@ -14,10 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
-};
-use crate::{component::dataset::Dataset, register_data_connector};
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
@@ -26,11 +22,19 @@ use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactor
 use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
+use runtime::parameters::ParameterSpec;
+use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
+use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -92,7 +96,7 @@ impl DataConnectorFactory for FlightSQLFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params
                 .parameters
@@ -165,15 +169,15 @@ impl DataConnector for FlightSQL {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.flightsql_factory, dataset.path().into())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "flightsql",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?,
-        )
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        match Read::table_provider(&self.flightsql_factory, dataset.path().into()).await {
+            Ok(provider) => Ok(provider),
+            Err(e) => Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "flightsql".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e.into(),
+            }),
+        }
     }
 }
 

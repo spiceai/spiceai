@@ -3780,6 +3780,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-flightsql"
+version = "1.11.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "flight_client",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+]
+
+[[package]]
 name = "connector-mongodb"
 version = "1.11.0-unstable"
 dependencies = [
@@ -3819,7 +3835,7 @@ dependencies = [
  "datafusion-table-providers",
  "linkme",
  "mysql_async",
- "opentelemetry 0.29.1",
+ "opentelemetry",
  "paste",
  "runtime",
  "secrecy",
@@ -3836,7 +3852,6 @@ dependencies = [
  "data_components",
  "datafusion",
  "linkme",
- "once_cell",
  "paste",
  "runtime",
  "runtime-parameters",
@@ -16676,6 +16691,7 @@ dependencies = [
  "clap 4.5.54",
  "connector-clickhouse",
  "connector-duckdb",
+ "connector-flightsql",
  "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
@@ -16753,6 +16769,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "connector-clickhouse",
  "connector-duckdb",
+ "connector-flightsql",
  "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
