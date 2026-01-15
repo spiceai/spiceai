@@ -293,10 +293,10 @@ pub enum StreamError {
 |-----------|--------------|--------|-------|
 | ✅ postgres | `postgres` | Done | |
 | ✅ mysql | `mysql` | Done | Similar to postgres |
-| ☐ clickhouse | `clickhouse` | | |
-| ☐ mssql | `mssql` | | |
-| ☐ snowflake | `snowflake` | | |
-| ☐ duckdb | `duckdb` | | Heavy libduckdb dependency |
+| ✅ clickhouse | `clickhouse` | Done | |
+| ✅ mssql | `mssql` | Done | |
+| ✅ snowflake | `snowflake` | Done | |
+| ✅ duckdb | `duckdb` | Done | Heavy libduckdb dependency |
 | ☐ mongodb | `mongodb` | | |
 | ☐ oracle | `oracle` | | |
 | ☐ spark | `spark` | | |

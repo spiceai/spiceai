@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,9 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{
-    component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect, register_data_connector,
-};
+//! `DuckDB` data connector for Spice.ai runtime.
+//!
+//! This crate provides the `DuckDB` connector implementation, allowing
+//! Spice.ai to connect to DuckDB databases as data sources.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds - changes to this connector only require rebuilding
+//! this crate, not the entire runtime.
+
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -26,16 +32,19 @@ use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult,
+};
+use runtime::datafusion::dialect::new_duckdb_dialect;
+use runtime::parameters::ParameterSpec;
+use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use super::{
-    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory, ParameterSpec,
-};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -47,6 +56,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// `DuckDB` data connector.
 pub struct DuckDB {
     duckdb_factory: DuckDBTableFactory,
 }
@@ -58,7 +68,8 @@ impl std::fmt::Debug for DuckDB {
 }
 
 impl DuckDB {
-    pub(crate) fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
+    /// Creates an in-memory DuckDB table factory.
+    pub fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
@@ -76,10 +87,8 @@ impl DuckDB {
         Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
     }
 
-    pub(crate) fn create_file(
-        path: &str,
-        params: &ConnectorParams,
-    ) -> AnyErrorResult<DuckDBTableFactory> {
+    /// Creates a file-based DuckDB table factory.
+    pub fn create_file(path: &str, params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
@@ -98,6 +107,7 @@ impl DuckDB {
     }
 }
 
+/// Factory for creating `DuckDB` connector instances.
 #[derive(Default, Copy, Clone)]
 pub struct DuckDBFactory {}
 
@@ -123,7 +133,7 @@ impl DataConnectorFactory for DuckDBFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let duckdb_factory =
                 if let Some(db_path) = params.parameters.clone().get("open").expose().ok() {
@@ -149,6 +159,34 @@ impl DataConnectorFactory for DuckDBFactory {
     }
 }
 
+register_data_connector!("duckdb", DuckDBFactory);
+
+#[derive(Debug, Snafu)]
+enum ReadProviderError {
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<ReadProviderError> for DataConnectorError {
+    fn from(err: ReadProviderError) -> Self {
+        match err {
+            ReadProviderError::UnableToGetReadProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for DuckDB {
     fn as_any(&self) -> &dyn Any {
@@ -158,7 +196,7 @@ impl DataConnector for DuckDB {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path: TableReference = dataset.path().into();
 
         if !(is_table_function(&path) || dataset.params.contains_key("duckdb_open")) {
@@ -171,11 +209,9 @@ impl DataConnector for DuckDB {
 
         Ok(Read::table_provider(&self.duckdb_factory, path)
             .await
-            .context(super::UnableToGetReadProviderSnafu {
+            .context(UnableToGetReadProviderSnafu {
                 dataconnector: "duckdb",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
     }
 }
-
-register_data_connector!("duckdb", DuckDBFactory);
