@@ -95,15 +95,15 @@ When we chose Vortex as the storage layer for Cayenne (our data accelerator at S
 
 Here's the research lineage that powers Vortex:
 
-📄 BtrBlocks (SIGMOD 2023) - The core algorithm from TUM. Cascading multiple lightweight encodings outperforms monolithic compression. Key insight: optimize for decompression speed, not just compression ratio.
+📄 BtrBlocks (SIGMOD 2023) - The core algorithm from Technical University of Munich. Cascading multiple lightweight encodings outperforms monolithic compression. Key insight: optimize for decompression speed, not just compression ratio.
 
-📄 FastLanes (VLDB 2023) - Hardware-friendly integer compression. Structures bit-packing to maximize SIMD utilization across AVX-512, AVX2, and ARM NEON. Near-memory-bandwidth decompression.
+📄 FastLanes (VLDB 2023) - Hardware-friendly integer compression. Structures bit-packing to maximize SIMD (Single Instruction, Multiple Data) utilization across Intel and ARM processors. Near-memory-bandwidth decompression.
 
 📄 FSST (VLDB 2020) - Fast Static Symbol Table for strings. Near-LZ4 ratios at 5-10× faster decompression. Critical for string-heavy analytical columns.
 
-📄 ALP (CWI Amsterdam) - Adaptive Lossless floating-Point compression. Exploits real-world float patterns (prices with 2 decimals, sensor readings with limited precision).
+📄 ALP (CWI Amsterdam) - Adaptive Lossless floating-Point compression from the Dutch national research institute. Exploits real-world float patterns (prices with 2 decimals, sensor readings with limited precision).
 
-📄 MonetDB/X100 + Morsel-Driven Parallelism - Foundations for vectorized, NUMA-aware query execution that Vortex builds on.
+📄 MonetDB/X100 + Morsel-Driven Parallelism - Foundations for vectorized, NUMA-aware (Non-Uniform Memory Access) query execution that Vortex builds on.
 
 The result? Compression that understands your data:
 • Integers via FastLanes bit-packing
@@ -122,7 +122,7 @@ Why does this matter for production systems?
 
 4️⃣ Zero-copy Arrow access. Data decompresses directly to Arrow arrays—no intermediate copies.
 
-Vortex is now an LF AI & Data project, and researchers are building on it (Anyblox, F3). The gap between academic research and production systems is narrowing.
+Vortex is now a Linux Foundation AI & Data project, and researchers are building on it (Anyblox, F3). The gap between academic research and production systems is narrowing.
 
 What's next? GPU-accelerated decoding and learned compression. The future of data storage is adaptive, intelligent, and fast.
 
