@@ -32,6 +32,7 @@ use runtime_parameters::ParameterSpec;
 // `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
 use connector_clickhouse as _;
 use connector_duckdb as _;
+use connector_mongodb as _;
 use connector_mssql as _;
 use connector_mysql as _;
 #[expect(unused_imports)]
@@ -72,8 +73,6 @@ use runtime::dataconnector::kafka as _;
 use runtime::dataconnector::localpod as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::memory as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::mongodb as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
 use connector_postgres as _;

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,27 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, register_data_connector};
+//! `MongoDB` data connector for Spice.ai runtime.
+//!
+//! This crate provides the MongoDB connector implementation, allowing
+//! Spice.ai to connect to MongoDB databases as data sources.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds - changes to this connector only require rebuilding
+//! this crate, not the entire runtime.
+
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
 };
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult,
+};
+use runtime::parameters::ParameterSpec;
+use runtime::register_data_connector;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
-use std::convert::Into;
 use std::future::Future;
 use std::pin::Pin;
-use std::string::ToString;
 use std::sync::Arc;
 
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec,
-};
-
+/// `MongoDB` data connector.
 pub struct MongoDB {
     mongodb_factory: MongoDBTableFactory,
 }
@@ -45,6 +54,7 @@ impl std::fmt::Debug for MongoDB {
     }
 }
 
+/// Factory for creating `MongoDB` connector instances.
 #[derive(Default, Copy, Clone)]
 pub struct MongoDBFactory {}
 
@@ -123,7 +133,7 @@ impl DataConnectorFactory for MongoDBFactory {
     fn create(
         &self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             // If a full connection_string is provided, warn about ignored connection details.
             if params.parameters.get("connection_string").ok().is_some() {
@@ -227,6 +237,34 @@ impl DataConnectorFactory for MongoDBFactory {
     }
 }
 
+register_data_connector!("mongodb", MongoDBFactory);
+
+#[derive(Debug, Snafu)]
+enum ReadProviderError {
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<ReadProviderError> for DataConnectorError {
+    fn from(err: ReadProviderError) -> Self {
+        match err {
+            ReadProviderError::UnableToGetReadProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for MongoDB {
     fn as_any(&self) -> &dyn Any {
@@ -236,14 +274,14 @@ impl DataConnector for MongoDB {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Read::table_provider(&self.mongodb_factory, dataset.path().into())
-            .await
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "mongodb",
-                connector_component: ConnectorComponent::from(dataset),
-            })
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        Ok(
+            Read::table_provider(&self.mongodb_factory, dataset.path().into())
+                .await
+                .context(UnableToGetReadProviderSnafu {
+                    dataconnector: "mongodb",
+                    connector_component: ConnectorComponent::from(dataset),
+                })?,
+        )
     }
 }
-
-register_data_connector!("mongodb", MongoDBFactory);

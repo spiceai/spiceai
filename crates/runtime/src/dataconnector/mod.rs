@@ -151,8 +151,6 @@ pub mod https;
 pub mod kafka;
 pub mod localpod;
 pub mod memory;
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
 
 #[cfg(feature = "nfs")]
 pub mod nfs;

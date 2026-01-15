@@ -3780,6 +3780,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-mongodb"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
 name = "connector-mssql"
 version = "1.11.0-unstable"
 dependencies = [
@@ -16611,6 +16627,7 @@ dependencies = [
  "clap 4.5.54",
  "connector-clickhouse",
  "connector-duckdb",
+ "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
  "connector-postgres",
@@ -16684,6 +16701,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "connector-clickhouse",
  "connector-duckdb",
+ "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
  "connector-postgres",
