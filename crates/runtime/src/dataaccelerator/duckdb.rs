@@ -52,6 +52,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
+use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
@@ -383,7 +384,13 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            download_snapshot_if_needed(
+                acceleration,
+                source,
+                PathBuf::from(path),
+                AccelerationEngine::DuckDB,
+            )
+            .await;
 
             self.get_shared_pool(source).await?;
         }

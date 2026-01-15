@@ -204,6 +204,7 @@ fn sanitize_column_reference(column_ref: &str) -> Result<Vec<String>> {
 }
 // Re-export for use within the runtime crate
 pub use data_components::turso::TursoConnectionPool;
+use runtime_acceleration::snapshot::AccelerationEngine;
 
 pub struct TursoAccelerator {
     // Store connection pools for file-based databases
@@ -497,7 +498,13 @@ impl DataAccelerator for TursoAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            download_snapshot_if_needed(
+                acceleration,
+                source,
+                PathBuf::from(path),
+                AccelerationEngine::Turso,
+            )
+            .await;
 
             // Initialize the database file using the shared pool
             let pool = self.get_shared_pool(source).await?;

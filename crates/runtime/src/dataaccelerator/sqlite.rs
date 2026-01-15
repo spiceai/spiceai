@@ -16,6 +16,14 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::{
+    component::dataset::acceleration::{Engine, Mode},
+    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    datafusion::udf::deny_spice_specific_functions,
+    make_spice_data_directory,
+    parameters::ParameterSpec,
+    register_data_accelerator, spice_data_base_path,
+};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::{
@@ -26,19 +34,11 @@ use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
+use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_table_partition::expression::PartitionedBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
-
-use crate::{
-    component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
-    datafusion::udf::deny_spice_specific_functions,
-    make_spice_data_directory,
-    parameters::ParameterSpec,
-    register_data_accelerator, spice_data_base_path,
-};
 
 use super::{AccelerationSource, DataAccelerator, upsert_dedup};
 
@@ -272,7 +272,13 @@ impl DataAccelerator for SqliteAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            download_snapshot_if_needed(
+                acceleration,
+                source,
+                PathBuf::from(path),
+                AccelerationEngine::Sqlite,
+            )
+            .await;
 
             self.get_shared_pool(source).await?;
         }
