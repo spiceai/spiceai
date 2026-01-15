@@ -17,11 +17,14 @@ connector-dremio = { path = "../../crates/data-connectors/connector-dremio", opt
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
 connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
+connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
 connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
 connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optional = true }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
+# connector-nfs requires system libnfs library - build separately with `nfs` feature
+connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
@@ -119,8 +122,9 @@ models = ["runtime/models"]
 mongodb = ["connector-mongodb", "runtime/mongodb"]
 mssql = ["connector-mssql", "runtime/mssql"]
 mysql = ["connector-mysql", "runtime/mysql"]
+# nfs feature requires system libnfs library and connector-nfs crate
 nfs = ["runtime/nfs"]
-odbc = ["runtime/odbc"]
+odbc = ["connector-odbc"]
 oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]

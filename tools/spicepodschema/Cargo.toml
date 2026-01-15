@@ -33,6 +33,7 @@ runtime = { path = "../../crates/runtime", features = [
     "mongodb",
     "mssql",
     "mysql",
+    # "nfs",  # requires system libnfs library
     # "odbc",
     "oracle",
     "postgres",
@@ -55,10 +56,12 @@ connector-dremio = { path = "../../crates/data-connectors/connector-dremio" }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb" }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql" }
 connector-ftp = { path = "../../crates/data-connectors/connector-ftp" }
+connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
 connector-imap = { path = "../../crates/data-connectors/connector-imap" }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb" }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql" }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql" }
+connector-nfs = { path = "../../crates/data-connectors/connector-nfs" }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle" }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres" }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb" }

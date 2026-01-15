@@ -3897,7 +3897,7 @@ dependencies = [
  "datafusion-table-providers",
  "linkme",
  "mysql_async",
- "opentelemetry",
+"opentelemetry",
  "paste",
  "runtime",
  "secrecy",
@@ -4011,6 +4011,8 @@ dependencies = [
  "runtime-parameters",
  "snafu",
 ]
+
+[[package]]
 
 [[package]]
 name = "console"
@@ -16779,23 +16781,6 @@ version = "2.0.0-unstable"
 dependencies = [
  "app",
  "clap 4.5.54",
- "connector-clickhouse",
- "connector-delta-lake",
- "connector-dremio",
- "connector-duckdb",
- "connector-flightsql",
- "connector-ftp",
- "connector-imap",
- "connector-mongodb",
- "connector-mssql",
- "connector-mysql",
- "connector-oracle",
- "connector-postgres",
- "connector-scylladb",
- "connector-sftp",
- "connector-sharepoint",
- "connector-snowflake",
- "connector-spark",
  "event_stream",
  "futures",
  "mimalloc",
@@ -16863,23 +16848,6 @@ dependencies = [
 name = "spicepodschema"
 version = "2.0.0-unstable"
 dependencies = [
- "connector-clickhouse",
- "connector-delta-lake",
- "connector-dremio",
- "connector-duckdb",
- "connector-flightsql",
- "connector-ftp",
- "connector-imap",
- "connector-mongodb",
- "connector-mssql",
- "connector-mysql",
- "connector-oracle",
- "connector-postgres",
- "connector-scylladb",
- "connector-sftp",
- "connector-sharepoint",
- "connector-snowflake",
- "connector-spark",
  "regex",
  "runtime",
  "runtime-parameters",

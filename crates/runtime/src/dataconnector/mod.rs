@@ -55,8 +55,28 @@ use tokio::sync::Mutex;
 use tracing::Level;
 
 use std::future::Future;
+use std::time::Duration;
 
 pub mod listing;
+
+/// Creates a default reqwest client with standard Spice settings.
+///
+/// # Errors
+///
+/// Returns an error if the client cannot be built.
+pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
+    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
+
+    reqwest::Client::builder()
+        .user_agent("spice")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .default_headers(headers)
+        .build()
+}
 
 #[derive(Clone, Copy)]
 pub struct DataConnectorRegistration {
@@ -138,15 +158,12 @@ pub mod file;
 
 pub mod git;
 pub mod github;
-pub mod graphql;
 pub mod https;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod localpod;
 pub mod memory;
 
-#[cfg(feature = "nfs")]
-pub mod nfs;
 #[cfg(feature = "odbc")]
 pub mod odbc;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built

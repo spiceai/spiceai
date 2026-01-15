@@ -16,6 +16,11 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+// Force linkage of connector-graphql crate by referencing it.
+// Without this reference, the linker may not include the crate and its
+// `register_data_connector!` registration won't appear in DATA_CONNECTOR_REGISTRATIONS.
+use connector_graphql as _;
+
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
