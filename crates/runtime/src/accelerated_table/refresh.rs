@@ -29,6 +29,7 @@ use crate::accelerated_table::snapshots::{
 };
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
+use crate::dataaccelerator::BootstrapStatus;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use arrow::datatypes::Schema;
@@ -49,7 +50,6 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
-use crate::dataaccelerator::BootstrapStatus;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
