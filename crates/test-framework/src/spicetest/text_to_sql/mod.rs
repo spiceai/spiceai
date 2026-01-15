@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, time::SystemTime};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime},
+};
 
 use crate::metrics::{MetricCollector, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms};
 use anyhow::{Context, Result};
@@ -23,9 +26,11 @@ use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 mod metrics;
 pub use metrics::{TextToSqlMetric, TextToSqlRunMetric};
 mod worker;
-pub use worker::{TextToSqlConfig, TextToSqlRequest, TextToSqlResult};
+pub use worker::{TextToSqlConfig, TextToSqlRequest};
 use worker::{TextToSqlWorker, TextToSqlWorkerResult};
 mod task_history;
+
+mod parse;
 
 #[derive(Default)]
 pub struct NotStarted {
@@ -63,7 +68,7 @@ pub struct Running {
 
 pub struct Completed {
     end_time: SystemTime,
-    results: BTreeMap<String, worker::TextToSqlResult>,
+    results: BTreeMap<String, metrics::TextToSqlMetric>,
 }
 
 impl TestState for NotStarted {}
@@ -162,38 +167,30 @@ impl SpiceTest<Running> {
 
 impl SpiceTest<Completed> {
     #[must_use]
-    pub fn get_results(&self) -> &BTreeMap<String, worker::TextToSqlResult> {
+    pub fn get_results(&self) -> &BTreeMap<String, metrics::TextToSqlMetric> {
         &self.state.results
     }
 
     pub fn get_run_metrics(&self) -> Result<TextToSqlRunMetric> {
-        Ok(TextToSqlRunMetric::new(
-            self.get_p95_response_time_metric(),
-            self.get_median_response_time_metric(),
-            self.get_exact_match_count(),
-            self.get_error_rate(),
-            self.get_mean_sql_query_count(),
-            self.get_mean_llm_input_tokens(),
-            self.get_mean_llm_output_tokens(),
-        ))
-    }
-
-    fn get_exact_match_count(&self) -> f64 {
-        let count = self
-            .state
-            .results
-            .values()
-            .filter(|result| result.generated_sql.trim() == result.expected_sql.trim())
-            .count();
-
         #[expect(clippy::cast_precision_loss)]
-        let rate = count as f64 / self.state.results.len() as f64;
-        rate
+        Ok(TextToSqlRunMetric::new(
+            self.percentile(|result| result.latency_ms, 95.0),
+            self.percentile(|result| result.latency_ms, 50.0),
+            self.mean(|result| result.generated_sql.trim() == result.expected_sql.trim()),
+            self.mean(|result| result.is_error),
+            self.mean(|result| result.sql_query_count as f64),
+            self.mean(|result| result.llm_input_tokens as f64),
+            self.mean(|result| result.llm_output_tokens as f64),
+            self.mean(|result| result.exact_logical_plan_match as f64),
+            self.mean(|result| result.correct_tables),
+            self.mean(|result| result.correct_table_projections),
+            self.mean(|result| result.correct_output_schema),
+        ))
     }
 
     fn aggregate<F, T, A>(&self, mut extractor: F, aggregator: A) -> f64
     where
-        F: FnMut(&TextToSqlResult) -> T,
+        F: FnMut(&TextToSqlMetric) -> T,
         T: Into<f64>,
         A: FnOnce(Vec<f64>) -> f64,
     {
@@ -208,7 +205,7 @@ impl SpiceTest<Completed> {
     }
     fn mean<F, T>(&self, extractor: F) -> f64
     where
-        F: FnMut(&TextToSqlResult) -> T,
+        F: FnMut(&TextToSqlMetric) -> T,
         T: Into<f64>,
     {
         self.aggregate(extractor, |values| {
@@ -221,7 +218,7 @@ impl SpiceTest<Completed> {
     }
     fn percentile<F, T>(&self, extractor: F, percentile: f64) -> f64
     where
-        F: FnMut(&TextToSqlResult) -> T,
+        F: FnMut(&TextToSqlMetric) -> T,
         T: Into<f64>,
     {
         self.aggregate(extractor, move |mut values| {
@@ -239,33 +236,6 @@ impl SpiceTest<Completed> {
             let index = ((values.len() - 1) as f64 * percentile / 100.0).round() as usize;
             values[index]
         })
-    }
-
-    fn get_error_rate(&self) -> f64 {
-        self.mean(|result| result.is_error)
-    }
-
-    fn get_p95_response_time_metric(&self) -> f64 {
-        1000.0 * self.percentile(|result| result.duration.as_secs_f64(), 95.0)
-    }
-
-    fn get_median_response_time_metric(&self) -> f64 {
-        1000.0 * self.percentile(|result| result.duration.as_secs_f64(), 50.0)
-    }
-
-    #[expect(clippy::cast_precision_loss)]
-    fn get_mean_sql_query_count(&self) -> f64 {
-        self.mean(|result| result.query_count as f64)
-    }
-
-    #[expect(clippy::cast_precision_loss)]
-    fn get_mean_llm_input_tokens(&self) -> f64 {
-        self.mean(|result| result.llm_input_tokens as f64)
-    }
-
-    #[expect(clippy::cast_precision_loss)]
-    fn get_mean_llm_output_tokens(&self) -> f64 {
-        self.mean(|result| result.llm_output_tokens as f64)
     }
 }
 
@@ -296,32 +266,16 @@ impl MetricCollector<TextToSqlMetric, TextToSqlRunMetric> for SpiceTest<Complete
             .results
             .iter()
             .map(|(id, result)| {
-                #[expect(clippy::cast_precision_loss)]
-                let latency_ms = result.duration.as_millis() as f64;
-                QueryMetric::new_from_durations(
+                #[expect(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_sign_loss)]
+                Ok(QueryMetric::new_from_durations(
                     id.as_str().into(),
-                    &vec![result.duration],
+                    &vec![Duration::from_millis(result.latency_ms as u64)],
                     QueryStatus::Passed,
                     system_time_to_unix_epoch_ms(self.start_time)?,
                     system_time_to_unix_epoch_ms(self.state.end_time)?,
-                )
-                .map(|metric| {
-                    metric.with_extended_metrics(TextToSqlMetric::new(
-                        result.question.clone(),
-                        result.generated_sql.clone(),
-                        result.expected_sql.clone(),
-                        result.query_count,
-                        result.sample_data_enabled,
-                        result.return_sql,
-                        result.is_error,
-                        latency_ms,
-                        result.sql_duration_ms,
-                        result.llm_duration_ms,
-                        result.llm_count,
-                        result.llm_input_tokens,
-                        result.llm_output_tokens,
-                    ))
-                })
+                )?
+                .with_extended_metrics(result.clone()))
             })
             .collect()
     }

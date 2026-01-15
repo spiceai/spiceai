@@ -273,7 +273,7 @@ impl Runtime {
                     name: acceleration_settings.engine.to_string(),
                 },
             ) {
-                Ok(()) => {
+                Ok(_) => {
                     // Initialization successful, continue to next view
                 }
                 Err(err) => {

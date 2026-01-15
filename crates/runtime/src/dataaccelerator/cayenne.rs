@@ -48,13 +48,13 @@ use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior};
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -1590,6 +1590,8 @@ impl CayenneAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file_path")
         .description("Path for storing Cayenne data files (Vortex files). Can be a local path or an S3 Express One Zone path. For S3 Express One Zone, use format: 's3://{bucket-name}--{zone-id}--x-s3/{prefix}/'. When S3 Express One Zone is specified, data files are stored exclusively in S3 while metadata (SQLite) remains on local disk."),
+    ParameterSpec::component("metadata_dir")
+        .description("Path for storing Cayenne metadata (SQLite catalog). If not specified, defaults to '{cayenne_file_path}/metadata'."),
     ParameterSpec::component("metastore")
         .description("Metastore backend for Cayenne catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time)")
         .default("sqlite"),
@@ -1701,7 +1703,7 @@ impl DataAccelerator for CayenneAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         tracing::warn!(
             "Cayenne data accelerator (Alpha) is in preview and should not be used in production."
         );
@@ -1753,11 +1755,10 @@ impl DataAccelerator for CayenneAccelerator {
 
             // Validate that snapshots are not enabled
             if !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(
-                        "Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: false' or remove the snapshots configuration",
-                    ),
-                }));
+                tracing::warn!(
+                    "Dataset {}: Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: disabled' or remove the snapshots configuration",
+                    source.name()
+                );
             }
         }
 
@@ -1807,7 +1808,7 @@ impl DataAccelerator for CayenneAccelerator {
                 }
             }
 
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         // If mode is FileCreate, delete the existing directory and metadata to start fresh
@@ -1868,10 +1869,16 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            download_snapshot_if_needed(acceleration, source, path_buf).await;
+            Ok(download_snapshot_if_needed(
+                acceleration,
+                source,
+                path_buf,
+                AccelerationEngine::Cayenne,
+            )
+            .await)
+        } else {
+            Ok(BootstrapStatus::none())
         }
-
-        Ok(())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.

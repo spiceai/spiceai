@@ -250,7 +250,13 @@ default = [
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
-duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb", "datafusion-optimizer-rules/duckdb"]
+duckdb = [
+    "dep:duckdb",
+    "db_connection_pool/duckdb",
+    "data_components/duckdb",
+    "datafusion-optimizer-rules/duckdb",
+    "runtime-acceleration/duckdb",
+]
 dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb", "dep:dynamodb-streams", "dep:humantime"]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
@@ -306,6 +312,7 @@ sqlite = [
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "dep:rusqlite",
+    "runtime-acceleration/sqlite",
 ]
 turso = [
     "dep:turso",
@@ -314,6 +321,7 @@ turso = [
     "data_components/sqlite",
     "data_components/turso",
     "dep:rusqlite",
+    "runtime-acceleration/turso"
 ]
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso"] }
