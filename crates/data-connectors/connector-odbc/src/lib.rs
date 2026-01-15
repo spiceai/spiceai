@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, parameters::Parameters, register_data_connector};
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::odbc::ODBCTableFactory;
@@ -25,15 +24,18 @@ use datafusion::sql::unparser::dialect::{
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    NewDataConnectorResult,
+};
+use runtime::parameters::{ParameterSpec, Parameters};
+use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
-};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -212,6 +214,12 @@ fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {
     Ok(())
 }
 
+impl std::fmt::Debug for ODBCFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ODBCFactory").finish()
+    }
+}
+
 impl DataConnectorFactory for ODBCFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -220,7 +228,7 @@ impl DataConnectorFactory for ODBCFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             parameter_is_integer(&params.parameters, "max_binary_size")?;
             parameter_is_integer(&params.parameters, "max_text_size")?;
@@ -286,13 +294,16 @@ where
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.odbc_factory, dataset.path().into())
                 .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "odbc",
-                    connector_component: ConnectorComponent::from(dataset),
+                .map_err(|source| {
+                    runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "odbc".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source,
+                    }
                 })?,
         )
     }

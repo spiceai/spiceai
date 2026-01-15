@@ -164,8 +164,6 @@ pub mod kafka;
 pub mod localpod;
 pub mod memory;
 
-#[cfg(feature = "odbc")]
-pub mod odbc;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
 pub mod gcs;
