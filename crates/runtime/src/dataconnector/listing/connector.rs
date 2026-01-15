@@ -106,10 +106,6 @@ impl LocationPruningListingTable {
         &self.inner.options().table_partition_cols
     }
 
-    fn metadata_columns(&self) -> &Vec<MetadataColumn> {
-        &self.inner.options().metadata_cols
-    }
-
     fn object_store_url(&self) -> ObjectStoreUrl {
         // Safe: Listing tables share object store across paths. Should always have at least one path.
         self.inner.table_paths().first().map_or_else(
