@@ -2123,3 +2123,157 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
         })
         .await
 }
+
+/// Test that queries with explicit column selection work correctly in caching mode.
+///
+/// This verifies that:
+/// 1. Queries selecting specific columns return only those columns
+/// 2. Internal columns used for cache management are not exposed
+/// 3. Data integrity is maintained for the columns users did request
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            // Create HTTP dataset with caching mode
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("300s".to_string()), // Long TTL to ensure no expiry during test
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_projection")
+                .with_dataset(dataset)
+                .build();
+
+            // Disable SQL results caching
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // STEP 1: First query to populate the cache (SELECT content - cache miss)
+            eprintln!("TEST: Step 1 - Populating cache with SELECT content...");
+            let df_populate = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=lauren")))?
+                .select(vec![col("content")])?;
+
+            let populate_results = df_populate.collect().await?;
+            assert!(
+                !populate_results.is_empty() && populate_results[0].num_rows() > 0,
+                "Should have fetched data from HTTP source"
+            );
+            assert_column_has_data(&populate_results, "content");
+
+            // Verify Step 1 returns only the requested column
+            let schema_step1 = populate_results[0].schema();
+            assert!(
+                schema_step1.column_with_name("content").is_some(),
+                "content should be in results"
+            );
+            assert_eq!(
+                schema_step1.fields().len(),
+                1,
+                "Should only have 1 column (content)"
+            );
+
+            // STEP 2: Query with same projection (cache hit)
+            eprintln!("TEST: Step 2 - Querying with SELECT content (should hit cache)...");
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=lauren")))?
+                .select(vec![col("content")])?;
+
+            let results = df.collect().await?;
+
+            assert!(
+                !results.is_empty() && results[0].num_rows() > 0,
+                "Should have data from cache"
+            );
+            assert_column_has_data(&results, "content");
+
+            let schema = results[0].schema();
+
+            // Verify only the requested column is present
+            assert!(
+                schema.column_with_name("content").is_some(),
+                "content should be in results"
+            );
+
+            // Verify we only have the 1 column we requested
+            assert_eq!(
+                schema.fields().len(),
+                1,
+                "Should only have 1 column (content)"
+            );
+
+            eprintln!("\nTEST SUMMARY:");
+            eprintln!("✅ Step 1: SELECT content (cache miss) - populated cache, content has data");
+            eprintln!("✅ Step 2: SELECT content (cache hit) - content has data");
+
+            Ok(())
+        })
+        .await
+}
+
+/// Asserts that the specified column in the given record batches contains non-empty string data.
+fn assert_column_has_data(batches: &[arrow::array::RecordBatch], column_name: &str) {
+    assert!(!batches.is_empty(), "expected at least one batch");
+
+    let total_len: usize = batches
+        .iter()
+        .filter_map(|b| b.schema().index_of(column_name).ok().map(|i| b.column(i)))
+        .map(|col| {
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column should be StringArray")
+                .iter()
+                .flatten()
+                .map(str::len)
+                .sum::<usize>()
+        })
+        .sum();
+
+    assert!(total_len > 0, "'{column_name}' column has no data");
+}
