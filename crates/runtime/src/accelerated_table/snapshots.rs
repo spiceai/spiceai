@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, sleep};
 
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ pub type SnapshotCallback =
 
 /// Spawns a task that periodically creates snapshots at the specified interval.
 ///
-/// If `dataset_ready_notify` is provided, the task will wait for the dataset to be ready
+/// If `dataset_ready_notification` is provided, the task will wait for the dataset to be ready
 /// before starting the snapshot interval loop. This prevents creating snapshots before
 /// the dataset has finished its initial load or bootstrap.
 ///
@@ -81,8 +81,7 @@ pub fn spawn_snapshot_interval_task(
                 "Snapshot interval task for {dataset_name} starting after dataset ready"
             );
         } else {
-            tracing::warn!(
-                // TODO: should be debug
+            tracing::debug!(
                 "Snapshot interval task for {dataset_name} starting immediately, no dataset_ready_notification provided"
             );
         }
@@ -131,7 +130,7 @@ pub fn spawn_snapshot_interval_task(
 
 /// Creates a callback that triggers snapshot creation after a specified number of batch updates.
 ///
-/// If `dataset_ready_notify` is provided, batch counting will only start after the dataset
+/// If `dataset_ready_notification` is provided, batch counting will only start after the dataset
 /// is ready. This prevents counting batches during the initial load/bootstrap phase.
 pub fn create_periodic_snapshot_callback(
     batches: i64,
@@ -168,8 +167,7 @@ pub fn create_periodic_snapshot_callback(
                     );
                 });
             } else {
-                tracing::warn!(
-                    // TODO: should be debug
+                tracing::debug!(
                     "Batch-based snapshot counting for {dataset_name} starting immediately, no dataset_ready_notification provided"
                 );
             }

@@ -770,7 +770,6 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
 
-        let on_complete_for_snapshots = self.on_complete_notification.clone();
         let (snapshot_interval_task, create_checkpoint_snapshot_after_refresh) =
             match snapshot_trigger {
                 // This will only create checkpoint - default behavior when snapshots are not configured

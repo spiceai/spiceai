@@ -275,7 +275,6 @@ impl Runtime {
             ) {
                 Ok(_) => {
                     // Initialization successful, continue to next view
-                    // Note: Views don't currently use the bootstrapped state
                 }
                 Err(err) => {
                     let view_name = &view.name;

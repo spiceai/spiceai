@@ -32,7 +32,7 @@ use runtime_acceleration::{
 use snafu::ResultExt;
 
 /// Downloads a snapshot if needed for bootstrapping.
-/// Returns `WasBootstrapped`::`Yes` if a snapshot was successfully downloaded.
+/// Returns `BootstrapStatus`::`Bootstrapped` if a snapshot was successfully downloaded.
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
