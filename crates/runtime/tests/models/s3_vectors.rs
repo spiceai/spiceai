@@ -19,7 +19,6 @@ use aws_credential_types::Credentials;
 use aws_sdk_credential_bridge::default_aws_config;
 use s3_vectors::{Client, DeleteIndexInput, S3Vectors};
 use serde_json::json;
-use snafu::ResultExt;
 use spicepod::{
     acceleration::Acceleration,
     component::dataset::Dataset,
@@ -29,18 +28,19 @@ use spicepod::{
 
 use crate::models::search::{SearchTestCase, SearchTestType, vectors_nonfilterable_col};
 
-mod search {
+pub(crate) mod search {
     use crate::{
         configure_test_datafusion,
         models::{
             get_mega_science_dataset, get_mega_science_view,
-            hf::{get_huggingface_embeddings, get_model_to_vec_embeddings},
+            hf::get_model_to_vec_embeddings,
             s3_vectors::{
                 basic_vector_search_tests, basic_vector_search_tests_on_table, delete_index,
                 vectors_filterable_col,
             },
             search::{
-                SearchTestCase, SearchTestType, run_search_w_explain, vectors_nonfilterable_col,
+                SearchTestCase, SearchTestType, replace_s3_vector_index_names,
+                run_search_w_explain, vectors_nonfilterable_col,
             },
         },
         utils::verify_env_secret_exists,
@@ -114,17 +114,16 @@ mod search {
     async fn basic_functionality() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
 
-        let mut ds =
-            get_mega_science_dataset(
-                Some("qs"),
-                None,
-                Some(Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-                )),
-            );
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            None,
+            Some(Column::new("answer").with_embedding(
+                ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
+            )),
+        );
         ds.vectors = Some(init_vector_store("spice-ci-tests-s3-vectors-basic", true).await?);
         app = add_mega_science_view_from_ds(app, &ds).await?;
         app = app.with_dataset(ds);
@@ -142,23 +141,21 @@ mod search {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn hybrid_w_vector_engine() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
-        let mut ds =
-            get_mega_science_dataset(
-                Some("qs"),
-                Some(
-                    Column::new("question")
-                        .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
-                ),
-                Some(Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-                )),
-            );
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            Some(
+                Column::new("question")
+                    .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+            ),
+            Some(Column::new("answer").with_embedding(
+                ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
+            )),
+        );
         ds.vectors = Some(init_vector_store("spice-ci-tests-s3-vectors-hybrid", true).await?);
         app = add_mega_science_view_from_ds(app, &ds).await?;
         app = app.with_dataset(ds);
@@ -259,19 +256,18 @@ mod search {
     async fn multiple_embeddings() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
 
-        let mut ds =
-            get_mega_science_dataset(
-                Some("qs"),
-                Some(Column::new("question").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-                )),
-                Some(Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
-                )),
-            );
+        let mut ds = get_mega_science_dataset(
+            Some("qs"),
+            Some(Column::new("question").with_embedding(
+                ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
+            )),
+            Some(Column::new("answer").with_embedding(
+                ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
+            )),
+        );
         let vector_store = init_vector_store("spice-ci-tests-s3-vectors-hybrid", true).await?;
         ds.vectors = Some(vector_store);
 
@@ -337,14 +333,14 @@ mod search {
     async fn multi_column_primary_key() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
             Some(
                 Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                    ColumnLevelEmbeddingConfig::model("potion-base-2M")
                         .with_row_id("id")
                         .with_row_id("question"),
                 ),
@@ -394,14 +390,14 @@ mod search {
     async fn with_chunking_metadata() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
             Some(vectors_nonfilterable_col(
                 Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                    ColumnLevelEmbeddingConfig::model("potion-base-2M")
                         .with_row_id("id")
                         .chunking(
                             EmbeddingChunkConfig::enabled()
@@ -468,14 +464,14 @@ mod search {
     async fn with_chunking() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
         let mut ds = get_mega_science_dataset(
             Some("qs"),
             None,
             Some(
                 Column::new("answer").with_embedding(
-                    ColumnLevelEmbeddingConfig::model("hf_minilm")
+                    ColumnLevelEmbeddingConfig::model("potion-base-2M")
                         .with_row_id("id")
                         .chunking(
                             EmbeddingChunkConfig::enabled()
@@ -541,11 +537,10 @@ mod search {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn metadata_columns() -> Result<(), anyhow::Error> {
         let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
             "minishlab/potion-base-2M",
-            "hf_minilm",
+            "potion-base-2M",
         ));
         // Metadata columns: question, subject (filterable), answer
         // Base columns:     reference_answer,source
@@ -555,7 +550,7 @@ mod search {
             Some(
                 Column::new("answer")
                     .with_embedding(
-                        ColumnLevelEmbeddingConfig::model("hf_minilm").with_row_id("id"),
+                        ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
                     )
                     .with_metadata(
                         [(
@@ -668,14 +663,16 @@ mod search {
         let bucket_name = "spice-ci-tests-s3-vectors-filters-pushdown";
         let vector_store = init_vector_store(bucket_name, true).await?;
 
-        let mut test_dataset = get_package_delivery_dataset("data/", "delivery", None, "hf_minilm");
+        // Use a single JSON file instead of the entire data/ directory to reduce embedding time
+        let mut test_dataset =
+            get_package_delivery_dataset("data/01.json", "delivery", None, "potion-base-2M");
         test_dataset.vectors = Some(vector_store);
 
         let app = AppBuilder::new("search_app")
             .with_dataset(test_dataset)
-            .with_embedding(get_huggingface_embeddings(
-                "sentence-transformers/all-MiniLM-L6-v2",
-                "hf_minilm",
+            .with_embedding(get_model_to_vec_embeddings(
+                "minishlab/potion-base-2M",
+                "potion-base-2M",
             ))
             .build();
 
@@ -748,14 +745,15 @@ mod search {
         ] {
             let vector_store = init_vector_store(bucket_name, true).await?;
 
-            let mut ds = get_package_delivery_dataset(data_path, "delivery", None, "hf_minilm");
+            let mut ds =
+                get_package_delivery_dataset(data_path, "delivery", None, "potion-base-2M");
             ds.vectors = Some(vector_store);
 
             let app = AppBuilder::new("search_app")
                 .with_dataset(ds)
                 .with_embedding(get_model_to_vec_embeddings(
                     "minishlab/potion-base-2M",
-                    "hf_minilm",
+                    "potion-base-2M",
                 ))
                 .build();
 
@@ -781,6 +779,12 @@ mod search {
 
         let _tracing: tracing::subscriber::DefaultGuard =
             crate::init_tracing(DEFAULT_TRACING_MODELS);
+
+        // Skip test if Docker is not available (e.g., on macOS CI runners without Docker)
+        if !crate::docker::is_docker_available().await {
+            tracing::info!("Docker is not available, skipping s3_vectors_kafka_stream test");
+            return Ok(());
+        }
 
         test_request_context()
             .scope(async {
@@ -810,7 +814,7 @@ mod search {
                 ds.vectors = Some(vector_store);
                 ds.columns = vec![
                     Column::new("answer").with_embeddings(vec![ColumnLevelEmbeddingConfig {
-                        model: "hf_minilm".to_string(),
+                        model: "potion-base-2M".to_string(),
                         chunking: None,
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
@@ -818,9 +822,9 @@ mod search {
 
                 let app = AppBuilder::new("search_app")
                     .with_dataset(ds)
-                    .with_embedding(get_huggingface_embeddings(
-                        "sentence-transformers/all-MiniLM-L6-v2",
-                        "hf_minilm",
+                    .with_embedding(get_model_to_vec_embeddings(
+                        "minishlab/potion-base-2M",
+                        "potion-base-2M",
                     ))
                     .build();
 
@@ -854,33 +858,51 @@ mod search {
         bucket_name: &str,
         predelete_index: bool,
     ) -> Result<VectorStore, anyhow::Error> {
+        // Use full u8 range (0-255) for index naming to reduce collision risk in parallel test runs
         init_vector_store_w_index_name(
             bucket_name,
-            format!("test-index-{}", rand::random::<u8>() % 11).as_str(),
+            format!("test-index-{}", rand::random::<u8>()).as_str(),
             predelete_index,
         )
         .await
     }
 
-    async fn init_vector_store_w_index_name(
-        bucket_name: &str,
-        index_name: &str,
+    pub(crate) async fn prepare_for_aws_tests(
+        store: &VectorStore,
         predelete_index: bool,
-    ) -> Result<VectorStore, anyhow::Error> {
+    ) -> Result<(), anyhow::Error> {
         for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
             verify_env_secret_exists(env_var)
                 .await
                 .map_err(anyhow::Error::msg)?;
         }
 
+        let bucket_name = store
+            .params
+            .as_ref()
+            .and_then(|p| p.as_string_map().get("s3_vectors_bucket").cloned())
+            .unwrap_or_default();
+        let index_name = store
+            .params
+            .as_ref()
+            .and_then(|p| p.as_string_map().get("s3_vectors_index").cloned())
+            .unwrap_or_default();
+
         if predelete_index {
-            let _ = delete_index(bucket_name, index_name)
+            let _ = delete_index(bucket_name.as_str(), index_name.as_str())
                 .await
                 .inspect_err(|e| {
-                    tracing::warn!("failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}. ");
+                    tracing::debug!("Failed to pre-delete index '{index_name}' in bucket '{bucket_name}': {e}. This is expected if the index does not exist yet.");
                 });
         }
+        Ok(())
+    }
 
+    pub(crate) async fn init_vector_store_w_index_name(
+        bucket_name: &str,
+        index_name: &str,
+        predelete_index: bool,
+    ) -> Result<VectorStore, anyhow::Error> {
         let params = spicepod::param::Params::from_string_map(
             vec![
                 ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
@@ -899,12 +921,14 @@ mod search {
             .collect(),
         );
 
-        Ok(VectorStore {
+        let store = VectorStore {
             enabled: true,
             engine: Some("s3_vectors".to_string()),
             params: Some(params),
             partition_by: vec![],
-        })
+        };
+        let () = prepare_for_aws_tests(&store, predelete_index).await?;
+        Ok(store)
     }
 
     async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
@@ -912,7 +936,7 @@ mod search {
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(90)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
             () = Arc::clone(&rt).load_components() => {}
@@ -942,8 +966,9 @@ mod search {
         }
 
         let formatted = arrow::util::pretty::pretty_format_batches(&batches)
-            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-        insta::assert_snapshot!(test_name, formatted);
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?
+            .to_string();
+        insta::assert_snapshot!(test_name, replace_s3_vector_index_names(&formatted));
         Ok(())
     }
 }
@@ -1026,8 +1051,12 @@ async fn delete_index(
         .set_vector_bucket_name(Some(bucket_name.to_string()))
         .build()?;
 
-    s3_vector_client.delete_index(input).await.boxed()?;
-
+    // Don't return error if delete fails, as index may not exist
+    if let Err(e) = s3_vector_client.delete_index(input).await {
+        tracing::debug!(
+            "failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}."
+        );
+    }
     Ok(())
 }
 

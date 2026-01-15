@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::key::PassthroughHashBuilder;
 use crate::{
     AsTableRefs, CacheProvider, FailedToInvalidateCacheSnafu, HashProvider, Result,
     TabledCacheProvider,
@@ -31,16 +32,20 @@ use std::time::Duration;
 // 'static is required by a bound from moka::Cache
 pub struct SimpleCache<
     V: Clone + Send + Sync + 'static,
-    T: BuildHasher + Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
 > {
-    cache: Cache<u64, V, T>,
+    cache: Cache<u64, V, PassthroughHashBuilder<T>>,
     hasher: T,
     max_size: u64,
     ttl: Duration,
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static> Display
-    for SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> Display for SimpleCache<V, T, H>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -52,8 +57,11 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     }
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    std::fmt::Debug for SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> std::fmt::Debug for SimpleCache<V, T, H>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimpleCache")
@@ -63,15 +71,18 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     }
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> SimpleCache<V, T, H>
 {
     pub fn new(cache_max_size: u64, ttl: Duration, hasher: T) -> Self {
-        let cache: Cache<u64, V, T> = Cache::builder()
+        let cache: Cache<u64, V, PassthroughHashBuilder<T>> = Cache::builder()
             .time_to_live(ttl)
             .max_capacity(cache_max_size)
             .support_invalidation_closures()
-            .build_with_hasher(hasher.clone());
+            .build_with_hasher(PassthroughHashBuilder::new(hasher.clone()));
 
         SimpleCache {
             cache,
@@ -82,16 +93,22 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
     }
 }
 
-impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    SimpleCache<V, T>
+impl<
+    V: AsTableRefs + Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> SimpleCache<V, T, H>
 {
     pub fn as_tabled_provider(self: Arc<Self>) -> Arc<dyn TabledCacheProvider<V> + Send + Sync> {
         self
     }
 }
 
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static> HashProvider
-    for SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> HashProvider for SimpleCache<V, T, H>
 {
     fn hasher(&self) -> Box<dyn Hasher> {
         Box::new(self.hasher.build_hasher())
@@ -99,8 +116,11 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
 }
 
 #[async_trait]
-impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    CacheProvider<V> for SimpleCache<V, T>
+impl<
+    V: Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> CacheProvider<V> for SimpleCache<V, T, H>
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V> {
         self.cache.get(key).await
@@ -134,8 +154,11 @@ impl<V: Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 's
 }
 
 #[async_trait]
-impl<V: AsTableRefs + Clone + Send + Sync + 'static, T: BuildHasher + Clone + Send + Sync + 'static>
-    TabledCacheProvider<V> for SimpleCache<V, T>
+impl<
+    V: AsTableRefs + Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+> TabledCacheProvider<V> for SimpleCache<V, T, H>
 {
     fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
         let table_name = match &table_ref {
@@ -197,10 +220,13 @@ mod tests {
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_put_and_get<T: BuildHasher + Clone + Send + Sync + 'static>(
+    async fn test_cache_put_and_get<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
         #[case] hasher: T,
     ) {
-        let cache: SimpleCache<CachedQueryResult, _> =
+        let cache: SimpleCache<CachedQueryResult, _, _> =
             SimpleCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;
@@ -224,8 +250,13 @@ mod tests {
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_miss<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
-        let cache: SimpleCache<CachedQueryResult, _> =
+    async fn test_cache_miss<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
+        #[case] hasher: T,
+    ) {
+        let cache: SimpleCache<CachedQueryResult, _, _> =
             SimpleCache::new(10, Duration::from_secs(60), hasher);
         let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
 
@@ -241,10 +272,13 @@ mod tests {
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_invalidate_all<T: BuildHasher + Clone + Send + Sync + 'static>(
+    async fn test_cache_invalidate_all<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
         #[case] hasher: T,
     ) {
-        let cache: SimpleCache<CachedQueryResult, _> =
+        let cache: SimpleCache<CachedQueryResult, _, _> =
             SimpleCache::new(10, Duration::from_secs(60), hasher);
         let result = create_test_cached_result().await;
 
@@ -275,8 +309,13 @@ mod tests {
     #[case::siphash(RandomState::default())]
     #[case::ahash(ahash::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_ttl<T: BuildHasher + Clone + Send + Sync + 'static>(#[case] hasher: T) {
-        let cache: SimpleCache<CachedQueryResult, _> =
+    async fn test_cache_ttl<
+        H: Hasher + Send + Sync + 'static,
+        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    >(
+        #[case] hasher: T,
+    ) {
+        let cache: SimpleCache<CachedQueryResult, _, _> =
             SimpleCache::new(10, Duration::from_millis(100), hasher);
         let key = || CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
         let result = create_test_cached_result().await;

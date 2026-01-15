@@ -26,6 +26,7 @@ use super::{
 
 use crate::{
     Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
+    register_data_connector,
 };
 
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
@@ -322,3 +323,5 @@ impl ListingTableConnector for S3 {
         }
     }
 }
+
+register_data_connector!("s3", S3Factory);

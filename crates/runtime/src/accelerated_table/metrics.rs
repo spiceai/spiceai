@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::LazyLock;
-
 use opentelemetry::{
     global,
     metrics::{Counter, Gauge, Histogram, Meter},
 };
+use std::sync::LazyLock;
+use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
 
 pub const METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS: &str =
     "dataset_acceleration_max_timestamp_before_refresh_ms";
@@ -58,6 +58,7 @@ pub(crate) static REFRESH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(
         .f64_histogram("dataset_acceleration_refresh_duration_ms")
         .with_description("Duration in milliseconds to load a full or appended refresh data.")
         .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 

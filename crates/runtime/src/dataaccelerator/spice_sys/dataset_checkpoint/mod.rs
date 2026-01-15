@@ -35,7 +35,6 @@ const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
 const SCHEMA_MIGRATION_01_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
 
-mod cayenne;
 #[cfg(feature = "duckdb")]
 mod duckdb;
 #[cfg(feature = "postgres")]
@@ -113,9 +112,8 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => Self::init_sqlite(conn).await?,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => Self::init_turso(pool).await?,
-            AccelerationConnection::Cayenne(metadata_path, data_path) => {
-                Self::init_cayenne(metadata_path, data_path)?;
-            }
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => Self::init_sqlite(conn).await?,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
@@ -135,9 +133,8 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => Self::migrate_sqlite(conn).await?,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => Self::migrate_turso(pool).await?,
-            AccelerationConnection::Cayenne(_, _) => {
-                // Cayenne doesn't need migration, schema is managed separately
-            }
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => Self::migrate_sqlite(conn).await?,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
@@ -175,8 +172,9 @@ impl DatasetCheckpoint {
             AccelerationConnection::Turso(pool) => {
                 self.exists_turso(pool).await.ok().unwrap_or(false)
             }
-            AccelerationConnection::Cayenne(_, data_path) => {
-                Self::exists_cayenne(data_path).ok().unwrap_or(false)
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => {
+                self.exists_sqlite(conn).await.ok().unwrap_or(false)
             }
             #[cfg(not(any(
                 feature = "sqlite",
@@ -200,9 +198,8 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => self.last_checkpoint_time_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.last_checkpoint_time_turso(pool).await,
-            AccelerationConnection::Cayenne(_, data_path) => {
-                Self::last_checkpoint_time_cayenne(data_path)
-            }
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => self.last_checkpoint_time_sqlite(conn).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
@@ -223,9 +220,8 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => self.checkpoint_sqlite(conn, schema).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.checkpoint_turso(pool, schema).await,
-            AccelerationConnection::Cayenne(metadata_path, data_path) => {
-                Self::checkpoint_cayenne(metadata_path, data_path, schema)
-            }
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => self.checkpoint_sqlite(conn, schema).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
@@ -246,9 +242,8 @@ impl DatasetCheckpoint {
             AccelerationConnection::SQLite(conn) => self.get_schema_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.get_schema_turso(pool).await,
-            AccelerationConnection::Cayenne(metadata_path, _) => {
-                Self::get_schema_cayenne(metadata_path)
-            }
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => self.get_schema_sqlite(conn).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",

@@ -18,6 +18,11 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
+pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
+    0.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0,
+    100_000.0, 250_000.0, 500_000.0,
+];
+
 static METER: LazyLock<Meter> =
     LazyLock::new(|| global::meter("dataset_acceleration_snapshot_metrics"));
 
@@ -67,6 +72,7 @@ static SNAPSHOT_WRITE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
             "Time in milliseconds taken to write the latest snapshot to object storage.",
         )
         .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 

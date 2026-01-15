@@ -233,7 +233,6 @@ impl Highlighter for EditorHelper {
     }
 }
 
-#[expect(clippy::too_many_lines)]
 #[expect(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
@@ -331,7 +330,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     rl.set_helper(Some(EditorHelper::new(
         Some(client.clone()),
         repl_config.api_key.clone(),
-        user_agent.to_string(),
+        user_agent.clone(),
     )));
     if let Some(helper) = rl.helper_mut() {
         // Perform initial refresh to populate autocomplete immediately with a 2-second timeout
@@ -578,7 +577,9 @@ pub async fn get_records(
         .metadata()
         .get("results-cache-status")
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|s| s.to_lowercase().starts_with("hit"));
+        .is_some_and(|s| {
+            s.to_lowercase().starts_with("hit") || s.to_lowercase().starts_with("stale")
+        });
 
     let stream = response.into_inner();
 

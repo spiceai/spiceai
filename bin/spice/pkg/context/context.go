@@ -239,12 +239,13 @@ func (c *RuntimeContext) Init(flags *pflag.FlagSet) error {
 
 func (c *RuntimeContext) Version() (string, error) {
 	spiceCMD := c.binaryFilePath(constants.SpiceRuntimeFilename)
-	version, err := exec.Command(spiceCMD, "--version").Output()
+	cmd := exec.Command(spiceCMD, "--version")
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%s: %w", strings.TrimSpace(string(output)), err)
 	}
 
-	return strings.TrimSpace(string(version)), nil
+	return strings.TrimSpace(string(output)), nil
 }
 
 func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
@@ -693,18 +694,10 @@ func (c *RuntimeContext) configureMetricsFlag(args []string) []string {
 	return args
 }
 
-func (c *RuntimeContext) configureOpenTelemetryEndpoint(args []string) []string {
-	if otelEndpoint, err := c.flags.GetString("open-telemetry-endpoint"); err == nil && otelEndpoint != "" {
-		args = appendIfAbsent(args, "--open_telemetry", otelEndpoint)
-	}
-	return args
-}
-
 func (c *RuntimeContext) configureEndpoints(args []string) []string {
 	args = c.configureFlightFlag(args)
 	args = appendIfAbsent(args, "--http", c.HttpSocketAddress())
 	args = c.configureMetricsFlag(args)
-	args = c.configureOpenTelemetryEndpoint(args)
 	return args
 }
 

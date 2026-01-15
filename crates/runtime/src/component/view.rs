@@ -177,7 +177,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
         let table_reference = Dataset::parse_table_reference(&view.name)?;
 
         let sql = if let Some(view_sql) = &view.sql {
-            view_sql.to_string()
+            view_sql.clone()
         } else if let Some(sql_ref) = &view.sql_ref {
             View::load_sql_ref(sql_ref)?
         } else {

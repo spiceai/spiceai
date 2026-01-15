@@ -17,12 +17,15 @@ limitations under the License.
 use std::{
     collections::HashMap,
     env,
-    io::Cursor,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{run_query, runtime_ready_check, test_request_context},
+};
 use anyhow::{Context, Result, anyhow};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -41,9 +44,10 @@ use object_store::{
 };
 use runtime::{Runtime, status::ComponentStatus};
 use runtime_acceleration::snapshot::{
-    SnapshotAdapter, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
+    AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
 use serde_json::{Value, json};
+use spicepod::acceleration::SnapshotsCompaction;
 use spicepod::{
     acceleration::{
         Acceleration, Mode, RefreshOnStartup, SnapshotBehavior as DatasetSnapshotBehavior,
@@ -54,7 +58,6 @@ use spicepod::{
     },
     param::Params,
 };
-use tar::Archive;
 use tempfile::TempDir;
 use tokio::{
     fs,
@@ -62,11 +65,6 @@ use tokio::{
     time::{sleep, timeout},
 };
 use uuid::Uuid;
-
-use crate::{
-    configure_test_datafusion, init_tracing,
-    utils::{run_query, runtime_ready_check, test_request_context},
-};
 
 const SNAPSHOT_BUCKET: &str = "spiceai-snapshot-integration-tests";
 const SNAPSHOT_REGION: &str = "us-west-2";
@@ -255,19 +253,6 @@ impl SnapshotFixture {
 
     async fn cleanup(self) -> Result<()> {
         self.context.cleanup().await
-    }
-}
-
-fn snapshot_adapter_for_engine(engine: &str) -> SnapshotAdapter {
-    if engine.eq_ignore_ascii_case("cayenne") {
-        SnapshotAdapter::directory_archive_with(Arc::new(|base| {
-            Ok(vec![
-                (base.join("metadata"), "metadata/".to_string()),
-                (base.to_path_buf(), "data/".to_string()),
-            ])
-        }))
-    } else {
-        SnapshotAdapter::identity()
     }
 }
 
@@ -471,9 +456,12 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
     let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
     load_runtime(Arc::clone(&runtime)).await?;
 
-    let baseline = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-        .await
-        .context("Executing baseline query for DuckDB snapshot")?;
+    let baseline = run_query(
+        &runtime,
+        "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+    )
+    .await
+    .context("Executing baseline query for DuckDB snapshot")?;
 
     let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
         .await
@@ -556,9 +544,12 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
     let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
     load_runtime(Arc::clone(&runtime)).await?;
 
-    let baseline = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-        .await
-        .context("Executing baseline query for SQLite snapshot")?;
+    let baseline = run_query(
+        &runtime,
+        "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+    )
+    .await
+    .context("Executing baseline query for SQLite snapshot")?;
 
     let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
         .await
@@ -596,90 +587,6 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
     })
 }
 
-async fn prepare_cayenne_fixture(test_name: &str) -> Result<SnapshotFixture> {
-    configure_test_datafusion();
-
-    let context = SnapshotS3Context::new(test_name).await?;
-    let temp_dir = TempDir::new().context("Creating temporary directory for Cayenne")?;
-    let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
-    let sample_source_path = temp_dir.path().join("taxi_sample.csv");
-    fs::write(&sample_source_path, sample_csv_contents)
-        .await
-        .context("Writing sample CSV for dataset source")?;
-    let dataset_from = format!("file://{}", sample_source_path.display());
-    let local_db_path = temp_dir.path().join("taxi_trips");
-
-    let dataset_params = HashMap::from([
-        ("file_format".to_string(), "csv".to_string()),
-        ("csv_has_header".to_string(), "true".to_string()),
-    ]);
-
-    let mut accel_params = HashMap::new();
-    accel_params.insert(
-        "cayenne_warehouse".to_string(),
-        local_db_path.to_string_lossy().to_string(),
-    );
-
-    let dataset = build_dataset(
-        &dataset_from,
-        TAXI_TRIPS_DATASET_NAME,
-        &dataset_params,
-        DatasetSnapshotBehavior::Enabled,
-        &accel_params,
-        "cayenne",
-        RefreshOnStartup::Auto,
-    );
-
-    let snapshots = build_snapshots_config(&context, BootstrapOnFailureBehavior::Warn);
-
-    let app = AppBuilder::new(format!("{test_name}_bootstrap"))
-        .with_snapshots(snapshots)
-        .with_dataset(dataset)
-        .build();
-
-    let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
-    load_runtime(Arc::clone(&runtime)).await?;
-
-    let baseline = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-        .await
-        .context("Executing baseline query for Cayenne snapshot")?;
-
-    let schema = run_query(&runtime, "SELECT * FROM taxi_trips LIMIT 1")
-        .await
-        .context("Retrieving schema for taxi_trips dataset")?
-        .first()
-        .map(RecordBatch::schema)
-        .ok_or_else(|| anyhow!("Failed to retrieve schema from taxi_trips dataset"))?;
-
-    runtime.shutdown().await;
-
-    let snapshot_objects = context
-        .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
-        .await?;
-    let metadata = build_metadata_document(
-        &context,
-        TAXI_TRIPS_DATASET_NAME,
-        &snapshot_objects,
-        &schema,
-    );
-    context
-        .write_metadata(&metadata)
-        .await
-        .context("Writing initial snapshot metadata")?;
-
-    Ok(SnapshotFixture {
-        context,
-        _temp_dir: temp_dir,
-        dataset_from,
-        local_db_path,
-        dataset_params,
-        schema,
-        baseline,
-        engine: "cayenne",
-        initial_snapshot_count: snapshot_objects.len(),
-    })
-}
-
 fn remove_existing_local_files(path: &Path) {
     let candidates = [
         path.to_path_buf(),
@@ -696,17 +603,6 @@ fn remove_existing_local_files(path: &Path) {
                 candidate.display()
             );
         }
-    }
-
-    // For Cayenne (directory-based), also remove the directory
-    if path.is_dir()
-        && let Err(err) = std::fs::remove_dir_all(path)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            "Failed to remove local acceleration directory {}: {err}",
-            path.display()
-        );
     }
 }
 
@@ -739,9 +635,12 @@ async fn snapshot_int_test1_duckdb_bootstrap_from_s3() -> Result<()> {
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let bootstrap_results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-                .await
-                .context("Querying dataset bootstrapped from DuckDB snapshot")?;
+            let bootstrap_results = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Querying dataset bootstrapped from DuckDB snapshot")?;
             let expected = fixture.baseline_pretty()?;
             let actual = pretty_format_batches(&bootstrap_results)
                 .map(|fmt| fmt.to_string())
@@ -808,7 +707,7 @@ async fn snapshot_int_test2_duckdb_bootstrap_without_federation() -> Result<()> 
                 "Dataset should be ready using the downloaded snapshot even when federation is disabled"
             );
 
-            let offline_results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
+            let offline_results = run_query(&runtime, "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1")
                 .await
                 .context("Querying dataset with federation disabled")?;
             let expected = fixture.baseline_pretty()?;
@@ -856,9 +755,12 @@ async fn snapshot_int_test3_sqlite_bootstrap_from_s3() -> Result<()> {
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let bootstrap_results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-                .await
-                .context("Querying dataset bootstrapped from SQLite snapshot")?;
+            let bootstrap_results = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Querying dataset bootstrapped from SQLite snapshot")?;
             let expected = fixture.baseline_pretty()?;
             let actual = pretty_format_batches(&bootstrap_results)
                 .map(|fmt| fmt.to_string())
@@ -904,7 +806,7 @@ async fn snapshot_int_test4_existing_acceleration_skips_snapshot_download() -> R
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
+            let results = run_query(&runtime, "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1")
                 .await
                 .context("Querying dataset with pre-existing acceleration file")?;
             let expected = fixture.baseline_pretty()?;
@@ -1001,9 +903,12 @@ async fn snapshot_int_test5_creates_and_uses_snapshot_on_restart() -> Result<()>
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-                .await
-                .context("Querying dataset after restart with generated snapshot")?;
+            let results = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Querying dataset after restart with generated snapshot")?;
             let expected = fixture.baseline_pretty()?;
             let actual = pretty_format_batches(&results)
                 .map(|fmt| fmt.to_string())
@@ -1060,23 +965,26 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 runtime_snapshots,
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
+                SnapshotsCompaction::Disabled,
             );
 
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
                 fixture.local_db_path.clone(),
+                AccelerationEngine::DuckDB,
             )
             .await
-            .map(|manager| {
-                manager.with_snapshot_adapter(snapshot_adapter_for_engine(fixture.engine))
-            })
             .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for concurrent test"))?;
 
             let snapshot_results = try_join_all((0..10).map(|_| {
                 let manager_clone = manager.clone();
                 let schema = Arc::clone(&schema);
-                async move { manager_clone.create_snapshot(&schema).await }
+                async move {
+                    let mutex = Arc::new(Mutex::new(()));
+                    let lock_guard = mutex.lock_owned().await;
+                    manager_clone.create_snapshot(&schema, lock_guard).await
+                }
             }))
             .await
             .context("Creating snapshots concurrently")?;
@@ -1108,7 +1016,6 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
         .await
 }
 
-#[expect(clippy::too_many_lines)]
 #[cfg(feature = "duckdb")]
 #[tokio::test]
 async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Result<()> {
@@ -1145,14 +1052,14 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .and_then(|app| app.snapshots.clone())
                 .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
             let snapshot_behavior =
-                RuntimeSnapshotBehavior::enabled(runtime_snapshots, runtime.secrets_weak(), runtime.tokio_io_runtime());
+                RuntimeSnapshotBehavior::enabled(runtime_snapshots, runtime.secrets_weak(), runtime.tokio_io_runtime(), SnapshotsCompaction::Disabled);
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
                 fixture.local_db_path.clone(),
+                AccelerationEngine::DuckDB,
             )
             .await
-            .map(|manager| manager.with_snapshot_adapter(snapshot_adapter_for_engine(fixture.engine)))
             .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?;
 
             let conn = Connection::open(&fixture.local_db_path)
@@ -1182,8 +1089,11 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .context("Cleaning up temporary snapshot modification table")?;
             drop(conn);
 
+            let mutex = Arc::new(Mutex::new(()));
+            let lock_guard = mutex.lock_owned().await;
+
             manager
-                .create_snapshot(&schema)
+                .create_snapshot(&schema, lock_guard)
                 .await
                 .context("Creating modified snapshot after deleting data")?;
 
@@ -1255,7 +1165,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            let results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
+            let results = run_query(&runtime, "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1")
                 .await
                 .context("Querying dataset after metadata-directed bootstrap")?;
             let expected = fixture.baseline_pretty()?;
@@ -1274,185 +1184,237 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
         .await
 }
 
-/// Parameterized test that verifies snapshot bootstrap works for both `DuckDB` and Cayenne accelerators.
-///
-/// This test:
-/// 1. Creates an initial snapshot by running the runtime with the accelerator
-/// 2. Removes the local acceleration file/directory
-/// 3. Restarts the runtime and verifies it bootstraps from the snapshot
-/// 4. Validates that query results match the original baseline
 #[cfg(feature = "duckdb")]
+#[expect(clippy::cast_precision_loss)]
 #[tokio::test]
-async fn snapshot_unified_test_bootstrap_from_s3() -> Result<()> {
+async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<()> {
     let _guard = init_tracing(Some("integration=debug,info"));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
-
-    // Test both DuckDB and Cayenne if their features are enabled
-    let test_cases = vec![
-        #[cfg(feature = "duckdb")]
-        ("duckdb", "unified_duckdb"),
-        ("cayenne", "unified_cayenne"),
-    ];
-
-    for (engine, test_suffix) in test_cases {
-        tracing::info!("Running unified snapshot bootstrap test for {engine}");
-
-        test_request_context()
-            .scope(async {
-                let fixture = match engine {
-                    #[cfg(feature = "duckdb")]
-                    "duckdb" => {
-                        prepare_duckdb_fixture(&format!("snapshot_unified_{test_suffix}")).await?
-                    }
-                    "cayenne" => {
-                        prepare_cayenne_fixture(&format!("snapshot_unified_{test_suffix}")).await?
-                    }
-                    _ => unreachable!("Unsupported engine in test"),
-                };
-
-                // Verify initial snapshot was created
-                assert_eq!(
-                    fixture.initial_snapshot_count, 1,
-                    "{engine}: Expected exactly one snapshot to be created during bootstrap"
-                );
-
-                // Remove local acceleration file/directory to force bootstrap from snapshot
-                remove_existing_local_files(&fixture.local_db_path);
-                assert!(
-                    !fixture.local_db_path.exists(),
-                    "{engine}: Local acceleration path should be removed before bootstrap test"
-                );
-
-                // Configure runtime to bootstrap from snapshot
-                let dataset = fixture.dataset(
-                    DatasetSnapshotBehavior::Enabled,
-                    RefreshOnStartup::Auto,
-                    &[],
-                    &[],
-                );
-                let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
-
-                let app = AppBuilder::new(format!("snapshot_unified_{test_suffix}_restart"))
-                    .with_snapshots(snapshots)
-                    .with_dataset(dataset)
-                    .build();
-
-                configure_test_datafusion();
-
-                let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
-                load_runtime(Arc::clone(&runtime)).await?;
-
-                // Verify data was bootstrapped correctly by comparing results
-                let bootstrap_results = run_query(&runtime, "SELECT COUNT(*) FROM taxi_trips")
-                    .await
-                    .with_context(|| {
-                        format!("Querying dataset bootstrapped from {engine} snapshot")
-                    })?;
-
-                let expected = fixture.baseline_pretty()?;
-                let actual = pretty_format_batches(&bootstrap_results)
-                    .map(|fmt| fmt.to_string())
-                    .with_context(|| format!("Formatting {engine} bootstrap result batches"))?;
-
-                assert_eq!(
-                    expected, actual,
-                    "{engine}: Bootstrap query results should match snapshot baseline"
-                );
-
-                // Verify snapshot metadata is correct
-                let metadata = fixture.context.metadata_json().await?;
-                let location = metadata
-                    .get("location")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        anyhow!("{engine}: Snapshot metadata missing 'location' field")
-                    })?;
-                assert_eq!(
-                    location,
-                    fixture.context.location_uri(),
-                    "{engine}: Snapshot metadata location should match configured location"
-                );
-
-                // Verify local path now exists after bootstrap
-                assert!(
-                    fixture.local_db_path.exists(),
-                    "{engine}: Local acceleration path should exist after successful bootstrap"
-                );
-
-                runtime.shutdown().await;
-
-                tracing::info!("✓ Unified snapshot bootstrap test passed for {engine}");
-
-                fixture.cleanup().await
-            })
-            .await?;
-    }
-
-    Ok(())
-}
-
-#[cfg(not(windows))]
-#[tokio::test]
-async fn snapshot_cayenne_archive_contains_expected_layout() -> Result<()> {
-    let _guard = init_tracing(Some("integration=debug,info"));
-    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
-
     test_request_context()
         .scope(async {
-            let fixture = prepare_cayenne_fixture("snapshot_cayenne_archive_layout").await?;
+            let fixture = prepare_duckdb_fixture("snapshot_int_test8").await?;
+            let schema = Arc::clone(fixture.schema());
 
-            let snapshot_objects = fixture
-                .context
-                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
-                .await
-                .context("Waiting for Cayenne snapshot upload")?;
+            // Step 1: Create database fragmentation by inserting and deleting data
+            // We create a separate table to avoid issues with taxi_trips being a view
+            let conn = Connection::open(&fixture.local_db_path)
+                .context("Opening DuckDB file to create fragmentation")?;
 
-            let snapshot_meta = snapshot_objects
-                .first()
-                .ok_or_else(|| anyhow!("No Cayenne snapshots found in object store"))?;
+            // Create a new table for fragmentation testing
+            conn.execute(
+                "CREATE TABLE frag_test (
+                    id INTEGER,
+                    data VARCHAR,
+                    padding VARCHAR
+                )",
+                [],
+            )
+                .context("Creating fragmentation test table")?;
 
-            let snapshot_bytes = fixture
-                .context
-                .store
-                .get(&snapshot_meta.location)
-                .await
-                .context("Downloading Cayenne snapshot object")?
-                .bytes()
-                .await
-                .context("Reading Cayenne snapshot bytes")?;
+            // Insert a large amount of data to grow the file
+            // Using generate_series to create bulk data
+            conn.execute(
+                "INSERT INTO frag_test
+                 SELECT i, 'data_' || i, REPEAT('x', 1000)
+                 FROM generate_series(1, 10000) AS t(i)",
+                [],
+            )
+                .context("Inserting initial data for fragmentation")?;
 
-            let mut archive = Archive::new(Cursor::new(snapshot_bytes));
-            let mut has_metadata = false;
-            let mut has_data = false;
-
-            for entry_result in archive
-                .entries()
-                .context("Iterating Cayenne snapshot tar entries")?
-            {
-                let entry = entry_result.context("Reading Cayenne snapshot tar entry")?;
-                if let Ok(path) = entry.path() {
-                    let path_str = path.to_string_lossy();
-                    if path_str.starts_with("metadata/") {
-                        has_metadata = true;
-                    }
-                    if path_str.starts_with("data/") {
-                        has_data = true;
-                    }
-                }
-
-                if has_metadata && has_data {
-                    break;
-                }
+            // Insert more duplicate data multiple times
+            for _ in 0..5 {
+                conn.execute(
+                    "INSERT INTO frag_test SELECT * FROM frag_test WHERE id <= 1000",
+                    [],
+                )
+                    .context("Inserting duplicate data for fragmentation")?;
             }
 
-            assert!(
-                has_metadata,
-                "Cayenne snapshot archive should contain metadata/ entries"
+            // Delete most rows to create dead tuples (fragmentation)
+            // Keep only the first 100 rows
+            conn.execute(
+                "DELETE FROM frag_test WHERE id > 100",
+                [],
+            )
+                .context("Deleting data to create dead tuples")?;
+
+            // Force checkpoint to flush WAL and materialize fragmentation
+            conn.execute("CHECKPOINT", [])
+                .context("Forcing DuckDB checkpoint")?;
+            drop(conn);
+
+            // Record the fragmented file size
+            let fragmented_size = std::fs::metadata(&fixture.local_db_path)
+                .context("Getting fragmented file size")?
+                .len();
+            tracing::info!(
+                "Fragmented database size: {fragmented_size} bytes. dataset={}",
+                TAXI_TRIPS_DATASET_NAME
             );
-            assert!(
-                has_data,
-                "Cayenne snapshot archive should contain data/ entries"
+
+            // Step 2: Create snapshot WITH compaction enabled
+            let dataset = fixture.dataset(
+                DatasetSnapshotBehavior::CreateOnly,
+                RefreshOnStartup::Auto,
+                &[],
+                &[],
             );
+            let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
+
+            let app = AppBuilder::new("snapshot_int_test8_compaction")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            let runtime_snapshots = runtime
+                .app()
+                .read()
+                .await
+                .as_ref()
+                .and_then(|app| app.snapshots.clone())
+                .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
+
+            // Create snapshot behavior with compaction ENABLED (last param = true)
+            let snapshot_behavior_with_compaction = RuntimeSnapshotBehavior::enabled(
+                Arc::clone(&runtime_snapshots),
+                runtime.secrets_weak(),
+                runtime.tokio_io_runtime(),
+                SnapshotsCompaction::Enabled,
+            );
+
+            let manager_with_compaction = SnapshotManager::try_new(
+                TAXI_TRIPS_DATASET_NAME.to_string(),
+                snapshot_behavior_with_compaction,
+                fixture.local_db_path.clone(),
+                AccelerationEngine::DuckDB,
+            )
+                .await
+                .ok_or_else(|| anyhow!("Failed to create SnapshotManager with compaction enabled"))?;
+
+            // Create compacted snapshot
+            let mutex = Arc::new(Mutex::new(()));
+            let lock_guard = mutex.lock_owned().await;
+
+            let compacted_location = manager_with_compaction
+                .create_snapshot(&schema, lock_guard)
+                .await
+                .context("Creating snapshot with compaction enabled")?;
+
+            tracing::info!(
+                "Created compacted snapshot at: {compacted_location}. dataset={}",
+                TAXI_TRIPS_DATASET_NAME
+            );
+
+            // Wait for compacted snapshot to appear
+            let compacted_objects = fixture
+                .context
+                .wait_for_snapshot_objects(
+                    TAXI_TRIPS_DATASET_NAME,
+                    fixture.initial_snapshot_count + 1,
+                    Duration::from_secs(90),
+                )
+                .await
+                .context("Waiting for compacted snapshot objects")?;
+
+            let compacted_snapshot = compacted_objects
+                .iter()
+                .max_by_key(|obj| obj.last_modified)
+                .ok_or_else(|| anyhow!("No compacted snapshot found in object storage"))?;
+
+            let compacted_size = compacted_snapshot.size;
+            tracing::info!(
+                "Compacted snapshot size: {compacted_size} bytes. dataset={}",
+                TAXI_TRIPS_DATASET_NAME
+            );
+
+            // Step 3: Verify compaction reduced the file size
+            // The compacted file should be smaller because COPY FROM DATABASE
+            // creates a fresh database without dead tuples
+            assert!(
+                compacted_size < fragmented_size,
+                "Compacted snapshot ({compacted_size} bytes) should be smaller than \
+                 fragmented database ({fragmented_size} bytes). \
+                 Compaction should remove dead tuples created by DELETE operations."
+            );
+
+            let size_reduction_percent =
+                ((fragmented_size - compacted_size) as f64 / fragmented_size as f64) * 100.0;
+            tracing::info!(
+                "Compaction reduced size by {size_reduction_percent:.1}%. \
+                 fragmented={fragmented_size} compacted={compacted_size} dataset={}",
+                TAXI_TRIPS_DATASET_NAME
+            );
+
+            runtime.shutdown().await;
+
+            // Step 4: Verify the compacted snapshot can be downloaded and used
+            remove_existing_local_files(&fixture.local_db_path);
+
+            // Update metadata to reference the compacted snapshot
+            let updated_metadata = build_metadata_document(
+                &fixture.context,
+                TAXI_TRIPS_DATASET_NAME,
+                &compacted_objects,
+                &schema,
+            );
+            fixture
+                .context
+                .write_metadata(&updated_metadata)
+                .await
+                .context("Writing metadata for compacted snapshot")?;
+
+            let dataset = fixture.dataset(
+                DatasetSnapshotBehavior::Enabled,
+                RefreshOnStartup::Auto,
+                &[],
+                &[],
+            );
+            let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
+
+            let app = AppBuilder::new("snapshot_int_test8_bootstrap_compacted")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            // Query the bootstrapped data
+            let results = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+                .await
+                .context("Querying dataset bootstrapped from compacted snapshot")?;
+
+            let expected = fixture.baseline_pretty()?;
+            let actual = pretty_format_batches(&results)
+                .map(|fmt| fmt.to_string())
+                .context("Formatting results from compacted snapshot")?;
+
+            assert_eq!(
+                expected, actual,
+                "Data from compacted snapshot should match baseline"
+            );
+
+            // Verify row count is preserved (compaction shouldn't lose data)
+            let count_results = run_query(&runtime, "SELECT COUNT(*) as cnt FROM taxi_trips")
+                .await
+                .context("Counting rows in bootstrapped dataset")?;
+
+            assert!(
+                !count_results.is_empty(),
+                "Should have count results from compacted snapshot"
+            );
+
+            runtime.shutdown().await;
 
             fixture.cleanup().await
         })

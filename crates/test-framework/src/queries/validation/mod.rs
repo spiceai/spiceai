@@ -241,7 +241,6 @@ macro_rules! downcast_and_stringify_ts {
 /// - If the function fails to downcast the array to the expected type (e.g., if the array's type is
 ///   mismatched), it will return an error.
 /// - If the array's data type is not supported for conversion, `None` is returned.
-#[expect(clippy::too_many_lines)]
 pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<String>> {
     if array.len() <= index {
         return Err(anyhow!("Index out of bounds: {index} >= {}", array.len()));
@@ -714,12 +713,14 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_correct_answer_wrong_type() {
+    #[tokio::test]
+    async fn test_correct_answer_wrong_type() {
         // Use the correct answer, but a different datatype
         // Q22 from CSV, cntrycode is Utf8. Query returns it as Int64
         let query = QuerySet::Tpch
-            .get_queries(None)
+            .get_queries(None, None, None)
+            .await
+            .expect("to get queries")
             .get(20)
             .expect("Should have q22")
             .clone();
@@ -799,11 +800,13 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_wrong_answers() {
+    #[tokio::test]
+    async fn test_wrong_answers() {
         // Use the wrong answer and validate it fails
         let query = QuerySet::Tpch
-            .get_queries(None)
+            .get_queries(None, None, None)
+            .await
+            .expect("to get queries")
             .get(20)
             .expect("Should have q22")
             .clone();

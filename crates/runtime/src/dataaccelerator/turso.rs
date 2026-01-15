@@ -62,7 +62,7 @@ use crate::{
     register_data_accelerator, spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -204,6 +204,7 @@ fn sanitize_column_reference(column_ref: &str) -> Result<Vec<String>> {
 }
 // Re-export for use within the runtime crate
 pub use data_components::turso::TursoConnectionPool;
+use runtime_acceleration::snapshot::AccelerationEngine;
 
 pub struct TursoAccelerator {
     // Store connection pools for file-based databases
@@ -501,7 +502,7 @@ impl DataAccelerator for TursoAccelerator {
                 acceleration,
                 source,
                 PathBuf::from(path),
-                self.snapshot_adapter(),
+                AccelerationEngine::Turso,
             )
             .await;
 
@@ -514,7 +515,6 @@ impl DataAccelerator for TursoAccelerator {
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    #[expect(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
@@ -694,13 +694,15 @@ impl DataAccelerator for TursoAccelerator {
 
         // Wrap in PolyTableProvider for proper read/write separation
         // This allows the table to support both reading and writing operations
-        let write_provider = Arc::clone(&turso_provider);
-        let delete_provider = Arc::clone(&turso_provider);
         let fed_provider = Arc::new(
             Arc::clone(&turso_provider)
                 .create_federated_table_provider()
                 .boxed()?,
         ) as Arc<dyn TableProvider>;
+
+        // Wrap with upsert deduplication if needed
+        let (write_provider, delete_provider) =
+            upsert_dedup::wrap_with_upsert_dedup_if_needed(turso_provider, &cmd.options);
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,
@@ -1301,7 +1303,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_timestamp_unit_conversion() {
         // Test that timestamps are correctly converted between different units
         // All timestamps are stored as milliseconds in Turso, but should be

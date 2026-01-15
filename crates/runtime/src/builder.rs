@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::cluster::ResolvedClusterConfig;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
 use crate::{
@@ -55,6 +56,7 @@ pub struct RuntimeBuilder {
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
     runtime_config: Arc<Config>,
+    resolved_cluster_config: Option<ResolvedClusterConfig>,
 }
 
 impl RuntimeBuilder {
@@ -74,6 +76,7 @@ impl RuntimeBuilder {
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
             runtime_config: Arc::new(Config::default()),
+            resolved_cluster_config: None,
         }
     }
 
@@ -146,7 +149,14 @@ impl RuntimeBuilder {
         self
     }
 
-    #[expect(clippy::too_many_lines)]
+    pub fn with_resolved_cluster_config(
+        mut self,
+        resolved_cluster_config: ResolvedClusterConfig,
+    ) -> Self {
+        self.resolved_cluster_config = Some(resolved_cluster_config);
+        self
+    }
+
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
         if let Err(e) = tracers::init_datafusion_tracer() {
@@ -201,9 +211,6 @@ impl RuntimeBuilder {
         }
 
         let caching = Runtime::init_caching(Some(&caching_config));
-        #[cfg(feature = "cluster")]
-        let cluster_config = Arc::new(self.runtime_config.cluster.clone());
-
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         // Create resource monitor early so it can be passed to DataFusion
@@ -222,10 +229,9 @@ impl RuntimeBuilder {
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone());
 
-        #[cfg(feature = "cluster")]
-        {
-            df_builder = df_builder.with_cluster_config(cluster_config);
-        };
+        if let Some(resolved_cluster_config) = self.resolved_cluster_config {
+            df_builder = df_builder.with_cluster_config(resolved_cluster_config);
+        }
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
@@ -287,6 +293,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            scheduler_peers: Arc::new(RwLock::new(HashMap::new())),
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };

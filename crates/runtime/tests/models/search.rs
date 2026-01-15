@@ -384,7 +384,9 @@ pub(crate) async fn run_search_w_explain(
                                 .try_collect::<Vec<RecordBatch>>()
                                 .await?;
 
-                            let disp = arrow::util::pretty::pretty_format_batches(&c)?;
+                            let mut disp =
+                                arrow::util::pretty::pretty_format_batches(&c)?.to_string();
+                            disp = replace_s3_vector_index_names(&disp);
 
                             insta::with_settings!({
                                 omit_expression => true,
@@ -407,6 +409,57 @@ pub(crate) fn vectors_nonfilterable_col(col: impl Into<Column>) -> Column {
         )]
         .into(),
     )
+}
+
+/// This function redacts the `S3Vector` index name from [`S3VectorsQueryExec`] in `LogicalPlan` output.
+///
+/// It keeps different index names unique via `INDEX_NAME_{i}`.
+pub(crate) fn replace_s3_vector_index_names(input: &str) -> String {
+    let mut index_map: HashMap<String, String> = HashMap::new();
+    let mut counter = 1;
+
+    input
+        .lines()
+        .map(|line| {
+            if !line.contains("S3VectorsQueryExec") {
+                return line.to_string();
+            }
+
+            // Find the content within parentheses after "S3VectorsQueryExec"
+            let Some(start_idx) = line.find("S3VectorsQueryExec (") else {
+                return line.to_string();
+            };
+            let after_paren = start_idx + "S3VectorsQueryExec (".len();
+            let Some(end_idx) = line[after_paren..].find(')') else {
+                return line.to_string();
+            };
+
+            let line_length = line.len();
+            let index_name = &line[after_paren..after_paren + end_idx];
+
+            // Get or create a replacement name for this index
+            let replacement = index_map
+                .entry(index_name.to_string())
+                .or_insert_with(|| {
+                    let name = format!("INDEX_NAME_{counter}");
+                    counter += 1;
+                    name
+                })
+                .clone();
+
+            // Build the new line with the replacement
+            let before = &line[..after_paren];
+            let after = &line[after_paren + end_idx..line_length - 1];
+            format!(
+                "{}{}{}{}|",
+                before,
+                replacement,
+                after,
+                " ".repeat(line_length - 1 - (before.len() + replacement.len() + after.len()))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test]

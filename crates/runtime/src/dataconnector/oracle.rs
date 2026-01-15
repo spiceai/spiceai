@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -270,3 +270,5 @@ impl DataConnector for Oracle {
         Ok(Arc::new(provider))
     }
 }
+
+register_data_connector!("oracle", OracleFactory);

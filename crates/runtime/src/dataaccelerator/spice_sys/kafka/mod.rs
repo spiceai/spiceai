@@ -65,10 +65,8 @@ impl KafkaSys {
             AccelerationConnection::SQLite(pool) => self.get_sqlite(pool).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
-            AccelerationConnection::Cayenne(_, _) => {
-                // Cayenne doesn't support Kafka metadata
-                None
-            }
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(pool) => self.get_sqlite(pool).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
@@ -89,10 +87,8 @@ impl KafkaSys {
             AccelerationConnection::SQLite(pool) => self.upsert_sqlite(pool, metadata).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
-            AccelerationConnection::Cayenne(_, _) => {
-                // Cayenne doesn't support Kafka metadata
-                Err(Error::NoAccelerationConnection)
-            }
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(pool) => self.upsert_sqlite(pool, metadata).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",

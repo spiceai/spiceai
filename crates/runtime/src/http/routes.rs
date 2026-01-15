@@ -194,10 +194,10 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
 // 3. HEALTH_REQUEST_BODY_LIMIT (128 KiB) - strict limit for unauthenticated endpoints (health checks, ready checks)
 //    Applied to unauthenticated routes to prevent DoS via health check endpoints
 const DEFAULT_REQUEST_BODY_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
+#[cfg(feature = "mcp")]
 const MCP_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
 const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
 
-#[expect(clippy::too_many_lines)]
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,

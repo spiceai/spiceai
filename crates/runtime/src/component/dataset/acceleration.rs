@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "duckdb")]
+use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
 };
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
+use spicepod::acceleration::{SnapshotsCompaction, SnapshotsTrigger};
 use spicepod::{
     acceleration::{self as spicepod_acceleration},
     param::Params,
@@ -26,8 +29,7 @@ use spicepod::{
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
-#[cfg(feature = "duckdb")]
-use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
+pub use runtime_acceleration::Engine;
 
 pub mod constraints;
 pub mod on_conflict;
@@ -141,61 +143,6 @@ impl Display for ZeroResultsAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-pub enum Engine {
-    #[default]
-    Arrow,
-    DuckDB,
-    PartitionedDuckDB,
-    TableModePartitionedDuckDB,
-    Sqlite,
-    Turso,
-    PostgreSQL,
-    Cayenne,
-}
-
-impl Display for Engine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Engine::Arrow => write!(f, "arrow"),
-            Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
-                write!(f, "duckdb")
-            }
-            Engine::Sqlite => write!(f, "sqlite"),
-            Engine::Turso => write!(f, "turso"),
-            Engine::PostgreSQL => write!(f, "postgres"),
-            Engine::Cayenne => write!(f, "cayenne"),
-        }
-    }
-}
-
-impl TryFrom<&str> for Engine {
-    type Error = crate::Error;
-
-    fn try_from(engine: &str) -> std::result::Result<Self, Self::Error> {
-        match engine.to_lowercase().as_str() {
-            "arrow" => Ok(Engine::Arrow),
-            "duckdb" => Ok(Engine::DuckDB),
-            "sqlite" => Ok(Engine::Sqlite),
-            "turso" => Ok(Engine::Turso),
-            "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
-            "cayenne" | "vortex" => Ok(Engine::Cayenne),
-            _ => crate::AcceleratorEngineNotAvailableSnafu {
-                name: engine.to_string(),
-            }
-            .fail(),
-        }
-    }
-}
-
-impl TryFrom<String> for Engine {
-    type Error = crate::Error;
-
-    fn try_from(engine: String) -> std::result::Result<Self, Self::Error> {
-        Engine::try_from(engine.as_str())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum IndexType {
     #[default]
@@ -272,6 +219,33 @@ impl Display for OnConflictBehavior {
     }
 }
 
+/// Behavior when a stale-if-error condition occurs in caching mode.
+/// When enabled, serves expired cached data if the upstream source returns an error.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum StaleIfError {
+    /// Do not serve stale data on error - propagate the error to the client.
+    #[default]
+    Disabled,
+    /// Serve expired data if the upstream source returns an error.
+    Enabled,
+}
+
+impl StaleIfError {
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, StaleIfError::Enabled)
+    }
+}
+
+impl Display for StaleIfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StaleIfError::Disabled => write!(f, "disabled"),
+            StaleIfError::Enabled => write!(f, "enabled"),
+        }
+    }
+}
+
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Acceleration {
@@ -286,6 +260,12 @@ pub struct Acceleration {
     pub refresh_on_startup: RefreshOnStartup,
 
     pub refresh_check_interval: Option<Duration>,
+
+    pub caching_ttl: Option<Duration>,
+
+    pub caching_stale_while_revalidate_ttl: Option<Duration>,
+
+    pub caching_stale_if_error: StaleIfError,
 
     pub refresh_cron: Option<Arc<str>>,
 
@@ -325,7 +305,13 @@ pub struct Acceleration {
 
     pub partition_by: Vec<PartitionedBy>,
 
-    pub snapshots: SnapshotBehavior,
+    pub snapshot_behavior: SnapshotBehavior,
+
+    pub snapshots_trigger: Option<SnapshotsTrigger>,
+
+    pub snapshots_trigger_threshold: Option<String>,
+
+    pub snapshots_compaction: SnapshotsCompaction,
 }
 
 impl Acceleration {
@@ -348,7 +334,6 @@ impl Acceleration {
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 
-    #[expect(clippy::too_many_lines)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
@@ -396,7 +381,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let mut params = acceleration.params.clone();
 
         let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
-        let engine = match Engine::try_from(engine_str)? {
+        let engine = match Engine::try_from(engine_str).map_err(|_| {
+            crate::Error::AcceleratorEngineNotAvailable {
+                name: engine_str.to_string(),
+            }
+        })? {
             #[cfg(feature = "duckdb")]
             Engine::DuckDB if !acceleration.partition_by.is_empty() => {
                 match get_duckdb_partition_mode(&params) {
@@ -425,6 +414,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
 
+        let caching_ttl = parse_caching_ttl(&mut params)?;
+        let caching_stale_while_revalidate_ttl =
+            parse_caching_stale_while_revalidate_ttl(&mut params)?;
+        let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
+
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",
             acceleration.refresh_check_interval,
@@ -449,6 +443,9 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             refresh_mode: acceleration.refresh_mode.map(RefreshMode::from),
             refresh_on_startup: RefreshOnStartup::from(acceleration.refresh_on_startup),
             refresh_check_interval,
+            caching_ttl,
+            caching_stale_while_revalidate_ttl,
+            caching_stale_if_error,
             refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -474,7 +471,10 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             primary_key,
             on_conflict,
             partition_by: acceleration.partition_by,
-            snapshots: SnapshotBehavior::disabled(),
+            snapshot_behavior: SnapshotBehavior::disabled(),
+            snapshots_trigger: acceleration.snapshots_trigger,
+            snapshots_trigger_threshold: acceleration.snapshots_trigger_threshold,
+            snapshots_compaction: acceleration.snapshots_compaction,
         })
     }
 }
@@ -487,6 +487,9 @@ impl Default for Acceleration {
             engine: Engine::default(),
             refresh_mode: None,
             refresh_check_interval: None,
+            caching_ttl: None,
+            caching_stale_while_revalidate_ttl: None,
+            caching_stale_if_error: StaleIfError::default(),
             refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
@@ -507,7 +510,10 @@ impl Default for Acceleration {
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
-            snapshots: SnapshotBehavior::Disabled,
+            snapshot_behavior: SnapshotBehavior::Disabled,
+            snapshots_trigger: None,
+            snapshots_trigger_threshold: None,
+            snapshots_compaction: SnapshotsCompaction::Disabled,
         }
     }
 }
@@ -530,6 +536,82 @@ fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<boo
         }
     }
     Ok(false)
+}
+
+/// Parse `caching_ttl` duration from params for caching mode.
+#[expect(clippy::result_large_err)]
+fn parse_caching_ttl(params: &mut Option<Params>) -> Result<Option<Duration>, crate::Error> {
+    parse_duration_param(params, "caching_ttl")
+}
+
+/// Parse `caching_stale_while_revalidate_ttl` duration from params for caching mode.
+#[expect(clippy::result_large_err)]
+fn parse_caching_stale_while_revalidate_ttl(
+    params: &mut Option<Params>,
+) -> Result<Option<Duration>, crate::Error> {
+    parse_duration_param(params, "caching_stale_while_revalidate_ttl")
+}
+
+/// Parse `caching_stale_if_error` from params for caching mode.
+/// Valid values: "enabled", "disabled" (default)
+#[expect(clippy::result_large_err)]
+fn parse_caching_stale_if_error(params: &mut Option<Params>) -> Result<StaleIfError, crate::Error> {
+    let Some(params) = params else {
+        return Ok(StaleIfError::default());
+    };
+    let Some(value) = params.data.remove("caching_stale_if_error") else {
+        return Ok(StaleIfError::default());
+    };
+    match value {
+        spicepod::param::ParamValue::String(s) => match s.to_lowercase().as_str() {
+            "enabled" => Ok(StaleIfError::Enabled),
+            "disabled" => Ok(StaleIfError::Disabled),
+            _ => Err(crate::Error::InvalidAccelerationConfiguration {
+                source: format!(
+                    "Invalid 'caching_stale_if_error' value: '{s}'. Expected 'enabled' or 'disabled'."
+                )
+                .into(),
+            }),
+        },
+        _ => Err(crate::Error::InvalidAccelerationConfiguration {
+            source: format!(
+                "Invalid 'caching_stale_if_error' param value: {value:?}. Expected 'enabled' or 'disabled'."
+            )
+            .into(),
+        }),
+    }
+}
+
+/// Helper to parse a duration parameter from params.
+#[expect(clippy::result_large_err)]
+fn parse_duration_param(
+    params: &mut Option<Params>,
+    param_name: &str,
+) -> Result<Option<Duration>, crate::Error> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+    let Some(value) = params.data.remove(param_name) else {
+        return Ok(None);
+    };
+    match value {
+        spicepod::param::ParamValue::String(s) => {
+            fundu::parse_duration(&s)
+                .map(Some)
+                .map_err(|e| crate::Error::InvalidSpicepodDataset {
+                    source: super::Error::UnableToParseFieldAsDuration {
+                        source: e,
+                        field: param_name.into(),
+                    },
+                })
+        }
+        _ => Err(crate::Error::InvalidAccelerationConfiguration {
+            source: format!(
+                "Invalid '{param_name}' param value: {value:?}. Expected a duration string."
+            )
+            .into(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -565,5 +647,35 @@ mod tests {
         let is_disabled =
             parse_is_query_federation_disabled(&mut Some(params_missing)).expect("to parse");
         assert!(!is_disabled);
+    }
+
+    #[test]
+    fn test_parse_caching_stale_if_error() {
+        // Test "enabled"
+        let params_enabled = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            "enabled".to_string(),
+        )]));
+        let result = parse_caching_stale_if_error(&mut Some(params_enabled)).expect("to parse");
+        assert_eq!(result, StaleIfError::Enabled);
+
+        // Test "disabled"
+        let params_disabled = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            "disabled".to_string(),
+        )]));
+        let result = parse_caching_stale_if_error(&mut Some(params_disabled)).expect("to parse");
+        assert_eq!(result, StaleIfError::Disabled);
+
+        // Test invalid value
+        let params_invalid = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            "invalid".to_string(),
+        )]));
+        parse_caching_stale_if_error(&mut Some(params_invalid)).expect_err("should error");
+
+        // Test missing parameter (default)
+        let result = parse_caching_stale_if_error(&mut None).expect("to parse");
+        assert_eq!(result, StaleIfError::Disabled);
     }
 }

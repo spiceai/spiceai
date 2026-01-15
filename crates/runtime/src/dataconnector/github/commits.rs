@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -58,6 +58,11 @@ impl GraphQLContext for CommitsTableArgs {
 
     fn error_checker(&self) -> Option<ErrorChecker> {
         Some(Arc::new(error_checker))
+    }
+
+    fn query_cost(&self) -> Option<u32> {
+        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
+        Some(2)
     }
 }
 

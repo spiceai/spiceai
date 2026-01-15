@@ -16,9 +16,6 @@ limitations under the License.
 
 //! Constants used throughout the Cayenne provider module.
 
-/// Default data file ID used when no specific file is referenced.
-pub const DEFAULT_DATA_FILE_ID: i64 = 0;
-
 /// Error message for poisoned `RwLock` on the listing table.
 ///
 /// Lock poisoning occurs when a thread panics while holding the lock, leaving it in an
@@ -34,3 +31,8 @@ pub const LISTING_TABLE_LOCK_POISONED: &str =
 pub const DELETION_CACHE_LOCK_POISONED: &str =
     "Lock poisoned on deletion cache: a thread panicked while holding this lock. \
     This indicates an internal error that requires restarting the runtime.";
+
+/// Default data file ID used for non-partitioned tables.
+///
+/// In Cayenne, this represents the single data file in a non-partitioned table.
+pub const DEFAULT_DATA_FILE_ID: i64 = 0;

@@ -52,6 +52,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
+use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
@@ -69,6 +70,10 @@ pub(crate) mod settings;
 
 pub(crate) const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
 pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
+    "spice.optimizer.duckdb_aggregate_pushdown";
+
+use super::upsert_dedup;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -299,6 +304,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
     ParameterSpec::runtime("partitioned_write_buffer"),
+    ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
 
 #[async_trait]
@@ -382,7 +388,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 acceleration,
                 source,
                 PathBuf::from(path),
-                self.snapshot_adapter(),
+                AccelerationEngine::DuckDB,
             )
             .await;
 
@@ -538,11 +544,14 @@ pub(crate) async fn create_table_provider(
     };
 
     let read_provider = Arc::clone(&duckdb_writer.read_provider);
-    let duckdb_writer = match on_data_written {
+    let duckdb_writer: Arc<DuckDBTableWriter> = match on_data_written {
         Some(handler) => Arc::new(duckdb_writer.clone().with_on_data_written_handler(handler)),
         None => Arc::new(duckdb_writer.clone()),
     };
-    let cloned_writer = Arc::clone(&duckdb_writer);
+
+    // Wrap with upsert deduplication if needed
+    let (write_provider, delete_provider) =
+        upsert_dedup::wrap_with_upsert_dedup_if_needed(duckdb_writer, &cmd.options);
 
     let mut schema_metadata = HashMap::new();
     schema_metadata.insert(
@@ -550,9 +559,20 @@ pub(crate) async fn create_table_provider(
         "duckdb".to_string(),
     );
 
+    let agg_pushdown_optimization = cmd
+        .options
+        .get("optimizer_duckdb_aggregate_pushdown")
+        .map_or("disabled", |v| v.as_str())
+        .to_lowercase();
+
+    schema_metadata.insert(
+        SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
+        agg_pushdown_optimization,
+    );
+
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
-        cloned_writer,
-        duckdb_writer,
+        write_provider,
+        delete_provider,
         read_provider,
         schema_metadata,
     ));
@@ -757,7 +777,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn retention_sql_fails_with_internal_tables() {
         use datafusion_table_providers::duckdb::DuckDB;
         use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -919,7 +938,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_duckdb() {
         let schema = Arc::new(Schema::new(vec![
@@ -1163,7 +1181,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_retention_sql_with_duckdb_accelerator() {
         use tempfile::TempDir;
 

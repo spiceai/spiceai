@@ -23,7 +23,7 @@ use std::{
 
 use crate::{
     metrics::QueryStatus,
-    queries::{self, QueryOverrides, QuerySet},
+    queries::{self, QuerySet},
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -39,6 +39,7 @@ mod worker;
 use worker::{AppendConfig, AppendWorker};
 
 mod sources;
+use crate::queries::QueryOverrides;
 use sources::FileAppendableSource;
 
 #[derive(Default)]
@@ -52,6 +53,7 @@ pub struct NotStarted {
     load_interval: Option<Duration>,
     load_steps: Option<u16>,
     with_conflict_data: bool,
+    with_retention_test_data: bool,
 }
 
 impl NotStarted {
@@ -66,16 +68,15 @@ impl NotStarted {
         self
     }
 
-    #[must_use]
-    pub fn with_query_set(
+    pub async fn with_query_set(
         mut self,
         query_set: QuerySet,
         overrides: Option<QueryOverrides>,
-    ) -> Self {
-        self.queries = query_set.get_queries(overrides);
+    ) -> Result<Self> {
+        self.queries = query_set.get_queries(overrides, None, None).await?;
         self.query_count = self.queries.len();
         self.query_set = query_set;
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -105,6 +106,12 @@ impl NotStarted {
     #[must_use]
     pub fn with_conflict_data(mut self, with_conflict_data: bool) -> Self {
         self.with_conflict_data = with_conflict_data;
+        self
+    }
+
+    #[must_use]
+    pub fn with_retention_test_data(mut self, with_retention_test_data: bool) -> Self {
+        self.with_retention_test_data = with_retention_test_data;
         self
     }
 
@@ -154,7 +161,8 @@ impl SpiceTest<NotStarted> {
             self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
         )
-        .with_conflict_data(self.state.with_conflict_data);
+        .with_conflict_data(self.state.with_conflict_data)
+        .with_retention_test_data(self.state.with_retention_test_data);
 
         if let Some(load_interval) = self.state.load_interval {
             append_config = append_config.with_load_interval(load_interval);

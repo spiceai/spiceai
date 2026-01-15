@@ -88,6 +88,7 @@ pub struct DuckDBPartitionedDataSink {
     table_definition: Arc<TableDefinition>,
     overwrite: InsertOp,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
     schema: SchemaRef,
     partitioner: Arc<BatchPartitioner>,
     write_settings: DuckDBWriteSettings,
@@ -108,7 +109,6 @@ impl DataSink for DuckDBPartitionedDataSink {
         &self.schema
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
@@ -165,12 +165,7 @@ impl DataSink for DuckDBPartitionedDataSink {
 
         let partitioner = Arc::clone(&self.partitioner);
 
-        let upsert_options = self
-            .on_conflict
-            .as_ref()
-            .map_or_else(UpsertOptions::default, |conflict| {
-                conflict.get_upsert_options()
-            });
+        let upsert_options = self.upsert_options.clone();
 
         while let Some(batch) = data.next().await {
             let batch = batch.map_err(check_and_mark_retriable_error)?;
@@ -282,6 +277,7 @@ impl DuckDBPartitionedDataSink {
         table_definition: Arc<TableDefinition>,
         overwrite: InsertOp,
         on_conflict: Option<OnConflict>,
+        upsert_options: UpsertOptions,
         schema: SchemaRef,
         partitioner: Arc<BatchPartitioner>,
     ) -> Self {
@@ -290,6 +286,7 @@ impl DuckDBPartitionedDataSink {
             table_definition,
             overwrite,
             on_conflict,
+            upsert_options,
             schema,
             partitioner,
             write_settings: DuckDBWriteSettings::default(),
@@ -935,6 +932,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Overwrite,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         );
@@ -1056,6 +1054,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Overwrite,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         );
@@ -1278,6 +1277,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Append,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         );
@@ -1395,6 +1395,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Overwrite,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         )
@@ -1476,6 +1477,7 @@ mod test {
             Arc::clone(&table_definition),
             InsertOp::Overwrite,
             None,
+            UpsertOptions::default(),
             table_definition.schema(),
             partitioner,
         )

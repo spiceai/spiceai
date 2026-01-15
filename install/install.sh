@@ -36,7 +36,7 @@ getSystemInfo() {
         amd64) ARCH="x86_64";;
     esac
 
-    OS=$(echo `uname`|tr '[:upper:]' '[:lower:]')
+    OS=$(uname | tr '[:upper:]' '[:lower:]')
 
     # Determine if sudo is needed based on install directory permissions
     if [[ -d "$SPICE_CLI_INSTALL_DIR" ]]; then
@@ -70,7 +70,7 @@ verifySupported() {
 runAsRoot() {
     local CMD="$*"
 
-    if [ $EUID -ne 0 -a $USE_SUDO = "true" ]; then
+    if [ $EUID -ne 0 ] && [ "$USE_SUDO" = "true" ]; then
         CMD="sudo $CMD"
     fi
 
@@ -92,25 +92,16 @@ checkHttpRequestCLI() {
     fi
 }
 
-checkJqInstalled() {
-    if ! type "jq" 1> /dev/null 2>&1; then
-        echo "'jq' is required"
-        echo
-        echo "To install (OSX): 'brew install jq'"
-        echo "To install (Ubuntu): 'apt install jq'"
-        echo
-        exit 1
-    fi
-}
+
 
 function gh_curl() {
     if [ -z "$GITHUB_TOKEN" ]
     then
         curl \
-            $@
+            "$@"
     else
         curl -H "Authorization: token $GITHUB_TOKEN" \
-            $@
+            "$@"
     fi
 }
 
@@ -118,10 +109,10 @@ function gh_wget() {
     if [ -z "$GITHUB_TOKEN" ]
     then
         wget \
-            $@
+            "$@"
     else
         wget --header="Authorization: token $GITHUB_TOKEN" \
-            $@
+            "$@"
     fi
 }
 
@@ -141,7 +132,13 @@ getLatestRelease() {
 downloadFile() {
     LATEST_RELEASE_TAG=$1
 
-    SPICE_CLI_ARTIFACT="${SPICE_CLI_FILENAME}_${OS}_${ARCH}.tar.gz"
+    # Build artifact name
+    # Asset naming convention: spice_{os}_{arch}.tar.gz
+    # Note: This script only supports Unix systems (Linux/macOS).
+    #       Windows uses Install.ps1 which downloads spice.exe_{os}_{arch}.tar.gz
+    local artifact_name="${SPICE_CLI_FILENAME}"
+
+    SPICE_CLI_ARTIFACT="${artifact_name}_${OS}_${ARCH}.tar.gz"
     DOWNLOAD_BASE="https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/releases/download"
     DOWNLOAD_URL="${DOWNLOAD_BASE}/${LATEST_RELEASE_TAG}/${SPICE_CLI_ARTIFACT}"
 
@@ -151,35 +148,18 @@ downloadFile() {
 
     echo "Downloading $DOWNLOAD_URL ..."
 
-    function gh_curl_vnd() {
-        gh_curl -H "Accept: application/vnd.github.v3.raw" \
-          $@
-    }
-
-    parser=". | map(select(.tag_name == \"$LATEST_RELEASE_TAG\"))[0].assets | map(select(.name == \"$SPICE_CLI_ARTIFACT\"))[0].id"
-
-    asset_id=$(gh_curl_vnd -s https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases | jq "$parser")
-    if [ "$asset_id" = "null" ] || [ -z "$asset_id" ]; then
-      echo "ERROR: version not found $VERSION"
-      exit 1
-    fi
-
-    # Download the binary
+    # Download the binary directly
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        gh_curl -H "Accept:application/octet-stream" -SsL \
-            https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id \
-            -o "$ARTIFACT_TMP_FILE"
+        gh_curl -SsL "$DOWNLOAD_URL" -o "$ARTIFACT_TMP_FILE"
     else
-        gh_wget -q --auth-no-challenge --header='Accept:application/octet-stream' \
-            https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id \
-            -O "$ARTIFACT_TMP_FILE"
+        gh_wget -q -O "$ARTIFACT_TMP_FILE" "$DOWNLOAD_URL"
     fi
 
     if [ ! -f "$ARTIFACT_TMP_FILE" ]; then
         echo "Failed to download $DOWNLOAD_URL"
         exit 1
     fi
-    
+
     echo "Download successful ($(du -h "$ARTIFACT_TMP_FILE" | cut -f1))"
 }
 
@@ -355,7 +335,6 @@ trap "fail_trap" EXIT
 getSystemInfo
 verifySupported
 checkHttpRequestCLI
-checkJqInstalled
 
 # Create install directory before checking sudo requirements
 if [ ! -d "$SPICE_CLI_INSTALL_DIR" ]; then

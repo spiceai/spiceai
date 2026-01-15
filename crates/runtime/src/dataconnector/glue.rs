@@ -37,6 +37,7 @@ use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 use crate::{
     component::dataset::Dataset,
     parameters::{ParameterSpec, Parameters},
+    register_data_connector,
 };
 
 use super::{
@@ -289,6 +290,8 @@ impl DataConnector for GlueDataConnector {
     }
 }
 
+register_data_connector!("glue", GlueDataConnectorFactory);
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum InputFormat {
     // Avro,
@@ -431,7 +434,7 @@ async fn create_iceberg_provider(
 
     props.insert(
         GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
-        metadata_location.to_string(),
+        metadata_location.clone(),
     );
 
     if let Some(catalog_id) = table.catalog_id.clone() {
@@ -554,7 +557,7 @@ fn get_metadata_location(table: &Table) -> Result<String, Error> {
     const METADATA_LOCATION: &str = "metadata_location";
     match &table.parameters {
         Some(properties) => match properties.get(METADATA_LOCATION) {
-            Some(location) => Ok(location.to_string()),
+            Some(location) => Ok(location.clone()),
             None => Err(Error::MissingMetadataLocation {
                 table: table.name().to_string(),
                 message: format!("No property '{METADATA_LOCATION}' found"),

@@ -28,6 +28,7 @@ mod abfs;
 mod acceleration;
 mod cache;
 mod catalog;
+mod cayenne;
 #[cfg(feature = "duckdb")]
 mod clickbench;
 mod cors;
@@ -48,6 +49,7 @@ mod databricks_spark_catalog_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_m2m;
 mod dataset_availability;
+mod datasets_api;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
@@ -79,6 +81,7 @@ mod odbc;
 mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
+mod prepared_statements;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;

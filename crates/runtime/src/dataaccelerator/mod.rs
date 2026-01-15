@@ -28,9 +28,8 @@ use datafusion::{
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
-use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
-    column_reference::ColumnReference, on_conflict::OnConflict,
+    column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
 use linkme::distributed_slice;
 use runtime_acceleration::snapshot::SnapshotAdapter;
@@ -57,6 +56,7 @@ pub mod turso;
 
 mod snapshots;
 pub mod spice_sys;
+pub mod upsert_dedup;
 
 pub(crate) use snapshots::validate_snapshot_paths;
 
@@ -281,10 +281,8 @@ impl AcceleratorEngineRegistry {
         {
             external_table_builder = external_table_builder.constraints(constraints.clone());
             let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
-            external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
-                ColumnReference::new(primary_keys),
-                UpsertOptions::default(),
-            ));
+            external_table_builder = external_table_builder
+                .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
         }
 
         if let Some(on_conflict) =
@@ -297,6 +295,10 @@ impl AcceleratorEngineRegistry {
             external_table_builder = external_table_builder.on_conflict(on_conflict);
         }
 
+        // Pass UpsertOptions for constraint validation behavior
+        external_table_builder =
+            external_table_builder.upsert_options(acceleration_settings.upsert_options());
+
         match acceleration_settings.table_constraints(Arc::clone(&schema)) {
             Ok(Some(constraints)) => {
                 if !constraints.is_empty() {
@@ -308,11 +310,9 @@ impl AcceleratorEngineRegistry {
                         let primary_keys: Vec<String> =
                             get_primary_keys_from_constraints(&constraints, &schema);
                         if !primary_keys.is_empty() {
-                            external_table_builder =
-                                external_table_builder.on_conflict(OnConflict::Upsert(
-                                    ColumnReference::new(primary_keys),
-                                    UpsertOptions::default(),
-                                ));
+                            external_table_builder = external_table_builder.on_conflict(
+                                OnConflict::Upsert(ColumnReference::new(primary_keys)),
+                            );
                         }
                     }
                 }
@@ -440,6 +440,7 @@ pub struct AcceleratorExternalTableBuilder {
     indexes: HashMap<ColumnReference, IndexType>,
     constraints: Option<Constraints>,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
 }
 
 impl AcceleratorExternalTableBuilder {
@@ -454,6 +455,7 @@ impl AcceleratorExternalTableBuilder {
             indexes: HashMap::new(),
             constraints: None,
             on_conflict: None,
+            upsert_options: UpsertOptions::default(),
         }
     }
 
@@ -484,6 +486,12 @@ impl AcceleratorExternalTableBuilder {
     #[must_use]
     pub fn constraints(mut self, constraints: Constraints) -> Self {
         self.constraints = Some(constraints);
+        self
+    }
+
+    #[must_use]
+    pub fn upsert_options(mut self, upsert_options: UpsertOptions) -> Self {
+        self.upsert_options = upsert_options;
         self
     }
 
@@ -533,6 +541,18 @@ impl AcceleratorExternalTableBuilder {
             let on_conflict_str = on_conflict.to_string();
             tracing::debug!("Adding on_conflict to options: {}", on_conflict_str);
             options.insert("on_conflict".to_string(), on_conflict_str);
+        }
+
+        // Pass upsert_options as JSON serialized string
+        if self.upsert_options.remove_duplicates || self.upsert_options.last_write_wins {
+            options.insert(
+                "upsert_remove_duplicates".to_string(),
+                self.upsert_options.remove_duplicates.to_string(),
+            );
+            options.insert(
+                "upsert_last_write_wins".to_string(),
+                self.upsert_options.last_write_wins.to_string(),
+            );
         }
 
         let constraints = match self.constraints {
@@ -621,7 +641,7 @@ pub(crate) fn get_primary_keys_from_constraints(
                 Some(
                     col_indexes
                         .iter()
-                        .map(|&col_index| schema.field(col_index).name().to_string()),
+                        .map(|&col_index| schema.field(col_index).name().clone()),
                 )
             } else {
                 None
@@ -2173,7 +2193,7 @@ mod accelerator_compat_tests {
                 if _mode == "file" {
                     options.insert("file".to_string(), location.clone());
                 }
-                options.insert("mode".to_string(), _mode.to_string());
+                options.insert("mode".to_string(), _mode.clone());
 
                 let external_table = CreateExternalTable {
                     schema: df_schema,

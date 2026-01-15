@@ -303,7 +303,6 @@ impl Runtime {
         .await;
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn register_loaded_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -380,7 +379,9 @@ impl Runtime {
                         self.df.results_cache_provider().is_some()
                     )
                 );
-                if !data_connector.initialization().is_on_trigger()
+                if data_connector
+                    .initialization_for_dataset(&ds)
+                    .is_dataset_health_monitor_enabled()
                     && let Some(datasets_health_monitor) = &self.datasets_health_monitor
                     && let Err(err) = datasets_health_monitor.register_dataset(&ds).await
                 {
@@ -694,7 +695,11 @@ impl Runtime {
                 })?;
         let accelerator_engine = acceleration_settings.engine;
 
-        if ds.access() == AccessMode::ReadWrite && !replicate {
+        // Allow ReadWrite access when:
+        // 1. Replication is enabled (changes are synced back to source), OR
+        // 2. on_conflict is configured (accelerator supports local writes via upsert/drop)
+        let has_on_conflict = !acceleration_settings.on_conflict.is_empty();
+        if ds.access() == AccessMode::ReadWrite && !replicate && !has_on_conflict {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 

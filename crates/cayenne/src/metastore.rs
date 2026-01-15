@@ -25,6 +25,8 @@ pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
 
+use std::fmt::Display;
+
 use super::catalog::CatalogResult;
 use async_trait::async_trait;
 
@@ -64,8 +66,22 @@ pub enum MetastoreValue {
     Text(String),
     /// Boolean value
     Bool(bool),
+    /// Blob (binary) value
+    Blob(Vec<u8>),
     /// Null value
     Null,
+}
+
+impl Display for MetastoreValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetastoreValue::Integer(v) => write!(f, "integer {v}"),
+            MetastoreValue::Text(v) => write!(f, "text '{v}'"),
+            MetastoreValue::Bool(v) => write!(f, "bool {v}"),
+            MetastoreValue::Blob(v) => write!(f, "blob ({} bytes)", v.len()),
+            MetastoreValue::Null => write!(f, "NULL"),
+        }
+    }
 }
 
 impl From<i64> for MetastoreValue {
@@ -127,6 +143,14 @@ pub trait MetastoreRow: Send {
     /// cannot be converted to bool.
     fn get_bool(&self, index: usize) -> CatalogResult<bool>;
 
+    /// Get a blob (binary) value from the row by column index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column index is out of bounds or if the value
+    /// cannot be converted to a byte array.
+    fn get_blob(&self, index: usize) -> CatalogResult<Vec<u8>>;
+
     /// Get an optional i64 value from the row by column index.
     ///
     /// # Errors
@@ -157,7 +181,7 @@ impl MetastoreGetValue for i64 {
         match value {
             MetastoreValue::Integer(v) => Ok(*v),
             _ => Err(super::catalog::CatalogError::Database {
-                message: "Expected integer value".to_string(),
+                message: format!("Expected integer value, found {value}"),
             }),
         }
     }
@@ -168,7 +192,7 @@ impl MetastoreGetValue for String {
         match value {
             MetastoreValue::Text(v) => Ok(v.clone()),
             _ => Err(super::catalog::CatalogError::Database {
-                message: "Expected text value".to_string(),
+                message: format!("Expected text value, found {value}"),
             }),
         }
     }
@@ -180,7 +204,18 @@ impl MetastoreGetValue for bool {
             MetastoreValue::Bool(v) => Ok(*v),
             MetastoreValue::Integer(v) => Ok(*v != 0),
             _ => Err(super::catalog::CatalogError::Database {
-                message: "Expected boolean value".to_string(),
+                message: format!("Expected boolean value, found {value}"),
+            }),
+        }
+    }
+}
+
+impl MetastoreGetValue for Vec<u8> {
+    fn from_value(value: &MetastoreValue) -> CatalogResult<Self> {
+        match value {
+            MetastoreValue::Blob(v) => Ok(v.clone()),
+            _ => Err(super::catalog::CatalogError::Database {
+                message: format!("Expected blob value, found {value}"),
             }),
         }
     }

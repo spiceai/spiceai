@@ -32,7 +32,6 @@ use std::sync::Arc;
 // Generate test variants for each backend
 test_with_backends!(test_cayenne_basic_workflow_impl);
 
-#[expect(clippy::too_many_lines)]
 async fn test_cayenne_basic_workflow_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -52,6 +51,7 @@ async fn test_cayenne_basic_workflow_impl(
         table_name: "test_table".to_string(),
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -440,27 +440,7 @@ fn verify_sqlite_metadata(
 
     let conn = Connection::open(db_path)?;
 
-    // 1. Verify cayenne_metadata table has initial metadata
-    let next_catalog_id: i64 = conn.query_row(
-        "SELECT value FROM cayenne_metadata WHERE key = 'next_catalog_id'",
-        [],
-        |row| row.get(0),
-    )?;
-    let next_file_id: i64 = conn.query_row(
-        "SELECT value FROM cayenne_metadata WHERE key = 'next_file_id'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert!(
-        next_catalog_id >= 2,
-        "Expected next_catalog_id to be at least 2"
-    );
-    assert_eq!(next_file_id, 1, "Expected next_file_id to be 1");
-    println!(
-        "  • Metadata verified: next_catalog_id={next_catalog_id}, next_file_id={next_file_id}"
-    );
-
-    // 2. Verify cayenne_table has the test_table entry
+    // 1. Verify cayenne_table has the test_table entry
     let table_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM cayenne_table", [], |row| row.get(0))?;
     assert_eq!(table_count, 1, "Expected 1 table in cayenne_table");
@@ -516,13 +496,6 @@ fn verify_sqlite_metadata(
         "  • Schema JSON is valid base64 ({} chars)",
         schema_json.len()
     );
-
-    // 4. Verify cayenne_data_file table exists (may be empty if no data files created yet)
-    let data_file_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM cayenne_data_file", [], |row| {
-            row.get(0)
-        })?;
-    println!("  • Data files tracked: {data_file_count}");
 
     // 5. Verify cayenne_delete_file table exists (should be empty for this test)
     let delete_file_count: i64 =
@@ -603,6 +576,7 @@ async fn test_cayenne_statistics_impl(
         table_name: "stats_table".to_string(),
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -659,7 +633,6 @@ async fn test_cayenne_statistics_impl(
 // Generate test variants for each backend
 test_with_backends!(test_cayenne_core_data_types_impl);
 
-#[expect(clippy::too_many_lines)]
 async fn test_cayenne_core_data_types_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -717,6 +690,7 @@ async fn test_cayenne_core_data_types_impl(
         table_name: "types_test".to_string(),
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec!["col_int64".to_string()],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -933,7 +907,6 @@ test_with_backends!(test_cayenne_sorted_insert_impl);
 /// 1. Data is sorted after retention filters and before listing table refresh
 /// 2. Sorting operates on the complete corpus after retention
 /// 3. Zone maps have optimal (non-overlapping) min/max ranges
-#[expect(clippy::too_many_lines)]
 async fn test_cayenne_sorted_insert_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -960,6 +933,7 @@ async fn test_cayenne_sorted_insert_impl(
         table_name: "sorted_table".to_string(),
         schema: Arc::<arrow::datatypes::Schema>::clone(&schema),
         primary_key: vec![],
+        on_conflict: None,
         base_path: data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config,

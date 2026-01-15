@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::sharepoint::{client::SharepointClient, table::SharepointTableProvider};
 use datafusion::datasource::TableProvider;
@@ -205,3 +205,5 @@ impl DataConnector for Sharepoint {
         }
     }
 }
+
+register_data_connector!("sharepoint", SharepointFactory);

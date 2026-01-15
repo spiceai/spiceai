@@ -24,7 +24,7 @@ mod embeddings {
 
     use anyhow::Result;
     use app::AppBuilder;
-    use async_openai::types::EmbeddingInput;
+    use async_openai::types::embeddings::EmbeddingInput;
     use spicepod::component::{embeddings::Embeddings, model::ModelFile};
 
     use crate::{

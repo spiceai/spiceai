@@ -64,10 +64,8 @@ impl DebeziumKafkaSys {
             AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.get_turso(pool).await,
-            AccelerationConnection::Cayenne(_, _) => {
-                // Cayenne doesn't support Debezium Kafka metadata
-                None
-            }
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => self.get_sqlite(conn).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
@@ -88,10 +86,8 @@ impl DebeziumKafkaSys {
             AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
             #[cfg(feature = "turso")]
             AccelerationConnection::Turso(pool) => self.upsert_turso(pool, metadata).await,
-            AccelerationConnection::Cayenne(_, _) => {
-                // Cayenne doesn't support Debezium Kafka metadata
-                Err(Error::NoAccelerationConnection)
-            }
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => self.upsert_sqlite(conn, metadata).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",

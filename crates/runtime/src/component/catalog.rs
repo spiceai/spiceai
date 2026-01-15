@@ -247,11 +247,11 @@ impl CatalogBuilder {
 
     pub fn build(self) -> Result<Catalog> {
         let app = self.app.ok_or(Error::UnableToBuildCatalog {
-            catalog: self.name.to_string(),
+            catalog: self.name.clone(),
             missing_component: "app".to_string(),
         })?;
         let runtime = self.runtime.ok_or(Error::UnableToBuildCatalog {
-            catalog: self.name.to_string(),
+            catalog: self.name.clone(),
             missing_component: "runtime".to_string(),
         })?;
 

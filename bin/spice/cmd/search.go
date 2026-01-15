@@ -143,13 +143,13 @@ spice search --cloud
 			rtcontext.RequireModelsFlavor(cmd)
 		}
 
-		datasets, err := api.GetDatasetsWithStatus(rtcontext)
+		datasets, err := api.GetData[api.Dataset](rtcontext, "/v1/datasets?status=true")
 		if err != nil {
 			slog.Error("could not list datasets", "error", err)
 		}
 
 		for _, dataset := range datasets {
-			if dataset.Status != api.Ready.String() && dataset.Status != api.Refreshing.String() {
+			if dataset.Status != "Ready" && dataset.Status != "Refreshing" {
 				// warn only if search is supported by the dataset
 				prop_val, _ := dataset.GetPropertyValue("search")
 				if prop_val == "supported" {
@@ -622,7 +622,7 @@ func runRemoteSearchREPL(cmd *cobra.Command, rtcontext *context.RuntimeContext, 
 		// Check cache status header
 		cacheStatus := resp.Header.Get("Search-Results-Cache-Status")
 		cachedStr := ""
-		if cacheStatus == "HIT" {
+		if cacheStatus == "HIT" || cacheStatus == "STALE" {
 			cachedStr = " (cached)"
 		}
 

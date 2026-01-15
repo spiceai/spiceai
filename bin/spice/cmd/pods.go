@@ -38,20 +38,13 @@ spice pods
 			slog.Error("failed to initialize runtime context", "error", err)
 			os.Exit(1)
 		}
-		spicepods, err := api.GetData[api.Spicepod](rtcontext, "/v1/spicepods")
+		spicepods, err := api.GetData[api.SpicepodStatus](rtcontext, "/v1/spicepods")
 		if err != nil {
 			slog.Error("listing spiced pods", "error", err)
 		}
 		table := make([]interface{}, len(spicepods))
 		for i, spicepod := range spicepods {
-			spicepodStatus := api.SpicepodStatus{
-				Version:           spicepod.Version,
-				Name:              spicepod.Name,
-				DatasetsCount:     len(spicepod.Datasets),
-				ModelsCount:       len(spicepod.Models),
-				DependenciesCount: len(spicepod.Dependencies),
-			}
-			table[i] = spicepodStatus
+			table[i] = spicepod
 		}
 		util.WriteTable(table)
 	},

@@ -131,31 +131,20 @@ impl Query {
             response => response,
         };
 
-        // Always use CacheKey::Query when checking the plan cache
-        // Only compute this hash if we need it for the plan cache lookup
         let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(df));
-        let plan = match df
-            .get_or_create_logical_plan(session, &sql_raw_cache_key, sql)
-            .await
-        {
+        let plan = match Self::get_plan(df, session, sql, &sql_raw_cache_key, parameters).await {
             Ok(plan) => plan,
             Err(e) => {
-                let e = find_datafusion_root(e);
-                let error_code = ErrorCode::from(&e);
-                let snafu_error = super::Error::UnableToExecuteQuery { source: e };
-                if let Some(t) = tracker {
-                    t.finish_with_error(&request_context, snafu_error.to_string(), error_code);
+                if let super::Error::UnableToExecuteQuery { source } = e {
+                    let code = ErrorCode::from(&source);
+                    let snafu_err = super::Error::UnableToExecuteQuery { source };
+                    if let Some(t) = tracker {
+                        t.finish_with_error(&request_context, snafu_err.to_string(), code);
+                    }
+                    return Err(snafu_err);
                 }
-                return Err(snafu_error);
+                return Err(e);
             }
-        };
-
-        // Use the logical plan with parameter values for caching and lookup
-        let plan = match parameters {
-            Some(param_values) => plan
-                .with_param_values(param_values)
-                .context(BindingParametersSnafu)?,
-            None => plan,
         };
 
         // Try to get cached results from plan
@@ -199,6 +188,36 @@ impl Query {
         ))
     }
 
+    /// Get the logical plan for the given SQL query, applying parameter values if provided.
+    pub(super) async fn get_plan(
+        df: &Arc<DataFusion>,
+        session: &SessionState,
+        sql: &str,
+        sql_raw_cache_key: &RawCacheKey,
+        parameters: Option<ParamValues>,
+    ) -> super::Result<LogicalPlan> {
+        let plan = match df
+            .get_or_create_logical_plan(session, sql_raw_cache_key, sql)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Err(super::Error::UnableToExecuteQuery {
+                    source: find_datafusion_root(e),
+                });
+            }
+        };
+
+        // Use the logical plan with parameter values for caching and lookup
+        let plan = match parameters {
+            Some(param_values) => plan
+                .with_param_values(param_values)
+                .context(BindingParametersSnafu)?,
+            None => plan,
+        };
+        Ok(plan)
+    }
+
     /// Return the [`Hasher`] that should be used in caching [`LogicalPlan`]s in [`DataFusion`].
     pub(super) fn plan_hasher(df: &DataFusion) -> Box<dyn Hasher> {
         df.plans_cache_provider().map_or(
@@ -207,7 +226,6 @@ impl Query {
         )
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn try_get_cached_result<'a>(
         df: &Arc<DataFusion>,
         request_context: &Arc<RequestContext>,
@@ -320,13 +338,7 @@ impl Query {
                     CacheKey::LogicalPlan(p) => Some(*p),
                     _ => None,
                 };
-                Self::trigger_background_query_revalidation(
-                    Arc::clone(df),
-                    sql,
-                    request_context,
-                    plan,
-                    raw_key,
-                );
+                Self::trigger_background_query_revalidation(Arc::clone(df), sql, plan, raw_key);
             }
         }
 
@@ -393,37 +405,16 @@ impl Query {
     /// - The `DataFusion` context is dropped (runtime shutdown)
     /// - The query execution is interrupted via the session context
     ///
-    /// Creates a background request context for cache revalidation
+    /// Creates a background request context for cache revalidation.
     ///
-    /// Takes the original request context and cache key to create a new background context
-    /// that uses a client-supplied cache key. This ensures the revalidation query uses the
-    /// exact same cache key as the original query.
-    fn create_background_context(
-        request_context: &Arc<RequestContext>,
-        cache_key: RawCacheKey,
-    ) -> Arc<RequestContext> {
-        // Create a background request context with a client-supplied cache key to ensure
-        // the revalidation query uses the exact same cache key as the original query.
-        // This allows the query to go through the normal caching pipeline and naturally
-        // update the cache entry that served stale data.
-        let cache_key_str = cache_key.as_u64().to_string();
-
-        // Convert the original cache control to use ClientSupplied cache key type
-        // For background revalidation, we want to STORE fresh results, so convert
-        // MaxStale to Cache to avoid serving stale data during revalidation
-        let background_cache_control = match request_context.cache_control() {
-            CacheControl::MaxStale(_, _) | CacheControl::Cache(_) => {
-                CacheControl::Cache(CacheKeyType::ClientSupplied)
-            }
-            other @ (CacheControl::NoCache
-            | CacheControl::MinFresh(_, _)
-            | CacheControl::OnlyIfCached(_)) => other,
-        };
-
+    /// Uses `NoCache` to prevent the background query from going through the normal
+    /// cache lookup/store path. This avoids false cache misses and duplicate storage.
+    /// The `cache_revalidation_result` function handles storing results under the correct
+    /// original cache key that triggered the stale-while-revalidate.
+    fn create_background_context() -> Arc<RequestContext> {
         Arc::new(
             RequestContext::builder(Protocol::Internal)
-                .with_cache_control(background_cache_control)
-                .with_client_supplied_cache_key(Some(cache_key_str))
+                .with_cache_control(CacheControl::NoCache)
                 .build(),
         )
     }
@@ -505,7 +496,6 @@ impl Query {
     fn trigger_background_query_revalidation(
         df: Arc<DataFusion>,
         sql: &str,
-        request_context: &Arc<RequestContext>,
         plan: Option<&LogicalPlan>,
         cache_key: RawCacheKey,
     ) {
@@ -523,16 +513,18 @@ impl Query {
 
         let cache_key_u64 = cache_key.as_u64();
 
-        // Create a background request context that will cache results using the same cache key
-        let background_context = Self::create_background_context(request_context, cache_key);
+        // Create a background request context with NoCache to bypass cache lookup
+        let background_context = Self::create_background_context();
 
         // Clone sql and plan for the async block
         let sql_owned = sql.to_string();
         let plan_owned = plan.cloned();
 
-        // Spawn a detached task for background revalidation
-        // Use optionally_get_with to ensure only one revalidation per key runs concurrently
-        tokio::spawn(async move {
+        // Get optional dedicated refresh runtime, fall back to current runtime if not configured
+        let refresh_runtime = df.refresh_runtime().cloned();
+
+        // Build the background task
+        let background_task = async move {
             // optionally_get_with provides automatic single-in-flight: if another task
             // is already running for this key, this will return None immediately
             let result = locks
@@ -607,6 +599,8 @@ impl Query {
 
             if result == Some(()) {
                 // This task was the one that ran the revalidation
+                // Remove the single-flight guard so future stale hits can trigger another refresh
+                locks.invalidate(&cache_key_u64).await;
             } else {
                 // Another task is already revalidating this key
                 tracing::debug!(
@@ -615,7 +609,16 @@ impl Query {
                 );
                 cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
             }
-        });
+        };
+
+        // Spawn on dedicated refresh runtime if configured, otherwise use current runtime.
+        // Using the dedicated refresh runtime isolates SWR background work from user-facing
+        // query processing, preventing latency spikes when many cache entries become stale.
+        if let Some(runtime) = refresh_runtime {
+            runtime.spawn(background_task);
+        } else {
+            tokio::spawn(background_task);
+        }
     }
 
     pub(super) fn wrap_stream_with_cache(
@@ -714,7 +717,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_get_plan_or_cached_cache_miss_and_hit() {
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
             item_ttl: Some("10m".to_string()),
@@ -1137,7 +1139,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_complete_lifecycle() {
         // This test validates the complete stale-while-revalidate lifecycle:
         // 1. Initial cache population
@@ -1367,7 +1368,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_stale_while_revalidate_with_client_supplied_cache_key() {
         // Configure cache with short TTL and stale-while-revalidate
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
@@ -1531,7 +1531,6 @@ mod tests {
             .await;
     }
 
-    #[expect(clippy::too_many_lines)]
     #[tokio::test]
     async fn test_single_in_flight_revalidation() {
         // This test validates that concurrent stale-while-revalidate requests

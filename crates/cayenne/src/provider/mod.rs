@@ -39,8 +39,10 @@ limitations under the License.
 //! - [`streaming`]: Streaming execution plan for write operations
 //! - [`utils`]: Numeric conversion utilities
 //! - [`constants`]: Shared constants
+//! - [`context`]: Shared context for Cayenne operations
 
 pub(crate) mod constants;
+pub(crate) mod context;
 pub(crate) mod delete;
 pub(crate) mod scan;
 pub(crate) mod streaming;
@@ -48,8 +50,9 @@ pub(crate) mod table;
 pub(crate) mod utils;
 
 // Re-export the main type at the module level for convenience
+pub use context::CayenneContext;
 pub use scan::CayenneAccelerationExec;
-pub use table::CayenneTableProvider;
+pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::{read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec};
@@ -83,6 +86,7 @@ mod tests {
     use datafusion_catalog::TableProvider;
     use datafusion_expr::dml::InsertOp;
     use datafusion_physical_plan::collect;
+    use datafusion_table_providers::util::on_conflict::OnConflict;
     use futures::future::join_all;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -112,6 +116,7 @@ mod tests {
                 table_name: table_name.to_string(),
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
                 base_path: temp_dir.path().to_string_lossy().to_string(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
@@ -553,6 +558,7 @@ mod tests {
             table_name: "sorted_test".to_string(),
             schema: Arc::clone(&schema),
             primary_key: vec![],
+            on_conflict: None,
             base_path: data_path.to_string_lossy().to_string(),
             partition_column: None,
             vortex_config,

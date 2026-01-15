@@ -14,17 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use crate::args::{DatasetTestArgs, QuerySetLoader};
+use crate::args::{CommonArgs, DatasetTestArgs};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
     queries::QuerySet,
-    spiced::StartRequest,
+    spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
     spicepod_utils::from_app,
     spicetest::datasets::NotStarted,
+    telemetry::{OtlpExporterConfig, Telemetry},
 };
 
 #[cfg(feature = "append")]
@@ -33,15 +34,25 @@ pub(crate) mod bench;
 pub(crate) mod data_consistency;
 pub(crate) mod dispatch;
 pub(crate) mod evals;
-pub(crate) mod http;
 pub(crate) mod load;
 pub(crate) mod query;
 pub(crate) mod search;
+pub(crate) mod text_to_sql;
 pub(crate) mod throughput;
-mod util;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
 
-use crate::args::CommonArgs;
+#[must_use]
+pub(crate) fn create_telemetry(common: &CommonArgs) -> Telemetry {
+    if let Some(endpoint) = &common.otlp_endpoint {
+        return Telemetry::with_otlp(OtlpExporterConfig {
+            endpoint: endpoint.clone().into(),
+            headers: common.otlp_header.clone(),
+            timeout: Duration::from_secs(10),
+        });
+    }
+
+    Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY")
+}
 
 /// Build a test configuration with validation data if applicable
 ///
@@ -53,7 +64,7 @@ use crate::args::CommonArgs;
 ///
 /// # Returns
 /// Tuple of (`QuerySet`, Vec<Query>, `NotStarted` builder)
-pub(crate) fn build_test_with_validation(
+pub(crate) async fn build_test_with_validation(
     args: &DatasetTestArgs,
     test_builder: NotStarted,
 ) -> anyhow::Result<(QuerySet, NotStarted)> {
@@ -62,9 +73,12 @@ pub(crate) fn build_test_with_validation(
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
+    let queries = query_set.get_queries(query_overrides, None, None).await?;
 
-    let mut test_builder = test_builder.with_query_set(queries);
+    let mut test_builder = test_builder
+        .with_query_set(queries)
+        .with_query_set_type(query_set.clone())
+        .with_query_overrides(query_overrides);
 
     // Add validation data if this is a scenario query set with validation enabled
     if args.validate
@@ -82,6 +96,32 @@ pub(crate) fn build_test_with_validation(
     Ok((query_set, test_builder))
 }
 
+pub(crate) async fn run_or_connect_spiced(
+    args: &CommonArgs,
+) -> anyhow::Result<(App, SpicedInstance)> {
+    let (app, mut instance) = if args.is_external_instance() {
+        println!(
+            "Connecting to external spiced instance at: {}",
+            args.spiced_path
+        );
+        let spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
+        let app = AppBuilder::new(spicepod.name.clone())
+            .with_spicepod(spicepod)
+            .build();
+        let instance = SpicedInstance::external(&args.spiced_path);
+        (app, instance)
+    } else {
+        let (app, start_request) = get_app_and_start_request(args).await?;
+        let instance = SpicedInstance::start(start_request).await?;
+        (app, instance)
+    };
+    instance
+        .wait_for_ready(std::time::Duration::from_secs(args.ready_wait))
+        .await?;
+
+    Ok((app, instance))
+}
+
 pub(crate) async fn get_app_and_start_request(
     args: &CommonArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
@@ -96,14 +136,14 @@ pub(crate) async fn get_app_and_start_request(
     if let Some(dependencies_root) = &args.spicepod_dependencies {
         for dependency in &spicepod.dependencies {
             let dependent_spicepod = Spicepod::load(&dependencies_root.join(dependency)).await?;
-            app_builder = app_builder.with_spicepod(dependent_spicepod);
+            app_builder = app_builder.with_spicepod_dependency(dependent_spicepod);
         }
     }
     // After we've loaded dependencies, remove.
     spicepod.dependencies = vec![];
     let app = app_builder.build();
 
-    let mut start_request = StartRequest::new(args.spiced_path.clone(), from_app(app.clone()))?;
+    let mut start_request = StartRequest::new(args.spiced_path_buf(), from_app(app.clone()))?;
 
     if let Some(ref data_dir) = args.data_dir {
         start_request = start_request.with_data_dir(data_dir.clone());

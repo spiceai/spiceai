@@ -35,6 +35,8 @@ mod cron;
 mod file_watcher;
 #[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+#[cfg(not(target_os = "windows"))]
+mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
 #[cfg(not(target_os = "windows"))]
@@ -43,6 +45,8 @@ mod query_push_down;
 mod refresh;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
+#[cfg(feature = "snapshots")]
+mod snapshot_mutex;
 
 pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file",);

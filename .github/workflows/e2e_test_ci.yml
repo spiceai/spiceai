@@ -63,7 +63,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -102,7 +102,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -119,17 +119,15 @@ jobs:
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
         with:
           go-version: ${{ env.GOVER }}
           cache: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -142,7 +140,7 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -172,81 +170,10 @@ jobs:
           chmod +x spice
 
       - name: Save spice artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         if: matrix.target.target_os != 'windows'
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: |
-            spice
-            spiced
-
-  build-macos-pr:
-    name: Build macOS aarch64 binaries (PR)
-    runs-on: spiceai-macos
-    if: github.event_name == 'pull_request'
-    needs: setup-matrix
-    env:
-      GOVER: 1.25.3
-      GOOS: darwin
-      GOARCH: arm64
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 1
-
-      - name: Configure Cargo directories (self-hosted macOS)
-        run: |
-          set -euo pipefail
-          cargo_home="${{ runner.temp }}/cargo-${{ github.run_id }}-${{ github.job }}"
-          mkdir -p "$cargo_home/bin"
-          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
-
-      - name: Set REL_VERSION from version.txt
-        run: python3 ./.github/scripts/get_release_version.py
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GOVER }}
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
-        with:
-          os: darwin
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/trunk' }}
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build spiced (macOS)
-        env:
-          MISTRALRS_METAL_PRECOMPILE: 0
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,metal"
-
-      - name: Build spice
-        run: make -C bin/spice
-
-      - name: make spiced executable
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: make spice executable
-        run: |
-          mv target/release/spice spice
-          chmod +x spice
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: build_darwin_aarch64
           path: |
             spice
             spiced
@@ -266,10 +193,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -308,7 +235,7 @@ jobs:
         run: |
           spice add spiceai/quickstart
           cat spicepod.yaml
-  
+
       - name: Wait for dataset to be ready
         working-directory: test_app
         timeout-minutes: 1
@@ -342,10 +269,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -409,10 +336,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -503,6 +430,7 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             {
               engine: postgres,
               params:
@@ -519,12 +447,11 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Prepare PostgreSQL dataset
@@ -542,7 +469,7 @@ jobs:
           createdb -h localhost -U postgres testdb_acc
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -688,6 +615,7 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             {
               engine: postgres,
               params:
@@ -704,13 +632,12 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install PostgreSQL
         if: matrix.acceleration.engine == 'postgres'
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Install MySQL (Linux)
@@ -750,7 +677,7 @@ jobs:
           mysql -h localhost -utest_user -ppassword testdb -e "SELECT * FROM test_mysql_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -898,7 +825,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
@@ -934,7 +861,7 @@ jobs:
           clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1000,7 +927,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
@@ -1021,7 +948,7 @@ jobs:
           ./duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1088,6 +1015,7 @@ jobs:
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             # { engine: turso, mode: memory },
             # { engine: turso, mode: file },
             # { engine: postgres},
@@ -1095,12 +1023,11 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Check PostgreSQL
@@ -1120,7 +1047,7 @@ jobs:
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth.recent_blocks;'
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1232,10 +1159,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1256,7 +1183,7 @@ jobs:
           echo "  caching:" >> spicepod.yaml
           echo "    sql_results:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      eviction_policy: lru" >> spicepod.yaml
+          echo "      caching_policy: lru" >> spicepod.yaml
           echo "      max_size: 128MiB" >> spicepod.yaml
           echo "      item_ttl: 300s" >> spicepod.yaml
           echo "datasets:" >> spicepod.yaml
@@ -1387,10 +1314,10 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1540,7 +1467,7 @@ jobs:
           SA_PASSWORD: 1StrongPwd!!
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Install mssql-tools
         run: |
@@ -1556,7 +1483,7 @@ jobs:
           /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1643,10 +1570,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1745,10 +1672,10 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1905,10 +1832,10 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build

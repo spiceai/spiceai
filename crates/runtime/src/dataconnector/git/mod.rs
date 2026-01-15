@@ -19,6 +19,7 @@ use crate::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, ParameterSpec, Parameters,
 };
+use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::git::{
     DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILES, GitTableConfig, GitTableProvider,
@@ -300,3 +301,5 @@ impl RateLimiter for NoOpRateLimiter {
         Ok(())
     }
 }
+
+register_data_connector!("git", GitFactory);

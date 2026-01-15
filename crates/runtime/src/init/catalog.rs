@@ -115,7 +115,7 @@ impl Runtime {
             .map(CatalogBuilder::try_from)
             .map(move |catalog_builder_result| {
                 catalog_builder_result.and_then(|catalog_builder| {
-                    let catalog_name = catalog_builder.name.to_string();
+                    let catalog_name = catalog_builder.name.clone();
                     catalog_builder
                         .with_app(Arc::clone(app))
                         .with_runtime(Arc::clone(&self))

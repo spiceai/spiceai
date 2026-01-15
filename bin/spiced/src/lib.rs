@@ -29,10 +29,11 @@ use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
-#[cfg(feature = "cluster")]
-use runtime::config::ClusterMode;
+use runtime::cluster::ResolvedClusterConfig;
+use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
@@ -46,6 +47,7 @@ use spiced_tracing::LogVerbosity;
 use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
+use util::in_tracing_context;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -97,6 +99,9 @@ pub enum Error {
     #[snafu(display("Generic Error: {reason}"))]
     GenericError { reason: String },
 
+    #[snafu(display("Invalid cluster configuration: {source}"))]
+    InvalidClusterConfig { source: std::io::Error },
+
     #[snafu(display("Failed to apply the runtime overrides from `--set-runtime`. {reason}"))]
     FailedToApplyOverridesGeneric { reason: String },
 
@@ -120,6 +125,15 @@ pub struct Args {
     /// Enable Prometheus metrics. (disabled by default)
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
     pub metrics: Option<SocketAddr>,
+
+    /// Deprecated OpenTelemetry bind address (no effect).
+    #[arg(
+        long = "open_telemetry",
+        value_name = "OPEN_TELEMETRY_BIND_ADDRESS",
+        default_value = "127.0.0.1:50052",
+        action
+    )]
+    pub open_telemetry_bind_address: SocketAddr,
 
     /// Print the version and exit.
     #[arg(long)]
@@ -180,9 +194,11 @@ pub struct Args {
     /// Overrides for the runtime configuration (--set-runtime key1.subkey=value1)
     #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
     pub set_runtime: Vec<(String, String)>,
+
+    #[arg(skip)]
+    pub open_telemetry_deprecated: bool,
 }
 
-#[expect(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
@@ -215,6 +231,9 @@ pub async fn run(args: Args) -> Result<()> {
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
     let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
 
+    let resolved_cluster_config =
+        in_tracing_context(|| ResolvedClusterConfig::try_new(args.runtime.cluster.clone()));
+
     let mut builder = Runtime::builder()
         .with_app_opt(app.clone())
         // User configured extensions
@@ -228,6 +247,23 @@ pub async fn run(args: Args) -> Result<()> {
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
         .with_runtime_config(args.runtime.clone())
         .with_io_runtime(Handle::current());
+
+    // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)
+    let is_cluster_mode =
+        args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
+
+    match resolved_cluster_config {
+        Ok(resolved_cluster_config) => {
+            builder = builder.with_resolved_cluster_config(resolved_cluster_config);
+        }
+        Err(e) if is_cluster_mode => {
+            // If cluster mode is intended (explicit --role or implicit via --scheduler-address), surface the error
+            return Err(Error::InvalidClusterConfig { source: e });
+        }
+        Err(_) => {
+            // No cluster mode specified, silently continue in standalone mode
+        }
+    }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
         let pods_watcher = PodsWatcher::new(spicepod_path.clone());
@@ -250,6 +286,12 @@ pub async fn run(args: Args) -> Result<()> {
     .await
     .context(UnableToInitializeTracingSnafu)?;
 
+    if args.open_telemetry_deprecated {
+        tracing::warn!(
+            "`--open_telemetry` is deprecated and has no effect; it will be removed in a future version"
+        );
+    }
+
     // Log spicepod load error now that tracing is initialized
     if let Some(err) = spicepod_load_error {
         tracing::warn!(
@@ -261,11 +303,25 @@ pub async fn run(args: Args) -> Result<()> {
     match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
         Some("sql_engine") | None => {
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-            let tokio_runtime = ManagedTokioRuntime::try_new()
+            let cpu_runtime = ManagedTokioRuntime::try_new()
                 .boxed()
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-            rt.datafusion().set_cpu_runtime(tokio_runtime);
+            rt.datafusion().set_cpu_runtime(cpu_runtime);
+
+            // Create a dedicated refresh runtime for acceleration refresh workers and
+            // stale-while-revalidate background cache refresh tasks. This isolates refresh
+            // workloads from query execution to prevent large refresh operations from
+            // impacting query latency.
+            // Uses low thread priority to minimize impact on latency-sensitive operations.
+            let refresh_runtime = ManagedTokioRuntime::builder()
+                .with_low_priority()
+                .with_thread_name("refresh-worker")
+                .build()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+            rt.datafusion().set_refresh_runtime(refresh_runtime);
         }
         Some("disabled") => {
             tracing::info!(
@@ -280,7 +336,12 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     if let Some(ref metrics_registry) = prometheus_registry {
-        init_metrics(&rt.datafusion(), metrics_registry.clone())
+        let otel_config = telemetry_config
+            .as_ref()
+            .and_then(|c| c.otel_exporter.as_ref())
+            .filter(|c| c.enabled);
+
+        init_metrics(&rt.datafusion(), metrics_registry.clone(), otel_config)
             .context(UnableToInitializeMetricsSnafu)?;
     }
 
@@ -288,7 +349,17 @@ pub async fn run(args: Args) -> Result<()> {
         .await
         .context(UnableToInitializeTlsSnafu)?;
 
-    start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
+    let telemetry_enabled = args.telemetry_enabled;
+    let telemetry_config_clone = telemetry_config.clone();
+    let app_name_clone = app_name.clone();
+    tokio::spawn(async move {
+        start_anonymous_telemetry(
+            telemetry_enabled,
+            telemetry_config_clone.as_ref(),
+            app_name_clone.as_ref(),
+        )
+        .await;
+    });
 
     let rt = Arc::new(rt);
 
@@ -330,8 +401,12 @@ pub async fn run(args: Args) -> Result<()> {
 }
 
 async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)> {
-    #[cfg(feature = "cluster")]
-    if matches!(args.runtime.cluster.mode, Some(ClusterMode::Executor)) {
+    // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
+    let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
+        || (args.runtime.cluster.role.is_none()
+            && args.runtime.cluster.scheduler_address.is_some());
+
+    if is_executor {
         tracing::info!(
             "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
         );
@@ -371,6 +446,7 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
 fn init_metrics(
     df: &Arc<DataFusion>,
     registry: prometheus::Registry,
+    otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::builder().build();
 
@@ -385,27 +461,62 @@ fn init_metrics(
     let spice_metrics_exporter =
         OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
 
-    let periodic_reader = PeriodicReader::builder(spice_metrics_exporter)
-        .with_interval(Duration::from_secs(30))
-        .build();
+    let spice_metrics_reader =
+        PeriodicReader::builder(spice_metrics_exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_interval(Duration::from_secs(30))
+            .build();
 
-    let provider = SdkMeterProvider::builder()
+    let mut provider_builder = SdkMeterProvider::builder()
         .with_resource(resource)
         .with_reader(prometheus_exporter)
-        .with_reader(periodic_reader)
-        .build();
+        .with_reader(spice_metrics_reader);
+
+    // Add OTEL push exporter if configured
+    if let Some(config) = otel_config {
+        match create_otel_reader(config) {
+            Ok(otel_reader) => {
+                provider_builder = provider_builder.with_reader(otel_reader);
+                let protocol = if config.is_http() { "http" } else { "grpc" };
+                tracing::info!(
+                    endpoint = %config.endpoint,
+                    protocol = protocol,
+                    push_interval = %config.push_interval,
+                    "OTEL metrics exporter enabled"
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize OTEL metrics exporter: {e}");
+            }
+        }
+    }
+
+    let provider = provider_builder.build();
     global::set_meter_provider(provider);
 
     Ok(())
 }
 
+/// Creates an OTEL periodic reader from the spicepod config
+fn create_otel_reader(
+    config: &app::spicepod::component::runtime::OtelExporterConfig,
+) -> Result<runtime::otel_push_exporter::OtelPeriodicReader, runtime::otel_push_exporter::Error> {
+    runtime::otel_push_exporter::create_otel_periodic_reader(config)
+}
+
 async fn start_anonymous_telemetry(
-    args: &Args,
+    telemetry_enabled: Option<bool>,
     spicepod_telemetry_config: Option<&TelemetryConfig>,
     spicepod_name: Option<&String>,
 ) {
-    let explicitly_disabled = args.telemetry_enabled == Some(false)
-        || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
+    // Always log hardware info at debug level regardless of telemetry settings
+    // Use async version to avoid blocking the async runtime
+    let hardware_info = telemetry::hardware::HardwareInfo::detect_async()
+        .await
+        .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
+    hardware_info.log_debug();
+
+    let explicitly_disabled =
+        telemetry_enabled == Some(false) || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 
     let telemetry_properties = match spicepod_telemetry_config {
         Some(config) => config
@@ -456,7 +567,7 @@ fn apply_overrides(
 
     for (path, value) in overrides {
         let yaml_value =
-            serde_yaml::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
+            serde_yaml::from_str(value).unwrap_or_else(|_| Value::String(value.clone()));
         match apply_override(&mut yaml, path, yaml_value) {
             Ok(()) => (),
             Err(e) => {

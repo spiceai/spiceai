@@ -1,6 +1,7 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
+snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -11,10 +12,10 @@ expression: normalize_search_response(resp)
       },
       "dataset": "multiple_columns",
       "matches": {
-        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make a"
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 8
+        "cp_catalog_page_sk": 2
       },
       "score": 0.01
     },
@@ -24,10 +25,10 @@ expression: normalize_search_response(resp)
       },
       "dataset": "multiple_columns",
       "matches": {
-        "cp_department": "DEPARTMENT"
+        "cp_description": "Programmes receive just likely, key homes. Relevant,"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 2
+        "cp_catalog_page_sk": 11
       },
       "score": 0.01
     }

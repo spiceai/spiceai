@@ -35,7 +35,6 @@ use tracing::instrument;
 const ORACLE_DOCKER_CONTAINER: &str = "runtime-integration-test-oracle";
 const ORACLE_PORT: u16 = 15210;
 
-#[expect(clippy::too_many_lines)]
 #[instrument]
 async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
     let connector = oracle_connector::new(

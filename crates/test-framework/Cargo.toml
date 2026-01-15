@@ -11,7 +11,10 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 app = { path = "../app" }
-arrow = { workspace = true, features = ["prettyprint"] }
+arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
+arrow-json.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
+async-channel = "2.3"
 async-openai.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -29,6 +32,7 @@ indicatif = "0.18.0"
 insta.workspace = true
 octocrab = "0.47.0"
 opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 rand.workspace = true
@@ -41,7 +45,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 spiceai = { workspace = true }
 spicepod = { path = "../spicepod" }
-sysinfo = "0.35.2"
+sysinfo = "0.37.2"
 telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
 tokio.workspace = true

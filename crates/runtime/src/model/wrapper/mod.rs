@@ -17,7 +17,7 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionResponseStream, ChatCompletionStreamOptions, CreateChatCompletionRequest,
         CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
@@ -67,7 +67,6 @@ pub(crate) static OPENAI_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
             "stream_options",
             "temperature",
             "top_p",
-            "tools",
             "tool_choice",
             "parallel_tool_calls",
             "user",
@@ -163,12 +162,14 @@ impl ChatWrapper {
         ) {
             // Template existing system prompt
             (Some(prompt), true) => {
-                let ctx = match req.metadata.as_ref() {
-                    Some(serde_json::Value::Object(m)) => {
-                        m.clone()
-                            .into_iter()
-                            .collect::<HashMap<String, serde_json::Value>>()
-                    }
+                let ctx = match req
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| serde_json::to_value(m).ok())
+                {
+                    Some(serde_json::Value::Object(m)) => m
+                        .into_iter()
+                        .collect::<HashMap<String, serde_json::Value>>(),
                     Some(_) | None => HashMap::new(),
                 };
 
@@ -208,11 +209,12 @@ impl ChatWrapper {
         if req.stream.is_some_and(|s| s) {
             req.stream_options = match req.stream_options {
                 Some(mut opts) => {
-                    opts.include_usage = true;
+                    opts.include_usage = Some(true);
                     Some(opts)
                 }
                 None => Some(ChatCompletionStreamOptions {
-                    include_usage: true,
+                    include_obfuscation: None,
+                    include_usage: Some(true),
                 }),
             };
         }
@@ -220,6 +222,7 @@ impl ChatWrapper {
     }
 
     /// For [`None`] valued fields in a [`CreateChatCompletionRequest`], if the chat model has non-`None` defaults, use those instead.
+    #[expect(deprecated)] // seed and user fields are deprecated in async-openai
     fn with_model_defaults(
         &self,
         mut req: CreateChatCompletionRequest,
@@ -258,7 +261,6 @@ impl ChatWrapper {
                 }
                 "temperature" => set_default_w_warning!(req, temperature, value, self.public_name),
                 "top_p" => set_default_w_warning!(req, top_p, value, self.public_name),
-                "tools" => set_default_w_warning!(req, tools, value, self.public_name),
                 "tool_choice" => set_default_w_warning!(req, tool_choice, value, self.public_name),
                 "parallel_tool_calls" => {
                     set_default_w_warning!(req, parallel_tool_calls, value, self.public_name);
@@ -288,7 +290,7 @@ impl Chat for ChatWrapper {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
 
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", metadata = %metadata);
+            tracing::info!(target: "task_history", metadata = ?metadata);
         }
 
         let labels = request_labels(&req);
@@ -332,7 +334,7 @@ impl Chat for ChatWrapper {
 
         let labels = request_labels(&req);
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", parent: &span, metadata = %metadata, "labels");
+            tracing::info!(target: "task_history", parent: &span, metadata = ?metadata, "labels");
         }
 
         let result = match self.chat.chat_request(req).instrument(span.clone()).await {

@@ -15,17 +15,17 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::schema::expand_views_schema;
 use async_trait::async_trait;
 use dataformat_json::{Format, SpiceJsonFormat};
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, Result as DFResult, ScalarValue};
+use datafusion::common::{Constraints, DFSchema, Result as DFResult, ScalarValue};
 use datafusion::config::{ConfigField, TableParquetOptions};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::file_format::{
@@ -47,6 +47,10 @@ use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
 use url::Url;
+#[cfg(not(windows))]
+use {
+    datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
+};
 
 use crate::Runtime;
 use crate::accelerated_table::AcceleratedTable;
@@ -59,6 +63,7 @@ use crate::parameters::{ExposedParamLookup, Parameters};
 use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
 
 use super::DelimitedFormat;
+use crate::dataconnector::DataConnectorError::SchemaMismatch;
 use crate::datafusion::builder::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 
@@ -74,6 +79,12 @@ struct LocationPruningListingTable {
     inner: Arc<ListingTable>,
     object_store: Arc<dyn ObjectStore>,
     table_path: ListingTableUrl,
+    /// The original file schema from the `ListingTable`, containing only columns
+    /// physically stored in data files. This must be stored separately because
+    /// `ListingTable` doesn't expose its `file_schema` field publicly, and we cannot
+    /// reliably reconstruct it from `table_schema` when partition columns also
+    /// appear in the file (causing duplicates in `table_schema`).
+    file_schema: SchemaRef,
 }
 
 impl LocationPruningListingTable {
@@ -81,11 +92,13 @@ impl LocationPruningListingTable {
         inner: Arc<ListingTable>,
         object_store: Arc<dyn ObjectStore>,
         table_path: ListingTableUrl,
+        file_schema: SchemaRef,
     ) -> Self {
         Self {
             inner,
             object_store,
             table_path,
+            file_schema,
         }
     }
 
@@ -106,29 +119,7 @@ impl LocationPruningListingTable {
     }
 
     fn file_schema(&self) -> Arc<Schema> {
-        let table_schema = self.inner.schema();
-        let partition_cols: HashSet<&str> = self
-            .partition_column_types()
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
-        let metadata_cols: HashSet<&str> = self
-            .metadata_columns()
-            .iter()
-            .map(MetadataColumn::name)
-            .collect();
-
-        let fields: Vec<_> = table_schema
-            .fields()
-            .iter()
-            .filter(|field| {
-                let name = field.name().as_str();
-                !partition_cols.contains(name) && !metadata_cols.contains(name)
-            })
-            .cloned()
-            .collect();
-
-        Arc::new(Schema::new(fields))
+        Arc::clone(&self.file_schema)
     }
 
     fn collect_partition_values(&self, meta: &ObjectMeta) -> Option<Vec<ScalarValue>> {
@@ -140,7 +131,7 @@ impl LocationPruningListingTable {
 
         let mut values = Vec::with_capacity(self.partition_column_types().len());
         for (value, (_, dtype)) in parts.into_iter().zip(self.partition_column_types()) {
-            let scalar = ScalarValue::try_from_string(value.to_string(), dtype).ok()?;
+            let scalar = ScalarValue::try_from_string(value.clone(), dtype).ok()?;
             values.push(scalar);
         }
         Some(values)
@@ -206,6 +197,13 @@ impl TableProvider for LocationPruningListingTable {
         let Some(locations) = extract_location_predicates(filters) else {
             return self.inner.scan(state, projection, filters, limit).await;
         };
+
+        // Ensure the query runtime uses the same object store configuration (endpoint/region)
+        // as the listing table, even when we bypass listing.
+        state.runtime_env().register_object_store(
+            self.object_store_url().as_ref(),
+            Arc::clone(&self.object_store),
+        );
 
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
 
@@ -536,6 +534,11 @@ pub trait ListingTableConnector: DataConnector {
                 Some(self.get_jsonl_format(dataset, params)?),
                 extension.unwrap_or(".jsonl".to_string()),
             )),
+            #[cfg(not(windows))]
+            (Some("vortex"), _) | (None, Some("vortex")) => Ok((
+                Some(VortexFormatFactory::new().default()),
+                extension.unwrap_or(".vortex".to_string()),
+            )),
             (Some("parquet"), _) | (None, Some("parquet"))=> Ok((
                 Some(Arc::new(
                     ParquetFormat::default().with_options(self.get_table_parquet_options(dataset).await?),
@@ -844,7 +847,6 @@ pub trait ListingTableConnector: DataConnector {
         ))
     }
 
-    #[expect(clippy::too_many_lines)]
     async fn create_listing_table(
         &self,
         dataset: &Dataset,
@@ -971,9 +973,24 @@ pub trait ListingTableConnector: DataConnector {
             }
         }
 
+        let final_schema = if dataset.get_param("hive_partitioning_enabled", false)
+            && table_path.is_collection()
+        {
+            self.deduplicate_partition_columns_expressed_in_file(
+                dataset,
+                expanded_schema,
+                &options.table_partition_cols,
+            )?
+        } else {
+            expanded_schema
+        };
+
+        // Keep a reference to the file schema for LocationPruningListingTable
+        let file_schema = Arc::clone(&final_schema);
+
         let config = ListingTableConfig::new(table_path.clone())
             .with_listing_options(options)
-            .with_schema(expanded_schema);
+            .with_schema(final_schema);
 
         // This shouldn't error because we're passing the schema and options correctly.
         let table =
@@ -1016,12 +1033,65 @@ pub trait ListingTableConnector: DataConnector {
             .any(|c| matches!(c, MetadataColumn::Location(_)));
 
         if has_location_metadata {
-            let wrapped =
-                LocationPruningListingTable::new(table_arc, Arc::clone(&object_store), table_path);
+            let wrapped = LocationPruningListingTable::new(
+                table_arc,
+                Arc::clone(&object_store),
+                table_path,
+                file_schema,
+            );
             Ok(Arc::new(wrapped))
         } else {
             Ok(table_arc)
         }
+    }
+
+    fn deduplicate_partition_columns_expressed_in_file(
+        &self,
+        dataset: &Dataset,
+        schema: SchemaRef,
+        partition_cols: &[(String, DataType)],
+    ) -> DataConnectorResult<SchemaRef> {
+        if partition_cols.is_empty() {
+            return Ok(schema);
+        }
+
+        let mut idents = schema
+            .fields
+            .iter()
+            .map(|f| (f.name().clone(), f.as_ref().clone()))
+            .collect::<HashMap<_, _>>();
+
+        for (name, partition_type) in partition_cols {
+            if let Some(field) = idents.remove(name) {
+                let types_match = match (partition_type, field.data_type()) {
+                    (DataType::Utf8, DataType::LargeUtf8 | DataType::Utf8View) => true,
+                    (pt, ft) => DFSchema::datatype_is_semantically_equal(pt, ft),
+                };
+
+                if !types_match {
+                    return Err(SchemaMismatch {
+                        dataset_name: dataset.name.to_string(),
+                        differences: format!(
+                            "Field {name} cannot be deduplicated as its field types differ:\
+                            (partition column): {}, (file column): {}",
+                            partition_type,
+                            field.data_type()
+                        ),
+                    });
+                }
+            }
+        }
+
+        let new_schema = Schema::new(
+            schema
+                .fields
+                .iter()
+                .filter_map(|f| idents.remove(f.name()))
+                .collect::<Vec<_>>(),
+        )
+        .with_metadata(schema.metadata.clone());
+
+        Ok(Arc::new(new_schema))
     }
 }
 
@@ -1380,6 +1450,7 @@ async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOption
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::RecordBatch;
     use chrono::{TimeZone, Utc};
     use datafusion_table_providers::util::secrets::to_secret_map;
     use futures::StreamExt;
@@ -1855,6 +1926,7 @@ mod tests {
                 .object_store(&table_path)
                 .expect("object store"),
             table_path.clone(),
+            file_schema,
         );
 
         let filters = vec![datafusion_expr::col("location").eq(datafusion_expr::lit(
@@ -1873,6 +1945,200 @@ mod tests {
                 .list_called
                 .load(std::sync::atomic::Ordering::SeqCst),
             "Listing should not be invoked when location predicates are present"
+        );
+    }
+
+    /// Regression test for issue where SELECT with metadata columns (like `location`)
+    /// appearing before partition columns in the projection would fail with
+    /// "column types must match schema types" error.
+    ///
+    /// The root cause was in `DataFusion`'s `ExtendedColumnProjector::project()` which
+    /// inserted partition columns first, then metadata columns, without accounting
+    /// for index position shifts when metadata columns had lower schema indices
+    /// than partition columns.
+    ///
+    /// For example, with schema [compression, day, location] where:
+    /// - compression is a file column (index 0)
+    /// - day is a partition column (index 1)
+    /// - location is a metadata column (index 2)
+    ///
+    /// `SELECT location, day, compression` would request projection [2, 1, 0] which
+    /// maps to output positions [0, 1, 2]. The old code would:
+    /// 1. Insert partition column `day` at position 1 → [compression, day]
+    /// 2. Insert metadata column `location` at position 0 → [location, compression, day]
+    ///
+    /// But the correct output should be [location, day, compression].
+    #[tokio::test]
+    async fn test_location_metadata_column_projection_order() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use tempfile::TempDir;
+
+        // Create temp directory with hive-partitioned parquet files
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let partition_dir = temp_dir.path().join("day=2025-01-01");
+        std::fs::create_dir_all(&partition_dir).expect("create partition dir");
+
+        // Create a simple parquet file with one column (the partition column comes from path)
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "compression",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+
+        let compression_array = arrow::array::StringArray::from(vec!["gzip"]);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&file_schema), vec![Arc::new(compression_array)])
+                .expect("create batch");
+
+        let parquet_path = partition_dir.join("data.parquet");
+        let file = std::fs::File::create(&parquet_path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&file_schema), None).expect("create writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        // Set up DataFusion with the listing table
+        let ctx = SessionContext::new();
+        let table_url = format!("file://{}/", temp_dir.path().display());
+        let store_url = Url::parse(&table_url).expect("parse url");
+        let table_path = ListingTableUrl::parse(&table_url).expect("parse listing url");
+
+        // Register the local filesystem object store
+        let object_store = object_store::local::LocalFileSystem::new();
+        ctx.runtime_env()
+            .register_object_store(&store_url, Arc::new(object_store));
+
+        // Create listing options with partition columns and location metadata
+        let file_format = Arc::new(ParquetFormat::default());
+        let options = ListingOptions::new(file_format)
+            .with_file_extension(".parquet")
+            .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)])
+            .with_metadata_cols(vec![MetadataColumn::Location(Some(
+                table_url.clone().into(),
+            ))]);
+
+        // Note: We only provide the file schema here. The ListingTable automatically
+        // adds partition columns (day) and metadata columns (location) to form the
+        // full table schema.
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("create listing table");
+
+        let provider = LocationPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path,
+            file_schema,
+        );
+
+        ctx.register_table("test_table", Arc::new(provider))
+            .expect("register table");
+
+        // Test 1: SELECT with location first (this was failing before the fix)
+        let df = ctx
+            .sql("SELECT location, day, compression FROM test_table")
+            .await
+            .expect("execute query");
+
+        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
+        assert_eq!(batches.len(), 1, "should have one batch");
+
+        let result = &batches[0];
+        assert_eq!(result.num_columns(), 3, "should have 3 columns");
+        assert_eq!(result.num_rows(), 1, "should have 1 row");
+
+        // Verify column order is correct
+        assert_eq!(
+            result.schema().field(0).name(),
+            "location",
+            "first column should be location"
+        );
+        assert_eq!(
+            result.schema().field(1).name(),
+            "day",
+            "second column should be day"
+        );
+        assert_eq!(
+            result.schema().field(2).name(),
+            "compression",
+            "third column should be compression"
+        );
+
+        // Verify data types are correct
+        let location_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("location should be string array");
+        let day_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("day should be string array");
+        let compression_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("compression should be string array");
+
+        // Verify values
+        assert!(
+            location_col
+                .value(0)
+                .contains("day=2025-01-01/data.parquet"),
+            "location should contain file path, got: {}",
+            location_col.value(0)
+        );
+        assert_eq!(day_col.value(0), "2025-01-01", "day should be 2025-01-01");
+        assert_eq!(
+            compression_col.value(0),
+            "gzip",
+            "compression should be gzip"
+        );
+
+        // Test 2: SELECT with just location and day (was causing panic before fix)
+        let df = ctx
+            .sql("SELECT location, day FROM test_table")
+            .await
+            .expect("execute query");
+
+        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
+        assert_eq!(batches.len(), 1, "should have one batch");
+        assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
+        assert_eq!(
+            batches[0].schema().field(0).name(),
+            "location",
+            "first column should be location"
+        );
+        assert_eq!(
+            batches[0].schema().field(1).name(),
+            "day",
+            "second column should be day"
+        );
+
+        // Test 3: SELECT with reversed order (day, location) - should also work
+        let df = ctx
+            .sql("SELECT day, location FROM test_table")
+            .await
+            .expect("execute query");
+
+        let batches: Vec<RecordBatch> = df.collect().await.expect("collect results");
+        assert_eq!(batches.len(), 1, "should have one batch");
+        assert_eq!(batches[0].num_columns(), 2, "should have 2 columns");
+        assert_eq!(
+            batches[0].schema().field(0).name(),
+            "day",
+            "first column should be day"
+        );
+        assert_eq!(
+            batches[0].schema().field(1).name(),
+            "location",
+            "second column should be location"
         );
     }
 

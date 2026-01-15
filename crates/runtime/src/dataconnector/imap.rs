@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::imap::{
     ImapTableProvider,
@@ -164,7 +164,7 @@ impl ImapFactory {
                         dataconnector: "imap".to_string(),
                         connector_component: params.component.clone(),
                         source: Error::InvalidFrom {
-                            from: dataset.from.to_string(),
+                            from: dataset.from.clone(),
                         }
                         .into(),
                     }
@@ -294,3 +294,5 @@ impl DataConnector for Imap {
         )))
     }
 }
+
+register_data_connector!("imap", ImapFactory);

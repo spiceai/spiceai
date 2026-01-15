@@ -211,7 +211,7 @@ pub async fn start_tracing_eval_run(
     let rb = eval_runs_record(id.as_str(), model_name, eval)
         .boxed()
         .context(FailedToUpdateEvalRunTableSnafu {
-            eval_run_id: id.to_string(),
+            eval_run_id: id.clone(),
         })?;
 
     df.write_data(
@@ -225,7 +225,7 @@ pub async fn start_tracing_eval_run(
     .await
     .boxed()
     .context(FailedToUpdateEvalRunTableSnafu {
-        eval_run_id: id.to_string(),
+        eval_run_id: id.clone(),
     })?;
 
     Ok(id)

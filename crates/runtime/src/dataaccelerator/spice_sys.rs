@@ -16,7 +16,9 @@ limitations under the License.
 
 //! Durable storage for Spice operational data related to acceleration.
 
-use std::{path::Path, sync::Arc};
+use std::path::Path;
+#[cfg(any(feature = "duckdb", feature = "turso"))]
+use std::sync::Arc;
 
 use super::AccelerationSource;
 use snafu::{OptionExt, ResultExt, Snafu};
@@ -29,6 +31,10 @@ use {
     datafusion_table_providers::util::secrets::to_secret_map,
 };
 
+#[cfg(all(not(windows), feature = "sqlite"))]
+use super::DataAccelerator;
+#[cfg(all(not(windows), feature = "sqlite"))]
+use super::cayenne::{CayenneAccelerator, Error as CayenneError};
 #[cfg(feature = "turso")]
 use super::turso::{Error as TursoError, TursoAccelerator};
 #[cfg(feature = "duckdb")]
@@ -53,6 +59,9 @@ pub mod debezium_kafka;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
+
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),
@@ -62,7 +71,8 @@ enum AccelerationConnection {
     SQLite(SqliteConnectionPool),
     #[cfg(feature = "turso")]
     Turso(Arc<super::turso::TursoConnectionPool>),
-    Cayenne(std::path::PathBuf, std::path::PathBuf), // (metadata_path, data_path)
+    #[cfg(all(not(windows), feature = "sqlite"))]
+    Cayenne(SqliteConnectionPool),
 }
 
 #[derive(Debug, Snafu)]
@@ -133,6 +143,20 @@ pub enum Error {
     #[snafu(display("Spice wasn't built with Turso support enabled"))]
     TursoFeatureNotEnabled,
 
+    #[cfg(all(not(windows), feature = "sqlite"))]
+    #[snafu(display("Failed to resolve Cayenne file path: {source}"))]
+    CayenneFilePath { source: CayenneError },
+
+    #[cfg(all(not(windows), feature = "sqlite"))]
+    #[snafu(display("Cayenne metadata directory does not exist at {path}"))]
+    CayenneMetadataMissing { path: String },
+
+    #[cfg(all(not(windows), feature = "sqlite"))]
+    #[snafu(display("Unable to create Cayenne connection pool: {source}"))]
+    CayennePool {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("{engine} acceleration not supported"))]
     UnsupportedEngine { engine: Engine },
 
@@ -162,7 +186,6 @@ pub enum OpenOption {
     OpenExisting,
 }
 
-#[expect(clippy::too_many_lines)]
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
     open_option: OpenOption,
@@ -319,8 +342,10 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "turso"))]
         Engine::Turso => TursoFeatureNotEnabledSnafu.fail(),
+        #[cfg(all(not(windows), feature = "sqlite"))]
         Engine::Cayenne => {
-            use crate::dataaccelerator::cayenne::CayenneAccelerator;
+            use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
+            use std::sync::Arc;
 
             let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
                 .await
@@ -334,37 +359,56 @@ async fn acceleration_connection(
                     target: "CayenneAccelerator",
                 })?;
 
-            // For Cayenne, we need the metadata and data directories
-            let metadata_dir = if let Some(acceleration) = source.acceleration() {
-                acceleration.params.get("cayenne_metadata_dir").map_or_else(
-                    || format!("{}/metadata", crate::spice_data_base_path()),
-                    String::clone,
-                )
-            } else {
-                format!("{}/metadata", crate::spice_data_base_path())
-            };
+            // Validate that we can resolve the file path (used for file existence check validation)
+            let _ = cayenne_accelerator
+                .file_path(source)
+                .map_err(|e| Error::CayenneFilePath {
+                    source: super::cayenne::Error::InvalidConfiguration {
+                        detail: std::sync::Arc::from(format!("{e}")),
+                    },
+                })?;
 
-            let data_dir =
-                cayenne_accelerator
-                    .cayenne_data_dir(source)
-                    .map_err(|e| Error::External {
-                        source: Box::new(e),
-                    })?;
+            // Derive metadata directory using shared resolution logic
+            let metadata_dir = CayenneAccelerator::resolve_metadata_dir(source.acceleration());
 
-            if open_option == OpenOption::OpenExisting && !Path::new(&data_dir).exists() {
-                return Err(Error::External {
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Cayenne data directory does not exist: {data_dir}"),
-                    )),
-                });
+            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+
+            if open_option == OpenOption::OpenExisting && !Path::new(&metadata_db_path).exists() {
+                return CayenneMetadataMissingSnafu {
+                    path: metadata_db_path,
+                }
+                .fail();
             }
 
-            Ok(AccelerationConnection::Cayenne(
-                std::path::PathBuf::from(metadata_dir),
-                std::path::PathBuf::from(data_dir),
-            ))
+            // Ensure metadata directory exists
+            if let Some(parent) = Path::new(&metadata_db_path).parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| Error::CayennePool {
+                        source: Box::new(e),
+                    })?;
+            }
+
+            // Create SQLite connection pool for cayenne metadata using the factory
+            let sqlite_factory = SqliteTableProviderFactory::new();
+            let pool = sqlite_factory
+                .get_or_init_instance(
+                    Arc::from(metadata_db_path.as_str()),
+                    datafusion_table_providers::sql::db_connection_pool::Mode::File,
+                    std::time::Duration::from_millis(5000),
+                )
+                .await
+                .map_err(|e| Error::CayennePool {
+                    source: Box::new(e),
+                })?;
+
+            Ok(AccelerationConnection::Cayenne(pool))
         }
+        #[cfg(any(windows, not(feature = "sqlite")))]
+        Engine::Cayenne => UnsupportedEngineSnafu {
+            engine: Engine::Cayenne,
+        }
+        .fail(),
         Engine::Arrow => UnsupportedEngineSnafu {
             engine: acceleration_settings.engine,
         }

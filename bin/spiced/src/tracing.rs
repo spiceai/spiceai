@@ -86,6 +86,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "search",
     "ballista",
     "datafusion",
+    "runtime_rate_control",
 ];
 
 const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
@@ -257,7 +258,7 @@ async fn zipkin_task_history_otel_exporter(
         return Ok(None);
     }
 
-    let collector_endpoint: String = zipkin_endpoint.to_string();
+    let collector_endpoint: String = zipkin_endpoint.clone();
 
     Ok(Some(
         ZipkinExporter::builder()
@@ -303,11 +304,15 @@ impl SpanExporter for OtelExportMultiplexer {
         let zipkin_future = self.zipkin.as_ref().map(|exporter| exporter.export(batch));
 
         async move {
-            if let Some(zipkin_future) = zipkin_future {
-                let _ = zipkin_future.await;
+            if let Some(zipkin_future) = zipkin_future
+                && let Err(e) = zipkin_future.await
+            {
+                tracing::warn!("Failed to send traces to Zipkin: {e}");
             }
 
-            let _ = history_future.await;
+            if let Err(e) = history_future.await {
+                tracing::warn!("Failed to write to task history: {e}");
+            }
 
             Ok(())
         }

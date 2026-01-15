@@ -33,8 +33,12 @@ use url::{Url, form_urlencoded::parse};
 
 #[cfg(feature = "ftp")]
 use crate::store::ftp::FTPObjectStore;
-#[cfg(feature = "ftp")]
+#[cfg(feature = "nfs")]
+use crate::store::nfs::NFSObjectStore;
+#[cfg(feature = "sftp")]
 use crate::store::sftp::SFTPObjectStore;
+#[cfg(feature = "smb")]
+use crate::store::smb::SMBObjectStore;
 
 #[derive(Debug)]
 pub struct SpiceObjectStoreRegistry {
@@ -220,7 +224,7 @@ impl SpiceObjectStoreRegistry {
         )) as Arc<dyn ObjectStore>)
     }
 
-    #[cfg(feature = "ftp")]
+    #[cfg(feature = "sftp")]
     fn prepare_sftp_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let Some(host) = url.host() else {
             return Err(DataFusionError::Configuration(
@@ -260,8 +264,94 @@ impl SpiceObjectStoreRegistry {
         )) as Arc<dyn ObjectStore>)
     }
 
+    #[cfg(feature = "smb")]
+    fn prepare_smb_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(host) = url.host() else {
+            return Err(DataFusionError::Configuration(
+                "No host provided for SMB".to_string(),
+            ));
+        };
+
+        // Extract share name from the first path segment
+        let path = url.path();
+        let share = path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .ok_or_else(|| {
+                DataFusionError::Configuration("No share name provided for SMB".to_string())
+            })?
+            .to_string();
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No user provided for SMB".to_string())
+        })?;
+        let password = params.get("pass").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No password provided for SMB".to_string())
+        })?;
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
+            })?;
+
+        Ok(Arc::new(SMBObjectStore::new(
+            host.to_string(),
+            share,
+            user,
+            password,
+            client_timeout,
+        )) as Arc<dyn ObjectStore>)
+    }
+
+    #[cfg(feature = "nfs")]
+    fn prepare_nfs_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(host) = url.host() else {
+            return Err(DataFusionError::Configuration(
+                "No host provided for NFS".to_string(),
+            ));
+        };
+
+        // The path is the export path
+        let export_path = url.path().to_string();
+        if export_path.is_empty() || export_path == "/" {
+            return Err(DataFusionError::Configuration(
+                "No export path provided for NFS".to_string(),
+            ));
+        }
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
+            })?;
+
+        Ok(Arc::new(NFSObjectStore::new(
+            host.to_string(),
+            export_path,
+            client_timeout,
+        )) as Arc<dyn ObjectStore>)
+    }
+
     // Splitting up this function wouldn't make much sense as it's all used to create the ObjectStore
-    #[expect(clippy::too_many_lines)]
     fn prepare_azure_object_store(
         &self,
         url: &Url,
@@ -327,7 +417,7 @@ impl SpiceObjectStoreRegistry {
             builder = builder.with_tenant_id(tenant_id);
         }
         if let Some(endpoint) = params.get("endpoint") {
-            builder = builder.with_endpoint(endpoint.to_string());
+            builder = builder.with_endpoint(endpoint.clone());
         }
 
         if let Some(use_fabric_endpoint) = params.get("use_fabric_endpoint") {
@@ -455,7 +545,7 @@ impl SpiceObjectStoreRegistry {
             return self.prepare_s3_object_store(url);
         }
 
-        if url.as_str().starts_with("abfs://") {
+        if url.as_str().starts_with("abfs://") || url.as_str().starts_with("abfss://") {
             return self.prepare_azure_object_store(url);
         }
 
@@ -464,9 +554,19 @@ impl SpiceObjectStoreRegistry {
             return Self::prepare_ftp_object_store(url);
         }
 
-        #[cfg(feature = "ftp")]
+        #[cfg(feature = "sftp")]
         if url.as_str().starts_with("sftp://") {
             return Self::prepare_sftp_object_store(url);
+        }
+
+        #[cfg(feature = "smb")]
+        if url.as_str().starts_with("smb://") {
+            return Self::prepare_smb_object_store(url);
+        }
+
+        #[cfg(feature = "nfs")]
+        if url.as_str().starts_with("nfs://") {
+            return Self::prepare_nfs_object_store(url);
         }
 
         Err(DataFusionError::Execution(format!(

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use datafusion::{
     common::{plan_err, tree_node::TreeNodeRecursion},
     error::DataFusionError,
-    logical_expr::LogicalPlan,
+    logical_expr::{LogicalPlan, Statement},
 };
 
 use crate::datafusion::DataFusion;
@@ -83,7 +83,13 @@ pub fn validate_sql_query_operations(
             plan_err!("COPY operations are not allowed")
         }
         LogicalPlan::Statement(stmt) => {
-            plan_err!("Statements are not allowed: {}", stmt.name())
+            // Allow PREPARE, EXECUTE, and DEALLOCATE statements using enum pattern matching
+            match stmt {
+                Statement::Prepare(_) | Statement::Execute(_) | Statement::Deallocate(_) => {
+                    Ok(TreeNodeRecursion::Continue)
+                }
+                _ => plan_err!("Statements are not allowed: {}", stmt.name()),
+            }
         }
         _ => Ok(TreeNodeRecursion::Continue),
     })?;

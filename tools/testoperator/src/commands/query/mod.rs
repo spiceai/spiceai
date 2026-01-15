@@ -48,7 +48,9 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .query_overrides
         .clone()
         .map(test_framework::queries::QueryOverrides::from);
-    let queries = query_set.get_queries(query_overrides);
+    let queries = query_set
+        .get_queries(query_overrides, Some(&spiced_instance), None)
+        .await?;
 
     let mut test = NotStarted::new()
         .with_parallel_count(1)
@@ -57,7 +59,9 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .with_disable_caching(args.disable_caching)
         .with_scale_factor(args.scale_factor.unwrap_or(1.0))
         .with_http_client(args.http_clients)
-        .with_query_set(queries);
+        .with_query_set(queries)
+        .with_query_set_type(query_set.clone())
+        .with_query_overrides(query_overrides);
 
     if args.validate
         && let Some(validation_data) =
