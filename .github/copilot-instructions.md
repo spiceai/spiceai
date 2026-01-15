@@ -8,6 +8,19 @@ Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and
 
 **Core Principle**: Developer Experience First — Bring data and AI/ML to your application, not the other way around.
 
+### ⚠️ DATA CORRECTNESS — ABSOLUTE TOP PRIORITY ⚠️
+
+**As an AI-native database and search engine, data correctness is non-negotiable and the highest priority of this project.**
+
+- **Data can NEVER be wrong**: Every query must return correct results. Incorrect data is unacceptable under any circumstances.
+- **Correctness over performance**: Never sacrifice data accuracy for speed or convenience. A slow correct answer is infinitely better than a fast wrong one.
+- **Verify transformations**: Any data transformation, aggregation, or computation must preserve data integrity.
+- **Test edge cases rigorously**: NULL handling, boundary conditions, type coercions, and overflow scenarios must all produce correct results.
+- **When in doubt, fail safely**: If there's any uncertainty about data correctness, return an error rather than potentially incorrect data.
+- **No silent data corruption**: Always surface errors visibly rather than returning subtly wrong results.
+
+**This principle supersedes all other considerations including performance, developer experience, and feature velocity.**
+
 ### Runtime Architecture - Separate Tokio Runtimes
 
 **Separate runtime instances for:**
@@ -148,6 +161,35 @@ while let Some(batch) = stream.next().await { process_batch(batch?)?; }
 
 // BAD - materializes entire dataset (OOM risk)
 let all_batches: Vec<RecordBatch> = stream.try_collect().await?;
+```
+
+### SQL & Query Safety (CRITICAL for Data Correctness)
+
+- **Favor DataFrame APIs over raw SQL for internal queries**: Use DataFusion's `DataFrame` API for runtime-internal queries—it's type-safe, composable, and avoids SQL parsing overhead
+- **Never trust user input in SQL**: Always use parameterized queries or proper escaping
+- **Validate query results**: When transforming data, verify row counts and key values are preserved
+- **Handle NULL correctly**: Use `Option<T>` appropriately; NULL propagation must match SQL semantics
+- **Be explicit about type coercions**: Arrow/DataFusion type casting must preserve data fidelity
+- **Test aggregations**: SUM, COUNT, AVG must handle empty sets, NULLs, and overflows correctly
+- **Verify JOIN semantics**: Ensure correct handling of NULL keys and duplicate rows
+- **ORDER BY stability**: Document whether sort is stable when values are equal
+
+```rust
+// GOOD - explicit NULL handling
+let value: Option<i64> = row.get("amount");
+let total = value.unwrap_or(0); // Only if business logic allows
+
+// GOOD - validate transformations with runtime error handling
+ensure!(
+    input_batch.num_rows() == output_batch.num_rows(),
+    RowCountMismatchSnafu {
+        expected: input_batch.num_rows(),
+        actual: output_batch.num_rows(),
+    }
+);
+
+// GOOD - propagate error instead of panicking on NULL
+let value: i64 = row.get("amount").context(AmountNullSnafu)?; // Returns a structured error if NULL
 ```
 
 ### Allocation Minimization
@@ -472,18 +514,19 @@ export PATH="$PATH:$HOME/.spice/bin"
 5. testoperator is the test harness
 6. Workspace uses Rust edition 2024
 7. Allocator customizable (default: snmalloc, can use jemalloc/mimalloc)
-8. New files should include copyright header. The current year is 2025. Required file types: `.rs`, `.go`
+8. New files should include copyright header. The current year is 2026. Required file types: `.rs`, `.go`
 
 ## Adding Features Checklist
 
 1. Check if needs new extension point
 2. Make heavy dependencies optional via features
 3. Add integration tests (testoperator or test-framework)
-4. Update user docs (README.md, docs/)
-5. Follow error message guidelines
-6. Ensure clippy passes
-7. Add to Makefile lint targets
-8. Ensure no blocking ops in async context (`spawn_blocking` or `rayon`)
+4. **Test data correctness edge cases**: NULLs, empty sets, boundary values, type coercions, large datasets
+5. Update user docs (README.md, docs/)
+6. Follow error message guidelines
+7. Ensure clippy passes
+8. Add to Makefile lint targets
+9. Ensure no blocking ops in async context (`spawn_blocking` or `rayon`)
 
 ## References
 

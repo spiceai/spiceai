@@ -17067,6 +17067,7 @@ dependencies = [
  "app",
  "arrow",
  "arrow-json",
+ "arrow-schema",
  "async-channel 2.5.0",
  "async-openai",
  "async-trait",
