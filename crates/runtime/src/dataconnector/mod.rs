@@ -165,8 +165,6 @@ pub mod iceberg;
 pub mod imap;
 pub mod parameters;
 pub mod s3;
-#[cfg(feature = "scylladb")]
-pub mod scylladb;
 #[cfg(feature = "ftp")]
 pub mod sftp;
 #[cfg(feature = "sharepoint")]

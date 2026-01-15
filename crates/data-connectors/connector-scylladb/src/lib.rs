@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,13 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, register_data_connector};
+//! ScyllaDB data connector for Spice.ai runtime.
+//!
+//! This crate provides the ScyllaDB connector implementation, allowing
+//! Spice.ai to connect to ScyllaDB clusters as data sources.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds - changes to this connector only require rebuilding
+//! this crate, not the entire runtime.
+
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::scylladb::ScyllaDbTableFactory;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::scylladbpool::ScyllaDbConnectionPool;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult,
+};
+use runtime::parameters::ParameterSpec;
+use runtime::register_data_connector;
+use runtime_parameters::Parameters;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use snafu::prelude::*;
@@ -29,11 +45,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-
-use super::ConnectorComponent;
-use super::ConnectorParams;
-use super::{DataConnector, DataConnectorError, DataConnectorFactory, Parameters};
-use crate::parameters::ParameterSpec;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -70,11 +81,13 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// ScyllaDB data connector.
 #[derive(Debug)]
 pub struct ScyllaDb {
     scylladb_factory: ScyllaDbTableFactory,
 }
 
+/// Factory for creating ScyllaDB connector instances.
 #[derive(Default, Copy, Clone)]
 pub struct ScyllaDbFactory {}
 
@@ -194,7 +207,7 @@ impl DataConnectorFactory for ScyllaDbFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match create_scylladb_connector(params.parameters).await {
                 Ok((session, keyspace, compute_context)) => {
@@ -252,6 +265,32 @@ impl DataConnectorFactory for ScyllaDbFactory {
 
 register_data_connector!("scylladb", ScyllaDbFactory);
 
+#[derive(Debug, Snafu)]
+enum ReadProviderError {
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<ReadProviderError> for DataConnectorError {
+    fn from(err: ReadProviderError) -> Self {
+        match err {
+            ReadProviderError::UnableToGetReadProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for ScyllaDb {
     fn as_any(&self) -> &dyn Any {
@@ -261,11 +300,11 @@ impl DataConnector for ScyllaDb {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.scylladb_factory, dataset.path().into())
                 .await
-                .context(super::UnableToGetReadProviderSnafu {
+                .context(UnableToGetReadProviderSnafu {
                     dataconnector: "scylladb",
                     connector_component: ConnectorComponent::from(dataset),
                 })?,
@@ -437,10 +476,6 @@ mod tests {
         assert!(keywords.contains(&"KEYSPACE"));
     }
 
-    // ============================================================================
-    // Additional comprehensive tests for edge cases and critical paths
-    // ============================================================================
-
     #[test]
     fn test_factory_new_arc() {
         let factory_arc = ScyllaDbFactory::new_arc();
@@ -459,7 +494,7 @@ mod tests {
         let factory = ScyllaDbFactory::new();
         let keywords = factory.reserved_keywords();
 
-        // Verify essential CQL keywords are present (matching actual RESERVED_KEYWORDS const)
+        // Verify essential CQL keywords are present
         let essential_keywords = vec![
             "SELECT",
             "FROM",

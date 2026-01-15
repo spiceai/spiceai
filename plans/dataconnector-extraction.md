@@ -297,11 +297,11 @@ pub enum StreamError {
 | ✅ mssql | `mssql` | Done | |
 | ✅ snowflake | `snowflake` | Done | |
 | ✅ duckdb | `duckdb` | Done | Heavy libduckdb dependency |
-| ☐ mongodb | `mongodb` | | |
-| ☐ oracle | `oracle` | | |
-| ☐ spark | `spark` | | |
+| ✅ mongodb | `mongodb` | Done | |
+| ✅ oracle | `oracle` | Done | |
+| ✅ spark | `spark` | Done | |
 | ☐ dynamodb | `dynamodb` | | Has streaming error handling |
-| ☐ scylladb | `scylladb` | | |
+| ✅ scylladb | `scylladb` | Done | |
 
 ### Medium Priority (Feature-Gated, Lighter Dependencies)
 

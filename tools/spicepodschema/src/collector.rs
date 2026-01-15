@@ -37,6 +37,7 @@ use connector_oracle as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
 use connector_postgres as _;
+use connector_scylladb as _;
 use connector_snowflake as _;
 use connector_spark as _;
 #[expect(unused_imports)]
