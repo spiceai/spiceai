@@ -1276,3 +1276,94 @@ impl Retention {
         RetentionBuilder::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    fn schema_with_fetched_at() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(
+                caching::CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]))
+    }
+
+    #[test]
+    fn test_extend_projection_none_returns_none() {
+        let schema = schema_with_fetched_at();
+        let result = extend_projection_for_caching(None, &schema);
+        assert!(result.is_none(), "None projection should return None");
+    }
+
+    #[test]
+    fn test_extend_projection_already_includes_fetched_at() {
+        let schema = schema_with_fetched_at();
+        // Projection includes fetched_at (index 3)
+        let projection = vec![0, 1, 3];
+        let result = extend_projection_for_caching(Some(&projection), &schema);
+        assert!(
+            result.is_none(),
+            "Projection already including fetched_at should return None"
+        );
+    }
+
+    #[test]
+    fn test_extend_projection_adds_fetched_at() {
+        let schema = schema_with_fetched_at();
+        // Projection does NOT include fetched_at
+        let projection = vec![0, 2]; // id, content
+        let extended = extend_projection_for_caching(Some(&projection), &schema)
+            .expect("Should extend projection");
+        assert_eq!(
+            extended,
+            vec![0, 2, 3],
+            "Should add fetched_at index at end"
+        );
+    }
+
+    #[test]
+    fn test_extend_projection_single_column() {
+        let schema = schema_with_fetched_at();
+        let projection = vec![2]; // just content
+        let extended = extend_projection_for_caching(Some(&projection), &schema)
+            .expect("Should extend projection");
+        assert_eq!(
+            extended,
+            vec![2, 3],
+            "Should add fetched_at to single column"
+        );
+    }
+
+    #[test]
+    fn test_apply_projection_reduces_columns() {
+        // Create a schema with 4 columns
+        let schema = schema_with_fetched_at();
+
+        // Create a dummy EmptyExec with the schema
+        let empty_exec = EmptyExec::new(Arc::clone(&schema));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(empty_exec);
+
+        // Apply projection for 2 columns (simulating user requested 2 columns)
+        let user_projection = vec![0, 2]; // id, content
+        let projected_plan =
+            apply_projection(plan, &user_projection).expect("apply_projection should succeed");
+
+        // Verify output schema has only the first 2 columns
+        let output_schema = projected_plan.schema();
+        assert_eq!(
+            output_schema.fields().len(),
+            2,
+            "Should have 2 columns after projection"
+        );
+        assert_eq!(output_schema.field(0).name(), "id");
+        assert_eq!(output_schema.field(1).name(), "name");
+    }
+}
