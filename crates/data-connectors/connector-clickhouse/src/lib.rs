@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, register_data_connector};
+//! `ClickHouse` data connector for Spice.ai runtime.
+//!
+//! This crate provides the `ClickHouse` connector implementation, allowing
+//! Spice.ai to connect to `ClickHouse` databases as data sources.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds - changes to this connector only require rebuilding
+//! this crate, not the entire runtime.
+
 use async_trait::async_trait;
 use clickhouse_rs::Options;
 use data_components::Read;
@@ -23,6 +31,13 @@ use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use db_connection_pool::clickhousepool::ClickhouseConnectionPool;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
+use runtime::parameters::{ParamLookup, ParameterSpec, Parameters};
+use runtime::register_data_connector;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -33,11 +48,6 @@ use std::str::ParseBoolError;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
-
-use super::ConnectorComponent;
-use super::ConnectorParams;
-use super::{DataConnector, DataConnectorError, DataConnectorFactory, Parameters};
-use crate::parameters::{ParamLookup, ParameterSpec};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -109,11 +119,13 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// `ClickHouse` data connector.
 #[derive(Debug)]
 pub struct Clickhouse {
     clickhouse_factory: ClickhouseTableFactory,
 }
 
+/// Factory for creating `ClickHouse` connector instances.
 #[derive(Default, Copy, Clone)]
 pub struct ClickhouseFactory {}
 
@@ -160,7 +172,7 @@ impl DataConnectorFactory for ClickhouseFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match get_config_from_params(params.parameters).await {
                 Ok(config) => {
@@ -234,15 +246,41 @@ impl DataConnector for Clickhouse {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.clickhouse_factory, dataset.path().into())
                 .await
-                .context(super::UnableToGetReadProviderSnafu {
+                .context(UnableToGetReadProviderSnafu {
                     dataconnector: "clickhouse",
                     connector_component: ConnectorComponent::from(dataset),
                 })?,
         )
+    }
+}
+
+#[derive(Debug, Snafu)]
+enum ReadProviderError {
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<ReadProviderError> for DataConnectorError {
+    fn from(err: ReadProviderError) -> Self {
+        match err {
+            ReadProviderError::UnableToGetReadProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
+        }
     }
 }
 
@@ -358,28 +396,6 @@ async fn get_config_from_params(params: Parameters) -> Result<ClickhouseConfig> 
 /// This function parses the URL and attempts to extract the database name from the path.
 /// It returns `Some(database_name)` if a valid database name is found, or `None` if no
 /// database is specified or the path is empty.
-///
-/// # Arguments
-///
-/// * `url` - A reference to a parsed `Url` struct representing the Clickhouse connection URL.
-///
-/// # Returns
-///
-/// An `Option<&str>` containing the database name if found, or `None` otherwise.
-///
-/// # Example
-///
-/// ```
-/// use url::Url;
-///
-/// let url = Url::parse("tcp://user:pass@host:9000/mydb").unwrap();
-/// let database = get_database_from_url(&url);
-/// assert_eq!(database, Some("mydb"));
-///
-/// let url_without_db = Url::parse("tcp://user:pass@host:9000").unwrap();
-/// let database = get_database_from_url(&url_without_db);
-/// assert_eq!(database, None);
-/// ```
 fn get_database_from_url(url_str: &str) -> Option<String> {
     let url = Url::parse(url_str).ok()?;
     match url.path_segments() {
