@@ -43,7 +43,11 @@ impl CachingEngineSys {
         let table_name = match (internal_tables.pop(), has_table) {
             (Some((internal_name, _)), _) => internal_name.to_string(),
             (None, true) => self.dataset_name.clone(),
-            (None, false) => return Ok(()), // No table exists yet
+            (None, false) => {
+                // No table exists yet
+                tracing::warn!("No table found for dataset: {}", self.dataset_name);
+                return Ok(());
+            }
         };
 
         // Update fetched_at for the table
