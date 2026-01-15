@@ -102,7 +102,6 @@ pub(super) async fn download_snapshot_if_needed(
     } else {
         BootstrapStatus::none()
     }
-    BootstrapStatus::None
 }
 
 pub(crate) async fn validate_snapshot_paths(sources: Vec<Arc<dyn AccelerationSource>>) {

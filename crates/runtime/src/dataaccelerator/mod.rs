@@ -610,20 +610,6 @@ pub trait AccelerationSource: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-/// Whether an accelerated table was bootstrapped during initialization.
-#[derive(Debug, Clone, Copy)]
-pub enum BootstrapStatus {
-    Bootstrapped,
-    None,
-}
-
-impl BootstrapStatus {
-    #[must_use]
-    pub fn is_bootstrapped(&self) -> bool {
-        matches!(self, BootstrapStatus::Bootstrapped)
-    }
-}
-
 pub async fn acceleration_file_path(
     source: &dyn AccelerationSource,
 ) -> Result<PathBuf, FilePathError> {

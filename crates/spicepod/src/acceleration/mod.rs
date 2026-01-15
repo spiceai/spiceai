@@ -304,9 +304,6 @@ pub struct Acceleration {
 
     #[serde(default, skip_serializing_if = "is_default_snapshot_compaction")]
     pub snapshots_compaction: SnapshotsCompaction,
-
-    #[serde(default = "default_false")]
-    pub snapshots_reset_expiry_on_load: bool,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -316,9 +313,6 @@ fn is_false(b: &bool) -> bool {
 
 const fn default_true() -> bool {
     true
-}
-const fn default_false() -> bool {
-    false
 }
 
 impl Default for Acceleration {
@@ -355,7 +349,6 @@ impl Default for Acceleration {
             snapshots_trigger: None,
             snapshots_trigger_threshold: None,
             snapshots_compaction: SnapshotsCompaction::Disabled,
-            snapshots_reset_expiry_on_load: false,
         }
     }
 }

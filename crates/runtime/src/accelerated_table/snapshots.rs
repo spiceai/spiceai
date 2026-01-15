@@ -81,7 +81,8 @@ pub fn spawn_snapshot_interval_task(
                 "Snapshot interval task for {dataset_name} starting after dataset ready"
             );
         } else {
-            tracing::warn!(  // TODO: should be debug
+            tracing::warn!(
+                // TODO: should be debug
                 "Snapshot interval task for {dataset_name} starting immediately, no dataset_ready_notification provided"
             );
         }
@@ -167,7 +168,8 @@ pub fn create_periodic_snapshot_callback(
                     );
                 });
             } else {
-                tracing::warn!(  // TODO: should be debug
+                tracing::warn!(
+                    // TODO: should be debug
                     "Batch-based snapshot counting for {dataset_name} starting immediately, no dataset_ready_notification provided"
                 );
             }
