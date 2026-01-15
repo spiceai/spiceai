@@ -795,7 +795,6 @@ fn parse_github_path(path: &str) -> Option<GitHubPathComponents<'_>> {
 }
 
 #[async_trait]
-#[expect(clippy::too_many_lines)]
 impl DataConnector for Github {
     fn as_any(&self) -> &dyn Any {
         self

@@ -64,7 +64,6 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
 /// work loop as a future
-#[expect(clippy::too_many_lines)]
 pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {

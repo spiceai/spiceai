@@ -198,7 +198,6 @@ const DEFAULT_REQUEST_BODY_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
 const MCP_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
 const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
 
-#[expect(clippy::too_many_lines)]
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,

@@ -657,7 +657,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines)]
     async fn test_parameter_binding_with_plan_caching() {
         use crate::dataaccelerator::AcceleratorEngineRegistry;
         use crate::datafusion::builder::DataFusionBuilder;
