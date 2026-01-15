@@ -220,15 +220,15 @@ pub(crate) fn routes(
         )
         .route(
             "/v1/datasets/{name}/acceleration/snapshots",
-            get(v1::snapshots::list).post(v1::snapshots::create),
-        )
-        .route(
-            "/v1/datasets/{name}/acceleration/snapshots/head",
-            patch(v1::snapshots::set_head),
+            get(v1::snapshots::list),
         )
         .route(
             "/v1/datasets/{name}/acceleration/snapshots/{snapshot_id}",
-            delete(v1::snapshots::delete),
+            get(v1::snapshots::get),
+        )
+        .route(
+            "/v1/datasets/{name}/acceleration/snapshots/current",
+            post(v1::snapshots::set_current),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route("/v1/packages/generate", post(v1::packages::generate));

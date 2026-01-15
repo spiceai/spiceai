@@ -983,7 +983,9 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 async move {
                     let mutex = Arc::new(Mutex::new(()));
                     let lock_guard = mutex.lock_owned().await;
-                    manager_clone.create_snapshot(&schema, lock_guard).await
+                    manager_clone
+                        .create_snapshot(&schema, None, lock_guard)
+                        .await
                 }
             }))
             .await
@@ -1093,7 +1095,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let lock_guard = mutex.lock_owned().await;
 
             manager
-                .create_snapshot(&schema, lock_guard)
+                .create_snapshot(&schema, None, lock_guard)
                 .await
                 .context("Creating modified snapshot after deleting data")?;
 
@@ -1301,7 +1303,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             let lock_guard = mutex.lock_owned().await;
 
             let compacted_location = manager_with_compaction
-                .create_snapshot(&schema, lock_guard)
+                .create_snapshot(&schema, None, lock_guard)
                 .await
                 .context("Creating snapshot with compaction enabled")?;
 

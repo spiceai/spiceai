@@ -108,6 +108,8 @@ struct SnapshotEntry {
     snapshot_checksum_algorithm: String,
     #[serde(rename = "snapshot-size")]
     snapshot_size: u64,
+    #[serde(rename = "row-count", default, skip_serializing_if = "Option::is_none")]
+    row_count: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +163,57 @@ pub struct SnapshotDownloadInfo {
     pub schema: SchemaRef,
     pub bytes_downloaded: u64,
     pub checksum: String,
+}
+
+/// Public snapshot information for API responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    /// Unique identifier for this snapshot.
+    pub snapshot_id: u64,
+    /// Timestamp when the snapshot was created (milliseconds since epoch).
+    pub timestamp_ms: i64,
+    /// URI location of the snapshot file.
+    pub location: String,
+    /// SHA256 checksum of the snapshot file.
+    pub checksum: String,
+    /// Checksum algorithm used (e.g., "SHA256").
+    pub checksum_algorithm: String,
+    /// Size of the snapshot file in bytes.
+    pub size_bytes: u64,
+    /// Number of rows in the snapshot, if known.
+    pub row_count: Option<u64>,
+    /// Whether this is the current (active) snapshot used for bootstrapping.
+    pub is_current: bool,
+}
+
+impl SnapshotInfo {
+    fn from_entry(entry: &SnapshotEntry, current_snapshot_id: Option<u64>) -> Self {
+        Self {
+            snapshot_id: entry.snapshot_id,
+            timestamp_ms: entry.timestamp_ms,
+            location: entry.snapshot.clone(),
+            checksum: entry.snapshot_checksum.clone(),
+            checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
+            size_bytes: entry.snapshot_size,
+            row_count: entry.row_count,
+            is_current: current_snapshot_id == Some(entry.snapshot_id),
+        }
+    }
+}
+
+/// Summary of all snapshots for a dataset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotSummary {
+    /// Name of the dataset.
+    pub dataset_name: String,
+    /// Base location URI for snapshots.
+    pub location: String,
+    /// Timestamp of the last metadata update (milliseconds since epoch).
+    pub last_updated_ms: i64,
+    /// ID of the current (active) snapshot, if any.
+    pub current_snapshot_id: Option<u64>,
+    /// List of all available snapshots.
+    pub snapshots: Vec<SnapshotInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +333,52 @@ pub enum SnapshotDownloadError {
     },
     #[snafu(display("Snapshot schema mismatch for dataset {dataset}"))]
     SchemaMismatch { dataset: String },
+}
+
+/// Errors that can occur during snapshot management operations.
+#[derive(Debug, Snafu)]
+pub enum SnapshotManagementError {
+    #[snafu(display("Failed to read snapshot metadata at {path}: {source}"))]
+    MetadataReadFailed {
+        path: String,
+        source: object_store::Error,
+    },
+    #[snafu(display("Snapshot metadata at {path} is invalid: {source}"))]
+    MetadataParseFailed {
+        path: String,
+        source: serde_json::Error,
+    },
+    #[snafu(display("Snapshot metadata at {path} has unsupported format version {version}"))]
+    MetadataVersionUnsupported { path: String, version: u32 },
+    #[snafu(display("Dataset {dataset} not found in snapshot metadata"))]
+    DatasetMissing { dataset: String },
+    #[snafu(display("Snapshot {snapshot_id} not found for dataset {dataset}"))]
+    SnapshotMissing { dataset: String, snapshot_id: u64 },
+    #[snafu(display("No snapshots metadata found at {path}"))]
+    NoMetadataFound { path: String },
+    #[snafu(display("Failed to write snapshot metadata to {path}: {source}"))]
+    MetadataWriteFailed {
+        path: String,
+        source: object_store::Error,
+    },
+    #[snafu(display("Failed to serialize snapshot metadata: {source}"))]
+    MetadataSerializeFailed { source: serde_json::Error },
+}
+
+impl From<MetadataLoadError> for SnapshotManagementError {
+    fn from(err: MetadataLoadError) -> Self {
+        match err {
+            MetadataLoadError::Read { path, source } => {
+                SnapshotManagementError::MetadataReadFailed { path, source }
+            }
+            MetadataLoadError::Parse { path, source } => {
+                SnapshotManagementError::MetadataParseFailed { path, source }
+            }
+            MetadataLoadError::UnsupportedVersion { path, version } => {
+                SnapshotManagementError::MetadataVersionUnsupported { path, version }
+            }
+        }
+    }
 }
 
 impl From<MetadataLoadError> for SnapshotDownloadError {
@@ -703,6 +802,7 @@ impl SnapshotManager {
     pub async fn create_snapshot(
         &self,
         schema: &SchemaRef,
+        row_count: Option<u64>,
         lock_guard: OwnedMutexGuard<()>,
     ) -> Result<ObjectPath, SnapshotUploadError> {
         let start_time = Instant::now();
@@ -757,6 +857,7 @@ impl SnapshotManager {
             &destination_location,
             checksum.clone(),
             total_bytes,
+            row_count,
             timestamp_ms,
             schema,
         )
@@ -1557,6 +1658,7 @@ impl SnapshotManager {
         location: &ObjectPath,
         checksum: String,
         size: u64,
+        row_count: Option<u64>,
         timestamp_ms: i64,
         schema: &SchemaRef,
     ) -> Result<(), SnapshotUploadError> {
@@ -1638,6 +1740,7 @@ impl SnapshotManager {
                 snapshot_checksum: checksum_for_metadata,
                 snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
                 snapshot_size: size,
+                row_count,
             };
 
             dataset_entry.snapshots.push(snapshot_entry);
@@ -1693,6 +1796,217 @@ impl SnapshotManager {
                 }
             }
         }
+    }
+
+    /// Returns the dataset name this manager is associated with.
+    #[must_use]
+    pub fn dataset_name(&self) -> &str {
+        &self.dataset_name
+    }
+
+    /// Returns the base location URI for snapshots.
+    #[must_use]
+    pub fn location_uri(&self) -> &str {
+        &self.snapshot_location_uri
+    }
+
+    /// Lists all snapshots available for this dataset.
+    ///
+    /// # Errors
+    ///
+    /// - If there is an error communicating with the object store.
+    /// - If the metadata is corrupted or has an unsupported format version.
+    pub async fn list_snapshots(&self) -> Result<SnapshotSummary, SnapshotManagementError> {
+        let handle = self.load_metadata().await?;
+
+        let Some(handle) = handle else {
+            return Ok(SnapshotSummary {
+                dataset_name: self.dataset_name.clone(),
+                location: self.snapshot_location_uri.clone(),
+                last_updated_ms: 0,
+                current_snapshot_id: None,
+                snapshots: Vec::new(),
+            });
+        };
+
+        let metadata = &handle.metadata;
+
+        let Some(dataset_metadata) = metadata.datasets.get(&self.dataset_name) else {
+            return Ok(SnapshotSummary {
+                dataset_name: self.dataset_name.clone(),
+                location: metadata.location.clone(),
+                last_updated_ms: metadata.last_updated_ms,
+                current_snapshot_id: None,
+                snapshots: Vec::new(),
+            });
+        };
+
+        let snapshots = dataset_metadata
+            .snapshots
+            .iter()
+            .map(|entry| SnapshotInfo::from_entry(entry, dataset_metadata.current_snapshot_id))
+            .collect();
+
+        Ok(SnapshotSummary {
+            dataset_name: self.dataset_name.clone(),
+            location: metadata.location.clone(),
+            last_updated_ms: metadata.last_updated_ms,
+            current_snapshot_id: dataset_metadata.current_snapshot_id,
+            snapshots,
+        })
+    }
+
+    /// Sets the current snapshot to the specified snapshot ID.
+    /// This is used for rollback operations to restore a previous snapshot state.
+    ///
+    /// # Errors
+    ///
+    /// - If the snapshot ID does not exist.
+    /// - If there is an error communicating with the object store.
+    /// - If there is a concurrent update conflict that cannot be resolved.
+    pub async fn set_current_snapshot(
+        &self,
+        snapshot_id: u64,
+    ) -> Result<(), SnapshotManagementError> {
+        let metadata_path = self.metadata_path();
+        let metadata_path_display = metadata_path.to_string();
+
+        // Retry loop to handle precondition failures due to concurrent updates.
+        loop {
+            let handle = self.load_metadata().await?;
+
+            let Some(handle) = handle else {
+                return Err(SnapshotManagementError::NoMetadataFound {
+                    path: metadata_path_display,
+                });
+            };
+
+            let mut metadata = handle.metadata.clone();
+            let now_ms = Utc::now().timestamp_millis();
+            metadata.last_updated_ms = now_ms;
+
+            let dataset_entry = metadata
+                .datasets
+                .get_mut(&self.dataset_name)
+                .ok_or_else(|| SnapshotManagementError::DatasetMissing {
+                    dataset: self.dataset_name.clone(),
+                })?;
+
+            // Validate that the snapshot ID exists
+            let snapshot_exists = dataset_entry
+                .snapshots
+                .iter()
+                .any(|entry| entry.snapshot_id == snapshot_id);
+
+            if !snapshot_exists {
+                return Err(SnapshotManagementError::SnapshotMissing {
+                    dataset: self.dataset_name.clone(),
+                    snapshot_id,
+                });
+            }
+
+            dataset_entry.current_snapshot_id = Some(snapshot_id);
+
+            let serialized = serde_json::to_vec_pretty(&metadata)
+                .map_err(|source| SnapshotManagementError::MetadataSerializeFailed { source })?;
+
+            let version = handle.version.clone();
+            let put_mode = match version {
+                Some(version) => PutMode::Update(version),
+                None => PutMode::Overwrite,
+            };
+
+            let payload = PutPayload::from(serialized);
+
+            match self
+                .object_store
+                .put_opts(&metadata_path, payload.clone(), put_mode.clone().into())
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(
+                        "Set current snapshot. dataset={} snapshot_id={snapshot_id}",
+                        self.dataset_name
+                    );
+                    return Ok(());
+                }
+                Err(object_store::Error::Precondition { .. }) => {
+                    // Concurrent update, retry
+                }
+                Err(object_store::Error::NotSupported { .. })
+                    if matches!(put_mode, PutMode::Update(_)) =>
+                {
+                    match self
+                        .object_store
+                        .put_opts(&metadata_path, payload, PutMode::Overwrite.into())
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!(
+                                "Set current snapshot. dataset={} snapshot_id={snapshot_id}",
+                                self.dataset_name
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            return Err(SnapshotManagementError::MetadataWriteFailed {
+                                path: metadata_path_display,
+                                source: err,
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(SnapshotManagementError::MetadataWriteFailed {
+                        path: metadata_path_display,
+                        source: err,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Gets information about a specific snapshot by ID.
+    ///
+    /// # Errors
+    ///
+    /// - If the snapshot ID does not exist.
+    /// - If there is an error communicating with the object store.
+    pub async fn get_snapshot(
+        &self,
+        snapshot_id: u64,
+    ) -> Result<SnapshotInfo, SnapshotManagementError> {
+        let metadata_path_display = self.metadata_path_display();
+
+        let handle = self.load_metadata().await?;
+
+        let Some(handle) = handle else {
+            return Err(SnapshotManagementError::NoMetadataFound {
+                path: metadata_path_display,
+            });
+        };
+
+        let dataset_metadata = handle
+            .metadata
+            .datasets
+            .get(&self.dataset_name)
+            .ok_or_else(|| SnapshotManagementError::DatasetMissing {
+                dataset: self.dataset_name.clone(),
+            })?;
+
+        let entry = dataset_metadata
+            .snapshots
+            .iter()
+            .find(|e| e.snapshot_id == snapshot_id)
+            .ok_or_else(|| SnapshotManagementError::SnapshotMissing {
+                dataset: self.dataset_name.clone(),
+                snapshot_id,
+            })?;
+
+        Ok(SnapshotInfo::from_entry(
+            entry,
+            dataset_metadata.current_snapshot_id,
+        ))
     }
 }
 
@@ -1960,6 +2274,7 @@ mod tests {
             snapshot_checksum: checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            row_count: None,
         };
 
         let schema = sample_schema();
@@ -2037,6 +2352,7 @@ mod tests {
             snapshot_checksum: "0000".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: first_contents.len() as u64,
+            row_count: None,
         };
 
         let valid_checksum = compute_sha256_hex(second_contents.as_ref());
@@ -2047,6 +2363,7 @@ mod tests {
             snapshot_checksum: valid_checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: second_contents.len() as u64,
+            row_count: None,
         };
 
         let schema = sample_schema();
@@ -2112,7 +2429,7 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard)
+            .create_snapshot(&schema, None, lock_guard)
             .await
             .expect("create snapshot");
 
@@ -2369,6 +2686,7 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            row_count: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -2433,6 +2751,7 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64 + 1,
+            row_count: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -2497,6 +2816,7 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: "MD5".to_string(),
             snapshot_size: contents.len() as u64,
+            row_count: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -2566,6 +2886,7 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            row_count: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -2697,7 +3018,7 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard)
+            .create_snapshot(&schema, None, lock_guard)
             .await
             .expect("create snapshot");
 

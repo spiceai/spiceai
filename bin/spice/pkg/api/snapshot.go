@@ -16,63 +16,33 @@ limitations under the License.
 
 package api
 
-import (
-	"encoding/json"
-	"fmt"
-	"net/url"
-
-	"github.com/spiceai/spiceai/bin/spice/pkg/context"
-)
-
-type DatasetSnapshots struct {
-	Dataset           string            `json:"dataset"`
-	Location          string            `json:"location"`
-	LastUpdatedMs     *int64            `json:"last_updated_ms"`
-	CurrentSnapshotID *uint64           `json:"current_snapshot_id"`
-	Snapshots         []DatasetSnapshot `json:"snapshots"`
+// SnapshotInfo represents details about a single acceleration snapshot.
+type SnapshotInfo struct {
+	SnapshotID        uint64  `json:"snapshot_id" csv:"snapshot_id"`
+	TimestampMs       int64   `json:"timestamp_ms" csv:"timestamp_ms"`
+	Location          string  `json:"location" csv:"location"`
+	Checksum          string  `json:"checksum" csv:"checksum"`
+	ChecksumAlgorithm string  `json:"checksum_algorithm" csv:"checksum_algorithm"`
+	SizeBytes         uint64  `json:"size_bytes" csv:"size_bytes"`
+	RowCount          *uint64 `json:"row_count,omitempty" csv:"row_count"`
+	IsCurrent         bool    `json:"is_current" csv:"is_current"`
 }
 
-type DatasetSnapshot struct {
-	SnapshotID        uint64 `json:"snapshot_id"`
-	TimestampMs       int64  `json:"timestamp_ms"`
-	URI               string `json:"uri"`
-	SizeBytes         uint64 `json:"size_bytes"`
-	Checksum          string `json:"checksum"`
-	ChecksumAlgorithm string `json:"checksum_algorithm"`
-	IsCurrent         bool   `json:"is_current"`
+// SnapshotSummary contains all snapshots for a dataset.
+type SnapshotSummary struct {
+	DatasetName       string         `json:"dataset_name" csv:"dataset_name"`
+	Location          string         `json:"location" csv:"location"`
+	LastUpdatedMs     int64          `json:"last_updated_ms" csv:"last_updated_ms"`
+	CurrentSnapshotID *uint64        `json:"current_snapshot_id,omitempty" csv:"current_snapshot_id"`
+	Snapshots         []SnapshotInfo `json:"snapshots" csv:"-"`
 }
 
+// SetCurrentSnapshotRequest is the request body for setting the current snapshot.
+type SetCurrentSnapshotRequest struct {
+	SnapshotID uint64 `json:"snapshot_id"`
+}
+
+// MessageResponse is a generic response with a message.
 type MessageResponse struct {
 	Message string `json:"message"`
-}
-
-func datasetSnapshotsBasePath(dataset string) string {
-	return fmt.Sprintf("/v1/datasets/%s/acceleration/snapshots", url.PathEscape(dataset))
-}
-
-func GetDatasetSnapshots(rtcontext *context.RuntimeContext, dataset string) (DatasetSnapshots, error) {
-	path := datasetSnapshotsBasePath(dataset)
-	return GetDataSingle[DatasetSnapshots](rtcontext, path)
-}
-
-func CreateDatasetSnapshot(rtcontext *context.RuntimeContext, dataset string) (DatasetSnapshots, error) {
-	path := datasetSnapshotsBasePath(dataset)
-	return PostRuntime[DatasetSnapshots](rtcontext, path, nil)
-}
-
-func SetDatasetSnapshotHead(rtcontext *context.RuntimeContext, dataset string, snapshotID uint64) (MessageResponse, error) {
-	path := fmt.Sprintf("%s/head", datasetSnapshotsBasePath(dataset))
-	bodyBytes, err := json.Marshal(struct {
-		SnapshotID uint64 `json:"snapshot_id"`
-	}{SnapshotID: snapshotID})
-	if err != nil {
-		return MessageResponse{}, err
-	}
-	body := string(bodyBytes)
-	return PatchRuntime[MessageResponse](rtcontext, path, &body)
-}
-
-func DeleteDatasetSnapshot(rtcontext *context.RuntimeContext, dataset string, snapshotID uint64) (MessageResponse, error) {
-	path := fmt.Sprintf("%s/%d", datasetSnapshotsBasePath(dataset), snapshotID)
-	return DeleteRuntime[MessageResponse](rtcontext, path)
 }

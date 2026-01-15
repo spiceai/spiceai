@@ -156,7 +156,7 @@ pub async fn create_checkpoint_and_snapshot(
 
     if let Some(snapshot_manager) = snapshot_manager {
         if let Err(e) = snapshot_manager
-            .create_snapshot(federated_schema, lock_guard)
+            .create_snapshot(federated_schema, None, lock_guard)
             .await
         {
             let dataset_label = dataset_name.to_string();

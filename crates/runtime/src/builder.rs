@@ -17,6 +17,7 @@ limitations under the License.
 use crate::cluster::ResolvedClusterConfig;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
+use crate::snapshot_registry::SnapshotManagerRegistry;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -292,6 +293,7 @@ impl RuntimeBuilder {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
+            snapshot_managers: Arc::new(SnapshotManagerRegistry::new()),
             schedulers: Arc::new(RwLock::new(HashMap::new())),
             scheduler_peers: Arc::new(RwLock::new(HashMap::new())),
             resource_monitor,
