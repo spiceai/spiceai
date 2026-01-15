@@ -33,7 +33,9 @@ use datafusion::common::Constraints;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_expr::{PhysicalExpr, expressions::Column};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::sql::TableReference;
 use datafusion::{
@@ -966,11 +968,17 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
-        // In caching mode, pass filters to accelerator so it can check for cached data.
-        // If accelerator returns 0 rows → cache miss → fetch from source.
+        // For caching mode, extend projection to include fetched_at for freshness checking if needed.
+        // If added internally, we'll strip it from results before returning to the user.
+        let extended_projection = if is_caching_mode {
+            extend_projection_for_caching(projection, &self.accelerator.schema())
+        } else {
+            None
+        };
+        let scan_projection = extended_projection.as_ref().or(projection);
         let input = self
             .accelerator
-            .scan(state, projection, filters, limit)
+            .scan(state, scan_projection, filters, limit)
             .await?;
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
@@ -992,22 +1000,31 @@ impl TableProvider for AcceleratedTable {
                 };
 
                 let federated_provider = self.federated.table_provider().await;
-                Arc::new(caching::CachingAccelerationScanExec::new(
-                    input,
-                    self.cache_ttl,
-                    self.cache_stale_while_revalidate_ttl,
-                    self.cache_stale_if_error,
-                    federated_provider,
-                    Arc::clone(&self.accelerator),
-                    self.dataset_name.to_string(),
-                    self.io_runtime.clone(),
-                    filters.to_vec(),
-                    projection.cloned(),
-                    limit,
-                    Arc::clone(&self.accelerator_write_mutex),
-                    Arc::clone(&self.in_flight_revalidations),
-                    Arc::clone(&self.synchronized_children),
-                ))
+                let caching_exec: Arc<dyn ExecutionPlan> =
+                    Arc::new(caching::CachingAccelerationScanExec::new(
+                        input,
+                        self.cache_ttl,
+                        self.cache_stale_while_revalidate_ttl,
+                        self.cache_stale_if_error,
+                        federated_provider,
+                        Arc::clone(&self.accelerator),
+                        self.dataset_name.to_string(),
+                        self.io_runtime.clone(),
+                        filters.to_vec(),
+                        projection.cloned(),
+                        limit,
+                        Arc::clone(&self.accelerator_write_mutex),
+                        Arc::clone(&self.in_flight_revalidations),
+                        Arc::clone(&self.synchronized_children),
+                    ));
+
+                // If we extended projection to add fetched_at, strip it from results
+                if let (true, Some(proj)) = (extended_projection.is_some(), projection) {
+                    // extended_projection is Some only when projection is Some and didn't already include fetched_at (was modified)
+                    apply_projection(caching_exec, proj)?
+                } else {
+                    caching_exec
+                }
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,
             (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
@@ -1064,6 +1081,43 @@ impl TableProvider for AcceleratedTable {
 
         Ok(union_plan)
     }
+}
+
+/// Extends projection to include `fetched_at` column for cache freshness checking.
+/// Returns `Some(extended_projection)` if extension was needed,
+/// or `None` if no extension needed (projection already includes it or is None).
+fn extend_projection_for_caching(
+    projection: Option<&Vec<usize>>,
+    schema: &SchemaRef,
+) -> Option<Vec<usize>> {
+    let proj = projection?;
+    let idx = schema.index_of(caching::CACHE_REFRESHED_AT_COLUMN).ok()?;
+    if proj.contains(&idx) {
+        return None;
+    }
+    // User projection doesn't include fetched_at - add it as last column
+    let mut extended = proj.clone();
+    extended.push(idx);
+    Some(extended)
+}
+
+/// Wraps plan with `ProjectionExec` to return only the user's originally requested columns.
+/// Used to strip internally-added columns (e.g., `fetched_at`) from user-facing results.
+fn apply_projection(
+    plan: Arc<dyn ExecutionPlan>,
+    projection: &[usize],
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let projection_expr: Vec<(Arc<dyn PhysicalExpr>, String)> = (0..projection.len())
+        .map(|i| {
+            let field = schema.field(i);
+            (
+                Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                field.name().clone(),
+            )
+        })
+        .collect();
+    Ok(Arc::new(ProjectionExec::try_new(projection_expr, plan)?))
 }
 
 #[derive(Debug)]
