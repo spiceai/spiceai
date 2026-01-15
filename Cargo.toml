@@ -112,9 +112,9 @@ aws-smithy-runtime = "1.9.4"
 aws-smithy-runtime-api = "1.9.2"
 aws-smithy-types = "1.3.4"
 axum = { version = "0.8", features = ["macros"] }
-ballista-core = "50.0.0"
-ballista-executor = "50.0.0"
-ballista-scheduler = { version = "50.0.0" }
+ballista-core = "51.0.0"
+ballista-executor = "51.0.0"
+ballista-scheduler = { version = "51.0.0" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -350,10 +350,10 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "7b3
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "82ccd89d3b21231f29d0dc7ace0a94470c562a89" } # spiceai (DF51 + spice features)
 
-# spiceai-51: DF51 base + TLS, API key auth, UDF sync patches
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "c8c5ecaafa358020ba08239ff064afa6f2fac2ac" }      # spiceai:spiceai-51 (DF51 + spice patches)
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", rev = "c8c5ecaafa358020ba08239ff064afa6f2fac2ac" }  # spiceai:spiceai-51
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "c8c5ecaafa358020ba08239ff064afa6f2fac2ac" } # spiceai:spiceai-51
+# spiceai-51: DF51 base + TLS, API key auth, UDF sync patches (rebased onto 51.0.0-rc1)
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "8c3ee901" }      # spiceai:spiceai-51 (DF51 + spice patches)
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", rev = "8c3ee901" }  # spiceai:spiceai-51
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "8c3ee901" } # spiceai:spiceai-51
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "923c33ede98429f6b5e9692fa9680ac455708c32" } # spiceai-57

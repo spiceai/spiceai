@@ -2108,8 +2108,8 @@ dependencies = [
 
 [[package]]
 name = "ballista-core"
-version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista?rev=c8c5ecaafa358020ba08239ff064afa6f2fac2ac#c8c5ecaafa358020ba08239ff064afa6f2fac2ac"
+version = "51.0.0"
+source = "git+https://github.com/spiceai/datafusion-ballista?rev=8c3ee901#8c3ee9019ed24108eb775d6e9ad3fc53a0362c29"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2143,8 +2143,8 @@ dependencies = [
 
 [[package]]
 name = "ballista-executor"
-version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista?rev=c8c5ecaafa358020ba08239ff064afa6f2fac2ac#c8c5ecaafa358020ba08239ff064afa6f2fac2ac"
+version = "51.0.0"
+source = "git+https://github.com/spiceai/datafusion-ballista?rev=8c3ee901#8c3ee9019ed24108eb775d6e9ad3fc53a0362c29"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2173,8 +2173,8 @@ dependencies = [
 
 [[package]]
 name = "ballista-scheduler"
-version = "50.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista?rev=c8c5ecaafa358020ba08239ff064afa6f2fac2ac#c8c5ecaafa358020ba08239ff064afa6f2fac2ac"
+version = "51.0.0"
+source = "git+https://github.com/spiceai/datafusion-ballista?rev=8c3ee901#8c3ee9019ed24108eb775d6e9ad3fc53a0362c29"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2184,6 +2184,7 @@ dependencies = [
  "dashmap",
  "datafusion",
  "datafusion-proto",
+ "datafusion-substrait",
  "futures",
  "http 1.4.0",
  "log",
@@ -5335,6 +5336,27 @@ dependencies = [
  "recursive",
  "regex",
  "sqlparser",
+]
+
+[[package]]
+name = "datafusion-substrait"
+version = "51.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2505af06d103a55b4e8ded0c6aeb6c72a771948da939c0bd3f8eee67af475a9c"
+dependencies = [
+ "async-recursion",
+ "async-trait",
+ "chrono",
+ "datafusion",
+ "half",
+ "itertools 0.14.0",
+ "object_store",
+ "pbjson-types",
+ "prost 0.14.3",
+ "substrait",
+ "tokio",
+ "url",
+ "uuid 1.19.0",
 ]
 
 [[package]]
@@ -11964,6 +11986,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "pbjson-build"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af22d08a625a2213a78dbb0ffa253318c5c79ce3133d32d296655a7bdfb02095"
+dependencies = [
+ "heck 0.5.0",
+ "itertools 0.14.0",
+ "prost 0.14.3",
+ "prost-types",
+]
+
+[[package]]
+name = "pbjson-types"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e748e28374f10a330ee3bb9f29b828c0ac79831a32bab65015ad9b661ead526"
+dependencies = [
+ "bytes",
+ "chrono",
+ "pbjson",
+ "pbjson-build",
+ "prost 0.14.3",
+ "prost-build",
+ "serde",
+]
+
+[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13609,6 +13658,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
+name = "regress"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2057b2325e68a893284d1538021ab90279adac1139957ca2a74426c6f118fb48"
+dependencies = [
+ "hashbrown 0.16.1",
+ "memchr",
+]
+
+[[package]]
 name = "relative-path"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15232,6 +15291,10 @@ name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "seq-macro"
@@ -15384,6 +15447,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "serde_tokenstream"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64060d864397305347a78851c51588fd283767e7e7589829e8121d65512340f1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -16505,6 +16580,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "substrait"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62fc4b483a129b9772ccb9c3f7945a472112fdd9140da87f8a4e7f1d44e045d0"
+dependencies = [
+ "heck 0.5.0",
+ "pbjson",
+ "pbjson-build",
+ "pbjson-types",
+ "prettyplease",
+ "prost 0.14.3",
+ "prost-build",
+ "prost-types",
+ "regress",
+ "schemars 0.8.22",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "syn 2.0.114",
+ "typify",
+ "walkdir",
 ]
 
 [[package]]
@@ -18484,6 +18584,53 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "typify"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6d5bcc6f62eb1fa8aa4098f39b29f93dcb914e17158b76c50360911257aa629"
+dependencies = [
+ "typify-impl",
+ "typify-macro",
+]
+
+[[package]]
+name = "typify-impl"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1eb359f7ffa4f9ebe947fa11a1b2da054564502968db5f317b7e37693cb2240"
+dependencies = [
+ "heck 0.5.0",
+ "log",
+ "proc-macro2",
+ "quote",
+ "regress",
+ "schemars 0.8.22",
+ "semver",
+ "serde",
+ "serde_json",
+ "syn 2.0.114",
+ "thiserror 2.0.17",
+ "unicode-ident",
+]
+
+[[package]]
+name = "typify-macro"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "911c32f3c8514b048c1b228361bebb5e6d73aeec01696e8cc0e82e2ffef8ab7a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "schemars 0.8.22",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_tokenstream",
+ "syn 2.0.114",
+ "typify-impl",
 ]
 
 [[package]]
