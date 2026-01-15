@@ -34,6 +34,16 @@ serviceAccount:
 #     cpu: 500m
 #     memory: 1Gi
 
+# Override the default command for spiced
+# command:
+#   - /usr/local/bin/spiced
+#   - --http
+#   - 0.0.0.0:8090
+#   - --metrics
+#   - 0.0.0.0:9090
+#   - --flight
+#   - 0.0.0.0:50051
+
 # Additional environment variables
 # additionalEnv:
 #   - name: ENV_VAR_NAME

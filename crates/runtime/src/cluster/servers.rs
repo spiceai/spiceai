@@ -88,7 +88,24 @@ pub async fn start_internal_cluster_server(
         .max_decoding_message_size(usize::MAX)
         .max_encoding_message_size(usize::MAX);
 
-    let cluster_service = ClusterServiceImpl::new(Arc::clone(&rt.app), Arc::clone(&rt.secrets));
+    let advertise_address = rt
+        .df
+        .cluster_config
+        .scheduler_url_string()
+        .map(str::to_string)
+        .or_else(|| {
+            rt.df
+                .cluster_config
+                .node_advertise_address()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| bind_address.to_string());
+    let cluster_service = ClusterServiceImpl::new(
+        Arc::clone(&rt.app),
+        Arc::clone(&rt.secrets),
+        advertise_address,
+        rt.scheduler_peers(),
+    );
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 
     let server = server

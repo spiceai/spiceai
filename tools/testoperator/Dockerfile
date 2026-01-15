@@ -1,6 +1,6 @@
 #syntax=docker/dockerfile:1.7
 
-ARG BASE_IMAGE=debian:bookworm-slim
+ARG BASE_IMAGE=debian:trixie-slim
 
 FROM ${BASE_IMAGE}
 

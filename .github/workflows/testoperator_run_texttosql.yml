@@ -40,6 +40,11 @@ on:
           - 'bird-bench-small[superhero]'
           - 'bird-bench-small[thrombosis_prediction]'
           - 'bird-bench-small[toxicology]'
+      use_evidence:
+        description: 'Include evidence in the question for bird-bench querysets'
+        required: false
+        type: boolean
+        default: false
       runner_type:
         description: 'Runner type'
         required: true
@@ -135,6 +140,7 @@ jobs:
         with:
           data_directory: /opt/spiced/data/
           queryset_name: ${{ github.event.inputs.benchmark_queryset }}
+          use_evidence: ${{ github.event.inputs.use_evidence }}
 
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |

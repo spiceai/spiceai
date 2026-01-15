@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator};
 use crate::{
     App, Runtime,
     component::{
@@ -52,6 +52,7 @@ use datafusion_table_providers::{
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
+use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
@@ -340,9 +341,9 @@ impl DataAccelerator for DuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         let path = self.file_path(source)?;
@@ -383,12 +384,20 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            let was_bootstrapped = download_snapshot_if_needed(
+                acceleration,
+                source,
+                PathBuf::from(path),
+                AccelerationEngine::DuckDB,
+            )
+            .await;
 
             self.get_shared_pool(source).await?;
+
+            return Ok(was_bootstrapped);
         }
 
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
