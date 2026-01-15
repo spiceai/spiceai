@@ -14,15 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, hash::Hash, time::Duration};
 
-use crate::metrics::{Builder, BuilderTarget, ExtendedMetrics};
+use crate::{
+    metrics::{Builder, BuilderTarget, ExtendedMetrics},
+    spicetest::text_to_sql::{
+        parse::extract_tables_and_projection, task_history::TaskHistoryMetrics,
+    },
+};
 use anyhow::Result;
 use arrow::{
     array::{Float64Builder, StringBuilder, UInt64Builder},
     datatypes::{DataType, Field},
 };
+use serde_json::Value;
 
+#[derive(Debug, Clone)]
 pub struct TextToSqlMetric {
     pub question: String,
     pub generated_sql: String,
@@ -42,13 +49,9 @@ pub struct TextToSqlMetric {
 
     // Functional metrics
     pub exact_match: u64,
-    // TODO: Requires LogicalPlan/AST parsing
     pub exact_logical_plan_match: u64,
-    // TODO: Requires LogicalPlan/AST parsing
     pub correct_tables: f64,
-    // TODO: Requires LogicalPlan/AST parsing
     pub correct_table_projections: f64,
-    // TODO: Requires LogicalPlan/AST parsing
     pub correct_output_schema: f64,
 }
 
@@ -194,46 +197,52 @@ impl ExtendedMetrics for TextToSqlMetric {
 }
 
 impl TextToSqlMetric {
-    #[must_use]
     #[expect(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn try_new(
         question: String,
-        generated_sql: String,
-        expected_sql: String,
-        sql_query_count: usize,
+        generated_sql: &str,
+        expected_sql: &str,
+        expected_logical_plan: &Value,
+        generated_logical_plan: Option<&Value>,
+        is_error: bool,
+        duration: Duration,
         sample_data_enabled: bool,
         return_sql: bool,
-        is_error: bool,
-        latency_ms: f64,
-        sql_duration_ms: f64,
-        llm_duration_ms: f64,
-        llm_count: usize,
-        llm_input_tokens: u64,
-        llm_output_tokens: u64,
-    ) -> Self {
-        let exact_match = (generated_sql.trim() == expected_sql.trim()).into();
+        task_history_metrics: &TaskHistoryMetrics,
+        correct_output_schema: f64,
+    ) -> Result<Self, anyhow::Error> {
+        let expected = extract_tables_and_projection(expected_logical_plan);
+        let generated = generated_logical_plan.map(extract_tables_and_projection);
 
-        Self {
+        Ok(Self {
             question,
-            generated_sql,
-            expected_sql,
-            sql_query_count,
+            generated_sql: generated_sql.to_string(),
+            expected_sql: expected_sql.to_string(),
+            sql_query_count: task_history_metrics.sql_count,
             sample_data_enabled,
             return_sql,
             is_error,
-            latency_ms,
-            sql_duration_ms,
-            llm_duration_ms,
-            llm_count,
-            llm_input_tokens,
-            llm_output_tokens,
-            exact_match,
-            // TODO: Requires LogicalPlan/AST parsing
-            exact_logical_plan_match: 0,
-            correct_tables: 0.0,
-            correct_table_projections: 0.0,
-            correct_output_schema: 0.0,
-        }
+            #[expect(clippy::cast_precision_loss)]
+            latency_ms: duration.as_millis() as f64,
+            sql_duration_ms: task_history_metrics.sql_duration_ms,
+            llm_duration_ms: task_history_metrics.llm_duration_ms,
+            llm_count: task_history_metrics.llm_count,
+            llm_input_tokens: task_history_metrics.llm_input_tokens,
+            llm_output_tokens: task_history_metrics.llm_output_tokens,
+            exact_match: (generated_sql.trim() == expected_sql.trim()).into(),
+            exact_logical_plan_match: generated_logical_plan
+                .map(|g| (g == expected_logical_plan).into())
+                .unwrap_or_default(),
+            correct_tables: generated
+                .as_ref()
+                .map(|g| intersection_over_union(&expected.0, &g.0))
+                .unwrap_or_default(),
+            correct_table_projections: generated
+                .as_ref()
+                .map(|g| intersection_over_union(&expected.1, &g.1))
+                .unwrap_or_default(),
+            correct_output_schema,
+        })
     }
 }
 
@@ -247,7 +256,7 @@ pub struct TextToSqlRunMetric {
     pub mean_sql_query_count: f64,
     pub mean_llm_input_tokens: f64,
     pub mean_llm_output_tokens: f64,
-    // TODO: Requires LogicalPlan/AST parsing
+
     pub exact_logical_plan_match_rate: f64,
     pub mean_correct_tables: f64,
     pub mean_correct_table_projections: f64,
@@ -357,6 +366,7 @@ impl ExtendedMetrics for TextToSqlRunMetric {
 
 impl TextToSqlRunMetric {
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         p95_latency_ms: f64,
         median_latency_ms: f64,
@@ -365,6 +375,10 @@ impl TextToSqlRunMetric {
         mean_sql_query_count: f64,
         mean_llm_input_tokens: f64,
         mean_llm_output_tokens: f64,
+        exact_logical_plan_match_rate: f64,
+        mean_correct_tables: f64,
+        mean_correct_table_projections: f64,
+        mean_correct_output_schema: f64,
     ) -> Self {
         Self {
             p95_latency_ms,
@@ -374,11 +388,27 @@ impl TextToSqlRunMetric {
             mean_sql_query_count,
             mean_llm_input_tokens,
             mean_llm_output_tokens,
-            // TODO: Requires LogicalPlan/AST parsing
-            exact_logical_plan_match_rate: 0.0,
-            mean_correct_tables: 0.0,
-            mean_correct_table_projections: 0.0,
-            mean_correct_output_schema: 0.0,
+            exact_logical_plan_match_rate,
+            mean_correct_tables,
+            mean_correct_table_projections,
+            mean_correct_output_schema,
         }
+    }
+}
+
+/// Calculate the Intersection over Union (`IoU`) between two sets.
+fn intersection_over_union<T: Eq + Hash>(
+    set_a: &std::collections::HashSet<T>,
+    set_b: &std::collections::HashSet<T>,
+) -> f64 {
+    let intersection: std::collections::HashSet<_> = set_a.intersection(set_b).collect();
+    let union: std::collections::HashSet<_> = set_a.union(set_b).collect();
+
+    if union.is_empty() {
+        1.0 // Both sets are empty, consider them as perfectly matching
+    } else {
+        #[expect(clippy::cast_precision_loss)]
+        let result = intersection.len() as f64 / union.len() as f64;
+        result
     }
 }

@@ -141,5 +141,7 @@ WORKDIR /app
 ENV HOME=/app
 ENV HF_HOME=/.cache/huggingface
 ENV HF_HUB_CACHE=/.cache/huggingface/hub
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_DIR=/etc/ssl/certs
 
 ENTRYPOINT ["/usr/local/bin/spiced"]

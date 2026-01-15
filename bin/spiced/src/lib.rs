@@ -248,16 +248,20 @@ pub async fn run(args: Args) -> Result<()> {
         .with_runtime_config(args.runtime.clone())
         .with_io_runtime(Handle::current());
 
+    // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)
+    let is_cluster_mode =
+        args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
+
     match resolved_cluster_config {
         Ok(resolved_cluster_config) => {
             builder = builder.with_resolved_cluster_config(resolved_cluster_config);
         }
-        Err(e) if args.runtime.cluster.role.is_some() => {
-            // If --role was explicitly specified, surface the configuration error
+        Err(e) if is_cluster_mode => {
+            // If cluster mode is intended (explicit --role or implicit via --scheduler-address), surface the error
             return Err(Error::InvalidClusterConfig { source: e });
         }
         Err(_) => {
-            // No explicit role specified, silently continue in standalone mode
+            // No cluster mode specified, silently continue in standalone mode
         }
     }
 

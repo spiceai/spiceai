@@ -13,6 +13,21 @@ limitations under the License.
 
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
+use arrow_schema::{Schema, SchemaRef};
+use aws_sdk_credential_bridge::object_store_builder::{
+    S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
+};
+use bytes::BytesMut;
+use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use object_store::{ObjectStore, PutMode, PutPayload, UpdateVersion, path::Path as ObjectPath};
+use runtime_parameters::{ParameterSpec, Parameters};
+use runtime_secrets::{Secrets, get_params_with_secrets};
+use serde::{Deserialize, Serialize};
+use serde_json::{self, Value};
+use sha2::{Digest, Sha256};
+use snafu::prelude::*;
+use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
 use std::{
     collections::HashMap,
     fmt::Write,
@@ -21,23 +36,7 @@ use std::{
     sync::{Arc, LazyLock},
     time::Instant,
 };
-
-use arrow_schema::{Schema, SchemaRef};
-use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
-use bytes::BytesMut;
-use chrono::{DateTime, Utc};
-use futures::StreamExt;
-use object_store::{
-    ClientOptions, ObjectStore, PutMode, PutPayload, UpdateVersion, aws::AmazonS3Builder,
-    client::SpawnedReqwestConnector, path::Path as ObjectPath,
-};
-use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_secrets::{Secrets, get_params_with_secrets};
-use serde::{Deserialize, Serialize};
-use serde_json::{self, Value};
-use sha2::{Digest, Sha256};
-use snafu::prelude::*;
-use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
+use tokio::sync::OwnedMutexGuard;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -50,8 +49,11 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
 mod behavior;
+mod engine;
 pub mod metrics;
 pub use behavior::SnapshotBehavior;
+use engine::{SnapshotEngine, create_snapshot_engine};
+use spicepod::acceleration::SnapshotsCompaction;
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -360,6 +362,14 @@ pub enum SnapshotUploadError {
     UploadMetadataSchemaMissing { dataset: String },
     #[snafu(display("Snapshot metadata schema conflict for dataset {dataset}"))]
     UploadSchemaMismatch { dataset: String },
+    #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}"))]
+    CopyLocal {
+        source_path: PathBuf,
+        dest_path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("Failed to prepare snapshot for upload: {source}"))]
+    PrepareUpload { source: engine::SnapshotEngineError },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -395,6 +405,17 @@ impl<'a> SnapshotPathLayout<'a> {
     }
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub enum AccelerationEngine {
+    Cayenne,
+    #[cfg(feature = "duckdb")]
+    DuckDB,
+    #[cfg(feature = "sqlite")]
+    Sqlite,
+    #[cfg(feature = "turso")]
+    Turso,
+}
+
 /// Manages snapshots for a specific accelerated dataset.
 #[derive(Clone)]
 pub struct SnapshotManager {
@@ -402,6 +423,7 @@ pub struct SnapshotManager {
     snapshots_location: object_store::path::Path,
     snapshot_location_uri: String,
     local_path: PathBuf,
+    snapshot_engine: Arc<dyn SnapshotEngine>,
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
@@ -505,16 +527,22 @@ impl SnapshotManager {
         dataset_name: String,
         snapshots: SnapshotBehavior,
         local_path: PathBuf,
+        engine: AccelerationEngine,
     ) -> Option<Self> {
-        let (snapshot_config, secrets, io_runtime) = match snapshots {
+        let (snapshot_config, secrets, io_runtime, compaction_enabled) = match snapshots {
             SnapshotBehavior::Disabled => {
                 tracing::debug!("Snapshots are disabled for {dataset_name}");
                 return None;
             }
-            SnapshotBehavior::Enabled(s, secrets, io_runtime)
-            | SnapshotBehavior::BootstrapOnly(s, secrets, io_runtime)
-            | SnapshotBehavior::CreateOnly(s, secrets, io_runtime) => {
-                (s, secrets.upgrade()?, io_runtime)
+            SnapshotBehavior::Enabled(s, secrets, io_runtime, compaction)
+            | SnapshotBehavior::CreateOnly(s, secrets, io_runtime, compaction) => (
+                s,
+                secrets.upgrade()?,
+                io_runtime,
+                matches!(compaction, SnapshotsCompaction::Enabled),
+            ),
+            SnapshotBehavior::BootstrapOnly(s, secrets, io_runtime) => {
+                (s, secrets.upgrade()?, io_runtime, false)
             }
         };
         tracing::debug!("Snapshots are enabled for {dataset_name}");
@@ -537,34 +565,47 @@ impl SnapshotManager {
             }
         };
 
-        let (store, path) = match (
+        let (store, path): (Arc<dyn ObjectStore>, _) = if let ("s3", path) = (
             snapshots_location_url.scheme(),
             snapshots_location_url.path(),
         ) {
-            ("s3", path) => {
-                let store = build_s3_object_store(
-                    &snapshots_location_url,
-                    secrets,
-                    snapshot_config.params.as_ref().map(Params::as_string_map),
-                    io_runtime,
-                )
-                .await
-                .inspect_err(|e| {
-                    tracing::error!("Error connecting to S3 snapshot location: {e}");
-                })
-                .ok()?;
-                let path = object_store::path::Path::from(path);
-                (store, path)
-            }
-            _ => object_store::parse_url(&snapshots_location_url).ok()?,
+            let store = build_s3_object_store(
+                &snapshots_location_url,
+                secrets,
+                snapshot_config.params.as_ref().map(Params::as_string_map),
+                io_runtime,
+            )
+            .await
+            .inspect_err(|e| {
+                tracing::error!("Error connecting to S3 snapshot location: {e}");
+            })
+            .ok()?;
+            let path = object_store::path::Path::from(path);
+            (store, path)
+        } else {
+            let (store, path) = object_store::parse_url(&snapshots_location_url).ok()?;
+            (store.into(), path)
         };
+
+        let snapshot_engine = create_snapshot_engine(&engine, compaction_enabled);
+
+        if compaction_enabled {
+            if snapshot_engine.supports_compaction() {
+                tracing::info!("Snapshot compaction is enabled for dataset {dataset_name}");
+            } else {
+                tracing::warn!(
+                    "Snapshot compaction is enabled for dataset {dataset_name} but engine does not support compaction"
+                );
+            }
+        }
 
         Some(Self {
             dataset_name,
             snapshots_location: path,
             snapshot_location_uri,
             local_path,
-            object_store: store.into(),
+            snapshot_engine,
+            object_store: store,
             checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
         })
@@ -586,33 +627,104 @@ impl SnapshotManager {
     pub async fn create_snapshot(
         &self,
         schema: &SchemaRef,
+        lock_guard: OwnedMutexGuard<()>,
     ) -> Result<ObjectPath, SnapshotUploadError> {
         let start_time = Instant::now();
         let now = Utc::now();
+        let source_local_path = self.local_path.clone();
         let layout = SnapshotPathLayout::new(&self.dataset_name);
-        let location = layout.build_location(&self.snapshots_location, now);
-        let location_path = location.to_string();
-        let local_path = self.local_path.clone();
+        let destination_location = layout.build_location(&self.snapshots_location, now);
         let timestamp_ms = now.timestamp_millis();
 
         tracing::info!(
-            "Uploading snapshot. dataset={} snapshot={location}",
+            "Uploading snapshot. dataset={} snapshot={destination_location}",
             self.dataset_name
         );
 
-        let file = fs::File::open(&local_path).await.context(OpenLocalSnafu {
-            path: local_path.clone(),
-        })?;
+        // Step 1: Copy the database file locally (lock is held)
+        let temp_copy_path = source_local_path.with_extension("snapshot_tmp");
+        fs::copy(&source_local_path, &temp_copy_path)
+            .await
+            .context(CopyLocalSnafu {
+                source_path: source_local_path.clone(),
+                dest_path: temp_copy_path.clone(),
+            })?;
+
+        // Step 2: Release the lock - queries can resume
+        drop(lock_guard);
+        tracing::debug!(
+            "Lock released after file copy. dataset={}",
+            self.dataset_name
+        );
+
+        // Step 3: Prepare a snapshot using engine-specific logic
+        let final_source_local_path = self
+            .snapshot_engine
+            .prepare_for_upload(&temp_copy_path, &self.dataset_name)
+            .await
+            .context(PrepareUploadSnafu)?;
+
+        // Step 4: Upload the file
+        let upload_result = self
+            .upload_snapshot_file(&final_source_local_path, &destination_location)
+            .await;
+
+        // Step 5: Cleanup temp files
+        let _ = fs::remove_file(&temp_copy_path).await;
+        if final_source_local_path != temp_copy_path {
+            let _ = fs::remove_file(&final_source_local_path).await;
+        }
+
+        let (total_bytes, checksum) = upload_result?;
+
+        self.update_metadata_after_upload(
+            &destination_location,
+            checksum.clone(),
+            total_bytes,
+            timestamp_ms,
+            schema,
+        )
+        .await?;
+
+        let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        metrics::record_write_metrics(
+            &self.dataset_name,
+            timestamp_ms / 1000,
+            duration_ms,
+            total_bytes,
+            &checksum,
+        );
+
+        tracing::info!(
+            "Snapshot uploaded. dataset={} snapshot={destination_location} size={total_bytes} sha={checksum}",
+            self.dataset_name,
+        );
+
+        Ok(destination_location)
+    }
+    /// Uploads a file to object storage, returning (size, checksum).
+    async fn upload_snapshot_file(
+        &self,
+        source_local_path: &PathBuf,
+        destination_location: &ObjectPath,
+    ) -> Result<(u64, String), SnapshotUploadError> {
+        let destination_location_path = destination_location.to_string();
+
+        let file = fs::File::open(source_local_path)
+            .await
+            .context(OpenLocalSnafu {
+                path: source_local_path.clone(),
+            })?;
 
         let mut reader = BufReader::with_capacity(SNAPSHOT_MULTIPART_CHUNK_SIZE, file);
 
-        let mut upload =
-            self.object_store
-                .put_multipart(&location)
-                .await
-                .context(StartUploadSnafu {
-                    path: location_path.clone(),
-                })?;
+        let mut upload = self
+            .object_store
+            .put_multipart(destination_location)
+            .await
+            .context(StartUploadSnafu {
+                path: destination_location_path.clone(),
+            })?;
 
         let mut buffer = BytesMut::with_capacity(SNAPSHOT_MULTIPART_CHUNK_SIZE);
         let mut eof = false;
@@ -633,21 +745,21 @@ impl SnapshotManager {
                     }
                     Err(source) => {
                         tracing::error!(
-                            "Failed to read local snapshot file while uploading. dataset={} snapshot={location} error={source}",
+                            "Failed to read local snapshot file. dataset={} snapshot={destination_location} error={source}",
                             self.dataset_name
                         );
                         if let Err(abort_source) = upload.abort().await {
                             tracing::warn!(
-                                "Failed to abort snapshot upload after read failure. dataset={} snapshot={location} error={abort_source}",
+                                "Failed to abort snapshot upload after read failure. dataset={} snapshot={destination_location} error={abort_source}",
                                 self.dataset_name
                             );
                             return Err(SnapshotUploadError::AbortUpload {
-                                path: location_path.clone(),
+                                path: destination_location_path.clone(),
                                 source: abort_source,
                             });
                         }
                         return Err(SnapshotUploadError::ReadLocal {
-                            path: local_path,
+                            path: source_local_path.clone(),
                             source,
                         });
                     }
@@ -663,21 +775,21 @@ impl SnapshotManager {
 
             if let Err(source) = upload.put_part(chunk.into()).await {
                 tracing::error!(
-                    "Snapshot upload part failed. dataset={} snapshot={location} error={source}",
+                    "Snapshot upload part failed. dataset={} snapshot={destination_location} error={source}",
                     self.dataset_name
                 );
                 if let Err(abort_source) = upload.abort().await {
                     tracing::warn!(
-                        "Failed to abort snapshot upload after part failure. dataset={} snapshot={location} error={abort_source}",
+                        "Failed to abort snapshot upload after part failure. dataset={} snapshot={destination_location} error={abort_source}",
                         self.dataset_name
                     );
                     return Err(SnapshotUploadError::AbortUpload {
-                        path: location_path.clone(),
+                        path: destination_location_path.clone(),
                         source: abort_source,
                     });
                 }
                 return Err(SnapshotUploadError::UploadPart {
-                    path: location_path.clone(),
+                    path: destination_location_path.clone(),
                     source,
                 });
             }
@@ -687,49 +799,25 @@ impl SnapshotManager {
             Ok(_) => {
                 let checksum_bytes = hasher.finalize();
                 let checksum = encode_hex_lower(checksum_bytes.as_ref());
-
-                self.update_metadata_after_upload(
-                    &location,
-                    checksum.clone(),
-                    total_bytes,
-                    timestamp_ms,
-                    schema,
-                )
-                .await?;
-
-                let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-                metrics::record_write_metrics(
-                    &self.dataset_name,
-                    timestamp_ms / 1000,
-                    duration_ms,
-                    total_bytes,
-                    &checksum,
-                );
-
-                tracing::info!(
-                    "Snapshot uploaded. dataset={} snapshot={location} size={total_bytes} sha={checksum}",
-                    self.dataset_name,
-                    checksum = checksum.as_str(),
-                );
-                Ok(location)
+                Ok((total_bytes, checksum))
             }
             Err(source) => {
                 tracing::error!(
-                    "Failed to finalize snapshot upload. dataset={} snapshot={location} error={source}",
+                    "Failed to finalize snapshot upload. dataset={} snapshot={destination_location} error={source}",
                     self.dataset_name
                 );
                 if let Err(abort_source) = upload.abort().await {
                     tracing::warn!(
-                        "Failed to abort snapshot upload after completion failure. dataset={} snapshot={location} error={abort_source}",
+                        "Failed to abort upload after completion failure. dataset={} error={abort_source}",
                         self.dataset_name
                     );
                     return Err(SnapshotUploadError::AbortUpload {
-                        path: location_path,
+                        path: destination_location_path,
                         source: abort_source,
                     });
                 }
                 Err(SnapshotUploadError::CompleteUpload {
-                    path: location_path,
+                    path: destination_location_path.clone(),
                     source,
                 })
             }
@@ -1326,24 +1414,8 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
 
 #[derive(Debug, Snafu)]
 enum S3ObjectStoreError {
-    #[snafu(transparent)]
-    InvalidBucketName {
-        source: aws_sdk_credential_bridge::Error,
-    },
-
-    #[snafu(display("Unable to parse client_timeout: {source}"))]
-    ClientTimeoutParse { source: fundu::ParseError },
-
-    #[snafu(display("Unexpected S3 auth method: {method}"))]
-    UnexpectedS3AuthMethod { method: String },
-
-    #[snafu(display("Unable to load S3 credentials from environment: {source}"))]
-    EnvLoad {
-        source: aws_sdk_credential_bridge::Error,
-    },
-
-    #[snafu(transparent)]
-    ObjectStore { source: object_store::Error },
+    #[snafu(display("Failed to build S3 object store: {source}"))]
+    BuilderError { source: S3ObjectStoreBuilderError },
 }
 
 async fn build_s3_object_store(
@@ -1351,78 +1423,16 @@ async fn build_s3_object_store(
     secrets: Arc<RwLock<Secrets>>,
     params: Option<HashMap<String, String>>,
     io_runtime: Handle,
-) -> Result<Box<dyn ObjectStore>, S3ObjectStoreError> {
+) -> Result<Arc<dyn ObjectStore>, S3ObjectStoreError> {
     let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref()).await;
 
-    let s3_region = s3_params.get("region").expose().ok();
-    let allow_http = s3_params
-        .get("allow_http")
-        .expose()
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(false);
-    let s3_endpoint = s3_params.get("endpoint").expose().ok();
-    let client_timeout = s3_params.get("client_timeout").expose().ok();
-    let bucket_name = get_bucket_name(snapshots_url)?;
-
-    let mut s3_builder = AmazonS3Builder::from_env()
-        .with_bucket_name(bucket_name)
-        .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
-        .with_allow_http(allow_http);
-    let mut client_options = ClientOptions::default();
-
-    if let Some(region) = s3_region {
-        s3_builder = s3_builder.with_region(region);
-    }
-    if let Some(endpoint) = s3_endpoint {
-        s3_builder = s3_builder.with_endpoint(endpoint);
-        if endpoint.starts_with("http://") {
-            client_options = client_options.with_allow_http(true);
-        }
-    }
-    if let Some(timeout) = client_timeout {
-        client_options = client_options
-            .with_timeout(fundu::parse_duration(timeout).context(ClientTimeoutParseSnafu)?);
-    }
-    let mut load_credentials_from_environment = true;
-
-    if let (Some(key), Some(secret)) = (
-        s3_params.get("key").expose().ok(),
-        s3_params.get("secret").expose().ok(),
-    ) {
-        s3_builder = s3_builder.with_access_key_id(key);
-        s3_builder = s3_builder.with_secret_access_key(secret);
-        if let Some(token) = s3_params.get("session_token").expose().ok() {
-            s3_builder = s3_builder.with_token(token);
-        }
-        load_credentials_from_environment = false;
-    }
-    s3_builder = s3_builder.with_client_options(client_options);
-
-    if load_credentials_from_environment {
-        tracing::trace!("Loading S3 credentials from environment");
-        match aws_sdk_credential_bridge::get_or_init_sdk_config().await {
-            Ok(Some(sdk_config)) => {
-                if sdk_config.credentials_provider().is_some() {
-                    tracing::trace!("Using S3 credentials provider from SDK config");
-                    s3_builder = s3_builder.with_credentials(Arc::new(
-                        S3CredentialProvider::from_config(sdk_config.as_ref())
-                            .context(EnvLoadSnafu)?,
-                    ));
-                }
-            }
-            Ok(None) => {
-                tracing::trace!(
-                    "No AWS SDK credentials available for snapshot store; assuming public access"
-                );
-            }
-            Err(err) => {
-                tracing::warn!("Unable to initialize AWS credentials for snapshot store: {err}");
-            }
-        }
-    }
-
-    Ok(Box::new(s3_builder.build()?))
+    S3ObjectStoreBuilder::from_url(snapshots_url, io_runtime)
+        .context(BuilderSnafu)?
+        .with_secret_params(&s3_params.to_secret_map())
+        .context(BuilderSnafu)?
+        .build()
+        .await
+        .context(BuilderSnafu)
 }
 
 async fn build_s3_parameters(
@@ -1451,6 +1461,7 @@ async fn build_s3_parameters(
 mod tests {
     use super::*;
     use crate::dataset_checkpoint::{DatasetCheckpointer, Result as DatasetCheckpointResult};
+    use crate::snapshot::engine::DuckDBSnapshotEngine;
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::{TimeZone, Utc};
@@ -1459,6 +1470,7 @@ mod tests {
     use std::{io::Write, path::PathBuf, sync::Arc, time::SystemTime};
     use tempfile::{NamedTempFile, TempDir};
     use tokio::fs;
+    use tokio::sync::Mutex;
 
     const DATASET_NAME: &str = "dataset";
     const SNAPSHOT_URI_PREFIX: &str = "memory://snapshots";
@@ -1501,6 +1513,7 @@ mod tests {
         local_path: PathBuf,
         behavior: BootstrapOnFailureBehavior,
         schema: &SchemaRef,
+        compaction_enabled: bool,
     ) -> SnapshotManager {
         let schema_for_factory = Arc::clone(schema);
         let factory: DatasetCheckpointerFactory = Arc::new(move || {
@@ -1512,11 +1525,14 @@ mod tests {
 
         let object_store: Arc<dyn ObjectStore> = store;
 
+        let snapshot_engine = Arc::new(DuckDBSnapshotEngine::new(compaction_enabled));
+
         SnapshotManager {
             dataset_name: DATASET_NAME.to_string(),
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             local_path,
+            snapshot_engine,
             object_store,
             bootstrap_failure_behavior: behavior,
             checkpointer_factory: Some(factory),
@@ -1572,6 +1588,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
 
         let result = manager
@@ -1632,6 +1649,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
 
         let info = manager
@@ -1718,6 +1736,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
+            false,
         );
 
         let info = manager
@@ -1751,10 +1770,14 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Fallback,
             &schema,
+            false,
         );
 
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
         let uploaded_path = manager
-            .create_snapshot(&schema)
+            .create_snapshot(&schema, lock_guard)
             .await
             .expect("create snapshot");
 
@@ -1846,6 +1869,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
         let factory = Arc::clone(
             manager
@@ -1909,6 +1933,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
         let factory = Arc::clone(
             manager
@@ -1972,6 +1997,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
         let factory = Arc::clone(
             manager
@@ -2042,6 +2068,7 @@ mod tests {
             local_path.clone(),
             BootstrapOnFailureBehavior::Warn,
             &runtime_schema,
+            false,
         );
         let factory = Arc::clone(
             manager
@@ -2069,6 +2096,7 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
 
         let uri = format!("{SNAPSHOT_URI_PREFIX}/month=2025-01/day=01/dataset=dataset/file.db");
@@ -2091,6 +2119,7 @@ mod tests {
             PathBuf::from("/tmp/unused"),
             BootstrapOnFailureBehavior::Warn,
             &schema,
+            false,
         );
 
         let uri = "memory://other-prefix/path/to/file.db";
@@ -2099,5 +2128,119 @@ mod tests {
             .expect("convert uri to path");
 
         assert_eq!(path.to_string(), "snapshots/other-prefix/path/to/file.db");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn create_snapshot_with_compaction() {
+        use duckdb::Connection;
+
+        let store = Arc::new(InMemory::new());
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.duckdb");
+
+        // Create a fragmented DuckDB database
+        {
+            let conn = Connection::open(&local_path).expect("open duckdb");
+
+            conn.execute("CREATE TABLE test_data (id INTEGER, padding VARCHAR)", [])
+                .expect("create table");
+
+            // Insert data with padding to make file size significant
+            conn.execute(
+                "INSERT INTO test_data
+                 SELECT i, REPEAT('x', 500)
+                 FROM generate_series(1, 2000000) AS t(i)",
+                [],
+            )
+            .expect("insert data");
+
+            // Delete most rows to create dead tuples (fragmentation)
+            conn.execute("DELETE FROM test_data WHERE id > 50", [])
+                .expect("delete data");
+
+            conn.execute("CHECKPOINT", []).expect("checkpoint");
+        }
+
+        let fragmented_size = std::fs::metadata(&local_path)
+            .expect("get fragmented size")
+            .len();
+
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            true,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
+        let uploaded_path = manager
+            .create_snapshot(&schema, lock_guard)
+            .await
+            .expect("create snapshot");
+
+        // Verify snapshot was uploaded to object store
+        let stored = store
+            .get(&uploaded_path)
+            .await
+            .expect("snapshot stored")
+            .bytes()
+            .await
+            .expect("read stored snapshot");
+
+        let uploaded_size = stored.len() as u64;
+
+        // Compacted snapshot should be smaller than fragmented source
+        assert!(
+            uploaded_size < fragmented_size,
+            "compacted snapshot ({uploaded_size} bytes) should be smaller than \
+             fragmented source ({fragmented_size} bytes)"
+        );
+
+        // Verify metadata was updated correctly
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_bytes = store
+            .get(&metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let metadata: SnapshotMetadata =
+            serde_json::from_slice(&metadata_bytes).expect("parse metadata");
+
+        let dataset = metadata
+            .datasets
+            .get(DATASET_NAME)
+            .expect("dataset metadata present");
+        assert_eq!(dataset.snapshots.len(), 1);
+        assert_eq!(dataset.current_snapshot_id, Some(0));
+
+        let entry = dataset.snapshots.first().expect("snapshot entry");
+        assert_eq!(entry.snapshot_size, uploaded_size);
+        assert_eq!(entry.snapshot_checksum, compute_sha256_hex(&stored));
+        assert_eq!(
+            entry.snapshot_checksum_algorithm,
+            SNAPSHOT_CHECKSUM_ALGORITHM
+        );
+        assert_eq!(entry.snapshot, snapshot_uri(&uploaded_path));
+
+        // Verify uploaded snapshot contains valid data
+        let verify_path = temp_dir.path().join("verify.duckdb");
+        std::fs::write(&verify_path, &stored).expect("write verify file");
+
+        {
+            let conn = Connection::open(&verify_path).expect("open verify db");
+
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM test_data", [], |row| row.get(0))
+                .expect("count rows");
+
+            assert_eq!(count, 50, "compacted snapshot should have 50 rows");
+        }
     }
 }

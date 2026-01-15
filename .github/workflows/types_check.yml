@@ -154,7 +154,6 @@ jobs:
         uses: ./.github/actions/install-postgres
         if: matrix.acceleration.engine == 'postgres'
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Test boolean
