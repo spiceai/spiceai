@@ -160,7 +160,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let snapshot_manager = SnapshotManager::try_new(
         "snapshot_mutex_test".to_string(),
         snapshot_behavior,
-        local_snapshot_file.clone(),
+        runtime_acceleration::snapshot::SnapshotAdapter::file(local_snapshot_file.clone()),
         AccelerationEngine::DuckDB,
     )
     .await

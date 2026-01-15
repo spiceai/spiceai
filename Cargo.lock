@@ -14185,16 +14185,19 @@ dependencies = [
 name = "runtime-acceleration"
 version = "1.11.0-unstable"
 dependencies = [
+ "anyhow",
  "arrow",
  "arrow-schema",
  "async-trait",
  "aws-sdk-credential-bridge",
  "bytes",
  "chrono",
+ "criterion 0.7.0",
  "datafusion",
  "duckdb",
  "fundu",
  "futures",
+ "hex",
  "object_store",
  "opentelemetry 0.29.1",
  "runtime-parameters",
@@ -14210,6 +14213,7 @@ dependencies = [
  "tracing",
  "url",
  "util",
+ "uuid 1.18.1",
 ]
 
 [[package]]

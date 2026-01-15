@@ -338,10 +338,7 @@ mod tests {
 
         // Archive the nested directory
         let mut archive_buffer = Vec::new();
-        let dirs = vec![(
-            test_dir.path().join("level1").to_path_buf(),
-            "data/".to_string(),
-        )];
+        let dirs = vec![(test_dir.path().join("level1"), "data/".to_string())];
         let bytes_written = archive_directories(&dirs, Cursor::new(&mut archive_buffer)).await?;
         assert!(bytes_written > 0);
 
@@ -477,11 +474,12 @@ mod tests {
 
         // Archive with different prefixes
         let mut archive_buffer = Vec::new();
-        let dirs = vec![
+        let directory_list = vec![
             (dir1.clone(), "metadata/".to_string()),
             (dir2.clone(), "data/".to_string()),
         ];
-        let bytes_written = archive_directories(&dirs, Cursor::new(&mut archive_buffer)).await?;
+        let bytes_written =
+            archive_directories(&directory_list, Cursor::new(&mut archive_buffer)).await?;
         assert!(bytes_written > 0);
 
         // Extract and verify both files are preserved with correct content
@@ -530,6 +528,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Test data patterns are always within u8 range"
+    )]
     async fn test_archive_preserves_file_content_integrity() -> Result<()> {
         let test_dir = TempDir::new().expect("Failed to create temp dir");
         let data_dir = test_dir.path().join("data");

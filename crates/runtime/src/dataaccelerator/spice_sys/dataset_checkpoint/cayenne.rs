@@ -22,6 +22,12 @@ use std::{
 
 use super::{DatasetCheckpoint, Error, Result};
 
+// These functions will be used for Cayenne directory-based checkpoint operations
+// when full Cayenne snapshot support is integrated.
+#[expect(
+    dead_code,
+    reason = "Functions will be used when Cayenne snapshot support is fully integrated"
+)]
 impl DatasetCheckpoint {
     /// Helper function to recursively find the most recent file modification time
     fn visit_dirs(dir: &Path, latest: &mut Option<SystemTime>) -> std::io::Result<()> {
@@ -148,24 +154,12 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn create_test_cayenne_checkpoint() -> (DatasetCheckpoint, TempDir, TempDir) {
-        use super::super::super::AccelerationConnection;
-        use runtime_acceleration::snapshot::SnapshotBehavior;
-
+    /// Helper to create temp directories for Cayenne tests.
+    /// Returns (`metadata_dir`, `data_dir`) `TempDir` instances.
+    fn create_test_dirs() -> (TempDir, TempDir) {
         let metadata_dir = TempDir::new().expect("Failed to create temp metadata dir");
         let data_dir = TempDir::new().expect("Failed to create temp data dir");
-
-        // Create a mock Cayenne checkpoint (we don't actually need a real connection for these tests)
-        let checkpoint = DatasetCheckpoint {
-            dataset_name: "test_cayenne_dataset".to_string(),
-            acceleration_connection: AccelerationConnection::Cayenne(
-                metadata_dir.path().to_path_buf(),
-                data_dir.path().to_path_buf(),
-            ),
-            snapshot_behavior: SnapshotBehavior::Disabled,
-        };
-
-        (checkpoint, metadata_dir, data_dir)
+        (metadata_dir, data_dir)
     }
 
     #[test]
@@ -181,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_cayenne_exists() {
-        let (_checkpoint, _metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+        let (_metadata_dir, data_dir) = create_test_dirs();
 
         // Initially empty
         assert!(
@@ -202,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_cayenne_schema_roundtrip() {
-        let (_checkpoint, metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+        let (metadata_dir, data_dir) = create_test_dirs();
 
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -224,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_cayenne_last_checkpoint_time() {
-        let (_checkpoint, _metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+        let (_metadata_dir, data_dir) = create_test_dirs();
 
         // Initially no checkpoint time
         assert!(
@@ -295,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_cayenne_checkpoint_creates_timestamp_file() {
-        let (_checkpoint, metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+        let (metadata_dir, data_dir) = create_test_dirs();
 
         let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
         let schema_ref = Arc::new(schema);
@@ -317,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_cayenne_schema_complex_types() {
-        let (_checkpoint, metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+        let (metadata_dir, data_dir) = create_test_dirs();
 
         // Create a schema with various complex types
         let schema = Schema::new(vec![
@@ -356,7 +350,7 @@ mod tests {
 
     #[test]
     fn test_cayenne_checkpoint_nested_directories() {
-        let (_checkpoint, _metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+        let (_metadata_dir, data_dir) = create_test_dirs();
 
         // Create nested directory structure
         let nested_dir = data_dir.path().join("subdir1/subdir2/subdir3");
@@ -378,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_cayenne_last_checkpoint_time_finds_most_recent() {
-        let (_checkpoint, _metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+        let (_metadata_dir, data_dir) = create_test_dirs();
 
         // Create multiple files at different times
         std::fs::write(data_dir.path().join("file1.vortex"), b"data1")
