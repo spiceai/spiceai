@@ -174,8 +174,6 @@ pub mod iceberg;
 pub mod parameters;
 pub mod s3;
 pub mod sink;
-#[cfg(feature = "smb")]
-pub mod smb;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]

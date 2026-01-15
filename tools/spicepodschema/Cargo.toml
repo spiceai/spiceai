@@ -61,12 +61,13 @@ connector-imap = { path = "../../crates/data-connectors/connector-imap" }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb" }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql" }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql" }
-connector-nfs = { path = "../../crates/data-connectors/connector-nfs" }
+# connector-nfs requires system libnfs library
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle" }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres" }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb" }
 connector-sftp = { path = "../../crates/data-connectors/connector-sftp" }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint" }
+connector-smb = { path = "../../crates/data-connectors/connector-smb" }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake" }
 connector-spark = { path = "../../crates/data-connectors/connector-spark" }
 

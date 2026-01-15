@@ -41,7 +41,7 @@ use connector_imap as _;
 use connector_mongodb as _;
 use connector_mssql as _;
 use connector_mysql as _;
-use connector_nfs as _;
+// connector-nfs requires system libnfs library
 use connector_oracle as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
@@ -49,6 +49,7 @@ use connector_postgres as _;
 use connector_scylladb as _;
 use connector_sftp as _;
 use connector_sharepoint as _;
+use connector_smb as _;
 use connector_snowflake as _;
 use connector_spark as _;
 #[expect(unused_imports)]

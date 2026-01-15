@@ -29,6 +29,7 @@ connector-oracle = { path = "../../crates/data-connectors/connector-oracle", opt
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
+connector-smb = { path = "../../crates/data-connectors/connector-smb", optional = true }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
 connector-spark = { path = "../../crates/data-connectors/connector-spark", optional = true }
 event_stream = { path = "../../crates/event_stream" }
@@ -134,7 +135,7 @@ release = []
 scylladb = ["connector-scylladb", "runtime/scylladb"]
 sftp = ["connector-sftp", "runtime/sftp"]
 sharepoint = ["connector-sharepoint", "runtime/sharepoint"]
-smb = ["runtime/smb"]
+smb = ["connector-smb"]
 snapshots = ["runtime/snapshots"]
 snowflake = ["connector-snowflake", "runtime/snowflake"]
 spark = ["connector-spark", "runtime/spark"]
