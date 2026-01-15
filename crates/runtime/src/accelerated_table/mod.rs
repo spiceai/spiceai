@@ -33,9 +33,7 @@ use datafusion::common::Constraints;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::physical_expr::{PhysicalExpr, expressions::Column};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::sql::TableReference;
 use datafusion::{
@@ -969,7 +967,8 @@ impl TableProvider for AcceleratedTable {
         }
 
         // For caching mode, extend projection to include fetched_at for freshness checking if needed.
-        // If added internally, we'll strip it from results before returning to the user.
+        // Added columns will be automatically stripped by `SchemaCastScanExec`, similar to
+        // fallback-to-source on cache miss where results return all columns.
         let extended_projection = if is_caching_mode {
             extend_projection_for_caching(projection, &self.accelerator.schema())
         } else {
@@ -1000,31 +999,22 @@ impl TableProvider for AcceleratedTable {
                 };
 
                 let federated_provider = self.federated.table_provider().await;
-                let caching_exec: Arc<dyn ExecutionPlan> =
-                    Arc::new(caching::CachingAccelerationScanExec::new(
-                        input,
-                        self.cache_ttl,
-                        self.cache_stale_while_revalidate_ttl,
-                        self.cache_stale_if_error,
-                        federated_provider,
-                        Arc::clone(&self.accelerator),
-                        self.dataset_name.to_string(),
-                        self.io_runtime.clone(),
-                        filters.to_vec(),
-                        projection.cloned(),
-                        limit,
-                        Arc::clone(&self.accelerator_write_mutex),
-                        Arc::clone(&self.in_flight_revalidations),
-                        Arc::clone(&self.synchronized_children),
-                    ));
-
-                // If we extended projection to add fetched_at, strip it from results
-                if let (true, Some(proj)) = (extended_projection.is_some(), projection) {
-                    // extended_projection is Some only when projection is Some and didn't already include fetched_at (was modified)
-                    apply_projection(caching_exec, proj)?
-                } else {
-                    caching_exec
-                }
+                Arc::new(caching::CachingAccelerationScanExec::new(
+                    input,
+                    self.cache_ttl,
+                    self.cache_stale_while_revalidate_ttl,
+                    self.cache_stale_if_error,
+                    federated_provider,
+                    Arc::clone(&self.accelerator),
+                    self.dataset_name.to_string(),
+                    self.io_runtime.clone(),
+                    filters.to_vec(),
+                    projection.cloned(),
+                    limit,
+                    Arc::clone(&self.accelerator_write_mutex),
+                    Arc::clone(&self.in_flight_revalidations),
+                    Arc::clone(&self.synchronized_children),
+                ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,
             (false, ZeroResultsAction::UseSource) => Arc::new(FallbackOnZeroResultsScanExec::new(
@@ -1099,25 +1089,6 @@ fn extend_projection_for_caching(
     let mut extended = proj.clone();
     extended.push(idx);
     Some(extended)
-}
-
-/// Wraps plan with `ProjectionExec` to return only the user's originally requested columns.
-/// Used to strip internally-added columns (e.g., `fetched_at`) from user-facing results.
-fn apply_projection(
-    plan: Arc<dyn ExecutionPlan>,
-    projection: &[usize],
-) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-    let schema = plan.schema();
-    let projection_expr: Vec<(Arc<dyn PhysicalExpr>, String)> = (0..projection.len())
-        .map(|i| {
-            let field = schema.field(i);
-            (
-                Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
-                field.name().clone(),
-            )
-        })
-        .collect();
-    Ok(Arc::new(ProjectionExec::try_new(projection_expr, plan)?))
 }
 
 #[derive(Debug)]
@@ -1281,7 +1252,6 @@ impl Retention {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use datafusion::physical_plan::empty::EmptyExec;
 
     fn schema_with_fetched_at() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1340,30 +1310,5 @@ mod tests {
             vec![2, 3],
             "Should add fetched_at to single column"
         );
-    }
-
-    #[test]
-    fn test_apply_projection_reduces_columns() {
-        // Create a schema with 4 columns
-        let schema = schema_with_fetched_at();
-
-        // Create a dummy EmptyExec with the schema
-        let empty_exec = EmptyExec::new(Arc::clone(&schema));
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(empty_exec);
-
-        // Apply projection for 2 columns (simulating user requested 2 columns)
-        let user_projection = vec![0, 2]; // id, content
-        let projected_plan =
-            apply_projection(plan, &user_projection).expect("apply_projection should succeed");
-
-        // Verify output schema has only the first 2 columns
-        let output_schema = projected_plan.schema();
-        assert_eq!(
-            output_schema.fields().len(),
-            2,
-            "Should have 2 columns after projection"
-        );
-        assert_eq!(output_schema.field(0).name(), "id");
-        assert_eq!(output_schema.field(1).name(), "name");
     }
 }

@@ -2200,6 +2200,7 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
                 !populate_results.is_empty() && populate_results[0].num_rows() > 0,
                 "Should have fetched data from HTTP source"
             );
+            assert_column_has_data(&populate_results, "content");
 
             // Verify Step 1 returns only the requested column
             let schema_step1 = populate_results[0].schema();
@@ -2230,6 +2231,7 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
                 !results.is_empty() && results[0].num_rows() > 0,
                 "Should have data from cache"
             );
+            assert_column_has_data(&results, "content");
 
             let schema = results[0].schema();
 
@@ -2247,10 +2249,31 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
             );
 
             eprintln!("\nTEST SUMMARY:");
-            eprintln!("✅ Step 1: SELECT content (cache miss) - populated cache, only content column returned");
-            eprintln!("✅ Step 2: SELECT content (cache hit) - only content column returned");
+            eprintln!("✅ Step 1: SELECT content (cache miss) - populated cache, content has data");
+            eprintln!("✅ Step 2: SELECT content (cache hit) - content has data");
 
             Ok(())
         })
         .await
+}
+
+/// Asserts that the specified column in the given record batches contains non-empty string data.
+fn assert_column_has_data(batches: &[arrow::array::RecordBatch], column_name: &str) {
+    assert!(!batches.is_empty(), "expected at least one batch");
+
+    let total_len: usize = batches
+        .iter()
+        .filter_map(|b| b.schema().index_of(column_name).ok().map(|i| b.column(i)))
+        .map(|col| {
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column should be StringArray")
+                .iter()
+                .flatten()
+                .map(str::len)
+                .sum::<usize>()
+        })
+        .sum();
+
+    assert!(total_len > 0, "'{column_name}' column has no data");
 }
