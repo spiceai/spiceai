@@ -653,6 +653,7 @@ impl Builder {
         }
 
         refresher.with_snapshot_creation_config(self.snapshot_creation_config);
+        refresher.set_bootstrap_status(self.bootstrap_status);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
