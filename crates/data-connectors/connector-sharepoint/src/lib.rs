@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,22 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::sharepoint::{client::SharepointClient, table::SharepointTableProvider};
 use datafusion::datasource::TableProvider;
 use document_parse::DocumentParser;
 use graph_rs_sdk::{GraphClient, identity::ConfidentialClientApplication};
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
+use runtime::parameters::{ParameterSpec, Parameters};
+use runtime::register_data_connector;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
-    ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
-};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -142,7 +143,7 @@ impl DataConnectorFactory for SharepointFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(Sharepoint::new(&params.parameters)?) as Arc<dyn DataConnector>)
         })
@@ -170,9 +171,10 @@ impl DataConnector for Sharepoint {
         let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from)
             .await
             .boxed()
-            .context(UnableToGetReadProviderSnafu {
-                dataconnector: "sharepoint",
+            .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "sharepoint".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
+                source: e,
             })?;
         Ok(Arc::new(SharepointTableProvider::new(
             client,
@@ -192,16 +194,17 @@ impl DataConnector for Sharepoint {
         match SharepointClient::new(Arc::clone(&self.client), &dataset.from)
             .await
             .boxed()
-            .context(UnableToGetReadProviderSnafu {
-                dataconnector: "sharepoint",
+            .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "sharepoint".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
+                source: e,
             }) {
             Ok(client) => Some(Ok(Arc::new(SharepointTableProvider::new(
                 client,
                 false,
                 self.get_formatter(dataset).await,
             )))),
-            Err(e) => return Some(Err(e)),
+            Err(e) => Some(Err(e)),
         }
     }
 }
