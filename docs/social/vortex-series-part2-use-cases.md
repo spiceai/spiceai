@@ -209,66 +209,67 @@ Choose alternatives when:
 
 ## LinkedIn Post (~3000 characters)
 
-📊 8 Use Cases Where Vortex Shines (And Why We Built Cayenne On It)
+📊 Why Vortex? The Use Cases That Made Us Choose It for Cayenne
 
-At Spice AI, we chose Vortex as the storage layer for Cayenne, our data accelerator. Here's where it delivers the biggest wins:
+At Spice AI, we evaluated every columnar format before building Cayenne. Here's why Vortex won—explained through the problems it solves:
 
-1️⃣ Wide Tables (Many Columns)
+🔷 Wide Tables (1000+ Columns)
 
-ML feature stores, IoT telemetry, denormalized analytics—hundreds or thousands of columns. Parquet's metadata parsing becomes a bottleneck. Vortex? Zero-copy/zero-parse metadata. 100× faster random access. Column projection is instantaneous.
+THE PROBLEM: ML feature stores and IoT telemetry have hundreds of columns. Parquet wastes time parsing metadata you don't need.
 
-2️⃣ AI & ML Pipelines
+WHY VORTEX: Zero-copy/zero-parse metadata design. Opening a 1000-column file is as fast as opening a 10-column file. Column projection is O(1), not O(columns). Result: 100× faster random access.
 
-Fast batch reads for training. Low-latency feature serving. Efficient embedding storage. Direct Arrow integration with PyTorch, Polars, and TensorFlow. Unified storage for structured data + AI artifacts.
+🔷 AI & ML Pipelines
 
-3️⃣ Data Engine Storage Layer
+THE PROBLEM: Training needs fast batch reads. Inference needs low-latency lookups. Most formats force you to choose.
 
-Building a query engine? Vortex was designed for embedding. Native DataFusion integration, pluggable encodings, rich statistics for optimization. It's how we built Cayenne: SQLite for metadata, Vortex for data, DataFusion for queries.
+WHY VORTEX: Arrow-native means zero serialization between storage and PyTorch/Polars/TensorFlow. The same format works for training batches AND feature serving. No format conversion, no copies.
 
-4️⃣ Real-Time Dashboards
+🔷 Data Engine Storage
 
-Sub-100ms queries with 10-second data freshness. No pre-aggregation required. Zero-copy Arrow decompression eliminates serialization overhead.
+THE PROBLEM: Building a query engine means choosing between "easy to integrate" (slow) or "fast" (months of work).
 
-5️⃣ Data Lake Acceleration
+WHY VORTEX: Designed for embedding. DataFusion integration is first-class. Rich statistics feed the query optimizer. Pluggable encodings let you extend without forking. We built Cayenne in weeks, not months.
 
-Parquet in S3 is cheap but slow. Materialize hot data into Vortex for 10-50× query speedups. Each column gets optimal encoding—dictionary, delta, RLE, FSST.
+🔷 Real-Time Dashboards
 
-6️⃣ High-Concurrency APIs
+THE PROBLEM: Pre-aggregate = inflexible. Query sources = slow. Pick your poison.
 
-Single-file databases choke at 100+ concurrent queries. Vortex's multi-file architecture + SQLite metadata coordination scales to 500+ QPS.
+WHY VORTEX: Zero-copy Arrow decompression eliminates the serialization tax. Sub-100ms queries on fresh data. Dashboards stay flexible AND fast.
 
-7️⃣ Time-Series Data
+🔷 High-Concurrency APIs
 
-Delta encoding compresses timestamps to 2-4 bits per value. Sort by time for sub-millisecond partition pruning. Perfect for metrics, logs, IoT.
+THE PROBLEM: Single-file databases (SQLite, DuckDB files) create lock contention. 100+ concurrent queries = timeouts.
 
-8️⃣ CDC & Upsert Streams
+WHY VORTEX: Multi-file architecture means no file-level locking. SQLite handles only lightweight metadata coordination. We've scaled to 500+ QPS without degradation.
 
-Deletion vectors provide ACID semantics without rewriting files. Sequence numbers enable proper upsert handling.
+🔷 Time-Series Data
 
-What makes Vortex different?
+THE PROBLEM: Timestamps are naturally sequential, but generic compression doesn't exploit this.
 
-It's not just faster Parquet—it's a fundamentally different approach. Type-aware encoding (FastLanes for integers, ALP for floats, FSST for strings). Zero-copy Arrow access. Statistics-driven optimization. And it's designed for embedding in engines, not just file storage.
+WHY VORTEX: Delta encoding compresses timestamps to 2-4 bits/value. Sorting enables segment-level pruning. Time-range queries touch only relevant data.
 
-When NOT to use it: OLTP, key-value lookups, full-text search, tiny datasets.
+The pattern across all these? Vortex isn't just "faster Parquet." It's built differently:
+• Type-aware encoding (FastLanes, ALP, FSST)
+• Zero-copy Arrow integration
+• Statistics-driven query optimization
+• Designed for engines, not just files
 
-What data challenges are you facing? We'd love to hear your patterns.
+What's your hardest data access pattern?
 
 ---
 
 ## X Post (280 characters)
 
-📊 8 Vortex use cases:
+📊 Why Vortex?
 
-1. Wide tables (100× faster metadata)
-2. AI/ML pipelines (Arrow-native)
-3. Data engine storage
-4. Real-time dashboards
-5. Data lake acceleration
-6. High-concurrency APIs
-7. Time-series
-8. CDC streams
+Wide tables → zero-parse metadata (100× faster)
+AI/ML → Arrow-native (no serialization)
+Data engines → built for embedding
+Dashboards → zero-copy decode
+High concurrency → no file locking
 
-Built for engines, not just files.
+Not faster Parquet. Built differently.
 
 ---
 
