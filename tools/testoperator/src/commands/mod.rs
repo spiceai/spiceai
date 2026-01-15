@@ -136,7 +136,7 @@ pub(crate) async fn get_app_and_start_request(
     if let Some(dependencies_root) = &args.spicepod_dependencies {
         for dependency in &spicepod.dependencies {
             let dependent_spicepod = Spicepod::load(&dependencies_root.join(dependency)).await?;
-            app_builder = app_builder.with_spicepod(dependent_spicepod);
+            app_builder = app_builder.with_spicepod_dependency(dependent_spicepod);
         }
     }
     // After we've loaded dependencies, remove.
