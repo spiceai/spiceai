@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,22 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{
-    component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
-    register_data_connector,
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::listing::{self, LISTING_TABLE_PARAMETERS, ListingTableConnector};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    NewDataConnectorResult,
 };
+use runtime::parameters::{ParameterSpec, Parameters};
+use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use url::Url;
-
-use super::{ConnectorComponent, ConnectorParams, listing};
-use super::{
-    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
-    listing::ListingTableConnector,
-};
 
 #[derive(Debug)]
 pub struct FTP {
@@ -77,7 +75,7 @@ impl DataConnectorFactory for FTPFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let ftp = FTP {
                 params: params.parameters,
@@ -114,14 +112,14 @@ impl ListingTableConnector for FTP {
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
-        let mut ftp_url =
-            Url::parse(url)
-                .boxed()
-                .context(super::InvalidConfigurationSnafu {
-                    dataconnector: format!("{self}"),
-                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/ftp"),
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
+        let mut ftp_url = Url::parse(url).boxed().map_err(|source| {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/ftp"),
+                connector_component: ConnectorComponent::from(dataset),
+                source,
+            }
+        })?;
 
         ftp_url.set_fragment(Some(&listing::build_fragments(
             &self.params,

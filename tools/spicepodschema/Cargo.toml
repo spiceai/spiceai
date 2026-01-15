@@ -53,6 +53,7 @@ connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-la
 connector-dremio = { path = "../../crates/data-connectors/connector-dremio" }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb" }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql" }
+connector-ftp = { path = "../../crates/data-connectors/connector-ftp" }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb" }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql" }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql" }

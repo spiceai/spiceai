@@ -35,6 +35,7 @@ use connector_delta_lake as _;
 use connector_dremio as _;
 use connector_duckdb as _;
 use connector_flightsql as _;
+use connector_ftp as _;
 use connector_mongodb as _;
 use connector_oracle as _;
 // #[expect(unused_imports)]

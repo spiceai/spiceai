@@ -135,8 +135,7 @@ pub mod debezium;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
-#[cfg(feature = "ftp")]
-pub mod ftp;
+
 pub mod git;
 pub mod github;
 pub mod graphql;
