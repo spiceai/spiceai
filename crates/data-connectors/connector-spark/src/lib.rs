@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,23 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_trait::async_trait;
+//! Spark Connect data connector for Spice.ai runtime.
+//!
+//! This crate provides the Spark Connect connector implementation, allowing
+//! Spice.ai to connect to Apache Spark clusters as data sources.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds - changes to this connector only require rebuilding
+//! this crate, not the entire runtime.
 
-use crate::{component::dataset::Dataset, register_data_connector};
+use async_trait::async_trait;
 use data_components::Read;
 use data_components::spark_connect::SparkConnect;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult,
+};
+use runtime::parameters::ParameterSpec;
+use runtime::register_data_connector;
+use runtime_parameters::Parameters;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters,
-};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -53,6 +63,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Spark Connect data connector.
 pub struct Spark {
     read_provider: Arc<dyn Read>,
 }
@@ -80,6 +91,7 @@ impl Spark {
     }
 }
 
+/// Factory for creating Spark connector instances.
 #[derive(Default, Copy, Clone)]
 pub struct SparkFactory {}
 
@@ -105,7 +117,7 @@ impl DataConnectorFactory for SparkFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match Spark::new(params.parameters).await {
                 Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
@@ -143,6 +155,34 @@ impl DataConnectorFactory for SparkFactory {
     }
 }
 
+register_data_connector!("spark", SparkFactory);
+
+#[derive(Debug, Snafu)]
+enum ReadProviderError {
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<ReadProviderError> for DataConnectorError {
+    fn from(err: ReadProviderError) -> Self {
+        match err {
+            ReadProviderError::UnableToGetReadProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for Spark {
     fn as_any(&self) -> &dyn Any {
@@ -152,17 +192,15 @@ impl DataConnector for Spark {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = TableReference::from(dataset.path());
         Ok(self
             .read_provider
             .table_provider(table_reference)
             .await
-            .context(super::UnableToGetReadProviderSnafu {
+            .context(UnableToGetReadProviderSnafu {
                 dataconnector: "spark",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
     }
 }
-
-register_data_connector!("spark", SparkFactory);

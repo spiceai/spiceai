@@ -38,16 +38,9 @@ use connector_oracle as _;
 // use runtime::dataconnector::odbc as _;
 use connector_postgres as _;
 use connector_snowflake as _;
+use connector_spark as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::s3 as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::sftp as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::sharepoint as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::sink as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::spark as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::spiceai as _;
 

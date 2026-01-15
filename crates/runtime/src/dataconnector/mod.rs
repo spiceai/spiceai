@@ -174,8 +174,6 @@ pub mod sharepoint;
 pub mod sink;
 #[cfg(feature = "smb")]
 pub mod smb;
-#[cfg(feature = "spark")]
-pub mod spark;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]

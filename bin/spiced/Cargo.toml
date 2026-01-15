@@ -19,6 +19,7 @@ connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optio
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
+connector-spark = { path = "../../crates/data-connectors/connector-spark", optional = true }
 event_stream = { path = "../../crates/event_stream" }
 repl = { path = "../../crates/repl" }
 futures.workspace = true
@@ -124,7 +125,7 @@ sharepoint = ["runtime/sharepoint"]
 smb = ["runtime/smb"]
 snapshots = ["runtime/snapshots"]
 snowflake = ["connector-snowflake", "runtime/snowflake"]
-spark = ["runtime/spark"]
+spark = ["connector-spark", "runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 turso = ["runtime/turso"]
