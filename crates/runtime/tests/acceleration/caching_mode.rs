@@ -2200,8 +2200,7 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
                 !populate_results.is_empty() && populate_results[0].num_rows() > 0,
                 "Should have fetched data from HTTP source"
             );
-            let row_count = populate_results[0].num_rows();
-            
+
             // Verify Step 1 returns only the requested column
             let schema_step1 = populate_results[0].schema();
             assert!(
@@ -2233,7 +2232,7 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
             );
 
             let schema = results[0].schema();
-            
+
             // Verify only the requested column is present
             assert!(
                 schema.column_with_name("content").is_some(),

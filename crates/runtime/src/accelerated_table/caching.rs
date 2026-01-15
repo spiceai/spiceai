@@ -103,7 +103,10 @@ fn check_cache_freshness(
     let schema = batches[0].schema();
     if schema.column_with_name(CACHE_REFRESHED_AT_COLUMN).is_none() {
         // No metadata column means data was never refreshed in cache mode - treat as expired
-        tracing::debug!("check_cache_freshness: no {} column, returning Expired", CACHE_REFRESHED_AT_COLUMN);
+        tracing::debug!(
+            "check_cache_freshness: no {} column, returning Expired",
+            CACHE_REFRESHED_AT_COLUMN
+        );
         return Ok(CacheFreshness::Expired);
     }
 
@@ -149,7 +152,9 @@ fn check_cache_freshness(
         for i in 0..ts_array.len() {
             if !ts_array.is_valid(i) {
                 // Null value = expired, return immediately (can't get worse)
-                tracing::debug!("check_cache_freshness: NULL timestamp at index {i}, returning Expired");
+                tracing::debug!(
+                    "check_cache_freshness: NULL timestamp at index {i}, returning Expired"
+                );
                 return Ok(CacheFreshness::Expired);
             }
             let ts = ts_array.value(i);
@@ -1867,7 +1872,7 @@ mod tests {
         );
     }
 
-        #[test]
+    #[test]
     fn test_check_cache_freshness_without_fetched_at_column() {
         // Test that batches without fetched_at column are treated as expired
         let schema = create_test_schema_without_refresh_timestamp();
@@ -1881,9 +1886,9 @@ mod tests {
         .expect("Failed to create batch");
 
         let max_age = Duration::from_secs(60);
-        let freshness = check_cache_freshness(&[batch], max_age, None)
-            .expect("Should check freshness");
-        
+        let freshness =
+            check_cache_freshness(&[batch], max_age, None).expect("Should check freshness");
+
         assert_eq!(
             freshness,
             CacheFreshness::Expired,
@@ -1910,9 +1915,9 @@ mod tests {
         .expect("Failed to create batch");
 
         let max_age = Duration::from_secs(60);
-        let freshness = check_cache_freshness(&[batch], max_age, None)
-            .expect("Should check freshness");
-        
+        let freshness =
+            check_cache_freshness(&[batch], max_age, None).expect("Should check freshness");
+
         assert_eq!(
             freshness,
             CacheFreshness::Expired,
