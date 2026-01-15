@@ -154,8 +154,6 @@ pub mod deferred;
 pub mod gcs;
 pub mod glue;
 pub mod iceberg;
-#[cfg(feature = "imap")]
-pub mod imap;
 pub mod parameters;
 pub mod s3;
 pub mod sink;

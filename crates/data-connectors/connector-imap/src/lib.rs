@@ -1,8 +1,8 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this Https except in compliance with the License.
+you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
      https://www.apache.org/licenses/LICENSE-2.0
@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::imap::{
     ImapTableProvider,
@@ -22,6 +21,13 @@ use data_components::imap::{
 };
 use datafusion::datasource::TableProvider;
 use regex::Regex;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
+use runtime::parameters::ParameterSpec;
+use runtime::register_data_connector;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{
@@ -31,11 +37,6 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::{Arc, LazyLock},
-};
-
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec,
 };
 
 const PARAMETERS: &[ParameterSpec] = &[
@@ -92,7 +93,7 @@ pub struct Imap {
     session: ImapSession,
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct ImapFactory {}
 
 impl ImapFactory {
@@ -205,7 +206,7 @@ impl DataConnectorFactory for ImapFactory {
     fn create(
         &self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let host = Self::parse_host(&mut params)?;
 
@@ -287,7 +288,7 @@ impl DataConnector for Imap {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(ImapTableProvider::new(
             self.session.clone(),
             dataset.is_accelerated(),

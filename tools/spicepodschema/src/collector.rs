@@ -36,6 +36,7 @@ use connector_dremio as _;
 use connector_duckdb as _;
 use connector_flightsql as _;
 use connector_ftp as _;
+use connector_imap as _;
 use connector_mongodb as _;
 use connector_mssql as _;
 use connector_mysql as _;

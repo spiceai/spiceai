@@ -17,6 +17,7 @@ connector-dremio = { path = "../../crates/data-connectors/connector-dremio", opt
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
 connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
+connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
 connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optional = true }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
@@ -109,7 +110,7 @@ dynamodb = ["runtime/dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
 iceberg-write = ["runtime/iceberg-write"]
-imap = ["runtime/imap"]
+imap = ["connector-imap", "runtime/imap"]
 kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
