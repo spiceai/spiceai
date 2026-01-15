@@ -314,7 +314,6 @@ pub struct Builder {
     caching_stale_while_revalidate_ttl: Option<Duration>,
     caching_stale_if_error: bool,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
-    /// The bootstrap status from dataset initialization.
     bootstrap_status: BootstrapStatus,
 }
 
@@ -356,7 +355,7 @@ impl Builder {
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: false,
             resource_monitor: None,
-            bootstrap_status: BootstrapStatus::None,
+            bootstrap_status: BootstrapStatus::none(),
         }
     }
 

@@ -960,7 +960,6 @@ pub struct RegisterDatasetContext {
     federated_read_table: FederatedTable,
     source: String,
     accelerated_table: Option<Arc<AcceleratedTable>>,
-    /// The bootstrap status from dataset initialization.
     bootstrap_status: BootstrapStatus,
 }
 

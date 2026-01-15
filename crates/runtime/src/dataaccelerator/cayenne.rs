@@ -1806,8 +1806,7 @@ impl DataAccelerator for CayenneAccelerator {
                 }
             }
 
-            // S3 Express One Zone does not support snapshot bootstrapping
-            return Ok(BootstrapStatus::None);
+            return Ok(BootstrapStatus::none());
         }
 
         // If mode is FileCreate, delete the existing directory and metadata to start fresh
@@ -1867,14 +1866,17 @@ impl DataAccelerator for CayenneAccelerator {
                 .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
         }
 
-        let was_bootstrapped = if let Some(acceleration) = source.acceleration() {
-            download_snapshot_if_needed(acceleration, source, path_buf, AccelerationEngine::Cayenne)
-                .await
+        if let Some(acceleration) = source.acceleration() {
+            Ok(download_snapshot_if_needed(
+                acceleration,
+                source,
+                path_buf,
+                AccelerationEngine::Cayenne,
+            )
+            .await)
         } else {
-            BootstrapStatus::None
-        };
-
-        Ok(was_bootstrapped)
+            Ok(BootstrapStatus::none())
+        }
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.

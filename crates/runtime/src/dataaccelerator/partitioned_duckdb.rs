@@ -276,7 +276,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
                 FileModeOnlySnafu
             );
         }
-        Ok(BootstrapStatus::None)
+        Ok(BootstrapStatus::none())
     }
 
     async fn create_external_table(

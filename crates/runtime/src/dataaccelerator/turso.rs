@@ -459,11 +459,10 @@ impl DataAccelerator for TursoAccelerator {
             // Initialize the shared pool to verify connectivity
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
-            return Ok(BootstrapStatus::None);
+            return Ok(BootstrapStatus::none());
         }
 
         // Handle file mode: validate path and setup file-based database
-        let mut was_bootstrapped = BootstrapStatus::None;
         if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("turso_file") {
                 make_spice_data_directory()
@@ -499,7 +498,7 @@ impl DataAccelerator for TursoAccelerator {
                 }
             }
 
-            was_bootstrapped = download_snapshot_if_needed(
+            let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
                 PathBuf::from(path),
@@ -510,9 +509,11 @@ impl DataAccelerator for TursoAccelerator {
             // Initialize the database file using the shared pool
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
+
+            return Ok(bootstrap_status);
         }
 
-        Ok(was_bootstrapped)
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.

@@ -177,7 +177,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             }
             self.get_shared_pool(source).await?;
         }
-        Ok(BootstrapStatus::None)
+        Ok(BootstrapStatus::none())
     }
 
     async fn create_external_table(

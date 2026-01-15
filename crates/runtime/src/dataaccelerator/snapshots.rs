@@ -40,7 +40,7 @@ pub(super) async fn download_snapshot_if_needed(
     engine: AccelerationEngine,
 ) -> BootstrapStatus {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
-        return BootstrapStatus::None;
+        return BootstrapStatus::none();
     }
 
     if path.exists() {
@@ -48,7 +48,7 @@ pub(super) async fn download_snapshot_if_needed(
             "Acceleration already exists at {}, skipping snapshot download",
             path.display()
         );
-        return BootstrapStatus::None;
+        return BootstrapStatus::none();
     }
 
     let dataset_name = source.name().to_string();
@@ -91,13 +91,16 @@ pub(super) async fn download_snapshot_if_needed(
                     bytes_downloaded,
                     &checksum,
                 );
-                return BootstrapStatus::Bootstrapped;
+                BootstrapStatus::bootstrapped()
             }
-            Ok(None) => {}
+            Ok(None) => BootstrapStatus::none(),
             Err(e) => {
                 tracing::error!("Failed to download snapshot: {}", e);
+                BootstrapStatus::none()
             }
         }
+    } else {
+        BootstrapStatus::none()
     }
     BootstrapStatus::None
 }

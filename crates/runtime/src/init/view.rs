@@ -273,7 +273,7 @@ impl Runtime {
                     name: acceleration_settings.engine.to_string(),
                 },
             ) {
-                Ok(_was_bootstrapped) => {
+                Ok(_) => {
                     // Initialization successful, continue to next view
                     // Note: Views don't currently use the bootstrapped state
                 }

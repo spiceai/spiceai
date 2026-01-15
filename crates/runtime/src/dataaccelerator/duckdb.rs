@@ -343,12 +343,11 @@ impl DataAccelerator for DuckDBAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Ok(BootstrapStatus::None);
+            return Ok(BootstrapStatus::none());
         }
 
         let path = self.file_path(source)?;
 
-        let mut was_bootstrapped = BootstrapStatus::None;
         if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("duckdb_file") {
                 make_spice_data_directory().map_err(|err| {
@@ -385,7 +384,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
             }
 
-            was_bootstrapped = download_snapshot_if_needed(
+            let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
                 PathBuf::from(path),
@@ -394,9 +393,11 @@ impl DataAccelerator for DuckDBAccelerator {
             .await;
 
             self.get_shared_pool(source).await?;
+
+            return Ok(bootstrap_status);
         }
 
-        Ok(was_bootstrapped)
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.

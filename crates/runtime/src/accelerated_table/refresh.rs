@@ -531,7 +531,7 @@ impl Refresher {
             io_runtime,
             resource_monitor: None,
             accelerator_write_mutex,
-            bootstrap_status: BootstrapStatus::None,
+            bootstrap_status: BootstrapStatus::none(),
         }
     }
 
@@ -588,6 +588,12 @@ impl Refresher {
         self
     }
 
+    /// Set the bootstrap status from dataset initialization.
+    pub fn set_bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
+        self.bootstrap_status = bootstrap_status;
+        self
+    }
+
     #[must_use]
     pub fn on_complete_notification(&self) -> Option<Arc<Notify>> {
         self.on_complete_notification.clone()
@@ -608,12 +614,6 @@ impl Refresher {
         monitor: crate::resource_monitor::ResourceMonitor,
     ) -> &mut Self {
         self.resource_monitor = Some(monitor);
-        self
-    }
-
-    /// Set the bootstrap status from dataset initialization.
-    pub fn set_bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
-        self.bootstrap_status = bootstrap_status;
         self
     }
 
