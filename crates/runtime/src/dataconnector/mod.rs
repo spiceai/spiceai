@@ -134,8 +134,6 @@ pub mod databricks;
 pub mod debezium;
 #[cfg(feature = "delta_lake")]
 pub mod delta_lake;
-#[cfg(feature = "dremio")]
-pub mod dremio;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;

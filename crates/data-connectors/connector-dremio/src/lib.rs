@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,14 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::ConnectorComponent;
-use super::ConnectorParams;
-use super::DataConnector;
-use super::DataConnectorFactory;
-use super::ParameterSpec;
-use crate::component::dataset::Dataset;
-use crate::dataconnector::DataConnectorError;
-use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::ReadWrite;
 use data_components::flight::FlightFactory;
@@ -35,6 +27,13 @@ use datafusion_federation::sql::RemoteTableRef;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
+use runtime::parameters::ParameterSpec;
+use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -136,7 +135,7 @@ impl DataConnectorFactory for DremioFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: Arc<str> = params
                 .parameters
@@ -194,7 +193,7 @@ impl DataConnector for Dremio {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = match RemoteTableRef::parse_with_default_dialect(dataset.path()) {
             Ok(table_reference) => table_reference.table_ref,
             Err(e) => {
@@ -221,11 +220,11 @@ impl DataConnector for Dremio {
                     });
                 }
 
-                return Err(DataConnectorError::UnableToGetReadProvider {
+                Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "dremio".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: e,
-                });
+                })
             }
         }
     }
@@ -233,13 +232,14 @@ impl DataConnector for Dremio {
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let read_write_result =
             ReadWrite::table_provider(&self.flight_factory, dataset.path().into())
                 .await
-                .context(super::UnableToGetReadWriteProviderSnafu {
-                    dataconnector: "dremio",
+                .map_err(|e| DataConnectorError::UnableToGetReadWriteProvider {
+                    dataconnector: "dremio".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
+                    source: e.into(),
                 });
 
         Some(read_write_result)

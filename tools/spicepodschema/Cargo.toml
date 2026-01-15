@@ -49,6 +49,7 @@ runtime = { path = "../../crates/runtime", features = [
 
 # Extracted connector crates (for linkme registration)
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse" }
+connector-dremio = { path = "../../crates/data-connectors/connector-dremio" }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb" }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql" }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb" }

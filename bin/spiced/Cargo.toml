@@ -12,6 +12,7 @@ version.workspace = true
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
+connector-dremio = { path = "../../crates/data-connectors/connector-dremio", optional = true }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
@@ -98,7 +99,7 @@ default = [
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
-dremio = ["runtime/dremio"]
+dremio = ["connector-dremio", "runtime/dremio"]
 duckdb = ["connector-duckdb", "runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
