@@ -179,8 +179,14 @@ let all_batches: Vec<RecordBatch> = stream.try_collect().await?;
 let value: Option<i64> = row.get("amount");
 let total = value.unwrap_or(0); // Only if business logic allows
 
-// GOOD - validate transformations
-debug_assert_eq!(input_batch.num_rows(), output_batch.num_rows(), "Row count mismatch after transform");
+// GOOD - validate transformations with runtime error handling
+ensure!(
+    input_batch.num_rows() == output_batch.num_rows(),
+    RowCountMismatchSnafu {
+        expected: input_batch.num_rows(),
+        actual: output_batch.num_rows(),
+    }
+);
 
 // GOOD - propagate error instead of panicking on NULL
 let value: i64 = row.get("amount").context(AmountNullSnafu)?; // Returns a structured error if NULL
