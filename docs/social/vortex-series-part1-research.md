@@ -47,6 +47,33 @@ For monotonic sequences like timestamps and auto-increment IDs, Vortex uses delt
 
 Vortex incorporates FSST (Fast Static Symbol Table) compression from the 2020 VLDB paper. FSST achieves near-LZ4 compression ratios with decompression speeds 5-10× faster—perfect for string columns in analytical queries.
 
+### FastLanes: High-Performance Integer Compression
+
+[FastLanes](https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf) (VLDB 2023) introduces a novel approach to integer compression that's hardware-friendly by design. The key insight: structure bit-packing operations to maximize SIMD utilization across different CPU architectures (AVX-512, AVX2, NEON). Vortex implements FastLanes for integer arrays, achieving near-memory-bandwidth decompression speeds. There's also [FastLanes on GPU](https://dbdbd2023.ugent.be/abstracts/felius_fastlanes.pdf) research extending this to GPU acceleration.
+
+### ALP: Adaptive Lossless Floating-Point Compression
+
+For floating-point data, Vortex uses [ALP (Adaptive Lossless floating-Point)](https://ir.cwi.nl/pub/33334/33334.pdf) compression from CWI Amsterdam. ALP exploits the observation that real-world floats often have limited precision (e.g., prices with 2 decimal places). It adaptively detects patterns and compresses accordingly. [G-ALP](https://dl.acm.org/doi/pdf/10.1145/3736227.3736242) extends this with GPU-optimized kernels.
+
+### Systems Research Influences
+
+Beyond encoding algorithms, Vortex draws from broader systems research:
+
+| Paper                                                                          | Contribution                                                             |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| **[Procella](https://dl.acm.org/citation.cfm?id=3360438)**                     | YouTube's unified data system—inspiration for handling diverse workloads |
+| **[MonetDB/X100](https://www.cidrdb.org/cidr2005/papers/P19.pdf)**             | Hyper-pipelining query execution, vectorized processing foundations      |
+| **[Morsel-Driven Parallelism](https://db.in.tum.de/~leis/papers/morsels.pdf)** | NUMA-aware query evaluation for modern many-core systems                 |
+| **[Anyblob](https://www.durner.dev/app/media/papers/anyblob-vldb23.pdf)**      | High-performance object storage access patterns                          |
+| **[ClickHouse](https://www.vldb.org/pvldb/vol17/p3731-schulze.pdf)**           | Practical lessons from production-scale analytics                        |
+
+### Vortex in Academic Research
+
+Vortex itself is now appearing in academic papers:
+
+- **[Anyblox](https://gienieczko.com/anyblox-paper)** — A Framework for Self-Decoding Datasets
+- **[F3](https://dl.acm.org/doi/pdf/10.1145/3749163)** — Open-Source Data File Format for the Future
+
 ## Why Research Matters for Production
 
 Academic research provides the theoretical foundations, but production systems need more:
@@ -68,51 +95,63 @@ When we chose Vortex as the storage layer for Cayenne (our data accelerator at S
 
 Here's the research lineage that powers Vortex:
 
-📄 BtrBlocks (SIGMOD 2023) - The core algorithm. Researchers at TUM showed that cascading multiple lightweight encodings outperforms monolithic compression. Key insight: optimize for decompression speed, not just compression ratio. Analytics queries spend most time reading, not writing.
+📄 BtrBlocks (SIGMOD 2023) - The core algorithm from TUM. Cascading multiple lightweight encodings outperforms monolithic compression. Key insight: optimize for decompression speed, not just compression ratio.
 
-📄 FSST (VLDB 2020) - Fast Static Symbol Table compression for strings. Achieves near-LZ4 ratios at 5-10× faster decompression. Critical for string-heavy analytical columns.
+📄 FastLanes (VLDB 2023) - Hardware-friendly integer compression. Structures bit-packing to maximize SIMD utilization across AVX-512, AVX2, and ARM NEON. Near-memory-bandwidth decompression.
 
-📄 Adaptive encoding selection - Rather than one-size-fits-all, sample the data and pick the optimal encoding per column. Dictionary for categories, delta for timestamps, RLE for sorted data, bit-packing for small integers.
+📄 FSST (VLDB 2020) - Fast Static Symbol Table for strings. Near-LZ4 ratios at 5-10× faster decompression. Critical for string-heavy analytical columns.
+
+📄 ALP (CWI Amsterdam) - Adaptive Lossless floating-Point compression. Exploits real-world float patterns (prices with 2 decimals, sensor readings with limited precision).
+
+📄 MonetDB/X100 + Morsel-Driven Parallelism - Foundations for vectorized, NUMA-aware query execution that Vortex builds on.
 
 The result? Compression that understands your data:
-• Timestamps compress via delta encoding to just 2-4 bits per value
-• Status codes become dictionary indices
-• Sorted columns collapse via run-length encoding
-• String columns get FSST treatment
+• Integers via FastLanes bit-packing
+• Floats via ALP adaptive encoding
+• Strings via FSST symbol tables
+• Timestamps via delta encoding
+• Sorted columns via run-length encoding
 
 Why does this matter for production systems?
 
 1️⃣ Query performance scales with decompression speed. Academic focus on decode performance translates directly to faster queries.
 
-2️⃣ Automatic encoding selection means zero configuration. The algorithm samples your data and picks optimal strategies—no manual tuning required.
+2️⃣ Automatic encoding selection means zero configuration. The algorithm samples your data and picks optimal strategies per column.
 
-3️⃣ SIMD acceleration is baked in. Modern research designs for vectorized execution from day one.
+3️⃣ SIMD acceleration is baked in. FastLanes was designed for vectorized execution from day one.
 
-4️⃣ Zero-copy Arrow access preserves the speed advantage. Data decompresses directly to Arrow arrays—no intermediate copies.
+4️⃣ Zero-copy Arrow access. Data decompresses directly to Arrow arrays—no intermediate copies.
 
-At Spice AI, we've seen this translate to real performance gains. Cayenne with Vortex consistently outperforms file-based DuckDB while using less memory and handling concurrent writes gracefully.
+Vortex is now an LF AI & Data project, and researchers are building on it (Anyblox, F3). The gap between academic research and production systems is narrowing.
 
-The gap between academic research and production systems is narrowing. Vortex represents the next generation of data formats where research-grade compression meets production-grade engineering.
-
-What's next? Research on learned compression, where ML models predict optimal encoding strategies based on data patterns. The future of data storage is adaptive, intelligent, and fast.
+What's next? GPU-accelerated decoding and learned compression. The future of data storage is adaptive, intelligent, and fast.
 
 ---
 
 ## X Post (280 characters)
 
-🔬 Vortex isn't just a file format—it's decades of DB research reaching production.
+🔬 Vortex = decades of DB research in production.
 
-BtrBlocks (SIGMOD '23) + FSST (VLDB '20) + adaptive encoding = compression that understands your data.
+BtrBlocks + FastLanes + FSST + ALP = type-aware compression.
 
-Result: faster queries, smaller files, zero config.
+Integers, floats, strings, timestamps—each gets optimal encoding. SIMD-accelerated decode. Zero-copy Arrow.
+
+100× faster random access vs Parquet.
 
 ---
 
 ## Reply with References
 
-References:
-• BtrBlocks paper (SIGMOD 2023): cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf
-• FSST paper (VLDB 2020): vldb.org/pvldb/vol13/p2649-boncz.pdf
+Research papers powering Vortex:
+• BtrBlocks (SIGMOD '23): cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf
+• FastLanes (VLDB '23): vldb.org/pvldb/vol16/p2132-afroozeh.pdf
+• FSST (VLDB '20): vldb.org/pvldb/vol13/p2649-boncz.pdf
+• ALP: ir.cwi.nl/pub/33334/33334.pdf
+• MonetDB/X100: cidrdb.org/cidr2005/papers/P19.pdf
+• Morsel-Driven Parallelism: db.in.tum.de/~leis/papers/morsels.pdf
+
+Project links:
 • Vortex GitHub: github.com/vortex-data/vortex
+• Vortex docs: docs.vortex.dev
+• Benchmarks: bench.vortex.dev
 • Cayenne docs: spiceai.org/docs/components/data-accelerators/cayenne
-• Our original deep-dive: [link to Vortex at Spice AI post]
