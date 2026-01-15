@@ -415,11 +415,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         }
 
         if acceleration.snapshots_reset_expiry_on_load
-            && engine != Engine::DuckDB
-            && matches!(
-                acceleration.refresh_mode,
-                Some(spicepod_acceleration::RefreshMode::Caching)
-            )
+            && (engine != Engine::DuckDB
+                || !matches!(
+                    acceleration.refresh_mode,
+                    Some(spicepod_acceleration::RefreshMode::Caching)
+                ))
         {
             tracing::warn!(
                 "Resetting expiry on load is only supported for DuckDB engine acceleration with caching refresh mode. Ignoring snapshots_reset_expiry_on_load."

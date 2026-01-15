@@ -15,37 +15,45 @@ limitations under the License.
 */
 
 use super::{CachingEngineSys, Error, Result};
+use datafusion_table_providers::duckdb::{DuckDB, RelationName, TableDefinition};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use std::sync::Arc;
 
 impl CachingEngineSys {
     pub(super) fn update_fetched_at_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
-        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
             .map_err(Error::external)?
             .get_underlying_conn_mut();
 
-        // Find all tables that start with __data_ prefix
-        let mut stmt = duckdb_conn
-            .prepare("SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_name LIKE '__data_%'")
+        let tx = duckdb_conn.transaction().map_err(Error::external)?;
+
+        // Create a TableDefinition from the dataset name to find internal tables
+        let table_definition = TableDefinition::new(
+            RelationName::new(&self.dataset_name),
+            Arc::new(arrow::datatypes::Schema::empty()), // Schema not needed for listing tables
+        );
+
+        let has_table = table_definition.has_table(&tx).map_err(Error::external)?;
+        let mut internal_tables = table_definition
+            .list_internal_tables(&tx)
             .map_err(Error::external)?;
 
-        let table_names: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .map_err(Error::external)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Error::external)?;
+        // Determine the actual table name (internal or direct)
+        let table_name = match (internal_tables.pop(), has_table) {
+            (Some((internal_name, _)), _) => internal_name.to_string(),
+            (None, true) => self.dataset_name.clone(),
+            (None, false) => return Ok(()), // No table exists yet
+        };
 
-        for table_name in table_names {
-            let update_query = format!(
-                "UPDATE \"{}\" SET fetched_at = (now() AT TIME ZONE 'UTC')::TIMESTAMP_NS",
-                table_name
-            );
-            duckdb_conn
-                .execute(&update_query, [])
-                .map_err(Error::external)?;
-        }
+        // Update fetched_at for the table
+        let update_query = format!(
+            "UPDATE \"{}\" SET fetched_at = (now() AT TIME ZONE 'UTC')::TIMESTAMP_NS",
+            table_name
+        );
+        tx.execute(&update_query, []).map_err(Error::external)?;
 
+        tx.commit().map_err(Error::external)?;
         Ok(())
     }
 }
