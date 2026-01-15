@@ -17,6 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::dataaccelerator::BootstrapStatus;
+use crate::dataaccelerator::spice_sys::OpenOption;
+use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
@@ -906,7 +908,7 @@ impl Runtime {
                             update_cached_dataset_timestamps(ds.as_ref()).await;
                         }
                         (ds.name.clone(), Ok(bootstrap_status))
-                    },
+                    }
                     Err(err) => {
                         let ds_name = &ds.name;
                         status.update_dataset(ds_name, status::ComponentStatus::Error);
@@ -1002,12 +1004,7 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         return;
     }
 
-    match crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys::try_new(
-        dataset,
-        crate::dataaccelerator::spice_sys::OpenOption::OpenExisting,
-    )
-    .await
-    {
+    match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
         Ok(caching_sys) => {
             if let Err(e) = caching_sys.update_fetched_at() {
                 tracing::warn!(
