@@ -961,7 +961,7 @@ impl CacheRefreshHelper {
                         let dataset_name_clone = dataset_name.to_string();
                         let accelerator_write_mutex_clone = Arc::clone(accelerator_write_mutex);
                         let in_flight_clone = Arc::clone(in_flight_revalidations);
-                        let filters_clone: Vec<Expr> = filters.to_vec();
+                        let filters_for_refresh: Vec<Expr> = filters.to_vec();
 
                         io_runtime.spawn(async move {
                             tracing::debug!(
@@ -971,7 +971,7 @@ impl CacheRefreshHelper {
                                 federated_clone,
                                 accelerator_clone,
                                 &dataset_name_clone,
-                                &filters_clone,
+                                &filters_for_refresh,
                                 accelerator_write_mutex_clone,
                             )
                             .await;
@@ -1372,7 +1372,11 @@ mod tests {
 
             // Return the configured data
             Ok(Arc::new(DataSourceExec::new(Arc::new(
-                MemorySourceConfig::try_new(&[self.data.clone()], Arc::clone(&self.schema), None)?,
+                MemorySourceConfig::try_new(
+                    std::slice::from_ref(&self.data),
+                    Arc::clone(&self.schema),
+                    None,
+                )?,
             ))))
         }
     }
