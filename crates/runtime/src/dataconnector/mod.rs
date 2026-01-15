@@ -159,8 +159,7 @@ pub mod memory;
 pub mod mongodb;
 #[cfg(feature = "mssql")]
 pub mod mssql;
-#[cfg(feature = "mysql")]
-pub mod mysql;
+
 #[cfg(feature = "nfs")]
 pub mod nfs;
 #[cfg(feature = "odbc")]

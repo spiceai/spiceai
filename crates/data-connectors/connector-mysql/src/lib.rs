@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,12 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::ComponentType;
-use crate::component::dataset::Dataset;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
-use crate::register_data_connector;
 use async_trait::async_trait;
-use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
@@ -29,17 +24,21 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use mysql_async::Metrics;
 use opentelemetry::KeyValue;
+use runtime::component::ComponentType;
+use runtime::component::dataset::Dataset;
+use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
+use runtime::parameters::ParameterSpec;
+use runtime::register_data_connector;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec,
-};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -112,7 +111,7 @@ impl DataConnectorFactory for MySQLFactory {
     fn create(
         &self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool_min = params
                 .parameters
@@ -235,18 +234,20 @@ impl DataConnector for MySQL {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let tbl = dataset
             .parse_path(true, Some(&MySqlDialect {}))
             .boxed()
-            .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+            .map_err(|e| DataConnectorError::InvalidConfiguration {
                 dataconnector: "mysql".to_string(),
                 source: e,
                 message: format!("The specified table name in dataset path is invalid '{}'.\nEnsure the table name uses valid characters for a MySQL table name and try again.", dataset.path()),
                 connector_component: ConnectorComponent::from(dataset),
             })?;
 
-        match Read::table_provider(&self.mysql_factory, tbl).await {
+        // Call the inherent method directly instead of using Read trait
+        // (orphan rule prevents trait impl in external crate)
+        match self.mysql_factory.table_provider(tbl).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(err_source) = e.source()
@@ -262,11 +263,11 @@ impl DataConnector for MySQL {
                     });
                 }
 
-                return Err(DataConnectorError::UnableToGetReadProvider {
+                Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "mysql".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: e,
-                });
+                })
             }
         }
     }

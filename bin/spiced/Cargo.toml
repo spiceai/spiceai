@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
+connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 event_stream = { path = "../../crates/event_stream" }
 repl = { path = "../../crates/repl" }
@@ -102,7 +103,7 @@ metal = ["runtime/metal"]
 models = ["runtime/models"]
 mongodb = ["runtime/mongodb"]
 mssql = ["runtime/mssql"]
-mysql = ["runtime/mysql"]
+mysql = ["connector-mysql", "runtime/mysql"]
 nfs = ["runtime/nfs"]
 odbc = ["runtime/odbc"]
 oracle = ["runtime/oracle"]

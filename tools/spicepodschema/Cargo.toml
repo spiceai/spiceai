@@ -46,4 +46,8 @@ runtime = { path = "../../crates/runtime", features = [
     "models",
 ] }
 
+# Extracted connector crates (for linkme registration)
+connector-mysql = { path = "../../crates/data-connectors/connector-mysql" }
+connector-postgres = { path = "../../crates/data-connectors/connector-postgres" }
+
 runtime-parameters = { path = "../../crates/runtime-parameters" }

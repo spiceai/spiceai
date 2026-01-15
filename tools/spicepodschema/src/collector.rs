@@ -30,6 +30,7 @@ use runtime_parameters::ParameterSpec;
 // Force linkage of all data connector modules by referencing their factory types.
 // Without these references, the linker may not include the modules and their
 // `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
+use connector_mysql as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::abfs as _;
 #[expect(unused_imports)]
@@ -76,14 +77,11 @@ use runtime::dataconnector::memory as _;
 use runtime::dataconnector::mongodb as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::mssql as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::mysql as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
+use connector_postgres as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::oracle as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::postgres as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::s3 as _;
 #[expect(unused_imports)]
