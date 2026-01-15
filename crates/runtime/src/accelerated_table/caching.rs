@@ -89,6 +89,12 @@ fn check_cache_freshness(
     max_age: Duration,
     stale_while_revalidate: Option<Duration>,
 ) -> DataFusionResult<CacheFreshness> {
+    tracing::trace!(
+        "check_cache_freshness CALLED: num_batches={}, max_age={:?}, swr={:?}",
+        batches.len(),
+        max_age,
+        stale_while_revalidate
+    );
     if batches.is_empty() {
         return Ok(CacheFreshness::Fresh); // No data means nothing to check
     }
@@ -97,6 +103,10 @@ fn check_cache_freshness(
     let schema = batches[0].schema();
     if schema.column_with_name(CACHE_REFRESHED_AT_COLUMN).is_none() {
         // No metadata column means data was never refreshed in cache mode - treat as expired
+        tracing::debug!(
+            "check_cache_freshness: no {} column, returning Expired",
+            CACHE_REFRESHED_AT_COLUMN
+        );
         return Ok(CacheFreshness::Expired);
     }
 
@@ -142,6 +152,9 @@ fn check_cache_freshness(
         for i in 0..ts_array.len() {
             if !ts_array.is_valid(i) {
                 // Null value = expired, return immediately (can't get worse)
+                tracing::debug!(
+                    "check_cache_freshness: NULL timestamp at index {i}, returning Expired"
+                );
                 return Ok(CacheFreshness::Expired);
             }
             let ts = ts_array.value(i);
@@ -1228,9 +1241,10 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 // Check if data is expired (past max_age + stale_while_revalidate)
                 // If expired, treat as cache miss with is_expired=true (will upsert)
                 if let Some(max_age) = max_age {
-                    let freshness =
-                        check_cache_freshness(&cached_batches, max_age, stale_while_revalidate)
-                            .unwrap_or(CacheFreshness::Expired);
+                    let freshness = check_cache_freshness(&cached_batches, max_age, stale_while_revalidate).unwrap_or_else(|e| {
+                        tracing::warn!("Failed to check cache data freshness for dataset={dataset_name}: {e}, treating as Expired");
+                        CacheFreshness::Expired
+                    });
 
                     if freshness == CacheFreshness::Expired {
                         tracing::debug!(
@@ -2037,6 +2051,59 @@ mod tests {
             filter_sets.len(),
             2,
             "Should deduplicate 5 identical rows + 1 different row into 2 filter sets"
+        );
+    }
+
+    #[test]
+    fn test_check_cache_freshness_without_fetched_at_column() {
+        // Test that batches without fetched_at column are treated as expired
+        let schema = create_test_schema_without_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1, 2]);
+        let name_array = StringArray::from(vec![Some("Alice"), Some("Bob")]);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .expect("Failed to create batch");
+
+        let max_age = Duration::from_secs(60);
+        let freshness =
+            check_cache_freshness(&[batch], max_age, None).expect("Should check freshness");
+
+        assert_eq!(
+            freshness,
+            CacheFreshness::Expired,
+            "Batches without fetched_at column should be expired"
+        );
+    }
+
+    #[test]
+    fn test_check_cache_freshness_with_null_timestamp() {
+        // Test that batches with NULL fetched_at are treated as expired
+        let schema = create_test_schema_with_refresh_timestamp();
+        let id_array = Int32Array::from(vec![1]);
+        let name_array = StringArray::from(vec![Some("Alice")]);
+        let refresh_timestamps = TimestampNanosecondArray::from(vec![None]); // NULL timestamp
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(refresh_timestamps),
+            ],
+        )
+        .expect("Failed to create batch");
+
+        let max_age = Duration::from_secs(60);
+        let freshness =
+            check_cache_freshness(&[batch], max_age, None).expect("Should check freshness");
+
+        assert_eq!(
+            freshness,
+            CacheFreshness::Expired,
+            "Batches with NULL fetched_at should be expired"
         );
     }
 
