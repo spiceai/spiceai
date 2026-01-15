@@ -52,7 +52,7 @@ use snafu::{OptionExt, prelude::*};
 use tokio::{fs::create_dir_all, sync::Mutex};
 
 use super::{
-    AccelerationSource, DataAccelerator,
+    AccelerationSource, BootstrapStatus, DataAccelerator,
     duckdb::{DuckDBAccelerator, create_table_provider, settings::OrderByNonIntegerLiteral},
 };
 use crate::{
@@ -269,14 +269,14 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(acceleration_settings) = source.acceleration() {
             ensure!(
                 matches!(acceleration_settings.mode, Mode::File),
                 FileModeOnlySnafu
             );
         }
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     async fn create_external_table(

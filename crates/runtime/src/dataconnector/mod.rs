@@ -44,7 +44,7 @@ use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use linkme::distributed_slice;
-use parameters::ConnectorParams;
+pub use parameters::ConnectorParams;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;

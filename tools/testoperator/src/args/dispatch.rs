@@ -288,6 +288,10 @@ pub struct TextToSqlArgs {
     /// Unique name for the configured testoperator run. Used to identify/group runs in telemetry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configuration_name: Option<String>,
+
+    /// Include evidence in the question for bird-bench querysets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_evidence: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

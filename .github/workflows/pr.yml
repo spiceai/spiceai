@@ -43,7 +43,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a success when skipped).
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -88,9 +88,8 @@ jobs:
       - name: Install golangci-lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          if ! command -v golangci-lint &> /dev/null ; then
-            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
-          fi
+          # Install golangci-lint v2.8.0+ which supports Go 1.25
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.8.0
 
       - name: Install make
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -128,18 +127,8 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
 
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
-
       - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -183,7 +172,7 @@ jobs:
     runs-on: spiceai-dev-runners
     needs: [check_changes, lint-go, lint-rust]
     env:
-      GOVER: 1.25.3
+      GOVER: 1.25.5
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -270,7 +259,7 @@ jobs:
         run: cargo build -p testoperator --all-features
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated

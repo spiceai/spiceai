@@ -4,8 +4,31 @@ description: 'composite action'
 runs:
   using: 'composite'
   steps:
-    - name: Install cc
+    - name: Install cc (Linux)
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential cmake pkg-config libssl-dev unixodbc unixodbc-dev protobuf-compiler libclang-dev libnfs-dev
+
+    - name: Install cc (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install cmake pkg-config openssl unixodbc protobuf llvm libnfs
+
+    - name: Install cc (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # Install Visual Studio Build Tools if not present (handled by setup-vs-buildtools action)
+        # Install additional dependencies via choco
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+        }
+        choco install cmake pkgconfiglite protoc llvm -y
+        echo "C:\Program Files\CMake\bin" >> $env:GITHUB_PATH
+        echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH

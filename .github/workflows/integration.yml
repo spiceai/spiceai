@@ -44,7 +44,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a success when skipped).
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -89,19 +89,8 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      - name: Check if sccache can be set up
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
-
       - name: Set up sccache
-        if: ${{ env.SCCACHE_SETUP == 'true' && needs.check_changes.outputs.relevant_changes == 'true' }}
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -114,10 +103,10 @@ jobs:
       - name: Build integration test archives
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: sccache
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          CARGO_INCREMENTAL: 0
         run: |
           set -euo pipefail
 
