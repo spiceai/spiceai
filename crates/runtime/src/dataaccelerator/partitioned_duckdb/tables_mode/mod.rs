@@ -51,6 +51,7 @@ use runtime_table_partition::{
 };
 use snafu::{OptionExt, prelude::*};
 
+use crate::dataaccelerator::BootstrapStatus;
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
@@ -143,7 +144,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(acceleration_settings) = source.acceleration() {
             ensure!(
                 matches!(acceleration_settings.mode, Mode::File),
@@ -176,7 +177,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
             }
             self.get_shared_pool(source).await?;
         }
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     async fn create_external_table(

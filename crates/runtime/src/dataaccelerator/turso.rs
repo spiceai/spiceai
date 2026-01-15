@@ -62,7 +62,7 @@ use crate::{
     register_data_accelerator, spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -441,7 +441,7 @@ impl DataAccelerator for TursoAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         // Reject remote database configurations (not supported as accelerators)
         // Note: This is an accelerator-specific limitation. Remote databases will be
         // supported when Turso is used as a data connector.
@@ -459,7 +459,7 @@ impl DataAccelerator for TursoAccelerator {
             // Initialize the shared pool to verify connectivity
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         // Handle file mode: validate path and setup file-based database
@@ -498,7 +498,7 @@ impl DataAccelerator for TursoAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(
+            let was_bootstrapped = download_snapshot_if_needed(
                 acceleration,
                 source,
                 PathBuf::from(path),
@@ -509,9 +509,11 @@ impl DataAccelerator for TursoAccelerator {
             // Initialize the database file using the shared pool
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
+
+            return Ok(was_bootstrapped);
         }
 
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
