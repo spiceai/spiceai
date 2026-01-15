@@ -68,6 +68,11 @@ last_sql AS (
       AND task = 'sql_query'
     ORDER BY end_time DESC
     LIMIT 1
+),
+trace_check AS (
+    SELECT COUNT(*) > 0 AS trace_exists
+    FROM runtime.task_history
+    WHERE trace_id = '{trace_id}'
 )
 SELECT
     COALESCE(s.sql_count, 0) AS sql_count,
@@ -80,8 +85,11 @@ SELECT
 FROM sql_stats s
 LEFT JOIN last_sql ls ON 1=1
 LEFT JOIN llm_stats l ON 1=1
+CROSS JOIN trace_check tc
+WHERE tc.trace_exists = true
 "
     );
+
     let data = retry_query_expecting_results(spice_client, &query, Duration::from_secs(15)).await;
 
     let Some(rb) = data.as_ref().and_then(|s| s.first()) else {

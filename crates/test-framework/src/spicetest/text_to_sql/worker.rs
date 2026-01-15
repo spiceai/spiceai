@@ -116,7 +116,6 @@ impl TextToSqlWorker {
     pub fn start(self) -> JoinHandle<Result<TextToSqlWorkerResult>> {
         tokio::spawn(async move {
             let mut results: BTreeMap<String, TextToSqlMetric> = BTreeMap::new();
-            let mut processed_count = 0usize;
 
             while let Ok(request) = self.request_rx.recv().await {
                 let start = Instant::now();
@@ -201,26 +200,16 @@ impl TextToSqlWorker {
                         request.sample_data_enabled,
                         request.return_sql,
                         &task_history_metrics,
-                        generated_schema
-                            .map(|s| u8::from(s == expected_schema))
-                            .unwrap_or_default()
-                            .into(),
+                        if generated_schema.is_some_and(|s| s == expected_schema) {
+                            1.0
+                        } else {
+                            0.0
+                        },
                     )?,
                 );
-
-                processed_count += 1;
-                if processed_count.is_multiple_of(10) {
-                    println!(
-                        "[TextToSqlWorker-{}]: processed {processed_count} requests",
-                        self.id
-                    );
-                }
             }
 
-            println!(
-                "[TextToSqlWorker-{}]: DONE, {processed_count} completed",
-                self.id
-            );
+            println!("[TextToSqlWorker-{}]: DONE", self.id);
 
             Ok(TextToSqlWorkerResult { results })
         })
