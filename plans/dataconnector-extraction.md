@@ -124,27 +124,36 @@ if let cdc::StreamError::Kafka(KafkaError::...) = err { ... }
 if let cdc::StreamError::Kafka(KafkaError::...) = err { ... }
 ```
 
-### Phase 3: Move `data_components/{name}` into Connector Crates
+### Phase 3: Minimize `data_components/{name}` Modules
 
-For each connector, move its `data_components` module into the connector crate:
+Due to the orphan rule, trait implementations for external types MUST stay in `data_components`. 
+However, we can minimize these modules to just the bare minimum:
 
+```rust
+// data_components/src/postgres.rs (MINIMAL - just trait impls)
+#[async_trait]
+impl Read for PostgresTableFactory {
+    async fn table_provider(&self, table_reference: TableReference) -> ... {
+        self.table_provider(table_reference).await  // delegates to inherent method
+    }
+}
+
+#[async_trait]
+impl DeletionTableProvider for PostgresTableWriter {
+    // Deletion logic stays here
+}
 ```
-# Before
-data_components/src/postgres/mod.rs  → table factory, connection logic
-connector-postgres/src/lib.rs        → DataConnector impl
 
-# After  
-connector-postgres/src/lib.rs        → DataConnector impl
-connector-postgres/src/factory.rs    → table factory (moved from data_components)
-connector-postgres/src/connection.rs → connection logic (moved from data_components)
-```
+The bulk of connector logic lives in `connector-{name}` crate. The `data_components` module only contains trait implementations that can't be moved.
 
-### Phase 4: Remove Connector Features from `data_components`
+### Phase 4: Keep Lean `data_components` Trait Modules
 
-Once all connector-specific code is moved out:
-1. Remove feature flags from `data_components/Cargo.toml`
-2. Remove connector modules from `data_components/src/lib.rs`
-3. `data_components` becomes a lean crate with only shared types
+The connector-specific modules in `data_components` remain but are minimal (just trait impls).
+These modules still require feature flags because they depend on `datafusion-table-providers/{name}`.
+
+**End state for `data_components`:**
+- Shared types: `cdc`, `delete`, `poly`, `Read`, `ReadWrite`, etc. (no feature flags)
+- Connector trait modules: `postgres`, `mysql`, etc. (feature-gated, minimal - just trait impls)
 
 ### Phase 5: Remove `runtime/{name}` Features
 
@@ -172,7 +181,9 @@ Remove all connector-specific features from `runtime/Cargo.toml`.
 4. Updated `spiced` to depend on `connector-postgres` when postgres feature enabled
 5. Made `ConnectorParams` fields public for external connector access
 
-**Note**: Still requires `runtime/postgres` feature temporarily. The `data_components/postgres` module has not yet been moved into the connector crate.
+**Key Design Decision**: The connector calls `PostgresTableFactory` methods directly (e.g., `self.postgres_factory.table_provider(...)`) rather than going through the `Read`/`ReadWrite` traits. This avoids the orphan rule constraint.
+
+**Note**: The `data_components/postgres` module CANNOT be fully moved into the connector crate due to the Rust orphan rule (see below). It stays in `data_components` with just the trait implementations.
 
 ### ✅ MySQL Connector Extracted
 
@@ -216,7 +227,32 @@ Remove all connector-specific features from `runtime/Cargo.toml`.
 
 ## Blocking Issues
 
-### Issue 1: Connector-Specific Error Handling in Runtime
+### Issue 1: Rust Orphan Rule (CRITICAL CONSTRAINT)
+
+**Problem**: The `DeletionTableProvider`, `Read`, and `ReadWrite` traits are defined in `data_components`, but the types they're implemented for (e.g., `PostgresTableFactory`, `PostgresTableWriter`) are defined in `datafusion-table-providers`. 
+
+Due to Rust's orphan rule, trait implementations can only exist in crates that define either:
+- The trait itself, OR
+- The type it's implemented for
+
+**Consequence**: The trait implementations in `data_components/{connector}.rs` **MUST stay in `data_components`**. They cannot be moved to connector crates.
+
+**Workaround Applied**: In connector crates, call the underlying inherent methods directly instead of using the traits:
+
+```rust
+// Instead of this (requires trait impl):
+match Read::table_provider(&self.postgres_factory, path).await { ... }
+
+// Do this (calls inherent method directly):
+match self.postgres_factory.table_provider(path).await { ... }
+```
+
+**Long-term Solutions**:
+1. Move traits to a separate `connector-traits` crate that `datafusion-table-providers` can depend on
+2. Use newtype wrappers in connector crates (adds complexity)
+3. Keep thin trait impl modules in `data_components` (current approach)
+
+### Issue 2: Connector-Specific Error Handling in Runtime
 
 **File**: `crates/runtime/src/accelerated_table/refresh_task/changes.rs`
 
@@ -332,15 +368,17 @@ description = "{Name} data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
-# Temporary: still use data_components until Phase 3
-data_components = { path = "../../data_components", features = ["{name}"] }
 datafusion.workspace = true
-datafusion-table-providers = { workspace = true, features = ["{name}"] }
+datafusion-table-providers = { workspace = true, features = ["{name}", "{name}-federation"] }
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true
+
+# NOTE: data_components is NOT needed here!
+# The connector calls table factory methods directly, not through Read/ReadWrite traits.
+# Trait implementations stay in data_components/{name}.rs due to orphan rule.
 
 [features]
 default = []

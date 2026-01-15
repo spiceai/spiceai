@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
+connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 event_stream = { path = "../../crates/event_stream" }
 repl = { path = "../../crates/repl" }
 futures.workspace = true
@@ -106,7 +107,7 @@ nfs = ["runtime/nfs"]
 odbc = ["runtime/odbc"]
 oracle = ["runtime/oracle"]
 pingora = ["runtime/pingora"]
-postgres = ["runtime/postgres"]
+postgres = ["connector-postgres", "runtime/postgres"]
 postgres-accel = ["runtime/postgres-accel"]
 postgres-write = ["runtime/postgres-write"]
 release = []

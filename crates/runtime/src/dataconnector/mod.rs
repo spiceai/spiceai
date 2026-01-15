@@ -175,8 +175,6 @@ pub mod iceberg;
 #[cfg(feature = "imap")]
 pub mod imap;
 pub mod parameters;
-#[cfg(feature = "postgres")]
-pub mod postgres;
 pub mod s3;
 #[cfg(feature = "scylladb")]
 pub mod scylladb;

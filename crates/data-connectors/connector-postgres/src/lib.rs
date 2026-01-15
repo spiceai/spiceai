@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,11 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, register_data_connector};
+//! `PostgreSQL` data connector for Spice.ai runtime.
+//!
+//! This crate provides the `PostgreSQL` connector implementation, allowing
+//! Spice.ai to connect to `PostgreSQL` databases as data sources.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds - changes to this connector only require rebuilding
+//! this crate, not the entire runtime.
+
 use async_trait::async_trait;
-use data_components::Read;
-#[cfg(feature = "postgres-write")]
-use data_components::ReadWrite;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
@@ -26,6 +31,13 @@ use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError,
     postgrespool::{self, PostgresConnectionPool},
 };
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
+use runtime::parameters::ParameterSpec;
+use runtime::register_data_connector;
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;
@@ -33,17 +45,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec,
-};
-
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
     UnableToCreatePostgresConnectionPool { source: DbConnectionPoolError },
 }
 
+/// `PostgreSQL` data connector.
 pub struct Postgres {
     postgres_factory: PostgresTableFactory,
 }
@@ -54,6 +62,7 @@ impl std::fmt::Debug for Postgres {
     }
 }
 
+/// Factory for creating `PostgreSQL` connector instances.
 #[derive(Default, Copy, Clone)]
 pub struct PostgresFactory {}
 
@@ -94,7 +103,7 @@ impl DataConnectorFactory for PostgresFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let mut param_map = params.parameters.to_secret_map();
 
@@ -168,8 +177,12 @@ impl DataConnector for Postgres {
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        match ReadWrite::table_provider(&self.postgres_factory, dataset.path().into()).await {
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
+        match self
+            .postgres_factory
+            .read_write_table_provider(dataset.path().into())
+            .await
+        {
             Ok(provider) => Some(Ok(provider)),
             Err(e) => {
                 if let Some(err_source) = e.source() {
@@ -199,11 +212,11 @@ impl DataConnector for Postgres {
                     }
                 }
 
-                return Some(Err(DataConnectorError::UnableToGetReadProvider {
+                Some(Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "postgres".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: e,
-                }));
+                }))
             }
         }
     }
@@ -211,8 +224,12 @@ impl DataConnector for Postgres {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        match Read::table_provider(&self.postgres_factory, dataset.path().into()).await {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        match self
+            .postgres_factory
+            .table_provider(dataset.path().into())
+            .await
+        {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(err_source) = e.source() {
@@ -242,11 +259,11 @@ impl DataConnector for Postgres {
                     }
                 }
 
-                return Err(DataConnectorError::UnableToGetReadProvider {
+                Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "postgres".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: e,
-                });
+                })
             }
         }
     }

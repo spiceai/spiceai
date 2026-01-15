@@ -3746,6 +3746,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
+name = "connector-postgres"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+]
+
+[[package]]
 name = "console"
 version = "0.15.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16512,6 +16526,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "app",
  "clap 4.5.54",
+ "connector-postgres",
  "event_stream",
  "futures",
  "mimalloc",
