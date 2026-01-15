@@ -242,4 +242,165 @@ mod tests {
             .expect("Failed to get last checkpoint time");
         assert!(checkpoint_time.is_some());
     }
+
+    #[test]
+    fn test_cayenne_init_creates_directories() {
+        let temp = TempDir::new().expect("Failed to create temp dir");
+        let metadata_path = temp.path().join("new_metadata");
+        let data_path = temp.path().join("new_data");
+
+        // Directories don't exist yet
+        assert!(!metadata_path.exists());
+        assert!(!data_path.exists());
+
+        // Init should create them
+        DatasetCheckpoint::init_cayenne(&metadata_path, &data_path)
+            .expect("Failed to init cayenne");
+
+        assert!(metadata_path.exists());
+        assert!(data_path.exists());
+    }
+
+    #[test]
+    fn test_cayenne_exists_nonexistent_path() {
+        let temp = TempDir::new().expect("Failed to create temp dir");
+        let nonexistent_path = temp.path().join("does_not_exist");
+
+        // Should return false for non-existent path
+        let result = DatasetCheckpoint::exists_cayenne(&nonexistent_path)
+            .expect("Failed to check existence");
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_cayenne_get_schema_no_file() {
+        let temp = TempDir::new().expect("Failed to create temp dir");
+
+        // No schema file exists
+        let result = DatasetCheckpoint::get_schema_cayenne(temp.path())
+            .expect("Failed to get schema");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_cayenne_last_checkpoint_time_nonexistent_path() {
+        let temp = TempDir::new().expect("Failed to create temp dir");
+        let nonexistent_path = temp.path().join("does_not_exist");
+
+        // Should return None for non-existent path
+        let result = DatasetCheckpoint::last_checkpoint_time_cayenne(&nonexistent_path)
+            .expect("Failed to get checkpoint time");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_cayenne_checkpoint_creates_timestamp_file() {
+        let (_checkpoint, metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let schema_ref = Arc::new(schema);
+
+        DatasetCheckpoint::checkpoint_cayenne(metadata_dir.path(), data_dir.path(), &schema_ref)
+            .expect("Failed to checkpoint");
+
+        // Verify timestamp file was created
+        let timestamp_file = metadata_dir.path().join("checkpoint_timestamp");
+        assert!(timestamp_file.exists());
+
+        // Verify timestamp is a valid number
+        let timestamp_content = std::fs::read_to_string(&timestamp_file)
+            .expect("Failed to read timestamp file");
+        let _timestamp: u128 = timestamp_content
+            .parse()
+            .expect("Timestamp should be a valid number");
+    }
+
+    #[test]
+    fn test_cayenne_schema_complex_types() {
+        let (_checkpoint, metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+
+        // Create a schema with various complex types
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("is_active", DataType::Boolean, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(
+                    datafusion::arrow::datatypes::TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                ),
+                true,
+            ),
+            Field::new("data", DataType::Binary, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]);
+        let schema_ref = Arc::new(schema.clone());
+
+        // Save the schema
+        DatasetCheckpoint::checkpoint_cayenne(metadata_dir.path(), data_dir.path(), &schema_ref)
+            .expect("Failed to checkpoint");
+
+        // Retrieve and verify
+        let retrieved_schema = DatasetCheckpoint::get_schema_cayenne(metadata_dir.path())
+            .expect("Failed to get schema")
+            .expect("Schema should exist");
+
+        assert_eq!(&schema, retrieved_schema.as_ref());
+    }
+
+    #[test]
+    fn test_cayenne_checkpoint_nested_directories() {
+        let (_checkpoint, _metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+
+        // Create nested directory structure
+        let nested_dir = data_dir.path().join("subdir1/subdir2/subdir3");
+        std::fs::create_dir_all(&nested_dir).expect("Failed to create nested dirs");
+        std::fs::write(nested_dir.join("deep_file.vortex"), b"deep data")
+            .expect("Failed to write deep file");
+
+        // Should still detect as existing
+        assert!(
+            DatasetCheckpoint::exists_cayenne(data_dir.path())
+                .expect("Failed to check if checkpoint exists")
+        );
+
+        // Last checkpoint time should find the nested file
+        let checkpoint_time = DatasetCheckpoint::last_checkpoint_time_cayenne(data_dir.path())
+            .expect("Failed to get last checkpoint time");
+        assert!(checkpoint_time.is_some());
+    }
+
+    #[test]
+    fn test_cayenne_last_checkpoint_time_finds_most_recent() {
+        let (_checkpoint, _metadata_dir, data_dir) = create_test_cayenne_checkpoint();
+
+        // Create multiple files at different times
+        std::fs::write(data_dir.path().join("file1.vortex"), b"data1")
+            .expect("Failed to write file1");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(data_dir.path().join("file2.vortex"), b"data2")
+            .expect("Failed to write file2");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(data_dir.path().join("file3.vortex"), b"data3")
+            .expect("Failed to write file3");
+
+        let checkpoint_time = DatasetCheckpoint::last_checkpoint_time_cayenne(data_dir.path())
+            .expect("Failed to get last checkpoint time")
+            .expect("Should have checkpoint time");
+
+        // Get the modification time of the most recent file
+        let file3_modified = std::fs::metadata(data_dir.path().join("file3.vortex"))
+            .expect("Failed to get metadata")
+            .modified()
+            .expect("Failed to get modified time");
+
+        // The checkpoint time should be the modification time of file3
+        assert_eq!(checkpoint_time, file3_modified);
+    }
 }

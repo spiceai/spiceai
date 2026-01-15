@@ -49,6 +49,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
 mod behavior;
+pub mod directory_archive;
 mod engine;
 pub mod metrics;
 pub use behavior::SnapshotBehavior;
