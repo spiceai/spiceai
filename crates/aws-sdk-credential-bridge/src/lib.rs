@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn test_get_bucket_name_invalid() {
         let url = Url::parse("s3:///path/to/file").expect("Failed to parse URL");
-        assert!(get_bucket_name(&url).is_err());
+        get_bucket_name(&url).expect_err("Should fail to get bucket name");
     }
 
     // Tests for determine_s3_credential_config

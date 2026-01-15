@@ -589,7 +589,7 @@ pub struct RuntimeDeserializer {
     pub metrics: Option<Metrics>,
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 impl TryFrom<RuntimeDeserializer> for Runtime {
     type Error = String;
 
@@ -651,7 +651,6 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use serde_yaml;

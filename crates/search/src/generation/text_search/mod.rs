@@ -211,7 +211,7 @@ impl FullTextSearchFieldIndex {
             if !cols.contains(pk) {
                 return Err(Error::TextSearchIndexMissingColummn {
                     missing: pk.clone(),
-                    index_columns: cols.clone(),
+                    index_columns: cols,
                 });
             }
         }

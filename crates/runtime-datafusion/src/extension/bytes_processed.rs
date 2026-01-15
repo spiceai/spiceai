@@ -327,7 +327,7 @@ impl ExecutionPlan for BytesProcessedExec {
     }
 
     fn statistics(&self) -> Result<Statistics> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         self.input_exec.statistics()
     }
 
@@ -410,7 +410,7 @@ mod tests {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_preserve_order_pushdown() -> Result<()> {
         let ctx = SessionContext::new();

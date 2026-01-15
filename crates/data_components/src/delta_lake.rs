@@ -231,7 +231,7 @@ impl DeltaTable {
         Schema::new(fields)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn create_parquet_exec(
         &self,
         projection: Option<&Vec<usize>>,
@@ -303,7 +303,7 @@ fn ensure_folder_location(table_location: String) -> String {
     }
 }
 
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_wrap)]
 fn map_delta_data_type_to_arrow_data_type(
     delta_data_type: &delta_kernel::schema::DataType,
 ) -> DataType {
@@ -389,7 +389,7 @@ impl TableProvider for DeltaTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -645,9 +645,8 @@ struct PartitionFileContext {
     _transform: Option<ExpressionRef>,
 }
 
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::needless_pass_by_value)]
+#[expect(clippy::cast_sign_loss)]
 fn handle_scan_file(
     scan_context: &mut ScanContext,
     path: &str,
@@ -750,8 +749,8 @@ fn get_full_selection_vector(selection_vector: &[bool], total_rows: usize) -> Ve
     new_selection_vector
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_sign_loss)]
 async fn get_parquet_access_plan(
     parquet_file_reader_factory: &Arc<dyn ParquetFileReaderFactory>,
     partitioned_file: &PartitionedFile,
@@ -801,8 +800,7 @@ async fn get_parquet_access_plan(
 }
 
 /// Convert a `DataFusion` filter expression to a `delta_kernel` expression
-#[allow(clippy::too_many_lines)]
-#[allow(
+#[expect(
     deprecated,
     reason = "Needed to exhaustively match on all expression types"
 )]
@@ -928,8 +926,8 @@ fn to_delta_kernel_binary_expression(
     }
 }
 
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::cast_sign_loss)]
+#[expect(clippy::too_many_lines)]
 fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
     match scalar {
         ScalarValue::Int8(Some(v)) => Some(Scalar::Byte(v)),
@@ -1104,8 +1102,8 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::similar_names)]
     fn test_to_delta_kernel_expr() {
         // Test basic column reference
         let col_expr = col("name");
@@ -1255,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn test_to_delta_kernel_scalar() {
         // Test string scalar
         let scalar = ScalarValue::Utf8(Some("test".to_string()));

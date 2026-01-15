@@ -226,7 +226,7 @@ impl Chat for Databricks {
     }
 
     /// [`Databricks`] doesn't support `max_completion_tokens`. Must define own health function.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn health(&self) -> super::chat::Result<()> {
         if matches!(self.health_check, HealthCheck::Skip) {
             return Ok(());

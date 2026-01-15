@@ -244,6 +244,9 @@ async fn write_record_batches(
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<PutResult>, FlightError> {
     let flight_descriptor = FlightDescriptor::new_path(vec!["my_table".to_string()]);
+
+    // collecting avoids a lifetime issue with the stream sending between threads
+    #[expect(clippy::needless_collect)]
     let flight_data_stream = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(flight_descriptor))
         .build(futures::stream::iter(

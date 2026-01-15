@@ -659,7 +659,7 @@ impl SnapshotManager {
     ///
     /// - If the local acceleration file cannot be opened or read.
     /// - If communicating with the backing object store fails at any stage of the upload.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub async fn create_snapshot(
         &self,
         schema: &SchemaRef,
@@ -1305,7 +1305,7 @@ impl SnapshotManager {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn download_snapshot_entry(
         &self,
         entry: &SnapshotEntry,
@@ -1466,7 +1466,7 @@ impl SnapshotManager {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn update_metadata_after_upload(
         &self,
         location: &ObjectPath,

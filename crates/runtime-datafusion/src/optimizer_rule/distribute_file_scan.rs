@@ -71,7 +71,7 @@ impl DistributeFileScanOptimizer {
 impl DistributeFileScanOptimizer {
     /// Bytes read is either the whole file or some part of it
     // `cast_sign_loss` is OK because file offsets are always non-negative
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn read_size(pf: &PartitionedFile) -> u64 {
         if let Some(range) = pf.range.as_ref() {
             (range.end - range.start) as u64

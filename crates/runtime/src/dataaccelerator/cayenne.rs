@@ -406,7 +406,7 @@ impl CayenneAccelerator {
 
         self.catalog
             .get_or_try_init(move || {
-                let connection_string = connection_string.clone();
+                let connection_string = connection_string;
                 async move {
                     let catalog = Arc::new(
                         cayenne::CayenneCatalog::new(connection_string).map_err(|e| {
@@ -646,7 +646,7 @@ impl DataAccelerator for CayenneAccelerator {
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     /// Cayenne supports file mode and can optionally partition data.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn create_external_table(
         &self,
         cmd: CreateExternalTable,
@@ -897,7 +897,7 @@ impl std::fmt::Debug for CayennePartitionCreator {
 }
 
 impl CayennePartitionCreator {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         table_name: String,
         base_path: PathBuf,

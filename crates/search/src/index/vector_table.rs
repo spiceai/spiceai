@@ -94,14 +94,7 @@ impl VectorScanTableProvider {
             input
         };
 
-        filtered.project(
-            projection
-                .iter()
-                .sorted_unstable()
-                .cloned()
-                .map(ident)
-                .collect::<Vec<Expr>>(),
-        )
+        filtered.project(projection.iter().sorted_unstable().cloned().map(ident))
     }
 
     fn columns_projected(
@@ -211,7 +204,6 @@ impl TableProvider for VectorScanTableProvider {
         self.table_provider.table_type()
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -306,13 +298,7 @@ impl TableProvider for VectorScanTableProvider {
         }
 
         join = join
-            .project(
-                columns_requested
-                    .into_iter()
-                    .sorted_unstable()
-                    .map(ident)
-                    .collect::<Vec<Expr>>(),
-            )?
+            .project(columns_requested.into_iter().sorted_unstable().map(ident))?
             .limit(0, limit)?;
 
         match with_join_optimization(state) {
@@ -637,7 +623,7 @@ mod tests {
         Ok(())
     }
 
-    #[allow(
+    #[expect(
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
         clippy::missing_panics_doc
@@ -663,7 +649,7 @@ mod tests {
                     *length,
                 );
                 Arc::new(FixedSizeListArray::from(
-                    ArrayData::builder(list_data_type.clone())
+                    ArrayData::builder(list_data_type)
                         .len(1)
                         .add_child_data(
                             ArrayData::builder(DataType::Float32)
@@ -685,7 +671,7 @@ mod tests {
     }
 
     /// Creates a [`RecordBatch`] with a single row that has default value of types, as per the [`Schema`].
-    #[allow(clippy::missing_panics_doc)]
+    #[expect(clippy::missing_panics_doc)]
     #[must_use]
     pub fn one_row_default_record_batch_for_schema(schema: &Arc<Schema>) -> RecordBatch {
         let arrays: Vec<ArrayRef> = schema

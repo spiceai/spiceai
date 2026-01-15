@@ -314,7 +314,7 @@ impl Runtime {
             .await
     }
 
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
         let df = Arc::clone(&self.df);
         let register_task = df

@@ -67,7 +67,7 @@ pub(crate) fn add_full_text_search_to_table(
     let store_fields = columns
         .iter()
         .filter_map(|c| {
-            if let Some(MetadataType::NonFilterable) = c.as_vector_metadata() {
+            if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
                 return Some(c.name.clone());
             }
             None
@@ -76,7 +76,7 @@ pub(crate) fn add_full_text_search_to_table(
 
     let index = FullTextDatabaseIndex::try_new(
         Arc::clone(&inner_table_provider),
-        search_fields.clone(),
+        search_fields,
         Some(primary_key),
         directory,
         &store_fields,

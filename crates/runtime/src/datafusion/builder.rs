@@ -242,7 +242,7 @@ impl DataFusionBuilder {
     ///
     /// Panics if the `DataFusion` instance cannot be built due to errors in registering functions or schemas.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
 
@@ -446,7 +446,7 @@ pub(crate) fn runtime_env(
     // If no memory limit is specified, default to 70% of total memory (container-aware)
     let effective_memory_limit = memory_limit.or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             clippy::cast_precision_loss
@@ -456,7 +456,7 @@ pub(crate) fn runtime_env(
         tracing::debug!(
             "No memory limit specified, defaulting to 70% of total memory: {}",
             {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 util::human_readable_bytes(default_limit as usize)
             }
         );

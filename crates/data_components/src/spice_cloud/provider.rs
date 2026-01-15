@@ -103,32 +103,27 @@ impl SpiceCloudPlatformCatalogProvider {
 
         let include = include.map(Arc::new);
 
-        let providers = try_join_all(
-            schema_names
-                .iter()
-                .map(|name| {
-                    let mut child_namespace_vec = root_namespace.clone().inner();
-                    let name_inner = name.clone().inner();
-                    let Some(last_name) = name_inner.last() else {
-                        unreachable!("The namespace should have at least one element");
-                    };
-                    child_namespace_vec.push(last_name.to_string());
-                    let Ok(child_namespace) = NamespaceIdent::from_vec(child_namespace_vec) else {
-                        unreachable!("This only panics if the vec is empty");
-                    };
-                    tracing::debug!(
-                        "Creating Spice.ai schema provider for namespace: {:?}",
-                        child_namespace
-                    );
-                    SpiceCloudPlatformSchemaProvider::try_new(
-                        Arc::clone(&client),
-                        child_namespace,
-                        Arc::clone(&connector),
-                        include.clone(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
+        let providers = try_join_all(schema_names.iter().map(|name| {
+            let mut child_namespace_vec = root_namespace.clone().inner();
+            let name_inner = name.clone().inner();
+            let Some(last_name) = name_inner.last() else {
+                unreachable!("The namespace should have at least one element");
+            };
+            child_namespace_vec.push(last_name.to_string());
+            let Ok(child_namespace) = NamespaceIdent::from_vec(child_namespace_vec) else {
+                unreachable!("This only panics if the vec is empty");
+            };
+            tracing::debug!(
+                "Creating Spice.ai schema provider for namespace: {:?}",
+                child_namespace
+            );
+            SpiceCloudPlatformSchemaProvider::try_new(
+                Arc::clone(&client),
+                child_namespace,
+                Arc::clone(&connector),
+                include.clone(),
+            )
+        }))
         .await?;
 
         let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
@@ -242,23 +237,18 @@ impl SpiceCloudPlatformSchemaProvider {
             })
             .collect::<Vec<_>>();
 
-        let table_providers = try_join_all(
-            included_table_names
-                .iter()
-                .map(|name| {
-                    let connector = Arc::clone(&connector);
-                    async move {
-                        match connector.table_provider(name.clone()).await {
-                            Ok(provider) => Ok(provider),
-                            Err(e) => Err(Error::TableProviderCreation {
-                                table: name.to_string(),
-                                source: e,
-                            }),
-                        }
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
+        let table_providers = try_join_all(included_table_names.iter().map(|name| {
+            let connector = Arc::clone(&connector);
+            async move {
+                match connector.table_provider(name.clone()).await {
+                    Ok(provider) => Ok(provider),
+                    Err(e) => Err(Error::TableProviderCreation {
+                        table: name.to_string(),
+                        source: e,
+                    }),
+                }
+            }
+        }))
         .await?;
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = included_table_names

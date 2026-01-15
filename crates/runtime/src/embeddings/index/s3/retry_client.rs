@@ -58,21 +58,21 @@ impl S3VectorRetryClientBuilder {
     }
 
     #[must_use]
-    #[allow(unused)]
+    #[expect(unused)]
     pub fn retry_strategy(mut self, retry_strategy: FibonacciBackoff) -> Self {
         self.retry_strategy = retry_strategy;
         self
     }
 
     #[must_use]
-    #[allow(unused)]
+    #[expect(unused)]
     pub fn max_parallelism(mut self, max_parallelism: usize) -> Self {
         self.max_parallelism = max_parallelism;
         self
     }
 
     #[must_use]
-    #[allow(unused)]
+    #[expect(unused)]
     pub fn operation_timeout(mut self, timeout: Duration) -> Self {
         self.operation_timeout = timeout;
         self

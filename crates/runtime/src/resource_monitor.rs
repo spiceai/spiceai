@@ -138,7 +138,7 @@ impl ResourceMonitor {
         };
 
         let process_memory = process.memory();
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             clippy::cast_precision_loss
@@ -151,7 +151,7 @@ impl ResourceMonitor {
         }
 
         // Only warn once per threshold crossing
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         for &threshold in THRESHOLDS.iter().rev() {
             if usage_percent >= threshold && inner.last_warning_threshold < threshold {
                 tracing::warn!(

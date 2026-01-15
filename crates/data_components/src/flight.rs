@@ -191,7 +191,6 @@ impl std::fmt::Debug for FlightTable {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 impl FlightTable {
     pub async fn create(
         name: &'static str,
@@ -209,11 +208,11 @@ impl FlightTable {
 
         Ok(Self {
             name,
+            join_push_down_context,
             client: client.clone(),
             schema,
-            table_reference,
             dialect,
-            join_push_down_context,
+            table_reference,
         })
     }
 
@@ -234,11 +233,11 @@ impl FlightTable {
 
         Self {
             name,
-            client: client.clone(),
-            schema,
-            table_reference,
-            dialect,
             join_push_down_context,
+            client,
+            schema,
+            dialect,
+            table_reference,
         }
     }
 
@@ -499,7 +498,6 @@ impl ExecutionPlan for FlightExec {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn query_to_stream(
     client: FlightClient,
     sql: String,
@@ -521,7 +519,6 @@ fn query_to_stream(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn to_execution_error(e: Error) -> DataFusionError {
     match e {
         Error::Flight { source } => match source {
