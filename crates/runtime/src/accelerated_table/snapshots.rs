@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::accelerated_table::SnapshotCreateTrigger;
+use crate::accelerated_table::refresh::DatasetReadyNotification;
 use arrow_schema::Schema;
 use datafusion::common::TableReference;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -57,7 +58,7 @@ pub fn spawn_snapshot_interval_task(
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: TableReference,
     federated_schema: Arc<Schema>,
-    dataset_ready_notify: Option<Arc<Notify>>,
+    dataset_ready_notification: Option<Arc<DatasetReadyNotification>>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
@@ -71,13 +72,17 @@ pub fn spawn_snapshot_interval_task(
 
     Some(tokio::spawn(async move {
         // Wait for the dataset to be ready before starting snapshot creation
-        if let Some(notify) = dataset_ready_notify {
+        if let Some(notify) = dataset_ready_notification {
             tracing::debug!(
                 "Snapshot interval task for {dataset_name} waiting for dataset to be ready"
             );
-            notify.notified().await;
+            notify.wait().await;
             tracing::debug!(
                 "Snapshot interval task for {dataset_name} starting after dataset ready"
+            );
+        } else {
+            tracing::warn!(  // TODO: should be debug
+                "Snapshot interval task for {dataset_name} starting immediately, no dataset_ready_notification provided"
             );
         }
 
@@ -134,7 +139,7 @@ pub fn create_periodic_snapshot_callback(
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: &TableReference,
     federated_schema: Arc<Schema>,
-    dataset_ready_notify: Option<Arc<Notify>>,
+    dataset_ready_notification: Option<Arc<DatasetReadyNotification>>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
@@ -148,19 +153,23 @@ pub fn create_periodic_snapshot_callback(
             let batches_processed = Arc::new(RwLock::new(0i64));
 
             // Track whether the dataset is ready (batch counting should start)
-            let dataset_ready = Arc::new(AtomicBool::new(dataset_ready_notify.is_none()));
+            let dataset_ready = Arc::new(AtomicBool::new(dataset_ready_notification.is_none()));
 
             // Spawn a task to set dataset_ready when notified
-            if let Some(notify) = dataset_ready_notify {
+            if let Some(notify) = dataset_ready_notification {
                 let dataset_ready_clone = Arc::clone(&dataset_ready);
                 let dataset_name_clone = dataset_name.clone();
                 tokio::spawn(async move {
-                    notify.notified().await;
+                    notify.wait().await;
                     dataset_ready_clone.store(true, Ordering::Release);
                     tracing::debug!(
                         "Batch-based snapshot counting for {dataset_name_clone} starting after dataset ready"
                     );
                 });
+            } else {
+                tracing::warn!(  // TODO: should be debug
+                    "Batch-based snapshot counting for {dataset_name} starting immediately, no dataset_ready_notification provided"
+                );
             }
 
             let callback = Arc::new(Mutex::new(Box::new(move || {
