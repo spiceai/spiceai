@@ -34,6 +34,7 @@ use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
@@ -114,9 +115,10 @@ impl SqliteAccelerator {
             sqlite3_auto_extension(Some(Self::sqlite3_decimal_init_wrapper));
         }
         Self {
-            // TODO: Add back with_decimal_between and with_function_support when datafusion-table-providers is updated
             sqlite_factory: SqliteTableProviderFactory::new()
-                .with_batch_insert_use_prepared_statements(true),
+                .with_batch_insert_use_prepared_statements(true)
+                .with_decimal_between(true)
+                .with_function_support(deny_spice_specific_functions()),
         }
     }
 
