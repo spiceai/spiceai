@@ -49,6 +49,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
+use crate::dataaccelerator::BootstrapStatus;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -478,6 +479,8 @@ pub struct Refresher {
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
     /// Shared with `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
+    /// The bootstrap status from dataset initialization.
+    bootstrap_status: BootstrapStatus,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -528,6 +531,7 @@ impl Refresher {
             io_runtime,
             resource_monitor: None,
             accelerator_write_mutex,
+            bootstrap_status: BootstrapStatus::none(),
         }
     }
 
@@ -581,6 +585,12 @@ impl Refresher {
         snapshot_config: Option<SnapshotCreationConfig>,
     ) -> &mut Self {
         self.snapshot_config = snapshot_config;
+        self
+    }
+
+    /// Set the bootstrap status from dataset initialization.
+    pub fn set_bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
+        self.bootstrap_status = bootstrap_status;
         self
     }
 
