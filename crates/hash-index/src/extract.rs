@@ -609,9 +609,9 @@ mod tests {
         assert_eq!(hash1, hash2);
 
         // Different keys should have different hashes (with high probability)
-        let hash_1 = KeyExtractor::hash_key(&extractor, 0);
-        let hash_2 = KeyExtractor::hash_key(&extractor, 1);
-        assert_ne!(hash_1, hash_2);
+        let first_hash = KeyExtractor::hash_key(&extractor, 0);
+        let second_hash = KeyExtractor::hash_key(&extractor, 1);
+        assert_ne!(first_hash, second_hash);
     }
 
     #[test]

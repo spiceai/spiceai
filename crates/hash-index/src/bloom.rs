@@ -244,6 +244,11 @@ impl From<BloomFilter> for BatchBloomFilter {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::needless_range_loop
+)]
 mod tests {
     use super::*;
 

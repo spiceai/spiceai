@@ -61,7 +61,7 @@ fn extract_primary_key_columns(
         if let Constraint::PrimaryKey(indices) = constraint {
             return indices
                 .iter()
-                .filter_map(|&idx| schema.field(idx).name().to_string().into())
+                .map(|&idx| schema.field(idx).name().clone())
                 .collect();
         }
     }
@@ -95,7 +95,7 @@ impl TableProviderFactory for ArrowFactory {
                 ));
             }
             let indexed_table =
-                IndexedMemTable::try_new(Arc::clone(&schema), vec![], primary_key_columns).await?;
+                IndexedMemTable::try_new(Arc::clone(&schema), vec![], primary_key_columns)?;
 
             // Apply constraints
             let indexed_table = indexed_table

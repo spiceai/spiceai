@@ -3157,6 +3157,7 @@ dependencies = [
  "hash-index",
  "insta",
  "object_store",
+ "parking_lot 0.12.5",
  "paste",
  "roaring",
  "rstest 0.26.1",

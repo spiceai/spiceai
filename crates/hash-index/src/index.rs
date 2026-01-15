@@ -43,39 +43,35 @@ use crate::bloom::BloomFilter;
 use crate::extract::create_key_extractor;
 use crate::{DuplicateKeySnafu, Result};
 
-/// Number of shards for concurrent access. Must be power of 2.
-/// 256 shards = minimal contention even with 64+ cores.
-const NUM_SHARDS: usize = 256;
-const SHARD_MASK: u64 = (NUM_SHARDS - 1) as u64;
-
 /// Fixed seed for deterministic hashing across instances.
 const HASH_SEED: u64 = 0x5370_6963_6541_4920; // "SpiceAI " in hex
 
-/// Multiplier for index threshold calculation.
+/// Number of shards for concurrent access.
 ///
-/// The index threshold is `INDEX_THRESHOLD_MULTIPLIER * parallelism`.
-/// Below this row count, building an index isn't worth the overhead.
-pub const INDEX_THRESHOLD_MULTIPLIER: usize = 256;
+/// Using a power of 2 enables efficient bitwise masking for shard selection.
+/// This value also serves as the threshold multiplier for indexing decisions.
+pub const NUM_SHARDS: usize = 256;
+const SHARD_MASK: u64 = (NUM_SHARDS - 1) as u64;
 
 /// Calculates the threshold row count below which indexing is not beneficial.
 ///
-/// The threshold is calculated as `256 × parallelism`. For small tables
+/// The threshold is calculated as `NUM_SHARDS × parallelism`. For small tables
 /// below this threshold, linear scans are faster than index lookups due to
 /// the overhead of index construction and maintenance.
 ///
 /// # Arguments
 ///
-/// * `parallelism` - The number of parallel threads (e.g., from DataFusion's
+/// * `parallelism` - The number of parallel threads (e.g., from `DataFusion`'s
 ///   `target_partitions` setting)
 ///
 /// # Example
 ///
-/// With parallelism=8: threshold = 256 × 8 = 2,048 rows  
+/// With parallelism=8: threshold = 256 × 8 = 2,048 rows\
 /// With parallelism=64: threshold = 256 × 64 = 16,384 rows
 #[inline]
 #[must_use]
 pub const fn index_threshold(parallelism: usize) -> usize {
-    INDEX_THRESHOLD_MULTIPLIER * parallelism
+    NUM_SHARDS * parallelism
 }
 
 /// Computes a 64-bit hash for a key using XXH3.
@@ -191,7 +187,7 @@ impl HashIndexBuilder {
     /// Sets the minimum row threshold below which no index will be built.
     ///
     /// Use [`index_threshold`] to calculate an appropriate value based on
-    /// the parallelism setting (e.g., DataFusion's `target_partitions`).
+    /// the parallelism setting (e.g., `DataFusion`'s `target_partitions`).
     ///
     /// If the total row count is below this threshold, [`try_build`] returns
     /// `None` instead of building an index, as linear scans would be faster.

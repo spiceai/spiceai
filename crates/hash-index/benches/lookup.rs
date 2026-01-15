@@ -31,7 +31,7 @@ use arrow::array::{BinaryArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use hash_index::{HashIndex, HashIndexBuilder, RowLocation, hash_key, index_threshold, INDEX_THRESHOLD_MULTIPLIER};
+use hash_index::{HashIndex, HashIndexBuilder, NUM_SHARDS, RowLocation, hash_key, index_threshold};
 use rand::Rng;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -731,9 +731,7 @@ fn bench_threshold_comparison(c: &mut Criterion) {
 
         // Random lookup targets (hit cases)
         let mut rng = rand::rng();
-        let lookup_targets: Vec<i64> = (0..100)
-            .map(|_| rng.random_range(0..size as i64))
-            .collect();
+        let lookup_targets: Vec<i64> = (0..100).map(|_| rng.random_range(0..size as i64)).collect();
 
         // Benchmark indexed lookup
         let index = HashIndexBuilder::new(vec!["id".to_string()])

@@ -32,8 +32,9 @@ limitations under the License.
 //! - With bloom filter: ~1000 hash table probes + 1M bit tests (much faster)
 
 use hash_index::{hash_key, BloomFilter};
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// A high-performance deletion index using SIMD hash index with bloom filter.
 ///
@@ -42,7 +43,7 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug)]
 pub struct DeletionIndex {
     /// Map of deleted PK -> delete sequence number.
-    /// Using HashMap internally but with bloom filter for fast negative lookups.
+    /// Using `HashMap` internally but with bloom filter for fast negative lookups.
     entries: RwLock<HashMap<i64, i64>>,
     /// Bloom filter for fast negative lookups.
     bloom: RwLock<BloomFilter>,
@@ -78,7 +79,7 @@ impl DeletionIndex {
         }
     }
 
-    /// Creates a deletion index from an existing HashMap.
+    /// Creates a deletion index from an existing `HashMap`.
     #[must_use]
     pub fn from_map(map: HashMap<i64, i64>) -> Self {
         let capacity = map.len().max(64);
@@ -98,7 +99,7 @@ impl DeletionIndex {
 
     /// Creates a deletion index from an Arc<HashMap>.
     ///
-    /// This clones the HashMap to enable mutable operations.
+    /// This clones the `HashMap` to enable mutable operations.
     #[must_use]
     pub fn from_arc_map(map: &Arc<HashMap<i64, i64>>) -> Self {
         Self::from_map((**map).clone())
@@ -111,10 +112,7 @@ impl DeletionIndex {
     /// Panics if the lock is poisoned.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries
-            .read()
-            .expect("DeletionIndex lock poisoned")
-            .len()
+        self.entries.read().len()
     }
 
     /// Returns true if the index is empty.
@@ -124,10 +122,7 @@ impl DeletionIndex {
     /// Panics if the lock is poisoned.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries
-            .read()
-            .expect("DeletionIndex lock poisoned")
-            .is_empty()
+        self.entries.read().is_empty()
     }
 
     /// Checks if a key might be deleted (bloom filter check only).
@@ -143,10 +138,7 @@ impl DeletionIndex {
         if !self.use_bloom {
             return true;
         }
-        self.bloom
-            .read()
-            .expect("DeletionIndex bloom lock poisoned")
-            .might_contain(hash_key(&pk))
+        self.bloom.read().might_contain(hash_key(&pk))
     }
 
     /// Gets the delete sequence for a key, if deleted.
@@ -159,21 +151,11 @@ impl DeletionIndex {
     #[inline]
     pub fn get(&self, pk: i64) -> Option<i64> {
         // Fast path: bloom filter check
-        if self.use_bloom
-            && !self
-                .bloom
-                .read()
-                .expect("DeletionIndex bloom lock poisoned")
-                .might_contain(hash_key(&pk))
-        {
+        if self.use_bloom && !self.bloom.read().might_contain(hash_key(&pk)) {
             return None;
         }
         // Slow path: hash table lookup
-        self.entries
-            .read()
-            .expect("DeletionIndex lock poisoned")
-            .get(&pk)
-            .copied()
+        self.entries.read().get(&pk).copied()
     }
 
     /// Checks if a key is deleted.
@@ -193,15 +175,9 @@ impl DeletionIndex {
     /// Panics if the lock is poisoned.
     pub fn insert(&self, pk: i64, delete_sequence: i64) -> Option<i64> {
         if self.use_bloom {
-            self.bloom
-                .write()
-                .expect("DeletionIndex bloom lock poisoned")
-                .insert(hash_key(&pk));
+            self.bloom.write().insert(hash_key(&pk));
         }
-        self.entries
-            .write()
-            .expect("DeletionIndex lock poisoned")
-            .insert(pk, delete_sequence)
+        self.entries.write().insert(pk, delete_sequence)
     }
 
     /// Inserts or updates a deletion entry with the maximum sequence number.
@@ -213,14 +189,10 @@ impl DeletionIndex {
     /// Panics if the lock is poisoned.
     pub fn insert_max(&self, pk: i64, delete_sequence: i64) {
         if self.use_bloom {
-            self.bloom
-                .write()
-                .expect("DeletionIndex bloom lock poisoned")
-                .insert(hash_key(&pk));
+            self.bloom.write().insert(hash_key(&pk));
         }
         self.entries
             .write()
-            .expect("DeletionIndex lock poisoned")
             .entry(pk)
             .and_modify(|seq| *seq = (*seq).max(delete_sequence))
             .or_insert(delete_sequence);
@@ -238,16 +210,13 @@ impl DeletionIndex {
         }
 
         if self.use_bloom {
-            let mut bloom = self
-                .bloom
-                .write()
-                .expect("DeletionIndex bloom lock poisoned");
+            let mut bloom = self.bloom.write();
             for (pk, _) in &entries_vec {
                 bloom.insert(hash_key(pk));
             }
         }
 
-        let mut map = self.entries.write().expect("DeletionIndex lock poisoned");
+        let mut map = self.entries.write();
         for (pk, seq) in entries_vec {
             map.insert(pk, seq);
         }
@@ -259,14 +228,8 @@ impl DeletionIndex {
     ///
     /// Panics if the lock is poisoned.
     pub fn clear(&self) {
-        self.entries
-            .write()
-            .expect("DeletionIndex lock poisoned")
-            .clear();
-        self.bloom
-            .write()
-            .expect("DeletionIndex bloom lock poisoned")
-            .clear();
+        self.entries.write().clear();
+        self.bloom.write().clear();
     }
 
     /// Returns a snapshot of the entries as an Arc<HashMap>.
@@ -278,12 +241,7 @@ impl DeletionIndex {
     /// Panics if the lock is poisoned.
     #[must_use]
     pub fn snapshot(&self) -> Arc<HashMap<i64, i64>> {
-        Arc::new(
-            self.entries
-                .read()
-                .expect("DeletionIndex lock poisoned")
-                .clone(),
-        )
+        Arc::new(self.entries.read().clone())
     }
 
     /// Provides iteration over keys (for compatibility).
@@ -292,26 +250,12 @@ impl DeletionIndex {
     ///
     /// Panics if the lock is poisoned.
     pub fn keys(&self) -> Vec<i64> {
-        self.entries
-            .read()
-            .expect("DeletionIndex lock poisoned")
-            .keys()
-            .copied()
-            .collect()
+        self.entries.read().keys().copied().collect()
     }
 
-    /// Provides iteration over entries (for compatibility).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock is poisoned.
-    pub fn iter(&self) -> Vec<(i64, i64)> {
-        self.entries
-            .read()
-            .expect("DeletionIndex lock poisoned")
-            .iter()
-            .map(|(&k, &v)| (k, v))
-            .collect()
+    /// Returns all entries as a vector of (key, value) pairs.
+    pub fn to_vec(&self) -> Vec<(i64, i64)> {
+        self.entries.read().iter().map(|(&k, &v)| (k, v)).collect()
     }
 }
 
@@ -345,7 +289,7 @@ impl KeyDeletionIndex {
         }
     }
 
-    /// Creates a deletion index from an existing HashMap.
+    /// Creates a deletion index from an existing `HashMap`.
     #[must_use]
     pub fn from_map(map: HashMap<Box<[u8]>, i64>) -> Self {
         let capacity = map.len().max(64);
@@ -375,10 +319,7 @@ impl KeyDeletionIndex {
     /// Panics if the lock is poisoned.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries
-            .read()
-            .expect("KeyDeletionIndex lock poisoned")
-            .len()
+        self.entries.read().len()
     }
 
     /// Returns true if empty.
@@ -388,10 +329,7 @@ impl KeyDeletionIndex {
     /// Panics if the lock is poisoned.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries
-            .read()
-            .expect("KeyDeletionIndex lock poisoned")
-            .is_empty()
+        self.entries.read().is_empty()
     }
 
     /// Checks if a key might be deleted (bloom filter check only).
@@ -404,10 +342,7 @@ impl KeyDeletionIndex {
         if !self.use_bloom {
             return true;
         }
-        self.bloom
-            .read()
-            .expect("KeyDeletionIndex bloom lock poisoned")
-            .might_contain(hash_key(&key))
+        self.bloom.read().might_contain(hash_key(&key))
     }
 
     /// Gets the delete sequence for a key.
@@ -417,20 +352,10 @@ impl KeyDeletionIndex {
     /// Panics if the lock is poisoned.
     #[inline]
     pub fn get(&self, key: &[u8]) -> Option<i64> {
-        if self.use_bloom
-            && !self
-                .bloom
-                .read()
-                .expect("KeyDeletionIndex bloom lock poisoned")
-                .might_contain(hash_key(&key))
-        {
+        if self.use_bloom && !self.bloom.read().might_contain(hash_key(&key)) {
             return None;
         }
-        self.entries
-            .read()
-            .expect("KeyDeletionIndex lock poisoned")
-            .get(key)
-            .copied()
+        self.entries.read().get(key).copied()
     }
 
     /// Inserts a deletion entry.
@@ -440,15 +365,9 @@ impl KeyDeletionIndex {
     /// Panics if the lock is poisoned.
     pub fn insert(&self, key: Box<[u8]>, delete_sequence: i64) -> Option<i64> {
         if self.use_bloom {
-            self.bloom
-                .write()
-                .expect("KeyDeletionIndex bloom lock poisoned")
-                .insert(hash_key(&key.as_ref()));
+            self.bloom.write().insert(hash_key(&key.as_ref()));
         }
-        self.entries
-            .write()
-            .expect("KeyDeletionIndex lock poisoned")
-            .insert(key, delete_sequence)
+        self.entries.write().insert(key, delete_sequence)
     }
 
     /// Inserts or updates with max sequence.
@@ -458,14 +377,10 @@ impl KeyDeletionIndex {
     /// Panics if the lock is poisoned.
     pub fn insert_max(&self, key: Box<[u8]>, delete_sequence: i64) {
         if self.use_bloom {
-            self.bloom
-                .write()
-                .expect("KeyDeletionIndex bloom lock poisoned")
-                .insert(hash_key(&key.as_ref()));
+            self.bloom.write().insert(hash_key(&key.as_ref()));
         }
         self.entries
             .write()
-            .expect("KeyDeletionIndex lock poisoned")
             .entry(key)
             .and_modify(|seq| *seq = (*seq).max(delete_sequence))
             .or_insert(delete_sequence);
@@ -478,12 +393,7 @@ impl KeyDeletionIndex {
     /// Panics if the lock is poisoned.
     #[must_use]
     pub fn snapshot(&self) -> Arc<HashMap<Box<[u8]>, i64>> {
-        Arc::new(
-            self.entries
-                .read()
-                .expect("KeyDeletionIndex lock poisoned")
-                .clone(),
-        )
+        Arc::new(self.entries.read().clone())
     }
 
     /// Clears all entries.
@@ -492,14 +402,8 @@ impl KeyDeletionIndex {
     ///
     /// Panics if the lock is poisoned.
     pub fn clear(&self) {
-        self.entries
-            .write()
-            .expect("KeyDeletionIndex lock poisoned")
-            .clear();
-        self.bloom
-            .write()
-            .expect("KeyDeletionIndex bloom lock poisoned")
-            .clear();
+        self.entries.write().clear();
+        self.bloom.write().clear();
     }
 }
 

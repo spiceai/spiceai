@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Allow pass-by-value for consistency with DataFusion TableProvider patterns
+#![allow(clippy::needless_pass_by_value)]
+// Allow let-else pattern suggestions as current style is clearer
+#![allow(clippy::manual_let_else)]
+// Allow collapsible if statements for readability
+#![allow(clippy::collapsible_if)]
+
 //! SIMD-optimized hash index for `MemTable`.
 //!
 //! This module provides a hash index wrapper that accelerates point lookups
@@ -46,7 +53,7 @@ use super::write::MemTable;
 /// When a primary key is defined, this table maintains a hash index that enables
 /// O(1) lookups instead of full table scans for equality predicates on the primary key.
 pub struct IndexedMemTable {
-    /// The underlying MemTable for data storage.
+    /// The underlying `MemTable` for data storage.
     inner: MemTable,
     /// Hash index for primary key lookups.
     index: Option<Arc<HashIndex>>,
@@ -65,7 +72,7 @@ impl Debug for IndexedMemTable {
 }
 
 impl IndexedMemTable {
-    /// Creates a new indexed MemTable.
+    /// Creates a new indexed `MemTable`.
     ///
     /// If primary key columns are provided and the row count exceeds the
     /// threshold (`256 × parallelism`), a hash index will be built. For
@@ -77,21 +84,21 @@ impl IndexedMemTable {
     /// * `schema` - The schema of the table
     /// * `partitions` - The data partitions
     /// * `primary_key_columns` - Columns that form the primary key
-    /// * `parallelism` - Number of parallel threads (e.g., from DataFusion's
+    /// * `parallelism` - Number of parallel threads (e.g., from `DataFusion`'s
     ///   `target_partitions`). If `None`, defaults to the number of CPUs.
-    pub async fn try_new(
+    pub fn try_new(
         schema: SchemaRef,
         partitions: Vec<Vec<RecordBatch>>,
         primary_key_columns: Vec<String>,
     ) -> Result<Self> {
-        Self::try_new_with_parallelism(schema, partitions, primary_key_columns, None).await
+        Self::try_new_with_parallelism(schema, partitions, primary_key_columns, None)
     }
 
-    /// Creates a new indexed MemTable with explicit parallelism setting.
+    /// Creates a new indexed `MemTable` with explicit parallelism setting.
     ///
     /// See [`try_new`] for details. This variant allows specifying the
     /// parallelism value used to calculate the index threshold.
-    pub async fn try_new_with_parallelism(
+    pub fn try_new_with_parallelism(
         schema: SchemaRef,
         partitions: Vec<Vec<RecordBatch>>,
         primary_key_columns: Vec<String>,
@@ -99,7 +106,9 @@ impl IndexedMemTable {
     ) -> Result<Self> {
         let inner = MemTable::try_new(Arc::clone(&schema), partitions.clone())?;
 
-        let index = if !primary_key_columns.is_empty() {
+        let index = if primary_key_columns.is_empty() {
+            None
+        } else {
             // Validate primary key columns exist in schema
             for col in &primary_key_columns {
                 if schema.index_of(col).is_err() {
@@ -129,8 +138,6 @@ impl IndexedMemTable {
                     DataFusionError::Execution(format!("Failed to build hash index: {e}"))
                 })?
                 .map(Arc::new)
-        } else {
-            None
         };
 
         Ok(Self {
@@ -141,16 +148,19 @@ impl IndexedMemTable {
     }
 
     /// Returns true if this table has an index.
+    #[must_use]
     pub fn has_index(&self) -> bool {
         self.index.is_some()
     }
 
     /// Returns the hash index if available.
+    #[must_use]
     pub fn index(&self) -> Option<&Arc<HashIndex>> {
         self.index.as_ref()
     }
 
     /// Returns the primary key columns.
+    #[must_use]
     pub fn primary_key_columns(&self) -> &[String] {
         &self.primary_key_columns
     }
@@ -244,7 +254,7 @@ impl IndexedMemTable {
         Ok(())
     }
 
-    /// Reads all partitions into vectors of RecordBatch.
+    /// Reads all partitions into vectors of `RecordBatch`.
     async fn read_all_partitions(&self) -> Vec<Vec<RecordBatch>> {
         let mut result = Vec::with_capacity(self.inner.batches.len());
         for partition in &self.inner.batches {
@@ -300,7 +310,7 @@ impl IndexedMemTable {
         }
     }
 
-    /// Configures on_conflict behavior.
+    /// Configures `on_conflict` behavior.
     #[must_use]
     pub fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
         self.inner = self.inner.with_on_conflict(on_conflict);
@@ -340,7 +350,7 @@ pub enum PrimaryKeyValue {
 }
 
 impl PrimaryKeyValue {
-    /// Tries to create a primary key value from a DataFusion scalar value.
+    /// Tries to create a primary key value from a `DataFusion` scalar value.
     fn try_from_scalar(scalar: &datafusion::scalar::ScalarValue) -> Option<Self> {
         match scalar {
             datafusion::scalar::ScalarValue::Int64(Some(v)) => Some(Self::Int64(*v)),
@@ -430,7 +440,7 @@ impl TableProvider for IndexedMemTable {
                     // Return a simple in-memory execution plan with the single row
                     let schema = result_batch.schema();
                     let stream = futures::stream::once(async move { Ok(result_batch) });
-                    let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
+                    let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
 
                     return Ok(Arc::new(IndexedLookupExec::new(
                         schema,
@@ -487,7 +497,7 @@ impl TableProvider for IndexedMemTable {
 /// Execution plan for indexed lookups.
 ///
 /// This is a simple wrapper that returns pre-computed results from index lookups.
-/// Displays as "IndexedLookupExec: indexed_scan on [pk_columns]" in EXPLAIN output.
+/// Displays as "`IndexedLookupExec`: `indexed_scan` on `[pk_columns]`" in EXPLAIN output.
 pub struct IndexedLookupExec {
     schema: SchemaRef,
     /// The result stream (single batch for point lookup).
@@ -539,6 +549,7 @@ impl IndexedLookupExec {
     }
 }
 
+#[expect(clippy::missing_fields_in_debug)]
 impl Debug for IndexedLookupExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IndexedLookupExec")
@@ -566,7 +577,7 @@ impl DisplayAs for IndexedLookupExec {
 }
 
 impl ExecutionPlan for IndexedLookupExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "IndexedLookupExec"
     }
 
@@ -643,6 +654,7 @@ mod tests {
 
     /// Creates a large batch with row count above the indexing threshold.
     /// With parallelism=1, threshold=256, so we create 300 rows.
+    #[expect(clippy::cast_possible_wrap, reason = "size is always small in tests")]
     fn create_large_test_batch(size: usize) -> RecordBatch {
         let ids: Vec<i64> = (0..size as i64).collect();
         let names: Vec<String> = (0..size).map(|i| format!("name_{i}")).collect();
@@ -662,27 +674,28 @@ mod tests {
     ///
     /// With parallelism=1, threshold=256 rows. Data must have 256+ rows
     /// for an index to be created.
-    async fn create_test_indexed_table(
+    fn create_test_indexed_table(
         schema: SchemaRef,
         partitions: Vec<Vec<RecordBatch>>,
         primary_key_columns: Vec<String>,
     ) -> Result<IndexedMemTable> {
         // Use parallelism=1 so threshold=256
         IndexedMemTable::try_new_with_parallelism(schema, partitions, primary_key_columns, Some(1))
-            .await
     }
 
     /// Creates an `IndexedMemTable` that forces index creation regardless of row count.
     ///
     /// Use this for tests that need to verify index behavior with small datasets.
-    async fn create_test_indexed_table_force_index(
+    fn create_test_indexed_table_force_index(
         schema: SchemaRef,
         partitions: Vec<Vec<RecordBatch>>,
         primary_key_columns: Vec<String>,
     ) -> Result<IndexedMemTable> {
         let inner = MemTable::try_new(Arc::clone(&schema), partitions.clone())?;
 
-        let index = if !primary_key_columns.is_empty() {
+        let index = if primary_key_columns.is_empty() {
+            None
+        } else {
             // Validate primary key columns exist in schema
             for col in &primary_key_columns {
                 if schema.index_of(col).is_err() {
@@ -708,8 +721,6 @@ mod tests {
                         DataFusionError::Execution(format!("Failed to build hash index: {e}"))
                     })?,
             ))
-        } else {
-            None
         };
 
         Ok(IndexedMemTable {
@@ -726,7 +737,6 @@ mod tests {
         let schema = batch.schema();
 
         let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
-            .await
             .expect("failed to create table");
 
         assert!(table.has_index());
@@ -740,7 +750,6 @@ mod tests {
         let schema = batch.schema();
 
         let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
-            .await
             .expect("failed to create table");
 
         // Lookup existing key
@@ -761,7 +770,6 @@ mod tests {
         let schema = batch.schema();
 
         let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
-            .await
             .expect("failed to create table");
 
         let keys = vec![1_i64, 3, 5, 999];
@@ -781,14 +789,13 @@ mod tests {
             vec![vec![batch]],
             vec![], // No primary key
         )
-        .await
         .expect("failed to create table");
 
         assert!(!table.has_index());
 
         // Point lookup should fail without index
         let result = table.get_by_key(&1_i64).await;
-        assert!(result.is_err());
+        let _ = result.expect_err("expected error for table without index");
     }
 
     #[tokio::test]
@@ -802,7 +809,6 @@ mod tests {
             vec![vec![batch]],
             vec!["id".to_string()],
         )
-        .await
         .expect("failed to create table");
 
         // Below threshold, no index should be created
@@ -823,7 +829,6 @@ mod tests {
             vec![vec![batch]],
             vec!["id".to_string()],
         )
-        .await
         .expect("failed to create table");
 
         // At threshold, index should be created
@@ -844,7 +849,6 @@ mod tests {
             vec![vec![batch]],
             vec!["id".to_string()],
         )
-        .await
         .expect("failed to create table");
 
         // Equality on primary key should get Exact pushdown
@@ -875,7 +879,6 @@ mod tests {
             vec![vec![batch]],
             vec!["id".to_string()],
         )
-        .await
         .expect("failed to create table");
 
         // Add primary key constraint
@@ -898,7 +901,7 @@ mod tests {
         ]));
         let names: Vec<String> = (0..size).map(|i| format!("name_{i}")).collect();
         let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
-        let values: Vec<i64> = (0..size as i64).map(|i| i * 100).collect();
+        let values: Vec<i64> = (0..i64::from(size)).map(|i| i * 100).collect();
         let name_array = StringArray::from(names_ref);
         let value_array = Int64Array::from(values);
         let batch = RecordBatch::try_new(
@@ -912,7 +915,6 @@ mod tests {
             vec![vec![batch]],
             vec!["name".to_string()],
         )
-        .await
         .expect("failed to create table");
 
         assert!(table.has_index());
@@ -927,7 +929,7 @@ mod tests {
     #[tokio::test]
     async fn test_large_table_indexed_lookup() {
         // Create a larger table to test index performance
-        let size = 10_000;
+        let size: i64 = 10_000;
         let ids: Vec<i64> = (0..size).collect();
         let names: Vec<String> = (0..size).map(|i| format!("name_{i}")).collect();
         let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -949,23 +951,16 @@ mod tests {
             vec![vec![batch]],
             vec!["id".to_string()],
         )
-        .await
         .expect("failed to create table");
 
         // Lookup various keys
-        for key in [0, 100, 1000, 5000, 9999] {
-            let result = table
-                .get_by_key(&(key as i64))
-                .await
-                .expect("lookup failed");
+        for key in [0_i64, 100, 1000, 5000, 9999] {
+            let result = table.get_by_key(&key).await.expect("lookup failed");
             assert!(result.is_some(), "Key {key} should exist");
         }
 
         // Lookup non-existing key
-        let result = table
-            .get_by_key(&(size as i64))
-            .await
-            .expect("lookup failed");
+        let result = table.get_by_key(&size).await.expect("lookup failed");
         assert!(result.is_none());
     }
 
@@ -1005,7 +1000,6 @@ mod tests {
             vec![vec![batch1], vec![batch2], vec![batch3]],
             vec!["id".to_string()],
         )
-        .await
         .expect("failed to create table");
 
         assert!(table.has_index());
@@ -1040,7 +1034,6 @@ mod tests {
             vec![vec![batch]],
             vec!["id".to_string()],
         )
-        .await
         .expect("failed to create table");
 
         let ctx = SessionContext::new();
@@ -1074,7 +1067,6 @@ mod tests {
             vec![vec![batch]],
             vec!["id".to_string()],
         )
-        .await
         .expect("failed to create table");
 
         let ctx = SessionContext::new();
@@ -1108,7 +1100,6 @@ mod tests {
             vec![vec![batch]],
             vec![], // No primary key
         )
-        .await
         .expect("failed to create table");
 
         let ctx = SessionContext::new();
@@ -1139,7 +1130,6 @@ mod tests {
             vec![vec![batch.clone()]],
             vec!["id".to_string()],
         )
-        .await
         .expect("failed to create indexed table");
 
         // Create non-indexed table
@@ -1148,7 +1138,6 @@ mod tests {
             vec![vec![batch]],
             vec![], // No primary key
         )
-        .await
         .expect("failed to create non-indexed table");
 
         let ctx = SessionContext::new();
@@ -1178,6 +1167,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_indexed_lookup_exec_display_format() {
+        use std::fmt::Write;
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
@@ -1189,7 +1180,6 @@ mod tests {
 
         // Test Default format via fmt_as
         let mut output = String::new();
-        use std::fmt::Write;
         write!(
             &mut output,
             "{}",

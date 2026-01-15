@@ -24,6 +24,17 @@ limitations under the License.
 //! - Hash collision handling
 //! - All supported data types
 
+// Test-specific allows for cleaner test code
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap,
+    clippy::similar_names,
+    clippy::uninlined_format_args,
+    clippy::doc_markdown
+)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread;
@@ -152,7 +163,7 @@ fn test_large_table_10k() {
 #[test]
 fn test_large_table_100k() {
     let ids: Vec<i64> = (0..100_000).collect();
-    let batch = create_int64_batch(ids.clone());
+    let batch = create_int64_batch(ids);
     let partitions = vec![vec![batch]];
 
     let index = HashIndexBuilder::new(vec!["id".to_string()])
@@ -326,7 +337,7 @@ fn test_duplicate_keys_rejected() {
         .allow_duplicates(false)
         .build(&partitions);
 
-    assert!(result.is_err());
+    let _err = result.expect_err("expected duplicate key error");
 }
 
 #[test]
@@ -518,7 +529,7 @@ fn test_clear_and_rebuild() {
 #[test]
 fn test_concurrent_reads() {
     let ids: Vec<i64> = (0..1000).collect();
-    let batch = create_int64_batch(ids.clone());
+    let batch = create_int64_batch(ids);
     let partitions = vec![vec![batch]];
 
     let index = Arc::new(
@@ -934,7 +945,7 @@ fn test_composite_key_duplicate_detection() {
         .allow_duplicates(false)
         .build(&partitions);
 
-    assert!(result.is_err());
+    let _err = result.expect_err("expected duplicate key error");
 }
 
 // =============================================================================
@@ -980,7 +991,7 @@ fn test_batch_lookup_all_hits() {
         .build(&partitions)
         .expect("failed to build index");
 
-    #[allow(clippy::redundant_closure)]
+    #[expect(clippy::redundant_closure)]
     let lookup_hashes: Vec<u64> = ids.iter().map(|k| hash_key(k)).collect();
     let results = index.get_batch(&lookup_hashes);
 
@@ -1230,9 +1241,9 @@ fn test_data_integrity_all_keys_retrievable() {
 
     // Every key must be retrievable
     for (row_idx, id) in ids.iter().enumerate() {
-        let loc = index.get(id);
-        assert!(loc.is_some(), "Key {id} not found in index");
-        let loc = loc.unwrap();
+        let loc = index
+            .get(id)
+            .unwrap_or_else(|| panic!("Key {id} not found in index"));
         assert_eq!(loc.partition, 0, "Wrong partition for key {id}");
         assert_eq!(loc.batch, 0, "Wrong batch for key {id}");
         assert_eq!(
@@ -1272,7 +1283,7 @@ fn test_data_integrity_non_existent_keys() {
 #[test]
 fn test_data_integrity_batch_vs_individual_lookup() {
     let ids: Vec<i64> = (0..5000).collect();
-    let batch = create_int64_batch(ids.clone());
+    let batch = create_int64_batch(ids);
     let partitions = vec![vec![batch]];
 
     let index = HashIndexBuilder::new(vec!["id".to_string()])
@@ -1281,7 +1292,7 @@ fn test_data_integrity_batch_vs_individual_lookup() {
 
     // Mix of existing and non-existing keys
     let lookup_keys: Vec<i64> = (0..6000).step_by(2).collect();
-    let hashes: Vec<u64> = lookup_keys.iter().map(|k| hash_key(k)).collect();
+    let hashes: Vec<u64> = lookup_keys.iter().map(hash_key).collect();
 
     let batch_results = index.get_batch(&hashes);
 
@@ -1295,7 +1306,7 @@ fn test_data_integrity_batch_vs_individual_lookup() {
     }
 }
 
-/// Test that insert_or_replace correctly updates locations.
+/// Test that `insert_or_replace` correctly updates locations.
 #[test]
 fn test_data_integrity_insert_or_replace() {
     let index = HashIndex::new(vec!["id".to_string()]);
@@ -1447,7 +1458,7 @@ fn test_data_integrity_rebuild() {
     }
 }
 
-/// Test add_batches appends correctly without affecting existing data.
+/// Test `add_batches` appends correctly without affecting existing data.
 #[test]
 fn test_data_integrity_add_batches() {
     let index = HashIndex::new(vec!["id".to_string()]);
@@ -1567,7 +1578,7 @@ fn test_data_integrity_string_keys() {
     let ids: Vec<&str> = (0..1000)
         .map(|i| {
             // Use static strings to avoid lifetime issues
-            Box::leak(format!("key_{:06}", i).into_boxed_str()) as &str
+            Box::leak(format!("key_{i:06}").into_boxed_str()) as &str
         })
         .collect();
     let batch = create_string_batch(ids.clone());
@@ -1580,8 +1591,8 @@ fn test_data_integrity_string_keys() {
     // Verify all string keys
     for (row_idx, id) in ids.iter().enumerate() {
         let loc = index
-            .get(&id.to_string())
-            .expect(&format!("String key '{id}' not found"));
+            .get(&(*id).to_string())
+            .unwrap_or_else(|| panic!("String key '{id}' not found"));
         assert_eq!(loc.row, row_idx as u32, "Wrong row for string key '{id}'");
     }
 }
@@ -1602,9 +1613,10 @@ fn test_data_integrity_hash_collision_simulation() {
 
     // All should be retrievable
     for i in 0..10_000_i64 {
-        let loc = index.get(&i);
-        assert!(loc.is_some(), "Key {i} not found after bulk insert");
-        assert_eq!(loc.unwrap().row, i as u32);
+        let loc = index
+            .get(&i)
+            .unwrap_or_else(|| panic!("Key {i} not found after bulk insert"));
+        assert_eq!(loc.row, i as u32);
     }
 }
 
@@ -1638,7 +1650,9 @@ fn test_data_integrity_concurrent_consistency() {
     for t in 0..num_threads {
         let start = t * keys_per_thread;
         for i in start..(start + keys_per_thread) {
-            let loc = index.get(&(i as i64)).expect(&format!("Key {i} not found"));
+            let loc = index
+                .get(&(i as i64))
+                .unwrap_or_else(|| panic!("Key {i} not found"));
             assert_eq!(
                 loc.batch, t as u32,
                 "Key {i} has wrong batch (thread assignment)"
@@ -1660,10 +1674,10 @@ fn test_data_integrity_duplicate_detection() {
         .allow_duplicates(false)
         .build(&partitions);
 
-    assert!(result.is_err(), "Should detect duplicate key");
+    let _err = result.expect_err("Should detect duplicate key");
 }
 
-/// Test that allow_duplicates mode uses last-write-wins.
+/// Test that `allow_duplicates` mode uses last-write-wins.
 #[test]
 fn test_data_integrity_allow_duplicates_last_wins() {
     let ids: Vec<i64> = vec![1, 2, 1, 3, 2]; // 1 appears at rows 0,2; 2 appears at rows 1,4
