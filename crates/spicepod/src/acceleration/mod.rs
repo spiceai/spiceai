@@ -334,9 +334,6 @@ fn is_false(b: &bool) -> bool {
 const fn default_true() -> bool {
     true
 }
-const fn default_false() -> bool {
-    false
-}
 
 impl Default for Acceleration {
     #[expect(deprecated)]
@@ -372,7 +369,7 @@ impl Default for Acceleration {
             snapshots_trigger: None,
             snapshots_trigger_threshold: None,
             snapshots_compaction: SnapshotsCompaction::Disabled,
-            snapshots_reset_expiry_on_load: false,
+            snapshots_reset_expiry_on_load: SnapshotsResetExpiryOnLoad::Disabled,
         }
     }
 }
