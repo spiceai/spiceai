@@ -17,7 +17,7 @@ limitations under the License.
 //! `DuckDB` data connector for Spice.ai runtime.
 //!
 //! This crate provides the `DuckDB` connector implementation, allowing
-//! Spice.ai to connect to DuckDB databases as data sources.
+//! Spice.ai to connect to `DuckDB` databases as data sources.
 //!
 //! This connector is extracted from the runtime crate to enable faster
 //! incremental builds - changes to this connector only require rebuilding
@@ -68,7 +68,11 @@ impl std::fmt::Debug for DuckDB {
 }
 
 impl DuckDB {
-    /// Creates an in-memory DuckDB table factory.
+    /// Creates an in-memory `DuckDB` table factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the in-memory `DuckDB` connection cannot be established.
     pub fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory()
@@ -87,7 +91,11 @@ impl DuckDB {
         Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
     }
 
-    /// Creates a file-based DuckDB table factory.
+    /// Creates a file-based `DuckDB` table factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file-based `DuckDB` connection cannot be established.
     pub fn create_file(path: &str, params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)

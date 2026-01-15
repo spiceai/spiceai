@@ -16,10 +16,52 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-// Force linkage of connector-graphql crate by referencing it.
-// Without this reference, the linker may not include the crate and its
-// `register_data_connector!` registration won't appear in DATA_CONNECTOR_REGISTRATIONS.
+// Force linkage of connector crates by referencing them.
+// Without these references, the linker may not include the crates and their
+// `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
+
+// Always-compiled connectors (no feature gate)
 use connector_graphql as _;
+
+// Feature-gated connectors
+#[cfg(feature = "clickhouse")]
+use connector_clickhouse as _;
+#[cfg(feature = "delta_lake")]
+use connector_delta_lake as _;
+#[cfg(feature = "dremio")]
+use connector_dremio as _;
+#[cfg(feature = "duckdb")]
+use connector_duckdb as _;
+#[cfg(feature = "flightsql")]
+use connector_flightsql as _;
+#[cfg(feature = "ftp")]
+use connector_ftp as _;
+#[cfg(feature = "imap")]
+use connector_imap as _;
+#[cfg(feature = "mongodb")]
+use connector_mongodb as _;
+#[cfg(feature = "mssql")]
+use connector_mssql as _;
+#[cfg(feature = "mysql")]
+use connector_mysql as _;
+#[cfg(feature = "odbc")]
+use connector_odbc as _;
+#[cfg(feature = "oracle")]
+use connector_oracle as _;
+#[cfg(feature = "postgres")]
+use connector_postgres as _;
+#[cfg(feature = "scylladb")]
+use connector_scylladb as _;
+#[cfg(feature = "sftp")]
+use connector_sftp as _;
+#[cfg(feature = "sharepoint")]
+use connector_sharepoint as _;
+#[cfg(feature = "smb")]
+use connector_smb as _;
+#[cfg(feature = "snowflake")]
+use connector_snowflake as _;
+#[cfg(feature = "spark")]
+use connector_spark as _;
 
 use std::collections::HashMap;
 use std::env;

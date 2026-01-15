@@ -16,8 +16,8 @@ limitations under the License.
 
 //! `MongoDB` data connector for Spice.ai runtime.
 //!
-//! This crate provides the MongoDB connector implementation, allowing
-//! Spice.ai to connect to MongoDB databases as data sources.
+//! This crate provides the `MongoDB` connector implementation, allowing
+//! Spice.ai to connect to `MongoDB` databases as data sources.
 //!
 //! This connector is extracted from the runtime crate to enable faster
 //! incremental builds - changes to this connector only require rebuilding

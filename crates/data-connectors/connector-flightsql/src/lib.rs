@@ -175,7 +175,7 @@ impl DataConnector for FlightSQL {
             Err(e) => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "flightsql".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: e.into(),
+                source: e,
             }),
         }
     }

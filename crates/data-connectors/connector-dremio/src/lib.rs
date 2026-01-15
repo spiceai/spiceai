@@ -239,7 +239,7 @@ impl DataConnector for Dremio {
                 .map_err(|e| DataConnectorError::UnableToGetReadWriteProvider {
                     dataconnector: "dremio".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
-                    source: e.into(),
+                    source: e,
                 });
 
         Some(read_write_result)

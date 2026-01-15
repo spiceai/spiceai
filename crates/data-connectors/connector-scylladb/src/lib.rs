@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! ScyllaDB data connector for Spice.ai runtime.
+//! `ScyllaDB` data connector for Spice.ai runtime.
 //!
-//! This crate provides the ScyllaDB connector implementation, allowing
-//! Spice.ai to connect to ScyllaDB clusters as data sources.
+//! This crate provides the `ScyllaDB` connector implementation, allowing
+//! Spice.ai to connect to `ScyllaDB` clusters as data sources.
 //!
 //! This connector is extracted from the runtime crate to enable faster
 //! incremental builds - changes to this connector only require rebuilding
@@ -81,13 +81,13 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// ScyllaDB data connector.
+/// `ScyllaDB` data connector.
 #[derive(Debug)]
 pub struct ScyllaDb {
     scylladb_factory: ScyllaDbTableFactory,
 }
 
-/// Factory for creating ScyllaDB connector instances.
+/// Factory for creating `ScyllaDB` connector instances.
 #[derive(Default, Copy, Clone)]
 pub struct ScyllaDbFactory {}
 

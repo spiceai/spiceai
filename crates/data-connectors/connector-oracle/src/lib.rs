@@ -197,6 +197,11 @@ impl Oracle {
     /// against race conditions using `WALLET_INIT`. If multiple datasets attempt to initialize
     /// the wallet concurrently, only the first call will perform the write and initialization;
     /// subsequent calls will return the cached result (success or error).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wallet directory cannot be created, the certificate cannot be
+    /// decoded from base64, or the certificate file cannot be written.
     pub fn save_wallet_cert_once(cert_base64_str: &str, wallet_path: &str) -> Result<()> {
         let mutex = WALLET_INIT.get_or_init(|| Mutex::new(None));
         let mut guard = mutex

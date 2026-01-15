@@ -25,7 +25,6 @@ use runtime::dataconnector::{
 };
 use runtime::parameters::{ParameterSpec, Parameters};
 use runtime::register_data_connector;
-use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -161,7 +160,7 @@ impl DataConnector for DeltaLake {
             Err(e) => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "delta_lake".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: e.into(),
+                source: e,
             }),
         }
     }
