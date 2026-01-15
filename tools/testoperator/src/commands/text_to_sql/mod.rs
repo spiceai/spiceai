@@ -53,10 +53,12 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
 
     let test = SpiceTest::new(
         args.get_configuration_name(&app.name),
-        NotStarted::new().with_config(
-            args.construct_requests()
-                .context("Cannot make text-to-SQL test cases")?,
-        ),
+        NotStarted::new()
+            .with_config(
+                args.construct_requests()
+                    .context("Cannot make text-to-SQL test cases")?,
+            )
+            .with_parallel_count(args.common.concurrency),
     )
     .with_spiced_instance(spiced_instance)
     .start()

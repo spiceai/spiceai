@@ -31,6 +31,28 @@ const AWS_PREFIXED_FRAGMENT_PARAMS: &[(&str, &str); 5] = &[
     ("aws_endpoint", "endpoint"),
 ];
 
+/// Maps Azure-prefixed parameter names (used by Delta Lake and other connectors)
+/// to the names expected by `SpiceObjectStoreRegistry.prepare_azure_object_store()`.
+///
+/// See `object_store::azure::AzureConfigKey` for the full list of supported keys.
+const AZURE_PREFIXED_FRAGMENT_PARAMS: &[(&str, &str); 7] = &[
+    ("azure_storage_account_name", "account"),
+    ("azure_storage_account_key", "access_key"),
+    ("azure_storage_client_id", "client_id"),
+    ("azure_storage_client_secret", "client_secret"),
+    ("azure_storage_sas_key", "sas_string"),
+    ("azure_storage_tenant_id", "tenant_id"),
+    ("azure_storage_endpoint", "endpoint"),
+];
+
+/// Maps GCS-prefixed parameter names (used by Delta Lake and other connectors)
+/// to the names expected by the object store registry.
+///
+/// Note: GCS is not currently fully supported in `SpiceObjectStoreRegistry`,
+/// but this canonicalization is added for forward compatibility.
+const GCS_PREFIXED_FRAGMENT_PARAMS: &[(&str, &str); 1] =
+    &[("google_service_account", "service_account")];
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Invalid configuration for {component}. {message}"))]
@@ -295,6 +317,39 @@ impl Parameters {
         let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
 
         for (prefixed_key, registry_key) in AWS_PREFIXED_FRAGMENT_PARAMS {
+            if let Some(value) = params.remove(*prefixed_key) {
+                params.insert((*registry_key).to_string(), value);
+            }
+        }
+
+        self.params = params.into_iter().collect();
+    }
+
+    /// Canonicalizes Azure-prefixed parameter names to the names expected by the object store registry.
+    ///
+    /// `delta_lake` and other connectors use `azure_storage_*` prefixed parameters, but
+    /// `SpiceObjectStoreRegistry.prepare_azure_object_store()` expects shorter names like
+    /// `account`, `access_key`, etc. This method maps the prefixed names to the expected names.
+    pub fn canonicalize_azure_fragments(&mut self) {
+        let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
+
+        for (prefixed_key, registry_key) in AZURE_PREFIXED_FRAGMENT_PARAMS {
+            if let Some(value) = params.remove(*prefixed_key) {
+                params.insert((*registry_key).to_string(), value);
+            }
+        }
+
+        self.params = params.into_iter().collect();
+    }
+
+    /// Canonicalizes GCS-prefixed parameter names to the names expected by the object store registry.
+    ///
+    /// `delta_lake` and other connectors use `google_*` prefixed parameters, but the object store
+    /// registry may expect different names. This method maps the prefixed names to the expected names.
+    pub fn canonicalize_gcs_fragments(&mut self) {
+        let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
+
+        for (prefixed_key, registry_key) in GCS_PREFIXED_FRAGMENT_PARAMS {
             if let Some(value) = params.remove(*prefixed_key) {
                 params.insert((*registry_key).to_string(), value);
             }
@@ -638,6 +693,148 @@ mod test {
                 "accelerator not_file"
             ),
             Some("file_format".to_string())
+        );
+    }
+
+    /// Helper to create Parameters for testing canonicalization.
+    /// Uses a generic prefix and accepts any parameter names.
+    fn create_test_params(params: Vec<(&str, &str)>) -> Parameters {
+        Parameters::new(
+            params
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), SecretString::new(v.to_string().into())))
+                .collect(),
+            "test",
+            &[], // No specs needed for canonicalization tests
+        )
+    }
+
+    /// Helper to extract params as a `HashMap` for assertion.
+    fn params_to_map(params: &Parameters) -> HashMap<String, String> {
+        params
+            .params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.expose_secret().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_canonicalize_azure_fragments() {
+        let mut params = create_test_params(vec![
+            ("azure_storage_account_name", "mystorageaccount"),
+            ("azure_storage_account_key", "secret_key_123"),
+            ("azure_storage_client_id", "client_id_456"),
+            ("azure_storage_client_secret", "client_secret_789"),
+            ("azure_storage_sas_key", "sas_token_xyz"),
+            ("azure_storage_tenant_id", "tenant_abc"),
+            (
+                "azure_storage_endpoint",
+                "https://mystorageaccount.blob.core.windows.net",
+            ),
+            ("unrelated_param", "some_value"),
+        ]);
+
+        params.canonicalize_azure_fragments();
+        let result = params_to_map(&params);
+
+        // Verify Azure params were renamed
+        assert_eq!(result.get("account"), Some(&"mystorageaccount".to_string()));
+        assert_eq!(
+            result.get("access_key"),
+            Some(&"secret_key_123".to_string())
+        );
+        assert_eq!(result.get("client_id"), Some(&"client_id_456".to_string()));
+        assert_eq!(
+            result.get("client_secret"),
+            Some(&"client_secret_789".to_string())
+        );
+        assert_eq!(result.get("sas_string"), Some(&"sas_token_xyz".to_string()));
+        assert_eq!(result.get("tenant_id"), Some(&"tenant_abc".to_string()));
+        assert_eq!(
+            result.get("endpoint"),
+            Some(&"https://mystorageaccount.blob.core.windows.net".to_string())
+        );
+
+        // Verify old names are removed
+        assert!(!result.contains_key("azure_storage_account_name"));
+        assert!(!result.contains_key("azure_storage_account_key"));
+
+        // Verify unrelated params are preserved
+        assert_eq!(
+            result.get("unrelated_param"),
+            Some(&"some_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_azure_fragments_partial() {
+        // Test with only some Azure params present
+        let mut params = create_test_params(vec![
+            ("azure_storage_account_name", "mystorageaccount"),
+            ("azure_storage_account_key", "secret_key_123"),
+        ]);
+
+        params.canonicalize_azure_fragments();
+        let result = params_to_map(&params);
+
+        assert_eq!(result.get("account"), Some(&"mystorageaccount".to_string()));
+        assert_eq!(
+            result.get("access_key"),
+            Some(&"secret_key_123".to_string())
+        );
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_canonicalize_gcs_fragments() {
+        let mut params = create_test_params(vec![
+            ("google_service_account", "/path/to/service_account.json"),
+            ("unrelated_param", "some_value"),
+        ]);
+
+        params.canonicalize_gcs_fragments();
+        let result = params_to_map(&params);
+
+        // Verify GCS params were renamed
+        assert_eq!(
+            result.get("service_account"),
+            Some(&"/path/to/service_account.json".to_string())
+        );
+
+        // Verify old names are removed
+        assert!(!result.contains_key("google_service_account"));
+
+        // Verify unrelated params are preserved
+        assert_eq!(
+            result.get("unrelated_param"),
+            Some(&"some_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_all_cloud_fragments() {
+        // Test that all three canonicalization methods can be chained
+        let mut params = create_test_params(vec![
+            ("aws_access_key_id", "aws_key"),
+            ("aws_secret_access_key", "aws_secret"),
+            ("azure_storage_account_name", "azure_account"),
+            ("azure_storage_account_key", "azure_key"),
+            ("google_service_account", "/path/to/sa.json"),
+        ]);
+
+        params.canonicalize_s3_fragments();
+        params.canonicalize_azure_fragments();
+        params.canonicalize_gcs_fragments();
+        let result = params_to_map(&params);
+
+        // All should be canonicalized
+        assert_eq!(result.get("key"), Some(&"aws_key".to_string()));
+        assert_eq!(result.get("secret"), Some(&"aws_secret".to_string()));
+        assert_eq!(result.get("account"), Some(&"azure_account".to_string()));
+        assert_eq!(result.get("access_key"), Some(&"azure_key".to_string()));
+        assert_eq!(
+            result.get("service_account"),
+            Some(&"/path/to/sa.json".to_string())
         );
     }
 }
