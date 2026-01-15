@@ -472,6 +472,7 @@ pub struct Refresher {
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
+    /// Notification for completion of refresh operation
     on_complete_notification: Option<Arc<Notify>>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
