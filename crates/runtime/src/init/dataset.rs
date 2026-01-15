@@ -997,8 +997,7 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
     let is_reset_expiry_on_load_enabled = dataset
         .acceleration
         .as_ref()
-        .map(|acc| acc.snapshots_reset_expiry_on_load_enabled)
-        .unwrap_or(false);
+        .is_some_and(|acc| acc.snapshots_reset_expiry_on_load_enabled);
 
     if !is_reset_expiry_on_load_enabled {
         return;
