@@ -16,16 +16,18 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use arrow::array::{Int64Array, RecordBatch, StringArray};
-use futures::TryStreamExt;
+use async_channel::Receiver;
+use opentelemetry::trace::TraceId;
+use rand::RngCore;
 use reqwest::Client;
 use serde_json::json;
 use tokio::task::JoinHandle;
+
+use crate::spicetest::text_to_sql::task_history::find_task_history_metrics;
 
 #[derive(Debug, Clone)]
 pub struct TextToSqlRequest {
@@ -85,225 +87,174 @@ pub(crate) struct TextToSqlWorkerResult {
 }
 
 pub struct TextToSqlResult {
+    pub question: String,
     pub generated_sql: String,
     pub expected_sql: String,
     pub is_error: bool,
-    pub number_of_attempts: usize,
     pub duration: Duration,
     pub sample_data_enabled: bool,
     pub return_sql: bool,
+
+    // Non-functional metrics from task_history
+    pub query_count: usize,
+    pub sql_duration_ms: f64,
+    pub llm_duration_ms: f64,
+    pub llm_count: usize,
+    pub llm_input_tokens: u64,
+    pub llm_output_tokens: u64,
 }
 
 pub(crate) struct TextToSqlWorker {
+    id: usize,
     http_client: Client,
     http_base_url: String,
     spice_client: spiceai::Client,
-    config: TextToSqlConfig,
+    request_rx: Receiver<TextToSqlRequest>,
 }
 
 impl TextToSqlWorker {
     pub fn new(
+        id: usize,
         http_client: Client,
         http_base_url: impl Into<String>,
         spice_client: spiceai::Client,
-        config: TextToSqlConfig,
+        request_rx: Receiver<TextToSqlRequest>,
     ) -> Self {
         Self {
+            id,
             http_client,
             http_base_url: http_base_url.into(),
             spice_client,
-            config,
+            request_rx,
         }
     }
 
     pub fn start(self) -> JoinHandle<Result<TextToSqlWorkerResult>> {
         tokio::spawn(async move {
             let mut results: BTreeMap<String, TextToSqlResult> = BTreeMap::new();
-            let total_requests = self.config.requests.len();
-            let mut last_progress_time = Instant::now();
+            let mut processed_count = 0usize;
 
-            println!("[TextToSqlWorker] STARTED, {total_requests} remaining");
-
-            for (index, request) in self.config.requests.into_iter().enumerate() {
+            while let Ok(request) = self.request_rx.recv().await {
                 let start = Instant::now();
-
-                let url = format!("{}/v1/nsql", self.http_base_url);
-                let body = json!({
-                    "query": request.question,
-                    "model": request.model,
-                    "sample_data_enabled": request.sample_data_enabled,
-                    "stream": false
-                });
-                let accept_header = if request.return_sql {
-                    "application/sql"
-                } else {
-                    "application/json"
-                };
-
-                let response = self
-                    .http_client
-                    .post(&url)
-                    .header("Content-Type", "application/json")
-                    .header("Accept", accept_header)
-                    .body(body.to_string())
-                    .send()
-                    .await?;
-
                 let mut is_error = false;
-                let text = match response.text().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        is_error = true;
-                        format!("HTTP error: {e}")
+                let mut generated_sql: Option<String> = None;
+
+                let trace_id = random_trace_id();
+                match nsql_request(&self.http_client, &self.http_base_url, &request, &trace_id)
+                    .await
+                {
+                    Ok(sql) if request.return_sql => {
+                        generated_sql = Some(sql);
                     }
-                };
-
-                let (number_of_attempts, sql) = if request.return_sql {
-                    (1, text)
-                } else {
-                    let sql = find_last_sql_statement(&self.spice_client)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("could not find last sql_query statement. Error: {e}")
-                        })?;
-                    let number_of_attempts = find_number_of_sql_attempts(&self.spice_client)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "could not find number of sql_query attempts. Error: {e}"
-                            )
-                        })?;
-
-                    (number_of_attempts, sql)
-                };
+                    Ok(_) => {} // NSQL returned data. Must get SQL from task_history
+                    Err(_) => {
+                        is_error = true;
+                    }
+                }
 
                 let duration = start.elapsed();
+
+                let (sql, task_metrics) = find_task_history_metrics(&self.spice_client, &trace_id)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("could not find task history metrics. Error: {e}")
+                    })?;
 
                 results.insert(
                     request.id.clone(),
                     TextToSqlResult {
-                        generated_sql: sql,
+                        question: request.question,
+                        generated_sql: generated_sql.or(sql).unwrap_or_default(),
                         expected_sql: request.expected_sql,
-                        number_of_attempts,
                         duration,
                         is_error,
+                        query_count: task_metrics.sql_count,
                         sample_data_enabled: request.sample_data_enabled,
                         return_sql: request.return_sql,
+                        sql_duration_ms: task_metrics.sql_duration_ms,
+                        llm_duration_ms: task_metrics.llm_duration_ms,
+                        llm_count: task_metrics.llm_count,
+                        llm_input_tokens: task_metrics.llm_input_tokens,
+                        llm_output_tokens: task_metrics.llm_output_tokens,
                     },
                 );
 
-                if last_progress_time.elapsed() >= Duration::from_secs(10) {
-                    let completed = index + 1;
-                    #[expect(clippy::cast_precision_loss)]
-                    let completed_percent = (completed as f64 / total_requests as f64) * 100.0;
+                processed_count += 1;
+                if processed_count.is_multiple_of(10) {
                     println!(
-                        "[TextToSqlWorker]: {completed}/{total_requests} completed ({completed_percent:.1}%)"
+                        "[TextToSqlWorker-{}]: processed {processed_count} requests",
+                        self.id
                     );
-                    last_progress_time = Instant::now();
                 }
             }
 
-            println!("[TextToSqlWorker]: DONE, {total_requests} completed");
+            println!(
+                "[TextToSqlWorker-{}]: DONE, {processed_count} completed",
+                self.id
+            );
 
             Ok(TextToSqlWorkerResult { results })
         })
     }
 }
 
-async fn find_number_of_sql_attempts(spice_client: &spiceai::Client) -> Result<usize> {
-    let data = retry_query_expecting_results(
-        spice_client,
-        "
-SELECT count(1) AS cnt
-FROM runtime.task_history
-WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' order by start_time desc limit 1) and task='sql_query'
-",
-        Duration::from_secs(10),
-    )
-    .await;
-
-    let Some(rb) = data.as_ref().and_then(|s| s.first()) else {
-        return Err(anyhow::anyhow!(
-            "could not find task history for text to SQL"
-        ));
-    };
-    #[expect(clippy::cast_possible_truncation)]
-    #[expect(clippy::cast_sign_loss)]
-    let count = rb
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow::anyhow!("could not downcast input column to Int64Array"))?
-        .value(0) as usize;
-    Ok(count)
-}
-
-async fn find_last_sql_statement(spice_client: &spiceai::Client) -> Result<String> {
-    let data = retry_query_expecting_results(
-        spice_client,
-        "
-SELECT input
-FROM runtime.task_history
-WHERE trace_id=(SELECT trace_id from runtime.task_history where task='nsql' order by start_time desc limit 1)
-  AND task='sql_query'
-ORDER BY end_time DESC
-LIMIT 1",
-        Duration::from_secs(10),
-    )
-    .await;
-
-    let Some(rb) = data.as_ref().and_then(|s| s.first()) else {
-        return Err(anyhow::anyhow!(
-            "could not find last sql_query task in runtime.task_history"
-        ));
+/// Runs a text to SQL HTTP operation. Returns the generated SQL or generated data (based on [`TextToSqlRequest::return_sql`]).
+async fn nsql_request(
+    client: &Client,
+    http_base_url: &str,
+    req: &TextToSqlRequest,
+    trace_id: &TraceId,
+) -> Result<String, reqwest::Error> {
+    let body = json!({
+        "query": req.question,
+        "model": req.model,
+        "sample_data_enabled": req.sample_data_enabled,
+        "stream": false
+    });
+    let accept_header = if req.return_sql {
+        "application/sql"
+    } else {
+        "application/json"
     };
 
-    let sql: String = rb
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow::anyhow!("could not downcast input column to StringArray"))?
-        .value(0)
-        .to_string();
-
-    Ok(sql)
+    client
+        .post(format!("{http_base_url}/v1/nsql"))
+        .header("Content-Type", "application/json")
+        .header("Accept", accept_header)
+        .header("traceparent", format_traceparent(trace_id))
+        .body(body.to_string())
+        .send()
+        .await?
+        .text()
+        .await
 }
 
-async fn retry_query_expecting_results(
-    spice_client: &spiceai::Client,
-    query: &str,
-    wait_for: Duration,
-) -> Option<Vec<RecordBatch>> {
-    use crate::utils::wait_until_true;
-    use tokio::time::sleep;
+/// Generates a random W3C Trace ID.
+fn random_trace_id() -> TraceId {
+    let mut bytes = [0u8; 16];
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut bytes);
 
-    let query = query.to_string();
-    let data = Arc::new(tokio::sync::Mutex::new(None));
+    // Ensure the TraceId is not all zeros
+    if bytes.iter().all(|&b| b == 0) {
+        return random_trace_id();
+    }
 
-    wait_until_true(wait_for, || {
-        let spice_client = spice_client.clone();
-        let query = query.clone();
-        let data = Arc::clone(&data);
-        async move {
-            match spice_client.query(&query).await {
-                Ok(stream) => {
-                    let rb_opt = stream.try_collect::<Vec<RecordBatch>>().await.ok();
-                    let no_data = rb_opt
-                        .as_ref()
-                        .is_none_or(|z| z.first().is_none_or(|rb| rb.num_rows() == 0));
-                    if no_data {
-                        sleep(Duration::from_secs(1)).await;
-                        false
-                    } else {
-                        *data.lock().await = rb_opt;
-                        true
-                    }
-                }
-                Err(_) => false,
-            }
-        }
-    })
-    .await;
+    TraceId::from_bytes(bytes)
+}
 
-    (data.lock().await).clone()
+/// Formats a W3C traceparent header value.
+fn format_traceparent(trace_id: &TraceId) -> String {
+    use std::fmt::Write;
+    // Format: version-traceid-parentid-flags
+    // version: 00, parentid: random 16 hex chars, flags: 01 (sampled)
+    let mut parent_bytes = [0u8; 8];
+    rand::rng().fill_bytes(&mut parent_bytes);
+    let parent_id = parent_bytes
+        .iter()
+        .fold(String::with_capacity(16), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+    format!("00-{trace_id}-{parent_id}-01")
 }

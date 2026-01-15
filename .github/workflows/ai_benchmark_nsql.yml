@@ -48,8 +48,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: darwin
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
@@ -57,12 +55,10 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced
-        if: matrix.target.target_os != 'darwin'
         run: |
           make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
 
       - name: make spiced executable
-        if: matrix.target.target_os != 'windows'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced

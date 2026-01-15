@@ -1005,6 +1005,88 @@ impl MetadataCatalog for CayenneCatalog {
             source: Box::new(e),
         })
     }
+
+    async fn drop_table(&self, table_name: &str) -> CatalogResult<bool> {
+        // First check if the table exists and get its ID
+        let table_id: Option<i64> = self
+            .metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
+                    params: vec![MetastoreValue::Text(table_name.to_string())],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .ok();
+
+        let Some(table_id) = table_id else {
+            return Ok(false); // Table doesn't exist
+        };
+
+        // Delete all related metadata in order (respect foreign key constraints)
+        // 1. Delete insert records
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
+                params: vec![MetastoreValue::Integer(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete insert records.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 2. Delete snapshot sequences
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_sequence WHERE table_id = ?1",
+                params: vec![MetastoreValue::Integer(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete snapshot sequences.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 3. Delete delete files
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_delete_file WHERE table_id = ?1",
+                params: vec![MetastoreValue::Integer(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete delete files.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 4. Delete partitions
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_partition WHERE table_id = ?1",
+                params: vec![MetastoreValue::Integer(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete partitions.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 5. Finally delete the table itself
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_table WHERE table_id = ?1",
+                params: vec![MetastoreValue::Integer(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete table.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

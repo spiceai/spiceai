@@ -42,36 +42,19 @@ env:
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
-  # a sucess when skipped).
+  # a success when skipped).
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: spiceai-macos
     outputs:
-      relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
+      relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 0
 
-      - name: Detect all code changes
-        id: changed-code-files
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
-        with:
-          filters: |
-            code_changes:
-              - 'crates/**'
-              - 'bin/**'
-              - 'test/**'
-              - 'tools/**'
-              - 'install/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'go.mod'
-              - 'go.sum'
-
-      - name: Check for relevant changes
-        id: check_changes
-        run: |
-          echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
 
   build:
     name: Build Test Binary
@@ -97,8 +80,6 @@ jobs:
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Set up make
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -108,37 +89,24 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      - name: Check if sccache can be set up
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
-
       - name: Set up sccache
-        if: ${{ env.SCCACHE_SETUP == 'true' && needs.check_changes.outputs.relevant_changes == 'true' }}
+        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          os: 'linux'
 
-      - name: Install Nextest
+      - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: ./.github/actions/setup-nextest
 
       # Build the test binaries without running tests
       - name: Build integration test archives
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
-          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          CARGO_INCREMENTAL: 0
+          RUSTC_WRAPPER: sccache
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          CARGO_INCREMENTAL: 0
         run: |
           set -euo pipefail
 
@@ -222,8 +190,6 @@ jobs:
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Install Oracle ODPI-C
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -237,10 +203,9 @@ jobs:
           name: integration-test-archive
           path: ./integration_test
 
-      - name: Install Nextest
+      - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -400,8 +365,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Download AWS SDK test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -409,9 +372,8 @@ jobs:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
@@ -443,8 +405,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Download AWS SDK credential bridge test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -452,9 +412,8 @@ jobs:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
@@ -490,8 +449,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Download data components test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -499,9 +456,8 @@ jobs:
           name: integration-data-components-test-archive
           path: ./data_components_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Run data components integration test
         env:
@@ -522,8 +478,6 @@ jobs:
           fetch-depth: 1
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: 'linux'
 
       - name: Download partition table test archive
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -531,9 +485,8 @@ jobs:
           name: integration-partition-table-test-archive
           path: ./partition_table_test
 
-      - name: Install Nextest
-        run: |
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
@@ -552,7 +505,7 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./partition_table_test/partition_table_test.tar.zst
-      
+
       - name: Configure Git
         if: github.event.inputs.update_snapshots == 'always'
         run: |

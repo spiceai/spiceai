@@ -18,5 +18,7 @@ limitations under the License.
 pub mod clickhouseconn;
 #[cfg(feature = "odbc")]
 pub mod odbcconn;
+#[cfg(feature = "scylladb")]
+pub mod scylladbconn;
 #[cfg(feature = "snowflake")]
 pub mod snowflakeconn;
