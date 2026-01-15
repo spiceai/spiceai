@@ -117,6 +117,65 @@ datasets:
 - Efficient upserts with sequence-number ordering
 - No full-file rewrites on updates
 
+## Use Case 6: Wide Tables (Many Columns)
+
+**The Problem:** Tables with hundreds or thousands of columns are common in ML feature stores, IoT telemetry, and denormalized analytics. Traditional formats struggle—Parquet's metadata parsing becomes a bottleneck, and most queries only touch a few columns.
+
+**The Vortex Solution:** Vortex's zero-copy/zero-parse metadata design handles wide tables efficiently. Column projection is instantaneous, and per-column statistics enable aggressive pruning.
+
+**Benefits:**
+- Zero-copy metadata access—no parsing overhead regardless of column count
+- Efficient column projection (read only what you need)
+- Per-column statistics for selective reads
+- 100× faster random access vs. Parquet on wide tables
+
+**Example workloads:**
+- ML feature stores with 1000+ features
+- IoT sensor arrays with hundreds of measurements
+- Denormalized star schemas for analytics
+
+## Use Case 7: AI and ML Data Pipelines
+
+**The Problem:** AI workloads need fast data access for training, inference, and embedding retrieval. Traditional formats create bottlenecks: slow reads during training, high latency for feature serving, inefficient vector storage.
+
+**The Vortex Solution:** Vortex's fast decode speeds and Arrow-native design integrate seamlessly with ML frameworks. Combined with Spice's vector search capabilities, it enables unified data + AI pipelines.
+
+**Benefits:**
+- Fast batch reads for training data loading
+- Low-latency feature serving for inference
+- Efficient storage for embeddings and vectors
+- Direct Arrow integration with PyTorch, TensorFlow, and Polars
+- Unified storage for structured data and AI artifacts
+
+**Example workloads:**
+- Training data caching for ML pipelines
+- Feature stores with fast lookup
+- RAG systems with embedding storage
+- Model inference with real-time feature retrieval
+
+## Use Case 8: Data Engines and Query Systems
+
+**The Problem:** Building a data engine requires a storage layer that's fast, extensible, and integrates cleanly with query planners. Parquet is ubiquitous but slow; Arrow IPC is fast but uncompressed.
+
+**The Vortex Solution:** Vortex was designed for embedding in data engines. Its DataFusion integration, pluggable encoding system, and statistics-driven optimization make it ideal as a storage backend.
+
+**How Spice Uses Vortex (Cayenne):**
+- SQLite for transactional metadata (schemas, snapshots, file references)
+- Vortex for columnar data storage
+- DataFusion for query execution
+- Multi-file architecture for concurrent access
+
+**Benefits:**
+- Native DataFusion integration via `vortex-datafusion`
+- Pluggable compression strategies
+- Rich statistics for query optimization
+- Clean separation of metadata and data concerns
+
+**Other engines exploring Vortex:**
+- Spark integration (via vortex-spark)
+- DuckDB interoperability (via Arrow)
+- Custom analytics engines built on DataFusion
+
 ## When NOT to Use Vortex
 
 Not every workload benefits from Vortex acceleration:
@@ -150,72 +209,76 @@ Choose alternatives when:
 
 ## LinkedIn Post (~3000 characters)
 
-📊 5 Use Cases Where Vortex-Based Acceleration Shines
+📊 8 Use Cases Where Vortex Shines (And Why We Built Cayenne On It)
 
-At Spice AI, we've deployed Cayenne (our Vortex-backed accelerator) across dozens of production workloads. Here's where it delivers the biggest wins:
+At Spice AI, we chose Vortex as the storage layer for Cayenne, our data accelerator. Here's where it delivers the biggest wins:
 
-1️⃣ Real-Time Dashboards
+1️⃣ Wide Tables (Many Columns)
 
-Traditional BI hits a wall: pre-aggregate and lose flexibility, or query sources directly and wait seconds. Cayenne gives you both—sub-100ms queries with 10-second data freshness. No pre-aggregation required, dashboards stay flexible.
+ML feature stores, IoT telemetry, denormalized analytics—hundreds or thousands of columns. Parquet's metadata parsing becomes a bottleneck. Vortex? Zero-copy/zero-parse metadata. 100× faster random access. Column projection is instantaneous.
 
-The secret: Vortex's zero-copy Arrow decompression eliminates the serialization overhead that kills dashboard performance.
+2️⃣ AI & ML Pipelines
 
-2️⃣ Data Lake Acceleration
+Fast batch reads for training. Low-latency feature serving. Efficient embedding storage. Direct Arrow integration with PyTorch, Polars, and TensorFlow. Unified storage for structured data + AI artifacts.
 
-Parquet in S3 is cheap to store, expensive to query. Full table scans take minutes. We've seen 10-50× query speedups by materializing hot data into Cayenne.
+3️⃣ Data Engine Storage Layer
 
-Why it works: Vortex's encoding-efficient compression beats generic codecs. Dictionary encoding for strings, delta for timestamps, RLE for sorted data—each column gets optimal treatment.
+Building a query engine? Vortex was designed for embedding. Native DataFusion integration, pluggable encodings, rich statistics for optimization. It's how we built Cayenne: SQLite for metadata, Vortex for data, DataFusion for queries.
 
-3️⃣ High-Concurrency APIs
+4️⃣ Real-Time Dashboards
 
-When 100+ concurrent queries hit your analytical backend, single-file databases choke. Cayenne's multi-file architecture eliminates contention. SQLite metadata coordination is microseconds, not milliseconds.
+Sub-100ms queries with 10-second data freshness. No pre-aggregation required. Zero-copy Arrow decompression eliminates serialization overhead.
 
-Real result: APIs that scaled to 10 QPS now handle 500+ without degradation.
+5️⃣ Data Lake Acceleration
 
-4️⃣ Time-Series Workloads
+Parquet in S3 is cheap but slow. Materialize hot data into Vortex for 10-50× query speedups. Each column gets optimal encoding—dictionary, delta, RLE, FSST.
 
-Time-series data begs for specialized treatment. Timestamps compress to 2-4 bits per value via delta encoding. Sort by time, and segment statistics enable sub-millisecond partition pruning.
+6️⃣ High-Concurrency APIs
 
-The pattern: sensor data, metrics, events, logs—anything with a timestamp primary axis.
+Single-file databases choke at 100+ concurrent queries. Vortex's multi-file architecture + SQLite metadata coordination scales to 500+ QPS.
 
-5️⃣ CDC & Upsert Streams
+7️⃣ Time-Series Data
 
-Debezium-style CDC needs update/delete support. Columnar formats are typically append-only. Cayenne's deletion vectors solve this—ACID semantics without rewriting files.
+Delta encoding compresses timestamps to 2-4 bits per value. Sort by time for sub-millisecond partition pruning. Perfect for metrics, logs, IoT.
 
-Sequence numbers handle the tricky case: delete then re-insert the same key. The insert wins if it came later.
+8️⃣ CDC & Upsert Streams
 
-When to skip it:
-• OLTP workloads → use PostgreSQL
-• Key-value lookups → use Redis
-• Full-text search → use Elasticsearch
-• Tiny datasets → keep in memory
+Deletion vectors provide ACID semantics without rewriting files. Sequence numbers enable proper upsert handling.
 
-The decision framework is simple: analytical patterns + query performance bottleneck + concurrent access = Cayenne with Vortex.
+What makes Vortex different?
 
-What workloads are you accelerating? We'd love to hear about your patterns.
+It's not just faster Parquet—it's a fundamentally different approach. Type-aware encoding (FastLanes for integers, ALP for floats, FSST for strings). Zero-copy Arrow access. Statistics-driven optimization. And it's designed for embedding in engines, not just file storage.
+
+When NOT to use it: OLTP, key-value lookups, full-text search, tiny datasets.
+
+What data challenges are you facing? We'd love to hear your patterns.
 
 ---
 
 ## X Post (280 characters)
 
-📊 5 use cases where Vortex shines:
+📊 8 Vortex use cases:
 
-1. Real-time dashboards (sub-100ms)
-2. Data lake acceleration (10-50× faster)
-3. High-concurrency APIs (500+ QPS)
-4. Time-series (delta encoding FTW)
-5. CDC streams (ACID deletes)
+1. Wide tables (100× faster metadata)
+2. AI/ML pipelines (Arrow-native)
+3. Data engine storage
+4. Real-time dashboards
+5. Data lake acceleration
+6. High-concurrency APIs
+7. Time-series
+8. CDC streams
 
-When NOT: OLTP, key-value, tiny data.
+Built for engines, not just files.
 
 ---
 
 ## Reply with References
 
 References:
-• Cayenne documentation: spiceai.org/docs/components/data-accelerators/cayenne
 • Vortex GitHub: github.com/vortex-data/vortex
+• Vortex docs: docs.vortex.dev
+• Cayenne documentation: spiceai.org/docs/components/data-accelerators/cayenne
 • Apache Arrow: arrow.apache.org
-• Debezium (CDC): debezium.io
-• TimescaleDB: timescale.com
+• Apache DataFusion: datafusion.apache.org
+• Vortex Spark integration: central.sonatype.com/artifact/dev.vortex/vortex-spark
 • Part 1 (Research): [link to Part 1 post]
