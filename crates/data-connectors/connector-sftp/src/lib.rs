@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,32 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{
-    component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
-    register_data_connector,
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::listing::{self, LISTING_TABLE_PARAMETERS, ListingTableConnector};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    NewDataConnectorResult,
 };
-
+use runtime::parameters::{ParameterSpec, Parameters};
+use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use url::Url;
-
-use super::{ConnectorComponent, ConnectorParams};
-use super::{
-    DataConnector, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
-    listing::{self, ListingTableConnector},
-};
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to parse URL {url}: {source}"))]
-    UnableToParseURL {
-        url: String,
-        source: url::ParseError,
-    },
-}
 
 #[derive(Debug)]
 pub struct SFTP {
@@ -52,7 +40,7 @@ impl std::fmt::Display for SFTP {
     }
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct SFTPFactory {}
 
 impl SFTPFactory {
@@ -88,7 +76,7 @@ impl DataConnectorFactory for SFTPFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let sftp = SFTP {
                 params: params.parameters,
@@ -125,21 +113,21 @@ impl ListingTableConnector for SFTP {
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
-        let mut ftp_url =
-            Url::parse(url)
-                .boxed()
-                .context(super::InvalidConfigurationSnafu {
-                    dataconnector: format!("{self}"),
-                    message: format!("The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/ftp"),
-                    connector_component: ConnectorComponent::from(dataset)
-                })?;
+        let mut sftp_url = Url::parse(url).boxed().map_err(|source| {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/sftp"),
+                connector_component: ConnectorComponent::from(dataset),
+                source,
+            }
+        })?;
 
-        ftp_url.set_fragment(Some(&listing::build_fragments(
+        sftp_url.set_fragment(Some(&listing::build_fragments(
             &self.params,
             vec!["port", "user", "pass", "client_timeout"],
         )));
 
-        Ok(ftp_url)
+        Ok(sftp_url)
     }
 }
 

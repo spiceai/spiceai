@@ -17,6 +17,7 @@ connector-dremio = { path = "../../crates/data-connectors/connector-dremio", opt
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
 connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
+connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optional = true }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
@@ -126,7 +127,7 @@ postgres-accel = ["runtime/postgres-accel"]
 postgres-write = ["runtime/postgres-write"]
 release = []
 scylladb = ["connector-scylladb", "runtime/scylladb"]
-sftp = ["runtime/sftp"]
+sftp = ["connector-sftp", "runtime/sftp"]
 sharepoint = ["connector-sharepoint", "runtime/sharepoint"]
 smb = ["runtime/smb"]
 snapshots = ["runtime/snapshots"]

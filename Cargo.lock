@@ -3938,6 +3938,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-sftp"
+version = "1.11.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "connector-sharepoint"
 version = "1.11.0-unstable"
 dependencies = [
@@ -16763,6 +16775,7 @@ dependencies = [
  "connector-oracle",
  "connector-postgres",
  "connector-scylladb",
+ "connector-sftp",
  "connector-sharepoint",
  "connector-snowflake",
  "connector-spark",
@@ -16845,6 +16858,7 @@ dependencies = [
  "connector-oracle",
  "connector-postgres",
  "connector-scylladb",
+ "connector-sftp",
  "connector-sharepoint",
  "connector-snowflake",
  "connector-spark",

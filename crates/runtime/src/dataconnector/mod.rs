@@ -158,8 +158,6 @@ pub mod iceberg;
 pub mod imap;
 pub mod parameters;
 pub mod s3;
-#[cfg(feature = "ftp")]
-pub mod sftp;
 pub mod sink;
 #[cfg(feature = "smb")]
 pub mod smb;
