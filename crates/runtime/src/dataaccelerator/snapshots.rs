@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
-use crate::dataaccelerator::WasBootstrapped;
+use crate::dataaccelerator::BootstrapStatus;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
@@ -36,9 +36,9 @@ pub(super) async fn download_snapshot_if_needed(
     source: &dyn AccelerationSource,
     path: PathBuf,
     engine: AccelerationEngine,
-) -> WasBootstrapped {
+) -> BootstrapStatus {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
-        return WasBootstrapped::no();
+        return BootstrapStatus::none();
     }
 
     if path.exists() {
@@ -46,7 +46,7 @@ pub(super) async fn download_snapshot_if_needed(
             "Acceleration already exists at {}, skipping snapshot download",
             path.display()
         );
-        return WasBootstrapped::no();
+        return BootstrapStatus::none();
     }
 
     let dataset_name = source.name().to_string();
@@ -89,16 +89,16 @@ pub(super) async fn download_snapshot_if_needed(
                     bytes_downloaded,
                     &checksum,
                 );
-                WasBootstrapped::yes()
+                BootstrapStatus::bootstrapped()
             }
-            Ok(None) => WasBootstrapped::no(),
+            Ok(None) => BootstrapStatus::none(),
             Err(e) => {
                 tracing::error!("Failed to download snapshot: {}", e);
-                WasBootstrapped::no()
+                BootstrapStatus::none()
             }
         }
     } else {
-        WasBootstrapped::no()
+        BootstrapStatus::none()
     }
 }
 

@@ -376,8 +376,8 @@ pub trait DataAccelerator: Send + Sync {
     async fn init(
         &self,
         _source: &dyn AccelerationSource,
-    ) -> Result<WasBootstrapped, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(WasBootstrapped::no())
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(BootstrapStatus::none())
     }
 
     /// Check if the accelerator is initialized for a component
@@ -661,22 +661,25 @@ async fn get_registered_accelerator(
 /// Indicates whether a data accelerator was bootstrapped (initialized from existing data)
 /// during initialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WasBootstrapped(bool);
+pub enum BootstrapStatus {
+    Bootstrapped,
+    None,
+}
 
-impl WasBootstrapped {
+impl BootstrapStatus {
     #[must_use]
-    pub const fn yes() -> Self {
-        Self(true)
+    pub const fn bootstrapped() -> Self {
+        Self::Bootstrapped
     }
 
     #[must_use]
-    pub const fn no() -> Self {
-        Self(false)
+    pub const fn none() -> Self {
+        Self::None
     }
 
     #[must_use]
-    pub const fn is_bootstrapped(&self) -> bool {
-        self.0
+    pub fn is_bootstrapped(&self) -> bool {
+        matches!(self, BootstrapStatus::Bootstrapped)
     }
 }
 
