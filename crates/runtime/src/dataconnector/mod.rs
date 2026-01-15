@@ -156,8 +156,6 @@ pub mod memory;
 pub mod nfs;
 #[cfg(feature = "odbc")]
 pub mod odbc;
-#[cfg(feature = "oracle")]
-pub mod oracle;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
 pub mod gcs;

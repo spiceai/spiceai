@@ -16,6 +16,7 @@ connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", opt
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
+connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
 event_stream = { path = "../../crates/event_stream" }
@@ -111,7 +112,7 @@ mssql = ["connector-mssql", "runtime/mssql"]
 mysql = ["connector-mysql", "runtime/mysql"]
 nfs = ["runtime/nfs"]
 odbc = ["runtime/odbc"]
-oracle = ["runtime/oracle"]
+oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]
 postgres-accel = ["runtime/postgres-accel"]

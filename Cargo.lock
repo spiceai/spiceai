@@ -3828,6 +3828,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-oracle"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "once_cell",
+ "paste",
+ "runtime",
+ "runtime-parameters",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
 name = "connector-postgres"
 version = "1.11.0-unstable"
 dependencies = [
@@ -16630,6 +16647,7 @@ dependencies = [
  "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
+ "connector-oracle",
  "connector-postgres",
  "connector-snowflake",
  "event_stream",
@@ -16704,6 +16722,7 @@ dependencies = [
  "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
+ "connector-oracle",
  "connector-postgres",
  "connector-snowflake",
  "regex",

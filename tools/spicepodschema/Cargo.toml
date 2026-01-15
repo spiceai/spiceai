@@ -52,6 +52,7 @@ connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb" }
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb" }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql" }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql" }
+connector-oracle = { path = "../../crates/data-connectors/connector-oracle" }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres" }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake" }
 
