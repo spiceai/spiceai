@@ -18,7 +18,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
-use crate::dataaccelerator::get_primary_keys_from_constraints;
+use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
@@ -314,6 +314,7 @@ pub struct Builder {
     caching_stale_while_revalidate_ttl: Option<Duration>,
     caching_stale_if_error: bool,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    bootstrap_status: BootstrapStatus,
 }
 
 impl Builder {
@@ -354,6 +355,7 @@ impl Builder {
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: false,
             resource_monitor: None,
+            bootstrap_status: BootstrapStatus::none(),
         }
     }
 
@@ -515,6 +517,12 @@ impl Builder {
     /// Set whether to serve expired data on upstream error in cache mode
     pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
         self.caching_stale_if_error = enabled;
+        self
+    }
+
+    /// Set whether the dataset was bootstrapped from a snapshot.
+    pub fn bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
+        self.bootstrap_status = bootstrap_status;
         self
     }
 

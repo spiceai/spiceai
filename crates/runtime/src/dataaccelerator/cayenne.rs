@@ -48,7 +48,7 @@ use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
@@ -1701,7 +1701,7 @@ impl DataAccelerator for CayenneAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         tracing::warn!(
             "Cayenne data accelerator (Alpha) is in preview and should not be used in production."
         );
@@ -1806,7 +1806,7 @@ impl DataAccelerator for CayenneAccelerator {
                 }
             }
 
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         // If mode is FileCreate, delete the existing directory and metadata to start fresh
@@ -1867,16 +1867,16 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            download_snapshot_if_needed(
+            Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
                 path_buf,
                 AccelerationEngine::Cayenne,
             )
-            .await;
+            .await)
+        } else {
+            Ok(BootstrapStatus::none())
         }
-
-        Ok(())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
