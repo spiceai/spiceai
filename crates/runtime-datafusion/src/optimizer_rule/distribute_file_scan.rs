@@ -260,8 +260,7 @@ impl DistributeFileScanOptimizer {
         )?;
 
         // Copy all existing attributes including projection, excluding file groups as they are potentially
-        // expensive to clone for large scans
-        // TODO: Port metadata_cols and object_versioning_type support from spiceai-50 to spiceai-51
+        // expensive to clone for large scans.
         let new_scan = FileScanConfigBuilder::new(
             original_file_scan.object_store_url.clone(),
             Arc::clone(original_file_scan.file_schema()),
@@ -273,6 +272,8 @@ impl DistributeFileScanOptimizer {
         .with_file_compression_type(original_file_scan.file_compression_type)
         .with_file_groups(stage_with_stats)
         .with_limit(original_file_scan.limit)
+        .with_metadata_cols(original_file_scan.metadata_cols.clone())
+        .with_object_versioning_type(original_file_scan.object_versioning_type.clone())
         .with_output_ordering(original_file_scan.output_ordering.clone())
         .with_statistics(agg_stats)
         .with_table_partition_cols(

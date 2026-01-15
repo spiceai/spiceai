@@ -249,8 +249,9 @@ impl ExecutionPlan for UpsertDedupExec {
         let constraints = self.constraints.clone();
         let upsert_options = self.upsert_options.clone();
 
-        // Create a stream that validates constraints on each batch
-        // TODO: Add back deduplication logic when datafusion-table-providers upsert API is ported
+        // Create a stream that validates constraints and applies deduplication to each batch.
+        // The validate_batch_with_constraints function handles both constraint validation and
+        // deduplication based on UpsertOptions (remove_duplicates, last_write_wins).
         let validated_stream = input_stream.then(move |batch_result| {
             let constraints = constraints.clone();
             let upsert_options = upsert_options.clone();

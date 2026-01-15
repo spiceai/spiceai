@@ -106,11 +106,8 @@ impl LocationPruningListingTable {
         &self.inner.options().table_partition_cols
     }
 
-    #[expect(dead_code, clippy::unused_self)]
     fn metadata_columns(&self) -> &Vec<MetadataColumn> {
-        // TODO: Port metadata_cols to DF51 fork's ListingOptions
-        static EMPTY: Vec<MetadataColumn> = Vec::new();
-        &EMPTY
+        &self.inner.options().metadata_cols
     }
 
     fn object_store_url(&self) -> ObjectStoreUrl {
@@ -280,8 +277,9 @@ impl TableProvider for LocationPruningListingTable {
                 .with_file_groups(file_groups)
                 .with_table_partition_cols(partition_fields)
                 .with_projection_indices(projection.cloned())
-                .with_limit(limit);
-        // TODO: Port with_metadata_cols and with_object_versioning_type to DF51 fork
+                .with_limit(limit)
+                .with_metadata_cols(self.inner.options().metadata_cols.clone())
+                .with_object_versioning_type(self.inner.options().object_versioning_type.clone());
 
         if let Some(constraints) = self.inner.constraints() {
             builder = builder.with_constraints(constraints.clone());
@@ -927,7 +925,7 @@ pub trait ListingTableConnector: DataConnector {
         let session_state = ctx.state();
         let mut options = ListingOptions::new(file_format)
             .with_file_extension(extension)
-            // TODO: Port with_object_versioning_type to DF51 fork
+            .with_object_versioning_type(self.object_versioning_type())
             .with_session_config_options(session_state.config());
 
         let resolved_schema = options
@@ -1028,13 +1026,11 @@ pub trait ListingTableConnector: DataConnector {
             return Ok(Arc::new(cached_table));
         }
 
-        let has_location_metadata = false;
-        // TODO: Port metadata_cols to DF51 fork
-        // let has_location_metadata = table_arc
-        //     .options()
-        //     .metadata_cols
-        //     .iter()
-        //     .any(|c| matches!(c, MetadataColumn::Location(_)));
+        let has_location_metadata = table_arc
+            .options()
+            .metadata_cols
+            .iter()
+            .any(|c| matches!(c, MetadataColumn::Location(_)));
 
         if has_location_metadata {
             let wrapped = LocationPruningListingTable::new(
@@ -1180,8 +1176,7 @@ fn add_metadata_columns_if_required(
             dataset.name,
             columns
         );
-        // TODO: Port with_metadata_cols to DF51 fork
-        let _ = columns;
+        return options.with_metadata_cols(columns);
     }
 
     options
@@ -1890,8 +1885,6 @@ mod tests {
         }
     }
 
-    // TODO: Re-enable once with_metadata_cols is ported to DF51 fork
-    #[ignore = "Requires with_metadata_cols to be ported to DF51 fork"]
     #[tokio::test]
     async fn test_location_pruning_skips_listing() {
         let ctx = SessionContext::new();
@@ -1909,11 +1902,9 @@ mod tests {
         let table_path =
             ListingTableUrl::parse("s3://bucket/prefix/").expect("to parse listing table url");
         let file_format = Arc::new(ParquetFormat::default());
-        // TODO: Re-enable once with_metadata_cols is ported to DF51 fork
-        // let mut options = ListingOptions::new(file_format)
-        //     .with_file_extension(".parquet")
-        //     .with_metadata_cols(vec![MetadataColumn::Location(Some("s3://bucket/".into()))]);
-        let mut options = ListingOptions::new(file_format).with_file_extension(".parquet");
+        let mut options = ListingOptions::new(file_format)
+            .with_file_extension(".parquet")
+            .with_metadata_cols(vec![MetadataColumn::Location(Some("s3://bucket/".into()))]);
         options = options.with_table_partition_cols(vec![]);
 
         let file_schema = Arc::new(Schema::new(vec![Field::new(
@@ -1977,8 +1968,6 @@ mod tests {
     /// 2. Insert metadata column `location` at position 0 → [location, compression, day]
     ///
     /// But the correct output should be [location, day, compression].
-    // TODO: Re-enable once with_metadata_cols is ported to DF51 fork
-    #[ignore = "Requires with_metadata_cols to be ported to DF51 fork"]
     #[tokio::test]
     async fn test_location_metadata_column_projection_order() {
         use datafusion::parquet::arrow::ArrowWriter;
@@ -2021,16 +2010,12 @@ mod tests {
 
         // Create listing options with partition columns and location metadata
         let file_format = Arc::new(ParquetFormat::default());
-        // TODO: Re-enable once with_metadata_cols is ported to DF51 fork
-        // let options = ListingOptions::new(file_format)
-        //     .with_file_extension(".parquet")
-        //     .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)])
-        //     .with_metadata_cols(vec![MetadataColumn::Location(Some(
-        //         table_url.clone().into(),
-        //     ))]);
         let options = ListingOptions::new(file_format)
             .with_file_extension(".parquet")
-            .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)]);
+            .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)])
+            .with_metadata_cols(vec![MetadataColumn::Location(Some(
+                table_url.clone().into(),
+            ))]);
 
         // Note: We only provide the file schema here. The ListingTable automatically
         // adds partition columns (day) and metadata columns (location) to form the

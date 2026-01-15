@@ -940,8 +940,9 @@ async fn create_scheduler_server(
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
 
-    // Note: TLS configuration for scheduler gRPC connections removed in ballista DF51 update.
-    // TLS support would need to be re-implemented if required.
+    // NOTE: TLS for scheduler gRPC was removed in ballista DF51 update.
+    // The upstream ballista API no longer supports `override_create_grpc_client_endpoint`.
+    // TODO(datafusion-ballista#51): Port TLS support to DF51 fork when cluster mTLS is needed.
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
