@@ -41,12 +41,9 @@ pub(super) async fn download_snapshot_if_needed(
         return;
     }
 
-    let primary_path = match adapter.primary_path() {
-        Some(path) => path.clone(),
-        None => {
-            tracing::debug!("No primary path for snapshot adapter, skipping download");
-            return;
-        }
+    let Some(primary_path) = adapter.primary_path().cloned() else {
+        tracing::debug!("No primary path for snapshot adapter, skipping download");
+        return;
     };
 
     if primary_path.exists() {

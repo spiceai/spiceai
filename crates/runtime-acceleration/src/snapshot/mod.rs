@@ -1436,8 +1436,7 @@ impl SnapshotManager {
         let extract_target = dirs
             .first()
             .and_then(|(dir, _)| dir.parent())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(std::env::temp_dir);
+            .map_or_else(std::env::temp_dir, std::path::Path::to_path_buf);
 
         // Extract the tar archive to the target directory
         let archive_file = fs::File::open(&temp_archive_path).await.map_err(|source| {
