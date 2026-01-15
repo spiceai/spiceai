@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
 use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
@@ -44,7 +43,6 @@ use datafusion::{
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
@@ -65,10 +63,12 @@ pub mod refresh_task;
 mod refresh_task_runner;
 mod retention;
 mod sink;
+mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
 
 pub use refresh_task_runner::RefreshTaskRunner;
+pub use snapshots::SnapshotCreationConfig;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -278,6 +278,13 @@ fn validate_refresh_data_window(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotCreateTrigger {
+    RefreshComplete,
+    Interval(Duration),
+    Batches(i64),
+}
+
 #[expect(clippy::struct_excessive_bools)]
 pub struct Builder {
     runtime_status: Arc<status::RuntimeStatus>,
@@ -299,10 +306,7 @@ pub struct Builder {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
-    snapshot_behavior: SnapshotBehavior,
-    snapshot_local_path: Option<PathBuf>,
-    snapshots_trigger_threshold: Option<i64>,
-    snapshots_create_interval: Option<Duration>,
+    snapshot_creation_config: Option<SnapshotCreationConfig>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -342,10 +346,7 @@ impl Builder {
             write_to_accelerator_only: false,
             initial_load_complete: false,
             refresh_semaphore: None,
-            snapshot_behavior: SnapshotBehavior::default(),
-            snapshot_local_path: None,
-            snapshots_trigger_threshold: None,
-            snapshots_create_interval: None,
+            snapshot_creation_config: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -488,17 +489,11 @@ impl Builder {
     }
 
     /// Configure whether snapshots are taken of the accelerated table after refreshes.
-    pub fn snapshot_behavior(
+    pub fn snapshot_creation_config(
         &mut self,
-        snapshot_behavior: SnapshotBehavior,
-        snapshot_path: Option<PathBuf>,
-        snapshots_trigger_threshold: Option<i64>,
-        snapshots_create_interval: Option<Duration>,
+        snapshot_config: Option<SnapshotCreationConfig>,
     ) -> &mut Self {
-        self.snapshot_behavior = snapshot_behavior;
-        self.snapshot_local_path = snapshot_path;
-        self.snapshots_trigger_threshold = snapshots_trigger_threshold;
-        self.snapshots_create_interval = snapshots_create_interval;
+        self.snapshot_creation_config = snapshot_config;
         self
     }
 
@@ -648,12 +643,8 @@ impl Builder {
         if let Some(semaphore) = self.refresh_semaphore {
             refresher.semaphore(semaphore);
         }
-        refresher.with_snapshot_behavior(
-            self.snapshot_behavior,
-            self.snapshot_local_path.clone(),
-            self.snapshots_trigger_threshold,
-            self.snapshots_create_interval,
-        );
+
+        refresher.with_snapshot_creation_config(self.snapshot_creation_config);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());

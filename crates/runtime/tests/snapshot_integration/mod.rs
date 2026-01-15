@@ -22,6 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{run_query, runtime_ready_check, test_request_context},
+};
 use anyhow::{Context, Result, anyhow};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -40,9 +44,10 @@ use object_store::{
 };
 use runtime::{Runtime, status::ComponentStatus};
 use runtime_acceleration::snapshot::{
-    SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
+    AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
 use serde_json::{Value, json};
+use spicepod::acceleration::SnapshotsCompaction;
 use spicepod::{
     acceleration::{
         Acceleration, Mode, RefreshOnStartup, SnapshotBehavior as DatasetSnapshotBehavior,
@@ -60,11 +65,6 @@ use tokio::{
     time::{sleep, timeout},
 };
 use uuid::Uuid;
-
-use crate::{
-    configure_test_datafusion, init_tracing,
-    utils::{run_query, runtime_ready_check, test_request_context},
-};
 
 const SNAPSHOT_BUCKET: &str = "spiceai-snapshot-integration-tests";
 const SNAPSHOT_REGION: &str = "us-west-2";
@@ -965,12 +965,14 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 runtime_snapshots,
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),
+                SnapshotsCompaction::Disabled,
             );
 
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
                 fixture.local_db_path.clone(),
+                AccelerationEngine::DuckDB,
             )
             .await
             .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for concurrent test"))?;
@@ -978,7 +980,11 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             let snapshot_results = try_join_all((0..10).map(|_| {
                 let manager_clone = manager.clone();
                 let schema = Arc::clone(&schema);
-                async move { manager_clone.create_snapshot(&schema).await }
+                async move {
+                    let mutex = Arc::new(Mutex::new(()));
+                    let lock_guard = mutex.lock_owned().await;
+                    manager_clone.create_snapshot(&schema, lock_guard).await
+                }
             }))
             .await
             .context("Creating snapshots concurrently")?;
@@ -1046,11 +1052,12 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .and_then(|app| app.snapshots.clone())
                 .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
             let snapshot_behavior =
-                RuntimeSnapshotBehavior::enabled(runtime_snapshots, runtime.secrets_weak(), runtime.tokio_io_runtime());
+                RuntimeSnapshotBehavior::enabled(runtime_snapshots, runtime.secrets_weak(), runtime.tokio_io_runtime(), SnapshotsCompaction::Disabled);
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
                 fixture.local_db_path.clone(),
+                AccelerationEngine::DuckDB,
             )
             .await
             .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?;
@@ -1082,8 +1089,11 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 .context("Cleaning up temporary snapshot modification table")?;
             drop(conn);
 
+            let mutex = Arc::new(Mutex::new(()));
+            let lock_guard = mutex.lock_owned().await;
+
             manager
-                .create_snapshot(&schema)
+                .create_snapshot(&schema, lock_guard)
                 .await
                 .context("Creating modified snapshot after deleting data")?;
 
@@ -1165,6 +1175,243 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             assert_eq!(
                 expected, actual,
                 "Runtime should download and use the snapshot referenced by metadata, not the latest upload"
+            );
+
+            runtime.shutdown().await;
+
+            fixture.cleanup().await
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[expect(clippy::cast_precision_loss)]
+#[tokio::test]
+async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+    test_request_context()
+        .scope(async {
+            let fixture = prepare_duckdb_fixture("snapshot_int_test8").await?;
+            let schema = Arc::clone(fixture.schema());
+
+            // Step 1: Create database fragmentation by inserting and deleting data
+            // We create a separate table to avoid issues with taxi_trips being a view
+            let conn = Connection::open(&fixture.local_db_path)
+                .context("Opening DuckDB file to create fragmentation")?;
+
+            // Create a new table for fragmentation testing
+            conn.execute(
+                "CREATE TABLE frag_test (
+                    id INTEGER,
+                    data VARCHAR,
+                    padding VARCHAR
+                )",
+                [],
+            )
+                .context("Creating fragmentation test table")?;
+
+            // Insert a large amount of data to grow the file
+            // Using generate_series to create bulk data
+            conn.execute(
+                "INSERT INTO frag_test
+                 SELECT i, 'data_' || i, REPEAT('x', 1000)
+                 FROM generate_series(1, 10000) AS t(i)",
+                [],
+            )
+                .context("Inserting initial data for fragmentation")?;
+
+            // Insert more duplicate data multiple times
+            for _ in 0..5 {
+                conn.execute(
+                    "INSERT INTO frag_test SELECT * FROM frag_test WHERE id <= 1000",
+                    [],
+                )
+                    .context("Inserting duplicate data for fragmentation")?;
+            }
+
+            // Delete most rows to create dead tuples (fragmentation)
+            // Keep only the first 100 rows
+            conn.execute(
+                "DELETE FROM frag_test WHERE id > 100",
+                [],
+            )
+                .context("Deleting data to create dead tuples")?;
+
+            // Force checkpoint to flush WAL and materialize fragmentation
+            conn.execute("CHECKPOINT", [])
+                .context("Forcing DuckDB checkpoint")?;
+            drop(conn);
+
+            // Record the fragmented file size
+            let fragmented_size = std::fs::metadata(&fixture.local_db_path)
+                .context("Getting fragmented file size")?
+                .len();
+            tracing::info!(
+                "Fragmented database size: {fragmented_size} bytes. dataset={}",
+                TAXI_TRIPS_DATASET_NAME
+            );
+
+            // Step 2: Create snapshot WITH compaction enabled
+            let dataset = fixture.dataset(
+                DatasetSnapshotBehavior::CreateOnly,
+                RefreshOnStartup::Auto,
+                &[],
+                &[],
+            );
+            let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
+
+            let app = AppBuilder::new("snapshot_int_test8_compaction")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            let runtime_snapshots = runtime
+                .app()
+                .read()
+                .await
+                .as_ref()
+                .and_then(|app| app.snapshots.clone())
+                .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
+
+            // Create snapshot behavior with compaction ENABLED (last param = true)
+            let snapshot_behavior_with_compaction = RuntimeSnapshotBehavior::enabled(
+                Arc::clone(&runtime_snapshots),
+                runtime.secrets_weak(),
+                runtime.tokio_io_runtime(),
+                SnapshotsCompaction::Enabled,
+            );
+
+            let manager_with_compaction = SnapshotManager::try_new(
+                TAXI_TRIPS_DATASET_NAME.to_string(),
+                snapshot_behavior_with_compaction,
+                fixture.local_db_path.clone(),
+                AccelerationEngine::DuckDB,
+            )
+                .await
+                .ok_or_else(|| anyhow!("Failed to create SnapshotManager with compaction enabled"))?;
+
+            // Create compacted snapshot
+            let mutex = Arc::new(Mutex::new(()));
+            let lock_guard = mutex.lock_owned().await;
+
+            let compacted_location = manager_with_compaction
+                .create_snapshot(&schema, lock_guard)
+                .await
+                .context("Creating snapshot with compaction enabled")?;
+
+            tracing::info!(
+                "Created compacted snapshot at: {compacted_location}. dataset={}",
+                TAXI_TRIPS_DATASET_NAME
+            );
+
+            // Wait for compacted snapshot to appear
+            let compacted_objects = fixture
+                .context
+                .wait_for_snapshot_objects(
+                    TAXI_TRIPS_DATASET_NAME,
+                    fixture.initial_snapshot_count + 1,
+                    Duration::from_secs(90),
+                )
+                .await
+                .context("Waiting for compacted snapshot objects")?;
+
+            let compacted_snapshot = compacted_objects
+                .iter()
+                .max_by_key(|obj| obj.last_modified)
+                .ok_or_else(|| anyhow!("No compacted snapshot found in object storage"))?;
+
+            let compacted_size = compacted_snapshot.size;
+            tracing::info!(
+                "Compacted snapshot size: {compacted_size} bytes. dataset={}",
+                TAXI_TRIPS_DATASET_NAME
+            );
+
+            // Step 3: Verify compaction reduced the file size
+            // The compacted file should be smaller because COPY FROM DATABASE
+            // creates a fresh database without dead tuples
+            assert!(
+                compacted_size < fragmented_size,
+                "Compacted snapshot ({compacted_size} bytes) should be smaller than \
+                 fragmented database ({fragmented_size} bytes). \
+                 Compaction should remove dead tuples created by DELETE operations."
+            );
+
+            let size_reduction_percent =
+                ((fragmented_size - compacted_size) as f64 / fragmented_size as f64) * 100.0;
+            tracing::info!(
+                "Compaction reduced size by {size_reduction_percent:.1}%. \
+                 fragmented={fragmented_size} compacted={compacted_size} dataset={}",
+                TAXI_TRIPS_DATASET_NAME
+            );
+
+            runtime.shutdown().await;
+
+            // Step 4: Verify the compacted snapshot can be downloaded and used
+            remove_existing_local_files(&fixture.local_db_path);
+
+            // Update metadata to reference the compacted snapshot
+            let updated_metadata = build_metadata_document(
+                &fixture.context,
+                TAXI_TRIPS_DATASET_NAME,
+                &compacted_objects,
+                &schema,
+            );
+            fixture
+                .context
+                .write_metadata(&updated_metadata)
+                .await
+                .context("Writing metadata for compacted snapshot")?;
+
+            let dataset = fixture.dataset(
+                DatasetSnapshotBehavior::Enabled,
+                RefreshOnStartup::Auto,
+                &[],
+                &[],
+            );
+            let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
+
+            let app = AppBuilder::new("snapshot_int_test8_bootstrap_compacted")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            // Query the bootstrapped data
+            let results = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+                .await
+                .context("Querying dataset bootstrapped from compacted snapshot")?;
+
+            let expected = fixture.baseline_pretty()?;
+            let actual = pretty_format_batches(&results)
+                .map(|fmt| fmt.to_string())
+                .context("Formatting results from compacted snapshot")?;
+
+            assert_eq!(
+                expected, actual,
+                "Data from compacted snapshot should match baseline"
+            );
+
+            // Verify row count is preserved (compaction shouldn't lose data)
+            let count_results = run_query(&runtime, "SELECT COUNT(*) as cnt FROM taxi_trips")
+                .await
+                .context("Counting rows in bootstrapped dataset")?;
+
+            assert!(
+                !count_results.is_empty(),
+                "Should have count results from compacted snapshot"
             );
 
             runtime.shutdown().await;
