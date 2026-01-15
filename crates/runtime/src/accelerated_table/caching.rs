@@ -1307,8 +1307,147 @@ mod tests {
     use super::*;
     use arrow::array::{Int32Array, RecordBatch, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use async_trait::async_trait;
+    use datafusion::catalog::Session;
+    use datafusion::datasource::TableType;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::physical_plan::ExecutionPlan;
+    use parking_lot::RwLock;
+    use std::any::Any;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+
+    /// Mock `TableProvider` that records filters passed to `scan()` for verification.
+    #[derive(Debug)]
+    struct FilterTrackingTableProvider {
+        schema: SchemaRef,
+        /// Data to return from scan
+        data: Vec<RecordBatch>,
+        /// Record of all filter sets passed to `scan()` calls
+        recorded_filters: Arc<RwLock<Vec<Vec<String>>>>,
+    }
+
+    impl FilterTrackingTableProvider {
+        fn new(schema: SchemaRef, data: Vec<RecordBatch>) -> Self {
+            Self {
+                schema,
+                data,
+                recorded_filters: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+
+        fn get_recorded_filters(&self) -> Vec<Vec<String>> {
+            self.recorded_filters.read().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for FilterTrackingTableProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            // Record the filters for later verification
+            let filter_strings: Vec<String> = filters
+                .iter()
+                .map(|f| f.human_display().to_string())
+                .collect();
+            self.recorded_filters.write().push(filter_strings);
+
+            // Return the configured data
+            Ok(Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[self.data.clone()], Arc::clone(&self.schema), None)?,
+            ))))
+        }
+    }
+
+    /// Mock accelerator that supports `insert_into` for upsert operations.
+    /// Tracks what data was written to it.
+    #[derive(Debug)]
+    struct MockAcceleratorTableProvider {
+        schema: SchemaRef,
+        /// Current data in the accelerator
+        data: Arc<RwLock<Vec<RecordBatch>>>,
+    }
+
+    impl MockAcceleratorTableProvider {
+        fn new(schema: SchemaRef, initial_data: Vec<RecordBatch>) -> Self {
+            Self {
+                schema,
+                data: Arc::new(RwLock::new(initial_data)),
+            }
+        }
+
+        fn get_data(&self) -> Vec<RecordBatch> {
+            self.data.read().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for MockAcceleratorTableProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let data = self.data.read().clone();
+            Ok(Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[data], Arc::clone(&self.schema), None)?,
+            ))))
+        }
+
+        async fn insert_into(
+            &self,
+            _state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            overwrite: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            // Execute the input plan to get the data
+            let task_ctx = Arc::new(datafusion::execution::context::TaskContext::default());
+            let batches = datafusion::physical_plan::collect(Arc::clone(&input), task_ctx).await?;
+
+            let mut data = self.data.write();
+            if matches!(overwrite, InsertOp::Overwrite) {
+                data.clear();
+            }
+            data.extend(batches);
+
+            // Return an empty exec as we don't need output
+            Ok(Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![]], Arc::clone(&self.schema), None)?,
+            ))))
+        }
+    }
 
     fn create_test_schema_with_refresh_timestamp() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1894,6 +2033,224 @@ mod tests {
             filter_sets.len(),
             2,
             "Should deduplicate 5 identical rows + 1 different row into 2 filter sets"
+        );
+    }
+
+    /// Verifies the SWR flow through `handle_cache_hit`.
+    /// This ensures that when stale data is accessed, the background refresh uses
+    /// `refresh_entry` with the specific access filters (not all cached entries).
+    ///
+    /// Test flow:
+    /// 1. Create stale cached data for multiple entries
+    /// 2. Call `handle_cache_hit` with filters for ONE specific entry
+    /// 3. Wait for background refresh to complete
+    /// 4. Verify federated source was called with ONLY the specific entry's filters
+    /// 5. Verify accelerator received the fresh data (rows were updated)
+    #[tokio::test]
+    async fn test_swr_handle_cache_hit_refreshes_only_accessed_entry() {
+        // Create schema with request columns (HTTP connector cache pattern)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("data", DataType::Utf8, true),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+
+        // Create fresh data that the federated source will return when refreshing
+        let fresh_data = {
+            let path = StringArray::from(vec!["/api/users"]);
+            let query = StringArray::from(vec!["id=1"]);
+            let data = StringArray::from(vec!["fresh_user_data"]);
+
+            #[expect(clippy::cast_possible_truncation)]
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos() as i64;
+            let timestamp = TimestampNanosecondArray::from(vec![Some(now)]);
+
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(path),
+                    Arc::new(query),
+                    Arc::new(data),
+                    Arc::new(timestamp),
+                ],
+            )
+            .expect("Should create batch")
+        };
+
+        // Create mock federated source that tracks filters
+        let federated = Arc::new(FilterTrackingTableProvider::new(
+            Arc::clone(&schema),
+            vec![fresh_data],
+        ));
+
+        // Create stale cached data - MULTIPLE entries in the cache, ALL stale
+        // This tests that only the ACCESSED entry gets refreshed, not all stale entries
+        let stale_cached_data = {
+            // 3 stale entries: /api/users?id=1, /api/posts?id=2, /api/comments?id=3
+            // All fetched 2 minutes ago (TTL is 60s), so all are stale
+            let path = StringArray::from(vec!["/api/users", "/api/posts", "/api/comments"]);
+            let query = StringArray::from(vec!["id=1", "id=2", "id=3"]);
+            let data = StringArray::from(vec![
+                "stale_user_data",
+                "stale_post_data",
+                "stale_comment_data",
+            ]);
+
+            #[expect(clippy::cast_possible_truncation)]
+            let two_min_ago = (SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos()
+                - Duration::from_secs(120).as_nanos()) as i64;
+            // All entries have the same stale timestamp
+            let timestamp = TimestampNanosecondArray::from(vec![
+                Some(two_min_ago),
+                Some(two_min_ago),
+                Some(two_min_ago),
+            ]);
+
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(path),
+                    Arc::new(query),
+                    Arc::new(data),
+                    Arc::new(timestamp),
+                ],
+            )
+            .expect("Should create batch")
+        };
+
+        // Create accelerator with all stale entries
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![stale_cached_data.clone()],
+        ));
+
+        // Define filters for accessing ONLY ONE specific entry (/api/users?id=1)
+        // The other stale entries (/api/posts, /api/comments) should NOT be refreshed
+        let access_filters = vec![
+            col("request_path").eq(lit("/api/users")),
+            col("request_query").eq(lit("id=1")),
+        ];
+
+        let max_age = Some(Duration::from_secs(60)); // 60 second TTL
+        let stale_while_revalidate = Some(Duration::from_secs(300)); // 5 minute SWR window
+        let accelerator_write_mutex = Arc::new(Mutex::new(()));
+        let in_flight_revalidations: InFlightRevalidations =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        // Create a tokio runtime handle for the background task
+        let io_runtime = tokio::runtime::Handle::current();
+
+        // Call handle_cache_hit - this should:
+        // 1. Return the stale data immediately
+        // 2. Spawn a background task to refresh ONLY the accessed entry
+        let _stream = CacheRefreshHelper::handle_cache_hit(
+            vec![stale_cached_data],
+            &(Arc::clone(&federated) as Arc<dyn TableProvider>),
+            &(Arc::clone(&accelerator) as Arc<dyn TableProvider>),
+            "test_dataset",
+            max_age,
+            stale_while_revalidate,
+            &io_runtime,
+            Arc::clone(&schema),
+            &accelerator_write_mutex,
+            &access_filters,
+            &in_flight_revalidations,
+        )
+        .await;
+
+        // Wait for background refresh to complete
+        // The background task runs asynchronously, so we need to give it time
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Verify the federated source was called with the SPECIFIC filters only
+        let recorded = federated.get_recorded_filters();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "Federated source should be called exactly once for the accessed entry. \
+             If called 0 times, the refresh didn't trigger. \
+             If called >1 times, multiple entries were refreshed (old buggy behavior)."
+        );
+
+        let filter_strs = &recorded[0];
+
+        // The key assertion: verify filters match ONLY the ACCESSED entry
+        let has_users_path = filter_strs
+            .iter()
+            .any(|f| f.contains("request_path") && f.contains("/api/users"));
+        let has_id_query = filter_strs
+            .iter()
+            .any(|f| f.contains("request_query") && f.contains("id=1"));
+
+        assert!(
+            has_users_path && has_id_query,
+            "Background refresh should use filters for the ACCESSED entry (/api/users?id=1). \
+             Got filters: {filter_strs:?}"
+        );
+
+        // Verify that OTHER stale entries were NOT included in the refresh
+        // This is the key test: with the bug, all 3 stale entries would be refreshed
+        let has_posts_path = filter_strs.iter().any(|f| f.contains("/api/posts"));
+        let has_comments_path = filter_strs.iter().any(|f| f.contains("/api/comments"));
+
+        assert!(
+            !has_posts_path && !has_comments_path,
+            "Background refresh should NOT include other stale entries (/api/posts, /api/comments). \
+             Only the accessed entry should be refreshed. Got filters: {filter_strs:?}"
+        );
+
+        // Verify in-flight tracking was cleaned up
+        let in_flight = in_flight_revalidations.lock().await;
+        assert!(
+            in_flight.is_empty(),
+            "In-flight revalidation set should be empty after refresh completes"
+        );
+        drop(in_flight);
+
+        // Verify the accelerator received the fresh data
+        let accelerator_data = accelerator.get_data();
+        assert!(
+            !accelerator_data.is_empty(),
+            "Accelerator should have data after refresh"
+        );
+
+        // Find the data column and verify it contains fresh data
+        let mut found_fresh_data = false;
+        for batch in &accelerator_data {
+            if let Ok(data_col_idx) = batch.schema().index_of("data") {
+                let data_array = batch
+                    .column(data_col_idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>();
+                if let Some(arr) = data_array {
+                    for i in 0..arr.len() {
+                        if arr.value(i) == "fresh_user_data" {
+                            found_fresh_data = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if found_fresh_data {
+                break;
+            }
+        }
+
+        assert!(
+            found_fresh_data,
+            "Accelerator should contain fresh data ('fresh_user_data') after background refresh. \
+             Current data: {accelerator_data:?}"
         );
     }
 }
