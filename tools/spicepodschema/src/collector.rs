@@ -31,6 +31,7 @@ use runtime_parameters::ParameterSpec;
 // Without these references, the linker may not include the modules and their
 // `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
 use connector_clickhouse as _;
+use connector_delta_lake as _;
 use connector_dremio as _;
 use connector_duckdb as _;
 use connector_flightsql as _;

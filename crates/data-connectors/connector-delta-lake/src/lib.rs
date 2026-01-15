@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,22 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, register_data_connector};
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::delta_lake::DeltaTableFactory;
 use datafusion::datasource::TableProvider;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
+use runtime::parameters::{ParameterSpec, Parameters};
+use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
-    Parameters,
-};
 
 #[derive(Debug)]
 pub struct DeltaLake {
@@ -116,7 +117,7 @@ impl DataConnectorFactory for DeltaLakeFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         let param_map = params.parameters.to_secret_map();
         Box::pin(async move {
             // Initialize AWS SDK credentials if not using explicit credentials
@@ -154,15 +155,15 @@ impl DataConnector for DeltaLake {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.delta_table_factory, dataset.path().into())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "delta_lake",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?,
-        )
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        match Read::table_provider(&self.delta_table_factory, dataset.path().into()).await {
+            Ok(provider) => Ok(provider),
+            Err(e) => Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "delta_lake".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e.into(),
+            }),
+        }
     }
 }
 

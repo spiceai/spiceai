@@ -132,8 +132,6 @@ pub mod abfs;
 pub mod databricks;
 #[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "delta_lake")]
-pub mod delta_lake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
