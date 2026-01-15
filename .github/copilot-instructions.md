@@ -182,8 +182,8 @@ let total = value.unwrap_or(0); // Only if business logic allows
 // GOOD - validate transformations
 debug_assert_eq!(input_batch.num_rows(), output_batch.num_rows(), "Row count mismatch after transform");
 
-// BAD - ignoring NULL semantics
-let value: i64 = row.get("amount").unwrap(); // Panics on NULL!
+// GOOD - propagate error instead of panicking on NULL
+let value: i64 = row.get("amount").context(AmountNullSnafu)?; // Returns a structured error if NULL
 ```
 
 ### Allocation Minimization
