@@ -195,7 +195,8 @@ impl TextToSqlWorker {
             &request.expected_sql,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("could not compute schema for expected SQL. Error: {e}"))?;
+        .inspect_err(|e| eprintln!("could not compute schema for expected SQL. Error: {e}"))
+        .ok();
 
         let expected_logical_plan = logical_plan(
             self.http_client.clone(),
@@ -205,7 +206,7 @@ impl TextToSqlWorker {
         .await
         .map_err(|e| anyhow::anyhow!("could not compute expected logical plan. Error: {e}"))?;
 
-        TextToSqlMetric::try_new(
+        Ok(TextToSqlMetric::new(
             request.question.clone(),
             &generated_sql,
             &request.expected_sql,
@@ -216,12 +217,12 @@ impl TextToSqlWorker {
             request.sample_data_enabled,
             request.return_sql,
             &task_history_metrics,
-            if generated_schema.is_some_and(|s| s == expected_schema) {
+            if generated_schema == expected_schema {
                 1.0
             } else {
                 0.0
             },
-        )
+        ))
     }
 }
 

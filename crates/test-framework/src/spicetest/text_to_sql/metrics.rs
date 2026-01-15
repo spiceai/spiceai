@@ -198,7 +198,7 @@ impl ExtendedMetrics for TextToSqlMetric {
 
 impl TextToSqlMetric {
     #[expect(clippy::too_many_arguments)]
-    pub fn try_new(
+    pub fn new(
         question: String,
         generated_sql: &str,
         expected_sql: &str,
@@ -210,11 +210,11 @@ impl TextToSqlMetric {
         return_sql: bool,
         task_history_metrics: &TaskHistoryMetrics,
         correct_output_schema: f64,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Self {
         let expected = extract_tables_and_projection(expected_logical_plan);
         let generated = generated_logical_plan.map(extract_tables_and_projection);
 
-        Ok(Self {
+        Self {
             question,
             generated_sql: generated_sql.to_string(),
             expected_sql: expected_sql.to_string(),
@@ -242,7 +242,7 @@ impl TextToSqlMetric {
                 .map(|g| intersection_over_union(&expected.1, &g.1))
                 .unwrap_or_default(),
             correct_output_schema,
-        })
+        }
     }
 }
 
