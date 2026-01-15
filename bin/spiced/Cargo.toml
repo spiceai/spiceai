@@ -82,6 +82,7 @@ default = [
     "turso",
     "smb",
     "pingora",
+    "scylladb",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -107,6 +108,7 @@ pingora = ["runtime/pingora"]
 postgres = ["runtime/postgres"]
 postgres-write = ["runtime/postgres-write"]
 release = []
+scylladb = ["runtime/scylladb"]
 sftp = ["runtime/sftp"]
 sharepoint = ["runtime/sharepoint"]
 smb = ["runtime/smb"]

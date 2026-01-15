@@ -33,6 +33,7 @@ roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
 rusqlite = { workspace = true }
 serde = { workspace = true }
+tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }

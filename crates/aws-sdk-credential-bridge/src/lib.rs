@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 mod credential_provider;
+pub mod object_store_builder;
+
 use std::{sync::Arc, time::Duration};
 
 use aws_config::Region;

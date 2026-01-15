@@ -150,6 +150,7 @@ search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
 secrecy.workspace = true
+scylla = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
@@ -249,7 +250,13 @@ default = [
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
-duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb", "datafusion-optimizer-rules/duckdb"]
+duckdb = [
+    "dep:duckdb",
+    "db_connection_pool/duckdb",
+    "data_components/duckdb",
+    "datafusion-optimizer-rules/duckdb",
+    "runtime-acceleration/duckdb",
+]
 dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb", "dep:dynamodb-streams", "dep:humantime"]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
@@ -286,6 +293,11 @@ s3_vectors = [
     "dep:s3_vectors",
     "search/s3_vectors",
 ]
+scylladb = [
+    "dep:scylla",
+    "db_connection_pool/scylladb",
+    "data_components/scylladb",
+]
 sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 smb = ["runtime-object-store/smb"]
@@ -301,6 +313,7 @@ sqlite = [
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "dep:rusqlite",
+    "runtime-acceleration/sqlite",
 ]
 turso = [
     "dep:turso",
@@ -309,6 +322,7 @@ turso = [
     "data_components/sqlite",
     "data_components/turso",
     "dep:rusqlite",
+    "runtime-acceleration/turso"
 ]
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso"] }

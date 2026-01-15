@@ -14,34 +14,48 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, time::SystemTime};
-
-use crate::metrics::{
-    MetricCollector, QueryMetric, QueryStatus, StatisticsCollector, system_time_to_unix_epoch_ms,
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime},
 };
+
+use crate::metrics::{MetricCollector, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms};
 use anyhow::{Context, Result};
 
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 mod metrics;
 pub use metrics::{TextToSqlMetric, TextToSqlRunMetric};
 mod worker;
-pub use worker::{TextToSqlConfig, TextToSqlRequest, TextToSqlResult};
+pub use worker::{TextToSqlConfig, TextToSqlRequest};
 use worker::{TextToSqlWorker, TextToSqlWorkerResult};
+mod task_history;
+
+mod parse;
 
 #[derive(Default)]
 pub struct NotStarted {
     config: TextToSqlConfig,
+    parallel_count: usize,
 }
 
 impl NotStarted {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            config: TextToSqlConfig::default(),
+            parallel_count: 1,
+        }
     }
 
     #[must_use]
     pub fn with_config(mut self, config: TextToSqlConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_parallel_count(mut self, parallel_count: usize) -> Self {
+        self.parallel_count = parallel_count;
         self
     }
 }
@@ -54,7 +68,7 @@ pub struct Running {
 
 pub struct Completed {
     end_time: SystemTime,
-    results: BTreeMap<String, worker::TextToSqlResult>,
+    results: BTreeMap<String, metrics::TextToSqlMetric>,
 }
 
 impl TestState for NotStarted {}
@@ -73,12 +87,42 @@ impl SpiceTest<NotStarted> {
             .spiced_instance
             .as_ref()
             .context("Spiced instance should be present")?;
-        let spice_client = spiced_instance
-            .spice_client(self.api_key.clone(), true)
-            .await
-            .context("Failed to create Spice client")?;
-        let http_client = spiced_instance.http_client()?;
-        let http_base_url = spiced_instance.http_base_url().to_string();
+
+        if self.state.parallel_count == 0 {
+            return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
+        }
+
+        let requests = self.state.config.requests;
+
+        // Use a smaller buffer to limit memory usage - workers pull concurrently
+        let buffer_size = (self.state.parallel_count * 2).max(1);
+        let (tx, rx) = async_channel::bounded::<TextToSqlRequest>(buffer_size);
+
+        // Add tasks to channel.
+        tokio::spawn(async move {
+            for request in requests {
+                if let Err(e) = tx.send(request).await {
+                    eprintln!("Failed to send request to workers: {e}");
+                    break;
+                }
+            }
+        });
+
+        // Create workers, each pulling from the shared channel
+        let mut workers = Vec::with_capacity(self.state.parallel_count);
+        for id in 0..self.state.parallel_count {
+            let spice_client = spiced_instance
+                .spice_client(self.api_key.clone(), true)
+                .await
+                .context("Failed to create Spice client")?;
+            let http_client = spiced_instance.http_client()?;
+            let http_base_url = spiced_instance.http_base_url().to_string();
+
+            workers.push(
+                TextToSqlWorker::new(id, http_client, http_base_url, spice_client, rx.clone())
+                    .start(),
+            );
+        }
 
         Ok(SpiceTest {
             name: self.name,
@@ -88,17 +132,7 @@ impl SpiceTest<NotStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
-            state: Running {
-                workers: vec![
-                    TextToSqlWorker::new(
-                        http_client,
-                        http_base_url,
-                        spice_client,
-                        self.state.config,
-                    )
-                    .start(),
-                ],
-            },
+            state: Running { workers },
         })
     }
 }
@@ -133,83 +167,75 @@ impl SpiceTest<Running> {
 
 impl SpiceTest<Completed> {
     #[must_use]
-    pub fn get_results(&self) -> &BTreeMap<String, worker::TextToSqlResult> {
+    pub fn get_results(&self) -> &BTreeMap<String, metrics::TextToSqlMetric> {
         &self.state.results
     }
 
     pub fn get_run_metrics(&self) -> Result<TextToSqlRunMetric> {
+        #[expect(clippy::cast_precision_loss)]
         Ok(TextToSqlRunMetric::new(
-            self.get_p95_response_time_metric()?,
-            self.get_median_response_time_metric()?,
-            self.get_average_attempts_metric(),
-            self.get_exact_match_count(),
-            self.get_error_rate(),
+            self.percentile(|result| result.latency_ms, 95.0),
+            self.percentile(|result| result.latency_ms, 50.0),
+            self.mean(|result| result.generated_sql.trim() == result.expected_sql.trim()),
+            self.mean(|result| result.is_error),
+            self.mean(|result| result.sql_query_count as f64),
+            self.mean(|result| result.llm_input_tokens as f64),
+            self.mean(|result| result.llm_output_tokens as f64),
+            self.mean(|result| result.exact_logical_plan_match as f64),
+            self.mean(|result| result.correct_tables),
+            self.mean(|result| result.correct_table_projections),
+            self.mean(|result| result.correct_output_schema),
         ))
     }
 
-    fn get_exact_match_count(&self) -> f64 {
-        let count = self
+    fn aggregate<F, T, A>(&self, mut extractor: F, aggregator: A) -> f64
+    where
+        F: FnMut(&TextToSqlMetric) -> T,
+        T: Into<f64>,
+        A: FnOnce(Vec<f64>) -> f64,
+    {
+        let values: Vec<f64> = self
             .state
             .results
             .values()
-            .filter(|result| result.generated_sql.trim() == result.expected_sql.trim())
-            .count();
+            .map(|x| extractor(x).into())
+            .collect();
 
-        #[expect(clippy::cast_precision_loss)]
-        let rate = count as f64 / self.state.results.len() as f64;
-        rate
+        aggregator(values)
     }
+    fn mean<F, T>(&self, extractor: F) -> f64
+    where
+        F: FnMut(&TextToSqlMetric) -> T,
+        T: Into<f64>,
+    {
+        self.aggregate(extractor, |values| {
+            let summ: f64 = values.iter().sum();
 
-    fn get_error_rate(&self) -> f64 {
-        let errors: f64 = self
-            .state
-            .results
-            .values()
-            .map(|result| f64::from(result.is_error))
-            .sum();
-
-        #[expect(clippy::cast_precision_loss)]
-        let rate = errors / self.state.results.len() as f64;
-        rate
+            #[expect(clippy::cast_precision_loss)]
+            let rate = summ / self.state.results.len() as f64;
+            rate
+        })
     }
+    fn percentile<F, T>(&self, extractor: F, percentile: f64) -> f64
+    where
+        F: FnMut(&TextToSqlMetric) -> T,
+        T: Into<f64>,
+    {
+        self.aggregate(extractor, move |mut values| {
+            if values.is_empty() {
+                return 0.0;
+            }
 
-    fn get_p95_response_time_metric(&self) -> Result<f64> {
-        let durations = self
-            .state
-            .results
-            .values()
-            .map(|result| result.duration)
-            .collect::<Vec<_>>();
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        #[expect(clippy::cast_precision_loss)]
-        let p95 = durations.percentile(95.0)?.as_millis() as f64;
-        Ok(p95)
-    }
-
-    fn get_median_response_time_metric(&self) -> Result<f64> {
-        let durations = self
-            .state
-            .results
-            .values()
-            .map(|result| result.duration)
-            .collect::<Vec<_>>();
-
-        #[expect(clippy::cast_precision_loss)]
-        let median = durations.median()?.as_millis() as f64;
-        Ok(median)
-    }
-
-    fn get_average_attempts_metric(&self) -> f64 {
-        let total_attempts: usize = self
-            .state
-            .results
-            .values()
-            .map(|result| result.number_of_attempts)
-            .sum();
-
-        #[expect(clippy::cast_precision_loss)]
-        let avg = total_attempts as f64 / self.state.results.len() as f64;
-        avg
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let index = ((values.len() - 1) as f64 * percentile / 100.0).round() as usize;
+            values[index]
+        })
     }
 }
 
@@ -240,23 +266,16 @@ impl MetricCollector<TextToSqlMetric, TextToSqlRunMetric> for SpiceTest<Complete
             .results
             .iter()
             .map(|(id, result)| {
-                QueryMetric::new_from_durations(
+                #[expect(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_sign_loss)]
+                Ok(QueryMetric::new_from_durations(
                     id.as_str().into(),
-                    &vec![result.duration],
+                    &vec![Duration::from_millis(result.latency_ms as u64)],
                     QueryStatus::Passed,
                     system_time_to_unix_epoch_ms(self.start_time)?,
                     system_time_to_unix_epoch_ms(self.state.end_time)?,
-                )
-                .map(|metric| {
-                    metric.with_extended_metrics(TextToSqlMetric::new(
-                        result.generated_sql.clone(),
-                        result.expected_sql.clone(),
-                        result.number_of_attempts,
-                        result.sample_data_enabled,
-                        result.return_sql,
-                        result.is_error,
-                    ))
-                })
+                )?
+                .with_extended_metrics(result.clone()))
             })
             .collect()
     }
