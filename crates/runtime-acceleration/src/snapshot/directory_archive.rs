@@ -539,7 +539,10 @@ mod tests {
         let patterns = vec![
             ("zeros.bin", vec![0u8; 4096]),
             ("ones.bin", vec![0xFFu8; 4096]),
-            ("alternating.bin", (0..4096).map(|i| (i % 2) as u8).collect()),
+            (
+                "alternating.bin",
+                (0..4096).map(|i| (i % 2) as u8).collect(),
+            ),
             (
                 "sequential.bin",
                 (0..4096).map(|i| (i % 256) as u8).collect(),

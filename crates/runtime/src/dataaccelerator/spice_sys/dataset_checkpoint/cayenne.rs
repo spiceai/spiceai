@@ -277,8 +277,8 @@ mod tests {
         let temp = TempDir::new().expect("Failed to create temp dir");
 
         // No schema file exists
-        let result = DatasetCheckpoint::get_schema_cayenne(temp.path())
-            .expect("Failed to get schema");
+        let result =
+            DatasetCheckpoint::get_schema_cayenne(temp.path()).expect("Failed to get schema");
         assert!(result.is_none());
     }
 
@@ -308,8 +308,8 @@ mod tests {
         assert!(timestamp_file.exists());
 
         // Verify timestamp is a valid number
-        let timestamp_content = std::fs::read_to_string(&timestamp_file)
-            .expect("Failed to read timestamp file");
+        let timestamp_content =
+            std::fs::read_to_string(&timestamp_file).expect("Failed to read timestamp file");
         let _timestamp: u128 = timestamp_content
             .parse()
             .expect("Timestamp should be a valid number");
