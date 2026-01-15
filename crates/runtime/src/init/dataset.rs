@@ -857,7 +857,6 @@ impl Runtime {
             ) {
                 Ok(was_bootstrapped) => {
                     // Update fetched_at timestamps for bootstrapped caching mode datasets
-                    println!("was_bootstrapped: {:?}", was_bootstrapped);
                     if was_bootstrapped.is_bootstrapped() {
                         update_cached_dataset_timestamps(ds.as_ref()).await;
                     }
@@ -936,7 +935,6 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         .as_ref()
         .and_then(|acc| acc.refresh_mode)
         .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
-    println!("update_cached_dataset_timestamps");
 
     if !is_caching_mode {
         return;
@@ -948,7 +946,6 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         .map(|acc| acc.snapshots_reset_expiry_on_load)
         .unwrap_or(false);
 
-    println!("is_reset_expiry_on_load: {is_reset_expiry_on_load}");
     if !is_reset_expiry_on_load {
         return;
     }

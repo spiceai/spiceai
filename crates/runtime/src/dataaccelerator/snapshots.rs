@@ -82,7 +82,6 @@ pub(super) async fn download_snapshot_if_needed(
                 bytes_downloaded,
                 checksum,
             })) => {
-                println!("!!!! Snapshot downloaded");
                 let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 metrics::record_bootstrap_metrics(
                     &dataset_name,
