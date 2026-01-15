@@ -172,10 +172,12 @@ fn compute_cache_key_from_filters(filters: &[Expr]) -> String {
 pub struct CacheRefreshHelper;
 
 impl CacheRefreshHelper {
-    /// Refresh stale rows in the cache by querying the accelerator for rows with old `fetched_at` timestamps,
+    /// Refresh ALL stale rows in the cache by querying the accelerator for rows with old `fetched_at` timestamps,
     /// then re-executing the query on the federated source with the original filter parameters.
-    /// This is specifically designed for HTTP connector caching mode.
-    pub async fn refresh_stale_rows(
+    /// This is specifically designed for HTTP connector caching mode and is used by the periodic refresh task.
+    ///
+    /// For single-entry refresh (e.g., SWR pattern), use `refresh_entry` instead.
+    pub async fn refresh_all_stale_rows(
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         dataset_name: &str,
@@ -284,6 +286,42 @@ impl CacheRefreshHelper {
         }
 
         Ok(total_refreshed)
+    }
+
+    /// Refreshes specific cache entry by fetching fresh data from the source.
+    /// This is used for Stale-While-Revalidate (SWR) pattern where only the accessed entry
+    /// should be refreshed, not all stale entries.
+    pub async fn refresh_entry(
+        federated: Arc<dyn TableProvider>,
+        accelerator: Arc<dyn TableProvider>,
+        dataset_name: &str,
+        filters: &[Expr],
+        accelerator_write_mutex: Arc<Mutex<()>>,
+    ) -> DataFusionResult<usize> {
+        tracing::trace!(
+            "Refreshing single cache entry for dataset {dataset_name} with {} filters",
+            filters.len()
+        );
+
+        // Fetch fresh data for this specific entry
+        let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
+
+        if batches.is_empty() {
+            tracing::debug!("No data returned from source for dataset={dataset_name}");
+            return Ok(0);
+        }
+
+        let refreshed_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        // Acquire mutex and upsert the refreshed data
+        let _lock_guard = accelerator_write_mutex.lock().await;
+        Self::upsert_into_accelerator(&accelerator, dataset_name, filters, batches).await?;
+
+        tracing::trace!(
+            "Refreshed single cache entry for dataset={dataset_name}, {refreshed_rows} rows"
+        );
+
+        Ok(refreshed_rows)
     }
 
     /// Extract filter expressions from a row containing `request_path`, `request_query`, `request_body`
@@ -923,16 +961,17 @@ impl CacheRefreshHelper {
                         let dataset_name_clone = dataset_name.to_string();
                         let accelerator_write_mutex_clone = Arc::clone(accelerator_write_mutex);
                         let in_flight_clone = Arc::clone(in_flight_revalidations);
+                        let filters_clone: Vec<Expr> = filters.to_vec();
 
                         io_runtime.spawn(async move {
                             tracing::debug!(
-                                "Background refresh task started for dataset={dataset_name_clone}"
+                                "SWR: Background refresh for single entry started for dataset={dataset_name_clone}"
                             );
-                            let result = Self::refresh_stale_rows(
+                            let result = Self::refresh_entry(
                                 federated_clone,
                                 accelerator_clone,
                                 &dataset_name_clone,
-                                max_age,
+                                &filters_clone,
                                 accelerator_write_mutex_clone,
                             )
                             .await;
