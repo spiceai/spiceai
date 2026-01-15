@@ -43,12 +43,12 @@ pub(crate) trait Validator {
 
 #[derive(Clone)]
 pub struct ConnectorParams {
-    pub(crate) parameters: Parameters,
-    pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
-    pub(crate) component: ConnectorComponent,
-    pub(crate) app: Option<Arc<App>>,
-    pub(crate) runtime: Option<Arc<Runtime>>,
-    pub(crate) io_runtime: Handle,
+    pub parameters: Parameters,
+    pub unsupported_type_action: Option<UnsupportedTypeAction>,
+    pub component: ConnectorComponent,
+    pub app: Option<Arc<App>>,
+    pub runtime: Option<Arc<Runtime>>,
+    pub io_runtime: Handle,
 }
 
 pub struct ConnectorParamsBuilder {
