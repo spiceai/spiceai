@@ -11,8 +11,12 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
+connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
+connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
+connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
+connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
 event_stream = { path = "../../crates/event_stream" }
 repl = { path = "../../crates/repl" }
 futures.workspace = true
@@ -50,7 +54,7 @@ alloc-snmalloc = []
 alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
-clickhouse = ["runtime/clickhouse"]
+clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
 cuda = ["runtime/cuda"]
 databricks = ["runtime/databricks"]
 debezium = ["runtime/debezium"]
@@ -90,7 +94,7 @@ default = [
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["runtime/dremio"]
-duckdb = ["runtime/duckdb"]
+duckdb = ["connector-duckdb", "runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["runtime/flightsql"]
 ftp = ["runtime/ftp"]
@@ -102,7 +106,7 @@ mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]
 models = ["runtime/models"]
 mongodb = ["runtime/mongodb"]
-mssql = ["runtime/mssql"]
+mssql = ["connector-mssql", "runtime/mssql"]
 mysql = ["connector-mysql", "runtime/mysql"]
 nfs = ["runtime/nfs"]
 odbc = ["runtime/odbc"]
@@ -117,7 +121,7 @@ sftp = ["runtime/sftp"]
 sharepoint = ["runtime/sharepoint"]
 smb = ["runtime/smb"]
 snapshots = ["runtime/snapshots"]
-snowflake = ["runtime/snowflake"]
+snowflake = ["connector-snowflake", "runtime/snowflake"]
 spark = ["runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]

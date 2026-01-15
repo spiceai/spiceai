@@ -30,11 +30,12 @@ use runtime_parameters::ParameterSpec;
 // Force linkage of all data connector modules by referencing their factory types.
 // Without these references, the linker may not include the modules and their
 // `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
+use connector_clickhouse as _;
+use connector_duckdb as _;
+use connector_mssql as _;
 use connector_mysql as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::abfs as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::clickhouse as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::databricks as _;
 #[expect(unused_imports)]
@@ -43,8 +44,6 @@ use runtime::dataconnector::debezium as _;
 use runtime::dataconnector::delta_lake as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::dremio as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::duckdb as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::dynamodb as _;
 #[expect(unused_imports)]
@@ -75,11 +74,10 @@ use runtime::dataconnector::localpod as _;
 use runtime::dataconnector::memory as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::mongodb as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::mssql as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
 use connector_postgres as _;
+use connector_snowflake as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::oracle as _;
 #[expect(unused_imports)]
@@ -90,8 +88,6 @@ use runtime::dataconnector::sftp as _;
 use runtime::dataconnector::sharepoint as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::sink as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::snowflake as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::spark as _;
 #[expect(unused_imports)]

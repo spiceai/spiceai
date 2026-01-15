@@ -3746,6 +3746,54 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
+name = "connector-clickhouse"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "clickhouse-rs",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "db_connection_pool",
+ "linkme",
+ "ns_lookup",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "url",
+]
+
+[[package]]
+name = "connector-duckdb"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "duckdb",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+]
+
+[[package]]
+name = "connector-mssql"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tiberius",
+]
+
+[[package]]
 name = "connector-mysql"
 version = "1.11.0-unstable"
 dependencies = [
@@ -3775,6 +3823,23 @@ dependencies = [
  "runtime",
  "secrecy",
  "snafu",
+]
+
+[[package]]
+name = "connector-snowflake"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "db_connection_pool",
+ "itertools 0.14.0",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "snowflake-api",
 ]
 
 [[package]]
@@ -16544,8 +16609,12 @@ version = "2.0.0-unstable"
 dependencies = [
  "app",
  "clap 4.5.54",
+ "connector-clickhouse",
+ "connector-duckdb",
+ "connector-mssql",
  "connector-mysql",
  "connector-postgres",
+ "connector-snowflake",
  "event_stream",
  "futures",
  "mimalloc",
@@ -16613,8 +16682,12 @@ dependencies = [
 name = "spicepodschema"
 version = "2.0.0-unstable"
 dependencies = [
+ "connector-clickhouse",
+ "connector-duckdb",
+ "connector-mssql",
  "connector-mysql",
  "connector-postgres",
+ "connector-snowflake",
  "regex",
  "runtime",
  "runtime-parameters",

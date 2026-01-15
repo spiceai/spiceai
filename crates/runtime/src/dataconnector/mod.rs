@@ -128,8 +128,6 @@ macro_rules! register_data_connector {
 }
 
 pub mod abfs;
-#[cfg(feature = "clickhouse")]
-pub mod clickhouse;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 #[cfg(feature = "debezium")]
@@ -138,8 +136,6 @@ pub mod debezium;
 pub mod delta_lake;
 #[cfg(feature = "dremio")]
 pub mod dremio;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
@@ -157,8 +153,6 @@ pub mod localpod;
 pub mod memory;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
-#[cfg(feature = "mssql")]
-pub mod mssql;
 
 #[cfg(feature = "nfs")]
 pub mod nfs;
@@ -184,8 +178,6 @@ pub mod sharepoint;
 pub mod sink;
 #[cfg(feature = "smb")]
 pub mod smb;
-#[cfg(feature = "snowflake")]
-pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
