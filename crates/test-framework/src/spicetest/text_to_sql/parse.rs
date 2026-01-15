@@ -106,7 +106,10 @@ pub async fn sql_schema(
 
     let response = http_client
         .post(&url)
-        .body(format!("SELECT * FROM ({sql}) LIMIT 1"))
+        .body(format!(
+            "SELECT * FROM ({}) LIMIT 1",
+            sql.strip_suffix(";").unwrap_or(sql)
+        ))
         .header("Content-Type", "text/plain")
         .header("Accept", "application/vnd.spiceai.nsql.v1+json")
         .send()

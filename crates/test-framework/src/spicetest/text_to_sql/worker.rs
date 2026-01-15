@@ -118,101 +118,110 @@ impl TextToSqlWorker {
             let mut results: BTreeMap<String, TextToSqlMetric> = BTreeMap::new();
 
             while let Ok(request) = self.request_rx.recv().await {
-                let start = Instant::now();
-                let mut is_error = false;
-                let mut generated_sql_opt: Option<String> = None;
-                let mut generated_schema_opt: Option<Schema> = None;
-
-                let trace_id = random_trace_id();
-                match nsql_request(&self.http_client, &self.http_base_url, &request, &trace_id)
-                    .await
-                {
-                    Ok(NSQLResponse::Sql(sql)) => {
-                        generated_sql_opt = Some(sql);
+                match self.process_request(&request).await {
+                    Ok(metric) => {
+                        results.insert(request.id.clone(), metric);
                     }
-                    Ok(NSQLResponse::Data(schema)) => {
-                        generated_schema_opt = Some(schema);
-                    }
-                    Err(_) => {
-                        is_error = true;
+                    Err(e) => {
+                        eprintln!(
+                            "[TextToSqlWorker-{}]: Failed to process request '{}': {e}",
+                            self.id, request.id
+                        );
                     }
                 }
-
-                let duration = start.elapsed();
-
-                let (sql, task_history_metrics) =
-                    find_task_history_metrics(&self.spice_client, &trace_id)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("could not find task history metrics. Error: {e}")
-                        })?;
-
-                let generated_sql = generated_sql_opt.or(sql).unwrap_or_default();
-
-                // Calculate generated schema & logical plan if absent.
-                let generated_schema = match generated_schema_opt {
-                    Some(schema) => Some(schema),
-                    None => sql_schema(
-                        self.http_client.clone(),
-                        &self.http_base_url,
-                        &generated_sql,
-                    )
-                    .await
-                    .ok(),
-                };
-
-                let generated_logical_plan = logical_plan(
-                    self.http_client.clone(),
-                    &self.http_base_url,
-                    &generated_sql,
-                )
-                .await
-                .ok();
-
-                // Calculate expected schema & logical plan if absent.
-                let expected_schema = sql_schema(
-                    self.http_client.clone(),
-                    &self.http_base_url,
-                    &request.expected_sql,
-                )
-                .await?;
-
-                let expected_logical_plan = logical_plan(
-                    self.http_client.clone(),
-                    &self.http_base_url,
-                    &request.expected_sql,
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("could not compute expected logical plan. Error: {e}")
-                })?;
-
-                results.insert(
-                    request.id.clone(),
-                    TextToSqlMetric::try_new(
-                        request.question,
-                        &generated_sql,
-                        &request.expected_sql,
-                        &expected_logical_plan,
-                        generated_logical_plan.as_ref(),
-                        is_error,
-                        duration,
-                        request.sample_data_enabled,
-                        request.return_sql,
-                        &task_history_metrics,
-                        if generated_schema.is_some_and(|s| s == expected_schema) {
-                            1.0
-                        } else {
-                            0.0
-                        },
-                    )?,
-                );
             }
 
             println!("[TextToSqlWorker-{}]: DONE", self.id);
 
             Ok(TextToSqlWorkerResult { results })
         })
+    }
+
+    async fn process_request(&self, request: &TextToSqlRequest) -> Result<TextToSqlMetric> {
+        let start = Instant::now();
+        let mut is_error = false;
+        let mut generated_sql_opt: Option<String> = None;
+        let mut generated_schema_opt: Option<Schema> = None;
+
+        let trace_id = random_trace_id();
+        match nsql_request(&self.http_client, &self.http_base_url, request, &trace_id).await {
+            Ok(NSQLResponse::Sql(sql)) => {
+                generated_sql_opt = Some(sql);
+            }
+            Ok(NSQLResponse::Data(schema)) => {
+                generated_schema_opt = Some(schema);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[TextToSqlWorker-{}]: NSQL request failed for '{}': {e}",
+                    self.id, request.id
+                );
+                is_error = true;
+            }
+        }
+
+        let duration = start.elapsed();
+
+        let (sql, task_history_metrics) = find_task_history_metrics(&self.spice_client, &trace_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not find task history metrics. Error: {e}"))?;
+
+        let generated_sql = generated_sql_opt.or(sql).unwrap_or_default();
+
+        // Calculate generated schema & logical plan if absent.
+        let generated_schema = match generated_schema_opt {
+            Some(schema) => Some(schema),
+            None => sql_schema(
+                self.http_client.clone(),
+                &self.http_base_url,
+                &generated_sql,
+            )
+            .await
+            .ok(),
+        };
+
+        let generated_logical_plan = logical_plan(
+            self.http_client.clone(),
+            &self.http_base_url,
+            &generated_sql,
+        )
+        .await
+        .ok();
+
+        // Calculate expected schema & logical plan if absent.
+        let expected_schema = sql_schema(
+            self.http_client.clone(),
+            &self.http_base_url,
+            &request.expected_sql,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("could not compute schema for expected SQL. Error: {e}"))?;
+
+        let expected_logical_plan = logical_plan(
+            self.http_client.clone(),
+            &self.http_base_url,
+            &request.expected_sql,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("could not compute expected logical plan. Error: {e}"))?;
+
+        TextToSqlMetric::try_new(
+            request.question.clone(),
+            &generated_sql,
+            &request.expected_sql,
+            &expected_logical_plan,
+            generated_logical_plan.as_ref(),
+            is_error,
+            duration,
+            request.sample_data_enabled,
+            request.return_sql,
+            &task_history_metrics,
+            if generated_schema.is_some_and(|s| s == expected_schema) {
+                1.0
+            } else {
+                0.0
+            },
+        )
     }
 }
 
