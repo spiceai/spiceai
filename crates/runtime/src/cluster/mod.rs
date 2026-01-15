@@ -71,6 +71,9 @@ use x509_certificate::CapturedX509Certificate;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
+type SchedulerEndpointOverride =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;
+
 struct SchedulerPollHandle {
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
@@ -860,7 +863,7 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    let (tx_ready, _rx_ready) = oneshot::channel::<String>();
+    let (tx_ready, rx_ready) = oneshot::channel::<String>();
     let readiness_sender = Arc::new(Mutex::new(Some(tx_ready)));
 
     let scheduler_url_for_manager = scheduler_url.clone();
@@ -917,6 +920,11 @@ pub async fn initialize_cluster_executor(
     });
 
     Ok(async move {
+        let _ = rx_ready
+            .await
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+
         // Bind the already-fetched app and initialize secrets for object store configuration
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
 
@@ -940,9 +948,10 @@ async fn create_scheduler_server(
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
 
-    // NOTE: TLS for scheduler gRPC was removed in ballista DF51 update.
-    // The upstream ballista API no longer supports `override_create_grpc_client_endpoint`.
-    // TODO(datafusion-ballista#51): Port TLS support to DF51 fork when cluster mTLS is needed.
+    let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
+    let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
+        .clone()
+        .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -971,6 +980,7 @@ async fn create_scheduler_server(
                     .build(),
             )
         })),
+        override_create_grpc_client_endpoint,
         ..Default::default()
     };
 
