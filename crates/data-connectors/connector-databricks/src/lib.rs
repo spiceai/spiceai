@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,23 +14,46 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::ComponentInitialization;
-use crate::component::dataset::Dataset;
-use crate::register_data_connector;
-use crate::token_providers::databricks::{
-    AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
-};
+//! Databricks data and catalog connector for Spice.ai runtime.
+//!
+//! This crate provides Databricks connector implementations, allowing
+//! Spice.ai to connect to Databricks (Delta Lake, Spark Connect, SQL Warehouse)
+//! as data sources and Unity Catalog as a catalog source.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds.
+
 use async_trait::async_trait;
-use data_components::Read;
 #[cfg(feature = "spark")]
 use data_components::databricks::DatabricksSparkConnect;
 use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
-use data_components::unity_catalog::Endpoint;
+use data_components::delta_lake::DeltaTableFactory;
+use data_components::unity_catalog::provider::UnityCatalogProvider;
+use data_components::unity_catalog::{
+    CatalogId, Endpoint, UCTable, UnityCatalog as UnityCatalogClient,
+};
+use data_components::{Read, RefreshableCatalogProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
+use runtime::Runtime;
+use runtime::catalogconnector::{CatalogConnector, Error as CatalogError, Result as CatalogResult};
+use runtime::component::ComponentInitialization;
+use runtime::component::catalog::Catalog;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
+use runtime::parameters::{ParameterSpec, Parameters};
+use runtime::register_data_connector;
+use runtime::token_providers::databricks::{
+    AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
+};
+use runtime_secrets::get_params_with_secrets;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,10 +61,9 @@ use token_provider::registry::TokenProviderRegistry;
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::runtime::Handle;
 
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
-    Parameters,
-};
+// ============================================================================
+// Data Connector Error Types
+// ============================================================================
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -93,6 +115,81 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+// ============================================================================
+// Data Connector Parameters
+// ============================================================================
+
+pub const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::component("endpoint")
+        .required()
+        .secret()
+        .description("The endpoint of the Databricks instance."),
+    ParameterSpec::component("sql_warehouse_id")
+        .secret()
+        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
+    ParameterSpec::component("token")
+        .secret()
+        .description("The personal access token used to authenticate against the DataBricks API."),
+    ParameterSpec::runtime("mode")
+        .description("The execution mode for running queries: 'spark_connect', 'delta_lake', or 'sql_warehouse'.")
+        .default("spark_connect"),
+    ParameterSpec::runtime("client_timeout")
+        .description("The timeout setting for object store client."),
+    ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
+    ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
+
+    // Databricks M2M Service Principal credentials
+    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+
+    // S3 storage options
+    ParameterSpec::component("aws_region")
+        .description("The AWS region to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_access_key_id")
+        .description("The AWS access key ID to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_secret_access_key")
+        .description("The AWS secret access key to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_endpoint")
+        .description("The AWS endpoint to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_allow_http")
+        .description("The AWS endpoint allow http scheme")
+        .secret(),
+
+    // Azure storage options
+    ParameterSpec::component("azure_storage_account_name")
+        .description("The storage account to use for Azure storage.")
+        .secret(),
+    ParameterSpec::component("azure_storage_account_key")
+        .description("The storage account key to use for Azure storage.")
+        .secret(),
+    ParameterSpec::component("azure_storage_client_id")
+        .description("The service principal client id for accessing the storage account.")
+        .secret(),
+    ParameterSpec::component("azure_storage_client_secret")
+        .description("The service principal client secret for accessing the storage account.")
+        .secret(),
+    ParameterSpec::component("azure_storage_sas_key")
+        .description("The shared access signature key for accessing the storage account.")
+        .secret(),
+    ParameterSpec::component("azure_storage_endpoint")
+        .description("The endpoint for the Azure Blob storage account.")
+        .secret(),
+
+    // GCS storage options
+    ParameterSpec::component("google_service_account")
+        .description("Filesystem path to the Google service account JSON key file.")
+        .secret(),
+];
+
+// ============================================================================
+// Databricks Data Connector
+// ============================================================================
+
+/// Databricks data connector.
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
     initialization: ComponentInitialization,
@@ -105,6 +202,12 @@ impl std::fmt::Debug for Databricks {
 }
 
 impl Databricks {
+    /// Creates a new Databricks connector instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required parameters are missing or invalid,
+    /// or if the connection to Databricks fails.
     pub async fn new(
         params: Parameters,
         io_runtime: Handle,
@@ -210,6 +313,11 @@ impl Databricks {
         }
     }
 
+    /// Gets a token provider based on the auth credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if token provider creation fails.
     pub async fn get_token_provider(
         endpoint: &str,
         auth_credentials: AuthCredentials<'_>,
@@ -232,6 +340,11 @@ impl Databricks {
         })
     }
 
+    /// Builds authentication credentials from the provided parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the authentication configuration is invalid.
     pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>> {
         let token = params.get("token").ok();
         let client_id = params.get("client_id").expose().ok();
@@ -337,6 +450,11 @@ impl Databricks {
         })
     }
 
+    /// Gets an M2M (machine-to-machine) token provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if token provider registration fails.
     pub async fn get_m2m_token_provider(
         endpoint: &str,
         client_id: &str,
@@ -358,6 +476,11 @@ impl Databricks {
             })
     }
 
+    /// Gets a U2M (user-to-machine) token provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if token provider registration fails.
     pub async fn get_u2m_token_provider(
         endpoint: &str,
         client_id: &str,
@@ -384,6 +507,10 @@ impl Databricks {
     }
 }
 
+// ============================================================================
+// Data Connector Factory
+// ============================================================================
+
 #[derive(Default, Clone, Copy)]
 pub struct DatabricksFactory {}
 
@@ -399,72 +526,6 @@ impl DatabricksFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("endpoint")
-        .required()
-        .secret()
-        .description("The endpoint of the Databricks instance."),
-    ParameterSpec::component("sql_warehouse_id")
-        .secret()
-        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
-    ParameterSpec::component("token")
-        .secret()
-        .description("The personal access token used to authenticate against the DataBricks API."),
-    ParameterSpec::runtime("mode")
-        .description("The execution mode for running queries: 'spark_connect', 'delta_lake', or 'sql_warehouse'.")
-        .default("spark_connect"),
-    ParameterSpec::runtime("client_timeout")
-        .description("The timeout setting for object store client."),
-    ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
-    ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
-
-    // Databricks M2M Service Principal credentials
-    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
-    ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
-
-    // S3 storage options
-    ParameterSpec::component("aws_region")
-        .description("The AWS region to use for S3 storage.")
-        .secret(),
-    ParameterSpec::component("aws_access_key_id")
-        .description("The AWS access key ID to use for S3 storage.")
-        .secret(),
-    ParameterSpec::component("aws_secret_access_key")
-        .description("The AWS secret access key to use for S3 storage.")
-        .secret(),
-    ParameterSpec::component("aws_endpoint")
-        .description("The AWS endpoint to use for S3 storage.")
-        .secret(),
-    ParameterSpec::component("aws_allow_http")
-        .description("The AWS endpoint allow http scheme")
-        .secret(),
-
-    // Azure storage options
-    ParameterSpec::component("azure_storage_account_name")
-        .description("The storage account to use for Azure storage.")
-        .secret(),
-    ParameterSpec::component("azure_storage_account_key")
-        .description("The storage account key to use for Azure storage.")
-        .secret(),
-    ParameterSpec::component("azure_storage_client_id")
-        .description("The service principal client id for accessing the storage account.")
-        .secret(),
-    ParameterSpec::component("azure_storage_client_secret")
-        .description("The service principal client secret for accessing the storage account.")
-        .secret(),
-    ParameterSpec::component("azure_storage_sas_key")
-        .description("The shared access signature key for accessing the storage account.")
-        .secret(),
-    ParameterSpec::component("azure_storage_endpoint")
-        .description("The endpoint for the Azure Blob storage account.")
-        .secret(),
-
-    // GCS storage options
-    ParameterSpec::component("google_service_account")
-        .description("Filesystem path to the Google service account JSON key file.")
-        .secret(),
-];
-
 impl DataConnectorFactory for DatabricksFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -473,7 +534,7 @@ impl DataConnectorFactory for DatabricksFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         if let Some(runtime) = params.runtime {
             let param_map = params.parameters.to_secret_map();
             Box::pin(async move {
@@ -525,16 +586,16 @@ impl DataConnector for Databricks {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = TableReference::from(dataset.path());
-        Ok(self
-            .read_provider
+        self.read_provider
             .table_provider(table_reference)
             .await
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "databricks",
+            .map_err(|source| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "databricks".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-            })?)
+                source,
+            })
     }
 
     fn initialization(&self) -> ComponentInitialization {
@@ -542,10 +603,270 @@ impl DataConnector for Databricks {
     }
 }
 
+register_data_connector!("databricks", DatabricksFactory);
+
+// ============================================================================
+// Catalog Connector
+// ============================================================================
+
+pub const CATALOG_PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::component("endpoint")
+        .required()
+        .secret()
+        .description("The endpoint of the Databricks instance."),
+    ParameterSpec::component("token")
+        .secret()
+        .description("The personal access token used to authenticate against the DataBricks API."),
+    ParameterSpec::runtime("mode")
+        .description("The execution mode for querying against Databricks.")
+        .default("spark_connect"),
+    ParameterSpec::runtime("client_timeout")
+        .description("The timeout setting for object store client."),
+    ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
+    ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
+    ParameterSpec::component("sql_warehouse_id")
+        .secret()
+        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
+
+    // Databricks M2M Service Principal credentials
+    ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
+    ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
+
+    // S3 storage options
+    ParameterSpec::component("aws_region")
+        .description("The AWS region to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_access_key_id")
+        .description("The AWS access key ID to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_secret_access_key")
+        .description("The AWS secret access key to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_endpoint")
+        .description("The AWS endpoint to use for S3 storage.")
+        .secret(),
+
+    // Azure storage options
+    ParameterSpec::component("azure_storage_account_name")
+        .description("The storage account to use for Azure storage.")
+        .secret(),
+    ParameterSpec::component("azure_storage_account_key")
+        .description("The storage account key to use for Azure storage.")
+        .secret(),
+    ParameterSpec::component("azure_storage_client_id")
+        .description("The service principal client id for accessing the storage account.")
+        .secret(),
+    ParameterSpec::component("azure_storage_client_secret")
+        .description("The service principal client secret for accessing the storage account.")
+        .secret(),
+    ParameterSpec::component("azure_storage_sas_key")
+        .description("The shared access signature key for accessing the storage account.")
+        .secret(),
+    ParameterSpec::component("azure_storage_endpoint")
+        .description("The endpoint for the Azure Blob storage account.")
+        .secret(),
+
+    // GCS storage options
+    ParameterSpec::component("google_service_account")
+        .description("Filesystem path to the Google service account JSON key file.")
+        .secret(),
+];
+
+/// Databricks Unity Catalog connector.
+#[derive(Clone)]
+pub struct DatabricksCatalog {
+    params: Parameters,
+    initialization: ComponentInitialization,
+}
+
+impl DatabricksCatalog {
+    #[must_use]
+    pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
+        let component_initialization = match Databricks::build_auth_credentials(&params.parameters)
+        {
+            Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
+            _ => ComponentInitialization::default(),
+        };
+
+        Arc::new(Self {
+            params: params.parameters,
+            initialization: component_initialization,
+        })
+    }
+}
+
+#[async_trait]
+impl CatalogConnector for DatabricksCatalog {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn refreshable_catalog_provider(
+        self: Arc<Self>,
+        runtime: Arc<Runtime>,
+        catalog: &Catalog,
+    ) -> CatalogResult<Arc<dyn RefreshableCatalogProvider>> {
+        let Some(catalog_id) = catalog.catalog_id.clone() else {
+            return Err(CatalogError::InvalidConfigurationNoSource {
+                connector: "databricks".into(),
+                message: "A Catalog Name is required for the Databricks Unity Catalog. For details, visit: https://spiceai.org/docs/components/catalogs/databricks#from".into(),
+                connector_component: ConnectorComponent::from(catalog)
+            });
+        };
+
+        let endpoint = self.params.get("endpoint").expose().ok_or_else(|p| {
+            CatalogError::InvalidConfigurationNoSource {
+                connector: "databricks".into(),
+                message: format!("A required parameter was missing: {}. For details, visit: https://spiceai.org/docs/components/catalogs/databricks#params", p.0),
+                connector_component: ConnectorComponent::from(catalog)
+            }
+        })?;
+
+        let auth_credentials =
+            Databricks::build_auth_credentials(&self.params).map_err(|source| {
+                CatalogError::UnableToGetCatalogProvider {
+                    connector: "databricks".to_string(),
+                    source: source.into(),
+                    connector_component: ConnectorComponent::from(catalog),
+                }
+            })?;
+
+        let token_provider = match auth_credentials {
+            AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
+            AuthCredentials::ServicePrincipal(client_id, client_secret) => {
+                Databricks::get_m2m_token_provider(
+                    endpoint,
+                    client_id,
+                    client_secret,
+                    &runtime.token_provider_registry(),
+                )
+                .await
+                .map_err(|source| CatalogError::UnableToGetCatalogProvider {
+                    connector: "databricks".to_string(),
+                    source: source.into(),
+                    connector_component: ConnectorComponent::from(catalog),
+                })?
+            }
+            AuthCredentials::U2M(client_id) => Databricks::get_u2m_token_provider(
+                endpoint,
+                client_id,
+                &runtime.token_provider_registry(),
+            )
+            .await
+            .map_err(|source| CatalogError::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?,
+        };
+
+        let unity_catalog =
+            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider)).map_err(
+                |source| CatalogError::UnableToGetCatalogProvider {
+                    connector: "databricks".to_string(),
+                    source: Box::new(source),
+                    connector_component: ConnectorComponent::from(catalog),
+                },
+            )?;
+        let client = Arc::new(unity_catalog);
+
+        // Copy the catalog params into the dataset params, and allow user to override
+        let mut dataset_params: HashMap<String, SecretString> =
+            get_params_with_secrets(runtime.secrets(), &catalog.params).await;
+
+        let secret_dataset_params =
+            get_params_with_secrets(runtime.secrets(), &catalog.dataset_params).await;
+
+        for (key, value) in secret_dataset_params {
+            dataset_params.insert(key, value);
+        }
+
+        let params = Parameters::try_new(
+            "connector databricks",
+            dataset_params.into_iter().collect(),
+            "databricks",
+            runtime.secrets(),
+            CATALOG_PARAMETERS,
+        )
+        .await
+        .map_err(|source| CatalogError::InternalWithSource {
+            connector: "databricks".to_string(),
+            connector_component: ConnectorComponent::from(catalog),
+            source,
+        })?;
+
+        let mode = self.params.get("mode").expose().ok();
+        let (table_creator, table_reference_creator) = if mode == Some("delta_lake") {
+            (
+                Arc::new(DeltaTableFactory::new(
+                    params.to_secret_map(),
+                    runtime.tokio_io_runtime(),
+                )) as Arc<dyn Read>,
+                table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
+            )
+        } else {
+            let dataset_databricks = Databricks::new(
+                params,
+                runtime.tokio_io_runtime(),
+                runtime.token_provider_registry(),
+            )
+            .await
+            .map_err(|source| CatalogError::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?;
+
+            (
+                dataset_databricks.read_provider(),
+                table_reference_creator_spark as fn(&UCTable) -> Option<TableReference>,
+            )
+        };
+
+        let catalog_provider = UnityCatalogProvider::try_new(
+            client,
+            CatalogId(catalog_id),
+            table_creator,
+            table_reference_creator,
+            catalog.include.clone(),
+        )
+        .await
+        .map_err(|e| CatalogError::UnableToGetCatalogProvider {
+            connector: "databricks".to_string(),
+            source: Box::new(e),
+            connector_component: ConnectorComponent::from(catalog),
+        })?;
+
+        Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
+    }
+
+    fn initialization(&self) -> ComponentInitialization {
+        self.initialization
+    }
+}
+
+#[expect(clippy::unnecessary_wraps)]
+fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
+    let table_reference = TableReference::Full {
+        catalog: uc_table.catalog_name.clone().into(),
+        schema: uc_table.schema_name.clone().into(),
+        table: uc_table.name.clone().into(),
+    };
+    Some(table_reference)
+}
+
+fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReference> {
+    let storage_location = uc_table.storage_location.as_deref()?;
+    Some(TableReference::bare(format!("{storage_location}/")))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
 
     #[test]
     fn test_build_auth_credentials_token_only() {
@@ -674,5 +995,3 @@ mod tests {
         }
     }
 }
-
-register_data_connector!("databricks", DatabricksFactory);

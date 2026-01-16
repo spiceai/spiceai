@@ -12,6 +12,7 @@ version.workspace = true
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
+connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }
 connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake", optional = true }
 connector-dremio = { path = "../../crates/data-connectors/connector-dremio", optional = true }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
@@ -71,7 +72,7 @@ anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
 cuda = ["runtime/cuda"]
-databricks = ["runtime/databricks"]
+databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
     "duckdb",

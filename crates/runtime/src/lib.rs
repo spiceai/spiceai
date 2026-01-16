@@ -123,7 +123,7 @@ pub mod status;
 pub mod task_history;
 pub mod timing;
 pub mod tls;
-mod token_providers;
+pub mod token_providers;
 pub mod tools;
 pub mod topological_ordering;
 pub(crate) mod tracers;
