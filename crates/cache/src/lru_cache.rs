@@ -70,7 +70,7 @@ where
             #[cfg(feature = "pingora")]
             Self::Pingora(backend) => backend.insert(key, value).await,
             #[cfg(not(feature = "pingora"))]
-            Self::MokaFallback(backend) => backend.insert(key, value, size).await,
+            Self::MokaFallback(backend) => backend.insert(key, value).await,
         }
     }
 
