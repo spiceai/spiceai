@@ -1,0 +1,29 @@
+[package]
+name = "hash-index"
+description = "SIMD-optimized hash index for fast point lookups in Arrow-based accelerators"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-row.workspace = true
+arrow-schema.workspace = true
+parking_lot.workspace = true
+snafu.workspace = true
+tracing.workspace = true
+twox-hash.workspace = true
+
+[dev-dependencies]
+criterion = "0.6"
+rand.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "lookup"
+harness = false

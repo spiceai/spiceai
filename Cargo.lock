@@ -3186,8 +3186,10 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-table-providers",
  "futures",
+ "hash-index",
  "insta",
  "object_store",
+ "parking_lot 0.12.5",
  "paste",
  "roaring",
  "rstest 0.26.1",
@@ -3900,6 +3902,29 @@ dependencies = [
 
 [[package]]
 name = "criterion"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bf7af66b0989381bd0be551bd7cc91912a655a58c6918420c9527b1fd8b4679"
+dependencies = [
+ "anes",
+ "cast",
+ "ciborium",
+ "clap 4.5.54",
+ "criterion-plot 0.5.0",
+ "itertools 0.13.0",
+ "num-traits",
+ "oorandom",
+ "plotters",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "tinytemplate",
+ "walkdir",
+]
+
+[[package]]
+name = "criterion"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1c047a62b0cc3e145fa84415a3191f628e980b194c2755aa12300a4e6cbd928"
@@ -4505,6 +4530,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 name = "data_components"
 version = "1.11.0-unstable"
 dependencies = [
+ "ahash 0.8.12",
  "arrow",
  "arrow-array",
  "arrow-buffer",
@@ -4545,6 +4571,7 @@ dependencies = [
  "globset",
  "graph-rs-sdk",
  "graphql-parser",
+ "hash-index",
  "http 1.4.0",
  "httpdate",
  "iceberg",
@@ -4556,6 +4583,7 @@ dependencies = [
  "insta",
  "logos",
  "mailparse",
+ "num_cpus",
  "object_store",
  "opendal",
  "oracle",
@@ -7521,6 +7549,24 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "hash-index"
+version = "1.11.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-row",
+ "arrow-schema",
+ "criterion 0.6.0",
+ "parking_lot 0.12.5",
+ "rand 0.9.2",
+ "snafu",
+ "tokio",
+ "tracing",
+ "twox-hash",
 ]
 
 [[package]]
