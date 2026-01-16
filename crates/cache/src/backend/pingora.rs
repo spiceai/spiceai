@@ -51,12 +51,12 @@ struct KeyMetadata {
 ///
 /// Architecture:
 /// - Values are stored in pingora-lru which handles LRU eviction
-/// - Metadata (TTL expiry, weight) is stored separately in sharded HashMaps
+/// - Metadata (TTL expiry, weight) is stored separately in sharded `HashMaps`
 /// - TTL checks use metadata first, avoiding unnecessary cache removals
 /// - `weighted_size()` uses pingora-lru's native `weight()` method for accuracy
 ///
 /// Trade-offs:
-/// - pingora-lru requires remove + re-admit to read values (no peek_value API)
+/// - pingora-lru requires remove + re-admit to read values (no `peek_value` API)
 /// - Brief race window during value retrieval under heavy concurrent load
 /// - More complex implementation than Moka
 pub struct PingoraBackend<V>
