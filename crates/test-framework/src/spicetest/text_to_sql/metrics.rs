@@ -19,7 +19,8 @@ use std::{collections::BTreeMap, hash::Hash, time::Duration};
 use crate::{
     metrics::{Builder, BuilderTarget, ExtendedMetrics},
     spicetest::text_to_sql::{
-        parse::extract_tables_and_projection, task_history::TaskHistoryMetrics,
+        parse::{attempt_parse_table_and_projection, extract_tables_and_projection},
+        task_history::TaskHistoryMetrics,
     },
 };
 use anyhow::Result;
@@ -212,8 +213,13 @@ impl TextToSqlMetric {
         correct_output_schema: f64,
     ) -> Self {
         let expected = extract_tables_and_projection(expected_logical_plan);
-        let generated = generated_logical_plan.map(extract_tables_and_projection);
-
+        let generated = generated_logical_plan
+            .map(extract_tables_and_projection)
+            .or_else(|| {
+                attempt_parse_table_and_projection(generated_sql)
+                    .inspect_err(|e| println!("Error in 'attempt_parse_table_and_projection'.{e}"))
+                    .ok()
+            });
         Self {
             question,
             generated_sql: generated_sql.to_string(),
@@ -397,7 +403,7 @@ impl TextToSqlRunMetric {
 }
 
 /// Calculate the Intersection over Union (`IoU`) between two sets.
-fn intersection_over_union<T: Eq + Hash>(
+pub(crate) fn intersection_over_union<T: Eq + Hash>(
     set_a: &std::collections::HashSet<T>,
     set_b: &std::collections::HashSet<T>,
 ) -> f64 {

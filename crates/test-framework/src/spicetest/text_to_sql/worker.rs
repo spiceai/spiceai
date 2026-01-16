@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::spicetest::text_to_sql::{
     TextToSqlMetric,
+    metrics::intersection_over_union,
     parse::{logical_plan, sql_schema},
     task_history::find_task_history_metrics,
 };
@@ -120,6 +121,14 @@ impl TextToSqlWorker {
             while let Ok(request) = self.request_rx.recv().await {
                 match self.process_request(&request).await {
                     Ok(metric) => {
+                        println!(
+                            "metrics:\n Expected: {:?}\n Actual: {:?}\n schemas:{:?} proj:{:?} table:{:?}\n",
+                            metric.expected_sql,
+                            metric.generated_sql,
+                            metric.correct_output_schema,
+                            metric.correct_table_projections,
+                            metric.correct_tables
+                        );
                         results.insert(request.id.clone(), metric);
                     }
                     Err(e) => {
@@ -186,6 +195,7 @@ impl TextToSqlWorker {
             &generated_sql,
         )
         .await
+        .inspect_err(|e| eprintln!("could not compute logical plan for generated SQL. Error: {e}"))
         .ok();
 
         // Calculate expected schema & logical plan if absent.
@@ -217,12 +227,20 @@ impl TextToSqlWorker {
             request.sample_data_enabled,
             request.return_sql,
             &task_history_metrics,
-            if generated_schema == expected_schema {
-                1.0
-            } else {
-                0.0
-            },
+            schema_similarity(generated_schema.as_ref(), expected_schema.as_ref()),
         ))
+    }
+}
+
+/// Computes the schema similarity between two Arrow schemas using Intersection over Union (IoU).
+fn schema_similarity(a: Option<&Schema>, b: Option<&Schema>) -> f64 {
+    match (a, b) {
+        (Some(schema_a), Some(schema_b)) => {
+            let fields_a = schema_a.fields().into_iter().collect();
+            let fields_b = schema_b.fields().into_iter().collect();
+            intersection_over_union(&fields_a, &fields_b)
+        }
+        _ => 0.0,
     }
 }
 
