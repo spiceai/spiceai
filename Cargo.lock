@@ -14193,6 +14193,7 @@ dependencies = [
  "spicepod",
  "strsim 0.11.1",
  "sysinfo 0.37.2",
+ "tar",
  "telemetry",
  "tempfile",
  "tera",
@@ -14230,16 +14231,19 @@ dependencies = [
 name = "runtime-acceleration"
 version = "1.11.0-unstable"
 dependencies = [
+ "anyhow",
  "arrow",
  "arrow-schema",
  "async-trait",
  "aws-sdk-credential-bridge",
  "bytes",
  "chrono",
+ "criterion 0.7.0",
  "datafusion",
  "duckdb",
  "fundu",
  "futures",
+ "hex",
  "object_store",
  "opentelemetry 0.29.1",
  "runtime-parameters",
@@ -14249,11 +14253,13 @@ dependencies = [
  "sha2 0.10.9",
  "snafu",
  "spicepod",
+ "tar",
  "tempfile",
  "tokio",
  "tracing",
  "url",
  "util",
+ "uuid 1.18.1",
 ]
 
 [[package]]
