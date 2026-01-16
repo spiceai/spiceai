@@ -768,9 +768,10 @@ impl SnapshotManager {
 
         // Step 1: Create a temporary tar archive of all directories
         let temp_archive_path = std::env::temp_dir().join(format!(
-            "snapshot_{}_{}.tar",
+            "snapshot_{}_{}_{}.tar",
             self.dataset_name,
-            chrono::Utc::now().format("%Y%m%dT%H%M%S")
+            chrono::Utc::now().format("%Y%m%dT%H%M%S"),
+            uuid::Uuid::now_v7()
         ));
 
         let archive_file = fs::File::create(&temp_archive_path)
@@ -1338,11 +1339,10 @@ impl SnapshotManager {
         }
         drop(file);
 
-        self.validate_snapshot(entry, actual_size, &hasher, local_path, path_display)
+        let actual_checksum = self
+            .validate_snapshot(entry, actual_size, hasher, local_path, path_display)
             .await?;
 
-        let checksum_bytes = hasher.finalize();
-        let actual_checksum = encode_hex_lower(checksum_bytes.as_ref());
         Ok((actual_size, actual_checksum))
     }
 
@@ -1358,9 +1358,10 @@ impl SnapshotManager {
 
         // Download to a temporary file first
         let temp_archive_path = std::env::temp_dir().join(format!(
-            "snapshot_download_{}_{}.tar",
+            "snapshot_download_{}_{}_{}.tar",
             self.dataset_name,
-            chrono::Utc::now().format("%Y%m%dT%H%M%S")
+            chrono::Utc::now().format("%Y%m%dT%H%M%S"),
+            uuid::Uuid::now_v7()
         ));
 
         // Ensure temp dir exists
@@ -1417,18 +1418,10 @@ impl SnapshotManager {
         }
         drop(file);
 
-        // Validate size and checksum before extraction
-        self.validate_snapshot(
-            entry,
-            actual_size,
-            &hasher,
-            &temp_archive_path,
-            path_display,
-        )
-        .await?;
-
-        let checksum_bytes = hasher.finalize();
-        let actual_checksum = encode_hex_lower(checksum_bytes.as_ref());
+        // Validate size and checksum before extraction, consuming the hasher to get the checksum
+        let actual_checksum = self
+            .validate_snapshot(entry, actual_size, hasher, &temp_archive_path, path_display)
+            .await?;
 
         // Find the common parent directory to extract the archive to.
         // The archive contains prefixed paths like "metadata/..." and "data/...",
@@ -1436,7 +1429,15 @@ impl SnapshotManager {
         let extract_target = dirs
             .first()
             .and_then(|(dir, _)| dir.parent())
-            .map_or_else(std::env::temp_dir, std::path::Path::to_path_buf);
+            .ok_or_else(|| {
+                let _ = std::fs::remove_file(&temp_archive_path);
+                SnapshotDownloadError::CreateLocalDir {
+                    path: temp_archive_path.clone(),
+                    source: std::io::Error::other(
+                        "Cannot determine extraction target: no directories specified or directory has no parent",
+                    ),
+                }
+            })?;
 
         // Extract the tar archive to the target directory
         let archive_file = fs::File::open(&temp_archive_path).await.map_err(|source| {
@@ -1446,7 +1447,7 @@ impl SnapshotManager {
             }
         })?;
 
-        extract_archive(archive_file, &extract_target)
+        extract_archive(archive_file, extract_target)
             .await
             .map_err(|source| SnapshotDownloadError::ArchiveExtract {
                 path: temp_archive_path.clone(),
@@ -1466,14 +1467,15 @@ impl SnapshotManager {
     }
 
     /// Validates snapshot size and checksum, cleaning up the local file on failure.
+    /// Consumes the hasher and returns the hex-encoded checksum on success.
     async fn validate_snapshot(
         &self,
         entry: &SnapshotEntry,
         actual_size: u64,
-        hasher: &Sha256,
+        hasher: Sha256,
         local_path: &PathBuf,
         path_display: &str,
-    ) -> Result<(), SnapshotDownloadError> {
+    ) -> Result<String, SnapshotDownloadError> {
         if entry.snapshot_size != actual_size {
             let _ = fs::remove_file(local_path).await;
             return Err(SnapshotDownloadError::SizeMismatch {
@@ -1494,7 +1496,7 @@ impl SnapshotManager {
             });
         }
 
-        let checksum_bytes = hasher.clone().finalize();
+        let checksum_bytes = hasher.finalize();
         let actual_checksum = encode_hex_lower(checksum_bytes.as_ref());
         let expected_checksum = entry.snapshot_checksum.to_lowercase();
         if expected_checksum != actual_checksum {
@@ -1506,7 +1508,7 @@ impl SnapshotManager {
             });
         }
 
-        Ok(())
+        Ok(actual_checksum)
     }
 
     async fn update_metadata_after_upload(
