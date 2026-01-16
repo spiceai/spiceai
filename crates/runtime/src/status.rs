@@ -21,7 +21,6 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 use tokio::sync::watch;
@@ -78,15 +77,6 @@ pub struct RuntimeStatus {
     is_shutdown: Arc<AtomicBool>,
     /// Per-component notifiers for status change subscriptions.
     notifiers: Arc<RwLock<HashMap<String, watch::Sender<ComponentStatus>>>>,
-}
-
-/// Error type for waiting on component readiness.
-#[derive(Debug)]
-pub enum WaitError {
-    /// The wait operation timed out.
-    Timeout,
-    /// The watch channel was closed.
-    ChannelClosed,
 }
 
 impl RuntimeStatus {
@@ -330,221 +320,87 @@ impl RuntimeStatus {
     }
 
     /// Internal helper to wait for a component to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    async fn wait_for_component_ready(
-        &self,
-        component_name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    async fn wait_for_component_ready(&self, component_name: &str) {
         let mut receiver = self.get_or_create_notifier(component_name);
 
-        let wait_future = async {
-            loop {
-                // Check current value (handles already-ready case)
-                if *receiver.borrow() == ComponentStatus::Ready {
-                    return Ok(());
-                }
-
-                // Wait for next change
-                receiver
-                    .changed()
-                    .await
-                    .map_err(|_| WaitError::ChannelClosed)?;
+        loop {
+            // Check current value (handles already-ready case)
+            if *receiver.borrow() == ComponentStatus::Ready {
+                return;
             }
-        };
 
-        match timeout {
-            Some(duration) => tokio::time::timeout(duration, wait_future)
-                .await
-                .map_err(|_| WaitError::Timeout)?,
-            None => wait_future.await,
+            // Wait for next change; return if channel closed (runtime shutting down)
+            if receiver.changed().await.is_err() {
+                return;
+            }
         }
     }
 
     /// Waits for a dataset to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the dataset doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_dataset_ready(
-        &self,
-        dataset: &TableReference,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_dataset_ready(&self, dataset: &TableReference) {
         let component_name = format!("dataset:{dataset}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 
     /// Waits for a model to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the model doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_model_ready(
-        &self,
-        model_name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_model_ready(&self, model_name: &str) {
         let component_name = format!("model:{model_name}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 
     /// Waits for a catalog to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the catalog doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_catalog_ready(
-        &self,
-        catalog_name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_catalog_ready(&self, catalog_name: &str) {
         let component_name = format!("catalog:{catalog_name}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 
     /// Waits for a tool to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the tool doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_tool_ready(
-        &self,
-        tool_name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_tool_ready(&self, tool_name: &str) {
         let component_name = format!("tool:{tool_name}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 
     /// Waits for a tool catalog to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the tool catalog doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_tool_catalog_ready(
-        &self,
-        catalog_name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_tool_catalog_ready(&self, catalog_name: &str) {
         let component_name = format!("tool_catalog:{catalog_name}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 
     /// Waits for an LLM to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the LLM doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_llm_ready(
-        &self,
-        model_name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_llm_ready(&self, model_name: &str) {
         let component_name = format!("llm:{model_name}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 
     /// Waits for an embedding model to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the embedding model doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_embedding_ready(
-        &self,
-        model_name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_embedding_ready(&self, model_name: &str) {
         let component_name = format!("embedding:{model_name}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 
     /// Waits for a view to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the view doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_view_ready(
-        &self,
-        view_name: &TableReference,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_view_ready(&self, view_name: &TableReference) {
         let component_name = format!("view:{view_name}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 
     /// Waits for a worker to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the worker doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_worker_ready(
-        &self,
-        worker_name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_worker_ready(&self, worker_name: &str) {
         let component_name = format!("worker:{worker_name}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 
     /// Waits for a cluster node to become ready.
-    ///
-    /// If `timeout` is `None`, waits indefinitely.
-    ///
-    /// # Errors
-    ///
-    /// Returns `WaitError::Timeout` if the cluster node doesn't become ready within the timeout.
-    /// Returns `WaitError::ChannelClosed` if the watch channel is closed.
-    pub async fn wait_for_cluster_ready(
-        &self,
-        node_name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<(), WaitError> {
+    pub async fn wait_for_cluster_ready(&self, node_name: &str) {
         let component_name = format!("cluster:{node_name}");
-        self.wait_for_component_ready(&component_name, timeout)
-            .await
+        self.wait_for_component_ready(&component_name).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -583,10 +439,7 @@ mod tests {
         status.update_dataset(&dataset, ComponentStatus::Ready);
 
         // Should return immediately
-        let result = status
-            .wait_for_dataset_ready(&dataset, Some(Duration::from_millis(100)))
-            .await;
-        result.expect("result");
+        status.wait_for_dataset_ready(&dataset).await;
     }
 
     #[tokio::test]
@@ -605,26 +458,8 @@ mod tests {
             status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
         });
 
-        // Wait for ready with a longer timeout
-        let result = status
-            .wait_for_dataset_ready(&dataset, Some(Duration::from_secs(1)))
-            .await;
-        result.expect("result");
-    }
-
-    #[tokio::test]
-    async fn test_wait_for_dataset_ready_timeout() {
-        let status = RuntimeStatus::new();
-        let dataset = TableReference::bare("test_dataset");
-
-        // Set dataset to initializing and never make it ready
-        status.update_dataset(&dataset, ComponentStatus::Initializing);
-
-        // Wait should timeout
-        let result = status
-            .wait_for_dataset_ready(&dataset, Some(Duration::from_millis(50)))
-            .await;
-        assert!(matches!(result, Err(WaitError::Timeout)));
+        // Wait for ready
+        status.wait_for_dataset_ready(&dataset).await;
     }
 
     #[tokio::test]
@@ -641,10 +476,7 @@ mod tests {
             status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
         });
 
-        let result = status
-            .wait_for_dataset_ready(&dataset, Some(Duration::from_secs(1)))
-            .await;
-        result.expect("result");
+        status.wait_for_dataset_ready(&dataset).await;
     }
 
     #[tokio::test]
@@ -660,17 +492,9 @@ mod tests {
         let dataset1 = dataset.clone();
         let dataset2 = dataset.clone();
 
-        let handle1 = tokio::spawn(async move {
-            status1
-                .wait_for_dataset_ready(&dataset1, Some(Duration::from_secs(1)))
-                .await
-        });
+        let handle1 = tokio::spawn(async move { status1.wait_for_dataset_ready(&dataset1).await });
 
-        let handle2 = tokio::spawn(async move {
-            status2
-                .wait_for_dataset_ready(&dataset2, Some(Duration::from_secs(1)))
-                .await
-        });
+        let handle2 = tokio::spawn(async move { status2.wait_for_dataset_ready(&dataset2).await });
 
         // Give tasks time to start waiting
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -678,15 +502,12 @@ mod tests {
         // Set ready - both should wake up
         status.update_dataset(&dataset, ComponentStatus::Ready);
 
-        let result1 = handle1.await.expect("task 1 should complete");
-        let result2 = handle2.await.expect("task 2 should complete");
-
-        result1.expect("result");
-        result2.expect("result");
+        handle1.await.expect("task 1 should complete");
+        handle2.await.expect("task 2 should complete");
     }
 
     #[tokio::test]
-    async fn test_wait_for_dataset_ready_no_timeout() {
+    async fn test_wait_for_dataset_ready_waits_indefinitely() {
         let status = RuntimeStatus::new();
         let dataset = TableReference::bare("test_dataset");
 
@@ -701,9 +522,8 @@ mod tests {
             status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
         });
 
-        // Wait with no timeout (None)
-        let result = status.wait_for_dataset_ready(&dataset, None).await;
-        result.expect("result");
+        // Wait indefinitely
+        status.wait_for_dataset_ready(&dataset).await;
     }
 
     #[tokio::test]

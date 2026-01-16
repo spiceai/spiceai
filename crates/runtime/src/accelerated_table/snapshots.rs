@@ -76,9 +76,7 @@ pub fn spawn_snapshot_interval_task(
             "Snapshot interval task for {dataset_name} waiting for dataset to be ready"
         );
         // Wait for the dataset to become ready
-        let _ = runtime_status
-            .wait_for_dataset_ready(&dataset_name, None)
-            .await;
+        runtime_status.wait_for_dataset_ready(&dataset_name).await;
         tracing::debug!("Snapshot interval task for {dataset_name} starting after dataset ready");
 
         // Determine initial delay based on bootstrapping status and checkpoint time
@@ -154,8 +152,8 @@ pub fn create_periodic_snapshot_callback(
             let dataset_ready_clone = Arc::clone(&dataset_ready);
             let dataset_name_clone = dataset_name.clone();
             tokio::spawn(async move {
-                let _ = runtime_status
-                    .wait_for_dataset_ready(&dataset_name_clone, None)
+                runtime_status
+                    .wait_for_dataset_ready(&dataset_name_clone)
                     .await;
                 dataset_ready_clone.store(true, Ordering::Release);
                 tracing::debug!(
