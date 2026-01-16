@@ -10,12 +10,11 @@ on:
         type: choice
         options:
           - 'all'
-          - 'gpt-5.1'
-          - 'gpt-5-mini'
+          - 'gpt-5.2'
           - 'o3-mini'
           - 'llama3-3B-Instruct'
-          - 'claude-sonnet-4-5'
-          - 'grok4'
+          - 'claude-haiku'
+          - 'grok-4-fast'
         default: 'all'
   schedule:
     - cron: '0 5 * * 2,5' # Every Monday and Thursday at 10pm PST (5am UTC next day)
@@ -82,12 +81,11 @@ jobs:
         with:
           script: |
             const matrix = [
-              { name: "gpt-5.1" },
-              { name: "gpt-5-mini" },
+              { name: "gpt-5.2" },
               { name: "o3-mini" },
               { name: "llama3-3B-Instruct" },
-              { name: "claude-sonnet-4-5" },
-              { name: "grok4" },
+              { name: "claude-haiku" },
+              { name: "grok-4-fast" },
             ];
 
             const model_option = context.payload.inputs?.model_option || 'all';
