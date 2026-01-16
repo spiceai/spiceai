@@ -1011,7 +1011,7 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
                     dataset.name
                 );
             } else {
-                tracing::debug!(
+                tracing::info!(
                     "Updated fetched_at for all records in cached dataset {}",
                     dataset.name
                 );

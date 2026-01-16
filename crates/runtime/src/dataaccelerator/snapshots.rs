@@ -83,6 +83,7 @@ pub(super) async fn download_snapshot_if_needed(
                 schema: _,
                 bytes_downloaded,
                 checksum,
+                last_updated_at,
             })) => {
                 let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 metrics::record_bootstrap_metrics(
@@ -91,7 +92,7 @@ pub(super) async fn download_snapshot_if_needed(
                     bytes_downloaded,
                     &checksum,
                 );
-                BootstrapStatus::bootstrapped()
+                BootstrapStatus::bootstrapped(last_updated_at)
             }
             Ok(None) => BootstrapStatus::none(),
             Err(e) => {

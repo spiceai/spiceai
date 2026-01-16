@@ -145,6 +145,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let refresh = Refresh::new(RefreshMode::Full);
     let accelerator_write_mutex = Arc::new(Mutex::new(()));
 
+    let on_complete_notification = Arc::new(tokio::sync::Notify::new());
     let mut refresher = Refresher::new(
         status::RuntimeStatus::new(),
         TableReference::bare("snapshot_mutex_test"),
@@ -155,6 +156,7 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
         None,
         runtime.tokio_io_runtime(),
         Arc::clone(&accelerator_write_mutex),
+        on_complete_notification,
     );
 
     let snapshot_manager = SnapshotManager::try_new(

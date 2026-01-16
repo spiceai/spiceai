@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -472,7 +472,6 @@ pub struct Refresher {
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
-    /// Notification for completion of refresh operation
     on_complete_notification: Option<Arc<Notify>>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -482,6 +481,9 @@ pub struct Refresher {
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// The bootstrap status from dataset initialization.
     bootstrap_status: BootstrapStatus,
+    /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
+    /// Shared with `AcceleratedTable`.
+    last_updated_at: Option<Arc<AtomicI64>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -533,6 +535,7 @@ impl Refresher {
             resource_monitor: None,
             accelerator_write_mutex,
             bootstrap_status: BootstrapStatus::none(),
+            last_updated_at: None,
         }
     }
 
@@ -568,6 +571,11 @@ impl Refresher {
 
     pub fn semaphore(&mut self, semaphore: Arc<Semaphore>) -> &mut Self {
         self.semaphore = Some(semaphore);
+        self
+    }
+
+    pub fn with_last_updated_at(&mut self, last_updated_at: Option<Arc<AtomicI64>>) -> &mut Self {
+        self.last_updated_at = last_updated_at;
         self
     }
 
@@ -687,9 +695,9 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                let on_dataset_ready = self.on_complete_notification.as_ref().map(|notification| {
+                let on_dataset_ready = self.on_complete_notification.as_ref().map(|n| {
                     DatasetReadyNotification::new(
-                        Arc::clone(notification),
+                        Arc::clone(n),
                         Arc::clone(&self.initial_load_completed),
                     )
                 });
@@ -705,6 +713,7 @@ impl Refresher {
                             Arc::clone(&federated_schema),
                             on_dataset_ready,
                             self.bootstrap_status,
+                            self.last_updated_at.clone(),
                         ),
                         None,
                     ),
@@ -718,6 +727,7 @@ impl Refresher {
                             &self.dataset_name,
                             self.federated.schema(),
                             on_dataset_ready,
+                            self.last_updated_at.clone(),
                         ),
                     ),
                 };
@@ -768,6 +778,7 @@ impl Refresher {
         let snapshot_mutex = Arc::clone(&self.accelerator_write_mutex);
 
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
+        let last_updated_at = self.last_updated_at.clone();
 
         let synchronize_with = self.synchronize_with.clone();
 
@@ -779,13 +790,12 @@ impl Refresher {
                 Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
                 Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
                 Some(SnapshotCreateTrigger::Interval(duration)) => {
-                    let on_dataset_ready =
-                        self.on_complete_notification.as_ref().map(|notification| {
-                            DatasetReadyNotification::new(
-                                Arc::clone(notification),
-                                Arc::clone(&self.initial_load_completed),
-                            )
-                        });
+                    let on_dataset_ready = self.on_complete_notification.as_ref().map(|n| {
+                        DatasetReadyNotification::new(
+                            Arc::clone(n),
+                            Arc::clone(&self.initial_load_completed),
+                        )
+                    });
                     (
                         spawn_snapshot_interval_task(
                             Some(*duration),
@@ -796,6 +806,7 @@ impl Refresher {
                             Arc::clone(&federated_schema),
                             on_dataset_ready,
                             self.bootstrap_status,
+                            self.last_updated_at.clone(),
                         ),
                         false,
                     )
@@ -855,7 +866,9 @@ impl Refresher {
                         tracing::debug!("Received refresh task completion callback: {res:?}");
 
                         if matches!(res, Ok(())) {
-                            notify_refresh_done(&dataset_name, &refresh, notifier.clone()).await;
+                            if let Some(notifier) = &notifier {
+                                notify_refresh_done(&dataset_name, &refresh, Arc::clone(notifier)).await;
+                            }
                             initial_load_completed.store(true, Ordering::Relaxed);
 
                             if let Some(cache_provider_ref) = caching.as_ref() {
@@ -873,6 +886,7 @@ impl Refresher {
                                     &federated_schema,
                                     &snapshot_mutex,
                                     &dataset_name,
+                                    last_updated_at.as_ref(),
                                 ).await;
                             }
                         }
@@ -987,11 +1001,9 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
 async fn notify_refresh_done(
     dataset_name: &TableReference,
     refresh: &Arc<RwLock<Refresh>>,
-    ready_sender: Option<Arc<Notify>>,
+    ready_sender: Arc<Notify>,
 ) {
-    if let Some(sender) = ready_sender.as_ref() {
-        sender.notify_waiters();
-    }
+    ready_sender.notify_waiters();
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1144,9 +1156,8 @@ mod tests {
             None,
             Handle::current(),
             Arc::new(Mutex::new(())),
+            Arc::clone(&notifier),
         );
-
-        refresher.with_completion_notifier(Arc::clone(&notifier));
 
         let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
@@ -1354,9 +1365,8 @@ mod tests {
                 None,
                 Handle::current(),
                 Arc::new(Mutex::new(())),
+                Arc::clone(&notifier),
             );
-
-            refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
@@ -1513,9 +1523,8 @@ mod tests {
                 None,
                 Handle::current(),
                 Arc::new(Mutex::new(())),
+                Arc::clone(&notifier),
             );
-
-            refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
@@ -1722,9 +1731,8 @@ mod tests {
                 None,
                 Handle::current(),
                 Arc::new(Mutex::new(())),
+                Arc::clone(&notifier),
             );
-
-            refresher.with_completion_notifier(Arc::clone(&notifier));
 
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);

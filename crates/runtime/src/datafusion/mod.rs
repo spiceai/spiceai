@@ -814,7 +814,7 @@ impl DataFusion {
             sink_connector,
             federated_table,
             Arc::clone(&pending_registration.secrets),
-            BootstrapStatus::None, // Sink datasets don't bootstrap from snapshots
+            BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
         )
         .await?;
 
@@ -2211,7 +2211,10 @@ async fn build_snapshot_creation_config(
         acceleration_engine,
     )
     .await
-    .map(|sm| SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)))
+    .map(|sm| {
+        let sm = sm.with_skip_on_no_updates(acceleration_settings.snapshots_skip_on_no_updates);
+        SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
+    }))
 }
 
 #[cfg(test)]

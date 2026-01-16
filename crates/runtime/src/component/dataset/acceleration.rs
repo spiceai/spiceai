@@ -314,6 +314,8 @@ pub struct Acceleration {
     pub snapshots_compaction: SnapshotsCompaction,
 
     pub snapshots_reset_expiry_on_load_enabled: bool,
+
+    pub snapshots_skip_on_no_updates: bool,
 }
 
 impl Acceleration {
@@ -495,6 +497,10 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 acceleration.snapshots_reset_expiry_on_load,
                 spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
             ),
+            snapshots_skip_on_no_updates: matches!(
+                acceleration.snapshots_skip_on_no_updates,
+                spicepod_acceleration::SnapshotsSkipOnNoUpdates::Enabled
+            ),
         })
     }
 }
@@ -535,6 +541,7 @@ impl Default for Acceleration {
             snapshots_trigger_threshold: None,
             snapshots_compaction: SnapshotsCompaction::Disabled,
             snapshots_reset_expiry_on_load_enabled: false,
+            snapshots_skip_on_no_updates: false,
         }
     }
 }

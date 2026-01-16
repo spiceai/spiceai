@@ -18,7 +18,7 @@ use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{SnapshotManager, metrics as snapshot_metrics};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, sleep};
@@ -60,6 +60,7 @@ pub fn spawn_snapshot_interval_task(
     federated_schema: Arc<Schema>,
     dataset_ready_notification: Option<Arc<DatasetReadyNotification>>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
+    last_updated_at: Option<Arc<AtomicI64>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
     let checkpointer = checkpointer?;
@@ -119,6 +120,7 @@ pub fn spawn_snapshot_interval_task(
                 &federated_schema,
                 &accelerator_write_mutex,
                 &dataset_name,
+                last_updated_at.as_ref(),
             )
             .await;
 
@@ -132,6 +134,7 @@ pub fn spawn_snapshot_interval_task(
 ///
 /// If `dataset_ready_notification` is provided, batch counting will only start after the dataset
 /// is ready. This prevents counting batches during the initial load/bootstrap phase.
+#[expect(clippy::too_many_arguments)]
 pub fn create_periodic_snapshot_callback(
     batches: i64,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
@@ -140,6 +143,7 @@ pub fn create_periodic_snapshot_callback(
     dataset_name: &TableReference,
     federated_schema: Arc<Schema>,
     dataset_ready_notification: Option<Arc<DatasetReadyNotification>>,
+    last_updated_at: Option<Arc<AtomicI64>>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
@@ -180,6 +184,7 @@ pub fn create_periodic_snapshot_callback(
                 let federated_schema = Arc::<Schema>::clone(&federated_schema);
                 let dataset_name = dataset_name.clone();
                 let dataset_ready = Arc::clone(&dataset_ready);
+                let last_updated_at = last_updated_at.clone();
 
                 Box::pin(async move {
                     // Only count batches after the dataset is ready
@@ -199,6 +204,7 @@ pub fn create_periodic_snapshot_callback(
                             &federated_schema,
                             &accelerator_write_mutex,
                             &dataset_name,
+                            last_updated_at.as_ref(),
                         )
                         .await;
                     }
@@ -218,6 +224,7 @@ pub async fn create_checkpoint_and_snapshot(
     federated_schema: &Arc<Schema>,
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
+    last_updated_at: Option<&Arc<AtomicI64>>,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     if let Err(e) = checkpointer.checkpoint(federated_schema).await {
@@ -226,15 +233,23 @@ pub async fn create_checkpoint_and_snapshot(
     }
 
     if let Some(snapshot_manager) = snapshot_manager {
-        if let Err(e) = snapshot_manager
-            .create_snapshot(federated_schema, lock_guard)
+        let updated_at = last_updated_at.map(|a| a.load(Ordering::Acquire));
+
+        match snapshot_manager
+            .create_snapshot(federated_schema, lock_guard, updated_at)
             .await
         {
-            let dataset_label = dataset_name.to_string();
-            snapshot_metrics::record_snapshot_failure(&dataset_label);
-            tracing::warn!("Failed to create snapshot for dataset {dataset_name}: {e}");
-        } else {
-            tracing::info!("Successfully created snapshot for dataset: {dataset_name}");
+            Ok(Some(_)) => {
+                tracing::info!("Successfully created snapshot for dataset: {dataset_name}");
+            }
+            Ok(None) => {
+                // Snapshot was skipped (no updates) - metric already recorded
+            }
+            Err(e) => {
+                let dataset_label = dataset_name.to_string();
+                snapshot_metrics::record_snapshot_failure(&dataset_label);
+                tracing::warn!("Failed to create snapshot for dataset {dataset_name}: {e}");
+            }
         }
     }
 }
