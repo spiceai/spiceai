@@ -181,13 +181,19 @@ impl ScalarUDFImpl for DigestMany {
 
         let concatenated_array = Arc::new(concatenated_builder.finish()) as ArrayRef;
 
+        // Query the hash function's return field (e.g., md5 returns Utf8View in DataFusion v51+)
+        let return_field = hash_fn.return_field_from_args(ReturnFieldArgs {
+            arg_fields: &[FieldRef::new(Field::new("dummy", DataType::Utf8, false))],
+            scalar_arguments: &[Some(&ScalarValue::Utf8(Some(String::new())))],
+        })?;
+
         // Hash entire array in one call - hash function can leverage SIMD internally
         // This is more efficient than N separate hash calls for N rows
         hash_fn.invoke_with_args(ScalarFunctionArgs {
             args: vec![ColumnarValue::Array(concatenated_array)],
             number_rows: num_rows,
             arg_fields: vec![],
-            return_field: Arc::new(Field::new("hash", DataType::Utf8, false)),
+            return_field,
             config_options: Arc::new(ConfigOptions::default()),
         })
     }
