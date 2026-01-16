@@ -40,7 +40,7 @@ use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -230,9 +230,9 @@ impl DataAccelerator for SqliteAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         let path = self.file_path(source)?;
@@ -272,7 +272,7 @@ impl DataAccelerator for SqliteAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(
+            let was_bootstrapped = download_snapshot_if_needed(
                 acceleration,
                 source,
                 PathBuf::from(path),
@@ -281,9 +281,11 @@ impl DataAccelerator for SqliteAccelerator {
             .await;
 
             self.get_shared_pool(source).await?;
+
+            return Ok(was_bootstrapped);
         }
 
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
