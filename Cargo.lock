@@ -2865,7 +2865,6 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
- "zstd",
 ]
 
 [[package]]

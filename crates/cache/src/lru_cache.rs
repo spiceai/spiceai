@@ -317,6 +317,12 @@ impl<
                 #[cfg(feature = "pingora")]
                 {
                     tracing::debug!("Using Pingora cache engine.");
+                    if matches!(caching_policy, CachingPolicy::TinyLfu) {
+                        tracing::warn!(
+                            "Pingora cache engine does not support TinyLFU caching policy. Falling back to LRU."
+                        );
+                    }
+
                     let backend =
                         CacheBackendEnum::Pingora(PingoraBackend::with_params(cache_max_size, ttl));
                     (backend, None, CacheEngine::Pingora)

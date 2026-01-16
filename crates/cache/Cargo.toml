@@ -33,7 +33,6 @@ spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
 twox-hash = { workspace = true }
-zstd = "0.13"
 
 [dev-dependencies]
 blake3 = "1.8"
