@@ -199,10 +199,17 @@ where
 
     async fn clear(&self) {
         // Collect all keys from metadata shards
+        // We must lock all shards for writing to ensure they clear without a new insert racing before the clear
+        let shard_locks = self
+            .metadata_shards
+            .as_ref()
+            .iter()
+            .map(|shard| shard.write())
+            .collect::<Vec<_>>();
         let keys: Vec<u64> = {
             let mut all_keys = Vec::new();
-            for shard in self.metadata_shards.as_ref() {
-                all_keys.extend(shard.read().keys().copied());
+            for shard in &shard_locks {
+                all_keys.extend(shard.keys().copied());
             }
             all_keys
         };
@@ -213,8 +220,8 @@ where
         }
 
         // Clear all metadata shards
-        for shard in self.metadata_shards.as_ref() {
-            shard.write().clear();
+        for mut shard in shard_locks {
+            shard.clear();
         }
     }
 
