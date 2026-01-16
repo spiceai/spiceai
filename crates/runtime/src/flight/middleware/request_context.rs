@@ -136,7 +136,8 @@ where
 
         // Add job executor extension if available (cluster mode)
         if let Some(ref executor) = self.job_executor {
-            builder = builder.with_extension(JobExecutorContextExtension::new(Arc::clone(executor)));
+            builder =
+                builder.with_extension(JobExecutorContextExtension::new(Arc::clone(executor)));
         }
 
         // Add session extension if we have one

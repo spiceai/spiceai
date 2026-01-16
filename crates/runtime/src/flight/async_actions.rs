@@ -130,9 +130,8 @@ pub struct CancelAsyncQueryResponse {
 /// Handles the `SubmitAsyncQuery` action.
 pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let context = RequestContext::current(AsyncMarker::new().await);
-    let executor = get_job_executor(&context).ok_or_else(|| {
-        Status::unavailable("Async queries are only available in cluster mode")
-    })?;
+    let executor = get_job_executor(&context)
+        .ok_or_else(|| Status::unavailable("Async queries are only available in cluster mode"))?;
 
     let request: SubmitAsyncQueryRequest = serde_json::from_slice(body).map_err(|e| {
         Status::invalid_argument(format!("Failed to parse SubmitAsyncQueryRequest: {e}"))
@@ -155,9 +154,8 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
 /// Handles the `GetAsyncQueryStatus` action.
 pub async fn handle_get_async_query_status(body: &[u8]) -> Result<Vec<u8>, Status> {
     let context = RequestContext::current(AsyncMarker::new().await);
-    let executor = get_job_executor(&context).ok_or_else(|| {
-        Status::unavailable("Async queries are only available in cluster mode")
-    })?;
+    let executor = get_job_executor(&context)
+        .ok_or_else(|| Status::unavailable("Async queries are only available in cluster mode"))?;
 
     let request: GetAsyncQueryStatusRequest = serde_json::from_slice(body).map_err(|e| {
         Status::invalid_argument(format!("Failed to parse GetAsyncQueryStatusRequest: {e}"))
@@ -178,9 +176,8 @@ pub async fn handle_get_async_query_status(body: &[u8]) -> Result<Vec<u8>, Statu
 /// Returns result data as Arrow IPC format.
 pub async fn handle_get_async_query_result(body: &[u8]) -> Result<Vec<u8>, Status> {
     let context = RequestContext::current(AsyncMarker::new().await);
-    let executor = get_job_executor(&context).ok_or_else(|| {
-        Status::unavailable("Async queries are only available in cluster mode")
-    })?;
+    let executor = get_job_executor(&context)
+        .ok_or_else(|| Status::unavailable("Async queries are only available in cluster mode"))?;
 
     let request: GetAsyncQueryResultRequest = serde_json::from_slice(body).map_err(|e| {
         Status::invalid_argument(format!("Failed to parse GetAsyncQueryResultRequest: {e}"))
@@ -212,9 +209,8 @@ pub async fn handle_get_async_query_result(body: &[u8]) -> Result<Vec<u8>, Statu
 /// Handles the `CancelAsyncQuery` action.
 pub async fn handle_cancel_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let context = RequestContext::current(AsyncMarker::new().await);
-    let executor = get_job_executor(&context).ok_or_else(|| {
-        Status::unavailable("Async queries are only available in cluster mode")
-    })?;
+    let executor = get_job_executor(&context)
+        .ok_or_else(|| Status::unavailable("Async queries are only available in cluster mode"))?;
 
     let request: CancelAsyncQueryRequest = serde_json::from_slice(body).map_err(|e| {
         Status::invalid_argument(format!("Failed to parse CancelAsyncQueryRequest: {e}"))
