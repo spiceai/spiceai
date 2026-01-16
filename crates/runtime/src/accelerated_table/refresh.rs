@@ -712,7 +712,7 @@ impl Refresher {
                             dataset_name.clone(),
                             Arc::clone(&federated_schema),
                             on_dataset_ready,
-                            self.bootstrap_status,
+                            self.bootstrap_status.clone(),
                             self.last_updated_at.clone(),
                         ),
                         None,
@@ -805,7 +805,7 @@ impl Refresher {
                             dataset_name.clone(),
                             Arc::clone(&federated_schema),
                             on_dataset_ready,
-                            self.bootstrap_status,
+                            self.bootstrap_status.clone(),
                             self.last_updated_at.clone(),
                         ),
                         false,
@@ -1156,9 +1156,9 @@ mod tests {
             None,
             Handle::current(),
             Arc::new(Mutex::new(())),
-            Arc::clone(&notifier),
         );
 
+        refresher.with_completion_notifier(Arc::clone(&notifier));
         let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
         let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
         let refresh_handle = refresher
@@ -1365,9 +1365,9 @@ mod tests {
                 None,
                 Handle::current(),
                 Arc::new(Mutex::new(())),
-                Arc::clone(&notifier),
             );
 
+            refresher.with_completion_notifier(Arc::clone(&notifier));
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
             let refresh_handle = refresher
@@ -1523,9 +1523,9 @@ mod tests {
                 None,
                 Handle::current(),
                 Arc::new(Mutex::new(())),
-                Arc::clone(&notifier),
             );
 
+            refresher.with_completion_notifier(Arc::clone(&notifier));
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
             let refresh_handle = refresher
@@ -1731,9 +1731,9 @@ mod tests {
                 None,
                 Handle::current(),
                 Arc::new(Mutex::new(())),
-                Arc::clone(&notifier),
             );
 
+            refresher.with_completion_notifier(Arc::clone(&notifier));
             let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
             let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
             let refresh_handle = refresher

@@ -58,7 +58,7 @@ pub mod metrics;
 pub use adapter::SnapshotAdapter;
 pub use behavior::SnapshotBehavior;
 use engine::{SnapshotEngine, create_snapshot_engine};
-use spicepod::acceleration::SnapshotsCompaction;
+use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy};
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
@@ -148,6 +148,7 @@ impl DatasetMetadata {
 }
 
 /// Details captured when downloading a snapshot for bootstrapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotDownloadInfo {
     pub schema: SchemaRef,
     pub bytes_downloaded: u64,
@@ -454,7 +455,7 @@ pub struct SnapshotManager {
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
-    skip_on_no_updates: bool,
+    snapshots_creation_policy: SnapshotsCreationPolicy,
 }
 
 impl std::fmt::Debug for SnapshotManager {
@@ -641,7 +642,7 @@ impl SnapshotManager {
             object_store: store,
             checkpointer_factory: None,
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
-            skip_on_no_updates: false,
+            snapshots_creation_policy: SnapshotsCreationPolicy::default(),
         })
     }
 
@@ -652,10 +653,13 @@ impl SnapshotManager {
         self
     }
 
-    /// Enables skipping snapshot creation when the data has not been updated.
+    /// Sets the policy for snapshot creation.
     #[must_use]
-    pub fn with_skip_on_no_updates(mut self, skip: bool) -> Self {
-        self.skip_on_no_updates = skip;
+    pub fn with_snapshots_creation_policy(
+        mut self,
+        snapshots_creation_policy: SnapshotsCreationPolicy,
+    ) -> Self {
+        self.snapshots_creation_policy = snapshots_creation_policy;
         self
     }
 
@@ -685,22 +689,21 @@ impl SnapshotManager {
         last_updated_at: Option<i64>,
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
         // Check if we should skip due to no updates
-        if self.skip_on_no_updates {
-            if let Some(last_updated_at) = last_updated_at {
-                if let Ok(Some(handle)) = self.load_metadata().await {
-                    if let Some(dataset_meta) = handle.metadata.datasets.get(&self.dataset_name) {
-                        if dataset_meta.last_updated_at_ms == Some(last_updated_at) {
-                            tracing::info!(
-                                "Skipping snapshot creation - no updates since last snapshot. dataset={} last_updated_at_ms={}",
-                                self.dataset_name,
-                                last_updated_at
-                            );
-                            metrics::record_snapshot_skipped(&self.dataset_name);
-                            return Ok(None);
-                        }
-                    }
-                }
-            }
+        if matches!(
+            self.snapshots_creation_policy,
+            SnapshotsCreationPolicy::Changed
+        ) && let Some(last_updated_at) = last_updated_at
+            && let Ok(Some(handle)) = self.load_metadata().await
+            && let Some(dataset_meta) = handle.metadata.datasets.get(&self.dataset_name)
+            && dataset_meta.last_updated_at_ms == Some(last_updated_at)
+        {
+            tracing::info!(
+                "Skipping snapshot creation - no updates since last snapshot. dataset={} last_updated_at_ms={}",
+                self.dataset_name,
+                last_updated_at
+            );
+            metrics::record_snapshot_skipped(&self.dataset_name);
+            return Ok(None);
         }
 
         let start_time = Instant::now();
@@ -1864,7 +1867,7 @@ mod tests {
             object_store,
             bootstrap_failure_behavior: behavior,
             checkpointer_factory: Some(factory),
-            skip_on_no_updates: false,
+            snapshots_creation_policy: SnapshotsCreationPolicy::Always,
         }
     }
 
@@ -2633,7 +2636,7 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, None)
+            .create_snapshot(&schema, lock_guard, None)
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -2748,9 +2751,10 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard)
+            .create_snapshot(&schema, lock_guard, None)
             .await
-            .expect("create snapshot");
+            .expect("create snapshot")
+            .expect("path");
 
         // Verify snapshot was uploaded
         let stored = store

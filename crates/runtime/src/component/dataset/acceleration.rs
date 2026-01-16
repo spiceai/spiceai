@@ -21,7 +21,7 @@ use datafusion_table_providers::util::{
 };
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
-use spicepod::acceleration::{SnapshotsCompaction, SnapshotsTrigger};
+use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy, SnapshotsTrigger};
 use spicepod::{
     acceleration::{self as spicepod_acceleration},
     param::Params,
@@ -315,7 +315,7 @@ pub struct Acceleration {
 
     pub snapshots_reset_expiry_on_load_enabled: bool,
 
-    pub snapshots_skip_on_no_updates: bool,
+    pub snapshots_creation_policy: SnapshotsCreationPolicy,
 }
 
 impl Acceleration {
@@ -503,10 +503,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 acceleration.snapshots_reset_expiry_on_load,
                 spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
             ),
-            snapshots_skip_on_no_updates: matches!(
-                acceleration.snapshots_skip_on_no_updates,
-                spicepod_acceleration::SnapshotsSkipOnNoUpdates::Enabled
-            ),
+            snapshots_creation_policy: acceleration.snapshots_creation_policy,
         })
     }
 }
@@ -547,7 +544,7 @@ impl Default for Acceleration {
             snapshots_trigger_threshold: None,
             snapshots_compaction: SnapshotsCompaction::Disabled,
             snapshots_reset_expiry_on_load_enabled: false,
-            snapshots_skip_on_no_updates: false,
+            snapshots_creation_policy: SnapshotsCreationPolicy::default(),
         }
     }
 }

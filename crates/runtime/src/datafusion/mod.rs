@@ -2211,7 +2211,7 @@ async fn build_snapshot_creation_config(
     )
     .await
     .map(|sm| {
-        let sm = sm.with_skip_on_no_updates(acceleration_settings.snapshots_skip_on_no_updates);
+        let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
         SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
     }))
 }

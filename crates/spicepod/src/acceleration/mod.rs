@@ -156,10 +156,10 @@ pub enum SnapshotsResetExpiryOnLoad {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum SnapshotsSkipOnNoUpdates {
+pub enum SnapshotsCreationPolicy {
+    Always,
     #[default]
-    Disabled,
-    Enabled,
+    Changed,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -178,8 +178,8 @@ fn is_default_snapshots_reset_expiry_on_load(c: &SnapshotsResetExpiryOnLoad) -> 
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
-fn is_default_snapshots_skip_on_no_updates(c: &SnapshotsSkipOnNoUpdates) -> bool {
-    *c == SnapshotsSkipOnNoUpdates::Disabled
+fn is_default_snapshots_creation_policy(c: &SnapshotsCreationPolicy) -> bool {
+    *c == SnapshotsCreationPolicy::Changed
 }
 
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -339,13 +339,8 @@ pub struct Acceleration {
     )]
     pub snapshots_reset_expiry_on_load: SnapshotsResetExpiryOnLoad,
 
-    /// Skip creating a snapshot if `last_updated_at` hasn't changed since the previous snapshot.
-    /// This avoids uploading identical snapshots when no data has been modified.
-    #[serde(
-        default,
-        skip_serializing_if = "is_default_snapshots_skip_on_no_updates"
-    )]
-    pub snapshots_skip_on_no_updates: SnapshotsSkipOnNoUpdates,
+    #[serde(default, skip_serializing_if = "is_default_snapshots_creation_policy")]
+    pub snapshots_creation_policy: SnapshotsCreationPolicy,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -392,7 +387,7 @@ impl Default for Acceleration {
             snapshots_trigger_threshold: None,
             snapshots_compaction: SnapshotsCompaction::Disabled,
             snapshots_reset_expiry_on_load: SnapshotsResetExpiryOnLoad::Disabled,
-            snapshots_skip_on_no_updates: SnapshotsSkipOnNoUpdates::Disabled,
+            snapshots_creation_policy: SnapshotsCreationPolicy::default(),
         }
     }
 }

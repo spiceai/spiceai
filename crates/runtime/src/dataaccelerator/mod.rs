@@ -32,7 +32,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
 use linkme::distributed_slice;
-use runtime_acceleration::snapshot::SnapshotAdapter;
+use runtime_acceleration::snapshot::{SnapshotAdapter, SnapshotDownloadInfo};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -666,20 +666,16 @@ async fn get_registered_accelerator(
 
 /// Indicates whether a data accelerator was bootstrapped (initialized from existing data)
 /// during initialization, and carries any metadata from the snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapStatus {
-    /// Bootstrapped from snapshot with optional timestamp metadata.
-    Bootstrapped {
-        /// Timestamp (ms since epoch) of the last insert_into, from snapshot metadata.
-        last_updated_at: Option<i64>,
-    },
+    Bootstrapped(SnapshotDownloadInfo),
     None,
 }
 
 impl BootstrapStatus {
     #[must_use]
-    pub const fn bootstrapped(last_updated_at: Option<i64>) -> Self {
-        Self::Bootstrapped { last_updated_at }
+    pub const fn bootstrapped(info: SnapshotDownloadInfo) -> Self {
+        Self::Bootstrapped(info)
     }
 
     #[must_use]
@@ -696,7 +692,7 @@ impl BootstrapStatus {
     pub const fn last_updated_at(&self) -> Option<i64> {
         match self {
             Self::None => None,
-            Self::Bootstrapped { last_updated_at } => *last_updated_at,
+            Self::Bootstrapped(info) => info.last_updated_at,
         }
     }
 }
