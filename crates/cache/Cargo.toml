@@ -25,9 +25,9 @@ datafusion.workspace = true
 fundu = { workspace = true }
 futures.workspace = true
 moka = { workspace = true, features = ["future"] }
+opentelemetry.workspace = true
 parking_lot.workspace = true
 pingora-lru = { workspace = true, optional = true }
-opentelemetry.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
@@ -36,8 +36,8 @@ twox-hash = { workspace = true }
 zstd = "0.13"
 
 [dev-dependencies]
-blake3 = "1.5"
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+blake3 = "1.8"
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 rand = "0.8"
 rstest = "0.25.0"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
@@ -48,9 +48,9 @@ default = []
 pingora = ["dep:pingora-lru"]
 
 [[bench]]
-name = "cache_throughput"
 harness = false
+name = "cache_throughput"
 
 [[bench]]
-name = "hash_algorithms"
 harness = false
+name = "hash_algorithms"

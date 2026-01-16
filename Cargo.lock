@@ -2850,7 +2850,7 @@ dependencies = [
  "blake3",
  "byte-unit",
  "bytes",
- "criterion 0.5.1",
+ "criterion 0.7.0",
  "datafusion",
  "fundu",
  "futures",
