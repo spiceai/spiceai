@@ -674,7 +674,7 @@ mod tests {
         }
 
         let mut retrieved_keys = backend.iter_keys().await;
-        retrieved_keys.sort();
+        retrieved_keys.sort_unstable();
 
         assert_eq!(retrieved_keys, inserted_keys);
     }
@@ -690,7 +690,7 @@ mod tests {
         backend.remove(&2).await;
 
         let mut keys = backend.iter_keys().await;
-        keys.sort();
+        keys.sort_unstable();
 
         assert_eq!(keys, vec![1, 3]);
     }
@@ -721,7 +721,7 @@ mod tests {
         }
 
         let mut keys = backend.iter_keys().await;
-        keys.sort();
+        keys.sort_unstable();
 
         let expected: Vec<u64> = (0..32).collect();
         assert_eq!(keys, expected);
@@ -744,7 +744,10 @@ mod tests {
 
         for i in 0..5 {
             backend.insert(i, TestValue::new("value")).await;
-            assert_eq!(backend.len().await, (i + 1) as usize);
+            assert_eq!(
+                backend.len().await,
+                usize::try_from(i + 1).expect("Should be usize")
+            );
         }
     }
 
@@ -758,7 +761,10 @@ mod tests {
 
         for i in 0..5 {
             backend.remove(&i).await;
-            assert_eq!(backend.len().await, (4 - i) as usize);
+            assert_eq!(
+                backend.len().await,
+                usize::try_from(4 - i).expect("Should be usize")
+            );
         }
     }
 
