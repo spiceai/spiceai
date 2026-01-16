@@ -1,0 +1,16 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: customer_rand_16"
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                      |
++---------------+---------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: customer.c_custkey = Int64(77777)                                                                                 |
+|               |   TableScan: customer projection=[c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment] |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                               |
+|               |   FilterExec: c_custkey@0 = 77777                                                                                         |
+|               |     SchemaCastScanExec                                                                                                    |
+|               |       BytesProcessedExec                                                                                                  |
+|               |         DataSourceExec: partitions=16, partition_sizes=[2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]                   |
+|               |                                                                                                                           |
++---------------+---------------------------------------------------------------------------------------------------------------------------+

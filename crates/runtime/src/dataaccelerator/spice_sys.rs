@@ -62,6 +62,8 @@ pub mod kafka;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 
+pub mod caching_engine;
+
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),

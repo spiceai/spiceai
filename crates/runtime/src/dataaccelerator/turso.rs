@@ -501,7 +501,7 @@ impl DataAccelerator for TursoAccelerator {
             let was_bootstrapped = download_snapshot_if_needed(
                 acceleration,
                 source,
-                PathBuf::from(path),
+                runtime_acceleration::snapshot::SnapshotAdapter::file(PathBuf::from(path)),
                 AccelerationEngine::Turso,
             )
             .await;
