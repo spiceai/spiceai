@@ -16,53 +16,6 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-// Force linkage of connector crates by referencing them.
-// Without these references, the linker may not include the crates and their
-// `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
-
-// Always-compiled connectors (no feature gate)
-use connector_graphql as _;
-
-// Feature-gated connectors
-#[cfg(feature = "clickhouse")]
-use connector_clickhouse as _;
-#[cfg(feature = "delta_lake")]
-use connector_delta_lake as _;
-#[cfg(feature = "dremio")]
-use connector_dremio as _;
-#[cfg(feature = "duckdb")]
-use connector_duckdb as _;
-#[cfg(feature = "flightsql")]
-use connector_flightsql as _;
-#[cfg(feature = "ftp")]
-use connector_ftp as _;
-#[cfg(feature = "imap")]
-use connector_imap as _;
-#[cfg(feature = "mongodb")]
-use connector_mongodb as _;
-#[cfg(feature = "mssql")]
-use connector_mssql as _;
-#[cfg(feature = "mysql")]
-use connector_mysql as _;
-#[cfg(feature = "odbc")]
-use connector_odbc as _;
-#[cfg(feature = "oracle")]
-use connector_oracle as _;
-#[cfg(feature = "postgres")]
-use connector_postgres as _;
-#[cfg(feature = "scylladb")]
-use connector_scylladb as _;
-#[cfg(feature = "sftp")]
-use connector_sftp as _;
-#[cfg(feature = "sharepoint")]
-use connector_sharepoint as _;
-#[cfg(feature = "smb")]
-use connector_smb as _;
-#[cfg(feature = "snowflake")]
-use connector_snowflake as _;
-#[cfg(feature = "spark")]
-use connector_spark as _;
-
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -99,6 +52,135 @@ use util::in_tracing_context;
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
+
+/// Registers all external data connectors with the runtime.
+///
+/// This function must be called during runtime initialization to make the
+/// extracted connector crates available. Unlike the built-in connectors in
+/// the runtime crate, external connectors are not automatically registered
+/// via the `linkme` distributed slice pattern.
+pub async fn register_external_connectors() {
+    use runtime::dataconnector::register_connector_factory;
+
+    // Always-compiled connectors (no feature gate)
+    register_connector_factory(
+        connector_graphql::CONNECTOR_NAME,
+        connector_graphql::factory(),
+    )
+    .await;
+
+    // Feature-gated connectors
+    #[cfg(feature = "clickhouse")]
+    register_connector_factory(
+        connector_clickhouse::CONNECTOR_NAME,
+        connector_clickhouse::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "databricks")]
+    register_connector_factory(
+        connector_databricks::CONNECTOR_NAME,
+        connector_databricks::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "delta_lake")]
+    register_connector_factory(
+        connector_delta_lake::CONNECTOR_NAME,
+        connector_delta_lake::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "dremio")]
+    register_connector_factory(
+        connector_dremio::CONNECTOR_NAME,
+        connector_dremio::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "duckdb")]
+    register_connector_factory(
+        connector_duckdb::CONNECTOR_NAME,
+        connector_duckdb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "flightsql")]
+    register_connector_factory(
+        connector_flightsql::CONNECTOR_NAME,
+        connector_flightsql::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "ftp")]
+    register_connector_factory(connector_ftp::CONNECTOR_NAME, connector_ftp::factory()).await;
+
+    #[cfg(feature = "imap")]
+    register_connector_factory(connector_imap::CONNECTOR_NAME, connector_imap::factory()).await;
+
+    #[cfg(feature = "mongodb")]
+    register_connector_factory(
+        connector_mongodb::CONNECTOR_NAME,
+        connector_mongodb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "mssql")]
+    register_connector_factory(connector_mssql::CONNECTOR_NAME, connector_mssql::factory()).await;
+
+    #[cfg(feature = "mysql")]
+    register_connector_factory(connector_mysql::CONNECTOR_NAME, connector_mysql::factory()).await;
+
+    #[cfg(feature = "nfs")]
+    register_connector_factory(connector_nfs::CONNECTOR_NAME, connector_nfs::factory()).await;
+
+    #[cfg(feature = "odbc")]
+    register_connector_factory(connector_odbc::CONNECTOR_NAME, connector_odbc::factory()).await;
+
+    #[cfg(feature = "oracle")]
+    register_connector_factory(
+        connector_oracle::CONNECTOR_NAME,
+        connector_oracle::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "postgres")]
+    register_connector_factory(
+        connector_postgres::CONNECTOR_NAME,
+        connector_postgres::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "scylladb")]
+    register_connector_factory(
+        connector_scylladb::CONNECTOR_NAME,
+        connector_scylladb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "sftp")]
+    register_connector_factory(connector_sftp::CONNECTOR_NAME, connector_sftp::factory()).await;
+
+    #[cfg(feature = "sharepoint")]
+    register_connector_factory(
+        connector_sharepoint::CONNECTOR_NAME,
+        connector_sharepoint::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "smb")]
+    register_connector_factory(connector_smb::CONNECTOR_NAME, connector_smb::factory()).await;
+
+    #[cfg(feature = "snowflake")]
+    register_connector_factory(
+        connector_snowflake::CONNECTOR_NAME,
+        connector_snowflake::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "spark")]
+    register_connector_factory(connector_spark::CONNECTOR_NAME, connector_spark::factory()).await;
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -247,6 +329,10 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<()> {
+    // Register external data connectors before runtime initialization.
+    // This makes connectors from extracted crates available to the runtime.
+    register_external_connectors().await;
+
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
     let spicepod_path = args

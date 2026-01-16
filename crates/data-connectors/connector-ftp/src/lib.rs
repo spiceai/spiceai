@@ -21,7 +21,6 @@ use runtime::dataconnector::{
     NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -130,4 +129,11 @@ impl ListingTableConnector for FTP {
     }
 }
 
-register_data_connector!("ftp", FTPFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "ftp";
+
+/// Returns a new instance of the `FTP` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    FTPFactory::new_arc()
+}

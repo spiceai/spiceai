@@ -21,7 +21,6 @@ use runtime::dataconnector::{
     NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -141,4 +140,11 @@ impl ListingTableConnector for SMB {
     }
 }
 
-register_data_connector!("smb", SMBFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "smb";
+
+/// Returns a new instance of the `SMB` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    SMBFactory::new_arc()
+}

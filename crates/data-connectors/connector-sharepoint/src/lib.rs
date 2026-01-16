@@ -25,7 +25,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::future::Future;
@@ -209,4 +208,11 @@ impl DataConnector for Sharepoint {
     }
 }
 
-register_data_connector!("sharepoint", SharepointFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "sharepoint";
+
+/// Returns a new instance of the `Sharepoint` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    SharepointFactory::new_arc()
+}

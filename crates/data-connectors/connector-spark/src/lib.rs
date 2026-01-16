@@ -34,7 +34,6 @@ use runtime::dataconnector::{
     DataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use runtime_parameters::Parameters;
 use snafu::prelude::*;
 use std::any::Any;
@@ -155,7 +154,14 @@ impl DataConnectorFactory for SparkFactory {
     }
 }
 
-register_data_connector!("spark", SparkFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "spark";
+
+/// Returns a new instance of the `Spark` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    SparkFactory::new_arc()
+}
 
 #[derive(Debug, Snafu)]
 enum ReadProviderError {

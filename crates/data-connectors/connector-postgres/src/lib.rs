@@ -37,7 +37,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;
@@ -269,4 +268,11 @@ impl DataConnector for Postgres {
     }
 }
 
-register_data_connector!("postgres", PostgresFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "postgres";
+
+/// Returns a new instance of the `PostgreSQL` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    PostgresFactory::new_arc()
+}

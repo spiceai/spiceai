@@ -28,7 +28,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -181,4 +180,11 @@ impl DataConnector for FlightSQL {
     }
 }
 
-register_data_connector!("flightsql", FlightSQLFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "flightsql";
+
+/// Returns a new instance of the `FlightSQL` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    FlightSQLFactory::new_arc()
+}

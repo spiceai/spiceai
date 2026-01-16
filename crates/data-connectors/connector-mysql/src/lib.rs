@@ -32,7 +32,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -473,4 +472,11 @@ impl MetricsProvider for MySQLMetricsProvider {
     }
 }
 
-register_data_connector!("mysql", MySQLFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "mysql";
+
+/// Returns a new instance of the `MySQL` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    MySQLFactory::new_arc()
+}

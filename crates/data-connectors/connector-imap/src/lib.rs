@@ -27,7 +27,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{
@@ -296,4 +295,11 @@ impl DataConnector for Imap {
     }
 }
 
-register_data_connector!("imap", ImapFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "imap";
+
+/// Returns a new instance of the `IMAP` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    ImapFactory::new_arc()
+}

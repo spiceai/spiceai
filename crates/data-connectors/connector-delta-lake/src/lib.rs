@@ -24,7 +24,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -166,4 +165,11 @@ impl DataConnector for DeltaLake {
     }
 }
 
-register_data_connector!("delta_lake", DeltaLakeFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "delta_lake";
+
+/// Returns a new instance of the `Delta Lake` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    DeltaLakeFactory::new_arc()
+}

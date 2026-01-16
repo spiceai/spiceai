@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::{
     init_tracing, run_query_and_check_results,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use arrow::record_batch::RecordBatch;
 use runtime::Runtime;
@@ -26,6 +26,7 @@ use runtime::Runtime;
 #[tokio::test(flavor = "multi_thread")]
 async fn test_aws_sdk_environment_resolution() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     ensure_aws_profile();
 

@@ -45,7 +45,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use runtime::token_providers::databricks::{
     AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
@@ -603,7 +602,14 @@ impl DataConnector for Databricks {
     }
 }
 
-register_data_connector!("databricks", DatabricksFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "databricks";
+
+/// Returns a new instance of the `Databricks` data connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    DatabricksFactory::new_arc()
+}
 
 // ============================================================================
 // Catalog Connector

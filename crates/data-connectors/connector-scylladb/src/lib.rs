@@ -35,7 +35,6 @@ use runtime::dataconnector::{
     DataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use runtime_parameters::Parameters;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
@@ -263,7 +262,14 @@ impl DataConnectorFactory for ScyllaDbFactory {
     }
 }
 
-register_data_connector!("scylladb", ScyllaDbFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "scylladb";
+
+/// Returns a new instance of the `ScyllaDB` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    ScyllaDbFactory::new_arc()
+}
 
 #[derive(Debug, Snafu)]
 enum ReadProviderError {

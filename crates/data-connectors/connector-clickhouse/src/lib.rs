@@ -37,7 +37,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::{ParamLookup, ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -235,7 +234,14 @@ impl DataConnectorFactory for ClickhouseFactory {
     }
 }
 
-register_data_connector!("clickhouse", ClickhouseFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "clickhouse";
+
+/// Returns a new instance of the `ClickHouse` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    ClickhouseFactory::new_arc()
+}
 
 #[async_trait]
 impl DataConnector for Clickhouse {

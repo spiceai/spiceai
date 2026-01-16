@@ -36,7 +36,6 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use runtime_parameters::Parameters;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
@@ -292,7 +291,14 @@ impl DataConnectorFactory for OracleFactory {
     }
 }
 
-register_data_connector!("oracle", OracleFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "oracle";
+
+/// Returns a new instance of the `Oracle` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    OracleFactory::new_arc()
+}
 
 #[derive(Debug, Snafu)]
 enum ReadProviderError {

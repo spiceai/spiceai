@@ -39,7 +39,6 @@ use runtime::dataconnector::{
 };
 use runtime::datafusion::dialect::new_duckdb_dialect;
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -167,7 +166,14 @@ impl DataConnectorFactory for DuckDBFactory {
     }
 }
 
-register_data_connector!("duckdb", DuckDBFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "duckdb";
+
+/// Returns a new instance of the `DuckDB` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    DuckDBFactory::new_arc()
+}
 
 #[derive(Debug, Snafu)]
 enum ReadProviderError {

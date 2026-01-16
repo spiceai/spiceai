@@ -3765,6 +3765,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-databricks"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-sdk-credential-bridge",
+ "data_components",
+ "datafusion",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime",
+ "runtime-secrets",
+ "secrecy",
+ "snafu",
+ "token_provider",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "connector-delta-lake"
 version = "1.11.0-unstable"
 dependencies = [
@@ -3842,6 +3862,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-graphql"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "token_provider",
+ "url",
+]
+
+[[package]]
 name = "connector-imap"
 version = "1.11.0-unstable"
 dependencies = [
@@ -3897,10 +3932,37 @@ dependencies = [
  "datafusion-table-providers",
  "linkme",
  "mysql_async",
-"opentelemetry",
+ "opentelemetry",
  "paste",
  "runtime",
  "secrecy",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-nfs"
+version = "1.11.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-odbc"
+version = "1.11.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "db_connection_pool",
+ "linkme",
+ "paste",
+ "runtime",
  "snafu",
  "tracing",
 ]
@@ -3982,6 +4044,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-smb"
+version = "1.11.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "connector-snowflake"
 version = "1.11.0-unstable"
 dependencies = [
@@ -4011,8 +4085,6 @@ dependencies = [
  "runtime-parameters",
  "snafu",
 ]
-
-[[package]]
 
 [[package]]
 name = "console"
@@ -14683,7 +14755,26 @@ dependencies = [
  "chrono",
  "chunking",
  "clap 4.5.54",
- "clickhouse-rs",
+ "connector-clickhouse",
+ "connector-databricks",
+ "connector-delta-lake",
+ "connector-dremio",
+ "connector-duckdb",
+ "connector-flightsql",
+ "connector-ftp",
+ "connector-graphql",
+ "connector-imap",
+ "connector-mongodb",
+ "connector-mssql",
+ "connector-mysql",
+ "connector-oracle",
+ "connector-postgres",
+ "connector-scylladb",
+ "connector-sftp",
+ "connector-sharepoint",
+ "connector-smb",
+ "connector-snowflake",
+ "connector-spark",
  "criterion 0.7.0",
  "csv",
  "dashmap",
@@ -14709,7 +14800,6 @@ dependencies = [
  "gethostname",
  "globset",
  "governor",
- "graph-rs-sdk",
  "graphql-parser",
  "headers-accept",
  "hf-hub",
@@ -14722,7 +14812,6 @@ dependencies = [
  "iceberg-catalog-glue",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
- "imap",
  "indexmap 2.13.0",
  "insta",
  "itertools 0.14.0",
@@ -14782,14 +14871,12 @@ dependencies = [
  "scheduler",
  "schemars 1.2.0",
  "scopeguard",
- "scylla",
  "search",
  "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",
  "snafu",
- "snowflake-api",
  "spice-cloud",
  "spiceai",
  "spicepod",
@@ -16781,6 +16868,28 @@ version = "2.0.0-unstable"
 dependencies = [
  "app",
  "clap 4.5.54",
+ "connector-clickhouse",
+ "connector-databricks",
+ "connector-delta-lake",
+ "connector-dremio",
+ "connector-duckdb",
+ "connector-flightsql",
+ "connector-ftp",
+ "connector-graphql",
+ "connector-imap",
+ "connector-mongodb",
+ "connector-mssql",
+ "connector-mysql",
+ "connector-nfs",
+ "connector-odbc",
+ "connector-oracle",
+ "connector-postgres",
+ "connector-scylladb",
+ "connector-sftp",
+ "connector-sharepoint",
+ "connector-smb",
+ "connector-snowflake",
+ "connector-spark",
  "event_stream",
  "futures",
  "mimalloc",
@@ -16848,6 +16957,25 @@ dependencies = [
 name = "spicepodschema"
 version = "2.0.0-unstable"
 dependencies = [
+ "connector-clickhouse",
+ "connector-delta-lake",
+ "connector-dremio",
+ "connector-duckdb",
+ "connector-flightsql",
+ "connector-ftp",
+ "connector-graphql",
+ "connector-imap",
+ "connector-mongodb",
+ "connector-mssql",
+ "connector-mysql",
+ "connector-oracle",
+ "connector-postgres",
+ "connector-scylladb",
+ "connector-sftp",
+ "connector-sharepoint",
+ "connector-smb",
+ "connector-snowflake",
+ "connector-spark",
  "regex",
  "runtime",
  "runtime-parameters",

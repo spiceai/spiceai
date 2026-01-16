@@ -35,7 +35,6 @@ use runtime::dataconnector::{
     DataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -237,7 +236,14 @@ impl DataConnectorFactory for MongoDBFactory {
     }
 }
 
-register_data_connector!("mongodb", MongoDBFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "mongodb";
+
+/// Returns a new instance of the `MongoDB` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    MongoDBFactory::new_arc()
+}
 
 #[derive(Debug, Snafu)]
 enum ReadProviderError {

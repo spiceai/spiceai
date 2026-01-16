@@ -195,6 +195,27 @@ bcder = "0.7.4"
 bollard = "0.18.1"
 bytes.workspace = true
 chrono.workspace = true
+# Connector crates for integration tests
+connector-clickhouse = { path = "../data-connectors/connector-clickhouse" }
+connector-databricks = { path = "../data-connectors/connector-databricks" }
+connector-delta-lake = { path = "../data-connectors/connector-delta-lake" }
+connector-dremio = { path = "../data-connectors/connector-dremio" }
+connector-duckdb = { path = "../data-connectors/connector-duckdb" }
+connector-flightsql = { path = "../data-connectors/connector-flightsql" }
+connector-ftp = { path = "../data-connectors/connector-ftp" }
+connector-graphql = { path = "../data-connectors/connector-graphql" }
+connector-imap = { path = "../data-connectors/connector-imap" }
+connector-mongodb = { path = "../data-connectors/connector-mongodb" }
+connector-mssql = { path = "../data-connectors/connector-mssql" }
+connector-mysql = { path = "../data-connectors/connector-mysql" }
+connector-oracle = { path = "../data-connectors/connector-oracle" }
+connector-postgres = { path = "../data-connectors/connector-postgres" }
+connector-scylladb = { path = "../data-connectors/connector-scylladb" }
+connector-sftp = { path = "../data-connectors/connector-sftp" }
+connector-sharepoint = { path = "../data-connectors/connector-sharepoint" }
+connector-smb = { path = "../data-connectors/connector-smb" }
+connector-snowflake = { path = "../data-connectors/connector-snowflake" }
+connector-spark = { path = "../data-connectors/connector-spark" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 repl = { path = "../repl" }
 hf-hub = { workspace = true }

@@ -21,7 +21,6 @@ use runtime::dataconnector::{
     NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -131,4 +130,11 @@ impl ListingTableConnector for SFTP {
     }
 }
 
-register_data_connector!("sftp", SFTPFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "sftp";
+
+/// Returns a new instance of the `SFTP` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    SFTPFactory::new_arc()
+}

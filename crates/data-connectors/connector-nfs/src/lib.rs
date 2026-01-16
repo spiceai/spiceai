@@ -21,7 +21,6 @@ use runtime::dataconnector::{
     NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -126,4 +125,11 @@ impl ListingTableConnector for NFS {
     }
 }
 
-register_data_connector!("nfs", NFSFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "nfs";
+
+/// Returns a new instance of the `NFS` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    NFSFactory::new_arc()
+}

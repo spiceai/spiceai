@@ -35,7 +35,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::future::Future;
@@ -218,7 +217,14 @@ impl DataConnectorFactory for SqlServerFactory {
     }
 }
 
-register_data_connector!("mssql", SqlServerFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "mssql";
+
+/// Returns a new instance of the `SQL Server` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    SqlServerFactory::new_arc()
+}
 
 #[derive(Debug, Snafu)]
 enum ReadProviderError {

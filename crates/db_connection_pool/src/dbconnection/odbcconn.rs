@@ -382,12 +382,21 @@ mod tests {
 
     use super::*;
 
-    // This test crudely validates that parameters are being received by the ODBC driver
+    // This test crudely validates that parameters are being received by the ODBC driver.
+    // Requires SQLite ODBC driver to be installed: `apt install libsqliteodbc` or equivalent.
+    #[ignore = "Requires SQLite ODBC driver"]
     #[cfg(feature = "odbc")]
     #[tokio::test]
     async fn test_bind_parameters() -> Result<()> {
         // It is possible to connect to the SQLite driver without an underlying file
-        let pool = ODBCPool::new(HashMap::new()).expect("Must create ODBC pool");
+        // We provide a dummy connection_string since ODBCPool::new requires it,
+        // but we use driver_connect directly which ignores it
+        let mut params = HashMap::new();
+        params.insert(
+            "connection_string".to_string(),
+            secrecy::SecretString::from("Driver={SQLite}"),
+        );
+        let pool = ODBCPool::new(params).expect("Must create ODBC pool");
         let env = pool.odbc_environment();
         let driver_cxn = env
             .driver_connect(

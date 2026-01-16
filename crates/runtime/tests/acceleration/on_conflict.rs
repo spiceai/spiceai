@@ -17,7 +17,7 @@ limitations under the License.
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
 use datafusion::{assert_batches_eq, error::DataFusionError};
@@ -37,6 +37,7 @@ use super::get_params;
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

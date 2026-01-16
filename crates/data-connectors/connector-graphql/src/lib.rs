@@ -25,7 +25,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult, default_spice_client,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use token_provider::{StaticTokenProvider, TokenProvider};
@@ -219,4 +218,11 @@ impl DataConnector for GraphQL {
     }
 }
 
-register_data_connector!("graphql", GraphQLFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "graphql";
+
+/// Returns a new instance of the `GraphQL` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    GraphQLFactory::new_arc()
+}

@@ -30,7 +30,6 @@ use runtime::dataconnector::{
     NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
-use runtime::register_data_connector;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -280,7 +279,14 @@ impl DataConnectorFactory for ODBCFactory {
     }
 }
 
-register_data_connector!("odbc", ODBCFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "odbc";
+
+/// Returns a new instance of the `ODBC` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    ODBCFactory::new_arc()
+}
 
 #[async_trait]
 impl<'a> DataConnector for ODBC<'a>

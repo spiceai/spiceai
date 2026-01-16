@@ -18,7 +18,7 @@ limitations under the License.
 //! Expects a Docker daemon to be running.
 use crate::{
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    utils::runtime_ready_check,
+    utils::{register_test_connectors, runtime_ready_check},
 };
 use std::sync::Arc;
 
@@ -69,6 +69,7 @@ async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
 async fn mysql_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -166,6 +167,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope_retry(3, || async {
         let running_container = start_mysql_docker_container(

@@ -36,7 +36,6 @@ use runtime::dataconnector::{
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::ParameterSpec;
-use runtime::register_data_connector;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;
@@ -134,7 +133,14 @@ impl DataConnectorFactory for SnowflakeFactory {
     }
 }
 
-register_data_connector!("snowflake", SnowflakeFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "snowflake";
+
+/// Returns a new instance of the `Snowflake` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    SnowflakeFactory::new_arc()
+}
 
 #[derive(Debug, Snafu)]
 enum ReadProviderError {
