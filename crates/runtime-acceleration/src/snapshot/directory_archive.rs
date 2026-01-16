@@ -123,7 +123,7 @@ where
     })
     .await
     .map_err(|e| ArchiveError::WriteArchive {
-        source: std::io::Error::other(e.to_string()),
+        source: std::io::Error::other(e),
     })??;
 
     // Write the tar data to the async writer
@@ -195,7 +195,7 @@ where
     .await
     .map_err(|e| ArchiveError::ExtractArchive {
         path: target_dir_for_error,
-        source: std::io::Error::other(e.to_string()),
+        source: std::io::Error::other(e),
     })??;
 
     Ok(())
