@@ -74,6 +74,10 @@ pub enum ContentBlock {
     Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse(ContentBlockToolUse),
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 impl ContentBlock {
@@ -99,6 +103,15 @@ impl ContentBlock {
                             arguments: None,
                         }),
                     }]),
+                    refusal: None,
+                    role: None,
+                }
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: None,
                     refusal: None,
                     role: None,
                 }
@@ -372,11 +385,17 @@ pub fn transform_stream(
                                 index: 0,
                                 logprobs: None,
                                 finish_reason: match stop_reason {
-                                    Some(StopReason::EndTurn | StopReason::StopSequence) => {
-                                        Some(FinishReason::Stop)
-                                    }
-                                    Some(StopReason::MaxTokens) => Some(FinishReason::Length),
+                                    Some(
+                                        StopReason::EndTurn
+                                        | StopReason::StopSequence
+                                        | StopReason::PauseTurn,
+                                    ) => Some(FinishReason::Stop),
+                                    Some(
+                                        StopReason::MaxTokens
+                                        | StopReason::ModelContextWindowExceeded,
+                                    ) => Some(FinishReason::Length),
                                     Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                                    Some(StopReason::Refusal) => Some(FinishReason::ContentFilter),
                                     None => None,
                                 },
                                 delta: ChatCompletionStreamResponseDelta {
