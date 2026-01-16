@@ -403,9 +403,15 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 "Indexes are not supported for Arrow engine acceleration. Ignoring indexes."
             );
         }
-        if engine == Engine::Arrow && primary_key.is_some() {
+        // Only warn about primary_key if hash_index is not enabled
+        let hash_index_enabled = params
+            .as_ref()
+            .and_then(|p| p.data.get("hash_index"))
+            .is_some_and(|v| v.as_string().eq_ignore_ascii_case("enabled"));
+        if engine == Engine::Arrow && primary_key.is_some() && !hash_index_enabled {
             tracing::warn!(
-                "Primary key is not supported for Arrow engine acceleration. Ignoring primary_key."
+                "Primary key specified but hash_index is not enabled for Arrow engine. \
+                 Add 'hash_index: enabled' to use primary_key for fast lookups. Note, hash_index is experimental in Arrow acceleration."
             );
         }
         if engine == Engine::Arrow && !on_conflict.is_empty() {

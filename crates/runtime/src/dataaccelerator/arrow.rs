@@ -51,6 +51,8 @@ impl Default for ArrowAccelerator {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("file_watcher"),
+    ParameterSpec::runtime("hash_index")
+        .description("Enable hash index for fast primary key lookups. Set to 'enabled' to enable (requires primary_key). Default: disabled."),
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
@@ -98,6 +100,15 @@ impl DataAccelerator for ArrowAccelerator {
         {
             cmd.options
                 .insert("sort_columns".to_string(), sort_cols_str.clone());
+        }
+
+        // Extract hash_index from acceleration params if provided
+        if let Some(source) = source
+            && let Some(acceleration) = source.acceleration()
+            && let Some(hash_index_str) = acceleration.params.get("hash_index")
+        {
+            cmd.options
+                .insert("hash_index".to_string(), hash_index_str.clone());
         }
 
         let ctx = SessionContext::new();
