@@ -121,14 +121,6 @@ impl TextToSqlWorker {
             while let Ok(request) = self.request_rx.recv().await {
                 match self.process_request(&request).await {
                     Ok(metric) => {
-                        println!(
-                            "metrics:\n Expected: {:?}\n Actual: {:?}\n schemas:{:?} proj:{:?} table:{:?}\n",
-                            metric.expected_sql,
-                            metric.generated_sql,
-                            metric.correct_output_schema,
-                            metric.correct_table_projections,
-                            metric.correct_tables
-                        );
                         results.insert(request.id.clone(), metric);
                     }
                     Err(e) => {

@@ -1,0 +1,38 @@
+{"run_id":"1768529024-459251000","line":583,"new":{"module_name":"test_framework__spicetest__text_to_sql__parse__tests","snapshot_name":"join_query","metadata":{"source":"crates/test-framework/src/spicetest/text_to_sql/parse.rs","assertion_line":583,"expression":"format_result(&tables, &projections)"},"snapshot":"Tables:\n  spice.public.orders\n  spice.public.users\n\nProjections:\n  spice.public.orders.total\n  spice.public.users.id\n  spice.public.users.name"},"old":{"module_name":"test_framework__spicetest__text_to_sql__parse__tests","metadata":{},"snapshot":"Tables:\n  spice.public.orders\n  spice.public.users\n\nProjections:\n  spice.public.o.total\n  spice.public.u.id\n  spice.public.u.name"}}
+{"run_id":"1768529024-459251000","line":716,"new":{"module_name":"test_framework__spicetest__text_to_sql__parse__tests","snapshot_name":"multiple_joins","metadata":{"source":"crates/test-framework/src/spicetest/text_to_sql/parse.rs","assertion_line":716,"expression":"format_result(&tables, &projections)"},"snapshot":"Tables:\n  spice.public.table_a\n  spice.public.table_b\n  spice.public.table_c\n\nProjections:\n  spice.public.table_a.id\n  spice.public.table_b.name\n  spice.public.table_c.value"},"old":{"module_name":"test_framework__spicetest__text_to_sql__parse__tests","metadata":{},"snapshot":"Tables:\n  spice.public.table_a\n  spice.public.table_b\n  spice.public.table_c\n\nProjections:\n  spice.public.a.id\n  spice.public.b.name\n  spice.public.c.value"}}
+{"run_id":"1768529032-705487000","line":735,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":650,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":616,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":683,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":815,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":781,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":765,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":667,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":568,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":749,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":799,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":699,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":554,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":601,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":631,"new":null,"old":null}
+{"run_id":"1768529032-705487000","line":716,"new":{"module_name":"test_framework__spicetest__text_to_sql__parse__tests","snapshot_name":"multiple_joins","metadata":{"source":"crates/test-framework/src/spicetest/text_to_sql/parse.rs","assertion_line":716,"expression":"format_result(&tables, &projections)"},"snapshot":"Tables:\n  spice.public.table_a\n  spice.public.table_b\n  spice.public.table_c\n\nProjections:\n  spice.public.table_a.id\n  spice.public.table_b.name\n  spice.public.table_c.value"},"old":{"module_name":"test_framework__spicetest__text_to_sql__parse__tests","metadata":{},"snapshot":"Tables:\n  spice.public.table_a\n  spice.public.table_b\n  spice.public.table_c\n\nProjections:\n  spice.public.a.id\n  spice.public.b.name\n  spice.public.c.value"}}
+{"run_id":"1768529032-705487000","line":583,"new":{"module_name":"test_framework__spicetest__text_to_sql__parse__tests","snapshot_name":"join_query","metadata":{"source":"crates/test-framework/src/spicetest/text_to_sql/parse.rs","assertion_line":583,"expression":"format_result(&tables, &projections)"},"snapshot":"Tables:\n  spice.public.orders\n  spice.public.users\n\nProjections:\n  spice.public.orders.total\n  spice.public.users.id\n  spice.public.users.name"},"old":{"module_name":"test_framework__spicetest__text_to_sql__parse__tests","metadata":{},"snapshot":"Tables:\n  spice.public.orders\n  spice.public.users\n\nProjections:\n  spice.public.o.total\n  spice.public.u.id\n  spice.public.u.name"}}
+{"run_id":"1768529060-515678000","line":650,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":616,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":765,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":815,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":683,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":667,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":583,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":781,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":735,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":716,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":568,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":799,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":554,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":601,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":699,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":749,"new":null,"old":null}
+{"run_id":"1768529060-515678000","line":631,"new":null,"old":null}
+{"run_id":"1768529131-270090000","line":736,"new":null,"old":null}
+{"run_id":"1768529196-185020000","line":736,"new":null,"old":null}
