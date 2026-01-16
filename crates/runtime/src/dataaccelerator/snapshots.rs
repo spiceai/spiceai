@@ -25,6 +25,7 @@ use crate::{
     },
 };
 use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_acceleration::snapshot::SnapshotAdapter;
 use runtime_acceleration::{
     dataset_checkpoint::make_checkpointer_factory,
     snapshot::{SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
@@ -34,17 +35,22 @@ use snafu::ResultExt;
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
-    path: PathBuf,
+    adapter: SnapshotAdapter,
     engine: AccelerationEngine,
 ) -> BootstrapStatus {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
         return BootstrapStatus::none();
     }
 
-    if path.exists() {
+    let Some(primary_path) = adapter.primary_path().cloned() else {
+        tracing::debug!("No primary path for snapshot adapter, skipping download");
+        return BootstrapStatus::none();
+    };
+
+    if primary_path.exists() {
         tracing::info!(
             "Acceleration already exists at {}, skipping snapshot download",
-            path.display()
+            primary_path.display()
         );
         return BootstrapStatus::none();
     }
@@ -69,7 +75,7 @@ pub(super) async fn download_snapshot_if_needed(
     if let Some(manager) = SnapshotManager::try_new(
         dataset_name.clone(),
         acceleration.snapshot_behavior.clone(),
-        path,
+        adapter,
         engine,
     )
     .await
