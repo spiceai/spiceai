@@ -116,9 +116,9 @@ impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
                 index: 0,
                 logprobs: None,
                 finish_reason: match value.stop_reason {
-                    Some(StopReason::StopSequence | StopReason::EndTurn | StopReason::PauseTurn) => {
-                        Some(FinishReason::Stop)
-                    }
+                    Some(
+                        StopReason::StopSequence | StopReason::EndTurn | StopReason::PauseTurn,
+                    ) => Some(FinishReason::Stop),
                     Some(StopReason::MaxTokens | StopReason::ModelContextWindowExceeded) => {
                         Some(FinishReason::Length)
                     }
