@@ -98,6 +98,7 @@ pub mod flight;
 mod http;
 mod init;
 pub mod internal_table;
+pub mod jobs;
 mod management;
 mod metrics;
 mod metrics_server;
@@ -484,6 +485,9 @@ pub struct Runtime {
     schedulers: Arc<ScheduleRegistry>,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 
+    /// Job executor for async SQL query jobs (only available in cluster mode with scheduler config)
+    job_executor: Arc<RwLock<Option<Arc<jobs::JobExecutor>>>>,
+
     resource_monitor: resource_monitor::ResourceMonitor,
 
     config: Arc<Config>,
@@ -575,6 +579,21 @@ impl Runtime {
     #[must_use]
     pub fn scheduler_peers(&self) -> Arc<RwLock<SchedulerPeers>> {
         Arc::clone(&self.scheduler_peers)
+    }
+
+    /// Returns the job executor for async SQL queries if available (cluster mode only).
+    #[must_use]
+    pub fn job_executor(&self) -> Option<Arc<jobs::JobExecutor>> {
+        self.job_executor
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Sets the job executor for async SQL queries.
+    pub async fn set_job_executor(&self, executor: Arc<jobs::JobExecutor>) {
+        let mut guard = self.job_executor.write().await;
+        *guard = Some(executor);
     }
 
     #[must_use]
