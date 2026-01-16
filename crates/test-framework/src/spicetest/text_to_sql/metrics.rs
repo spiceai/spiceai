@@ -217,7 +217,7 @@ impl TextToSqlMetric {
             .map(extract_tables_and_projection)
             .or_else(|| {
                 attempt_parse_table_and_projection(generated_sql)
-                    .inspect_err(|e| println!("Error in 'attempt_parse_table_and_projection'.{e}"))
+                    .inspect_err(|e| eprintln!("Error in 'attempt_parse_table_and_projection'.{e}"))
                     .ok()
             });
         Self {
