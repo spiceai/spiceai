@@ -2273,6 +2273,7 @@ mod tests {
         assert_eq!(cache_provider.item_count().await, 1);
     }
 
+    #[cfg(feature = "duckdb")]
     mod build_snapshot_creation_config_tests {
         use super::*;
         use crate::component::dataset::Dataset;
