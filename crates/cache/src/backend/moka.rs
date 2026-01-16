@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -76,7 +76,7 @@ where
     T: BuildHasher + Clone + Send + Sync + 'static,
     <T as BuildHasher>::Hasher: Send + Sync + 'static,
 {
-    async fn insert(&self, key: u64, value: V, _size: usize) {
+    async fn insert(&self, key: u64, value: V) {
         // Moka handles sizing via the weigher
         self.cache.insert(key, value).await;
     }

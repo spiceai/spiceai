@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Display;
+
 use super::{default_true, is_default_or_none};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -58,6 +60,15 @@ pub enum CacheEngine {
     Moka,
     /// Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL handling with a rare race condition. Note: table-specific invalidation not currently supported.
     Pingora,
+}
+
+impl Display for CacheEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheEngine::Moka => write!(f, "Moka"),
+            CacheEngine::Pingora => write!(f, "Pingora-LRU"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

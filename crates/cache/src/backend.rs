@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@ pub mod moka;
 
 #[cfg(feature = "pingora")]
 pub mod pingora;
+
+use crate::Sizeable;
 
 pub use self::moka::MokaBackend;
 
@@ -60,9 +62,9 @@ impl CacheBackendBuilder {
 /// This trait allows runtime selection between different cache engines via configuration.
 /// Implementations must be thread-safe and support TTL-based eviction.
 #[async_trait]
-pub trait CacheBackend<V>: Send + Sync {
+pub trait CacheBackend<V: Sizeable>: Send + Sync {
     /// Insert a value into the cache with the given key and size
-    async fn insert(&self, key: u64, value: V, size: usize);
+    async fn insert(&self, key: u64, value: V);
 
     /// Get a value from the cache by key
     /// Returns None if key doesn't exist or value has expired

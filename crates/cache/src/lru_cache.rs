@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -64,11 +64,11 @@ where
     T: BuildHasher + Clone + Send + Sync + 'static,
     <T as BuildHasher>::Hasher: Send + Sync + 'static,
 {
-    async fn insert(&self, key: u64, value: V, size: usize) {
+    async fn insert(&self, key: u64, value: V) {
         match self {
-            Self::Moka(backend) => backend.insert(key, value, size).await,
+            Self::Moka(backend) => backend.insert(key, value).await,
             #[cfg(feature = "pingora")]
-            Self::Pingora(backend) => backend.insert(key, value, size).await,
+            Self::Pingora(backend) => backend.insert(key, value).await,
             #[cfg(not(feature = "pingora"))]
             Self::MokaFallback(backend) => backend.insert(key, value, size).await,
         }
@@ -175,9 +175,10 @@ impl<
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max size: {:.2}, item ttl: {:?}",
+            "max size: {:.2}, item ttl: {:?}, engine: {}",
             Byte::from_u64(self.max_size).get_adjusted_unit(byte_unit::Unit::MiB),
-            self.ttl
+            self.ttl,
+            self.engine
         )
     }
 }
@@ -237,6 +238,48 @@ pub fn build_from_config<V: Sizeable + CacheMetrics + Clone + Send + Sync + 'sta
     )))
 }
 
+// Build the Moka cache (used for Moka backend or for table invalidation support)
+fn build_moka_cache<
+    V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
+    T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
+    H: Hasher + Send + Sync + 'static,
+>(
+    cache_max_size: u64,
+    ttl: Duration,
+    hasher: T,
+    caching_policy: CachingPolicy,
+) -> Cache<u64, V, PassthroughHashBuilder<T>> {
+    let moka_eviction_policy = match caching_policy {
+        CachingPolicy::Lru => moka::policy::EvictionPolicy::lru(),
+        CachingPolicy::TinyLfu => moka::policy::EvictionPolicy::tiny_lfu(),
+    };
+
+    Cache::builder()
+        .time_to_live(ttl)
+        .weigher(|_key, value: &V| -> u32 {
+            let val: usize = value.get_memory_size();
+            match val.try_into() {
+                Ok(val) => val,
+                Err(e) => {
+                    tracing::warn!(
+                        "Lru cache: Failed to convert query result size to u32: {}",
+                        e
+                    );
+                    u32::MAX
+                }
+            }
+        })
+        .max_capacity(cache_max_size)
+        .eviction_policy(moka_eviction_policy)
+        .support_invalidation_closures()
+        .eviction_listener(|_key, _value, cause| {
+            if cause.was_evicted() {
+                V::record_eviction();
+            }
+        })
+        .build_with_hasher(PassthroughHashBuilder::new(hasher))
+}
+
 impl<
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
     T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
@@ -254,39 +297,6 @@ impl<
     where
         <T as BuildHasher>::Hasher: Send + Sync + 'static,
     {
-        let moka_eviction_policy = match caching_policy {
-            CachingPolicy::Lru => moka::policy::EvictionPolicy::lru(),
-            CachingPolicy::TinyLfu => moka::policy::EvictionPolicy::tiny_lfu(),
-        };
-
-        // Build the Moka cache (used for Moka backend or for table invalidation support)
-        let build_moka_cache = || {
-            Cache::builder()
-                .time_to_live(ttl)
-                .weigher(|_key, value: &V| -> u32 {
-                    let val: usize = value.get_memory_size();
-                    match val.try_into() {
-                        Ok(val) => val,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Lru cache: Failed to convert query result size to u32: {}",
-                                e
-                            );
-                            u32::MAX
-                        }
-                    }
-                })
-                .max_capacity(cache_max_size)
-                .eviction_policy(moka_eviction_policy.clone())
-                .support_invalidation_closures()
-                .eviction_listener(|_key, _value, cause| {
-                    if cause.was_evicted() {
-                        V::record_eviction();
-                    }
-                })
-                .build_with_hasher(PassthroughHashBuilder::new(hasher.clone()))
-        };
-
         // Create the appropriate backend and moka_cache based on engine selection
         #[expect(
             clippy::type_complexity,
@@ -298,17 +308,15 @@ impl<
             CacheEngine,
         ) = match engine {
             CacheEngine::Moka => {
-                tracing::info!("Using Moka cache engine");
-                let cache = build_moka_cache();
+                tracing::debug!("Using Moka cache engine");
+                let cache = build_moka_cache(cache_max_size, ttl, hasher.clone(), caching_policy);
                 let backend = CacheBackendEnum::Moka(MokaBackend::from_cache(cache.clone()));
                 (backend, Some(cache), CacheEngine::Moka)
             }
             CacheEngine::Pingora => {
                 #[cfg(feature = "pingora")]
                 {
-                    tracing::info!(
-                        "Using Pingora cache engine (high-performance, lock-free). Note: table-specific invalidation will iterate all keys."
-                    );
+                    tracing::debug!("Using Pingora cache engine.");
                     let backend =
                         CacheBackendEnum::Pingora(PingoraBackend::with_params(cache_max_size, ttl));
                     (backend, None, CacheEngine::Pingora)
@@ -318,7 +326,8 @@ impl<
                     tracing::warn!(
                         "Pingora cache engine requested but 'pingora' feature is not enabled. Falling back to Moka."
                     );
-                    let cache = build_moka_cache();
+                    let cache =
+                        build_moka_cache(cache_max_size, ttl, hasher.clone(), caching_policy);
                     let backend =
                         CacheBackendEnum::MokaFallback(MokaBackend::from_cache(cache.clone()));
                     (backend, Some(cache), CacheEngine::Moka)
@@ -389,8 +398,7 @@ impl<
     }
 
     async fn put_raw_key(&self, key: &u64, value: V) {
-        let size = value.get_memory_size();
-        self.backend.insert(*key, value, size).await;
+        self.backend.insert(*key, value).await;
 
         let now_seconds = self.initial_instant.elapsed().as_secs();
         let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
@@ -946,5 +954,247 @@ mod tests {
             .is_none()
             .then_some(())
             .expect("cache should be empty after invalidate_all");
+    }
+
+    /// Test that Pingora backend table invalidation works correctly.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn test_pingora_invalidate_for_table() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let table_ref = TableReference::Bare {
+            table: Arc::from("test_table"),
+        };
+        let result = create_test_cached_result().await;
+
+        // Put a value in the cache
+        let key = CacheKey::Query("pingora_table_test", None).as_raw_key(cache.hasher());
+        cache.put_raw_key(&key.as_u64(), result).await;
+        cache.checkpoint().await;
+
+        // Verify the value is in the cache
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        retrieved
+            .is_some()
+            .then_some(())
+            .expect("cache should contain the key before invalidation");
+
+        // Invalidate the cache for the table
+        cache
+            .invalidate_for_table(table_ref)
+            .expect("should invalidate cache for pingora");
+
+        // Force pending tasks
+        cache.checkpoint().await;
+
+        // Verify the value is no longer in the cache
+        let retrieved = cache.get_raw_key(&key.as_u64()).await;
+        retrieved
+            .is_none()
+            .then_some(())
+            .expect("cache should not contain key after table invalidation");
+    }
+
+    /// Test Pingora backend table invalidation with multiple entries - only matching tables removed.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn test_pingora_invalidate_for_table_selective() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        // Create results for different tables
+        let result_test_table = create_test_cached_result().await; // references "test_table"
+
+        // Create a result that references a different table
+        let different_table_batch = create_test_record_batch();
+        let mut different_input_tables = HashSet::new();
+        different_input_tables.insert(TableReference::Bare {
+            table: Arc::from("other_table"),
+        });
+        let encoder = crate::encoding::get_encoder(spicepod::component::caching::Encoding::None);
+        let result_other_table = CachedQueryResult::from_batches(
+            &[different_table_batch],
+            Arc::new(different_input_tables),
+            std::time::Instant::now(),
+            encoder,
+        )
+        .await
+        .expect("Failed to create cached result");
+
+        // Insert both into cache
+        let key1 = CacheKey::Query("query_test_table", None).as_raw_key(cache.hasher());
+        let key2 = CacheKey::Query("query_other_table", None).as_raw_key(cache.hasher());
+
+        cache.put_raw_key(&key1.as_u64(), result_test_table).await;
+        cache.put_raw_key(&key2.as_u64(), result_other_table).await;
+        cache.checkpoint().await;
+
+        // Both should be in cache
+        assert!(
+            cache.get_raw_key(&key1.as_u64()).await.is_some(),
+            "key1 should be in cache"
+        );
+        assert!(
+            cache.get_raw_key(&key2.as_u64()).await.is_some(),
+            "key2 should be in cache"
+        );
+
+        // Invalidate only "test_table"
+        let table_ref = TableReference::Bare {
+            table: Arc::from("test_table"),
+        };
+        cache
+            .invalidate_for_table(table_ref)
+            .expect("should invalidate cache");
+        cache.checkpoint().await;
+
+        // key1 (test_table) should be removed
+        assert!(
+            cache.get_raw_key(&key1.as_u64()).await.is_none(),
+            "key1 should be removed after invalidation"
+        );
+
+        // key2 (other_table) should still be present
+        assert!(
+            cache.get_raw_key(&key2.as_u64()).await.is_some(),
+            "key2 should still be in cache"
+        );
+    }
+
+    /// Test Pingora backend TTL expiration works correctly.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn test_pingora_ttl_expiration() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024,                // 1 MB
+            Duration::from_millis(100), // Short TTL for testing
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let key = CacheKey::Query("pingora_ttl_test", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result().await;
+
+        // Put a value in the cache
+        cache.put_raw_key(&key.as_u64(), result).await;
+        cache.checkpoint().await;
+
+        // Value should exist immediately
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_some(),
+            "value should exist before TTL"
+        );
+
+        // Wait for TTL to expire
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Value should be expired
+        assert!(
+            cache.get_raw_key(&key.as_u64()).await.is_none(),
+            "value should be expired after TTL"
+        );
+    }
+
+    /// Test Pingora backend size tracking works correctly.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn test_pingora_size_tracking() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        // Cache should start empty
+        assert_eq!(cache.item_count().await, 0);
+
+        let key1 = CacheKey::Query("pingora_size_test_1", None).as_raw_key(cache.hasher());
+        let key2 = CacheKey::Query("pingora_size_test_2", None).as_raw_key(cache.hasher());
+        let result1 = create_test_cached_result().await;
+        let result2 = create_test_cached_result().await;
+
+        // Insert first entry
+        cache.put_raw_key(&key1.as_u64(), result1).await;
+        cache.checkpoint().await;
+        assert_eq!(cache.item_count().await, 1);
+        let size_after_first = cache.size_bytes().await;
+        assert!(size_after_first > 0, "size should be positive after insert");
+
+        // Insert second entry
+        cache.put_raw_key(&key2.as_u64(), result2).await;
+        cache.checkpoint().await;
+        assert_eq!(cache.item_count().await, 2);
+        let size_after_second = cache.size_bytes().await;
+        assert!(
+            size_after_second > size_after_first,
+            "size should increase after second insert"
+        );
+
+        // Remove first entry
+        cache.invalidate_all().await;
+        cache.checkpoint().await;
+        assert_eq!(cache.item_count().await, 0);
+        assert_eq!(cache.size_bytes().await, 0);
+    }
+
+    /// Test Pingora backend with search results table invalidation.
+    #[cfg(feature = "pingora")]
+    #[tokio::test]
+    async fn test_pingora_search_cache_invalidate_for_table() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedSearchResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_secs(60),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        let table_ref = TableReference::Bare {
+            table: Arc::from("test_table"),
+        };
+        let result = create_test_cached_search_result();
+
+        let raw_cache_key = 789_012u64;
+
+        // Put a value in the cache
+        cache.put_raw_key(&raw_cache_key, result).await;
+        cache.checkpoint().await;
+
+        // Verify the value is in the cache
+        assert!(
+            cache.get_raw_key(&raw_cache_key).await.is_some(),
+            "search result should be in cache"
+        );
+
+        // Invalidate the cache for the table
+        cache
+            .invalidate_for_table(table_ref)
+            .expect("should invalidate search cache for pingora");
+        cache.checkpoint().await;
+
+        // Verify the value is no longer in the cache
+        assert!(
+            cache.get_raw_key(&raw_cache_key).await.is_none(),
+            "search result should be removed after table invalidation"
+        );
     }
 }
