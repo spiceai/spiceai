@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
+use crate::dataaccelerator::BootstrapStatus;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
@@ -24,6 +25,7 @@ use crate::{
     },
 };
 use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_acceleration::snapshot::SnapshotAdapter;
 use runtime_acceleration::{
     dataset_checkpoint::make_checkpointer_factory,
     snapshot::{SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
@@ -33,19 +35,24 @@ use snafu::ResultExt;
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
-    path: PathBuf,
+    adapter: SnapshotAdapter,
     engine: AccelerationEngine,
-) {
+) -> BootstrapStatus {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
-        return;
+        return BootstrapStatus::none();
     }
 
-    if path.exists() {
+    let Some(primary_path) = adapter.primary_path().cloned() else {
+        tracing::debug!("No primary path for snapshot adapter, skipping download");
+        return BootstrapStatus::none();
+    };
+
+    if primary_path.exists() {
         tracing::info!(
             "Acceleration already exists at {}, skipping snapshot download",
-            path.display()
+            primary_path.display()
         );
-        return;
+        return BootstrapStatus::none();
     }
 
     let dataset_name = source.name().to_string();
@@ -68,7 +75,7 @@ pub(super) async fn download_snapshot_if_needed(
     if let Some(manager) = SnapshotManager::try_new(
         dataset_name.clone(),
         acceleration.snapshot_behavior.clone(),
-        path,
+        adapter,
         engine,
     )
     .await
@@ -88,12 +95,16 @@ pub(super) async fn download_snapshot_if_needed(
                     bytes_downloaded,
                     &checksum,
                 );
+                BootstrapStatus::bootstrapped()
             }
-            Ok(None) => {}
+            Ok(None) => BootstrapStatus::none(),
             Err(e) => {
                 tracing::error!("Failed to download snapshot: {}", e);
+                BootstrapStatus::none()
             }
         }
+    } else {
+        BootstrapStatus::none()
     }
 }
 

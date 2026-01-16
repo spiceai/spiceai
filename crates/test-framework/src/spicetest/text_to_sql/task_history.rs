@@ -25,7 +25,7 @@ use opentelemetry::trace::TraceId;
 
 /// Metrics from `runtime.task_history` for a `nsql` operation.
 #[derive(Debug, Clone)]
-pub(crate) struct TaskHistoryMetrics {
+pub struct TaskHistoryMetrics {
     pub sql_duration_ms: f64,
     pub sql_count: usize,
     pub llm_duration_ms: f64,

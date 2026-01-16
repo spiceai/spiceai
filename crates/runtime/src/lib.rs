@@ -37,7 +37,6 @@ use worker::WorkerRegistry;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
-use crate::snapshot_registry::SnapshotManagerRegistry;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError,
@@ -117,7 +116,6 @@ pub mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
-pub mod snapshot_registry;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
@@ -482,7 +480,6 @@ pub struct Runtime {
     tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     token_provider_registry: Arc<TokenProviderRegistry>,
-    snapshot_managers: Arc<SnapshotManagerRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
@@ -568,11 +565,6 @@ impl Runtime {
     #[must_use]
     pub fn token_provider_registry(&self) -> Arc<TokenProviderRegistry> {
         Arc::clone(&self.token_provider_registry)
-    }
-
-    #[must_use]
-    pub fn snapshot_managers(&self) -> Arc<SnapshotManagerRegistry> {
-        Arc::clone(&self.snapshot_managers)
     }
 
     #[must_use]

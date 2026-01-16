@@ -578,15 +578,14 @@ dependencies = [
 
 [[package]]
 name = "arrow-odbc"
-version = "18.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f58735896cd5ea1a19170cdee39635d04807148e502372b03c54e7dfe78ce32f"
+version = "21.0.0"
+source = "git+https://github.com/pacman82/arrow-odbc?rev=7316b13ac969eea8bef7b496a2ba334ebd4e6e06#7316b13ac969eea8bef7b496a2ba334ebd4e6e06"
 dependencies = [
  "arrow",
  "atoi",
  "chrono",
  "log",
- "odbc-api 14.3.0",
+ "odbc-api",
  "thiserror 2.0.17",
 ]
 
@@ -3155,8 +3154,10 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-table-providers",
  "futures",
+ "hash-index",
  "insta",
  "object_store",
+ "parking_lot 0.12.5",
  "paste",
  "roaring",
  "rstest 0.26.1",
@@ -3842,6 +3843,29 @@ dependencies = [
 
 [[package]]
 name = "criterion"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bf7af66b0989381bd0be551bd7cc91912a655a58c6918420c9527b1fd8b4679"
+dependencies = [
+ "anes",
+ "cast",
+ "ciborium",
+ "clap 4.5.54",
+ "criterion-plot 0.5.0",
+ "itertools 0.13.0",
+ "num-traits",
+ "oorandom",
+ "plotters",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "tinytemplate",
+ "walkdir",
+]
+
+[[package]]
+name = "criterion"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1c047a62b0cc3e145fa84415a3191f628e980b194c2755aa12300a4e6cbd928"
@@ -4413,6 +4437,7 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 name = "data_components"
 version = "1.11.0-unstable"
 dependencies = [
+ "ahash 0.8.12",
  "arrow",
  "arrow-array",
  "arrow-buffer",
@@ -4453,6 +4478,7 @@ dependencies = [
  "globset",
  "graph-rs-sdk",
  "graphql-parser",
+ "hash-index",
  "http 1.4.0",
  "httpdate",
  "iceberg",
@@ -4464,6 +4490,7 @@ dependencies = [
  "insta",
  "logos",
  "mailparse",
+ "num_cpus",
  "object_store",
  "opendal",
  "oracle",
@@ -5313,7 +5340,7 @@ dependencies = [
  "datafusion-table-providers",
  "dyn-clone",
  "futures",
- "odbc-api 20.1.0",
+ "odbc-api",
  "pkcs8 0.10.2",
  "scylla",
  "secrecy",
@@ -7419,6 +7446,24 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "hash-index"
+version = "1.11.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-row",
+ "arrow-schema",
+ "criterion 0.6.0",
+ "parking_lot 0.12.5",
+ "rand 0.9.2",
+ "snafu",
+ "tokio",
+ "tracing",
+ "twox-hash",
 ]
 
 [[package]]
@@ -11194,37 +11239,17 @@ dependencies = [
 
 [[package]]
 name = "odbc-api"
-version = "14.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0566d76c87be8dac51dbba245287afdbf8d5fe3c7ffb9cf5c73786ee4427f15"
-dependencies = [
- "atoi",
- "log",
- "odbc-sys 0.25.1",
- "thiserror 2.0.17",
- "widestring",
- "winit",
-]
-
-[[package]]
-name = "odbc-api"
 version = "20.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "783bf33566037e27f47dbb0ca9c0a0562e80e35ee2a8cf35b86048905c36076a"
 dependencies = [
  "atoi",
  "log",
- "odbc-sys 0.27.4",
+ "odbc-sys",
  "thiserror 2.0.17",
  "widestring",
  "winit",
 ]
-
-[[package]]
-name = "odbc-sys"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ecdb20f7c165083ad1bc9f55122f677725e257716a5bc83e5413d5654b7d6f1"
 
 [[package]]
 name = "odbc-sys"
@@ -14168,6 +14193,7 @@ dependencies = [
  "spicepod",
  "strsim 0.11.1",
  "sysinfo 0.37.2",
+ "tar",
  "telemetry",
  "tempfile",
  "tera",
@@ -14205,16 +14231,19 @@ dependencies = [
 name = "runtime-acceleration"
 version = "1.11.0-unstable"
 dependencies = [
+ "anyhow",
  "arrow",
  "arrow-schema",
  "async-trait",
  "aws-sdk-credential-bridge",
  "bytes",
  "chrono",
+ "criterion 0.7.0",
  "datafusion",
  "duckdb",
  "fundu",
  "futures",
+ "hex",
  "object_store",
  "opentelemetry 0.29.1",
  "runtime-parameters",
@@ -14224,11 +14253,13 @@ dependencies = [
  "sha2 0.10.9",
  "snafu",
  "spicepod",
+ "tar",
  "tempfile",
  "tokio",
  "tracing",
  "url",
  "util",
+ "uuid 1.18.1",
 ]
 
 [[package]]
@@ -17062,6 +17093,7 @@ dependencies = [
  "app",
  "arrow",
  "arrow-json",
+ "arrow-schema",
  "async-channel 2.5.0",
  "async-openai",
  "async-trait",

@@ -971,7 +971,9 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
-                fixture.local_db_path.clone(),
+                runtime_acceleration::snapshot::SnapshotAdapter::file(
+                    fixture.local_db_path.clone(),
+                ),
                 AccelerationEngine::DuckDB,
             )
             .await
@@ -983,9 +985,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 async move {
                     let mutex = Arc::new(Mutex::new(()));
                     let lock_guard = mutex.lock_owned().await;
-                    manager_clone
-                        .create_snapshot(&schema, None, lock_guard)
-                        .await
+                    manager_clone.create_snapshot(&schema, lock_guard).await
                 }
             }))
             .await
@@ -1058,7 +1058,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
-                fixture.local_db_path.clone(),
+                runtime_acceleration::snapshot::SnapshotAdapter::file(fixture.local_db_path.clone()),
                 AccelerationEngine::DuckDB,
             )
             .await
@@ -1095,7 +1095,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let lock_guard = mutex.lock_owned().await;
 
             manager
-                .create_snapshot(&schema, None, lock_guard)
+                .create_snapshot(&schema, lock_guard)
                 .await
                 .context("Creating modified snapshot after deleting data")?;
 
@@ -1292,7 +1292,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             let manager_with_compaction = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior_with_compaction,
-                fixture.local_db_path.clone(),
+                runtime_acceleration::snapshot::SnapshotAdapter::file(fixture.local_db_path.clone()),
                 AccelerationEngine::DuckDB,
             )
                 .await
@@ -1303,7 +1303,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             let lock_guard = mutex.lock_owned().await;
 
             let compacted_location = manager_with_compaction
-                .create_snapshot(&schema, None, lock_guard)
+                .create_snapshot(&schema, lock_guard)
                 .await
                 .context("Creating snapshot with compaction enabled")?;
 

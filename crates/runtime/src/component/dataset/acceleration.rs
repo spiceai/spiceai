@@ -312,6 +312,8 @@ pub struct Acceleration {
     pub snapshots_trigger_threshold: Option<String>,
 
     pub snapshots_compaction: SnapshotsCompaction,
+
+    pub snapshots_reset_expiry_on_load_enabled: bool,
 }
 
 impl Acceleration {
@@ -401,14 +403,34 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 "Indexes are not supported for Arrow engine acceleration. Ignoring indexes."
             );
         }
-        if engine == Engine::Arrow && primary_key.is_some() {
+        // Only warn about primary_key if hash_index is not enabled
+        let hash_index_enabled = params
+            .as_ref()
+            .and_then(|p| p.data.get("hash_index"))
+            .is_some_and(|v| v.as_string().eq_ignore_ascii_case("enabled"));
+        if engine == Engine::Arrow && primary_key.is_some() && !hash_index_enabled {
             tracing::warn!(
-                "Primary key is not supported for Arrow engine acceleration. Ignoring primary_key."
+                "Primary key specified but hash_index is not enabled for Arrow engine. \
+                 Add 'hash_index: enabled' to use primary_key for fast lookups. Note, hash_index is experimental in Arrow acceleration."
             );
         }
         if engine == Engine::Arrow && !on_conflict.is_empty() {
             tracing::warn!(
                 "Conflict resolution is not supported for Arrow engine acceleration. Ignoring on_conflict."
+            );
+        }
+
+        if matches!(
+            acceleration.snapshots_reset_expiry_on_load,
+            spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
+        ) && (engine != Engine::DuckDB
+            || !matches!(
+                acceleration.refresh_mode,
+                Some(spicepod_acceleration::RefreshMode::Caching)
+            ))
+        {
+            tracing::warn!(
+                "Resetting expiry on load is only supported for DuckDB engine acceleration with caching refresh mode. Ignoring snapshots_reset_expiry_on_load."
             );
         }
 
@@ -475,6 +497,10 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             snapshots_trigger: acceleration.snapshots_trigger,
             snapshots_trigger_threshold: acceleration.snapshots_trigger_threshold,
             snapshots_compaction: acceleration.snapshots_compaction,
+            snapshots_reset_expiry_on_load_enabled: matches!(
+                acceleration.snapshots_reset_expiry_on_load,
+                spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
+            ),
         })
     }
 }
@@ -514,6 +540,7 @@ impl Default for Acceleration {
             snapshots_trigger: None,
             snapshots_trigger_threshold: None,
             snapshots_compaction: SnapshotsCompaction::Disabled,
+            snapshots_reset_expiry_on_load_enabled: false,
         }
     }
 }
