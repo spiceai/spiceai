@@ -35,6 +35,8 @@ const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
 const SCHEMA_MIGRATION_01_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
 
+#[cfg(not(windows))]
+mod cayenne;
 #[cfg(feature = "duckdb")]
 mod duckdb;
 #[cfg(feature = "postgres")]

@@ -56,6 +56,7 @@ hex = "0.4"
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+uuid = { version = "1", features = ["v7"] }
 
 [[bench]]
 harness = false
