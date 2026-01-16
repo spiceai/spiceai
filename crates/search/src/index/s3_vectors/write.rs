@@ -98,6 +98,15 @@ pub enum Error {
 
     #[snafu(display("Embedding dimension is too large to fit into an i32"))]
     EmbeddingDimensionTooLarge { source: TryFromIntError },
+
+    #[snafu(display(
+        "Embedding dimension mismatch: expected {expected} but got {actual} at row {row_index}"
+    ))]
+    EmbeddingDimensionMismatch {
+        expected: usize,
+        actual: usize,
+        row_index: usize,
+    },
 }
 
 /// Extra index data from the raw table batches, embedded required column and write to [`S3VectorsTable`].
@@ -487,14 +496,23 @@ fn create_embedding_array(
     let field = Field::new_list_field(DataType::Float32, false);
     builder = builder.with_field(field);
 
-    for embedding_opt in embedding_vectors {
+    let expected_dim = dimension as usize;
+    for (row_index, embedding_opt) in embedding_vectors.iter().enumerate() {
         if let Some(embedding) = embedding_opt {
+            // Validate embedding dimension matches expected dimension
+            if embedding.len() != expected_dim {
+                return Err(Box::new(Error::EmbeddingDimensionMismatch {
+                    expected: expected_dim,
+                    actual: embedding.len(),
+                    row_index,
+                }));
+            }
             // Optimized: append_slice automatically marks all values as valid
             // without needing to allocate a separate validity vector
             builder.values().append_slice(embedding);
             builder.append(true);
         } else {
-            builder.values().append_nulls(dimension as usize);
+            builder.values().append_nulls(expected_dim);
             builder.append(false);
         }
     }
@@ -502,7 +520,7 @@ fn create_embedding_array(
     Ok(Arc::new(builder.finish()))
 }
 
-/// Filter out zero vectors (all values in the vector are 0.0)
+/// Filter out zero vectors (all values in the vector are 0.0 or all NaN)
 #[expect(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
@@ -517,7 +535,10 @@ fn filter_zero_vectors(
     // Filter in reverse order to avoid index shifting when removing elements
     for i in (0..embeddings.len()).rev() {
         if let Some(embedding) = &embeddings[i]
-            && embedding.iter().all(|&x| x == 0.0)
+            // Check if all values are zero (handles both 0.0 and -0.0)
+            // Also filter out vectors where all values are NaN (invalid embeddings)
+            && (embedding.iter().all(|&x| x == 0.0)
+                || embedding.iter().all(|x| x.is_nan()))
         {
             let key_str = primary_keys
                 .get(i)

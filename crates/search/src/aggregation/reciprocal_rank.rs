@@ -249,8 +249,8 @@ fn verify_schema_compatibility(schemas: &[SchemaRef]) -> Result<()> {
         }
 
         // Check that the schema is the same across all streams (i.e. all same as the first).
-        // Ensure each column is in first schema, and equal number of columns.
-        let correct_columns = s.fields().iter().any(|f| {
+        // Ensure ALL columns are in the first schema with matching types and nullability.
+        let correct_columns = s.fields().iter().all(|f| {
             let Some((_, f2)) = schema.column_with_name(f.name()) else {
                 return false;
             };
@@ -415,5 +415,59 @@ mod tests {
             additional_columns_of_schema(&schema, primary_keys.as_slice()),
             vec![Column::from_name("additional")]
         );
+    }
+
+    /// Test that verify_schema_compatibility correctly rejects schemas with mismatched column types.
+    /// After the fix (changing .any() to .all()), this test verifies that schema validation
+    /// properly catches when columns have different types.
+    #[test]
+    fn test_verify_schema_compatibility_rejects_type_mismatch() {
+        // Two schemas with:
+        // - Same required columns (__spice_value, __spice_search_score)
+        // - Same number of columns (4)
+        // - But "extra" column has different types (Int8 vs Float64)
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("extra", DataType::Int8, false), // Int8
+        ]));
+
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("extra", DataType::Float64, false), // Float64 - DIFFERENT!
+        ]));
+
+        // After fix: This should fail because "extra" has different types
+        let result = verify_schema_compatibility(&[schema1, schema2]);
+
+        // Verify that schema validation correctly catches the type mismatch
+        assert!(
+            result.is_err(),
+            "Schema validation should fail when column types differ"
+        );
+    }
+
+    /// Test that verify_schema_compatibility accepts schemas that are truly compatible
+    #[test]
+    fn test_verify_schema_compatibility_accepts_matching_schemas() {
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("extra", DataType::Int8, false),
+        ]));
+
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("extra", DataType::Int8, false), // Same type
+        ]));
+
+        let result = verify_schema_compatibility(&[schema1, schema2]);
+        assert!(result.is_ok(), "Compatible schemas should pass validation");
     }
 }

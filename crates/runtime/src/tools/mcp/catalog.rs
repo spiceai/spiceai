@@ -107,7 +107,12 @@ impl McpToolCatalog {
             loop {
                 interval.tick().await;
 
-                let heartbeat_result = client_clone.read().await.ping().await;
+                // Acquire the lock, perform the ping, and drop the lock before any long-running await.
+                // This avoids holding the lock across the network call which could block other operations.
+                let heartbeat_result = {
+                    let client_guard = client_clone.read().await;
+                    client_guard.ping().await
+                };
                 if let Err(ref e) = heartbeat_result {
                     tracing::warn!("MCP client heartbeat failed, attempting reconnection");
                     tracing::debug!("MCP client heartbeat failed with error: {e}");

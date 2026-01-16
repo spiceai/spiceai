@@ -36,12 +36,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
 use parking_lot::RwLock;
-use snafu::ensure;
+use snafu::{OptionExt, ensure};
 use twox_hash::XxHash3_64;
 
 use crate::bloom::BloomFilter;
 use crate::extract::create_key_extractor;
-use crate::{DuplicateKeySnafu, Result};
+use crate::{DuplicateKeySnafu, IndexOverflowSnafu, Result};
 
 /// Fixed seed for deterministic hashing across instances.
 const HASH_SEED: u64 = 0x5370_6963_6541_4920; // "SpiceAI " in hex
@@ -277,11 +277,22 @@ impl HashIndexBuilder {
                         continue; // Skip null keys
                     };
 
-                    let location = RowLocation::new(
-                        u32::try_from(partition_idx).unwrap_or(u32::MAX),
-                        u32::try_from(batch_idx).unwrap_or(u32::MAX),
-                        u32::try_from(row).unwrap_or(u32::MAX),
-                    );
+                    let partition_u32 = u32::try_from(partition_idx).ok().context(
+                        IndexOverflowSnafu {
+                            context: "partition",
+                            value: partition_idx,
+                        },
+                    )?;
+                    let batch_u32 = u32::try_from(batch_idx).ok().context(IndexOverflowSnafu {
+                        context: "batch",
+                        value: batch_idx,
+                    })?;
+                    let row_u32 = u32::try_from(row).ok().context(IndexOverflowSnafu {
+                        context: "row",
+                        value: row,
+                    })?;
+
+                    let location = RowLocation::new(partition_u32, batch_u32, row_u32);
 
                     if self.allow_duplicates {
                         index.insert_or_replace(hash, location);
@@ -309,10 +320,28 @@ struct ShardTable {
     len: usize,
 }
 
+/// Sentinel value used to mark empty slots in the hash table.
+/// We reserve 0 as the empty marker, so any hash that equals 0 is remapped to 1.
+const EMPTY_SLOT_SENTINEL: u64 = 0;
+
+/// Normalizes a hash value to avoid collision with the empty-slot sentinel.
+/// If the hash equals EMPTY_SLOT_SENTINEL (0), it is mapped to 1.
+/// This ensures no valid key can produce a hash that looks like an empty slot.
+#[inline]
+const fn normalize_hash(hash: u64) -> u64 {
+    if hash == EMPTY_SLOT_SENTINEL {
+        1
+    } else {
+        hash
+    }
+}
+
 /// A slot in the hash table.
 #[derive(Clone, Copy, Default)]
 struct Slot {
-    hash: u64, // 0 = empty
+    /// The normalized hash value. EMPTY_SLOT_SENTINEL (0) indicates an empty slot.
+    /// Any actual hash that equals 0 is remapped to 1 via `normalize_hash()`.
+    hash: u64,
     location: RowLocation,
 }
 
@@ -602,6 +631,7 @@ impl HashIndex {
     /// Looks up by pre-computed hash.
     #[inline]
     pub fn get_by_hash(&self, hash: u64) -> Option<RowLocation> {
+        let hash = normalize_hash(hash);
         // Fast path: bloom filter check
         if let Some(bloom) = &self.bloom
             && !bloom.read().might_contain(hash)
@@ -636,6 +666,7 @@ impl HashIndex {
     /// Checks if index might contain hash (bloom filter only).
     #[inline]
     pub fn might_contain(&self, hash: u64) -> bool {
+        let hash = normalize_hash(hash);
         match &self.bloom {
             Some(bloom) => bloom.read().might_contain(hash),
             None => true,
@@ -645,11 +676,13 @@ impl HashIndex {
     /// Checks if index contains hash.
     #[inline]
     pub fn contains(&self, hash: u64) -> bool {
+        // normalize_hash is called inside get_by_hash
         self.get_by_hash(hash).is_some()
     }
 
     /// Inserts a new entry.
     pub fn insert(&self, hash: u64, location: RowLocation) -> bool {
+        let hash = normalize_hash(hash);
         let inserted = self.shard(hash).insert(hash, location);
         if inserted {
             self.len.fetch_add(1, Ordering::Relaxed);
@@ -662,6 +695,7 @@ impl HashIndex {
 
     /// Inserts or replaces an entry.
     pub fn insert_or_replace(&self, hash: u64, location: RowLocation) {
+        let hash = normalize_hash(hash);
         let shard = self.shard(hash);
         let old_len = shard.len();
         shard.insert_or_replace(hash, location);
@@ -676,6 +710,7 @@ impl HashIndex {
 
     /// Removes an entry.
     pub fn remove(&self, hash: u64) -> Option<RowLocation> {
+        let hash = normalize_hash(hash);
         let result = self.shard(hash).remove(hash);
         if result.is_some() {
             self.len.fetch_sub(1, Ordering::Relaxed);
@@ -715,11 +750,22 @@ impl HashIndex {
                         continue;
                     };
 
-                    let location = RowLocation::new(
-                        u32::try_from(partition_idx).unwrap_or(u32::MAX),
-                        u32::try_from(batch_idx).unwrap_or(u32::MAX),
-                        u32::try_from(row).unwrap_or(u32::MAX),
-                    );
+                    let partition_u32 = u32::try_from(partition_idx).ok().context(
+                        IndexOverflowSnafu {
+                            context: "partition",
+                            value: partition_idx,
+                        },
+                    )?;
+                    let batch_u32 = u32::try_from(batch_idx).ok().context(IndexOverflowSnafu {
+                        context: "batch",
+                        value: batch_idx,
+                    })?;
+                    let row_u32 = u32::try_from(row).ok().context(IndexOverflowSnafu {
+                        context: "row",
+                        value: row,
+                    })?;
+
+                    let location = RowLocation::new(partition_u32, batch_u32, row_u32);
 
                     self.insert_or_replace(hash, location);
                 }
@@ -733,7 +779,7 @@ impl HashIndex {
     ///
     /// # Errors
     ///
-    /// Returns an error if key extraction fails for any batch.
+    /// Returns an error if key extraction fails for any batch, or if indices overflow u32.
     pub fn add_batches(
         &self,
         partition_idx: u32,
@@ -746,18 +792,31 @@ impl HashIndex {
             }
 
             let extractor = create_key_extractor(batch, &self.key_columns)?;
-            let batch_idx = starting_batch_idx + u32::try_from(batch_offset).unwrap_or(u32::MAX);
+            let batch_offset_u32 =
+                u32::try_from(batch_offset)
+                    .ok()
+                    .context(IndexOverflowSnafu {
+                        context: "batch_offset",
+                        value: batch_offset,
+                    })?;
+            let batch_idx = starting_batch_idx
+                .checked_add(batch_offset_u32)
+                .context(IndexOverflowSnafu {
+                    context: "batch",
+                    value: starting_batch_idx as usize + batch_offset,
+                })?;
 
             for row in 0..extractor.len() {
                 let Some(hash) = extractor.hash_key(row) else {
                     continue;
                 };
 
-                let location = RowLocation::new(
-                    partition_idx,
-                    batch_idx,
-                    u32::try_from(row).unwrap_or(u32::MAX),
-                );
+                let row_u32 = u32::try_from(row).ok().context(IndexOverflowSnafu {
+                    context: "row",
+                    value: row,
+                })?;
+
+                let location = RowLocation::new(partition_idx, batch_idx, row_u32);
 
                 self.insert_or_replace(hash, location);
             }

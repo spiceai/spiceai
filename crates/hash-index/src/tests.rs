@@ -1702,3 +1702,54 @@ fn test_data_integrity_allow_duplicates_last_wins() {
     // Total unique keys
     assert_eq!(index.len(), 3);
 }
+
+/// Test that hash index correctly handles hash values that equal the empty-slot sentinel.
+/// After the fix, hash values of 0 are normalized to 1, so keys that would hash to 0
+/// are correctly stored and retrieved.
+#[test]
+fn test_zero_hash_normalized() {
+    let index = HashIndex::new(vec!["id".to_string()]);
+
+    // Manually insert using hash = 0 (the sentinel value)
+    // After the fix, this should be normalized to 1 internally
+    let location = RowLocation::new(0, 0, 42);
+    let inserted = index.insert(0, location);
+    assert!(inserted, "Insert with hash=0 should succeed");
+
+    // After fix: get_by_hash(0) should return the location
+    // because 0 is normalized to 1 before storage and lookup
+    let result = index.get_by_hash(0);
+    assert!(
+        result.is_some(),
+        "Keys with hash=0 should be retrievable after normalization fix"
+    );
+    assert_eq!(result, Some(location));
+
+    // Verify the index length is correct
+    assert_eq!(index.len(), 1);
+}
+
+/// Test that the hash normalization is consistent between insert and get.
+#[test]
+fn test_zero_hash_normalization_consistency() {
+    let index = HashIndex::new(vec!["id".to_string()]);
+
+    // Insert with hash = 0
+    let loc1 = RowLocation::new(0, 0, 1);
+    assert!(index.insert(0, loc1));
+
+    // Insert with hash = 1 (this is what 0 normalizes to internally)
+    // This should be a duplicate since 0 is normalized to 1
+    let loc2 = RowLocation::new(0, 0, 2);
+    let inserted = index.insert(1, loc2);
+
+    // Both hash 0 and 1 map to normalized hash 1, so one will succeed and one will fail
+    // (depending on whether we consider them duplicates)
+    // The important thing is that get_by_hash(0) and get_by_hash(1) return the same result
+    let result_0 = index.get_by_hash(0);
+    let result_1 = index.get_by_hash(1);
+    assert_eq!(
+        result_0, result_1,
+        "Hash 0 and 1 should return the same result after normalization"
+    );
+}
