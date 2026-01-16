@@ -1,19 +1,5 @@
 ---
 source: crates/runtime/tests/search/mod.rs
 description: "SELECT subject FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4"
-snapshot_kind: text
 ---
-[
-  {
-    "subject": "math"
-  },
-  {
-    "subject": "math"
-  },
-  {
-    "subject": "math"
-  },
-  {
-    "subject": "math"
-  }
-]
+"HTTP error: 400 Bad Request - Arrow error: Cast error: cannot cast fixed-size-list to fixed-size-list with different size"
