@@ -756,18 +756,8 @@ pub trait ListingTableConnector: DataConnector {
                     },
                 )?;
 
-            table_parquet_options
-                .set(
-                    "tolerate_missing_page_index",
-                    &page_index_options.tolerate_missing_page_index.to_string(),
-                )
-                .map_err(
-                    |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                        dataconnector: format!("{self}"),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: Box::new(e),
-                    },
-                )?;
+            // Note: tolerate_missing_page_index was removed in DataFusion v51.
+            // Page index reading now handles missing indexes gracefully by default.
         }
 
         Ok(table_parquet_options)
@@ -1397,14 +1387,12 @@ impl SensitiveListingTableUrl {
 
 struct ParquetPageIndexOptions {
     enable_page_index: bool,
-    tolerate_missing_page_index: bool,
 }
 
 impl Default for ParquetPageIndexOptions {
     fn default() -> Self {
         Self {
             enable_page_index: true,
-            tolerate_missing_page_index: false,
         }
     }
 }
@@ -1425,15 +1413,13 @@ async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOption
         app::App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
 
     match parquet_page_index_param.as_str() {
-        "auto" => ParquetPageIndexOptions {
-            enable_page_index: true,
-            tolerate_missing_page_index: true,
-        },
+        // Note: "auto" and "required" both enable page index now. The difference was that "auto"
+        // set tolerate_missing_page_index=true, but that option was removed in DataFusion v51.
+        // Page index reading now handles missing indexes gracefully by default.
+        "auto" | "required" => ParquetPageIndexOptions::default(),
         "skip" => ParquetPageIndexOptions {
             enable_page_index: false,
-            tolerate_missing_page_index: false,
         },
-        "required" => ParquetPageIndexOptions::default(),
         _ => {
             tracing::warn!(
                 "Invalid value '{}' for runtime.params.parquet_page_index, valid options are: 'auto', 'skip', 'required'. Using 'required'.",
@@ -2332,7 +2318,6 @@ mod tests {
 
         let options = parquet_page_index_options(&runtime).await;
         assert!(options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 
     #[tokio::test]
@@ -2347,9 +2332,10 @@ mod tests {
             .build()
             .await;
 
+        // "auto" and "required" now behave the same since tolerate_missing_page_index
+        // was removed in DataFusion v51. Page index reading handles missing indexes gracefully.
         let options = parquet_page_index_options(&runtime).await;
         assert!(options.enable_page_index);
-        assert!(options.tolerate_missing_page_index);
     }
 
     #[test]
@@ -2468,7 +2454,6 @@ mod tests {
 
         let options = parquet_page_index_options(&runtime).await;
         assert!(!options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 
     #[tokio::test]
@@ -2485,7 +2470,6 @@ mod tests {
 
         let options = parquet_page_index_options(&runtime).await;
         assert!(options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 
     #[tokio::test]
@@ -2503,6 +2487,5 @@ mod tests {
         let options = parquet_page_index_options(&runtime).await;
         // Should fall back to default
         assert!(options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 }
