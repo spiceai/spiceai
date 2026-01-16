@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -79,7 +78,7 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotManager};
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotAdapter, SnapshotManager};
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
@@ -1259,7 +1258,7 @@ impl DataFusion {
                     dataset,
                     &acceleration_settings,
                     refresh_mode,
-                    snapshot_path,
+                    SnapshotAdapter::file(snapshot_path),
                 )
                 .await?
                 {
@@ -2118,7 +2117,7 @@ async fn build_snapshot_creation_config(
     dataset: &Dataset,
     acceleration_settings: &Acceleration,
     refresh_mode: RefreshMode,
-    snapshot_path: PathBuf,
+    snapshot_adapter: SnapshotAdapter,
 ) -> Result<Option<SnapshotCreationConfig>> {
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
@@ -2207,7 +2206,7 @@ async fn build_snapshot_creation_config(
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),
         acceleration_settings.snapshot_behavior.clone(),
-        snapshot_path.clone(),
+        snapshot_adapter,
         acceleration_engine,
     )
     .await
@@ -2276,6 +2275,7 @@ mod tests {
         assert_eq!(cache_provider.item_count().await, 1);
     }
 
+    #[cfg(all(feature = "duckdb", feature = "snapshots",))]
     mod build_snapshot_creation_config_tests {
         use super::*;
         use crate::component::dataset::Dataset;
@@ -2362,7 +2362,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Full,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 
@@ -2386,7 +2386,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 
@@ -2423,7 +2423,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Changes,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 
@@ -2460,7 +2460,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Full,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 
@@ -2492,7 +2492,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 
@@ -2524,7 +2524,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 
@@ -2556,7 +2556,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 
@@ -2584,7 +2584,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 
@@ -2612,7 +2612,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Full,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 
@@ -2643,7 +2643,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Changes,
-                snapshot_path,
+                SnapshotAdapter::file(snapshot_path),
             )
             .await;
 

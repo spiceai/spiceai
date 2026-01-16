@@ -1994,6 +1994,9 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             let parent_row_count = parent_results[0].num_rows();
             eprintln!("TEST: Parent cache populated with {parent_row_count} rows");
 
+            // Wait for background cache write to complete
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
             // Get the parent's accelerator reference for later verification
             let parent_accelerator = runtime_phase1
                 .datafusion()
