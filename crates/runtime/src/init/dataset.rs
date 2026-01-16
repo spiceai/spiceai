@@ -17,6 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::dataaccelerator::BootstrapStatus;
+use crate::dataaccelerator::spice_sys::OpenOption;
+use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
@@ -901,7 +903,12 @@ impl Runtime {
                         name: acceleration_settings.engine.to_string(),
                     },
                 ) {
-                    Ok(bootstrap_status) => (ds.name.clone(), Ok(bootstrap_status)),
+                    Ok(bootstrap_status) => {
+                        if bootstrap_status.is_bootstrapped() {
+                            update_cached_dataset_timestamps(ds.as_ref()).await;
+                        }
+                        (ds.name.clone(), Ok(bootstrap_status))
+                    }
                     Err(err) => {
                         let ds_name = &ds.name;
                         status.update_dataset(ds_name, status::ComponentStatus::Error);
@@ -972,4 +979,49 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
         .build());
     }
     Ok(())
+}
+
+/// Updates the `fetched_at` column for all records in a cached dataset that was bootstrapped.
+/// This is necessary for caching mode to ensure all bootstrapped records have a valid timestamp.
+async fn update_cached_dataset_timestamps(dataset: &Dataset) {
+    let is_caching_mode = dataset
+        .acceleration
+        .as_ref()
+        .and_then(|acc| acc.refresh_mode)
+        .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
+
+    if !is_caching_mode {
+        return;
+    }
+
+    let is_reset_expiry_on_load_enabled = dataset
+        .acceleration
+        .as_ref()
+        .is_some_and(|acc| acc.snapshots_reset_expiry_on_load_enabled);
+
+    if !is_reset_expiry_on_load_enabled {
+        return;
+    }
+
+    match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
+        Ok(caching_sys) => {
+            if let Err(e) = caching_sys.update_fetched_at() {
+                tracing::warn!(
+                    "Failed to update fetched_at for cached dataset {}: {e}",
+                    dataset.name
+                );
+            } else {
+                tracing::debug!(
+                    "Updated fetched_at for all records in cached dataset {}",
+                    dataset.name
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to initialize caching engine for {}: {e}",
+                dataset.name
+            );
+        }
+    }
 }

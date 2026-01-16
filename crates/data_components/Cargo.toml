@@ -11,6 +11,7 @@ version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ahash.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
@@ -54,6 +55,7 @@ git2 = { workspace = true }
 globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
+hash-index = { path = "../hash-index" }
 http.workspace = true
 httpdate.workspace = true
 iceberg.workspace = true
@@ -63,6 +65,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
 mailparse = { workspace = true, optional = true }
+num_cpus = "1.16"
 object_store = { workspace = true }
 opendal = "0.54"
 oracle = { version = "0.6", optional = true }
