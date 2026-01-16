@@ -22,12 +22,6 @@ use std::{
 
 use super::{DatasetCheckpoint, Error, Result};
 
-// These functions will be used for Cayenne directory-based checkpoint operations
-// when full Cayenne snapshot support is integrated.
-#[expect(
-    dead_code,
-    reason = "Functions will be used when Cayenne snapshot support is fully integrated"
-)]
 impl DatasetCheckpoint {
     /// Helper function to recursively find the most recent file modification time
     fn visit_dirs(dir: &Path, latest: &mut Option<SystemTime>) -> std::io::Result<()> {
