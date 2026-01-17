@@ -306,15 +306,37 @@ pub struct RedactedThinkingBlockParam {
 #[serde(tag = "type")]
 pub enum ResponseContentBlock {
     #[serde(rename = "text")]
-    Text(TextBlockParam),
+    Text(ResponseTextBlock),
     #[serde(rename = "tool_use")]
-    ToolUse(ToolUseBlockParam),
+    ToolUse(ResponseToolUseBlock),
     #[serde(rename = "thinking")]
     Thinking(ThinkingBlock),
     #[serde(rename = "redacted_thinking")]
     RedactedThinking(RedactedThinkingBlock),
     #[serde(rename = "server_tool_use")]
     ServerToolUse(ServerToolUseBlock),
+}
+
+/// Text block for responses - unlike `TextBlockParam`, this doesn't include the `type` field
+/// since it's consumed by the `#[serde(tag = "type")]` attribute on `ResponseContentBlock`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResponseTextBlock {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+}
+
+/// Tool use block for responses - unlike `ToolUseBlockParam`, this doesn't include the `type` field
+/// since it's consumed by the `#[serde(tag = "type")]` attribute on `ResponseContentBlock`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResponseToolUseBlock {
+    pub id: String,
+    pub input: serde_json::Value,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolCaller>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

@@ -42,8 +42,8 @@ use serde_json::json;
 use super::Anthropic;
 use super::types::{
     AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
-    MessageParam, MessageRole, MetadataParam, ResponseContentBlock, StopReason, TextBlockParam,
-    ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam, default_max_tokens,
+    MessageParam, MessageRole, MetadataParam, ResponseContentBlock, ResponseTextBlock, StopReason,
+    TextBlockParam, ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam, default_max_tokens,
     tool_from_completion_tools,
 };
 use super::types_stream::transform_stream;
@@ -170,7 +170,7 @@ fn create_completion_message(
                     },
                 )))
             }
-            ResponseContentBlock::Text(TextBlockParam { text, .. }) => {
+            ResponseContentBlock::Text(ResponseTextBlock { text, .. }) => {
                 content.push_str(text);
                 None
             }
