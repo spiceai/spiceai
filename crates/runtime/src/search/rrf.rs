@@ -133,8 +133,8 @@ struct ReciprocalRankFusionSubqueryArgs {
     pub rank_weight: Option<f64>,
 }
 
-/// Checks if an expression is a scalar function, possibly wrapped in an Alias.
-/// In DataFusion v51+, function calls with named arguments may be wrapped in Alias.
+/// Checks if an expression is a scalar function, possibly wrapped in an `Alias`.
+/// In `DataFusion` v51+, function calls with named arguments may be wrapped in `Alias`.
 fn is_scalar_function_expr(expr: &Expr) -> bool {
     match expr {
         Expr::ScalarFunction(_) => true,
@@ -143,7 +143,7 @@ fn is_scalar_function_expr(expr: &Expr) -> bool {
     }
 }
 
-/// Unwraps an expression that may be wrapped in an Alias to get the inner ScalarFunction.
+/// Unwraps an expression that may be wrapped in an `Alias` to get the inner `ScalarFunction`.
 fn unwrap_scalar_function(expr: Expr) -> Expr {
     match expr {
         Expr::Alias(alias) => {
