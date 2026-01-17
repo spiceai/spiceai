@@ -91,6 +91,16 @@ pub enum Error {
     /// Duplicate key detected during index build.
     #[snafu(display("Duplicate key detected"))]
     DuplicateKey,
+
+    /// Hash collision detected between different keys during index build.
+    /// This indicates two different keys produced the same hash value.
+    #[snafu(display(
+        "Hash collision detected for hash {hash}. Two different keys produced the same hash. Index build failed to ensure data correctness."
+    ))]
+    HashCollision {
+        /// The hash value that caused the collision.
+        hash: u64,
+    },
 }
 
 /// Result type for hash index operations.

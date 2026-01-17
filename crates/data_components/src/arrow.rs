@@ -90,7 +90,7 @@ impl IndexType {
 }
 
 /// Parses the indexes option string into column names and their index types.
-/// Format: "col1:enabled;col2:unique;col3,col4:unique" (compound key with columns col3 and col4)
+/// Format: "col1:enabled;col2:unique;(col3,col4):unique" (compound key with columns col3 and col4)
 fn parse_indexes_option(
     indexes_str: &str,
     schema: &arrow::datatypes::Schema,
@@ -104,12 +104,14 @@ fn parse_indexes_option(
         }
 
         let parts: Vec<&str> = entry.split(':').collect();
-        if parts.is_empty() {
+        let Some(col_part) = parts.first().map(|s| s.trim()) else {
+            continue;
+        };
+        if col_part.is_empty() {
             continue;
         }
 
         // Parse column reference - may be compound like "(col1, col2)" or just "col1"
-        let col_part = parts[0].trim();
         let columns: Vec<String> = if col_part.starts_with('(') && col_part.ends_with(')') {
             // Compound key: "(col1, col2)"
             col_part[1..col_part.len() - 1]

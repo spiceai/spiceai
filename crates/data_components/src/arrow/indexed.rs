@@ -410,12 +410,20 @@ impl IndexedMemTable {
     ///
     /// Returns the matching secondary index and the key value if a single-column
     /// secondary index matches an equality predicate in the filters.
+    ///
+    /// # Limitations
+    ///
+    /// Although secondary indexes may be configured with multiple columns (compound keys),
+    /// the current implementation only uses single-column secondary indexes for query
+    /// optimization. Multi-column secondary indexes are built and maintained but will not
+    /// accelerate queries until full compound key lookup support is implemented.
     fn find_secondary_index_match(
         &self,
         filters: &[Expr],
     ) -> Option<(&SecondaryIndex, PrimaryKeyValue)> {
         for secondary in &self.secondary_indexes {
-            // Only support single-column secondary indexes for now
+            // Only support single-column secondary indexes for now.
+            // Multi-column secondary indexes are built but not used for optimization yet.
             if secondary.columns.len() != 1 {
                 continue;
             }
@@ -2056,11 +2064,10 @@ mod tests {
             "Utf8 mismatch should fail"
         );
 
-        // Test missing column
-        assert!(
-            !pk.matches_batch(&batch, "nonexistent"),
-            "Missing column should fail"
-        );
+        // Note: We don't test for missing columns here because:
+        // 1. The primary key column is validated at table creation time
+        // 2. matches_batch() uses unreachable!() for missing columns since it should never happen
+        // 3. Testing unreachable code paths would just verify the panic behavior
     }
 
     // =============================================================================

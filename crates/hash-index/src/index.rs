@@ -305,16 +305,10 @@ impl HashIndexBuilder {
                                 }
 
                                 // Different key bytes = hash collision (different keys, same hash).
-                                // This is a limitation of the current hash index design which
-                                // doesn't support chaining. Log and continue - the first key
-                                // wins and subsequent lookups for the colliding key will fail.
-                                // This is acceptable for unique indexes where collisions are rare.
-                                tracing::warn!(
-                                    hash,
-                                    "Hash collision detected during index build. \
-                                     Two different keys produced the same hash. \
-                                     The second key will not be indexed."
-                                );
+                                // Per DATA CORRECTNESS principles: lookups must never fail to find
+                                // existing data. Since our hash table doesn't support chaining,
+                                // we must fail the index build rather than silently drop keys.
+                                return Err(crate::Error::HashCollision { hash });
                             }
                         }
                     }
