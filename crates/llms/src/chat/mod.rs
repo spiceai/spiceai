@@ -21,19 +21,19 @@ use nsql::SqlGeneration;
 #[cfg(feature = "local_llm")]
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use snafu::Snafu;
 #[cfg(feature = "local_llm")]
 use snafu::ResultExt;
+use snafu::Snafu;
 use spicepod::component::model::ModelSource;
 #[cfg(feature = "local_llm")]
+use std::path::Path;
+#[cfg(feature = "local_llm")]
 use std::path::PathBuf;
+use std::pin::Pin;
 #[cfg(feature = "local_llm")]
 use std::str::FromStr;
 #[cfg(feature = "local_llm")]
 use std::sync::Arc;
-#[cfg(feature = "local_llm")]
-use std::path::Path;
-use std::pin::Pin;
 use tracing_futures::Instrument;
 
 use async_openai::{

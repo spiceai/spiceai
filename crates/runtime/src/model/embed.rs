@@ -31,9 +31,9 @@ use llms::bedrock::{
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
-use llms::embeddings::{Embed, Error as EmbedError};
 #[cfg(feature = "models")]
 use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
+use llms::embeddings::{Embed, Error as EmbedError};
 #[cfg(feature = "models")]
 use llms::model2vec::Model2Vec;
 use llms::openai::embed::OpenaiEmbed;
