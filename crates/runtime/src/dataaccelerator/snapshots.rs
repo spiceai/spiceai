@@ -28,10 +28,12 @@ use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::SnapshotAdapter;
 use runtime_acceleration::{
     dataset_checkpoint::make_checkpointer_factory,
-    snapshot::{SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
+    snapshot::{SnapshotBehavior, SnapshotManager, metrics},
 };
 use snafu::ResultExt;
 
+/// Downloads a snapshot if needed for bootstrapping.
+/// Returns `BootstrapStatus`::`Bootstrapped` if a snapshot was successfully downloaded.
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
@@ -83,19 +85,15 @@ pub(super) async fn download_snapshot_if_needed(
         let manager = manager.with_checkpointer_factory(checkpoint_factory);
         let start_time = Instant::now();
         match manager.download_latest_snapshot().await {
-            Ok(Some(SnapshotDownloadInfo {
-                schema: _,
-                bytes_downloaded,
-                checksum,
-            })) => {
+            Ok(Some(info)) => {
                 let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 metrics::record_bootstrap_metrics(
                     &dataset_name,
                     duration_ms,
-                    bytes_downloaded,
-                    &checksum,
+                    info.bytes_downloaded,
+                    &info.checksum,
                 );
-                BootstrapStatus::bootstrapped()
+                BootstrapStatus::bootstrapped(info)
             }
             Ok(None) => BootstrapStatus::none(),
             Err(e) => {
