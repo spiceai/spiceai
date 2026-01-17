@@ -95,10 +95,10 @@ pub enum Error {
     /// Hash collision detected between different keys during index build.
     /// This indicates two different keys produced the same hash value.
     #[snafu(display(
-        "Hash collision detected for hash {hash}. Two different keys produced the same hash. Index build failed to ensure data correctness."
+        "Index build failed due to a hash collision between different keys. This is a rare condition that prevents the index from guaranteeing data correctness. Try rebuilding the index with a different dataset ordering."
     ))]
     HashCollision {
-        /// The hash value that caused the collision.
+        /// The hash value that caused the collision (for internal debugging).
         hash: u64,
     },
 }

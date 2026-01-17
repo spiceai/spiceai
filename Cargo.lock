@@ -7458,7 +7458,6 @@ dependencies = [
  "arrow-row",
  "arrow-schema",
  "criterion 0.6.0",
- "opentelemetry 0.29.1",
  "parking_lot 0.12.5",
  "rand 0.9.2",
  "snafu",

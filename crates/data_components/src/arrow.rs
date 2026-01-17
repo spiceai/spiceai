@@ -182,6 +182,15 @@ impl TableProviderFactory for ArrowFactory {
                     let is_unique = index_type == IndexType::Unique;
                     let index_name = columns.join("_");
 
+                    // Warn about compound secondary indexes not being used for query optimization yet
+                    if columns.len() > 1 {
+                        tracing::warn!(
+                            index_name = %index_name,
+                            columns = ?columns,
+                            "Compound secondary index created but will not be used for query optimization. Only single-column secondary indexes currently accelerate queries."
+                        );
+                    }
+
                     // Build hash index for secondary columns
                     // Note: For empty table, we create the index structure; it will be populated on insert
                     let partitions: Vec<Vec<arrow::array::RecordBatch>> = vec![];
@@ -436,5 +445,178 @@ mod tests {
 
         // With hash_index not specified, should still create successfully (uses non-indexed table)
         assert!(table.as_any().is::<DeletionTableProviderAdapter>());
+    }
+
+    // =============================================================================
+    // parse_indexes_option Unit Tests
+    // =============================================================================
+
+    fn create_schema_with_columns(columns: &[(&str, arrow::datatypes::DataType)]) -> Schema {
+        Schema::new(
+            columns
+                .iter()
+                .map(|(name, dt)| Field::new(*name, dt.clone(), false))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn test_parse_indexes_single_column_enabled() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        let result = parse_indexes_option("col1:enabled", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec!["col1".to_string()]);
+        assert_eq!(result[0].1, IndexType::Enabled);
+    }
+
+    #[test]
+    fn test_parse_indexes_single_column_unique() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        let result = parse_indexes_option("col2:unique", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec!["col2".to_string()]);
+        assert_eq!(result[0].1, IndexType::Unique);
+    }
+
+    #[test]
+    fn test_parse_indexes_compound_key_unique() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+            ("col3", arrow::datatypes::DataType::Int32),
+        ]);
+
+        let result = parse_indexes_option("(col1,col2):unique", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].0,
+            vec!["col1".to_string(), "col2".to_string()]
+        );
+        assert_eq!(result[0].1, IndexType::Unique);
+    }
+
+    #[test]
+    fn test_parse_indexes_multiple_indexes() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+            ("col3", arrow::datatypes::DataType::Int32),
+        ]);
+
+        let result =
+            parse_indexes_option("col1:unique;col2:enabled;(col2,col3):unique", &schema)
+                .expect("parse failed");
+        assert_eq!(result.len(), 3);
+
+        assert_eq!(result[0].0, vec!["col1".to_string()]);
+        assert_eq!(result[0].1, IndexType::Unique);
+
+        assert_eq!(result[1].0, vec!["col2".to_string()]);
+        assert_eq!(result[1].1, IndexType::Enabled);
+
+        assert_eq!(
+            result[2].0,
+            vec!["col2".to_string(), "col3".to_string()]
+        );
+        assert_eq!(result[2].1, IndexType::Unique);
+    }
+
+    #[test]
+    fn test_parse_indexes_empty_string() {
+        let schema = create_schema_with_columns(&[("col1", arrow::datatypes::DataType::Int64)]);
+
+        let result = parse_indexes_option("", &schema).expect("parse failed");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_indexes_malformed_entries_skipped() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        // Empty entries are skipped, only valid entry is parsed
+        let result =
+            parse_indexes_option(";;col1:unique;;", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec!["col1".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_indexes_invalid_column_returns_error() {
+        let schema = create_schema_with_columns(&[("col1", arrow::datatypes::DataType::Int64)]);
+
+        let result = parse_indexes_option("nonexistent:unique", &schema);
+        assert!(result.is_err());
+        let err = result.expect_err("expected error");
+        assert!(
+            err.to_string().contains("nonexistent"),
+            "Error should mention the invalid column name"
+        );
+    }
+
+    #[test]
+    fn test_parse_indexes_compound_key_with_invalid_column() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        let result = parse_indexes_option("(col1,invalid):unique", &schema);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_indexes_default_type_is_enabled() {
+        let schema = create_schema_with_columns(&[("col1", arrow::datatypes::DataType::Int64)]);
+
+        // No type specified - should default to Enabled
+        let result = parse_indexes_option("col1", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, IndexType::Enabled);
+    }
+
+    #[test]
+    fn test_parse_indexes_whitespace_handling() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        // Whitespace around entries and values should be trimmed
+        let result =
+            parse_indexes_option("  col1 : unique ; ( col1 , col2 ) : enabled  ", &schema)
+                .expect("parse failed");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, vec!["col1".to_string()]);
+        assert_eq!(result[0].1, IndexType::Unique);
+        assert_eq!(
+            result[1].0,
+            vec!["col1".to_string(), "col2".to_string()]
+        );
+        assert_eq!(result[1].1, IndexType::Enabled);
+    }
+
+    #[test]
+    fn test_parse_indexes_case_insensitive_type() {
+        let schema = create_schema_with_columns(&[("col1", arrow::datatypes::DataType::Int64)]);
+
+        let result1 = parse_indexes_option("col1:UNIQUE", &schema).expect("parse failed");
+        assert_eq!(result1[0].1, IndexType::Unique);
+
+        let result2 = parse_indexes_option("col1:Unique", &schema).expect("parse failed");
+        assert_eq!(result2[0].1, IndexType::Unique);
+
+        let result3 = parse_indexes_option("col1:ENABLED", &schema).expect("parse failed");
+        assert_eq!(result3[0].1, IndexType::Enabled);
     }
 }

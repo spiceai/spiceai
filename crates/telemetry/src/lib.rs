@@ -16,10 +16,8 @@ limitations under the License.
 
 use meter::METER;
 use opentelemetry::metrics::UpDownCounter;
-use opentelemetry::{
-    KeyValue,
-    metrics::{Counter, Histogram},
-};
+pub use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Histogram};
 use std::{sync::LazyLock, time::Duration};
 
 #[cfg(feature = "anonymous_telemetry")]
@@ -274,16 +272,4 @@ static HASH_INDEX_MEMORY_BYTES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
 
 pub fn track_hash_index_memory_bytes(bytes: u64, dimensions: &[KeyValue]) {
     HASH_INDEX_MEMORY_BYTES.record(bytes, dimensions);
-}
-
-static HASH_INDEX_LOOKUPS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("hash_index_lookups")
-        .with_description("Number of hash index lookup operations.")
-        .with_unit("lookups")
-        .build()
-});
-
-pub fn track_hash_index_lookup(dimensions: &[KeyValue]) {
-    HASH_INDEX_LOOKUPS.add(1, dimensions);
 }
