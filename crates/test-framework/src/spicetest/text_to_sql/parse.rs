@@ -839,13 +839,15 @@ mod tests {
 
     #[test]
     fn properly_extra_text() {
-        assert!(attempt_parse_table_and_projection(r#"Looking at the schema and previous errors, I need to provide only the raw SQL without any explanations, markdown, or extra text. The errors indicate the SQL parser is failing because of the additional content.
+        let _ = attempt_parse_table_and_projection(r#"Looking at the schema and previous errors, I need to provide only the raw SQL without any explanations, markdown, or extra text. The errors indicate the SQL parser is failing because of the additional content.
 
             Based on the tables:
             - `frpm` has `"FRPM Count (K-12)"` column
             - `schools` has `"MailStreet"` column (unabbreviated mailing street address)
             - Join on `"CDSCode"`
 
-            SELECT "MailStreet" FROM schools JOIN frpm ON schools."CDSCode" = frpm."CDSCode" WHERE frpm."FRPM Count (K-12)" IS NOT NULL ORDER BY frpm."FRPM Count (K-12)" DESC LIMIT 1"#).is_err());
+            SELECT "MailStreet" FROM schools JOIN frpm ON schools."CDSCode" = frpm."CDSCode" WHERE frpm."FRPM Count (K-12)" IS NOT NULL ORDER BY frpm."FRPM Count (K-12)" DESC LIMIT 1"#).expect_err(
+                "Invalid SQL should return an error"
+            );
     }
 }
