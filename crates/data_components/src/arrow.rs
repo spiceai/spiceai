@@ -496,10 +496,7 @@ mod tests {
 
         let result = parse_indexes_option("(col1,col2):unique", &schema).expect("parse failed");
         assert_eq!(result.len(), 1);
-        assert_eq!(
-            result[0].0,
-            vec!["col1".to_string(), "col2".to_string()]
-        );
+        assert_eq!(result[0].0, vec!["col1".to_string(), "col2".to_string()]);
         assert_eq!(result[0].1, IndexType::Unique);
     }
 
@@ -511,9 +508,8 @@ mod tests {
             ("col3", arrow::datatypes::DataType::Int32),
         ]);
 
-        let result =
-            parse_indexes_option("col1:unique;col2:enabled;(col2,col3):unique", &schema)
-                .expect("parse failed");
+        let result = parse_indexes_option("col1:unique;col2:enabled;(col2,col3):unique", &schema)
+            .expect("parse failed");
         assert_eq!(result.len(), 3);
 
         assert_eq!(result[0].0, vec!["col1".to_string()]);
@@ -522,10 +518,7 @@ mod tests {
         assert_eq!(result[1].0, vec!["col2".to_string()]);
         assert_eq!(result[1].1, IndexType::Enabled);
 
-        assert_eq!(
-            result[2].0,
-            vec!["col2".to_string(), "col3".to_string()]
-        );
+        assert_eq!(result[2].0, vec!["col2".to_string(), "col3".to_string()]);
         assert_eq!(result[2].1, IndexType::Unique);
     }
 
@@ -545,8 +538,7 @@ mod tests {
         ]);
 
         // Empty entries are skipped, only valid entry is parsed
-        let result =
-            parse_indexes_option(";;col1:unique;;", &schema).expect("parse failed");
+        let result = parse_indexes_option(";;col1:unique;;", &schema).expect("parse failed");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, vec!["col1".to_string()]);
     }
@@ -572,7 +564,7 @@ mod tests {
         ]);
 
         let result = parse_indexes_option("(col1,invalid):unique", &schema);
-        assert!(result.is_err());
+        let _ = result.expect_err("expected error for invalid column");
     }
 
     #[test]
@@ -593,16 +585,12 @@ mod tests {
         ]);
 
         // Whitespace around entries and values should be trimmed
-        let result =
-            parse_indexes_option("  col1 : unique ; ( col1 , col2 ) : enabled  ", &schema)
-                .expect("parse failed");
+        let result = parse_indexes_option("  col1 : unique ; ( col1 , col2 ) : enabled  ", &schema)
+            .expect("parse failed");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, vec!["col1".to_string()]);
         assert_eq!(result[0].1, IndexType::Unique);
-        assert_eq!(
-            result[1].0,
-            vec!["col1".to_string(), "col2".to_string()]
-        );
+        assert_eq!(result[1].0, vec!["col1".to_string(), "col2".to_string()]);
         assert_eq!(result[1].1, IndexType::Enabled);
     }
 
