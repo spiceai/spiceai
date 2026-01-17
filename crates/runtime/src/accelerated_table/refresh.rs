@@ -1005,34 +1005,6 @@ async fn notify_refresh_done(
     metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
 }
 
-/// A notification wrapper that handles "already ready" state.
-/// Subscribers are notified immediately if already ready, otherwise they wait.
-#[derive(Clone)]
-pub struct DatasetReadyNotification {
-    notify: Arc<Notify>,
-    is_ready: Arc<AtomicBool>,
-}
-
-impl DatasetReadyNotification {
-    pub fn new(notify: Arc<Notify>, is_ready: Arc<AtomicBool>) -> Arc<Self> {
-        Arc::new(Self { notify, is_ready })
-    }
-
-    /// Wait until the dataset is ready. Returns immediately if already ready.
-    pub async fn wait(&self) {
-        // IMPORTANT: Create the future FIRST, before checking the condition.
-        // This ensures we'll catch any notification that happens after this point.
-        let notified = self.notify.notified();
-
-        if self.is_ready.load(Ordering::Acquire) {
-            return;
-        }
-
-        // Any notify_waiters() call that happened after we created `notified` will wake us up.
-        notified.await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use arrow::{
