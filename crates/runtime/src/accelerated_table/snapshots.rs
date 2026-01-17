@@ -127,6 +127,7 @@ pub fn spawn_snapshot_interval_task(
 ///
 /// If `runtime_status` is provided, batch counting will only start after the dataset
 /// is ready. This prevents counting batches during the initial load/bootstrap phase.
+#[expect(clippy::too_many_arguments)]
 pub fn create_periodic_snapshot_callback(
     batches: i64,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
