@@ -224,7 +224,7 @@ impl TextToSqlWorker {
     }
 }
 
-/// Computes the schema similarity between two Arrow schemas using Intersection over Union (IoU).
+/// Computes the schema similarity between two Arrow schemas using Intersection over Union (`IoU`).
 fn schema_similarity(a: Option<&Schema>, b: Option<&Schema>) -> f64 {
     match (a, b) {
         (Some(schema_a), Some(schema_b)) => {

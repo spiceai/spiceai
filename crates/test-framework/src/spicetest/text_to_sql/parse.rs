@@ -375,10 +375,7 @@ fn extract_columns_from_expr(
             extract_columns_from_expr(left, projections, default_table, alias_map);
             extract_columns_from_expr(right, projections, default_table, alias_map);
         }
-        Expr::UnaryOp { expr: e, .. } => {
-            extract_columns_from_expr(e, projections, default_table, alias_map);
-        }
-        Expr::Nested(e) => {
+        Expr::UnaryOp { expr: e, .. } | Expr::Nested(e) | Expr::Cast { expr: e, .. } => {
             extract_columns_from_expr(e, projections, default_table, alias_map);
         }
         Expr::Function(f) => {
@@ -411,9 +408,6 @@ fn extract_columns_from_expr(
             if let Some(e) = else_result {
                 extract_columns_from_expr(e, projections, default_table, alias_map);
             }
-        }
-        Expr::Cast { expr: e, .. } => {
-            extract_columns_from_expr(e, projections, default_table, alias_map);
         }
         Expr::Subquery(q) => {
             // Subqueries have their own scope, don't pass default_table or alias_map
