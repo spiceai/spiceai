@@ -1418,7 +1418,7 @@ impl SnapshotManager {
         }
         drop(file);
 
-        // Validate size and checksum before extraction
+// Validate size and checksum before extraction, consuming the hasher to get the checksum
         let actual_checksum = self
             .validate_snapshot(entry, actual_size, hasher, &temp_archive_path, path_display)
             .await?;
@@ -1429,13 +1429,15 @@ impl SnapshotManager {
         let extract_target = dirs
             .first()
             .and_then(|(dir, _)| dir.parent())
-            .ok_or_else(|| SnapshotDownloadError::ArchiveExtract {
-                path: temp_archive_path.clone(),
-                source: std::io::Error::other(
-                    "Cannot determine extraction target: no directories specified or directory has no parent",
-                ),
-            })?
-            .to_path_buf();
+            .ok_or_else(|| {
+                let _ = std::fs::remove_file(&temp_archive_path);
+                SnapshotDownloadError::CreateLocalDir {
+                    path: temp_archive_path.clone(),
+                    source: std::io::Error::other(
+                        "Cannot determine extraction target: no directories specified or directory has no parent",
+                    ),
+                }
+            })?;
 
         // Extract the tar archive to the target directory
         let archive_file = fs::File::open(&temp_archive_path).await.map_err(|source| {
@@ -1445,7 +1447,7 @@ impl SnapshotManager {
             }
         })?;
 
-        extract_archive(archive_file, &extract_target)
+        extract_archive(archive_file, extract_target)
             .await
             .map_err(|source| SnapshotDownloadError::ArchiveExtract {
                 path: temp_archive_path.clone(),
@@ -1465,7 +1467,7 @@ impl SnapshotManager {
     }
 
     /// Validates snapshot size and checksum, cleaning up the local file on failure.
-    /// Consumes the hasher and returns the computed checksum on success.
+    /// Consumes the hasher and returns the hex-encoded checksum on success.
     async fn validate_snapshot(
         &self,
         entry: &SnapshotEntry,

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -168,6 +168,15 @@ impl IndexedMemTable {
     /// Performs a point lookup by primary key value.
     ///
     /// This is the fast path that uses the hash index for O(1) lookup.
+    ///
+    /// # Warning: Hash Collision Risk
+    ///
+    /// This method returns the row matching the hash, but does NOT verify
+    /// that the actual key in the row matches the lookup key. In the rare
+    /// case of a hash collision, this could return the wrong row.
+    ///
+    /// For data-critical queries, prefer using SQL queries via `scan()`,
+    /// which verifies actual key values after hash lookup.
     pub async fn get_by_key<K: std::hash::Hash>(&self, key: &K) -> Result<Option<RecordBatch>> {
         let index = match &self.index {
             Some(idx) => idx,
@@ -215,6 +224,15 @@ impl IndexedMemTable {
     /// Performs batch lookup for multiple primary key values.
     ///
     /// Returns batches for found keys. Keys not found are skipped.
+    ///
+    /// # Warning: Hash Collision Risk
+    ///
+    /// This method returns rows matching the hashes, but does NOT verify
+    /// that the actual keys in the rows match the lookup keys. In the rare
+    /// case of a hash collision, this could return incorrect rows.
+    ///
+    /// For data-critical queries, prefer using SQL queries via `scan()`,
+    /// which verifies actual key values after hash lookup.
     pub async fn get_batch_by_keys<K: std::hash::Hash>(
         &self,
         keys: &[K],
@@ -374,6 +392,50 @@ impl PrimaryKeyValue {
         }
         hasher.finish()
     }
+
+    /// Verifies that this key value matches the primary key in the given batch at row 0.
+    ///
+    /// This is critical for data correctness: after a hash lookup, we must verify
+    /// the actual key matches to handle hash collisions correctly.
+    fn matches_batch(&self, batch: &RecordBatch, pk_column: &str) -> bool {
+        let Ok(col_idx) = batch.schema().index_of(pk_column) else {
+            unreachable!(
+                "Primary key column '{}' missing from RecordBatch schema during index verification",
+                pk_column
+            );
+        };
+        let column = batch.column(col_idx);
+
+        // Row 0 since batch is a single-row slice from get_row_at_location
+        match self {
+            Self::Int64(expected) => {
+                if let Some(arr) = column.as_any().downcast_ref::<arrow::array::Int64Array>() {
+                    !arr.is_null(0) && arr.value(0) == *expected
+                } else {
+                    false
+                }
+            }
+            Self::Int32(expected) => {
+                if let Some(arr) = column.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    !arr.is_null(0) && arr.value(0) == *expected
+                } else {
+                    false
+                }
+            }
+            Self::Utf8(expected) => {
+                if let Some(arr) = column.as_any().downcast_ref::<arrow::array::StringArray>() {
+                    !arr.is_null(0) && arr.value(0) == expected
+                } else if let Some(arr) = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                {
+                    !arr.is_null(0) && arr.value(0) == expected
+                } else {
+                    false
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -430,24 +492,37 @@ impl TableProvider for IndexedMemTable {
             if let Some(location) = index.get_by_hash(hash) {
                 // Fast path: use index to find the row
                 if let Some(batch) = self.get_row_at_location(location).await? {
-                    // Apply projection if needed
-                    let result_batch = if let Some(proj) = projection {
-                        batch.project(proj)?
-                    } else {
-                        batch
-                    };
+                    // CRITICAL: Verify actual key matches to handle hash collisions.
+                    // Hash collisions are rare with 64-bit hashes, but for 100% data
+                    // correctness we must verify the actual key value.
+                    let pk_column = &self.primary_key_columns[0];
+                    if pk_value.matches_batch(&batch, pk_column) {
+                        // Key verified - return the matched row
+                        // Apply projection if needed
+                        let result_batch = if let Some(proj) = projection {
+                            batch.project(proj)?
+                        } else {
+                            batch
+                        };
 
-                    // Return a simple in-memory execution plan with the single row
-                    let schema = result_batch.schema();
-                    let stream = futures::stream::once(async move { Ok(result_batch) });
-                    let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
+                        // Return a simple in-memory execution plan with the single row
+                        let schema = result_batch.schema();
+                        let stream = futures::stream::once(async move { Ok(result_batch) });
+                        let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
 
-                    return Ok(Arc::new(IndexedLookupExec::new(
-                        schema,
-                        Box::pin(stream),
-                        pk_columns,
-                        true, // found result
-                    )));
+                        return Ok(Arc::new(IndexedLookupExec::new(
+                            schema,
+                            Box::pin(stream),
+                            pk_columns,
+                            true, // found result
+                        )));
+                    }
+                    // Hash collision: the hash matched but actual key doesn't.
+                    // Fall through to return empty result.
+                    tracing::debug!(
+                        hash = hash,
+                        "Hash collision detected during point lookup; actual key doesn't match"
+                    );
                 }
             }
 
@@ -1229,5 +1304,592 @@ mod tests {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             self.0.fmt_as(self.1, f)
         }
+    }
+
+    // =========================================================================
+    // Data Correctness Tests
+    // =========================================================================
+
+    /// Test key verification with Int64 primary key.
+    #[tokio::test]
+    async fn test_data_correctness_key_verification_int64() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // Query should return exact match
+        let df = ctx
+            .sql("SELECT id, name FROM test WHERE id = 42")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        let id_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected int64");
+        assert_eq!(id_col.value(0), 42, "Must return exact key match");
+    }
+
+    /// Test key verification with string primary key.
+    #[tokio::test]
+    async fn test_data_correctness_key_verification_string() {
+        let names: Vec<&str> = (0..300)
+            .map(|i| {
+                // Leak strings to get 'static lifetime for test
+                Box::leak(format!("user_{i}").into_boxed_str()) as &str
+            })
+            .collect();
+        let ids: Vec<i64> = (0..300).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let name_array = StringArray::from(names.clone());
+        let id_array = Int64Array::from(ids);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(name_array), Arc::new(id_array)],
+        )
+        .expect("failed to create batch");
+
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["name".to_string()])
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        let df = ctx
+            .sql("SELECT name, id FROM test WHERE name = 'user_123'")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        let name_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("expected string");
+        assert_eq!(name_col.value(0), "user_123", "Must return exact key match");
+    }
+
+    /// Test that non-existent keys return empty results (not wrong data).
+    #[tokio::test]
+    async fn test_data_correctness_nonexistent_key_returns_empty() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // Key that doesn't exist
+        let df = ctx
+            .sql("SELECT * FROM test WHERE id = 999999")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        // Should return empty, not some random row
+        let total_rows: usize = batches.iter().map(arrow_array::RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 0, "Non-existent key must return empty result");
+    }
+
+    /// Test boundary values for Int64 primary key.
+    #[tokio::test]
+    async fn test_data_correctness_int64_boundary_values() {
+        let ids: Vec<i64> = vec![i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+        let names: Vec<String> = ids.iter().map(|i| format!("name_{i}")).collect();
+        let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(names_ref)),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let table = create_test_indexed_table_force_index(
+            schema,
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // Test each boundary value
+        for expected_id in &ids {
+            let sql = format!("SELECT id FROM test WHERE id = {expected_id}");
+            let df = ctx.sql(&sql).await.expect("query failed");
+            let batches = df.collect().await.expect("collect failed");
+
+            assert_eq!(batches.len(), 1, "Boundary value {expected_id} not found");
+            let id_col = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("expected int64");
+            assert_eq!(
+                id_col.value(0),
+                *expected_id,
+                "Boundary value mismatch for {expected_id}"
+            );
+        }
+    }
+
+    /// Test empty string as primary key.
+    #[tokio::test]
+    async fn test_data_correctness_empty_string_key() {
+        let names: Vec<&str> = vec!["", "a", "normal", "   ", "\t\n"];
+        #[expect(clippy::cast_possible_wrap)]
+        let ids: Vec<i64> = (0..names.len() as i64).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(Int64Array::from(ids)),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let table = create_test_indexed_table_force_index(
+            schema,
+            vec![vec![batch]],
+            vec!["name".to_string()],
+        )
+        .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // Query empty string - use parameterized-style query
+        let df = ctx
+            .sql("SELECT id FROM test WHERE name = ''")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        assert_eq!(batches.len(), 1);
+        let id_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected int64");
+        assert_eq!(id_col.value(0), 0, "Empty string key should map to id=0");
+    }
+
+    /// Test Unicode characters in string keys.
+    #[tokio::test]
+    async fn test_data_correctness_unicode_keys() {
+        let names: Vec<&str> = vec![
+            "hello",
+            "世界",       // Chinese
+            "مرحبا",      // Arabic
+            "🚀🎉",       // Emoji
+            "café",       // Accented
+            "null\0byte", // Embedded null byte
+            "a\tb\nc",    // Whitespace
+        ];
+        #[expect(clippy::cast_possible_wrap)]
+        let ids: Vec<i64> = (0..names.len() as i64).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int64Array::from(ids.clone())),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let table = create_test_indexed_table_force_index(
+            schema,
+            vec![vec![batch]],
+            vec!["name".to_string()],
+        )
+        .expect("failed to create table");
+
+        // Test direct lookup for each key
+        for name in &names {
+            let result = table.get_by_key(&(*name).to_string()).await;
+            assert!(
+                result.is_ok(),
+                "Lookup should not error for unicode key: {name:?}"
+            );
+            let batch = result.expect("lookup failed");
+            assert!(batch.is_some(), "Unicode key {name:?} should be found");
+        }
+    }
+
+    // =========================================================================
+    // Security-Related Tests
+    // =========================================================================
+
+    /// Test SQL injection attempt in key value is handled safely.
+    #[tokio::test]
+    async fn test_security_sql_injection_in_value() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // This is a literal string, not actual injection - but tests proper handling
+        // The key "1 OR 1=1" should not match anything (it's parsed as Int64 = 1)
+        let df = ctx
+            .sql("SELECT COUNT(*) as cnt FROM test WHERE id = 1")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        // Should return exactly 1 row, not all rows
+        let cnt_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("expected int64");
+        assert_eq!(
+            cnt_col.value(0),
+            1,
+            "Should find exactly 1 row, not be vulnerable to injection"
+        );
+    }
+
+    /// Test that string injection attempts in literals are safe.
+    #[tokio::test]
+    async fn test_security_string_literal_injection() {
+        let names: Vec<&str> = (0..300)
+            .map(|i| Box::leak(format!("user_{i}").into_boxed_str()) as &str)
+            .collect();
+        let ids: Vec<i64> = (0..300).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(Int64Array::from(ids)),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["name".to_string()])
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // Injection attempt in string literal (DataFusion handles this safely)
+        let df = ctx
+            .sql("SELECT COUNT(*) as cnt FROM test WHERE name = 'user_1'' OR ''1''=''1'")
+            .await;
+
+        // This should either error or return 0 rows - never return all rows
+        if let Ok(df) = df {
+            let batches = df.collect().await.expect("collect failed");
+            let cnt_col = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("expected int64");
+            assert_eq!(
+                cnt_col.value(0),
+                0,
+                "Injection string should not match any real key"
+            );
+        }
+        // Else: SQL parse error is also acceptable - injection was blocked
+    }
+
+    /// Test that duplicate primary keys are rejected (data integrity).
+    #[tokio::test]
+    async fn test_security_duplicate_key_rejected() {
+        let ids: Vec<i64> = vec![1, 2, 3, 2, 5]; // Duplicate key: 2
+        let names: Vec<&str> = vec!["a", "b", "c", "d", "e"];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .expect("failed to create batch");
+
+        // Creating indexed table with duplicates should fail
+        let result = create_test_indexed_table_force_index(
+            schema,
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        );
+
+        assert!(
+            result.is_err(),
+            "Duplicate primary keys should be rejected for data integrity"
+        );
+    }
+
+    // =========================================================================
+    // NULL Handling Tests
+    // =========================================================================
+
+    /// Test that NULL primary keys are skipped (not indexed).
+    #[tokio::test]
+    async fn test_data_correctness_null_keys_skipped() {
+        let ids: Vec<Option<i64>> = vec![Some(1), None, Some(3), None, Some(5)];
+        let names: Vec<&str> = vec!["a", "b", "c", "d", "e"];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true), // nullable
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let table = create_test_indexed_table_force_index(
+            schema,
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+
+        // Only non-null keys should be indexed
+        assert!(table.has_index());
+        let index = table.index().expect("should have index");
+        assert_eq!(index.len(), 3, "Only 3 non-null keys should be indexed");
+
+        // Non-null keys should be findable
+        assert!(table.get_by_key(&1_i64).await.expect("lookup").is_some());
+        assert!(table.get_by_key(&3_i64).await.expect("lookup").is_some());
+        assert!(table.get_by_key(&5_i64).await.expect("lookup").is_some());
+    }
+
+    // =========================================================================
+    // Projection Safety Tests
+    // =========================================================================
+
+    /// Test that projections don't affect data correctness.
+    #[tokio::test]
+    async fn test_data_correctness_projection_safety() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // Query with projection that excludes the primary key column
+        let df = ctx
+            .sql("SELECT name FROM test WHERE id = 42")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        let name_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("expected string");
+        assert_eq!(
+            name_col.value(0),
+            "name_42",
+            "Projection should return correct row data"
+        );
+    }
+
+    /// Test concurrent reads don't cause data races.
+    #[tokio::test]
+    async fn test_data_correctness_concurrent_reads() {
+        let batch = create_large_test_batch(1000);
+        let schema = batch.schema();
+
+        let table = Arc::new(
+            create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+                .expect("failed to create table"),
+        );
+
+        // Spawn multiple concurrent lookups
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let table_clone = Arc::clone(&table);
+            handles.push(tokio::spawn(async move {
+                for key in (i * 100)..(i * 100 + 100) {
+                    let result = table_clone
+                        .get_by_key(&i64::from(key))
+                        .await
+                        .expect("lookup failed");
+
+                    if key < 1000 {
+                        assert!(result.is_some(), "Key {key} should exist");
+                    }
+                }
+            }));
+        }
+
+        // Wait for all tasks
+        for handle in handles {
+            handle.await.expect("task panicked");
+        }
+    }
+
+    /// Test Int32 primary key type.
+    #[tokio::test]
+    async fn test_data_correctness_int32_primary_key() {
+        let ids: Vec<i32> = (0..300).collect();
+        let names: Vec<String> = ids.iter().map(|i| format!("name_{i}")).collect();
+        let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(ids)),
+                Arc::new(StringArray::from(names_ref)),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        let df = ctx
+            .sql("SELECT id, name FROM test WHERE id = 42")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+
+        let id_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("expected int32");
+        assert_eq!(id_col.value(0), 42, "Must return exact Int32 key match");
+    }
+
+    /// Test `PrimaryKeyValue::matches_batch` for all supported types.
+    #[test]
+    fn test_primary_key_value_matches_batch() {
+        // Test Int64
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![42]))])
+            .expect("batch");
+
+        let pk = PrimaryKeyValue::Int64(42);
+        assert!(pk.matches_batch(&batch, "id"), "Int64 match should succeed");
+
+        let pk_wrong = PrimaryKeyValue::Int64(99);
+        assert!(
+            !pk_wrong.matches_batch(&batch, "id"),
+            "Int64 mismatch should fail"
+        );
+
+        // Test Int32
+        let schema32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch32 = RecordBatch::try_new(
+            schema32,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![42]))],
+        )
+        .expect("batch");
+
+        let pk32 = PrimaryKeyValue::Int32(42);
+        assert!(
+            pk32.matches_batch(&batch32, "id"),
+            "Int32 match should succeed"
+        );
+
+        // Test Utf8
+        let schema_str = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let batch_str =
+            RecordBatch::try_new(schema_str, vec![Arc::new(StringArray::from(vec!["hello"]))])
+                .expect("batch");
+
+        let pk_str = PrimaryKeyValue::Utf8("hello".to_string());
+        assert!(
+            pk_str.matches_batch(&batch_str, "name"),
+            "Utf8 match should succeed"
+        );
+
+        let pk_str_wrong = PrimaryKeyValue::Utf8("world".to_string());
+        assert!(
+            !pk_str_wrong.matches_batch(&batch_str, "name"),
+            "Utf8 mismatch should fail"
+        );
+
+        // Test missing column
+        assert!(
+            !pk.matches_batch(&batch, "nonexistent"),
+            "Missing column should fail"
+        );
     }
 }

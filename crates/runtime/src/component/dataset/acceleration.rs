@@ -414,6 +414,12 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                  Add 'hash_index: enabled' to use primary_key for fast lookups. Note, hash_index is experimental in Arrow acceleration."
             );
         }
+        // Warn when hash_index is enabled that it's experimental
+        if engine == Engine::Arrow && hash_index_enabled {
+            tracing::warn!(
+                "hash_index is enabled for Arrow engine acceleration. Note: hash_index is experimental and may have breaking changes in future releases."
+            );
+        }
         if engine == Engine::Arrow && !on_conflict.is_empty() {
             tracing::warn!(
                 "Conflict resolution is not supported for Arrow engine acceleration. Ignoring on_conflict."
