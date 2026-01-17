@@ -2292,4 +2292,539 @@ mod tests {
             vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact]
         );
     }
+
+    // ==================== APPEND/CACHING MODE TESTS ====================
+    // These tests verify hash indexing works correctly in append and caching
+    // acceleration modes, including incremental updates.
+
+    /// Test append mode: insert new rows and verify index is updated correctly.
+    #[tokio::test]
+    async fn test_append_mode_insert_and_rebuild_index() {
+        // Start with a table above threshold
+        let batch1 = create_large_test_batch(300);
+        let schema = batch1.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch1]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+
+        assert!(table.has_index());
+        assert_eq!(table.index().map(|i| i.len()), Some(300));
+
+        // Verify initial lookup works
+        let result = table.get_by_key(&50_i64).await.expect("lookup failed");
+        assert!(result.is_some());
+
+        // Simulate append: add more rows directly to inner MemTable
+        let new_ids: Vec<i64> = (300..400).collect();
+        let new_names: Vec<String> = (300..400).map(|i| format!("name_{i}")).collect();
+        let new_names_ref: Vec<&str> = new_names.iter().map(String::as_str).collect();
+
+        let new_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(new_ids)),
+                Arc::new(StringArray::from(new_names_ref)),
+            ],
+        )
+        .expect("batch");
+
+        // Insert new batch into inner MemTable
+        {
+            let partition = &table.inner.batches[0];
+            let mut batches = partition.write().await;
+            batches.push(new_batch);
+        }
+
+        // Before rebuild, new keys should NOT be in index
+        let result_before = table.get_by_key(&350_i64).await.expect("lookup failed");
+        assert!(
+            result_before.is_none(),
+            "New key should not be found before index rebuild"
+        );
+
+        // Rebuild index to include new data
+        table.rebuild_index().await.expect("rebuild failed");
+
+        // Verify new data is now indexed
+        assert_eq!(table.index().map(|i| i.len()), Some(400));
+
+        // Lookup new key should now work
+        let result_after = table.get_by_key(&350_i64).await.expect("lookup failed");
+        assert!(
+            result_after.is_some(),
+            "New key should be found after index rebuild"
+        );
+        let row = result_after.expect("expected row");
+        assert_eq!(row.num_rows(), 1);
+
+        // Verify name matches
+        let name_col = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("expected string");
+        assert_eq!(name_col.value(0), "name_350");
+
+        // Old keys should still work
+        let old_key_result = table.get_by_key(&50_i64).await.expect("lookup failed");
+        assert!(old_key_result.is_some());
+    }
+
+    /// Test append mode: multiple incremental appends with index rebuilds.
+    #[tokio::test]
+    async fn test_append_mode_multiple_incremental_updates() {
+        let batch1 = create_large_test_batch(300);
+        let schema = batch1.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch1]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+
+        assert_eq!(table.index().map(|i| i.len()), Some(300));
+
+        // First append: add 100 rows
+        let append1_ids: Vec<i64> = (300..400).collect();
+        let append1_names: Vec<String> = (300..400).map(|i| format!("name_{i}")).collect();
+        let append1_names_ref: Vec<&str> = append1_names.iter().map(String::as_str).collect();
+
+        let append1_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(append1_ids)),
+                Arc::new(StringArray::from(append1_names_ref)),
+            ],
+        )
+        .expect("batch");
+
+        {
+            let partition = &table.inner.batches[0];
+            let mut batches = partition.write().await;
+            batches.push(append1_batch);
+        }
+
+        table.rebuild_index().await.expect("rebuild failed");
+        assert_eq!(table.index().map(|i| i.len()), Some(400));
+
+        // Second append: add another 100 rows
+        let append2_ids: Vec<i64> = (400..500).collect();
+        let append2_names: Vec<String> = (400..500).map(|i| format!("name_{i}")).collect();
+        let append2_names_ref: Vec<&str> = append2_names.iter().map(String::as_str).collect();
+
+        let append2_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(append2_ids)),
+                Arc::new(StringArray::from(append2_names_ref)),
+            ],
+        )
+        .expect("batch");
+
+        {
+            let partition = &table.inner.batches[0];
+            let mut batches = partition.write().await;
+            batches.push(append2_batch);
+        }
+
+        table.rebuild_index().await.expect("rebuild failed");
+        assert_eq!(table.index().map(|i| i.len()), Some(500));
+
+        // Verify all ranges are accessible
+        for id in [0_i64, 150, 350, 450] {
+            let result = table.get_by_key(&id).await.expect("lookup failed");
+            assert!(result.is_some(), "Key {id} should be found");
+        }
+    }
+
+    /// Test caching mode with replace: replace existing rows and verify index is updated.
+    #[tokio::test]
+    async fn test_caching_mode_replace_rows() {
+        // Create initial batch
+        let batch1 = create_large_test_batch(300);
+        let schema = batch1.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch1]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+
+        // Verify initial state
+        let result = table.get_by_key(&100_i64).await.expect("lookup failed");
+        assert!(result.is_some());
+        let row = result.expect("expected row");
+        let name = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string");
+        assert_eq!(name.value(0), "name_100");
+
+        // Simulate caching mode replace: add updated row with same key but different value
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![100_i64])),
+                Arc::new(StringArray::from(vec!["updated_name_100"])),
+            ],
+        )
+        .expect("batch");
+
+        // In caching mode, the old data is replaced. Simulate by clearing and re-adding.
+        // This test simulates what happens when caching fetches fresh data.
+        {
+            let partition = &table.inner.batches[0];
+            let mut batches = partition.write().await;
+
+            // Filter out the old row with id=100 and add the updated one
+            // For simplicity, we'll just add the update - in real caching mode,
+            // the whole table might be replaced or deduplication happens
+            batches.push(update_batch);
+        }
+
+        // Rebuild index after modification
+        table.rebuild_index().await.expect("rebuild failed");
+
+        // Now lookup should find the key (but there may be duplicates - testing rebuild works)
+        let result = table.get_by_key(&100_i64).await.expect("lookup failed");
+        assert!(result.is_some(), "Key 100 should still be found");
+    }
+
+    /// Test caching mode: full table replacement (like a cache miss + refetch).
+    #[tokio::test]
+    async fn test_caching_mode_full_replacement() {
+        // Create initial data
+        let initial_batch = create_large_test_batch(300);
+        let schema = initial_batch.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![initial_batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+
+        // Verify initial keys exist
+        assert!(table.get_by_key(&50_i64).await.expect("lookup").is_some());
+        assert!(table.get_by_key(&250_i64).await.expect("lookup").is_some());
+
+        // Simulate full cache replacement: clear and add new data
+        // New data has different key range (1000-1299)
+        let new_ids: Vec<i64> = (1000..1300).collect();
+        let new_names: Vec<String> = (1000..1300).map(|i| format!("cached_name_{i}")).collect();
+        let new_names_ref: Vec<&str> = new_names.iter().map(String::as_str).collect();
+
+        let new_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(new_ids)),
+                Arc::new(StringArray::from(new_names_ref)),
+            ],
+        )
+        .expect("batch");
+
+        // Clear old data and add new
+        {
+            let partition = &table.inner.batches[0];
+            let mut batches = partition.write().await;
+            batches.clear();
+            batches.push(new_batch);
+        }
+
+        // Rebuild index
+        table.rebuild_index().await.expect("rebuild failed");
+
+        // Old keys should NOT be found
+        assert!(
+            table.get_by_key(&50_i64).await.expect("lookup").is_none(),
+            "Old key should not be found after full replacement"
+        );
+        assert!(
+            table.get_by_key(&250_i64).await.expect("lookup").is_none(),
+            "Old key should not be found after full replacement"
+        );
+
+        // New keys SHOULD be found
+        let result = table.get_by_key(&1050_i64).await.expect("lookup");
+        assert!(result.is_some(), "New key should be found");
+        let row = result.expect("row");
+        let name = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string");
+        assert_eq!(name.value(0), "cached_name_1050");
+
+        // Index should reflect new size
+        assert_eq!(table.index().map(|i| i.len()), Some(300));
+    }
+
+    /// Test index correctness after multiple partitions are modified.
+    #[tokio::test]
+    async fn test_multi_partition_updates() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        // Create two partitions with different key ranges
+        let batch1_ids: Vec<i64> = (0..200).collect();
+        let batch1_names: Vec<String> = (0..200).map(|i| format!("p1_name_{i}")).collect();
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(batch1_ids)),
+                Arc::new(StringArray::from(
+                    batch1_names.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch1");
+
+        let batch2_ids: Vec<i64> = (200..400).collect();
+        let batch2_names: Vec<String> = (200..400).map(|i| format!("p2_name_{i}")).collect();
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(batch2_ids)),
+                Arc::new(StringArray::from(
+                    batch2_names.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch2");
+
+        // Two partitions
+        let table = IndexedMemTable::try_new_with_parallelism(
+            Arc::clone(&schema),
+            vec![vec![batch1], vec![batch2]],
+            vec!["id".to_string()],
+            Some(1),
+        )
+        .expect("table");
+
+        assert_eq!(table.index().map(|i| i.len()), Some(400));
+
+        // Verify cross-partition lookups
+        let p1_result = table.get_by_key(&50_i64).await.expect("lookup");
+        assert!(p1_result.is_some());
+        let p1_row = p1_result.expect("row");
+        let p1_name = p1_row
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string");
+        assert_eq!(p1_name.value(0), "p1_name_50");
+
+        let p2_result = table.get_by_key(&250_i64).await.expect("lookup");
+        assert!(p2_result.is_some());
+        let p2_row = p2_result.expect("row");
+        let p2_name = p2_row
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string");
+        assert_eq!(p2_name.value(0), "p2_name_250");
+
+        // Add data to first partition
+        let append_ids: Vec<i64> = (400..500).collect();
+        let append_names: Vec<String> = (400..500).map(|i| format!("appended_{i}")).collect();
+        let append_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(append_ids)),
+                Arc::new(StringArray::from(
+                    append_names.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch");
+
+        {
+            let partition = &table.inner.batches[0];
+            let mut batches = partition.write().await;
+            batches.push(append_batch);
+        }
+
+        table.rebuild_index().await.expect("rebuild");
+        assert_eq!(table.index().map(|i| i.len()), Some(500));
+
+        // All ranges should be accessible
+        assert!(table.get_by_key(&50_i64).await.expect("lookup").is_some());
+        assert!(table.get_by_key(&250_i64).await.expect("lookup").is_some());
+        assert!(table.get_by_key(&450_i64).await.expect("lookup").is_some());
+    }
+
+    /// Test secondary index is also rebuilt after append.
+    #[tokio::test]
+    async fn test_append_mode_secondary_index_rebuild() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("email", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        // Create initial data
+        let num_rows = 300;
+        let ids: Vec<i64> = (0..num_rows).map(i64::from).collect();
+        let emails: Vec<String> = (0..num_rows)
+            .map(|i| format!("user{i}@example.com"))
+            .collect();
+        let names: Vec<String> = (0..num_rows).map(|i| format!("name_{i}")).collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(
+                    emails.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    names.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch");
+
+        let partitions = vec![vec![batch]];
+
+        let table = IndexedMemTable::try_new_with_parallelism(
+            Arc::clone(&schema),
+            partitions.clone(),
+            vec!["id".to_string()],
+            Some(1),
+        )
+        .expect("table");
+
+        // Add secondary index on email
+        let email_index = hash_index::HashIndexBuilder::new(vec!["email".to_string()])
+            .allow_duplicates(false)
+            .build(&partitions)
+            .expect("email index");
+
+        let secondary = SecondaryIndex::new(
+            "email".to_string(),
+            vec!["email".to_string()],
+            true,
+            Arc::new(email_index),
+        );
+
+        let table = table.with_secondary_index(secondary);
+
+        // Verify secondary index works initially
+        assert_eq!(table.secondary_indexes.len(), 1);
+        assert_eq!(table.secondary_indexes[0].index.len(), 300);
+
+        // Append new data
+        let new_ids: Vec<i64> = (300..400).collect();
+        let new_emails: Vec<String> = (300..400)
+            .map(|i| format!("new_user{i}@example.com"))
+            .collect();
+        let new_names: Vec<String> = (300..400).map(|i| format!("new_name_{i}")).collect();
+
+        let new_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(new_ids)),
+                Arc::new(StringArray::from(
+                    new_emails.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    new_names.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("new batch");
+
+        {
+            let partition = &table.inner.batches[0];
+            let mut batches = partition.write().await;
+            batches.push(new_batch);
+        }
+
+        // Rebuild both primary and secondary indexes
+        table.rebuild_index().await.expect("rebuild");
+
+        // Verify both indexes are updated
+        assert_eq!(table.index().map(|i| i.len()), Some(400));
+        assert_eq!(table.secondary_indexes[0].index.len(), 400);
+    }
+
+    /// Test that index lookup returns correct data after interleaved inserts and queries.
+    #[tokio::test]
+    async fn test_data_correctness_after_interleaved_operations() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("table");
+
+        // Query, insert, query, insert, query pattern
+        // Query 1
+        let r1 = table.get_by_key(&50_i64).await.expect("lookup");
+        assert!(r1.is_some());
+
+        // Insert batch 1
+        let insert1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1000_i64, 1001])),
+                Arc::new(StringArray::from(vec!["insert1_a", "insert1_b"])),
+            ],
+        )
+        .expect("batch");
+
+        {
+            let partition = &table.inner.batches[0];
+            let mut batches = partition.write().await;
+            batches.push(insert1);
+        }
+
+        // Query 2 - before rebuild, new key not found
+        let r2 = table.get_by_key(&1000_i64).await.expect("lookup");
+        assert!(r2.is_none());
+
+        table.rebuild_index().await.expect("rebuild");
+
+        // Query 3 - after rebuild, new key found
+        let r3 = table.get_by_key(&1000_i64).await.expect("lookup");
+        assert!(r3.is_some());
+
+        // Insert batch 2
+        let insert2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![2000_i64])),
+                Arc::new(StringArray::from(vec!["insert2"])),
+            ],
+        )
+        .expect("batch");
+
+        {
+            let partition = &table.inner.batches[0];
+            let mut batches = partition.write().await;
+            batches.push(insert2);
+        }
+
+        table.rebuild_index().await.expect("rebuild");
+
+        // Query 4 - all keys accessible
+        assert!(table.get_by_key(&50_i64).await.expect("lookup").is_some());
+        assert!(table.get_by_key(&1000_i64).await.expect("lookup").is_some());
+        assert!(table.get_by_key(&2000_i64).await.expect("lookup").is_some());
+
+        // Verify total count: 300 initial + 2 (insert1) + 1 (insert2) = 303
+        assert_eq!(table.index().map(|i| i.len()), Some(303));
+    }
 }

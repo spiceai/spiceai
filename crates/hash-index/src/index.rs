@@ -33,6 +33,7 @@ limitations under the License.
 
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use arrow::array::RecordBatch;
 use parking_lot::RwLock;
@@ -237,11 +238,25 @@ impl HashIndexBuilder {
     }
 
     fn build_internal(self, partitions: &[Vec<RecordBatch>]) -> Result<HashIndex> {
+        let start_time = Instant::now();
+
         let total_rows: usize = partitions
             .iter()
             .flat_map(|p| p.iter())
             .map(RecordBatch::num_rows)
             .sum();
+
+        let num_partitions = partitions.len();
+        let num_batches: usize = partitions.iter().map(Vec::len).sum();
+        let key_columns_display = self.key_columns.join(", ");
+
+        tracing::info!(
+            rows = total_rows,
+            partitions = num_partitions,
+            batches = num_batches,
+            key_columns = %key_columns_display,
+            "Building hash index"
+        );
 
         let capacity = self.expected_rows.max(total_rows).max(1024);
         let per_shard = (capacity / NUM_SHARDS).max(16);
@@ -261,6 +276,17 @@ impl HashIndexBuilder {
             key_columns: self.key_columns.clone(),
             bloom,
         };
+
+        // Progress tracking for large indexes
+        let progress_interval = if total_rows > 1_000_000 {
+            total_rows / 10 // Log every 10%
+        } else if total_rows > 100_000 {
+            total_rows / 5 // Log every 20%
+        } else {
+            usize::MAX // Don't log progress for small tables
+        };
+        let mut rows_processed: usize = 0;
+        let mut last_progress_log: usize = 0;
 
         // Insert all entries
         for (partition_idx, partition) in partitions.iter().enumerate() {
@@ -312,8 +338,76 @@ impl HashIndexBuilder {
                             }
                         }
                     }
+
+                    rows_processed += 1;
+                }
+
+                // Log progress for large indexes
+                if rows_processed - last_progress_log >= progress_interval {
+                    let percent = (rows_processed * 100) / total_rows;
+                    let elapsed = start_time.elapsed();
+                    // Cast precision loss is acceptable for logging display purposes
+                    #[expect(clippy::cast_precision_loss)]
+                    let rows_per_sec_f64 = if elapsed.as_secs_f64() > 0.0 {
+                        rows_processed as f64 / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    // Truncation/sign loss acceptable: rows/sec won't exceed u64::MAX
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let rows_per_sec = rows_per_sec_f64 as u64;
+                    tracing::info!(
+                        progress_percent = percent,
+                        rows_indexed = rows_processed,
+                        rows_per_sec = rows_per_sec,
+                        "Hash index build progress"
+                    );
+                    last_progress_log = rows_processed;
                 }
             }
+        }
+
+        let elapsed = start_time.elapsed();
+        let indexed_entries = index.len();
+        // Cast precision loss is acceptable for logging display purposes
+        #[expect(clippy::cast_precision_loss)]
+        let rows_per_sec_f64 = if elapsed.as_secs_f64() > 0.0 {
+            indexed_entries as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        // Truncation/sign loss acceptable: rows/sec won't exceed u64::MAX
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rows_per_sec = rows_per_sec_f64 as u64;
+
+        // Estimate memory usage: each shard has slots, each slot is 16 bytes (hash + location)
+        let memory_bytes = index.memory_usage_bytes();
+        #[expect(clippy::cast_precision_loss)]
+        let memory_mb = memory_bytes as f64 / 1_048_576.0;
+
+        // Truncation/sign loss acceptable: elapsed_ms won't exceed u64::MAX for practical builds
+        #[expect(clippy::cast_possible_truncation)]
+        let elapsed_ms = elapsed.as_millis() as u64;
+
+        tracing::info!(
+            entries = indexed_entries,
+            elapsed_ms = elapsed_ms,
+            rows_per_sec = rows_per_sec,
+            memory_bytes = memory_bytes,
+            memory_mb = format!("{memory_mb:.2}"),
+            bloom_filter = self.use_bloom_filter,
+            "Hash index build complete"
+        );
+
+        // Record OTel metrics when the metrics feature is enabled
+        #[cfg(feature = "metrics")]
+        {
+            let dimensions = &[];
+            telemetry::track_hash_index_build(dimensions);
+            telemetry::track_hash_index_build_duration(elapsed, dimensions);
+            // usize to u64 never truncates on 64-bit, and widens safely on 32-bit
+            telemetry::track_hash_index_entries(indexed_entries as u64, dimensions);
+            telemetry::track_hash_index_memory_bytes(memory_bytes as u64, dimensions);
         }
 
         Ok(index)
@@ -380,6 +474,10 @@ impl Shard {
         let mut table = self.table.write();
         table.slots.fill(Slot::default());
         table.len = 0;
+    }
+
+    fn capacity(&self) -> usize {
+        self.table.read().slots.len()
     }
 }
 
@@ -717,6 +815,32 @@ impl HashIndex {
             self.len.fetch_sub(1, Ordering::Relaxed);
         }
         result
+    }
+
+    /// Returns the estimated memory usage in bytes.
+    ///
+    /// This includes the hash table slots across all shards and the bloom filter
+    /// if enabled. The actual memory usage may be slightly higher due to allocator
+    /// overhead and struct padding.
+    #[must_use]
+    pub fn memory_usage_bytes(&self) -> usize {
+        // Each slot is 16 bytes (8 byte hash + 8 byte RowLocation which packs into 8 bytes)
+        const SLOT_SIZE: usize = 16;
+
+        let mut total: usize = 0;
+
+        // Sum up all shard capacities
+        for shard in self.shards.iter() {
+            total += shard.capacity() * SLOT_SIZE;
+        }
+
+        // Add bloom filter memory if present
+        if let Some(bloom) = &self.bloom {
+            // Bloom filter uses 1 bit per entry, roughly
+            total += bloom.read().memory_usage_bytes();
+        }
+
+        total
     }
 
     /// Clears all entries.
