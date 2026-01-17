@@ -16,7 +16,7 @@ clap.workspace = true
 datafusion.workspace = true
 flight_client = { path = "../flight_client" }
 futures.workspace = true
-llms = { path = "../llms" }
+llms = { path = "../llms", default-features = false }
 prost.workspace = true
 reqwest.workspace = true
 rustyline = { version = "17.0.1", features = [
