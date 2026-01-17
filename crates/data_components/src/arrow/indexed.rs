@@ -666,13 +666,15 @@ impl TableProvider for IndexedMemTable {
         if let Some((secondary, key_value)) = self.find_secondary_index_match(filters) {
             // Only use indexed lookup for unique secondary indexes
             // Non-unique indexes would need multi-value support which hash-index doesn't provide yet
-            if secondary.unique {
+            // Also verify this is a single-column index since verification below only checks first column
+            if secondary.unique && secondary.columns.len() == 1 {
                 let hash = key_value.hash();
                 let index_columns = secondary.columns.clone();
 
                 if let Some(location) = secondary.index.get_by_hash(hash) {
                     if let Some(batch) = self.get_row_at_location(location).await? {
                         // Verify the actual key matches (handle hash collisions)
+                        // SAFETY: We already verified secondary.columns.len() == 1 above
                         let index_column = &secondary.columns[0];
                         if key_value.matches_batch(&batch, index_column) {
                             let result_batch = if let Some(proj) = projection {

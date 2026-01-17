@@ -278,8 +278,10 @@ impl HashIndexBuilder {
         };
 
         // Progress tracking for large indexes
+        // Use a max threshold (1M rows) to ensure more frequent updates for extremely large indexes
         let progress_interval = if total_rows > 1_000_000 {
-            total_rows / 10 // Log every 10%
+            // Log every 10% or 1M rows, whichever is smaller
+            (total_rows / 10).min(1_000_000)
         } else if total_rows > 100_000 {
             total_rows / 5 // Log every 20%
         } else {
@@ -325,16 +327,22 @@ impl HashIndexBuilder {
                                 let existing_key_bytes =
                                     existing_extractor.key_bytes(existing_loc.row as usize);
 
-                                if current_key_bytes == existing_key_bytes {
-                                    // Same key bytes = true duplicate key
-                                    return Err(crate::Error::DuplicateKey);
+                                // Note: Null keys are filtered at line 301-303 (Skip null keys),
+                                // so key_bytes() should never return None here. If it does,
+                                // treat it as a hash collision (different keys) to be safe.
+                                match (current_key_bytes, existing_key_bytes) {
+                                    (Some(current), Some(existing)) if current == existing => {
+                                        // Same key bytes = true duplicate key
+                                        return Err(crate::Error::DuplicateKey);
+                                    }
+                                    _ => {
+                                        // Different key bytes (or null) = hash collision.
+                                        // Per DATA CORRECTNESS principles: lookups must never fail to find
+                                        // existing data. Since our hash table doesn't support chaining,
+                                        // we must fail the index build rather than silently drop keys.
+                                        return Err(crate::Error::HashCollision { hash });
+                                    }
                                 }
-
-                                // Different key bytes = hash collision (different keys, same hash).
-                                // Per DATA CORRECTNESS principles: lookups must never fail to find
-                                // existing data. Since our hash table doesn't support chaining,
-                                // we must fail the index build rather than silently drop keys.
-                                return Err(crate::Error::HashCollision { hash });
                             }
                         }
                     }
