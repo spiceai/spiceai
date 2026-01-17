@@ -498,7 +498,7 @@ impl DataAccelerator for TursoAccelerator {
                 }
             }
 
-            let was_bootstrapped = download_snapshot_if_needed(
+            let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
                 runtime_acceleration::snapshot::SnapshotAdapter::file(PathBuf::from(path)),
@@ -510,7 +510,7 @@ impl DataAccelerator for TursoAccelerator {
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
 
-            return Ok(was_bootstrapped);
+            return Ok(bootstrap_status);
         }
 
         Ok(BootstrapStatus::none())

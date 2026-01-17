@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
@@ -241,6 +243,9 @@ pub struct AcceleratedTable {
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: caching::InFlightRevalidations,
+    /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
+    /// `None` if no insert has occurred yet (and no bootstrap timestamp was provided).
+    last_updated_at: Option<Arc<AtomicI64>>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -627,6 +632,12 @@ impl Builder {
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
+        // Initialize from bootstrap metadata if available, otherwise None.
+        let last_updated_at: Option<Arc<AtomicI64>> = self
+            .bootstrap_status
+            .last_updated_at()
+            .map(|ts| Arc::new(AtomicI64::new(ts)));
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -638,12 +649,13 @@ impl Builder {
             self.io_runtime.clone(),
             Arc::clone(&accelerator_write_mutex),
         );
+        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
-        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
+        refresher.with_last_updated_at(last_updated_at.clone());
         refresher.with_metrics(self.metrics);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
@@ -755,6 +767,7 @@ impl Builder {
             io_runtime: self.io_runtime,
             accelerator_write_mutex,
             in_flight_revalidations,
+            last_updated_at,
         })
     }
 }
@@ -1028,12 +1041,22 @@ impl TableProvider for AcceleratedTable {
         Ok(Arc::new(SchemaCastScanExec::new(plan, self.schema())))
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     async fn insert_into(
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Update last_updated_at timestamp
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        if let Some(ref last_updated_at) = self.last_updated_at {
+            last_updated_at.store(now_ms, Ordering::Release);
+        }
+
         // When on_conflict is configured, writes go only to the accelerator
         // (the federated source may not support writes, e.g., file connector).
         if self.write_to_accelerator_only {

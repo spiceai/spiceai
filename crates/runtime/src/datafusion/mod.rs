@@ -813,7 +813,7 @@ impl DataFusion {
             sink_connector,
             federated_table,
             Arc::clone(&pending_registration.secrets),
-            BootstrapStatus::None, // Sink datasets don't bootstrap from snapshots
+            BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
         )
         .await?;
 
@@ -2119,8 +2119,8 @@ async fn build_snapshot_creation_config(
     refresh_mode: RefreshMode,
     snapshot_adapter: SnapshotAdapter,
 ) -> Result<Option<SnapshotCreationConfig>> {
-    let is_batch_refresh = matches!(refresh_mode, RefreshMode::Full)
-        || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_some());
+    let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
+        || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
     let snapshot_threshold: Option<String> =
         acceleration_settings.snapshots_trigger_threshold.clone();
@@ -2158,20 +2158,7 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    let snapshot_creation_trigger = if is_batch_refresh {
-        match snapshot_trigger {
-            None | Some(SnapshotsTrigger::RefreshComplete) => {
-                SnapshotCreateTrigger::RefreshComplete
-            }
-            Some(SnapshotsTrigger::TimeInterval) => {
-                let interval = parse_interval(&snapshot_threshold)?;
-                SnapshotCreateTrigger::Interval(interval)
-            }
-            Some(SnapshotsTrigger::StreamBatches) => {
-                return Err(Error::UnsupportedStreamBatchesForBatchRefresh);
-            }
-        }
-    } else {
+    let snapshot_creation_trigger = if is_streaming_refresh {
         match snapshot_trigger {
             None | Some(SnapshotsTrigger::TimeInterval) => {
                 let interval = parse_interval(&snapshot_threshold)?;
@@ -2183,6 +2170,19 @@ async fn build_snapshot_creation_config(
             Some(SnapshotsTrigger::StreamBatches) => {
                 let batches = parse_batches(&snapshot_threshold)?;
                 SnapshotCreateTrigger::Batches(batches)
+            }
+        }
+    } else {
+        match snapshot_trigger {
+            None | Some(SnapshotsTrigger::RefreshComplete) => {
+                SnapshotCreateTrigger::RefreshComplete
+            }
+            Some(SnapshotsTrigger::TimeInterval) => {
+                let interval = parse_interval(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Interval(interval)
+            }
+            Some(SnapshotsTrigger::StreamBatches) => {
+                return Err(Error::UnsupportedStreamBatchesForBatchRefresh);
             }
         }
     };
@@ -2210,7 +2210,10 @@ async fn build_snapshot_creation_config(
         acceleration_engine,
     )
     .await
-    .map(|sm| SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)))
+    .map(|sm| {
+        let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
+        SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
+    }))
 }
 
 #[cfg(test)]
