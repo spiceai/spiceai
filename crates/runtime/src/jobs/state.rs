@@ -101,7 +101,7 @@ pub struct JobSchema {
 /// Manifest describing the complete result set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobResultManifest {
-    /// Data format (always "ARROW_IPC" for now)
+    /// Data format (always `ARROW_IPC` for now)
     pub format: String,
     /// Result schema
     pub schema: JobSchema,
@@ -199,7 +199,9 @@ impl JobState {
         self.status = JobStatus::Succeeded;
         self.result = Some(result);
         self.completed_at_ms = Some(now);
-        self.expires_at_ms = Some(now.saturating_add(result_ttl.as_millis() as u64));
+        // Saturate at u64::MAX for extremely large TTLs (effectively never expires)
+        let ttl_ms = u64::try_from(result_ttl.as_millis()).unwrap_or(u64::MAX);
+        self.expires_at_ms = Some(now.saturating_add(ttl_ms));
     }
 
     /// Transitions job to failed state with error.
@@ -236,8 +238,13 @@ impl JobState {
 }
 
 fn now_ms_or_zero() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+        Err(e) => {
+            // This should only happen if system time is before Unix epoch,
+            // which indicates a misconfigured system clock
+            tracing::warn!(error = %e, "System time is before Unix epoch, using 0 for timestamp");
+            0
+        }
+    }
 }

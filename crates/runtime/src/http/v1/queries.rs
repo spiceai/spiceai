@@ -17,13 +17,13 @@ limitations under the License.
 //! HTTP API endpoints for async SQL queries.
 //!
 //! Async query API:
-//! - POST /v1/queries - Submit a new query for async execution
-//! - GET /v1/queries/{query_id} - Get query status and first result chunk
-//! - GET /v1/queries/{query_id}/status - Get query status only
-//! - GET /v1/queries/{query_id}/results - Get full results (with pagination)
-//! - GET /v1/queries/{query_id}/results/chunks/{chunk_index} - Get a specific result chunk
-//! - POST /v1/queries/{query_id}/cancel - Cancel a running query
-//! - GET /v1/queries - List all queries
+//! - `POST /v1/queries` - Submit a new query for async execution
+//! - `GET /v1/queries/{query_id}` - Get query status and first result chunk
+//! - `GET /v1/queries/{query_id}/status` - Get query status only
+//! - `GET /v1/queries/{query_id}/results` - Get full results (with pagination)
+//! - `GET /v1/queries/{query_id}/results/chunks/{chunk_index}` - Get a specific result chunk
+//! - `POST /v1/queries/{query_id}/cancel` - Cancel a running query
+//! - `GET /v1/queries` - List all queries
 
 use std::sync::Arc;
 
@@ -33,9 +33,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
-use crate::jobs::{JobExecutor, JobState, JobStatus};
+use crate::jobs::{DEFAULT_CHUNK_SIZE, JobExecutor, JobState, JobStatus};
 
 /// Request body for submitting a new query.
 #[derive(Debug, Deserialize)]
@@ -49,11 +50,11 @@ pub struct SubmitQueryRequest {
     /// Optional timeout for sync wait (0 = fully async). In seconds.
     /// If > 0, the server will wait up to this long for results before returning.
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub timeout_seconds: Option<u64>,
     /// Optional target dataset or namespace.
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub dataset: Option<String>,
 }
 
@@ -123,7 +124,7 @@ pub struct SchemaResponse {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ManifestResponse {
-    /// Data format (ARROW_IPC).
+    /// Data format (`ARROW_IPC`).
     pub format: String,
     /// Result schema.
     pub schema: SchemaResponse,
@@ -191,7 +192,7 @@ pub struct ListQueriesQuery {
     pub status: Option<String>,
     /// Maximum number of results.
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub limit: Option<usize>,
 }
 
@@ -261,7 +262,7 @@ pub(crate) async fn submit(
             };
             (StatusCode::ACCEPTED, Json(response)).into_response()
         }
-        Err(e) => error_to_response(e),
+        Err(e) => error_to_response(&e),
     }
 }
 
@@ -291,18 +292,17 @@ pub(crate) async fn get_query(
             let mut response = job_state_to_response(&state);
 
             // If succeeded, include first chunk data
-            if state.status == JobStatus::Succeeded {
-                if let Ok(batches) = executor.get_chunk(&query_id, 0).await {
-                    if let Some(result) = &state.result {
-                        let first_chunk = build_chunk_response(&query_id, 0, &batches, result);
-                        response.result = Some(first_chunk);
-                    }
-                }
+            if state.status == JobStatus::Succeeded
+                && let (Ok(batches), Some(result)) =
+                    (executor.get_chunk(&query_id, 0).await, &state.result)
+            {
+                let first_chunk = build_chunk_response(&query_id, 0, &batches, result);
+                response.result = Some(first_chunk);
             }
 
             (StatusCode::OK, Json(response)).into_response()
         }
-        Err(e) => error_to_response(e),
+        Err(e) => error_to_response(&e),
     }
 }
 
@@ -341,7 +341,7 @@ pub(crate) async fn get_status(
 
             (StatusCode::OK, Json(status_response)).into_response()
         }
-        Err(e) => error_to_response(e),
+        Err(e) => error_to_response(&e),
     }
 }
 
@@ -374,13 +374,16 @@ pub(crate) async fn get_results(
     // First check the job state
     let state = match executor.get_status(&query_id).await {
         Ok(s) => s,
-        Err(e) => return error_to_response(e),
+        Err(e) => return error_to_response(&e),
     };
 
     if state.status != JobStatus::Succeeded {
-        // Use 425 Too Early for not yet complete
+        // HTTP 425 Too Early - query results not yet available
+        // Safety: 425 is a valid HTTP status code (RFC 8470)
+        #[expect(clippy::unwrap_used)]
+        let too_early = StatusCode::from_u16(425).unwrap();
         return (
-            StatusCode::from_u16(425).unwrap_or(StatusCode::CONFLICT),
+            too_early,
             Json(serde_json::json!({
                 "error": format!("Query not yet complete (status: {})", state.status),
                 "status": state.status.to_string()
@@ -405,7 +408,7 @@ pub(crate) async fn get_results(
                     .into_response()
             }
         }
-        Err(e) => error_to_response(e),
+        Err(e) => error_to_response(&e),
     }
 }
 
@@ -417,7 +420,7 @@ pub struct ResultsQueryParams {
     pub partition: Option<usize>,
     /// Result format (json, csv, arrow).
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub format: Option<String>,
 }
 
@@ -445,7 +448,7 @@ pub(crate) async fn get_chunk(
     // First check the job state to get manifest
     let state = match executor.get_status(&query_id).await {
         Ok(s) => s,
-        Err(e) => return error_to_response(e),
+        Err(e) => return error_to_response(&e),
     };
 
     if state.status != JobStatus::Succeeded {
@@ -474,7 +477,7 @@ pub(crate) async fn get_chunk(
                     .into_response()
             }
         }
-        Err(e) => error_to_response(e),
+        Err(e) => error_to_response(&e),
     }
 }
 
@@ -504,7 +507,7 @@ pub(crate) async fn cancel(
             let response = job_state_to_response(&state);
             (StatusCode::OK, Json(response)).into_response()
         }
-        Err(e) => error_to_response(e),
+        Err(e) => error_to_response(&e),
     }
 }
 
@@ -524,11 +527,11 @@ pub(crate) async fn cancel(
     )
 ))]
 pub(crate) async fn list(
-    Extension(_executor): Extension<Arc<JobExecutor>>,
+    Extension(executor): Extension<Arc<JobExecutor>>,
     Query(query): Query<ListQueriesQuery>,
 ) -> Response {
     // Parse status filter
-    let _status_filter = query.status.and_then(|s| match s.to_lowercase().as_str() {
+    let status_filter = query.status.and_then(|s| match s.to_lowercase().as_str() {
         "queued" | "pending" => Some(JobStatus::Pending),
         "running" => Some(JobStatus::Running),
         "completed" | "succeeded" => Some(JobStatus::Succeeded),
@@ -538,14 +541,35 @@ pub(crate) async fn list(
         _ => None,
     });
 
-    // For listing, we need access to the job store directly
-    // For now, return empty list as we need to add list functionality to executor
-    let response = ListQueriesResponse {
-        queries: vec![],
-        total_count: 0,
-    };
+    match executor.list_jobs(status_filter).await {
+        Ok(jobs) => {
+            let queries: Vec<QuerySummary> = jobs
+                .into_iter()
+                .take(query.limit.unwrap_or(100))
+                .map(|job| {
+                    let sql_preview = if job.sql.len() > 100 {
+                        format!("{}...", &job.sql[..97])
+                    } else {
+                        job.sql.clone()
+                    };
+                    QuerySummary {
+                        query_id: job.job_id,
+                        state: job.status.to_string(),
+                        sql_preview,
+                        created_at: ms_to_iso8601(job.created_at_ms),
+                    }
+                })
+                .collect();
 
-    (StatusCode::OK, Json(response)).into_response()
+            let total_count = queries.len();
+            let response = ListQueriesResponse {
+                queries,
+                total_count,
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => error_to_response(&e),
+    }
 }
 
 fn job_state_to_response(state: &JobState) -> QueryResponse {
@@ -599,10 +623,13 @@ fn build_chunk_response(
     job_result: &crate::jobs::JobResult,
 ) -> ChunkResponse {
     // Calculate row count and offset
-    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let row_count: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
 
-    // Calculate row offset based on chunk index (approximate)
-    let row_offset = chunk_index.saturating_mul(10_000); // Using default chunk size
+    // Calculate row offset based on chunk index (approximate using default chunk size)
+    let row_offset = chunk_index.saturating_mul(DEFAULT_CHUNK_SIZE);
 
     // Determine next chunk info
     let (next_chunk_index, next_chunk_url) =
@@ -611,8 +638,7 @@ fn build_chunk_response(
             (
                 Some(next_idx),
                 Some(format!(
-                    "/api/v1/queries/{}/results/chunks/{}",
-                    query_id, next_idx
+                    "/api/v1/queries/{query_id}/results/chunks/{next_idx}"
                 )),
             )
         } else {
@@ -639,34 +665,36 @@ fn batches_to_json(batches: &[arrow::array::RecordBatch]) -> Vec<serde_json::Val
         let buf = Vec::new();
         let mut writer = arrow_json::ArrayWriter::new(buf);
 
-        if writer.write(batch).is_ok() && writer.finish().is_ok() {
-            if let Ok(json_str) = String::from_utf8(writer.into_inner()) {
-                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                    result.extend(arr);
-                }
-            }
+        // Skip batches that fail to serialize - continue processing remaining batches
+        if writer.write(batch).is_err() || writer.finish().is_err() {
+            continue;
         }
+
+        let Ok(json_str) = String::from_utf8(writer.into_inner()) else {
+            continue;
+        };
+
+        let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) else {
+            continue;
+        };
+
+        result.extend(arr);
     }
 
     result
 }
 
-fn error_to_response(error: crate::jobs::Error) -> Response {
+fn error_to_response(error: &crate::jobs::Error) -> Response {
     use crate::jobs::Error;
 
-    match &error {
-        Error::JobNotFound { .. } => (
+    match error {
+        Error::JobNotFound { .. } | Error::ChunkNotFound { .. } => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": error.to_string()})),
         )
             .into_response(),
         Error::JobResultsExpired { .. } => (
             StatusCode::GONE,
-            Json(serde_json::json!({"error": error.to_string()})),
-        )
-            .into_response(),
-        Error::ChunkNotFound { .. } => (
-            StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": error.to_string()})),
         )
             .into_response(),
@@ -688,67 +716,17 @@ fn error_to_response(error: crate::jobs::Error) -> Response {
     }
 }
 
+/// Converts a Unix timestamp in milliseconds to ISO 8601 format.
 fn ms_to_iso8601(ms: u64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
+    // Convert milliseconds to seconds and nanoseconds for chrono
+    // The casts are safe: secs < 2^63 for reasonable timestamps (until year 292M+)
+    // nanos < 1_000_000_000 which fits in u32
+    #[expect(clippy::cast_possible_wrap)]
+    let secs = (ms / 1000) as i64;
+    #[expect(clippy::cast_possible_truncation)]
+    let nanos = ((ms % 1000) * 1_000_000) as u32;
 
-    let duration = Duration::from_millis(ms);
-    let datetime = UNIX_EPOCH + duration;
-
-    // Format as ISO 8601
-    let secs = datetime
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let days_since_epoch = secs / 86400;
-    let remaining_secs = secs % 86400;
-    let hours = remaining_secs / 3600;
-    let minutes = (remaining_secs % 3600) / 60;
-    let seconds = remaining_secs % 60;
-
-    // Calculate year, month, day from days since epoch (1970-01-01)
-    let (year, month, day) = days_to_ymd(days_since_epoch);
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hours, minutes, seconds
-    )
-}
-
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Simplified calendar calculation
-    let mut remaining_days = days;
-    let mut year = 1970u64;
-
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
-
-    let leap = is_leap_year(year);
-    let days_in_months: [u64; 12] = if leap {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut month = 1u64;
-    for days_in_month in days_in_months {
-        if remaining_days < days_in_month {
-            break;
-        }
-        remaining_days -= days_in_month;
-        month += 1;
-    }
-
-    let day = remaining_days + 1;
-    (year, month, day)
-}
-
-fn is_leap_year(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    DateTime::from_timestamp(secs, nanos)
+        .unwrap_or_default()
+        .to_rfc3339()
 }

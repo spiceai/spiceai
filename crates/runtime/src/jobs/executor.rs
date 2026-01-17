@@ -34,7 +34,7 @@ use super::store::JobStore;
 pub struct JobExecutor {
     job_store: Arc<JobStore>,
     df: Arc<DataFusion>,
-    /// Tracks active job cancellation tokens by job_id
+    /// Tracks active job cancellation tokens by `job_id`
     active_jobs: Arc<RwLock<std::collections::HashMap<String, CancellationToken>>>,
 }
 
@@ -135,6 +135,11 @@ impl JobExecutor {
         self.job_store.read_chunk(job_id, chunk_index).await
     }
 
+    /// Lists all jobs, optionally filtered by status.
+    pub async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
+        self.job_store.list_jobs(status_filter).await
+    }
+
     async fn execute_job(
         job_store: &JobStore,
         df: Arc<DataFusion>,
@@ -151,8 +156,8 @@ impl JobExecutor {
         }
 
         // Parse parameters if present
-        let params: Option<ParamValues> = if let Some(p) = &state.parameters {
-            match crate::datafusion::param_utils::convert_json_to_param_values(p.clone()) {
+        let params: Option<ParamValues> = if let Some(p) = state.parameters {
+            match crate::datafusion::param_utils::convert_json_to_param_values(p) {
                 Ok(params) => Some(params),
                 Err(e) => {
                     job_store
@@ -226,6 +231,11 @@ impl JobExecutor {
 }
 
 /// Categorizes an error message into an error code.
+///
+/// This is a best-effort categorization based on string matching of error messages.
+/// It may not correctly categorize all `DataFusion` errors, especially if error messages
+/// change between versions or if SQL queries contain keywords like 'timeout' in comments.
+/// The categorization is intended for informational purposes in API responses.
 fn categorize_error(message: &str) -> &'static str {
     let lower = message.to_lowercase();
 

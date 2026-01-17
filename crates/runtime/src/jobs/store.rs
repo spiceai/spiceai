@@ -168,7 +168,7 @@ impl JobStore {
 
     /// Writes result chunks for a completed job.
     ///
-    /// Takes an iterator of RecordBatches and writes them as Arrow IPC chunks.
+    /// Takes an iterator of `RecordBatch`es and writes them as Arrow IPC chunks.
     /// Returns the job result manifest.
     pub async fn write_result_chunks(
         &self,
@@ -239,7 +239,7 @@ impl JobStore {
             .enumerate()
             .map(|(i, field)| ColumnSchema {
                 name: field.name().clone(),
-                type_name: format!("{:?}", field.data_type()),
+                type_name: field.data_type().to_string(),
                 type_precision: None, // TODO: extract from decimal types
                 type_scale: None,
                 nullable: field.is_nullable(),
@@ -315,7 +315,10 @@ impl JobStore {
         let cursor = std::io::Cursor::new(bytes.as_ref());
         let reader = StreamReader::try_new(cursor, None).context(DeserializeChunkSnafu)?;
 
-        let batches: Vec<RecordBatch> = reader.filter_map(|r| r.ok()).collect();
+        // Collect all batches, propagating any errors that occur
+        let batches: Vec<RecordBatch> = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context(DeserializeChunkSnafu)?;
 
         Ok(batches)
     }
@@ -377,7 +380,10 @@ impl JobStore {
             let meta = entry.context(ObjectStoreReadSnafu)?;
 
             // Only process .json files (job state, not chunks)
-            if !meta.location.as_ref().ends_with(".json") {
+            if !std::path::Path::new(meta.location.as_ref())
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
                 continue;
             }
 
@@ -395,10 +401,8 @@ impl JobStore {
             };
 
             // Apply status filter
-            if let Some(filter) = status_filter {
-                if state.status != filter {
-                    continue;
-                }
+            if status_filter.is_some_and(|filter| state.status != filter) {
+                continue;
             }
 
             // Skip expired jobs
@@ -422,35 +426,32 @@ impl JobStore {
         let mut deleted_count = 0usize;
 
         while let Some(entry) = stream.next().await {
-            let meta = match entry {
-                Ok(m) => m,
-                Err(_) => continue,
+            let Ok(meta) = entry else {
+                continue;
             };
 
             // Only process .json files
-            if !meta.location.as_ref().ends_with(".json") {
+            if !std::path::Path::new(meta.location.as_ref())
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
                 continue;
             }
 
-            let result = match self.store.get(&meta.location).await {
-                Ok(r) => r,
-                Err(_) => continue,
+            let Ok(result) = self.store.get(&meta.location).await else {
+                continue;
             };
 
-            let bytes = match result.bytes().await {
-                Ok(b) => b,
-                Err(_) => continue,
+            let Ok(bytes) = result.bytes().await else {
+                continue;
             };
 
-            let state: JobState = match serde_json::from_slice(&bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
+            let Ok(state) = serde_json::from_slice::<JobState>(&bytes) else {
+                continue;
             };
 
-            if state.is_expired() {
-                if self.delete_job(&state.job_id).await.is_ok() {
-                    deleted_count = deleted_count.saturating_add(1);
-                }
+            if state.is_expired() && self.delete_job(&state.job_id).await.is_ok() {
+                deleted_count = deleted_count.saturating_add(1);
             }
         }
 
