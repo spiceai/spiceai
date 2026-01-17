@@ -780,6 +780,7 @@ impl CacheRefreshHelper {
     ///   when the upstream source returns an error instead of propagating the error.
     /// * `expired_batches` - The expired cached data to serve if `stale_if_error` is enabled and
     ///   the source returns an error.
+    /// * `io_runtime` - Tokio runtime handle for spawning background write tasks.
     /// * `accelerator_write_mutex` - Mutex to protect concurrent access to the accelerator.
     /// * `synchronized_children` - Child accelerators that should also receive the cached data.
     #[expect(clippy::too_many_arguments)]
@@ -793,6 +794,7 @@ impl CacheRefreshHelper {
         is_expired: bool,
         stale_if_error: bool,
         expired_batches: Option<Vec<RecordBatch>>,
+        io_runtime: &Handle,
         accelerator_write_mutex: Arc<Mutex<()>>,
         synchronized_children: SynchronizedChildren,
     ) -> SendableRecordBatchStream {
@@ -806,49 +808,67 @@ impl CacheRefreshHelper {
                     dataset_name
                 );
 
-                // Acquire the mutex to protect accelerator operations
-                let lock_guard = accelerator_write_mutex.lock().await;
-
-                // Store in accelerator for future queries
-                let store_result = if is_expired {
-                    // Data exists but is expired - upsert (remove matching rows, add new)
-                    tracing::debug!("Upserting expired cache entry for dataset={dataset_name}");
-                    Self::upsert_into_accelerator(
-                        &accelerator,
-                        dataset_name,
-                        filters,
-                        batches.clone(),
-                    )
-                    .await
-                } else {
-                    // No data exists - insert (append)
-                    tracing::debug!("Inserting new cache entry for dataset={dataset_name}");
-                    Self::insert_into_accelerator(&accelerator, dataset_name, batches.clone()).await
-                };
-
-                drop(lock_guard); // Release the mutex
-
-                if let Err(e) = store_result {
-                    tracing::warn!(
-                        "Failed to store fetched data in accelerator for dataset {}: {}",
-                        dataset_name,
-                        e
-                    );
-                }
-
-                // Propagate to synchronized children (localpod caching)
-                Self::propagate_to_synchronized_children(
-                    &synchronized_children,
-                    dataset_name,
-                    filters,
-                    &batches,
-                    is_expired,
-                )
-                .await;
-
-                // Use the schema from the fetched batches, not from the accelerator scan
+                // Use the schema from the fetched batches
                 let batch_schema = batches[0].schema();
-                tracing::debug!("Fetched batch schema:\n{}", SchemaDisplay(&batch_schema));
+                tracing::trace!("Fetched batch schema:\n{}", SchemaDisplay(&batch_schema));
+
+                // Clone batches for background write task.
+                // RecordBatch::clone() is cheap - only clones Arc pointers, not the underlying data.
+                let batches_for_write = batches.clone();
+                let accelerator_clone = Arc::clone(&accelerator);
+                let dataset_name_clone = dataset_name.to_string();
+                let filters_clone: Vec<Expr> = filters.to_vec();
+                let synchronized_children_clone = Arc::clone(&synchronized_children);
+
+                // Spawn background task to write to accelerator (don't block user response)
+                io_runtime.spawn(async move {
+                    // Acquire the mutex to protect accelerator operations
+                    let lock_guard = accelerator_write_mutex.lock().await;
+
+                    // Store in accelerator for future queries
+                    let store_result = if is_expired {
+                        // Data exists but is expired - upsert (remove matching rows, add new)
+                        tracing::debug!("Upserting expired cache entry for dataset={dataset_name_clone}");
+                        Self::upsert_into_accelerator(
+                            &accelerator_clone,
+                            &dataset_name_clone,
+                            &filters_clone,
+                            batches_for_write.clone(),
+                        )
+                        .await
+                    } else {
+                        // No data exists - insert (append)
+                        tracing::debug!("Inserting new cache entry for dataset={dataset_name_clone}");
+                        Self::insert_into_accelerator(&accelerator_clone, &dataset_name_clone, batches_for_write.clone()).await
+                    };
+
+                    drop(lock_guard); // Release the mutex
+
+                    if let Err(e) = store_result {
+                        tracing::warn!(
+                            "Failed to store fetched data in accelerator for dataset {}: {}",
+                            dataset_name_clone,
+                            e
+                        );
+                    }
+
+                    // Propagate to synchronized children (localpod caching)
+                    Self::propagate_to_synchronized_children(
+                        &synchronized_children_clone,
+                        &dataset_name_clone,
+                        &filters_clone,
+                        &batches_for_write,
+                        is_expired,
+                    )
+                    .await;
+
+                    tracing::debug!(
+                        "Background cache write completed for dataset={dataset_name_clone}, {} rows",
+                        total_rows
+                    );
+                });
+
+                // Return data to user immediately (don't wait for background write)
                 let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
                 let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
                 Box::pin(adapter)
@@ -1266,6 +1286,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             true, // is_expired = true, will upsert
                             stale_if_error,
                             expired_batches,
+                            &io_runtime,
                             Arc::clone(&accelerator_write_mutex),
                             Arc::clone(&synchronized_children),
                         )
@@ -1303,6 +1324,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     false, // is_expired = false, will insert (append)
                     false, // stale_if_error = false, no expired data to fall back to
                     None,  // no expired batches
+                    &io_runtime,
                     accelerator_write_mutex,
                     synchronized_children,
                 )
