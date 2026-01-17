@@ -63,7 +63,7 @@ use axum::{
     http::{HeaderValue, Method, Request},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{Router, delete, get, post},
+    routing::{Router, get, post},
 };
 use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
@@ -217,18 +217,6 @@ pub(crate) fn routes(
         .route(
             "/v1/datasets/{name}/acceleration",
             patch(v1::datasets::acceleration),
-        )
-        .route(
-            "/v1/datasets/{name}/acceleration/snapshots",
-            get(v1::snapshots::list),
-        )
-        .route(
-            "/v1/datasets/{name}/acceleration/snapshots/{snapshot_id}",
-            get(v1::snapshots::get),
-        )
-        .route(
-            "/v1/datasets/{name}/acceleration/snapshots/current",
-            post(v1::snapshots::set_current),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route("/v1/packages/generate", post(v1::packages::generate));
