@@ -75,7 +75,10 @@ impl DigestMany {
         }
     }
 
-    fn make_scalar_function_args(args: Vec<ColumnarValue>, return_field: FieldRef) -> ScalarFunctionArgs {
+    fn make_scalar_function_args(
+        args: Vec<ColumnarValue>,
+        return_field: FieldRef,
+    ) -> ScalarFunctionArgs {
         ScalarFunctionArgs {
             args,
             number_rows: 1,
