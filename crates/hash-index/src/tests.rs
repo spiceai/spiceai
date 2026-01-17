@@ -1743,9 +1743,13 @@ fn test_zero_hash_normalization_consistency() {
     let loc2 = RowLocation::new(0, 0, 2);
     let inserted = index.insert(1, loc2);
 
-    // Both hash 0 and 1 map to normalized hash 1, so one will succeed and one will fail
-    // (depending on whether we consider them duplicates)
-    // The important thing is that get_by_hash(0) and get_by_hash(1) return the same result
+    // Since both hash 0 and 1 normalize to 1, the second insert should fail as a duplicate
+    assert!(
+        !inserted,
+        "Second insert should fail because hash 0 and 1 both normalize to 1"
+    );
+
+    // Both hash 0 and 1 map to normalized hash 1, so they should return the same result
     let result_0 = index.get_by_hash(0);
     let result_1 = index.get_by_hash(1);
     assert_eq!(

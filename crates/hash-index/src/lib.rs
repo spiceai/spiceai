@@ -91,7 +91,7 @@ pub enum Error {
     #[snafu(display("Duplicate key detected"))]
     DuplicateKey,
 
-    /// Index overflow: partition, batch, or row index exceeds u32::MAX.
+    /// Index overflow: partition, batch, or row index exceeds `u32::MAX`.
     #[snafu(display("Index overflow: {context} index {value} exceeds u32::MAX"))]
     IndexOverflow {
         /// What type of index overflowed (partition, batch, or row).

@@ -277,12 +277,13 @@ impl HashIndexBuilder {
                         continue; // Skip null keys
                     };
 
-                    let partition_u32 = u32::try_from(partition_idx).ok().context(
-                        IndexOverflowSnafu {
-                            context: "partition",
-                            value: partition_idx,
-                        },
-                    )?;
+                    let partition_u32 =
+                        u32::try_from(partition_idx)
+                            .ok()
+                            .context(IndexOverflowSnafu {
+                                context: "partition",
+                                value: partition_idx,
+                            })?;
                     let batch_u32 = u32::try_from(batch_idx).ok().context(IndexOverflowSnafu {
                         context: "batch",
                         value: batch_idx,
@@ -325,21 +326,17 @@ struct ShardTable {
 const EMPTY_SLOT_SENTINEL: u64 = 0;
 
 /// Normalizes a hash value to avoid collision with the empty-slot sentinel.
-/// If the hash equals EMPTY_SLOT_SENTINEL (0), it is mapped to 1.
+/// If the hash equals `EMPTY_SLOT_SENTINEL` (0), it is mapped to 1.
 /// This ensures no valid key can produce a hash that looks like an empty slot.
 #[inline]
 const fn normalize_hash(hash: u64) -> u64 {
-    if hash == EMPTY_SLOT_SENTINEL {
-        1
-    } else {
-        hash
-    }
+    if hash == EMPTY_SLOT_SENTINEL { 1 } else { hash }
 }
 
 /// A slot in the hash table.
 #[derive(Clone, Copy, Default)]
 struct Slot {
-    /// The normalized hash value. EMPTY_SLOT_SENTINEL (0) indicates an empty slot.
+    /// The normalized hash value. `EMPTY_SLOT_SENTINEL` (0) indicates an empty slot.
     /// Any actual hash that equals 0 is remapped to 1 via `normalize_hash()`.
     hash: u64,
     location: RowLocation,
@@ -676,7 +673,6 @@ impl HashIndex {
     /// Checks if index contains hash.
     #[inline]
     pub fn contains(&self, hash: u64) -> bool {
-        // normalize_hash is called inside get_by_hash
         self.get_by_hash(hash).is_some()
     }
 
@@ -750,12 +746,13 @@ impl HashIndex {
                         continue;
                     };
 
-                    let partition_u32 = u32::try_from(partition_idx).ok().context(
-                        IndexOverflowSnafu {
-                            context: "partition",
-                            value: partition_idx,
-                        },
-                    )?;
+                    let partition_u32 =
+                        u32::try_from(partition_idx)
+                            .ok()
+                            .context(IndexOverflowSnafu {
+                                context: "partition",
+                                value: partition_idx,
+                            })?;
                     let batch_u32 = u32::try_from(batch_idx).ok().context(IndexOverflowSnafu {
                         context: "batch",
                         value: batch_idx,
@@ -799,12 +796,13 @@ impl HashIndex {
                         context: "batch_offset",
                         value: batch_offset,
                     })?;
-            let batch_idx = starting_batch_idx
-                .checked_add(batch_offset_u32)
-                .context(IndexOverflowSnafu {
-                    context: "batch",
-                    value: starting_batch_idx as usize + batch_offset,
-                })?;
+            let batch_idx =
+                starting_batch_idx
+                    .checked_add(batch_offset_u32)
+                    .context(IndexOverflowSnafu {
+                        context: "batch",
+                        value: starting_batch_idx as usize + batch_offset,
+                    })?;
 
             for row in 0..extractor.len() {
                 let Some(hash) = extractor.hash_key(row) else {

@@ -54,7 +54,7 @@ pub(crate) fn format_column_data(
 
             let truncated = string_array
                 .iter()
-                .map(|x| trancate_str(x, max_characters))
+                .map(|x| truncate_str(x, max_characters))
                 .collect::<arrow::array::StringViewArray>();
 
             Ok(Arc::new(truncated) as ArrayRef)
@@ -69,7 +69,7 @@ pub(crate) fn format_column_data(
 
             let truncated = string_array
                 .iter()
-                .map(|x| trancate_str(x, max_characters))
+                .map(|x| truncate_str(x, max_characters))
                 .collect::<arrow::array::StringArray>();
 
             Ok(Arc::new(truncated) as ArrayRef)
@@ -173,7 +173,7 @@ fn get_possible_nested_list_datatype(f: &Arc<Field>) -> (DataType, Option<DataTy
 ///
 /// This function correctly handles multi-byte UTF-8 characters (e.g., emoji, CJK)
 /// by truncating at character boundaries rather than byte boundaries.
-fn trancate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
+fn truncate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
     str.map(|value| {
         // Find the byte index of the (max_characters)th character boundary
         // If the string has fewer characters, return the whole string
@@ -498,32 +498,32 @@ mod tests {
 
     use super::*;
 
-    /// Test that truncate_str correctly handles multi-byte UTF-8 strings.
+    /// Test that `truncate_str` correctly handles multi-byte UTF-8 strings.
     /// After the fix, this should truncate by character count, not byte count.
     #[test]
     fn test_truncate_str_multibyte_utf8() {
         // "日本語" is 9 bytes (3 chars × 3 bytes each)
         // Truncating to 2 characters should give us "日本" (6 bytes)
         let input = Some("日本語");
-        let result = trancate_str(input, 2);
+        let result = truncate_str(input, 2);
         assert_eq!(result, Some("日本"));
 
         // Truncating to 5 characters on a 3-char string should return all of it
-        let result = trancate_str(input, 5);
+        let result = truncate_str(input, 5);
         assert_eq!(result, Some("日本語"));
     }
 
-    /// Test that truncate_str correctly handles emoji (4-byte UTF-8 characters).
+    /// Test that `truncate_str` correctly handles emoji (4-byte UTF-8 characters).
     #[test]
     fn test_truncate_str_emoji() {
         // 🎉 is 4 bytes, 🚀 is 4 bytes
         let input = Some("🎉🚀");
         // Truncating to 1 character should give us just the first emoji
-        let result = trancate_str(input, 1);
+        let result = truncate_str(input, 1);
         assert_eq!(result, Some("🎉"));
 
         // Truncating to 2 characters should give us both emojis
-        let result = trancate_str(input, 2);
+        let result = truncate_str(input, 2);
         assert_eq!(result, Some("🎉🚀"));
     }
 
@@ -532,7 +532,7 @@ mod tests {
     fn test_truncate_str_mixed() {
         let input = Some("Hello世界!");
         // 8 characters: H, e, l, l, o, 世, 界, !
-        let result = trancate_str(input, 6);
+        let result = truncate_str(input, 6);
         assert_eq!(result, Some("Hello世"));
     }
 

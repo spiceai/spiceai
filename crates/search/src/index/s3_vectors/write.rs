@@ -535,17 +535,15 @@ fn filter_zero_vectors(
     // Filter in reverse order to avoid index shifting when removing elements
     for i in (0..embeddings.len()).rev() {
         if let Some(embedding) = &embeddings[i]
-            // Check if all values are zero (handles both 0.0 and -0.0)
-            // Also filter out vectors where all values are NaN (invalid embeddings)
-            && (embedding.iter().all(|&x| x == 0.0)
-                || embedding.iter().all(|x| x.is_nan()))
+            // Single pass: check if all values are zero or NaN (both are invalid embeddings)
+            && embedding.iter().all(|&x| x == 0.0 || x.is_nan())
         {
             let key_str = primary_keys
                 .get(i)
                 .and_then(|k| k.as_ref().map(String::as_str))
                 .unwrap_or("unknown");
             tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
+                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values"
             );
 
             embeddings.remove(i);
