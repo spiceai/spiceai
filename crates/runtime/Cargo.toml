@@ -83,7 +83,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-llms = { path = "../llms" }
+llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
 model_components = { path = "../model_components" }
 moka.workspace = true
@@ -274,6 +274,8 @@ models = [
     "dep:strsim",
     "runtime-datafusion-udfs/models",
     "search/llms",
+    "llms/local_llm",
+    "llms/local_embed",
 ]
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
