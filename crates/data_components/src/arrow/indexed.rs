@@ -501,10 +501,10 @@ impl PrimaryKeyValue {
     /// the actual key matches to handle hash collisions correctly.
     fn matches_batch(&self, batch: &RecordBatch, pk_column: &str) -> bool {
         let Ok(col_idx) = batch.schema().index_of(pk_column) else {
-            // Column not found - this should not happen in normal operation
-            // as the column was validated during index creation.
-            // Return false to fail the match safely rather than panic.
-            return false;
+            unreachable!(
+                "Primary key column '{}' missing from RecordBatch schema during index verification",
+                pk_column
+            );
         };
         let column = batch.column(col_idx);
 
