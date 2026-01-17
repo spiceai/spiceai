@@ -359,7 +359,7 @@ delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "923c33ede98429f6b5e9692fa9680ac455708c32" } # spiceai-57
 
-arrow-odbc = { git = "https://github.com/pacman82/arrow-odbc", rev = "7316b13" }
+arrow-odbc = { git = "https://github.com/pacman82/arrow-odbc", rev = "7316b13ac969eea8bef7b496a2ba334ebd4e6e06" }
 
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
