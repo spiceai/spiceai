@@ -44,6 +44,7 @@ limitations under the License.
 pub(crate) mod constants;
 pub(crate) mod context;
 pub(crate) mod delete;
+pub mod deletion_index;
 pub(crate) mod scan;
 pub(crate) mod streaming;
 pub(crate) mod table;

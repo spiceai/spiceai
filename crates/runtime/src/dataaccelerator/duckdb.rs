@@ -387,7 +387,7 @@ impl DataAccelerator for DuckDBAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                PathBuf::from(path),
+                runtime_acceleration::snapshot::SnapshotAdapter::file(PathBuf::from(path)),
                 AccelerationEngine::DuckDB,
             )
             .await;
