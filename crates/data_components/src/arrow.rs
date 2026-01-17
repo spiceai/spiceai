@@ -24,10 +24,12 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use hash_index::HashIndexBuilder;
 use std::sync::Arc;
 
 use crate::delete::DeletionTableProviderAdapter;
 
+use self::indexed::SecondaryIndex;
 use self::write::MemTable;
 
 pub mod indexed;
@@ -68,6 +70,78 @@ fn extract_primary_key_columns(
     Vec::new()
 }
 
+/// Represents an index type from the spicepod configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    /// A standard index that allows duplicates (not fully utilized yet with hash index).
+    Enabled,
+    /// A unique index that enforces uniqueness.
+    Unique,
+}
+
+impl IndexType {
+    fn from_str(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("unique") {
+            Self::Unique
+        } else {
+            Self::Enabled
+        }
+    }
+}
+
+/// Parses the indexes option string into column names and their index types.
+/// Format: "col1:enabled;col2:unique;col3,col4:unique" (compound key with columns col3 and col4)
+fn parse_indexes_option(
+    indexes_str: &str,
+    schema: &arrow::datatypes::Schema,
+) -> DataFusionResult<Vec<(Vec<String>, IndexType)>> {
+    let mut indexes = Vec::new();
+
+    for entry in indexes_str.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = entry.split(':').collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        // Parse column reference - may be compound like "(col1, col2)" or just "col1"
+        let col_part = parts[0].trim();
+        let columns: Vec<String> = if col_part.starts_with('(') && col_part.ends_with(')') {
+            // Compound key: "(col1, col2)"
+            col_part[1..col_part.len() - 1]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            vec![col_part.to_string()]
+        };
+
+        // Validate all columns exist in schema
+        for col in &columns {
+            if schema.field_with_name(col).is_err() {
+                return Err(DataFusionError::Configuration(format!(
+                    "Index column '{col}' not found in schema"
+                )));
+            }
+        }
+
+        let index_type = if parts.len() > 1 {
+            IndexType::from_str(parts[1].trim())
+        } else {
+            IndexType::Enabled
+        };
+
+        indexes.push((columns, index_type));
+    }
+
+    Ok(indexes)
+}
+
 #[async_trait]
 impl TableProviderFactory for ArrowFactory {
     async fn create(
@@ -94,8 +168,40 @@ impl TableProviderFactory for ArrowFactory {
                     "hash_index requires a primary_key to be specified".to_string(),
                 ));
             }
-            let indexed_table =
+            let mut indexed_table =
                 IndexedMemTable::try_new(Arc::clone(&schema), vec![], primary_key_columns)?;
+
+            // Parse and create secondary indexes if specified
+            if let Some(indexes_str) = cmd.options.get("indexes") {
+                let indexes_config = parse_indexes_option(indexes_str, &schema)?;
+                let mut secondary_indexes = Vec::new();
+
+                for (columns, index_type) in indexes_config {
+                    let is_unique = index_type == IndexType::Unique;
+                    let index_name = columns.join("_");
+
+                    // Build hash index for secondary columns
+                    // Note: For empty table, we create the index structure; it will be populated on insert
+                    let partitions: Vec<Vec<arrow::array::RecordBatch>> = vec![];
+                    let hash_index = HashIndexBuilder::new(columns.clone())
+                        .allow_duplicates(!is_unique)
+                        .build(&partitions)
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to build secondary index '{index_name}': {e}"
+                            ))
+                        })?;
+
+                    secondary_indexes.push(SecondaryIndex::new(
+                        index_name,
+                        columns,
+                        is_unique,
+                        Arc::new(hash_index),
+                    ));
+                }
+
+                indexed_table = indexed_table.with_secondary_indexes(secondary_indexes);
+            }
 
             // Apply constraints
             let indexed_table = indexed_table

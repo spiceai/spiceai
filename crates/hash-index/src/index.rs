@@ -36,12 +36,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
 use parking_lot::RwLock;
-use snafu::ensure;
 use twox_hash::XxHash3_64;
 
+use crate::Result;
 use crate::bloom::BloomFilter;
 use crate::extract::create_key_extractor;
-use crate::{DuplicateKeySnafu, Result};
 
 /// Fixed seed for deterministic hashing across instances.
 const HASH_SEED: u64 = 0x5370_6963_6541_4920; // "SpiceAI " in hex
@@ -286,8 +285,38 @@ impl HashIndexBuilder {
                     if self.allow_duplicates {
                         index.insert_or_replace(hash, location);
                     } else {
-                        let inserted = index.insert(hash, location);
-                        ensure!(inserted, DuplicateKeySnafu);
+                        match index.insert(hash, location) {
+                            InsertResult::Inserted => {}
+                            InsertResult::HashCollision(existing_loc) => {
+                                // Hash collision detected. Verify if keys are actually equal
+                                // by comparing their raw byte representations.
+                                let existing_batch = &partitions[existing_loc.partition as usize]
+                                    [existing_loc.batch as usize];
+                                let existing_extractor =
+                                    create_key_extractor(existing_batch, &self.key_columns)?;
+
+                                let current_key_bytes = extractor.key_bytes(row);
+                                let existing_key_bytes =
+                                    existing_extractor.key_bytes(existing_loc.row as usize);
+
+                                if current_key_bytes == existing_key_bytes {
+                                    // Same key bytes = true duplicate key
+                                    return Err(crate::Error::DuplicateKey);
+                                }
+
+                                // Different key bytes = hash collision (different keys, same hash).
+                                // This is a limitation of the current hash index design which
+                                // doesn't support chaining. Log and continue - the first key
+                                // wins and subsequent lookups for the colliding key will fail.
+                                // This is acceptable for unique indexes where collisions are rare.
+                                tracing::warn!(
+                                    hash,
+                                    "Hash collision detected during index build. \
+                                     Two different keys produced the same hash. \
+                                     The second key will not be indexed."
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -334,7 +363,7 @@ impl Shard {
         table.get(hash)
     }
 
-    fn insert(&self, hash: u64, location: RowLocation) -> bool {
+    fn insert(&self, hash: u64, location: RowLocation) -> InsertResult {
         let mut table = self.table.write();
         table.insert(hash, location)
     }
@@ -358,6 +387,15 @@ impl Shard {
         table.slots.fill(Slot::default());
         table.len = 0;
     }
+}
+
+/// Result of an insert operation into the hash table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertResult {
+    /// Successfully inserted.
+    Inserted,
+    /// Hash collision detected. Contains the location of the existing entry.
+    HashCollision(RowLocation),
 }
 
 // Truncation for u64 -> usize is intentional on 32-bit platforms.
@@ -396,7 +434,7 @@ impl ShardTable {
         }
     }
 
-    fn insert(&mut self, hash: u64, location: RowLocation) -> bool {
+    fn insert(&mut self, hash: u64, location: RowLocation) -> InsertResult {
         if self.len * 4 >= self.slots.len() * 3 {
             self.grow();
         }
@@ -410,11 +448,11 @@ impl ShardTable {
                 slot.hash = hash;
                 slot.location = location;
                 self.len += 1;
-                return true;
+                return InsertResult::Inserted;
             }
 
             if slot.hash == hash {
-                return false; // Duplicate
+                return InsertResult::HashCollision(slot.location);
             }
 
             idx = (idx + 1) & self.mask;
@@ -649,15 +687,19 @@ impl HashIndex {
     }
 
     /// Inserts a new entry.
-    pub fn insert(&self, hash: u64, location: RowLocation) -> bool {
-        let inserted = self.shard(hash).insert(hash, location);
-        if inserted {
+    ///
+    /// Returns `InsertResult::Inserted` if the entry was successfully inserted,
+    /// or `InsertResult::HashCollision(existing_location)` if an entry with the
+    /// same hash already exists.
+    pub fn insert(&self, hash: u64, location: RowLocation) -> InsertResult {
+        let result = self.shard(hash).insert(hash, location);
+        if matches!(result, InsertResult::Inserted) {
             self.len.fetch_add(1, Ordering::Relaxed);
             if let Some(bloom) = &self.bloom {
                 bloom.write().insert(hash);
             }
         }
-        inserted
+        result
     }
 
     /// Inserts or replaces an entry.

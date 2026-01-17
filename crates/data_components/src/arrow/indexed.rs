@@ -48,10 +48,45 @@ use hash_index::{HashIndex, HashIndexBuilder, RowLocation, index_threshold};
 
 use super::write::MemTable;
 
+/// Configuration for a secondary hash index.
+#[derive(Debug, Clone)]
+pub struct SecondaryIndex {
+    /// The name of the index (typically the column name(s) joined).
+    pub name: String,
+    /// Column names that form the index key.
+    pub columns: Vec<String>,
+    /// Whether this index enforces uniqueness.
+    pub unique: bool,
+    /// The hash index itself.
+    pub index: Arc<HashIndex>,
+}
+
+impl SecondaryIndex {
+    /// Creates a new secondary index.
+    #[must_use]
+    pub fn new(name: String, columns: Vec<String>, unique: bool, index: Arc<HashIndex>) -> Self {
+        Self {
+            name,
+            columns,
+            unique,
+            index,
+        }
+    }
+
+    /// Returns the column names this index is built on.
+    #[must_use]
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
 /// A `MemTable` enhanced with a SIMD-optimized hash index for fast point lookups.
 ///
 /// When a primary key is defined, this table maintains a hash index that enables
 /// O(1) lookups instead of full table scans for equality predicates on the primary key.
+///
+/// Additionally, secondary indexes can be defined for non-primary key columns to
+/// accelerate equality predicates on those columns.
 pub struct IndexedMemTable {
     /// The underlying `MemTable` for data storage.
     inner: MemTable,
@@ -59,6 +94,8 @@ pub struct IndexedMemTable {
     index: Option<Arc<HashIndex>>,
     /// Primary key column names.
     primary_key_columns: Vec<String>,
+    /// Secondary indexes on non-primary key columns.
+    secondary_indexes: Vec<SecondaryIndex>,
 }
 
 impl Debug for IndexedMemTable {
@@ -67,6 +104,7 @@ impl Debug for IndexedMemTable {
             .field("schema", &self.inner.schema())
             .field("indexed", &self.index.is_some())
             .field("primary_key_columns", &self.primary_key_columns)
+            .field("secondary_indexes_count", &self.secondary_indexes.len())
             .finish()
     }
 }
@@ -144,6 +182,7 @@ impl IndexedMemTable {
             inner,
             index,
             primary_key_columns,
+            secondary_indexes: Vec::new(),
         })
     }
 
@@ -151,6 +190,32 @@ impl IndexedMemTable {
     #[must_use]
     pub fn has_index(&self) -> bool {
         self.index.is_some()
+    }
+
+    /// Returns true if this table has any secondary indexes.
+    #[must_use]
+    pub fn has_secondary_indexes(&self) -> bool {
+        !self.secondary_indexes.is_empty()
+    }
+
+    /// Returns the secondary indexes.
+    #[must_use]
+    pub fn secondary_indexes(&self) -> &[SecondaryIndex] {
+        &self.secondary_indexes
+    }
+
+    /// Adds a secondary index to the table.
+    #[must_use]
+    pub fn with_secondary_index(mut self, index: SecondaryIndex) -> Self {
+        self.secondary_indexes.push(index);
+        self
+    }
+
+    /// Adds multiple secondary indexes to the table.
+    #[must_use]
+    pub fn with_secondary_indexes(mut self, indexes: Vec<SecondaryIndex>) -> Self {
+        self.secondary_indexes.extend(indexes);
+        self
     }
 
     /// Returns the hash index if available.
@@ -263,12 +328,25 @@ impl IndexedMemTable {
     ///
     /// This should be called after modifications that invalidate the index.
     pub async fn rebuild_index(&self) -> Result<()> {
+        let partitions = self.read_all_partitions().await;
+
+        // Rebuild primary key index
         if let Some(index) = &self.index {
-            let partitions = self.read_all_partitions().await;
             index.rebuild(&partitions).map_err(|e| {
-                DataFusionError::Execution(format!("Failed to rebuild hash index: {e}"))
+                DataFusionError::Execution(format!("Failed to rebuild primary key hash index: {e}"))
             })?;
         }
+
+        // Rebuild secondary indexes
+        for secondary in &self.secondary_indexes {
+            secondary.index.rebuild(&partitions).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to rebuild secondary index '{}': {e}",
+                    secondary.name
+                ))
+            })?;
+        }
+
         Ok(())
     }
 
@@ -326,6 +404,30 @@ impl IndexedMemTable {
             }
             _ => None,
         }
+    }
+
+    /// Finds a secondary index that can be used for the given filters.
+    ///
+    /// Returns the matching secondary index and the key value if a single-column
+    /// secondary index matches an equality predicate in the filters.
+    fn find_secondary_index_match(
+        &self,
+        filters: &[Expr],
+    ) -> Option<(&SecondaryIndex, PrimaryKeyValue)> {
+        for secondary in &self.secondary_indexes {
+            // Only support single-column secondary indexes for now
+            if secondary.columns.len() != 1 {
+                continue;
+            }
+
+            let column = &secondary.columns[0];
+            for filter in filters {
+                if let Some(value) = Self::extract_equality_value(filter, column) {
+                    return Some((secondary, value));
+                }
+            }
+        }
+        None
     }
 
     /// Configures `on_conflict` behavior.
@@ -399,10 +501,10 @@ impl PrimaryKeyValue {
     /// the actual key matches to handle hash collisions correctly.
     fn matches_batch(&self, batch: &RecordBatch, pk_column: &str) -> bool {
         let Ok(col_idx) = batch.schema().index_of(pk_column) else {
-            unreachable!(
-                "Primary key column '{}' missing from RecordBatch schema during index verification",
-                pk_column
-            );
+            // Column not found - this should not happen in normal operation
+            // as the column was validated during index creation.
+            // Return false to fail the match safely rather than panic.
+            return false;
         };
         let column = batch.column(col_idx);
 
@@ -460,14 +562,21 @@ impl TableProvider for IndexedMemTable {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        // If we have an index and the filter is a simple PK equality,
+        let owned_filters: Vec<Expr> = filters.iter().map(|&e| e.clone()).collect();
+
+        // If we have a primary key index and the filter is a simple PK equality,
         // we can fully push it down (exact match)
-        if self.index.is_some() {
-            let owned_filters: Vec<Expr> = filters.iter().map(|&e| e.clone()).collect();
-            if self.extract_pk_equality_value(&owned_filters).is_some() {
-                return Ok(vec![TableProviderFilterPushDown::Exact; filters.len()]);
-            }
+        if self.index.is_some() && self.extract_pk_equality_value(&owned_filters).is_some() {
+            return Ok(vec![TableProviderFilterPushDown::Exact; filters.len()]);
         }
+
+        // Check if a secondary index can handle this filter
+        // Note: Secondary indexes may have duplicates, so we use Inexact
+        // to indicate additional filtering may be needed
+        if self.find_secondary_index_match(&owned_filters).is_some() {
+            return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
+        }
+
         // Otherwise, delegate to MemTable behavior (Unsupported)
         Ok(vec![
             TableProviderFilterPushDown::Unsupported;
@@ -482,7 +591,7 @@ impl TableProvider for IndexedMemTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Check if we can use the index for a point lookup
+        // Check if we can use the primary key index for a point lookup
         if let (Some(index), Some(pk_value)) =
             (&self.index, self.extract_pk_equality_value(filters))
         {
@@ -541,6 +650,66 @@ impl TableProvider for IndexedMemTable {
                 pk_columns,
                 false, // not found
             )));
+        }
+
+        // Check if we can use a secondary index for lookup
+        // Note: Secondary indexes with unique=true work like primary key lookups (single result)
+        // Non-unique secondary indexes still provide fast lookup but may have collisions
+        if let Some((secondary, key_value)) = self.find_secondary_index_match(filters) {
+            // Only use indexed lookup for unique secondary indexes
+            // Non-unique indexes would need multi-value support which hash-index doesn't provide yet
+            if secondary.unique {
+                let hash = key_value.hash();
+                let index_columns = secondary.columns.clone();
+
+                if let Some(location) = secondary.index.get_by_hash(hash) {
+                    if let Some(batch) = self.get_row_at_location(location).await? {
+                        // Verify the actual key matches (handle hash collisions)
+                        let index_column = &secondary.columns[0];
+                        if key_value.matches_batch(&batch, index_column) {
+                            let result_batch = if let Some(proj) = projection {
+                                batch.project(proj)?
+                            } else {
+                                batch
+                            };
+
+                            let schema = result_batch.schema();
+                            let stream = futures::stream::once(async move { Ok(result_batch) });
+                            let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
+
+                            return Ok(Arc::new(IndexedLookupExec::new(
+                                schema,
+                                Box::pin(stream),
+                                index_columns,
+                                true,
+                            )));
+                        }
+                        // Hash collision - fall through to return empty
+                        tracing::debug!(
+                            hash = hash,
+                            index_name = %secondary.name,
+                            "Hash collision detected during secondary index lookup"
+                        );
+                    }
+                }
+
+                // Key not found - return empty result
+                let schema = if let Some(proj) = projection {
+                    Arc::new(self.schema().project(proj)?)
+                } else {
+                    self.schema()
+                };
+                let stream = futures::stream::empty();
+                let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
+
+                return Ok(Arc::new(IndexedLookupExec::new(
+                    schema,
+                    Box::pin(stream),
+                    index_columns,
+                    false,
+                )));
+            }
+            // Non-unique secondary indexes fall through to full table scan
         }
 
         // Fall back to regular MemTable scan
@@ -802,6 +971,7 @@ mod tests {
             inner,
             index,
             primary_key_columns,
+            secondary_indexes: Vec::new(),
         })
     }
 
@@ -1890,6 +2060,229 @@ mod tests {
         assert!(
             !pk.matches_batch(&batch, "nonexistent"),
             "Missing column should fail"
+        );
+    }
+
+    // =============================================================================
+    // Secondary Index Tests
+    // =============================================================================
+
+    /// Test that secondary indexes can be added to an `IndexedMemTable`.
+    #[tokio::test]
+    async fn test_secondary_index_creation() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("email", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        // Create larger batch to exceed index threshold
+        let num_rows = 500;
+        let ids: Vec<i64> = (0..num_rows).collect();
+        let emails: Vec<String> = (0..num_rows)
+            .map(|i| format!("user{i}@example.com"))
+            .collect();
+        let emails_ref: Vec<&str> = emails.iter().map(String::as_str).collect();
+        let names: Vec<String> = (0..num_rows).map(|i| format!("User {i}")).collect();
+        let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(emails_ref)),
+                Arc::new(StringArray::from(names_ref)),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let partitions = vec![vec![batch]];
+
+        // Create table with primary key on 'id' with forced index creation
+        let table = IndexedMemTable::try_new_with_parallelism(
+            Arc::clone(&schema),
+            partitions.clone(),
+            vec!["id".to_string()],
+            Some(1), // Force index creation
+        )
+        .expect("failed to create table");
+
+        // Build secondary index on 'email'
+        let email_index = hash_index::HashIndexBuilder::new(vec!["email".to_string()])
+            .allow_duplicates(false)
+            .build(&partitions)
+            .expect("failed to build email index");
+
+        let secondary = SecondaryIndex::new(
+            "email".to_string(),
+            vec!["email".to_string()],
+            true, // unique
+            Arc::new(email_index),
+        );
+
+        let table_with_secondary = table.with_secondary_index(secondary);
+
+        assert!(
+            table_with_secondary.has_index(),
+            "should have primary key index"
+        );
+        assert!(
+            table_with_secondary.has_secondary_indexes(),
+            "should have secondary indexes"
+        );
+        assert_eq!(table_with_secondary.secondary_indexes().len(), 1);
+        assert_eq!(table_with_secondary.secondary_indexes()[0].name, "email");
+    }
+
+    /// Test unique secondary index lookup.
+    #[tokio::test]
+    async fn test_secondary_index_unique_lookup() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("email", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        // Create large batch to exceed index threshold
+        let num_rows = 500;
+        let ids: Vec<i64> = (0..num_rows).collect();
+        let emails: Vec<String> = (0..num_rows)
+            .map(|i| format!("user{i}@example.com"))
+            .collect();
+        let emails_ref: Vec<&str> = emails.iter().map(String::as_str).collect();
+        let names: Vec<String> = (0..num_rows).map(|i| format!("User {i}")).collect();
+        let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(emails_ref.clone())),
+                Arc::new(StringArray::from(names_ref)),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let partitions = vec![vec![batch]];
+
+        // Create table with primary key on 'id'
+        let table = IndexedMemTable::try_new_with_parallelism(
+            Arc::clone(&schema),
+            partitions.clone(),
+            vec!["id".to_string()],
+            Some(1), // Force index creation
+        )
+        .expect("failed to create table");
+
+        // Build secondary index on 'email'
+        let email_index = hash_index::HashIndexBuilder::new(vec!["email".to_string()])
+            .allow_duplicates(false)
+            .build(&partitions)
+            .expect("failed to build email index");
+
+        let secondary = SecondaryIndex::new(
+            "email".to_string(),
+            vec!["email".to_string()],
+            true, // unique
+            Arc::new(email_index),
+        );
+
+        let table_with_secondary = table.with_secondary_index(secondary);
+
+        // Register and query
+        let ctx = SessionContext::new();
+        ctx.register_table("users", Arc::new(table_with_secondary))
+            .expect("failed to register");
+
+        // Query using the secondary index column
+        let df = ctx
+            .sql("SELECT id, email, name FROM users WHERE email = 'user42@example.com'")
+            .await
+            .expect("query failed");
+
+        let batches = df.collect().await.expect("collect failed");
+        assert_eq!(batches.len(), 1, "expected one batch");
+        assert_eq!(batches[0].num_rows(), 1, "expected one row");
+
+        let id_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected int64");
+        assert_eq!(id_col.value(0), 42);
+    }
+
+    /// Test that `supports_filters_pushdown` returns `Inexact` for secondary index queries.
+    #[test]
+    fn test_secondary_index_filter_pushdown() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("email", DataType::Utf8, false),
+        ]));
+
+        // Create enough rows to exceed the index threshold (256 * parallelism)
+        let num_rows = 500;
+        let ids: Vec<i64> = (0..num_rows).map(i64::from).collect();
+        let emails: Vec<String> = (0..num_rows)
+            .map(|i| format!("user{i}@example.com"))
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(emails)),
+            ],
+        )
+        .expect("batch");
+
+        let partitions = vec![vec![batch]];
+
+        // Use parallelism=1 so threshold is 256 (500 rows exceeds this)
+        let table = IndexedMemTable::try_new_with_parallelism(
+            Arc::clone(&schema),
+            partitions.clone(),
+            vec!["id".to_string()],
+            Some(1),
+        )
+        .expect("table");
+
+        // Verify primary index was built
+        assert!(table.has_index(), "primary index should be built");
+
+        let email_index = hash_index::HashIndexBuilder::new(vec!["email".to_string()])
+            .allow_duplicates(false)
+            .build(&partitions)
+            .expect("index");
+
+        let secondary = SecondaryIndex::new(
+            "email".to_string(),
+            vec!["email".to_string()],
+            true,
+            Arc::new(email_index),
+        );
+
+        let table_with_secondary = table.with_secondary_index(secondary);
+
+        // PK query should return Exact
+        let pk_filter = datafusion::prelude::col("id").eq(datafusion::prelude::lit(1_i64));
+        let result = table_with_secondary
+            .supports_filters_pushdown(&[&pk_filter])
+            .expect("pushdown check");
+        assert_eq!(
+            result,
+            vec![datafusion::logical_expr::TableProviderFilterPushDown::Exact]
+        );
+
+        // Secondary index query should return Inexact (for unique secondary indexes)
+        let secondary_filter =
+            datafusion::prelude::col("email").eq(datafusion::prelude::lit("user42@example.com"));
+        let result = table_with_secondary
+            .supports_filters_pushdown(&[&secondary_filter])
+            .expect("pushdown check");
+        assert_eq!(
+            result,
+            vec![datafusion::logical_expr::TableProviderFilterPushDown::Inexact]
         );
     }
 }
