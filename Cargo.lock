@@ -14338,7 +14338,7 @@ dependencies = [
  "tracing",
  "url",
  "util",
- "uuid 1.18.1",
+ "uuid 1.19.0",
 ]
 
 [[package]]
