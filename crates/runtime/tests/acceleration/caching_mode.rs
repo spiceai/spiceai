@@ -924,6 +924,9 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
                 "Should have results from HTTP request"
             );
 
+            // Wait for batched cache write to flush (500ms interval + buffer)
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
             // Query cache again - should now return cached data
             let df = status
                 .datafusion()
