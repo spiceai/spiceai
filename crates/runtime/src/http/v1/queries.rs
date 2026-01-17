@@ -192,7 +192,6 @@ pub struct ListQueriesQuery {
     pub status: Option<String>,
     /// Maximum number of results.
     #[serde(default)]
-    #[expect(dead_code)]
     pub limit: Option<usize>,
 }
 
