@@ -797,7 +797,7 @@ impl Refresher {
                         self.last_updated_at.clone(),
                     ),
                     false,
-                )
+                ),
             };
         self.snapshot_interval_task = snapshot_interval_task;
 
