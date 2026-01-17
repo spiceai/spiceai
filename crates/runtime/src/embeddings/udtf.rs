@@ -48,6 +48,7 @@ use datafusion::{
 use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
 };
+#[cfg(feature = "s3_vectors")]
 use futures::FutureExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
