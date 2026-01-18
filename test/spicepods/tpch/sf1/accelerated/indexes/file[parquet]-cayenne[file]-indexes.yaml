@@ -1,0 +1,60 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-cayenne[file]-indexes
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: c_custkey
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: (l_orderkey, l_linenumber)
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: n_nationkey
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: o_orderkey
+  - from: file:data/part.parquet
+    name: part
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: p_partkey
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: (ps_partkey, ps_suppkey)
+  - from: file:data/region.parquet
+    name: region
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: r_regionkey
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: s_suppkey

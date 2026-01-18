@@ -54,7 +54,7 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior};
+use runtime_acceleration::snapshot::AccelerationEngine;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -1752,14 +1752,6 @@ impl DataAccelerator for CayenneAccelerator {
                     ),
                 }));
             }
-
-            // Validate that snapshots are not enabled
-            if !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
-                tracing::warn!(
-                    "Dataset {}: Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: disabled' or remove the snapshots configuration",
-                    source.name()
-                );
-            }
         }
 
         let dir_path = self.file_path(source)?;
@@ -1869,10 +1861,13 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
+            let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+            let snapshot_adapter =
+                runtime_acceleration::snapshot::SnapshotAdapter::cayenne(metadata_dir, path_buf);
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
-                path_buf,
+                snapshot_adapter,
                 AccelerationEngine::Cayenne,
             )
             .await)

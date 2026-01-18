@@ -27,6 +27,7 @@ use std::{fmt::Debug, sync::Arc};
 use tokio::runtime::Handle;
 use tokio::task;
 
+#[cfg(feature = "local_embed")]
 pub mod candle;
 
 #[derive(Debug, Snafu)]

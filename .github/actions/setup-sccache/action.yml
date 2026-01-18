@@ -24,6 +24,7 @@ runs:
         [cache.s3]
         bucket = "sccache"
         endpoint = "${{ inputs.minio_endpoint }}"
+        use_ssl = false
         server_side_encryption = false
         no_credentials = false
         region = "us-east-1"
@@ -49,6 +50,7 @@ runs:
         [cache.s3]
         bucket = "sccache"
         endpoint = "http://localhost:9000"
+        use_ssl = false
         server_side_encryption = false
         no_credentials = false
         region = "us-east-1"
@@ -83,6 +85,7 @@ runs:
         [cache.s3]
         bucket = "sccache"
         endpoint = "${{ inputs.minio_endpoint }}"
+        use_ssl = false
         server_side_encryption = false
         no_credentials = false
         region = "us-east-1"
