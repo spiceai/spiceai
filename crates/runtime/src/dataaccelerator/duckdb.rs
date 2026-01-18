@@ -384,17 +384,17 @@ impl DataAccelerator for DuckDBAccelerator {
                 }
             }
 
-            let was_bootstrapped = download_snapshot_if_needed(
+            let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                PathBuf::from(path),
+                runtime_acceleration::snapshot::SnapshotAdapter::file(PathBuf::from(path)),
                 AccelerationEngine::DuckDB,
             )
             .await;
 
             self.get_shared_pool(source).await?;
 
-            return Ok(was_bootstrapped);
+            return Ok(bootstrap_status);
         }
 
         Ok(BootstrapStatus::none())

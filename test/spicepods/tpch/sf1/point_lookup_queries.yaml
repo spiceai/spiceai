@@ -1,0 +1,119 @@
+# TPC-H Point Lookup Queries
+# These queries test single-row lookups by primary key
+# Designed to benchmark primary_key index performance
+name: tpch_point_lookups
+
+queries:
+  # Customer table point lookups (c_custkey is PK, range 1-150000)
+  - name: customer_pk_1
+    sql: SELECT * FROM customer WHERE c_custkey = 1
+  - name: customer_pk_1000
+    sql: SELECT * FROM customer WHERE c_custkey = 1000
+  - name: customer_pk_50000
+    sql: SELECT * FROM customer WHERE c_custkey = 50000
+  - name: customer_pk_100000
+    sql: SELECT * FROM customer WHERE c_custkey = 100000
+  - name: customer_pk_150000
+    sql: SELECT * FROM customer WHERE c_custkey = 150000
+  - name: customer_pk_random1
+    sql: SELECT * FROM customer WHERE c_custkey = 12345
+  - name: customer_pk_random2
+    sql: SELECT * FROM customer WHERE c_custkey = 67890
+  - name: customer_pk_random3
+    sql: SELECT * FROM customer WHERE c_custkey = 99999
+
+  # Orders table point lookups (o_orderkey is PK - sparse, not all values exist)
+  - name: orders_pk_1
+    sql: SELECT * FROM orders WHERE o_orderkey = 1
+  - name: orders_pk_32
+    sql: SELECT * FROM orders WHERE o_orderkey = 32
+  - name: orders_pk_100
+    sql: SELECT * FROM orders WHERE o_orderkey = 100
+  - name: orders_pk_500000
+    sql: SELECT * FROM orders WHERE o_orderkey = 500000
+  - name: orders_pk_1000000
+    sql: SELECT * FROM orders WHERE o_orderkey = 1000000
+  - name: orders_pk_123456
+    sql: SELECT * FROM orders WHERE o_orderkey = 123456
+  - name: orders_pk_2000000
+    sql: SELECT * FROM orders WHERE o_orderkey = 2000000
+
+  # Part table point lookups (p_partkey is PK, range 1-200000)
+  - name: part_pk_1
+    sql: SELECT * FROM part WHERE p_partkey = 1
+  - name: part_pk_10000
+    sql: SELECT * FROM part WHERE p_partkey = 10000
+  - name: part_pk_100000
+    sql: SELECT * FROM part WHERE p_partkey = 100000
+  - name: part_pk_200000
+    sql: SELECT * FROM part WHERE p_partkey = 200000
+  - name: part_pk_random1
+    sql: SELECT * FROM part WHERE p_partkey = 54321
+  - name: part_pk_random2
+    sql: SELECT * FROM part WHERE p_partkey = 98765
+
+  # Supplier table point lookups (s_suppkey is PK, range 1-10000)
+  - name: supplier_pk_1
+    sql: SELECT * FROM supplier WHERE s_suppkey = 1
+  - name: supplier_pk_5000
+    sql: SELECT * FROM supplier WHERE s_suppkey = 5000
+  - name: supplier_pk_10000
+    sql: SELECT * FROM supplier WHERE s_suppkey = 10000
+  - name: supplier_pk_random1
+    sql: SELECT * FROM supplier WHERE s_suppkey = 1234
+  - name: supplier_pk_random2
+    sql: SELECT * FROM supplier WHERE s_suppkey = 7890
+
+  # Lineitem table point lookups (composite PK: l_orderkey, l_linenumber)
+  - name: lineitem_pk_1_1
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 1 AND l_linenumber = 1
+  - name: lineitem_pk_1_3
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 1 AND l_linenumber = 3
+  - name: lineitem_pk_32_1
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 32 AND l_linenumber = 1
+  - name: lineitem_pk_500000_1
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 500000 AND l_linenumber = 1
+  - name: lineitem_pk_1000000_1
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 1000000 AND l_linenumber = 1
+
+  # Partsupp table point lookups (composite PK: ps_partkey, ps_suppkey)
+  - name: partsupp_pk_1_2
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1 AND ps_suppkey = 2
+  - name: partsupp_pk_1_2502
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1 AND ps_suppkey = 2502
+  - name: partsupp_pk_10000_1
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 10000 AND ps_suppkey = 1
+  - name: partsupp_pk_100000_1
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 100000 AND ps_suppkey = 1
+
+  # Nation table point lookups (n_nationkey is PK, range 0-24)
+  - name: nation_pk_0
+    sql: SELECT * FROM nation WHERE n_nationkey = 0
+  - name: nation_pk_12
+    sql: SELECT * FROM nation WHERE n_nationkey = 12
+  - name: nation_pk_24
+    sql: SELECT * FROM nation WHERE n_nationkey = 24
+
+  # Region table point lookups (r_regionkey is PK, range 0-4)
+  - name: region_pk_0
+    sql: SELECT * FROM region WHERE r_regionkey = 0
+  - name: region_pk_2
+    sql: SELECT * FROM region WHERE r_regionkey = 2
+  - name: region_pk_4
+    sql: SELECT * FROM region WHERE r_regionkey = 4
+
+  # Multi-row lookups by PK (IN clause) - should still benefit from index
+  - name: customer_pk_in_5
+    sql: SELECT * FROM customer WHERE c_custkey IN (1, 100, 1000, 10000, 100000)
+  - name: orders_pk_in_5
+    sql: SELECT * FROM orders WHERE o_orderkey IN (1, 32, 100, 500000, 1000000)
+  - name: part_pk_in_5
+    sql: SELECT * FROM part WHERE p_partkey IN (1, 1000, 10000, 100000, 200000)
+
+  # Range lookups on PK (should benefit from sorted index)
+  - name: customer_pk_range_10
+    sql: SELECT * FROM customer WHERE c_custkey >= 1000 AND c_custkey < 1010
+  - name: part_pk_range_10
+    sql: SELECT * FROM part WHERE p_partkey >= 50000 AND p_partkey < 50010
+  - name: supplier_pk_range_10
+    sql: SELECT * FROM supplier WHERE s_suppkey >= 5000 AND s_suppkey < 5010
