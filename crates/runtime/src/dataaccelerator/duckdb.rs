@@ -25,7 +25,11 @@ use crate::{
         view::View,
     },
     dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
-    datafusion::{dialect::new_duckdb_dialect, udf::deny_spice_specific_functions},
+    datafusion::{
+        dialect::new_duckdb_dialect,
+        sort_columns::{SortColumn, parse_sort_columns},
+        udf::deny_spice_specific_functions,
+    },
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
@@ -303,6 +307,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         "The maximum number of client connections created in the duckdb connection pool.",
     ),
     ParameterSpec::runtime("on_refresh_recompute_statistics"),
+    ParameterSpec::runtime("on_refresh_sort_columns"),
     ParameterSpec::runtime("partitioned_write_buffer"),
     ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
 ];
@@ -487,32 +492,66 @@ impl DataAccelerator for DuckDBAccelerator {
         }
 
         let write_completion_handler = source.and_then(|src| {
-            let retention_sql = src
-                .acceleration()
-                .and_then(|acc| acc.retention_sql.as_deref())
-                .map(str::trim)
-                .filter(|sql| !sql.is_empty())?
-                .to_string();
-
+            let acceleration = src.acceleration()?;
             let dataset_name = src.name().to_string();
             let schema = Arc::new(cmd.schema.as_arrow().clone());
 
-            match crate::datafusion::retention_sql::parse_retention_sql(
-                src.name(),
-                &retention_sql,
-                schema,
-            ) {
-                Ok(parsed_sql) => Some(make_retention_write_handler(
-                    dataset_name,
-                    parsed_sql.delete_statement,
-                )),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse retention_sql for dataset {}: {}. Retention SQL will not be applied.",
-                        dataset_name, e
-                    );
-                    None
+            let mut config = OnRefreshConfig::default();
+
+            // Parse retention SQL if configured
+            if let Some(retention_sql) = acceleration
+                .retention_sql
+                .as_deref()
+                .map(str::trim)
+                .filter(|sql| !sql.is_empty())
+            {
+                match crate::datafusion::retention_sql::parse_retention_sql(
+                    src.name(),
+                    retention_sql,
+                    Arc::clone(&schema),
+                ) {
+                    Ok(parsed_sql) => {
+                        config.retention_delete = Some(parsed_sql.delete_statement);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse retention_sql for dataset {}: {}. Retention SQL will not be applied.",
+                            dataset_name, e
+                        );
+                    }
                 }
+            }
+
+            // Parse on_refresh_sort_columns if configured
+            if let Some(sort_columns_str) = acceleration
+                .params
+                .get("on_refresh_sort_columns")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                match parse_sort_columns(sort_columns_str, &schema) {
+                    Ok(sort_columns) => {
+                        tracing::debug!(
+                            dataset = %dataset_name,
+                            sort_columns = ?sort_columns,
+                            "Parsed on_refresh_sort_columns"
+                        );
+                        config.sort_columns = sort_columns;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse on_refresh_sort_columns for dataset {}: {}. Sorting will not be applied.",
+                            dataset_name, e
+                        );
+                    }
+                }
+            }
+
+            if config.is_empty() {
+                None
+            } else {
+                Some(make_on_refresh_write_handler(dataset_name, config))
             }
         });
 
@@ -614,23 +653,60 @@ fn reconstruct_retention_sql_with_table_name(
     Ok(statement.to_string())
 }
 
-fn make_retention_write_handler(
+/// Configuration for on-refresh operations that run after data is written but before commit.
+#[derive(Clone, Default)]
+struct OnRefreshConfig {
+    /// Parsed DELETE statement for retention SQL
+    retention_delete: Option<Delete>,
+    /// Sort columns configuration
+    sort_columns: Vec<SortColumn>,
+}
+
+impl OnRefreshConfig {
+    /// Creates an empty config.
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Sets retention SQL configuration.
+    #[must_use]
+    fn with_retention(mut self, delete: Delete) -> Self {
+        self.retention_delete = Some(delete);
+        self
+    }
+
+    /// Sets sort columns configuration.
+    #[must_use]
+    fn with_sort(mut self, columns: Vec<SortColumn>) -> Self {
+        self.sort_columns = columns;
+        self
+    }
+
+    fn is_empty(&self) -> bool {
+        self.retention_delete.is_none() && self.sort_columns.is_empty()
+    }
+}
+
+fn make_on_refresh_write_handler(
     dataset_name: String,
-    parsed_delete: Delete,
+    config: OnRefreshConfig,
 ) -> WriteCompletionHandler {
     Arc::new(move |tx, table_manager, _schema, inserted_rows| {
         let internal_table_name = table_manager.table_name().to_string();
 
-        tracing::debug!(
-            dataset = %dataset_name,
-            table = %internal_table_name,
-            inserted_rows,
-            "Applying retention SQL before commit"
-        );
+        // Apply retention SQL if configured
+        if let Some(ref parsed_delete) = config.retention_delete {
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                inserted_rows,
+                "Applying retention SQL before commit"
+            );
 
-        // Reconstruct the SQL with the internal table name
-        let reconstructed_sql =
-            match reconstruct_retention_sql_with_table_name(&parsed_delete, &internal_table_name) {
+            let reconstructed_sql = match reconstruct_retention_sql_with_table_name(
+                parsed_delete,
+                &internal_table_name,
+            ) {
                 Ok(sql) => sql,
                 Err(e) => {
                     return Err(DataFusionError::Execution(format!(
@@ -639,27 +715,78 @@ fn make_retention_write_handler(
                 }
             };
 
-        tracing::debug!(
-            dataset = %dataset_name,
-            table = %internal_table_name,
-            sql = %reconstructed_sql,
-            "Reconstructed retention SQL with internal table name"
-        );
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                sql = %reconstructed_sql,
+                "Reconstructed retention SQL with internal table name"
+            );
 
-        match tx.execute(reconstructed_sql.as_str(), []) {
-            Ok(affected_rows) => {
-                tracing::debug!(
-                    dataset = %dataset_name,
-                    table = %internal_table_name,
-                    affected_rows,
-                    "Retention SQL applied before commit"
-                );
-                Ok(())
+            match tx.execute(reconstructed_sql.as_str(), []) {
+                Ok(affected_rows) => {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        table = %internal_table_name,
+                        affected_rows,
+                        "Retention SQL applied before commit"
+                    );
+                }
+                Err(err) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to apply retention SQL for dataset {dataset_name} (table {internal_table_name}): {err}"
+                    )));
+                }
             }
-            Err(err) => Err(DataFusionError::Execution(format!(
-                "Failed to apply retention SQL for dataset {dataset_name} (table {internal_table_name}): {err}"
-            ))),
         }
+
+        // Current sorting implementation is experimental. CREATE OR REPLACE TABLE recreates
+        // the table from scratch, which means:
+        // - Primary keys and unique constraints (table-level definitions) are NOT preserved
+        // - Indexes (separate DB objects) are dropped when the original table is replaced
+        // - Foreign key constraints are NOT preserved
+        if !config.sort_columns.is_empty() {
+            let order_by_clause: String = config
+                .sort_columns
+                .iter()
+                .map(|sc| format!("\"{}\" {}", sc.column, sc.direction))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                inserted_rows,
+                order_by = %order_by_clause,
+                "Applying on-refresh sort before commit"
+            );
+
+            let sort_sql = format!(
+                "CREATE OR REPLACE TABLE \"{table}\" AS SELECT * FROM \"{table}\" ORDER BY {order_by}",
+                table = internal_table_name,
+                order_by = order_by_clause,
+            );
+
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                sql = %sort_sql,
+                "Executing on-refresh sort SQL"
+            );
+
+            if let Err(err) = tx.execute(sort_sql.as_str(), []) {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to apply on-refresh sort for dataset {dataset_name} (table {internal_table_name}): {err}"
+                )));
+            }
+
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                "On-refresh sort applied before commit"
+            );
+        }
+
+        Ok(())
     })
 }
 
@@ -722,8 +849,10 @@ mod tests {
         )
         .expect("should parse retention SQL")
         .delete_statement;
-        let handler =
-            super::make_retention_write_handler("retention_dataset".to_string(), parsed_delete);
+        let handler = super::make_on_refresh_write_handler(
+            "retention_dataset".to_string(),
+            super::OnRefreshConfig::empty().with_retention(parsed_delete),
+        );
 
         let table = super::create_table_provider(
             &duckdb_accelerator.duckdb_factory,
@@ -838,7 +967,10 @@ mod tests {
         )
         .expect("should parse retention SQL")
         .delete_statement;
-        let handler = super::make_retention_write_handler("taxi_trips".to_string(), parsed_delete);
+        let handler = super::make_on_refresh_write_handler(
+            "taxi_trips".to_string(),
+            super::OnRefreshConfig::empty().with_retention(parsed_delete),
+        );
 
         let table = super::create_table_provider(
             &duckdb_accelerator.duckdb_factory,
@@ -1227,9 +1359,9 @@ mod tests {
         )
         .expect("should parse retention SQL")
         .delete_statement;
-        let handler = super::make_retention_write_handler(
+        let handler = super::make_on_refresh_write_handler(
             "retention_test_dataset".to_string(),
-            parsed_delete,
+            super::OnRefreshConfig::empty().with_retention(parsed_delete),
         );
 
         // Create the accelerator and table
@@ -1397,5 +1529,123 @@ mod tests {
             reconstructed.to_lowercase().starts_with("delete from"),
             "Should start with DELETE FROM"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sort_columns_with_duckdb_accelerator() {
+        use crate::datafusion::sort_columns::SortColumn;
+        use tempfile::TempDir;
+
+        // Create a temporary directory for the DuckDB file
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let db_path = temp_dir.path().join("test_sort.db");
+
+        // Create schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+
+        // Prepare the external table command with file path
+        let mut external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("sort_test_dataset"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        external_table.options.insert(
+            "open".to_string(),
+            db_path.to_str().expect("path").to_string(),
+        );
+
+        // Create sort columns configuration - sort by value DESC
+        let sort_columns = vec![SortColumn::desc("value")];
+        let handler = super::make_on_refresh_write_handler(
+            "sort_test_dataset".to_string(),
+            super::OnRefreshConfig::empty().with_sort(sort_columns),
+        );
+
+        // Create the accelerator and table
+        let accelerator = DuckDBAccelerator::new();
+        let table = super::create_table_provider(
+            &accelerator.duckdb_factory,
+            &external_table,
+            Some(handler),
+        )
+        .await
+        .expect("table should be created");
+
+        // Insert data in unsorted order
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int64Array::from(vec![30, 10, 50, 20, 40])), // unsorted values
+            ],
+        )
+        .expect("record batch");
+
+        let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
+
+        let write_ctx = SessionContext::new();
+        let insert_plan = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insert plan");
+
+        // Execute the insert - this should trigger the sort
+        collect(insert_plan, write_ctx.task_ctx())
+            .await
+            .expect("insert should succeed");
+
+        // Query the table to verify sorting was applied
+        let read_ctx = SessionContext::new();
+        let scan = table
+            .scan(&read_ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let results = collect(scan, read_ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+
+        // Collect all values in order
+        let mut values = Vec::new();
+        for batch in &results {
+            let value_array = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column should be Int64Array");
+
+            for i in 0..value_array.len() {
+                values.push(value_array.value(i));
+            }
+        }
+
+        // Verify data is sorted in descending order
+        assert_eq!(
+            values,
+            vec![50, 40, 30, 20, 10],
+            "Data should be sorted by value DESC"
+        );
+
+        // cleanup
+        drop(table);
+        drop(temp_dir);
     }
 }

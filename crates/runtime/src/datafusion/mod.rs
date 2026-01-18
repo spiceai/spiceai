@@ -109,6 +109,7 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
+pub mod sort_columns;
 pub(crate) mod sql_validator;
 pub mod udf;
 
