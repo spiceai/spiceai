@@ -208,32 +208,39 @@ async fn flush_cache_writes(
     let upsert_rows: usize = upsert_batches.iter().map(RecordBatch::num_rows).sum();
     let upsert_count = upsert_filters.len();
 
+    // Combine all batches for writing
+    let mut all_batches = insert_batches;
+    all_batches.extend(upsert_batches);
+
     let write_start = std::time::Instant::now();
+
+    // Check if the accelerator has constraints configured (primary key, unique, etc.).
+    // If it does, we can use native upsert (append_to_accelerator) which is more efficient
+    // than the read-filter-write pattern (batched_upsert_into_accelerator).
+    let has_constraints = accelerator.constraints().is_some_and(|c| !c.is_empty());
 
     // Acquire the mutex once for the entire batch
     let lock_wait_start = std::time::Instant::now();
     let lock_guard = accelerator_write_mutex.lock().await;
     let lock_wait_ms = lock_wait_start.elapsed().as_millis();
 
-    // If we have upserts, combine everything into a single read-filter-write operation
-    // This is more efficient than separate insert + upsert operations
-    let result = if !upsert_filters.is_empty() {
-        // Combine insert and upsert batches - they'll all be written together
-        let mut all_new_batches = insert_batches;
-        all_new_batches.extend(upsert_batches);
-
+    let result = if all_batches.is_empty() {
+        Ok(())
+    } else if has_constraints {
+        // Use native upsert via append - the accelerator's OnConflict::Upsert handles deduplication
+        CacheRefreshHelper::append_to_accelerator(accelerator, dataset_name, all_batches).await
+    } else if !upsert_filters.is_empty() {
+        // No constraints - fall back to read-filter-write pattern for upserts
         CacheRefreshHelper::batched_upsert_into_accelerator(
             accelerator,
             dataset_name,
             &upsert_filters,
-            all_new_batches,
+            all_batches,
         )
         .await
-    } else if !insert_batches.is_empty() {
-        // No upserts - use more efficient insert path
-        CacheRefreshHelper::insert_into_accelerator(accelerator, dataset_name, insert_batches).await
     } else {
-        Ok(())
+        // No upserts needed - use insert path
+        CacheRefreshHelper::insert_into_accelerator(accelerator, dataset_name, all_batches).await
     };
 
     drop(lock_guard);
@@ -837,6 +844,61 @@ impl CacheRefreshHelper {
 
         // Overwrite the accelerator with the combined data
         Self::overwrite_accelerator(Arc::clone(accelerator), dataset_name, combined_batches).await
+    }
+
+    /// Append data to the accelerator using native upsert.
+    ///
+    /// This uses `InsertOp::Append` which, when the accelerator is configured with
+    /// `OnConflict::Upsert` on primary key columns, will automatically use the database's
+    /// native upsert mechanism:
+    /// - `DuckDB`: `INSERT INTO ... ON CONFLICT (pk_cols) DO UPDATE SET ...`
+    /// - Arrow/MemTable: `filter_existing()` to remove colliding rows before insert
+    ///
+    /// This avoids first reading and then writing the entire table and is more efficient
+    async fn append_to_accelerator(
+        accelerator: &Arc<dyn TableProvider>,
+        dataset_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> DataFusionResult<()> {
+        if batches.is_empty() {
+            tracing::debug!(
+                "append_to_accelerator called with empty batches for dataset={dataset_name}"
+            );
+            return Ok(());
+        }
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let schema = batches[0].schema();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        tracing::trace!(
+            "append_to_accelerator - appending {} batches ({total_rows} total rows) to accelerator for dataset={dataset_name}",
+            batches.len(),
+        );
+
+        let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
+        let adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            batch_stream,
+        );
+
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(adapter)));
+
+        // Use InsertOp::Append - the accelerator's OnConflict::Upsert handles deduplication
+        let insert_op = InsertOp::Append;
+
+        let insert_plan = accelerator.insert_into(&state, plan, insert_op).await?;
+
+        let task_ctx = Arc::new(TaskContext::default());
+        let _ = datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
+
+        tracing::debug!(
+            "append_to_accelerator COMPLETED - successfully appended {total_rows} rows to accelerator for dataset={dataset_name}"
+        );
+
+        Ok(())
     }
 
     /// Batched upsert: replace multiple cache entries in a single read-filter-write operation.
@@ -1631,6 +1693,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use async_trait::async_trait;
     use datafusion::catalog::Session;
+    use datafusion::common::{Constraint, Constraints};
     use datafusion::datasource::TableType;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
