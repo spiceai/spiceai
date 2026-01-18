@@ -9,13 +9,14 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake pkg-config libssl-dev unixodbc unixodbc-dev protobuf-compiler libclang-dev libnfs-dev
+        # Install mold linker for faster linking (20-30% faster link times)
+        sudo apt-get install -y build-essential cmake pkg-config libssl-dev unixodbc unixodbc-dev protobuf-compiler libclang-dev libnfs-dev mold lld clang
 
     - name: Install cc (macOS)
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        brew install cmake pkg-config openssl unixodbc protobuf llvm libnfs
+        brew install cmake pkg-config openssl unixodbc protobuf llvm libnfs lld
 
     - name: Install cc (Windows)
       if: runner.os == 'Windows'

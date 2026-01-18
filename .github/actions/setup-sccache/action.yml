@@ -10,6 +10,15 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    - name: Set sccache environment variables
+      shell: bash
+      run: |
+        echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
+        echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
+        echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
+        echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
     - name: Set up sccache (Linux)
       if: runner.os == 'Linux'
       shell: bash
