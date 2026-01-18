@@ -234,36 +234,32 @@ mod tests {
     #[test]
     fn test_error_invalid_direction() {
         let schema = test_schema();
-        let result = parse_sort_columns("id INVALID", &schema);
-        assert!(result.is_err());
+        parse_sort_columns("id INVALID", &schema).expect_err("should fail on invalid direction");
     }
 
     #[test]
     fn test_error_column_not_found() {
         let schema = test_schema();
-        let result = parse_sort_columns("nonexistent DESC", &schema);
-        assert!(result.is_err());
+        parse_sort_columns("nonexistent DESC", &schema)
+            .expect_err("should fail on nonexistent column");
     }
 
     #[test]
     fn test_error_empty_input() {
         let schema = test_schema();
-        let result = parse_sort_columns("", &schema);
-        assert!(result.is_err());
+        parse_sort_columns("", &schema).expect_err("should fail on empty input");
     }
 
     #[test]
     fn test_error_only_whitespace() {
         let schema = test_schema();
-        let result = parse_sort_columns("   ,   ", &schema);
-        assert!(result.is_err());
+        parse_sort_columns("   ,   ", &schema).expect_err("should fail on whitespace-only input");
     }
 
     #[test]
     fn test_error_too_many_parts() {
         let schema = test_schema();
-        let result = parse_sort_columns("id ASC extra", &schema);
-        assert!(result.is_err());
+        parse_sort_columns("id ASC extra", &schema).expect_err("should fail on too many parts");
     }
 
     #[test]

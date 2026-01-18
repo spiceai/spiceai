@@ -496,7 +496,7 @@ impl DataAccelerator for DuckDBAccelerator {
             let dataset_name = src.name().to_string();
             let schema = Arc::new(cmd.schema.as_arrow().clone());
 
-            let mut config = OnRefreshConfig::default();
+            let mut config = OnRefreshConfig::empty();
 
             // Parse retention SQL if configured
             if let Some(retention_sql) = acceleration
@@ -511,7 +511,7 @@ impl DataAccelerator for DuckDBAccelerator {
                     Arc::clone(&schema),
                 ) {
                     Ok(parsed_sql) => {
-                        config.retention_delete = Some(parsed_sql.delete_statement);
+                        config = config.with_retention(parsed_sql.delete_statement);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -537,7 +537,7 @@ impl DataAccelerator for DuckDBAccelerator {
                             sort_columns = ?sort_columns,
                             "Parsed on_refresh_sort_columns"
                         );
-                        config.sort_columns = sort_columns;
+                        config = config.with_sort(sort_columns);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -761,9 +761,7 @@ fn make_on_refresh_write_handler(
             );
 
             let sort_sql = format!(
-                "CREATE OR REPLACE TABLE \"{table}\" AS SELECT * FROM \"{table}\" ORDER BY {order_by}",
-                table = internal_table_name,
-                order_by = order_by_clause,
+                "CREATE OR REPLACE TABLE \"{internal_table_name}\" AS SELECT * FROM \"{internal_table_name}\" ORDER BY {order_by_clause}"
             );
 
             tracing::debug!(
@@ -822,7 +820,8 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
 
         let external_table = CreateExternalTable {
             schema: df_schema,
@@ -866,7 +865,7 @@ mod tests {
             Arc::clone(&schema),
             vec![Arc::new(Int64Array::from(vec![1, 3, 5, 7]))],
         )
-        .expect("record batch");
+        .expect("to create RecordBatch");
 
         let exec = Arc::new(MockExec::new(vec![Ok(input)], schema));
 
@@ -878,21 +877,21 @@ mod tests {
                 InsertOp::Append,
             )
             .await
-            .expect("insert plan");
+            .expect("to create insert plan");
 
         collect(insert_plan, write_ctx.task_ctx())
             .await
-            .expect("insert succeeds");
+            .expect("to execute insert");
 
         let read_ctx = SessionContext::new();
         let scan_plan = table
             .scan(&read_ctx.state(), None, &[], None)
             .await
-            .expect("scan plan");
+            .expect("to create scan plan");
 
         let batches = collect(scan_plan, read_ctx.task_ctx())
             .await
-            .expect("scan succeeds");
+            .expect("to execute scan");
 
         let mut values = Vec::new();
         for batch in &batches {
@@ -900,7 +899,7 @@ mod tests {
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .expect("int column");
+                .expect("to downcast column to Int64Array");
             values.extend((0..column.len()).map(|idx| column.value(idx)));
         }
 
@@ -922,20 +921,24 @@ mod tests {
         // DuckDB's error: "Can only delete from base table!" occurs because DELETE statements
         // must target the base/view table name, not the internal table directly.
 
-        let temp_dir = TempDir::new().expect("create temp dir");
+        let temp_dir = TempDir::new().expect("to create temp directory");
         let db_path = temp_dir.path().join("test_retention.db");
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
         ]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
 
         let mut options = HashMap::new();
         // Use file mode to enable full DuckDB features
         options.insert(
             "open".to_string(),
-            db_path.to_str().expect("path").to_string(),
+            db_path
+                .to_str()
+                .expect("to convert path to string")
+                .to_string(),
         );
         // Enable preserve_insertion_order which triggers internal table creation
         options.insert("preserve_insertion_order".to_string(), "true".to_string());
@@ -988,7 +991,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![1, 3, 5, 7])),
             ],
         )
-        .expect("record batch");
+        .expect("to create RecordBatch");
 
         let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
 
@@ -1000,7 +1003,7 @@ mod tests {
                 InsertOp::Append,
             )
             .await
-            .expect("insert plan");
+            .expect("to create insert plan");
 
         // First insert should succeed
         collect(insert_plan, write_ctx.task_ctx())
@@ -1010,14 +1013,14 @@ mod tests {
         // Verify internal tables were created by checking DuckDB directly
         let pool = Arc::new(
             DuckDbConnectionPool::new_file(
-                db_path.to_str().expect("path"),
+                db_path.to_str().expect("to convert path to string"),
                 &duckdb::AccessMode::ReadWrite,
             )
-            .expect("create pool"),
+            .expect("to create DuckDB connection pool"),
         );
 
-        let mut conn = pool.connect_sync().expect("connect");
-        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("get duckdb conn");
+        let mut conn = pool.connect_sync().expect("to get connection from pool");
+        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
 
         // Check for internal tables (they follow the pattern __data_*)
         let internal_tables: Vec<String> = duckdb_conn
@@ -1025,11 +1028,11 @@ mod tests {
             .prepare(
                 "SELECT table_name FROM information_schema.tables WHERE table_name LIKE '__data_%'",
             )
-            .expect("prepare")
+            .expect("to prepare SQL statement")
             .query_map([], |row| row.get(0))
-            .expect("query")
+            .expect("to execute query")
             .collect::<Result<Vec<_>, _>>()
-            .expect("collect");
+            .expect("to collect query results");
 
         if internal_tables.is_empty() {
             eprintln!(
@@ -1050,7 +1053,7 @@ mod tests {
         let insert_plan2 = table
             .insert_into(&write_ctx.state(), exec2, InsertOp::Append)
             .await
-            .expect("insert plan");
+            .expect("to create second insert plan");
 
         let result = collect(insert_plan2, write_ctx.task_ctx()).await;
 
@@ -1064,7 +1067,7 @@ mod tests {
         assert!(
             error_msg.contains("Can only delete from base table")
                 || error_msg.contains("Binder Error")
-                || error_msg.contains("Failed to apply retention SQL"),
+                || error_msg.contains("to apply retention SQL"),
             "Expected error about deleting from base table, got: {error_msg}"
         );
 
@@ -1091,7 +1094,8 @@ mod tests {
                 false,
             ),
         ]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_table"),
@@ -1285,11 +1289,11 @@ mod tests {
             "duckdb_file_accelerator_init".to_string(),
             "duckdb_file_accelerator_init",
         )
-        .expect("Failed to create builder")
+        .expect("to create builder")
         .with_app(Arc::new(app))
         .with_runtime(Arc::new(rt))
         .build()
-        .expect("Failed to build dataset");
+        .expect("to build dataset");
 
         dataset.acceleration = Some(Acceleration {
             engine: Engine::DuckDB,
@@ -1319,7 +1323,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Create a temporary directory for the DuckDB file
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir = TempDir::new().expect("to create temp dir");
         let db_path = temp_dir.path().join("test_retention.db");
 
         // Create schema
@@ -1327,7 +1331,8 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
         ]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
 
         // Prepare the external table command with file path
         let mut external_table = CreateExternalTable {
@@ -1347,7 +1352,10 @@ mod tests {
         };
         external_table.options.insert(
             "open".to_string(),
-            db_path.to_str().expect("path").to_string(),
+            db_path
+                .to_str()
+                .expect("to convert path to string")
+                .to_string(),
         );
 
         // Parse retention SQL and create handler
@@ -1382,7 +1390,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![2, 3, 4, 6, 7, 8])), // values: 2, 3, 4 should be deleted (< 5)
             ],
         )
-        .expect("record batch");
+        .expect("to create RecordBatch");
 
         let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
 
@@ -1394,7 +1402,7 @@ mod tests {
                 InsertOp::Append,
             )
             .await
-            .expect("insert plan");
+            .expect("to create insert plan");
 
         // Execute the insert - this should trigger the retention SQL
         collect(insert_plan, write_ctx.task_ctx())
@@ -1537,7 +1545,7 @@ mod tests {
         use tempfile::TempDir;
 
         // Create a temporary directory for the DuckDB file
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir = TempDir::new().expect("to create temp dir");
         let db_path = temp_dir.path().join("test_sort.db");
 
         // Create schema
@@ -1545,7 +1553,8 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
         ]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
 
         // Prepare the external table command with file path
         let mut external_table = CreateExternalTable {
@@ -1565,7 +1574,10 @@ mod tests {
         };
         external_table.options.insert(
             "open".to_string(),
-            db_path.to_str().expect("path").to_string(),
+            db_path
+                .to_str()
+                .expect("to convert path to string")
+                .to_string(),
         );
 
         // Create sort columns configuration - sort by value DESC
@@ -1593,7 +1605,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![30, 10, 50, 20, 40])), // unsorted values
             ],
         )
-        .expect("record batch");
+        .expect("to create RecordBatch");
 
         let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
 
@@ -1605,7 +1617,7 @@ mod tests {
                 InsertOp::Append,
             )
             .await
-            .expect("insert plan");
+            .expect("to create insert plan");
 
         // Execute the insert - this should trigger the sort
         collect(insert_plan, write_ctx.task_ctx())
