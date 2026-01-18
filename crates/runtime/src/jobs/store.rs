@@ -205,19 +205,35 @@ impl JobStore {
 
         for batch in batches {
             let batch_rows = batch.num_rows();
-            total_rows = total_rows.saturating_add(batch_rows);
+            total_rows = total_rows.checked_add(batch_rows).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "total_row_count".to_string(),
+                }
+            })?;
 
             current_chunk_batches.push(batch);
-            current_chunk_rows = current_chunk_rows.saturating_add(batch_rows);
+            current_chunk_rows = current_chunk_rows.checked_add(batch_rows).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "chunk_row_count".to_string(),
+                }
+            })?;
 
             // Flush chunk if we've reached the chunk size
             if current_chunk_rows >= self.chunk_size {
                 let bytes = self
                     .write_chunk(job_id, chunk_index, &current_chunk_batches)
                     .await?;
-                total_bytes = total_bytes.saturating_add(bytes);
+                total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                    super::error::Error::IntegerOverflow {
+                        field: "total_byte_count".to_string(),
+                    }
+                })?;
                 chunk_indices.push(chunk_index);
-                chunk_index = chunk_index.saturating_add(1);
+                chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                    super::error::Error::IntegerOverflow {
+                        field: "chunk_index".to_string(),
+                    }
+                })?;
                 current_chunk_batches.clear();
                 current_chunk_rows = 0;
             }
@@ -228,7 +244,11 @@ impl JobStore {
             let bytes = self
                 .write_chunk(job_id, chunk_index, &current_chunk_batches)
                 .await?;
-            total_bytes = total_bytes.saturating_add(bytes);
+            total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "total_byte_count".to_string(),
+                }
+            })?;
             chunk_indices.push(chunk_index);
         }
 
@@ -451,6 +471,7 @@ impl JobStore {
             };
 
             if state.is_expired() && self.delete_job(&state.job_id).await.is_ok() {
+                // Saturate at MAX on overflow - cleanup count is informational only
                 deleted_count = deleted_count.saturating_add(1);
             }
         }
@@ -636,6 +657,8 @@ mod tests {
     #[test]
     fn test_generate_job_id() {
         let id1 = JobStore::generate_job_id();
+        // UUIDv7 uses millisecond timestamp, so sleep briefly to ensure different IDs
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let id2 = JobStore::generate_job_id();
 
         assert_ne!(id1, id2);

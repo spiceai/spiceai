@@ -664,16 +664,26 @@ fn batches_to_json(batches: &[arrow::array::RecordBatch]) -> Vec<serde_json::Val
         let buf = Vec::new();
         let mut writer = arrow_json::ArrayWriter::new(buf);
 
-        // Skip batches that fail to serialize - continue processing remaining batches
-        if writer.write(batch).is_err() || writer.finish().is_err() {
+        // Log errors but continue - data correctness note: partial results are returned
+        // with visible errors rather than silently failing. The caller can check logs.
+        if let Err(e) = writer.write(batch) {
+            tracing::error!(error = %e, "Failed to serialize RecordBatch to JSON; partial results may be returned");
+            continue;
+        }
+        if let Err(e) = writer.finish() {
+            tracing::error!(error = %e, "Failed to finish JSON serialization; partial results may be returned");
             continue;
         }
 
         let Ok(json_str) = String::from_utf8(writer.into_inner()) else {
+            tracing::error!("Invalid UTF-8 in JSON output; partial results may be returned");
             continue;
         };
 
         let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) else {
+            tracing::error!(
+                "Failed to parse JSON array from serialized output; partial results may be returned"
+            );
             continue;
         };
 
