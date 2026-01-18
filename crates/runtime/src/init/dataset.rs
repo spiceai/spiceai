@@ -88,7 +88,7 @@ impl Runtime {
         // First create futures for non-localpod datasets
         for ds in &valid_datasets {
             let bootstrap_status = match init_results.get(&ds.name) {
-                Some(Ok(status)) => *status,
+                Some(Ok(status)) => status.clone(),
                 Some(Err(_)) => {
                     // Error already logged in initialize_datasets_accelerators
                     continue;
@@ -302,7 +302,7 @@ impl Runtime {
             };
 
             if let Err(err) = Arc::clone(&runtime)
-                .register_loaded_dataset(Arc::clone(&ds), connector, None, bootstrap_status)
+                .register_loaded_dataset(Arc::clone(&ds), connector, None, bootstrap_status.clone())
                 .await
             {
                 if runtime.status.is_shutdown() {
@@ -794,7 +794,7 @@ impl Runtime {
 
         for ds in &valid_datasets {
             let bootstrap_status = match init_results.get(&ds.name) {
-                Some(Ok(status)) => *status,
+                Some(Ok(status)) => status.clone(),
                 Some(Err(_)) => {
                     // Error already logged in initialize_datasets_accelerators
                     continue;
@@ -1011,7 +1011,7 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
                     dataset.name
                 );
             } else {
-                tracing::debug!(
+                tracing::info!(
                     "Updated fetched_at for all records in cached dataset {}",
                     dataset.name
                 );

@@ -1,0 +1,221 @@
+# TPC-H SF10 Point Lookup Stress Test
+# High-volume random point lookups for benchmarking index performance
+# Designed for 100+ concurrent clients
+# SF10: 10x scale factor with larger key ranges
+name: tpch_point_lookup_stress_sf10
+
+queries:
+  # Customer random lookups (range 1-1500000 for SF10)
+  - name: customer_rand_1
+    sql: SELECT * FROM customer WHERE c_custkey = 78230
+  - name: customer_rand_2
+    sql: SELECT * FROM customer WHERE c_custkey = 421560
+  - name: customer_rand_3
+    sql: SELECT * FROM customer WHERE c_custkey = 892340
+  - name: customer_rand_4
+    sql: SELECT * FROM customer WHERE c_custkey = 1234560
+  - name: customer_rand_5
+    sql: SELECT * FROM customer WHERE c_custkey = 34910
+  - name: customer_rand_6
+    sql: SELECT * FROM customer WHERE c_custkey = 782340
+  - name: customer_rand_7
+    sql: SELECT * FROM customer WHERE c_custkey = 1456780
+  - name: customer_rand_8
+    sql: SELECT * FROM customer WHERE c_custkey = 567890
+  - name: customer_rand_9
+    sql: SELECT * FROM customer WHERE c_custkey = 987650
+  - name: customer_rand_10
+    sql: SELECT * FROM customer WHERE c_custkey = 111110
+  - name: customer_rand_11
+    sql: SELECT * FROM customer WHERE c_custkey = 222220
+  - name: customer_rand_12
+    sql: SELECT * FROM customer WHERE c_custkey = 333330
+  - name: customer_rand_13
+    sql: SELECT * FROM customer WHERE c_custkey = 444440
+  - name: customer_rand_14
+    sql: SELECT * FROM customer WHERE c_custkey = 555550
+  - name: customer_rand_15
+    sql: SELECT * FROM customer WHERE c_custkey = 666660
+  - name: customer_rand_16
+    sql: SELECT * FROM customer WHERE c_custkey = 777770
+  - name: customer_rand_17
+    sql: SELECT * FROM customer WHERE c_custkey = 888880
+  - name: customer_rand_18
+    sql: SELECT * FROM customer WHERE c_custkey = 999990
+  - name: customer_rand_19
+    sql: SELECT * FROM customer WHERE c_custkey = 1111110
+  - name: customer_rand_20
+    sql: SELECT * FROM customer WHERE c_custkey = 1357920
+
+  # Orders random lookups (sparse keys, multiples of ~32 work best)
+  # SF10 has 15M orders (orderkeys up to ~60M due to sparsity)
+  - name: orders_rand_1
+    sql: SELECT * FROM orders WHERE o_orderkey = 1
+  - name: orders_rand_2
+    sql: SELECT * FROM orders WHERE o_orderkey = 320
+  - name: orders_rand_3
+    sql: SELECT * FROM orders WHERE o_orderkey = 640
+  - name: orders_rand_4
+    sql: SELECT * FROM orders WHERE o_orderkey = 1280
+  - name: orders_rand_5
+    sql: SELECT * FROM orders WHERE o_orderkey = 2560
+  - name: orders_rand_6
+    sql: SELECT * FROM orders WHERE o_orderkey = 5120
+  - name: orders_rand_7
+    sql: SELECT * FROM orders WHERE o_orderkey = 10240
+  - name: orders_rand_8
+    sql: SELECT * FROM orders WHERE o_orderkey = 20480
+  - name: orders_rand_9
+    sql: SELECT * FROM orders WHERE o_orderkey = 40960
+  - name: orders_rand_10
+    sql: SELECT * FROM orders WHERE o_orderkey = 81920
+  - name: orders_rand_11
+    sql: SELECT * FROM orders WHERE o_orderkey = 1000000
+  - name: orders_rand_12
+    sql: SELECT * FROM orders WHERE o_orderkey = 2000000
+  - name: orders_rand_13
+    sql: SELECT * FROM orders WHERE o_orderkey = 3000000
+  - name: orders_rand_14
+    sql: SELECT * FROM orders WHERE o_orderkey = 4000000
+  - name: orders_rand_15
+    sql: SELECT * FROM orders WHERE o_orderkey = 5000000
+  - name: orders_rand_16
+    sql: SELECT * FROM orders WHERE o_orderkey = 6000000
+  - name: orders_rand_17
+    sql: SELECT * FROM orders WHERE o_orderkey = 7000000
+  - name: orders_rand_18
+    sql: SELECT * FROM orders WHERE o_orderkey = 8000000
+  - name: orders_rand_19
+    sql: SELECT * FROM orders WHERE o_orderkey = 9000000
+  - name: orders_rand_20
+    sql: SELECT * FROM orders WHERE o_orderkey = 10000000
+
+  # Part random lookups (range 1-2000000 for SF10)
+  - name: part_rand_1
+    sql: SELECT * FROM part WHERE p_partkey = 123450
+  - name: part_rand_2
+    sql: SELECT * FROM part WHERE p_partkey = 234560
+  - name: part_rand_3
+    sql: SELECT * FROM part WHERE p_partkey = 345670
+  - name: part_rand_4
+    sql: SELECT * FROM part WHERE p_partkey = 456780
+  - name: part_rand_5
+    sql: SELECT * FROM part WHERE p_partkey = 567890
+  - name: part_rand_6
+    sql: SELECT * FROM part WHERE p_partkey = 678900
+  - name: part_rand_7
+    sql: SELECT * FROM part WHERE p_partkey = 789010
+  - name: part_rand_8
+    sql: SELECT * FROM part WHERE p_partkey = 890120
+  - name: part_rand_9
+    sql: SELECT * FROM part WHERE p_partkey = 901230
+  - name: part_rand_10
+    sql: SELECT * FROM part WHERE p_partkey = 1012340
+  - name: part_rand_11
+    sql: SELECT * FROM part WHERE p_partkey = 1123450
+  - name: part_rand_12
+    sql: SELECT * FROM part WHERE p_partkey = 1234560
+  - name: part_rand_13
+    sql: SELECT * FROM part WHERE p_partkey = 1345670
+  - name: part_rand_14
+    sql: SELECT * FROM part WHERE p_partkey = 1456780
+  - name: part_rand_15
+    sql: SELECT * FROM part WHERE p_partkey = 1567890
+  - name: part_rand_16
+    sql: SELECT * FROM part WHERE p_partkey = 1678900
+  - name: part_rand_17
+    sql: SELECT * FROM part WHERE p_partkey = 1789010
+  - name: part_rand_18
+    sql: SELECT * FROM part WHERE p_partkey = 1890120
+  - name: part_rand_19
+    sql: SELECT * FROM part WHERE p_partkey = 1990000
+  - name: part_rand_20
+    sql: SELECT * FROM part WHERE p_partkey = 2000000
+
+  # Supplier random lookups (range 1-100000 for SF10)
+  - name: supplier_rand_1
+    sql: SELECT * FROM supplier WHERE s_suppkey = 1230
+  - name: supplier_rand_2
+    sql: SELECT * FROM supplier WHERE s_suppkey = 4560
+  - name: supplier_rand_3
+    sql: SELECT * FROM supplier WHERE s_suppkey = 7890
+  - name: supplier_rand_4
+    sql: SELECT * FROM supplier WHERE s_suppkey = 12340
+  - name: supplier_rand_5
+    sql: SELECT * FROM supplier WHERE s_suppkey = 23450
+  - name: supplier_rand_6
+    sql: SELECT * FROM supplier WHERE s_suppkey = 34560
+  - name: supplier_rand_7
+    sql: SELECT * FROM supplier WHERE s_suppkey = 45670
+  - name: supplier_rand_8
+    sql: SELECT * FROM supplier WHERE s_suppkey = 56780
+  - name: supplier_rand_9
+    sql: SELECT * FROM supplier WHERE s_suppkey = 67890
+  - name: supplier_rand_10
+    sql: SELECT * FROM supplier WHERE s_suppkey = 78900
+  - name: supplier_rand_11
+    sql: SELECT * FROM supplier WHERE s_suppkey = 89010
+  - name: supplier_rand_12
+    sql: SELECT * FROM supplier WHERE s_suppkey = 90120
+  - name: supplier_rand_13
+    sql: SELECT * FROM supplier WHERE s_suppkey = 91230
+  - name: supplier_rand_14
+    sql: SELECT * FROM supplier WHERE s_suppkey = 92340
+  - name: supplier_rand_15
+    sql: SELECT * FROM supplier WHERE s_suppkey = 93450
+
+  # Lineitem composite key lookups (using valid sparse orderkeys)
+  # SF10 has ~60M lineitems
+  - name: lineitem_rand_1
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 1 AND l_linenumber = 1
+  - name: lineitem_rand_2
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 320 AND l_linenumber = 1
+  - name: lineitem_rand_3
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 1000 AND l_linenumber = 1
+  - name: lineitem_rand_4
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 9000 AND l_linenumber = 1
+  - name: lineitem_rand_5
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 99200 AND l_linenumber = 1
+  - name: lineitem_rand_6
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 1000000 AND l_linenumber = 1
+  - name: lineitem_rand_7
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 2000000 AND l_linenumber = 1
+  - name: lineitem_rand_8
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 3000000 AND l_linenumber = 1
+  - name: lineitem_rand_9
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 4000000 AND l_linenumber = 1
+  - name: lineitem_rand_10
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 5000000 AND l_linenumber = 1
+  - name: lineitem_rand_11
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 6000000 AND l_linenumber = 1
+  - name: lineitem_rand_12
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 7000000 AND l_linenumber = 1
+  - name: lineitem_rand_13
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 8000000 AND l_linenumber = 1
+  - name: lineitem_rand_14
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 9000000 AND l_linenumber = 1
+  - name: lineitem_rand_15
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 10000000 AND l_linenumber = 1
+
+  # Partsupp composite key lookups (pattern: suppkey = partkey + 1)
+  # SF10 has 8M partsupp rows
+  - name: partsupp_rand_1
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1 AND ps_suppkey = 2
+  - name: partsupp_rand_2
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1 AND ps_suppkey = 25002
+  - name: partsupp_rand_3
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1000 AND ps_suppkey = 1001
+  - name: partsupp_rand_4
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 10000 AND ps_suppkey = 10001
+  - name: partsupp_rand_5
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 100000 AND ps_suppkey = 1
+  - name: partsupp_rand_6
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 500000 AND ps_suppkey = 1
+  - name: partsupp_rand_7
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1000000 AND ps_suppkey = 1
+  - name: partsupp_rand_8
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1500000 AND ps_suppkey = 1
+  - name: partsupp_rand_9
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1990000 AND ps_suppkey = 90001
+  - name: partsupp_rand_10
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 2000000 AND ps_suppkey = 1
