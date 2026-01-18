@@ -98,12 +98,24 @@ impl JobStore {
     }
 
     /// Generates a new unique job ID.
+    ///
+    /// Returns a Databricks-style formatted ID like "01ABC-DEF-456-789".
+    /// Uses `UUIDv7` which contains a millisecond timestamp plus random bits.
     #[must_use]
     pub fn generate_job_id() -> String {
-        // Format: 01ABC-DEF-456 style (Databricks-like)
+        // Format: 01ABC-DEF-456-789 style (Databricks-like)
+        // UUIDv7 structure: 48-bit timestamp (ms) + 4-bit version + 12-bit rand + 62-bit rand
+        // We use characters 0-16 to include timestamp + version + random bits for uniqueness
         let uuid = Uuid::now_v7();
         let hex = uuid.simple().to_string();
-        format!("{}-{}-{}", &hex[0..5], &hex[5..8], &hex[8..11]).to_uppercase()
+        format!(
+            "{}-{}-{}-{}",
+            &hex[0..5],
+            &hex[5..8],
+            &hex[8..11],
+            &hex[11..14]
+        )
+        .to_uppercase()
     }
 
     /// Creates a new pending job and stores it.
@@ -657,12 +669,11 @@ mod tests {
     #[test]
     fn test_generate_job_id() {
         let id1 = JobStore::generate_job_id();
-        // UUIDv7 uses millisecond timestamp, so sleep briefly to ensure different IDs
-        std::thread::sleep(std::time::Duration::from_millis(2));
         let id2 = JobStore::generate_job_id();
 
-        assert_ne!(id1, id2);
-        assert_eq!(id1.len(), 13); // 5 + 1 + 3 + 1 + 3
-        assert!(id1.contains('-'));
+        // Even without sleep, UUIDv7 includes random bits that should differ
+        assert_ne!(id1, id2, "UUIDv7-based job IDs should be unique");
+        assert_eq!(id1.len(), 17); // 5 + 1 + 3 + 1 + 3 + 1 + 3
+        assert_eq!(id1.matches('-').count(), 3);
     }
 }
