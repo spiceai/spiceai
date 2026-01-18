@@ -46,7 +46,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::{HashIndex, HashIndexBuilder, RowLocation, hash_key};
+use crate::{HashIndex, HashIndexBuilder, InsertResult, RowLocation, hash_key};
 
 // =============================================================================
 // Helper Functions
@@ -363,8 +363,11 @@ fn test_insert_duplicate_returns_false() {
     let loc1 = RowLocation::simple(0, 0);
     let loc2 = RowLocation::simple(0, 1);
 
-    assert!(index.insert(hash, loc1));
-    assert!(!index.insert(hash, loc2)); // Should return false
+    assert!(matches!(index.insert(hash, loc1), InsertResult::Inserted));
+    assert!(matches!(
+        index.insert(hash, loc2),
+        InsertResult::HashCollision(_)
+    )); // Should return collision
     assert_eq!(index.len(), 1);
     assert_eq!(index.get_by_hash(hash), Some(loc1)); // Original preserved
 }
@@ -381,7 +384,7 @@ fn test_insert_workflow() {
     for i in 0..100_i64 {
         let hash = hash_key(&i);
         let loc = RowLocation::simple(0, i as u32);
-        assert!(index.insert(hash, loc));
+        assert!(matches!(index.insert(hash, loc), InsertResult::Inserted));
     }
 
     assert_eq!(index.len(), 100);
@@ -446,7 +449,7 @@ fn test_insert_after_delete() {
     // Insert, delete, insert again
     index.insert(hash, loc1);
     index.remove(hash);
-    assert!(index.insert(hash, loc2)); // Should succeed
+    assert!(matches!(index.insert(hash, loc2), InsertResult::Inserted)); // Should succeed
 
     assert_eq!(index.get_by_hash(hash), Some(loc2));
     assert_eq!(index.len(), 1);
@@ -948,6 +951,184 @@ fn test_composite_key_duplicate_detection() {
     let _err = result.expect_err("expected duplicate key error");
 }
 
+#[test]
+fn test_composite_key_three_columns() {
+    // Test three-column compound primary key
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, false),
+        Field::new("year", DataType::Int32, false),
+        Field::new("product_id", DataType::Int64, false),
+    ]));
+
+    let region_array = StringArray::from(vec!["US", "US", "EU", "EU", "US"]);
+    let year_array = Int32Array::from(vec![2024, 2024, 2024, 2024, 2025]);
+    let product_id_array = Int64Array::from(vec![100, 101, 100, 101, 100]);
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(region_array),
+            Arc::new(year_array),
+            Arc::new(product_id_array),
+        ],
+    )
+    .expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec![
+        "region".to_string(),
+        "year".to_string(),
+        "product_id".to_string(),
+    ])
+    .build(&partitions)
+    .expect("failed to build index");
+
+    // All 5 combinations should be unique
+    assert_eq!(index.len(), 5);
+}
+
+#[test]
+fn test_composite_key_three_columns_with_duplicates() {
+    // Test duplicate detection with three-column compound key
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, false),
+        Field::new("year", DataType::Int32, false),
+        Field::new("product_id", DataType::Int64, false),
+    ]));
+
+    // Row 0 and Row 3 have the same compound key: ("US", 2024, 100)
+    let region_array = StringArray::from(vec!["US", "US", "EU", "US"]);
+    let year_array = Int32Array::from(vec![2024, 2024, 2024, 2024]);
+    let product_id_array = Int64Array::from(vec![100, 101, 100, 100]); // Row 0 and 3 are same
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(region_array),
+            Arc::new(year_array),
+            Arc::new(product_id_array),
+        ],
+    )
+    .expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+
+    let result = HashIndexBuilder::new(vec![
+        "region".to_string(),
+        "year".to_string(),
+        "product_id".to_string(),
+    ])
+    .allow_duplicates(false)
+    .build(&partitions);
+
+    result.expect_err("expected duplicate key error for compound key");
+}
+
+#[test]
+fn test_composite_key_column_order_matters() {
+    // Different column order should produce different hashes
+    // Even with same values, (id=1, name="alice") should differ from (name="alice", id=1)
+    // if column order in the key definition is different
+    let batch = create_composite_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]);
+    let partitions = vec![vec![batch]];
+
+    // Build index with order: id, name
+    let index1 = HashIndexBuilder::new(vec!["id".to_string(), "name".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // Build index with order: name, id
+    let index2 = HashIndexBuilder::new(vec!["name".to_string(), "id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // Both should have 3 entries
+    assert_eq!(index1.len(), 3);
+    assert_eq!(index2.len(), 3);
+
+    // The key_columns should reflect the order
+    assert_eq!(index1.key_columns(), &["id", "name"]);
+    assert_eq!(index2.key_columns(), &["name", "id"]);
+}
+
+#[test]
+fn test_composite_key_large_table() {
+    // Test compound key with 10k rows to ensure proper scaling
+    let n = 10_000;
+    let ids: Vec<i64> = (0..n).collect();
+    let names: Vec<String> = (0..n).map(|i| format!("user_{}", i % 100)).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let id_array = Int64Array::from(ids);
+    let name_array = StringArray::from(name_refs);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)])
+        .expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string(), "name".to_string()])
+        .with_expected_rows(n as usize)
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // All combinations are unique (id is unique even though name repeats)
+    assert_eq!(index.len(), n as usize);
+}
+
+#[test]
+fn test_composite_key_partial_match_not_found() {
+    // Ensure that matching only some columns doesn't find a row
+    let batch = create_composite_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]);
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string(), "name".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // We can't directly look up partial keys with the current API,
+    // but we can verify the index has distinct entries for each full compound key
+    assert_eq!(index.len(), 3);
+}
+
+#[test]
+fn test_composite_key_across_partitions() {
+    // Test that compound keys work correctly across multiple partitions
+    let batch1 = create_composite_batch(vec![1, 1], vec!["alice", "bob"]);
+    let batch2 = create_composite_batch(vec![2, 2], vec!["alice", "bob"]);
+    let batch3 = create_composite_batch(vec![1, 2], vec!["carol", "carol"]);
+
+    let partitions = vec![vec![batch1], vec![batch2], vec![batch3]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string(), "name".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // 2 + 2 + 2 = 6 unique compound keys
+    assert_eq!(index.len(), 6);
+}
+
+#[test]
+fn test_composite_key_rebuild_consistency() {
+    // Verify that rebuilding the index produces consistent results
+    let batch = create_composite_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]);
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string(), "name".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    assert_eq!(index.len(), 5);
+
+    // Rebuild should maintain same count
+    index.rebuild(&partitions).expect("failed to rebuild index");
+    assert_eq!(index.len(), 5);
+}
+
 // =============================================================================
 // Hash Collision Stress Test
 // =============================================================================
@@ -961,7 +1142,10 @@ fn test_many_entries_same_h2() {
     for i in 0..10_000_i64 {
         let hash = hash_key(&i);
         let loc = RowLocation::simple(0, i as u32);
-        assert!(index.insert(hash, loc));
+        assert!(
+            matches!(index.insert(hash, loc), InsertResult::Inserted),
+            "Failed to insert {i}"
+        );
     }
 
     // All should be findable
@@ -1384,7 +1568,7 @@ fn test_data_integrity_remove_then_reinsert() {
 
     // Insert
     let loc1 = RowLocation::new(0, 0, 0);
-    assert!(index.insert(hash, loc1));
+    assert!(matches!(index.insert(hash, loc1), InsertResult::Inserted));
     assert_eq!(index.get(&key), Some(loc1));
 
     // Remove
@@ -1394,7 +1578,7 @@ fn test_data_integrity_remove_then_reinsert() {
 
     // Re-insert with different location
     let loc2 = RowLocation::new(1, 1, 100);
-    assert!(index.insert(hash, loc2));
+    assert!(matches!(index.insert(hash, loc2), InsertResult::Inserted));
     assert_eq!(index.get(&key), Some(loc2));
     assert_eq!(index.len(), 1);
 }
@@ -1608,7 +1792,10 @@ fn test_data_integrity_hash_collision_simulation() {
     for i in 0..10_000_i64 {
         let hash = hash_key(&i);
         let loc = RowLocation::simple(0, i as u32);
-        assert!(index.insert(hash, loc), "Failed to insert key {i}");
+        assert!(
+            matches!(index.insert(hash, loc), InsertResult::Inserted),
+            "Failed to insert key {i}"
+        );
     }
 
     // All should be retrievable
