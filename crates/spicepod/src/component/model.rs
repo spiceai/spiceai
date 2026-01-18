@@ -93,6 +93,7 @@ pub enum ModelSource {
     File,
     Databricks,
     Bedrock,
+    LiteLLM,
 }
 
 impl ModelSource {
@@ -172,6 +173,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Databricks)
         } else if value.starts_with("bedrock") {
             Ok(ModelSource::Bedrock)
+        } else if value.starts_with("litellm") {
+            Ok(ModelSource::LiteLLM)
         } else {
             Err("Unknown prefix")
         }
@@ -193,6 +196,7 @@ impl Display for ModelSource {
             ModelSource::SpiceAI => write!(f, "spiceai"),
             ModelSource::Databricks => write!(f, "databricks"),
             ModelSource::Bedrock => write!(f, "bedrock"),
+            ModelSource::LiteLLM => write!(f, "litellm"),
         }
     }
 }
