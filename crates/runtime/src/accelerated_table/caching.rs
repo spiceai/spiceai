@@ -1693,7 +1693,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use async_trait::async_trait;
     use datafusion::catalog::Session;
-    use datafusion::common::{Constraint, Constraints};
     use datafusion::datasource::TableType;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
