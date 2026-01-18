@@ -651,10 +651,6 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
 
 impl TableFunctionImpl for ReciprocalRankFusion {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        eprintln!("DEBUG RRF call with {} args:", args.len());
-        for (i, arg) in args.iter().enumerate() {
-            eprintln!("  arg[{}]: {:?}", i, arg);
-        }
         let rrf_args = ReciprocalRankFusionArgs::from_udtf_exprs(args)?;
         let rerank_and_fuse_df = self.rerank_and_fuse_df(&rrf_args)?;
         Ok(Arc::new(

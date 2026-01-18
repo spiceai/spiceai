@@ -253,7 +253,15 @@ impl VectorSearchTableFunc {
     }
 
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {
-        let mut args = args.iter();
+        // Filter out passthrough parameters (those with spice.parameter_name metadata)
+        // These are meant for table functions like RRF, not for vector_search itself
+        let filtered_args: Vec<_> = args
+            .iter()
+            .filter(|arg| {
+                !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
+            })
+            .collect();
+        let mut args = filtered_args.into_iter();
 
         let tbl = args.next();
         let Some(Expr::Column(c)) = tbl else {
