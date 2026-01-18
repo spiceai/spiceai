@@ -13,7 +13,7 @@ version.workspace = true
 async-openai.workspace = true
 async-trait.workspace = true
 futures.workspace = true
-llms = { path = "../llms" }
+llms = { path = "../llms", default-features = false }
 rand.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true

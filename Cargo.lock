@@ -7450,7 +7450,7 @@ dependencies = [
 
 [[package]]
 name = "hash-index"
-version = "1.11.0-unstable"
+version = "1.11.0-enterprise-beta"
 dependencies = [
  "arrow",
  "arrow-array",
