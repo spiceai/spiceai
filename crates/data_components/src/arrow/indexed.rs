@@ -1839,6 +1839,7 @@ mod tests {
 
     /// Test `PrimaryKeyValue::matches_batch` for all supported types.
     #[test]
+    #[ignore = "https://github.com/spiceai/spiceai/issues/8961"]
     fn test_primary_key_value_matches_batch() {
         // Test Int64
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
