@@ -30,6 +30,20 @@ limitations under the License.
 //! Single-threaded: ~275M point lookups/sec\
 //! 8-threaded concurrent: ~27M ops/sec\
 //! Batch (1000 keys): 300M elements/sec
+//!
+//! # Platform Requirements
+//!
+//! This module requires at least a 64-bit platform. All `u64 -> usize` casts
+//! are safe because the Spice runtime requires `usize` to be at least 64 bits.
+
+// Spice runtime requires at least 64-bit pointer size. These casts are always safe.
+#![allow(clippy::cast_possible_truncation)]
+
+// Compile-time assertion: require at least 64-bit pointer size (8 bytes).
+const _: () = assert!(
+    size_of::<usize>() >= 8,
+    "hash-index requires a 64-bit platform (usize must be at least 8 bytes)"
+);
 
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -401,12 +415,6 @@ impl Shard {
     }
 }
 
-// Truncation for u64 -> usize is intentional on 32-bit platforms.
-// Hash index is 64-bit optimized; 32-bit targets won't see performance benefits anyway.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "32-bit truncation intentional"
-)]
 impl ShardTable {
     #[inline]
     fn get(&self, hash: u64) -> Option<RowLocation> {
