@@ -28,7 +28,10 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_expr::sqlparser::ast;
 use datafusion_expr::{Expr, LogicalPlan};
+#[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;

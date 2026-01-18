@@ -132,6 +132,7 @@ impl<
 
     async fn invalidate_all(&self) {
         self.cache.invalidate_all();
+        self.cache.run_pending_tasks().await;
     }
 
     async fn size_bytes(&self) -> u64 {

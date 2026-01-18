@@ -28,29 +28,31 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
-const (
-	GET  = "GET"
-	POST = "POST"
-)
-
 func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, method, path string, body *string) (T, error) {
 	var resp *http.Response
 	var err error
 
+	var reader io.Reader
+	if body != nil {
+		reader = strings.NewReader(*body)
+	}
+
 	switch method {
-	case GET:
-		resp, err = rtcontext.Do("GET", path, nil, "Content-Type", "application/json")
-
-	case POST:
-		var reader io.Reader
+	case http.MethodGet:
+		resp, err = rtcontext.Do(http.MethodGet, path, nil)
+	case http.MethodDelete:
+		resp, err = rtcontext.Do(http.MethodDelete, path, nil)
+	case http.MethodPost:
 		if body != nil {
-			reader = strings.NewReader(*body)
-		}
-
-		if body != nil {
-			resp, err = rtcontext.Do("POST", path, reader, "Content-Type", "application/json")
+			resp, err = rtcontext.Do(http.MethodPost, path, reader, "Content-Type", "application/json")
 		} else {
-			resp, err = rtcontext.Do("POST", path, reader)
+			resp, err = rtcontext.Do(http.MethodPost, path, reader)
+		}
+	case http.MethodPatch:
+		if body != nil {
+			resp, err = rtcontext.Do(http.MethodPatch, path, reader, "Content-Type", "application/json")
+		} else {
+			resp, err = rtcontext.Do(http.MethodPatch, path, reader)
 		}
 	default:
 		return *new(T), fmt.Errorf("unsupported method: %s", method)
@@ -90,7 +92,7 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 }
 
 func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T, error) {
-	result, err := doRuntimeApiRequest[[]T](rtcontext, GET, path, nil)
+	result, err := doRuntimeApiRequest[[]T](rtcontext, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +100,7 @@ func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T
 }
 
 func GetDataSingle[T interface{}](rtcontext *context.RuntimeContext, path string) (T, error) {
-	result, err := doRuntimeApiRequest[T](rtcontext, GET, path, nil)
+	result, err := doRuntimeApiRequest[T](rtcontext, http.MethodGet, path, nil)
 	if err != nil {
 		return *new(T), err
 	}
@@ -106,12 +108,20 @@ func GetDataSingle[T interface{}](rtcontext *context.RuntimeContext, path string
 }
 
 func PostRuntime[T interface{}](rtcontext *context.RuntimeContext, path string, body *string) (T, error) {
-	return doRuntimeApiRequest[T](rtcontext, POST, path, body)
+	return doRuntimeApiRequest[T](rtcontext, http.MethodPost, path, body)
+}
+
+func PatchRuntime[T interface{}](rtcontext *context.RuntimeContext, path string, body *string) (T, error) {
+	return doRuntimeApiRequest[T](rtcontext, http.MethodPatch, path, body)
+}
+
+func DeleteRuntime[T interface{}](rtcontext *context.RuntimeContext, path string) (T, error) {
+	return doRuntimeApiRequest[T](rtcontext, http.MethodDelete, path, nil)
 }
 
 func WriteDataTable[T interface{}](rtcontext *context.RuntimeContext, path string, t T) error {
 
-	items, err := doRuntimeApiRequest[[]T](rtcontext, GET, path, nil)
+	items, err := doRuntimeApiRequest[[]T](rtcontext, http.MethodGet, path, nil)
 
 	if err != nil {
 		return fmt.Errorf("error fetching runtime information: %w", err)
