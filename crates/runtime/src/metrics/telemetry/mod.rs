@@ -101,6 +101,7 @@ static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
             "The total amount of time spent planning and executing queries in milliseconds.",
         )
         .with_unit("ms")
+        .with_boundaries(telemetry::DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 
@@ -116,6 +117,7 @@ static QUERY_EXECUTION_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
             "The total amount of time spent only executing queries. This is 0 for cached queries.",
         )
         .with_unit("ms")
+        .with_boundaries(telemetry::DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 

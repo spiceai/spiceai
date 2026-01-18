@@ -83,7 +83,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-llms = { path = "../llms" }
+llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
 model_components = { path = "../model_components" }
 moka.workspace = true
@@ -96,7 +96,7 @@ once_cell = "1.21.3"
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.30", features = [
+opentelemetry-proto = { version = "0.31", features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",
@@ -225,6 +225,7 @@ test-framework = { path = "../test-framework" }
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+tar = "0.4"
 
 [features]
 aws-secrets-manager = [
@@ -250,7 +251,13 @@ default = [
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
-duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb", "datafusion-optimizer-rules/duckdb"]
+duckdb = [
+    "dep:duckdb",
+    "db_connection_pool/duckdb",
+    "data_components/duckdb",
+    "datafusion-optimizer-rules/duckdb",
+    "runtime-acceleration/duckdb",
+]
 dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb", "dep:dynamodb-streams", "dep:humantime"]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
@@ -267,6 +274,8 @@ models = [
     "dep:strsim",
     "runtime-datafusion-udfs/models",
     "search/llms",
+    "llms/local_llm",
+    "llms/local_embed",
 ]
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
@@ -306,6 +315,7 @@ sqlite = [
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "dep:rusqlite",
+    "runtime-acceleration/sqlite",
 ]
 turso = [
     "dep:turso",
@@ -314,6 +324,7 @@ turso = [
     "data_components/sqlite",
     "data_components/turso",
     "dep:rusqlite",
+    "runtime-acceleration/turso"
 ]
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso"] }

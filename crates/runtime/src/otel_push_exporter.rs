@@ -33,7 +33,6 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
-use futures::TryFutureExt;
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{
     metrics::{
@@ -73,47 +72,58 @@ impl FilteringExporter {
         }
     }
 
-    /// Returns true if the metric should be exported based on the whitelist.
-    fn should_export(&self, metric_name: &str) -> bool {
-        self.whitelist.is_empty() || self.whitelist.contains(metric_name)
-    }
-
-    /// Filters the metrics in place, removing any that don't match the whitelist.
-    fn filter_metrics(&self, resource_metrics: &mut ResourceMetrics) {
+    /// Check if the batch contains any metrics that match the whitelist.
+    ///
+    /// Returns true if:
+    /// - The whitelist is empty (export all metrics), OR
+    /// - At least one metric in the batch matches the whitelist
+    fn has_any_matching_metrics(&self, metrics: &ResourceMetrics) -> bool {
         if self.whitelist.is_empty() {
-            return; // No filtering needed
+            return true;
         }
 
-        for scope_metrics in &mut resource_metrics.scope_metrics {
-            scope_metrics
-                .metrics
-                .retain(|metric| self.should_export(&metric.name));
+        for scope_metrics in metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if self.whitelist.contains(metric.name()) {
+                    return true;
+                }
+            }
         }
-
-        // Remove empty scope_metrics
-        resource_metrics
-            .scope_metrics
-            .retain(|sm| !sm.metrics.is_empty());
+        false
     }
 }
 
 impl PushMetricExporter for FilteringExporter {
     fn export(
         &self,
-        metrics: &mut ResourceMetrics,
+        metrics: &ResourceMetrics,
     ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
-        self.filter_metrics(metrics);
-        self.inner.export(metrics).inspect_err(|err| {
-            match err {
-                opentelemetry_sdk::error::OTelSdkError::InternalFailure(msg) => {
-                    tracing::warn!("Failed to export metrics: {msg}");
-                }
-                opentelemetry_sdk::error::OTelSdkError::Timeout(duration) => {
-                    tracing::warn!("Failed to export metrics: timed out after {duration:?}");
-                }
-                opentelemetry_sdk::error::OTelSdkError::AlreadyShutdown => (), // No logging needed
+        // Check if any metrics in this batch match the whitelist.
+        // Note: Due to OpenTelemetry 0.31's immutable `&ResourceMetrics` API, we cannot
+        // filter individual metrics from the batch. Instead, we skip the entire export
+        // if NO metrics match the whitelist. When at least one metric matches, the
+        // entire batch is exported. For fine-grained filtering, configure the OTEL
+        // collector to filter metrics at ingestion time.
+        let should_export = self.has_any_matching_metrics(metrics);
+
+        async move {
+            if !should_export {
+                tracing::debug!("Skipping metrics export: no metrics match whitelist");
+                return Ok(());
             }
-        })
+
+            self.inner.export(metrics).await.inspect_err(|err| {
+                match err {
+                    opentelemetry_sdk::error::OTelSdkError::InternalFailure(msg) => {
+                        tracing::warn!("Failed to export metrics: {msg}");
+                    }
+                    opentelemetry_sdk::error::OTelSdkError::Timeout(duration) => {
+                        tracing::warn!("Failed to export metrics: timed out after {duration:?}");
+                    }
+                    opentelemetry_sdk::error::OTelSdkError::AlreadyShutdown => (), // No logging needed
+                }
+            })
+        }
     }
 
     fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
@@ -122,6 +132,13 @@ impl PushMetricExporter for FilteringExporter {
 
     fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
         self.inner.shutdown()
+    }
+
+    fn shutdown_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
     }
 
     fn temporality(&self) -> Temporality {

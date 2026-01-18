@@ -20,7 +20,7 @@ use arrow::array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder, make_b
 use arrow::array::{ListArray, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow_flight::{FlightData, SchemaAsIpc, flight_service_server::FlightService};
-use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator};
+use arrow_ipc::writer::{self, CompressionContext, DictionaryTracker, IpcDataGenerator};
 use data_components::cdc::changes_schema;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::sql::TableReference;
@@ -97,6 +97,7 @@ pub(crate) async fn handle(
     let response_stream = stream::unfold(rx, move |mut rx| {
         let encoder = IpcDataGenerator::default();
         let mut tracker = DictionaryTracker::new(false);
+        let mut compression_context = CompressionContext::default();
         let write_options = writer::IpcWriteOptions::default();
         let table_provider = Arc::clone(&table_provider_stream);
         async move {
@@ -150,9 +151,12 @@ pub(crate) async fn handle(
                             )));
                             schema_sent = true;
                         }
-                        let Ok((flight_dictionaries, flight_batch)) =
-                            encoder.encoded_batch(&new_record_batch, &mut tracker, &write_options)
-                        else {
+                        let Ok((flight_dictionaries, flight_batch)) = encoder.encode(
+                            &new_record_batch,
+                            &mut tracker,
+                            &write_options,
+                            &mut compression_context,
+                        ) else {
                             panic!("Unable to encode batch")
                         };
 

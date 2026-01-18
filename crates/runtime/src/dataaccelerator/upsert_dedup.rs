@@ -38,7 +38,7 @@ use datafusion::{
     },
 };
 use datafusion_table_providers::util::constraints::UpsertOptions;
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 
 /// A wrapper `TableProvider` that applies batch deduplication based on `UpsertOptions`
 /// before passing data to the underlying provider.
@@ -249,15 +249,17 @@ impl ExecutionPlan for UpsertDedupExec {
         let constraints = self.constraints.clone();
         let upsert_options = self.upsert_options.clone();
 
-        // Create a stream that applies deduplication to each batch
-        let dedup_stream = input_stream.then(move |batch_result| {
+        // Create a stream that validates constraints and applies deduplication to each batch.
+        // The validate_batch_with_constraints function handles both constraint validation and
+        // deduplication based on UpsertOptions (remove_duplicates, last_write_wins).
+        let validated_stream = input_stream.then(move |batch_result| {
             let constraints = constraints.clone();
             let upsert_options = upsert_options.clone();
             async move {
                 let batch = batch_result?;
 
-                // Apply constraint validation with deduplication
-                let deduplicated_batches =
+                // Apply constraint validation
+                let validated_batches =
                     datafusion_table_providers::util::constraints::validate_batch_with_constraints(
                         vec![batch],
                         &constraints,
@@ -266,19 +268,16 @@ impl ExecutionPlan for UpsertDedupExec {
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                Ok(deduplicated_batches)
+                // Return the first batch (we passed in one batch)
+                validated_batches.into_iter().next().ok_or_else(|| {
+                    DataFusionError::Internal("Expected validated batch".to_string())
+                })
             }
-        });
-
-        // Flatten the Vec<RecordBatch> results into individual batches
-        let flattened_stream = dedup_stream.flat_map(|result| match result {
-            Ok(batches) => stream::iter(batches.into_iter().map(Ok)).boxed(),
-            Err(e) => stream::once(async move { Err(e) }).boxed(),
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            flattened_stream,
+            validated_stream,
         )))
     }
 

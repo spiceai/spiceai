@@ -21,14 +21,14 @@ use aws_sdk_glue::{Client, types::Table};
 use aws_sdk_sts::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
-    CatalogBuilder, NamespaceIdent, TableIdent,
+    Catalog, CatalogBuilder, NamespaceIdent, TableIdent,
     io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN},
 };
 use iceberg_catalog_glue::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
     GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
 };
-use iceberg_datafusion::IcebergTableProvider;
+use iceberg_datafusion::IcebergStaticTableProvider;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::sync::LazyLock;
@@ -455,12 +455,21 @@ async fn create_iceberg_provider(
 
     let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());
 
-    let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
+    let iceberg_table = catalog.load_table(&identifier).await.map_err(|e| {
+        super::DataConnectorError::InvalidConfiguration {
+            dataconnector: PREFIX.to_string(),
+            connector_component: dataset.into(),
+            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+            source: e.into(),
+        }
+    })?;
+
+    let table_provider = IcebergStaticTableProvider::try_new_from_table(iceberg_table)
         .await
         .map_err(|e| super::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: dataset.into(),
-            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+            message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
             source: e.into(),
         })?;
 

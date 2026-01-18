@@ -818,9 +818,9 @@ impl RefreshTask {
             self.dataset_name,
         );
 
-        // Use the CacheRefreshHelper to identify and refresh stale rows
+        // Use the CacheRefreshHelper to identify and refresh all stale rows
         let federated_provider = self.federated.table_provider().await;
-        let refreshed_count = CacheRefreshHelper::refresh_stale_rows(
+        let refreshed_count = CacheRefreshHelper::refresh_all_stale_rows(
             federated_provider,
             Arc::clone(&self.accelerator),
             self.dataset_name.to_string().as_str(),

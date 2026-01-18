@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use crate::component::dataset::{ReadyState, TimeFormat};
-use crate::dataaccelerator::get_primary_keys_from_constraints;
+use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
 use crate::datafusion::error::SpiceExternalError;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
@@ -44,7 +45,6 @@ use datafusion::{
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
@@ -65,10 +65,12 @@ pub mod refresh_task;
 mod refresh_task_runner;
 mod retention;
 mod sink;
+mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
 
 pub use refresh_task_runner::RefreshTaskRunner;
+pub use snapshots::SnapshotCreationConfig;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -241,6 +243,9 @@ pub struct AcceleratedTable {
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// Tracks in-flight revalidation requests to avoid duplicate upstream requests during SWR window
     in_flight_revalidations: caching::InFlightRevalidations,
+    /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
+    /// `None` if no insert has occurred yet (and no bootstrap timestamp was provided).
+    last_updated_at: Option<Arc<AtomicI64>>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -278,6 +283,13 @@ fn validate_refresh_data_window(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotCreateTrigger {
+    RefreshComplete,
+    Interval(Duration),
+    Batches(i64),
+}
+
 #[expect(clippy::struct_excessive_bools)]
 pub struct Builder {
     runtime_status: Arc<status::RuntimeStatus>,
@@ -299,10 +311,7 @@ pub struct Builder {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
-    snapshot_behavior: SnapshotBehavior,
-    snapshot_local_path: Option<PathBuf>,
-    snapshots_trigger_threshold: Option<i64>,
-    snapshots_create_interval: Option<Duration>,
+    snapshot_creation_config: Option<SnapshotCreationConfig>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -310,6 +319,7 @@ pub struct Builder {
     caching_stale_while_revalidate_ttl: Option<Duration>,
     caching_stale_if_error: bool,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    bootstrap_status: BootstrapStatus,
 }
 
 impl Builder {
@@ -342,10 +352,7 @@ impl Builder {
             write_to_accelerator_only: false,
             initial_load_complete: false,
             refresh_semaphore: None,
-            snapshot_behavior: SnapshotBehavior::default(),
-            snapshot_local_path: None,
-            snapshots_trigger_threshold: None,
-            snapshots_create_interval: None,
+            snapshot_creation_config: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
@@ -353,6 +360,7 @@ impl Builder {
             caching_stale_while_revalidate_ttl: None,
             caching_stale_if_error: false,
             resource_monitor: None,
+            bootstrap_status: BootstrapStatus::none(),
         }
     }
 
@@ -488,17 +496,11 @@ impl Builder {
     }
 
     /// Configure whether snapshots are taken of the accelerated table after refreshes.
-    pub fn snapshot_behavior(
+    pub fn snapshot_creation_config(
         &mut self,
-        snapshot_behavior: SnapshotBehavior,
-        snapshot_path: Option<PathBuf>,
-        snapshots_trigger_threshold: Option<i64>,
-        snapshots_create_interval: Option<Duration>,
+        snapshot_config: Option<SnapshotCreationConfig>,
     ) -> &mut Self {
-        self.snapshot_behavior = snapshot_behavior;
-        self.snapshot_local_path = snapshot_path;
-        self.snapshots_trigger_threshold = snapshots_trigger_threshold;
-        self.snapshots_create_interval = snapshots_create_interval;
+        self.snapshot_creation_config = snapshot_config;
         self
     }
 
@@ -520,6 +522,12 @@ impl Builder {
     /// Set whether to serve expired data on upstream error in cache mode
     pub fn caching_stale_if_error(&mut self, enabled: bool) -> &mut Self {
         self.caching_stale_if_error = enabled;
+        self
+    }
+
+    /// Set whether the dataset was bootstrapped from a snapshot.
+    pub fn bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
+        self.bootstrap_status = bootstrap_status;
         self
     }
 
@@ -624,6 +632,12 @@ impl Builder {
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
+        // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
+        // Initialize from bootstrap metadata if available, otherwise None.
+        let last_updated_at: Option<Arc<AtomicI64>> = self
+            .bootstrap_status
+            .last_updated_at()
+            .map(|ts| Arc::new(AtomicI64::new(ts)));
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -635,12 +649,13 @@ impl Builder {
             self.io_runtime.clone(),
             Arc::clone(&accelerator_write_mutex),
         );
+        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
-        refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
+        refresher.with_last_updated_at(last_updated_at.clone());
         refresher.with_metrics(self.metrics);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
@@ -648,12 +663,9 @@ impl Builder {
         if let Some(semaphore) = self.refresh_semaphore {
             refresher.semaphore(semaphore);
         }
-        refresher.with_snapshot_behavior(
-            self.snapshot_behavior,
-            self.snapshot_local_path.clone(),
-            self.snapshots_trigger_threshold,
-            self.snapshots_create_interval,
-        );
+
+        refresher.with_snapshot_creation_config(self.snapshot_creation_config);
+        refresher.set_bootstrap_status(self.bootstrap_status);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
@@ -755,6 +767,7 @@ impl Builder {
             io_runtime: self.io_runtime,
             accelerator_write_mutex,
             in_flight_revalidations,
+            last_updated_at,
         })
     }
 }
@@ -966,11 +979,18 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
-        // In caching mode, pass filters to accelerator so it can check for cached data.
-        // If accelerator returns 0 rows → cache miss → fetch from source.
+        // For caching mode, extend projection to include fetched_at for freshness checking if needed.
+        // Added columns will be automatically stripped by `SchemaCastScanExec`, similar to
+        // fallback-to-source on cache miss where results return all columns.
+        let extended_projection = if is_caching_mode {
+            extend_projection_for_caching(projection, &self.accelerator.schema())
+        } else {
+            None
+        };
+        let scan_projection = extended_projection.as_ref().or(projection);
         let input = self
             .accelerator
-            .scan(state, projection, filters, limit)
+            .scan(state, scan_projection, filters, limit)
             .await?;
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
@@ -1021,12 +1041,22 @@ impl TableProvider for AcceleratedTable {
         Ok(Arc::new(SchemaCastScanExec::new(plan, self.schema())))
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     async fn insert_into(
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Update last_updated_at timestamp
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        if let Some(ref last_updated_at) = self.last_updated_at {
+            last_updated_at.store(now_ms, Ordering::Release);
+        }
+
         // When on_conflict is configured, writes go only to the accelerator
         // (the federated source may not support writes, e.g., file connector).
         if self.write_to_accelerator_only {
@@ -1055,15 +1085,31 @@ impl TableProvider for AcceleratedTable {
             .await?;
 
         // Return the equivalent of a UNION ALL that inserts both into the acceleration and federated source tables.
-        let union_plan = Arc::new(UnionExec::new(vec![
-            accelerated_insert_plan,
-            federated_insert_plan,
-        ]));
+        let union_plan: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![accelerated_insert_plan, federated_insert_plan])?;
 
         self.refresher().set_initial_load_completed(true);
 
         Ok(union_plan)
     }
+}
+
+/// Extends projection to include `fetched_at` column for cache freshness checking.
+/// Returns `Some(extended_projection)` if extension was needed,
+/// or `None` if no extension needed (projection already includes it or is None).
+fn extend_projection_for_caching(
+    projection: Option<&Vec<usize>>,
+    schema: &SchemaRef,
+) -> Option<Vec<usize>> {
+    let proj = projection?;
+    let idx = schema.index_of(caching::CACHE_REFRESHED_AT_COLUMN).ok()?;
+    if proj.contains(&idx) {
+        return None;
+    }
+    // User projection doesn't include fetched_at - add it as last column
+    let mut extended = proj.clone();
+    extended.push(idx);
+    Some(extended)
 }
 
 #[derive(Debug)]
@@ -1220,5 +1266,70 @@ impl Retention {
     #[must_use]
     pub fn builder() -> RetentionBuilder {
         RetentionBuilder::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+    fn schema_with_fetched_at() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(
+                caching::CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]))
+    }
+
+    #[test]
+    fn test_extend_projection_none_returns_none() {
+        let schema = schema_with_fetched_at();
+        let result = extend_projection_for_caching(None, &schema);
+        assert!(result.is_none(), "None projection should return None");
+    }
+
+    #[test]
+    fn test_extend_projection_already_includes_fetched_at() {
+        let schema = schema_with_fetched_at();
+        // Projection includes fetched_at (index 3)
+        let projection = vec![0, 1, 3];
+        let result = extend_projection_for_caching(Some(&projection), &schema);
+        assert!(
+            result.is_none(),
+            "Projection already including fetched_at should return None"
+        );
+    }
+
+    #[test]
+    fn test_extend_projection_adds_fetched_at() {
+        let schema = schema_with_fetched_at();
+        // Projection does NOT include fetched_at
+        let projection = vec![0, 2]; // id, content
+        let extended = extend_projection_for_caching(Some(&projection), &schema)
+            .expect("Should extend projection");
+        assert_eq!(
+            extended,
+            vec![0, 2, 3],
+            "Should add fetched_at index at end"
+        );
+    }
+
+    #[test]
+    fn test_extend_projection_single_column() {
+        let schema = schema_with_fetched_at();
+        let projection = vec![2]; // just content
+        let extended = extend_projection_for_caching(Some(&projection), &schema)
+            .expect("Should extend projection");
+        assert_eq!(
+            extended,
+            vec![2, 3],
+            "Should add fetched_at to single column"
+        );
     }
 }

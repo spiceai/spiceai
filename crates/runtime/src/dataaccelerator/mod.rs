@@ -32,6 +32,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
 use linkme::distributed_slice;
+use runtime_acceleration::snapshot::{SnapshotAdapter, SnapshotDownloadInfo};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -370,12 +371,19 @@ pub trait DataAccelerator: Send + Sync {
     /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
 
+    /// Provides snapshot handling configuration for this accelerator.
+    fn snapshot_adapter(&self) -> SnapshotAdapter {
+        SnapshotAdapter::default()
+    }
+
     /// Initialize the accelerator for a component
+    /// Returns `WasBootstrapped::yes()` if the accelerator was initialized from existing data,
+    /// `WasBootstrapped::no()` otherwise.
     async fn init(
         &self,
         _source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(BootstrapStatus::none())
     }
 
     /// Check if the accelerator is initialized for a component
@@ -566,6 +574,7 @@ impl AcceleratorExternalTableBuilder {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -654,6 +663,39 @@ async fn get_registered_accelerator(
         .accelerator_engine_registry()
         .get_accelerator_engine(engine)
         .await
+}
+
+/// Indicates whether a data accelerator was bootstrapped (initialized from existing data)
+/// during initialization, and carries any metadata from the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapStatus {
+    Bootstrapped(SnapshotDownloadInfo),
+    None,
+}
+
+impl BootstrapStatus {
+    #[must_use]
+    pub const fn bootstrapped(info: SnapshotDownloadInfo) -> Self {
+        Self::Bootstrapped(info)
+    }
+
+    #[must_use]
+    pub const fn none() -> Self {
+        Self::None
+    }
+
+    #[must_use]
+    pub fn is_bootstrapped(&self) -> bool {
+        matches!(self, Self::Bootstrapped { .. })
+    }
+
+    #[must_use]
+    pub const fn last_updated_at(&self) -> Option<i64> {
+        match self {
+            Self::None => None,
+            Self::Bootstrapped(info) => info.last_updated_at,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +982,7 @@ mod accelerator_compat_tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -2196,6 +2239,7 @@ mod accelerator_compat_tests {
                     file_type: String::new(),
                     table_partition_cols: vec![],
                     if_not_exists: true,
+                    or_replace: false,
                     definition: None,
                     order_exprs: vec![],
                     unbounded: false,

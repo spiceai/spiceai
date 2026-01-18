@@ -188,6 +188,7 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
 }
 
 impl From<ModelSourceType> for Option<Box<dyn ModelSource>> {
+    #[cfg_attr(not(feature = "full"), allow(unused_variables))]
     fn from(source: ModelSourceType) -> Self {
         #[cfg(feature = "full")]
         if source == ModelSourceType::Local {

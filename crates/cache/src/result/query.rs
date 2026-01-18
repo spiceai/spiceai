@@ -190,8 +190,18 @@ impl CachedQueryResult {
 
 impl Sizeable for CachedQueryResult {
     fn get_memory_size(&self) -> usize {
-        // Delegate to accurate memory_size() method, cap at usize::MAX
-        self.memory_size().try_into().unwrap_or(usize::MAX)
+        // Delegate to accurate memory_size() method, cap at usize::MAX.
+        // If the value does not fit into usize (e.g., on 32-bit platforms), log and saturate.
+        let total_size = self.memory_size();
+        if let Ok(size) = usize::try_from(total_size) {
+            size
+        } else {
+            tracing::warn!(
+                actual_size = total_size,
+                "CachedQueryResult::memory_size exceeds usize::MAX; saturating to usize::MAX"
+            );
+            usize::MAX
+        }
     }
 }
 

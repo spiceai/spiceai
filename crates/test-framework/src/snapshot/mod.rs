@@ -43,7 +43,10 @@ pub async fn record_explain_plan(
         .await
         .map_err(|e| anyhow::anyhow!("query `{query_name}` to plan: {e}"))?;
 
-    let explain_plan = arrow::util::pretty::pretty_format_batches(&plan_results)?;
+    let explain_plan_raw = arrow::util::pretty::pretty_format_batches(&plan_results)?;
+
+    // Sort PartitionedUnionExec children for deterministic snapshot comparison
+    let explain_plan = sort_partitioned_union_children(&explain_plan_raw.to_string());
 
     let mut assertion_err: Option<String> = None;
 
@@ -89,6 +92,108 @@ pub async fn record_explain_plan(
     }
 
     Ok(())
+}
+
+/// Sorts children of `PartitionedUnionExec` nodes in the explain plan output
+/// to ensure deterministic snapshot comparison.
+///
+/// The approach: when we find `PartitionedUnionExec`, we identify child subtrees
+/// by their indentation level. Lines at the first child's indent level start new
+/// subtrees. We sort all subtrees alphabetically.
+fn sort_partitioned_union_children(explain_plan: &str) -> String {
+    // if no PartitionedUnionExec, return unchanged
+    if !explain_plan.contains("PartitionedUnionExec") {
+        return explain_plan.to_string();
+    }
+
+    let lines: Vec<&str> = explain_plan.lines().collect();
+    let mut result: Vec<String> = Vec::with_capacity(lines.len());
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        result.push(line.to_string());
+
+        // Check if this line contains PartitionedUnionExec
+        if line.contains("PartitionedUnionExec") && i + 1 < lines.len() {
+            let parent_indent = get_indent_level(line);
+            let first_child_indent = get_indent_level(lines[i + 1]);
+
+            // The first child should have greater indentation
+            if first_child_indent <= parent_indent {
+                i += 1;
+                continue;
+            }
+
+            // Collect all lines that belong to PartitionedUnionExec children
+            // Stop at empty-content lines (table separators) or lower indent
+            let children_start = i + 1;
+            let mut children_end = children_start;
+            while children_end < lines.len() {
+                let child_line = lines[children_end];
+                // Stop at empty-content lines (table row separators)
+                if is_empty_content_line(child_line) {
+                    break;
+                }
+                let child_indent = get_indent_level(child_line);
+                if child_indent <= parent_indent {
+                    break;
+                }
+                children_end += 1;
+            }
+
+            // Split children into subtrees based on indent level
+            let mut subtrees: Vec<Vec<&str>> = Vec::new();
+            let mut current_subtree: Vec<&str> = Vec::new();
+
+            for current_line in lines.iter().take(children_end).skip(children_start) {
+                // A line at the first child's indent level starts a new subtree
+                if get_indent_level(current_line) == first_child_indent
+                    && !current_subtree.is_empty()
+                {
+                    subtrees.push(current_subtree);
+                    current_subtree = Vec::new();
+                }
+                current_subtree.push(current_line);
+            }
+            if !current_subtree.is_empty() {
+                subtrees.push(current_subtree);
+            }
+
+            // Sort all subtrees by their string representation
+            subtrees.sort_by(|a, b| {
+                let a_str = a.join("\n");
+                let b_str = b.join("\n");
+                a_str.cmp(&b_str)
+            });
+
+            // Add sorted subtrees to result
+            for subtree in &subtrees {
+                for subtree_line in subtree {
+                    result.push((*subtree_line).to_string());
+                }
+            }
+
+            i = children_end;
+            continue;
+        }
+        i += 1;
+    }
+
+    result.join("\n")
+}
+
+/// Checks if a line contains only whitespace and `|` characters (empty table cell).
+fn is_empty_content_line(line: &str) -> bool {
+    line.chars().all(|c| c.is_whitespace() || c == '|')
+}
+
+/// Gets the indentation level of a line in the explain plan.
+/// Counts leading whitespace and `|` characters before the first content.
+fn get_indent_level(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| c.is_whitespace() || *c == '|')
+        .count()
 }
 
 #[cfg(test)]
@@ -166,5 +271,133 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children() {
+        // Simplified explain plan with out-of-order PartitionedUnionExec children
+        let input = r#"|               |                                       PartitionedUnionExec                                   |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=3/orders"     |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=1/orders"     |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=2/orders"     |
+|               |                         AggregateExec: mode=Final                                                  |"#;
+
+        // All children sorted alphabetically (1, 2, 3)
+        let expected = r#"|               |                                       PartitionedUnionExec                                   |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=1/orders"     |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=2/orders"     |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=3/orders"     |
+|               |                         AggregateExec: mode=Final                                                  |"#;
+
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children_plain_format() {
+        // Plain format (non-table) with out-of-order children
+        let input = r"SchemaCastScanExec
+  PartitionedUnionExec
+    CayenneAccelerationExec partition=3
+      BytesProcessedExec
+        DataSourceExec
+    CayenneAccelerationExec partition=1
+      BytesProcessedExec
+        DataSourceExec
+    CayenneAccelerationExec partition=2
+      BytesProcessedExec
+        DataSourceExec
+  SomeOtherExec";
+
+        // All children sorted alphabetically (1, 2, 3)
+        let expected = r"SchemaCastScanExec
+  PartitionedUnionExec
+    CayenneAccelerationExec partition=1
+      BytesProcessedExec
+        DataSourceExec
+    CayenneAccelerationExec partition=2
+      BytesProcessedExec
+        DataSourceExec
+    CayenneAccelerationExec partition=3
+      BytesProcessedExec
+        DataSourceExec
+  SomeOtherExec";
+
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children_no_union() {
+        // Plan without PartitionedUnionExec should be unchanged
+        let input = r"|               |   ProjectionExec                    |
+|               |     SortExec                        |
+|               |       AggregateExec                 |";
+
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_get_indent_level() {
+        // Table format: counts whitespace and | before first content
+        assert_eq!(
+            super::get_indent_level("|               |   PartitionedUnionExec   |"),
+            20 // |, 15 spaces, |, 3 spaces
+        );
+        assert_eq!(
+            super::get_indent_level("|               |     CooperativeExec      |"),
+            22 // |, 15 spaces, |, 5 spaces
+        );
+        assert_eq!(
+            super::get_indent_level("|               | PartitionedUnionExec     |"),
+            18 // |, 15 spaces, |, 1 space
+        );
+        // Plain format: counts leading spaces
+        assert_eq!(super::get_indent_level("  PartitionedUnionExec"), 2);
+        assert_eq!(super::get_indent_level("    CayenneAccelerationExec"), 4);
+        assert_eq!(super::get_indent_level("SchemaCastScanExec"), 0);
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children_empty() {
+        // PartitionedUnionExec with no children (sibling follows at same indent)
+        let input = r"|               |                                       PartitionedUnionExec                                   |
+|               |                         AggregateExec: mode=Final                                                  |
+|               |                           ProjectionExec                                                           |";
+
+        // Should remain unchanged - no children to sort
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children_trailing_empty_line() {
+        // Table format with trailing empty line in last child - should be preserved at end
+        let input = r"|               |                                       PartitionedUnionExec                                   |
+|               |                                         CooperativeExec partition=2                                |
+|               |                                         CooperativeExec partition=1                                |
+|               |                                                                                                    |";
+
+        // Children sorted (1, 2), trailing empty line stays at end
+        let expected = r"|               |                                       PartitionedUnionExec                                   |
+|               |                                         CooperativeExec partition=1                                |
+|               |                                         CooperativeExec partition=2                                |
+|               |                                                                                                    |";
+
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, expected);
     }
 }

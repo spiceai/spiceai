@@ -131,6 +131,7 @@ macro_rules! handle_primitive_nullable_type {
 /// # Errors
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
+#[expect(clippy::too_many_lines, reason = "Large function due to API upgrade")]
 pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Option<Field>> = Vec::new();
     let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();

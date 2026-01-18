@@ -642,6 +642,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use arrow::array::Int64Array;
+    use datafusion::scalar::ScalarValue;
 
     use futures::TryStreamExt;
 
@@ -927,7 +928,7 @@ mod tests {
         }))
         .await;
 
-        let parameters = ParamValues::List(vec![1.into()]);
+        let parameters = ParamValues::from(vec![ScalarValue::Int32(Some(1))]);
 
         let request_context =
             create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
@@ -949,7 +950,7 @@ mod tests {
             })
             .await;
 
-        let parameters = ParamValues::List(vec![2.into()]);
+        let parameters = ParamValues::from(vec![ScalarValue::Int32(Some(2))]);
 
         let query_builder =
             QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
@@ -971,7 +972,7 @@ mod tests {
         }))
         .await;
 
-        let parameters = ParamValues::List(vec![1.into()]);
+        let parameters = ParamValues::from(vec![ScalarValue::Int32(Some(1))]);
 
         let request_context =
             create_test_request_context(CacheControl::Cache(CacheKeyType::Default), None);
@@ -993,7 +994,7 @@ mod tests {
             })
             .await;
 
-        let parameters = ParamValues::List(vec![2.into()]);
+        let parameters = ParamValues::from(vec![ScalarValue::Int32(Some(2))]);
 
         let query_builder =
             QueryBuilder::new("SELECT $1", Arc::clone(&df)).parameters(Some(parameters));
@@ -1013,7 +1014,7 @@ mod tests {
             })
             .await;
 
-        let parameters = ParamValues::List(vec![2.into()]);
+        let parameters = ParamValues::from(vec![ScalarValue::Int32(Some(2))]);
 
         // Repeat the same query to ensure a cache hit
         let query_builder =
