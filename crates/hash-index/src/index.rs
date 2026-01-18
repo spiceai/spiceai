@@ -322,24 +322,39 @@ struct ShardTable {
 }
 
 /// Sentinel value used to mark empty slots in the hash table.
-/// We reserve 0 as the empty marker, so any hash that equals 0 is remapped to 1.
-const EMPTY_SLOT_SENTINEL: u64 = 0;
+/// We use `u64::MAX` as the empty marker to avoid collision with common hash values.
+const EMPTY_SLOT_SENTINEL: u64 = u64::MAX;
 
 /// Normalizes a hash value to avoid collision with the empty-slot sentinel.
-/// If the hash equals `EMPTY_SLOT_SENTINEL` (0), it is mapped to 1.
+/// If the hash equals `EMPTY_SLOT_SENTINEL` (`u64::MAX`), it is mapped to `u64::MAX - 1`.
 /// This ensures no valid key can produce a hash that looks like an empty slot.
+/// Using `u64::MAX` as sentinel avoids the collision issue that would occur with 0,
+/// where remapping 0→1 would create collisions between distinct keys.
 #[inline]
 const fn normalize_hash(hash: u64) -> u64 {
-    if hash == EMPTY_SLOT_SENTINEL { 1 } else { hash }
+    if hash == EMPTY_SLOT_SENTINEL {
+        u64::MAX - 1
+    } else {
+        hash
+    }
 }
 
 /// A slot in the hash table.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Slot {
-    /// The normalized hash value. `EMPTY_SLOT_SENTINEL` (0) indicates an empty slot.
-    /// Any actual hash that equals 0 is remapped to 1 via `normalize_hash()`.
+    /// The normalized hash value. `EMPTY_SLOT_SENTINEL` (`u64::MAX`) indicates an empty slot.
+    /// Any actual hash that equals `u64::MAX` is remapped to `u64::MAX - 1` via `normalize_hash()`.
     hash: u64,
     location: RowLocation,
+}
+
+impl Default for Slot {
+    fn default() -> Self {
+        Self {
+            hash: EMPTY_SLOT_SENTINEL,
+            location: RowLocation::new(0, 0, 0),
+        }
+    }
 }
 
 impl Shard {
@@ -409,7 +424,7 @@ impl ShardTable {
                 return Some(slot.location);
             }
 
-            if slot.hash == 0 {
+            if slot.hash == EMPTY_SLOT_SENTINEL {
                 return None;
             }
 
@@ -432,7 +447,7 @@ impl ShardTable {
         loop {
             let slot = &mut self.slots[idx];
 
-            if slot.hash == 0 {
+            if slot.hash == EMPTY_SLOT_SENTINEL {
                 slot.hash = hash;
                 slot.location = location;
                 self.len += 1;
@@ -457,7 +472,7 @@ impl ShardTable {
         loop {
             let slot = &mut self.slots[idx];
 
-            if slot.hash == 0 {
+            if slot.hash == EMPTY_SLOT_SENTINEL {
                 slot.hash = hash;
                 slot.location = location;
                 self.len += 1;
@@ -492,7 +507,7 @@ impl ShardTable {
                 return Some(location);
             }
 
-            if slot.hash == 0 {
+            if slot.hash == EMPTY_SLOT_SENTINEL {
                 return None;
             }
 
@@ -511,7 +526,7 @@ impl ShardTable {
 
         loop {
             let slot = self.slots[current_idx];
-            if slot.hash == 0 {
+            if slot.hash == EMPTY_SLOT_SENTINEL {
                 break;
             }
 
@@ -540,10 +555,10 @@ impl ShardTable {
         let new_mask = new_capacity - 1;
 
         for slot in &self.slots {
-            if slot.hash != 0 {
+            if slot.hash != EMPTY_SLOT_SENTINEL {
                 let mut idx = (slot.hash as usize) & new_mask;
                 loop {
-                    if new_slots[idx].hash == 0 {
+                    if new_slots[idx].hash == EMPTY_SLOT_SENTINEL {
                         new_slots[idx] = *slot;
                         break;
                     }
