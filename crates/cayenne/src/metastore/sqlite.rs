@@ -507,12 +507,19 @@ impl MetastoreBackend for SqliteMetastore {
                 if journal_mode.eq_ignore_ascii_case("wal") {
                     tracing::info!("Truncating Cayenne catalog WAL log");
                     // Truncate the WAL log to persist changes and reduce file size
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+                    // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
+                    let _: (i32, i32, i32) = conn.query_row(
+                        "PRAGMA wal_checkpoint(TRUNCATE)",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?;
                 }
 
                 // Run optimize to improve query performance for future connections
+                // PRAGMA optimize may return rows indicating what was optimized
                 tracing::info!("Running optimize on Cayenne catalog");
-                conn.execute("PRAGMA optimize", [])?;
+                let mut stmt = conn.prepare("PRAGMA optimize")?;
+                let _ = stmt.query([])?.next(); // Consume any results
 
                 Ok::<_, rusqlite::Error>(())
             })
@@ -522,6 +529,14 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to shutdown catalog: {e}"),
                 },
             )?;
+
+            // Explicitly close the connection to ensure clean shutdown.
+            // Clone creates a handle to the same background thread, and closing it
+            // will close the underlying connection. Subsequent operations on the
+            // original handle will return ConnectionClosed error.
+            if let Err(e) = conn.clone().close().await {
+                tracing::warn!("Failed to close Cayenne catalog connection: {e}");
+            }
         }
 
         Ok(())
