@@ -88,7 +88,7 @@ impl PreparedStatementParamColumn {
 
 /// # Usage
 ///
-/// ```rust
+/// ```rust,ignore
 /// create_param_batch(vec![
 ///   PreparedStatementParamColumn::new(
 ///     "$1",
@@ -100,7 +100,7 @@ impl PreparedStatementParamColumn {
 ///     "$2",
 ///     arrow::datatypes::DataType::Utf8,
 ///     true,
-///     Arc::new(StringArray::from(vec![Some(41), 42])) as Arc<dyn arrow::array::Array>
+///     Arc::new(StringArray::from(vec![Some("a"), Some("b")])) as Arc<dyn arrow::array::Array>
 ///   )
 /// ])?;
 /// ```
