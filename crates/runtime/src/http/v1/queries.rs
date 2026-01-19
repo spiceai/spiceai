@@ -256,8 +256,8 @@ pub(crate) async fn submit(
                     state: state.status.to_string(),
                     error: None,
                 },
-                status_url: format!("/api/v1/queries/{query_id}/status"),
-                results_url: format!("/api/v1/queries/{query_id}/results"),
+                status_url: format!("/v1/queries/{query_id}/status"),
+                results_url: format!("/v1/queries/{query_id}/results"),
             };
             (StatusCode::ACCEPTED, Json(response)).into_response()
         }
