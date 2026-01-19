@@ -59,7 +59,7 @@ jobs:
             shell: zsh
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install zsh (Ubuntu)
         if: contains(matrix.os, 'linux') && matrix.shell == 'zsh'
@@ -99,7 +99,7 @@ jobs:
             shell: zsh
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install zsh (Ubuntu)
         if: contains(matrix.os, 'linux') && matrix.shell == 'zsh'
@@ -177,7 +177,7 @@ jobs:
             runner: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Test install.sh with custom directory
         run: |
@@ -247,7 +247,7 @@ jobs:
             variant: metal
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Test install-spiced.sh with variant '${{ matrix.variant }}'
         env:
@@ -275,7 +275,7 @@ jobs:
             runner: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get a known release version
         id: get_version
@@ -314,7 +314,7 @@ jobs:
         client: [curl, wget]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Remove alternative HTTP client
         run: |
@@ -357,7 +357,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Test invalid version handling
         run: |
@@ -400,7 +400,7 @@ jobs:
         distro: [Ubuntu-22.04]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup WSL
         uses: Vampire/setup-wsl@v5
@@ -451,7 +451,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Test Install.ps1
         shell: pwsh
@@ -488,7 +488,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Test Install.ps1 with custom directory
         shell: pwsh
@@ -522,7 +522,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Test PowerShell script syntax
         shell: pwsh
@@ -564,7 +564,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
