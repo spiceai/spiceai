@@ -2899,7 +2899,7 @@ dependencies = [
  "fundu",
  "futures",
  "moka",
- "opentelemetry 0.29.1",
+ "opentelemetry",
  "parking_lot 0.12.5",
  "pingora-lru",
  "rand 0.8.5",
