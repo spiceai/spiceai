@@ -34,8 +34,6 @@ const _NUM_SEPARATORS: usize = 3; // 3 periods '.' separate the 4 parts
 const _S3_VECTOR_INDEX_NAME_MAX_LENGTH: usize = 63;
 
 // Check at compile time that we use the full amount allowed from S3
-#[expect(clippy::disallowed_macros, clippy::allow_attributes)]
-#[allow(unfulfilled_lint_expectations)]
 const _: () = {
     assert!(
         INDEX_NAME_MAX_LENGTH

@@ -484,8 +484,6 @@ impl Ai {
             results.into_iter().map(|(_, result)| result).collect();
 
         // debug assertion only
-        #[expect(clippy::disallowed_macros, clippy::allow_attributes)]
-        #[allow(unfulfilled_lint_expectations)]
         {
             debug_assert_eq!(
                 ordered_results.len(),
