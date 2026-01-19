@@ -404,13 +404,20 @@ testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrenc
 
 - **Always use full 40-character SHA hashes** for git dependencies, never abbreviated SHAs
 - Full SHAs ensure reproducible builds and avoid ambiguity
+- **For spiceai forks**: Add a comment with the branch name to track the source
 
 ```toml
 # GOOD - full SHA
 datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" }
 
+# GOOD - spiceai fork with branch comment
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" } # branch: spice
+
 # BAD - abbreviated SHA
 datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a1b2c3d" }
+
+# BAD - spiceai fork without branch comment
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" }
 ```
 
 ## Development Workflow
