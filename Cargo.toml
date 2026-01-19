@@ -159,7 +159,7 @@ delta_kernel = { version = "0.17.0", features = [
 ] }
 derive_builder = "0.20.2"
 dotenvy = "0.15"
-duckdb = "1.4.2"
+duckdb = "1.4.3"
 dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.30"
@@ -358,7 +358,7 @@ ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", re
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "8c3ee9019ed24108eb775d6e9ad3fc53a0362c29" } # spiceai:spiceai-51
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a14c73d9" } # spiceai-1.4.2
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "1f28290b70664c5765781a705e362ae2fe7b89f4" } # duckdb-1.4.3
 
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
