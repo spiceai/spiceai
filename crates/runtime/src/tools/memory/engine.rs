@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -58,8 +58,9 @@ pub trait MemoryEngine: Send + Sync {
 /// Get the configured memory engine for the runtime.
 ///
 /// Returns the builtin memory engine which uses SQL-based storage.
+/// Takes a reference to avoid unnecessary Arc cloning.
 pub async fn get_memory_engine(
-    rt: Arc<Runtime>,
+    rt: &Arc<Runtime>,
 ) -> Result<Arc<dyn MemoryEngine>, Box<dyn std::error::Error + Send + Sync>> {
     use super::builtin::BuiltinMemoryEngine;
 

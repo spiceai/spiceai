@@ -79,7 +79,7 @@ impl SpiceModelTool for LoadMemoryTool {
 
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let params: LoadMemoryParams = serde_json::from_str(arg).boxed()?;
-            let engine = get_memory_engine(Arc::clone(&self.rt)).await?;
+            let engine = get_memory_engine(&self.rt).await?;
 
             engine.load(&params.last).await
         }

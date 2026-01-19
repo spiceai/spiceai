@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::TryStreamExt;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use uuid::Uuid;
 
 use crate::{
@@ -35,14 +35,25 @@ use super::{MemoryTableElement, engine::MemoryEngine, memory_table_name, try_fro
 ///
 /// This engine stores memories in a `DataFusion` table configured with a memory connector.
 /// It requires a dataset with `from: memory:` to be configured in the spicepod.
+///
+/// Uses `Weak<Runtime>` to avoid circular dependencies that would prevent clean shutdown.
 pub struct BuiltinMemoryEngine {
-    rt: Arc<Runtime>,
+    rt: Weak<Runtime>,
 }
 
 impl BuiltinMemoryEngine {
     #[must_use]
-    pub fn new(rt: Arc<Runtime>) -> Self {
-        Self { rt }
+    pub fn new(rt: &Arc<Runtime>) -> Self {
+        Self {
+            rt: Arc::downgrade(rt),
+        }
+    }
+
+    /// Upgrade the weak reference to a strong Arc, returning an error if the Runtime was dropped.
+    fn runtime(&self) -> Result<Arc<Runtime>, Box<dyn std::error::Error + Send + Sync>> {
+        self.rt
+            .upgrade()
+            .ok_or_else(|| "Runtime has been dropped".into())
     }
 }
 
@@ -53,7 +64,8 @@ impl MemoryEngine for BuiltinMemoryEngine {
         value: &str,
         created_by: Option<&str>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let table_name = memory_table_name(&self.rt).await?;
+        let rt = self.runtime()?;
+        let table_name = memory_table_name(&rt).await?;
 
         let batch = try_from(&[MemoryTableElement {
             id: Uuid::now_v7(),
@@ -68,8 +80,7 @@ impl MemoryEngine for BuiltinMemoryEngine {
             update_type: UpdateType::Append,
         };
 
-        self.rt
-            .datafusion()
+        rt.datafusion()
             .write_data(&table_name, data_update)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
@@ -84,15 +95,15 @@ impl MemoryEngine for BuiltinMemoryEngine {
         &self,
         last_interval: &str,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let table_name = memory_table_name(&self.rt).await?;
+        let rt = self.runtime()?;
+        let table_name = memory_table_name(&rt).await?;
         let last_duration = fundu::parse_duration(last_interval).map_err(
             |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("Failed to parse interval '{last_interval}': {e}").into()
             },
         )?;
 
-        let batches = self
-            .rt
+        let batches = rt
             .datafusion()
             .query_builder(&format!(
                 "SELECT value FROM {table_name} WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",

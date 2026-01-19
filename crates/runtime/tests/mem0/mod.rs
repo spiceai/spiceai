@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -46,34 +46,6 @@ async fn rate_limit_guard() {
     tokio::time::sleep(delay).await;
 }
 
-/// Retry an async operation with exponential backoff for rate limiting.
-#[expect(dead_code)]
-async fn retry_with_backoff<T, E, F, Fut>(mut op: F) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
-{
-    let mut attempts = 0;
-    let max_attempts = 3;
-    let mut delay = Duration::from_millis(500);
-
-    loop {
-        match op().await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                attempts += 1;
-                if attempts >= max_attempts {
-                    return Err(e);
-                }
-                eprintln!("Attempt {attempts} failed: {e:?}, retrying in {delay:?}");
-                tokio::time::sleep(delay).await;
-                delay *= 2; // Exponential backoff
-            }
-        }
-    }
-}
-
 /// Get API key from environment for integration tests.
 /// Set `MEM0_API_KEY` environment variable to run integration tests.
 fn get_api_key() -> Option<SecretString> {
@@ -92,66 +64,13 @@ fn test_user_id() -> String {
     format!("test-user-{}", uuid::Uuid::now_v7())
 }
 
-/// Helper to clean up a user's memories, ignoring errors
-#[expect(dead_code)]
-async fn cleanup_user(client: &Mem0Client, user_id: &str) {
-    let delete_request = DeleteMemoryRequest {
-        user_id: Some(user_id.to_string()),
-        agent_id: None,
-        org_id: None,
-        project_id: None,
-    };
-    let _ = client.delete_all_memories(delete_request).await;
-}
-
-/// Helper to add a memory with retry logic
-#[expect(dead_code)]
-async fn add_memory_with_retry(
-    client: &Mem0Client,
-    content: &str,
-    user_id: &str,
-) -> Result<AddMemoryResponse, runtime::tools::mem0::Error> {
-    retry_with_backoff(|| async {
-        let add_request = AddMemoryRequest {
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: content.to_string(),
-            }],
-            user_id: Some(user_id.to_string()),
-            async_mode: false,
-            ..Default::default()
-        };
-        client.add_memories(add_request).await
-    })
-    .await
-}
-
-/// Helper to search memories with retry logic
-#[expect(dead_code)]
-async fn search_with_retry(
-    client: &Mem0Client,
-    query: &str,
-    user_id: &str,
-) -> Result<Vec<Memory>, runtime::tools::mem0::Error> {
-    retry_with_backoff(|| async {
-        let search_request = SearchMemoryRequest {
-            query: query.to_string(),
-            filters: Some(json!({"user_id": user_id})),
-            top_k: Some(10),
-            ..Default::default()
-        };
-        client.search_memories(search_request).await
-    })
-    .await
-}
-
 #[tokio::test]
 #[ignore = "requires MEM0_API_KEY environment variable"]
 async fn test_add_and_search_memory() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -222,7 +141,7 @@ async fn test_get_memories() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -279,7 +198,7 @@ async fn test_delete_specific_memory() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -308,11 +227,8 @@ async fn test_delete_specific_memory() {
     if let AddMemoryResponse::Sync(events) = add_response {
         if let Some(first) = events.first() {
             // Delete the specific memory
-            let delete_result = client.delete_memory(&first.id).await;
-            // Memory may have been processed asynchronously, so 404 is acceptable if cleanup worked
-            if let Err(ref e) = delete_result {
-                eprintln!("Warning: delete_memory returned error (may be timing-related): {e:?}");
-            }
+            // Memory may have been processed asynchronously, so 404 is acceptable
+            let _ = client.delete_memory(&first.id).await;
         }
     } else {
         panic!("Expected sync response for memory addition");
@@ -335,7 +251,7 @@ async fn test_memory_with_metadata() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -381,7 +297,7 @@ async fn test_search_with_threshold() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -440,7 +356,7 @@ async fn test_empty_search_query() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -454,11 +370,8 @@ async fn test_empty_search_query() {
         ..Default::default()
     };
 
-    let search_result = client.search_memories(search_request).await;
     // Empty query may fail or return empty - either is acceptable
-    if let Err(ref e) = search_result {
-        eprintln!("Empty query returned error (expected): {e:?}");
-    }
+    let _ = client.search_memories(search_request).await;
 }
 
 #[tokio::test]
@@ -467,7 +380,6 @@ async fn test_special_characters_in_memory() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
         return;
     };
 
@@ -509,7 +421,7 @@ async fn test_very_long_memory_content() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -551,7 +463,7 @@ async fn test_multiple_messages_in_single_request() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -619,7 +531,7 @@ async fn test_search_nonexistent_user() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -653,7 +565,7 @@ async fn test_delete_nonexistent_memory() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -678,7 +590,7 @@ async fn test_concurrent_memory_additions() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -755,7 +667,7 @@ async fn test_concurrent_searches() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -841,7 +753,7 @@ async fn test_mixed_concurrent_operations() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -952,7 +864,7 @@ async fn test_full_crud_workflow() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1001,19 +913,10 @@ async fn test_full_crud_workflow() {
             break;
         }
 
-        if attempt < 4 {
-            eprintln!(
-                "Attempt {}: No memories found yet, retrying...",
-                attempt + 1
-            );
-        }
+        // Wait before retrying for eventual consistency
     }
 
-    if memories.is_empty() {
-        eprintln!(
-            "Warning: No memories found after CREATE (eventual consistency). Continuing test."
-        );
-    }
+    // Note: Empty memories is acceptable due to eventual consistency
 
     // UPDATE: Add more context to existing memory (mem0 handles deduplication)
     let update_request = AddMemoryRequest {
@@ -1101,12 +1004,8 @@ async fn test_full_crud_workflow() {
         }
     }
 
-    // Allow for eventual consistency - warn but don't fail if some memories remain
-    if remaining_count > 0 {
-        eprintln!(
-            "Warning: {remaining_count} memories remained after deletion (eventual consistency)"
-        );
-    }
+    // Note: remaining_count > 0 is acceptable due to eventual consistency
+    let _ = remaining_count;
 }
 
 #[tokio::test]
@@ -1115,7 +1014,7 @@ async fn test_pagination_workflow() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1189,7 +1088,7 @@ async fn test_agent_scoped_memories() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1260,7 +1159,7 @@ async fn test_search_with_various_top_k_values() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1299,8 +1198,7 @@ async fn test_search_with_various_top_k_values() {
         );
 
         let memories = search_result.expect("search should succeed");
-        #[expect(clippy::cast_sign_loss)]
-        let top_k_usize = top_k as usize;
+        let top_k_usize = usize::try_from(top_k).expect("top_k value should be non-negative");
         assert!(
             memories.len() <= top_k_usize,
             "Should return at most {top_k} results, got {}",
@@ -1324,7 +1222,7 @@ async fn test_async_vs_sync_mode() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1399,7 +1297,7 @@ async fn test_rapid_add_delete_cycles() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1453,7 +1351,7 @@ async fn test_different_user_isolation() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1548,7 +1446,7 @@ async fn test_different_user_isolation() {
 async fn test_graph_memory_add_with_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1588,7 +1486,7 @@ async fn test_graph_memory_add_with_relationships() {
 async fn test_graph_memory_search_with_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1652,7 +1550,7 @@ async fn test_graph_memory_search_with_relationships() {
 async fn test_graph_memory_get_all_with_context() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1705,7 +1603,7 @@ async fn test_graph_memory_get_all_with_context() {
 async fn test_graph_memory_multiple_entities() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1782,7 +1680,7 @@ async fn test_graph_memory_multiple_entities() {
 async fn test_graph_memory_organization_hierarchy() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1840,7 +1738,7 @@ async fn test_graph_memory_organization_hierarchy() {
 async fn test_graph_memory_disabled() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1892,7 +1790,7 @@ async fn test_graph_memory_disabled() {
 async fn test_graph_memory_multi_hop_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -1955,7 +1853,7 @@ async fn test_graph_memory_multi_hop_relationships() {
 async fn test_graph_memory_client_config() {
     rate_limit_guard().await;
     let Some(api_key) = get_api_key() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -2018,7 +1916,7 @@ async fn test_graph_memory_client_config() {
 async fn test_graph_memory_location_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
@@ -2076,7 +1974,7 @@ async fn test_graph_memory_location_relationships() {
 async fn test_graph_memory_temporal_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        eprintln!("Skipping test: MEM0_API_KEY not set");
+        return;
         return;
     };
 
