@@ -23,6 +23,7 @@ use spicepod::{acceleration::Mode, param::Params};
 mod caching_mode;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
+mod hash_index;
 #[cfg(feature = "postgres")]
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
