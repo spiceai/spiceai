@@ -44,6 +44,8 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # Use all available CPU cores for parallel compilation
+  CARGO_BUILD_JOBS: 0
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via

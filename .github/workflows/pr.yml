@@ -43,6 +43,8 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # Use all available CPU cores for parallel compilation
+  CARGO_BUILD_JOBS: 0
   # Use fast linkers for PR builds (mold for x86_64, lld for aarch64)
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold

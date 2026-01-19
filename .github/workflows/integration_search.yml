@@ -28,6 +28,8 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
+  # Use all available CPU cores for parallel compilation
+  CARGO_BUILD_JOBS: 0
 
 jobs:
   test-search:
