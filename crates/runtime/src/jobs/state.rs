@@ -199,8 +199,10 @@ impl JobState {
         self.status = JobStatus::Succeeded;
         self.result = Some(result);
         self.completed_at_ms = Some(now);
-        // Saturate at u64::MAX for extremely large TTLs (effectively never expires)
+        // Convert TTL to milliseconds, saturating at u64::MAX for extremely large TTLs
+        // (effectively "never expires" - over 500 million years)
         let ttl_ms = u64::try_from(result_ttl.as_millis()).unwrap_or(u64::MAX);
+        // Saturate at u64::MAX if overflow would occur (effectively "never expires")
         self.expires_at_ms = Some(now.saturating_add(ttl_ms));
     }
 
@@ -237,6 +239,8 @@ impl JobState {
     }
 }
 
+/// Gets the current Unix timestamp in milliseconds, logging a warning if the system
+/// clock is before the Unix epoch and returning 0 as a fallback.
 fn now_ms_or_zero() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),

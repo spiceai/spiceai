@@ -291,12 +291,21 @@ pub(crate) async fn get_query(
             let mut response = job_state_to_response(&state);
 
             // If succeeded, include first chunk data
-            if state.status == JobStatus::Succeeded
-                && let (Ok(batches), Some(result)) =
-                    (executor.get_chunk(&query_id, 0).await, &state.result)
-            {
-                let first_chunk = build_chunk_response(&query_id, 0, &batches, result);
-                response.result = Some(first_chunk);
+            if state.status == JobStatus::Succeeded {
+                if let Ok(batches) = executor.get_chunk(&query_id, 0).await {
+                    if let Some(result) = &state.result {
+                        match build_chunk_response(&query_id, 0, &batches, result) {
+                            Ok(first_chunk) => response.result = Some(first_chunk),
+                            Err(e) => {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(serde_json::json!({"error": e})),
+                                )
+                                    .into_response();
+                            }
+                        }
+                    }
+                }
             }
 
             (StatusCode::OK, Json(response)).into_response()
@@ -377,14 +386,34 @@ pub(crate) async fn get_results(
     };
 
     if state.status != JobStatus::Succeeded {
-        // HTTP 425 Too Early - query results not yet available
-        // Safety: 425 is a valid HTTP status code (RFC 8470)
-        #[expect(clippy::unwrap_used)]
-        let too_early = StatusCode::from_u16(425).unwrap();
+        // Return appropriate error based on terminal state
+        let (status_code, error_msg) = match state.status {
+            JobStatus::Failed => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Query execution failed".to_string(),
+            ),
+            JobStatus::Cancelled => (
+                StatusCode::GONE,
+                "Query was cancelled".to_string(),
+            ),
+            JobStatus::Closed => (
+                StatusCode::GONE,
+                "Query results have expired".to_string(),
+            ),
+            // Pending or Running - use 425 Too Early
+            // Safety: 425 is a valid HTTP status code (RFC 8470), so from_u16 cannot fail
+            _ => {
+                let too_early = match StatusCode::from_u16(425) {
+                    Ok(code) => code,
+                    Err(_) => unreachable!("425 is a valid HTTP status code"),
+                };
+                (too_early, format!("Query not yet complete (status: {})", state.status))
+            }
+        };
         return (
-            too_early,
+            status_code,
             Json(serde_json::json!({
-                "error": format!("Query not yet complete (status: {})", state.status),
+                "error": error_msg,
                 "status": state.status.to_string()
             })),
         )
@@ -396,9 +425,16 @@ pub(crate) async fn get_results(
     match result {
         Ok(batches) => {
             if let Some(job_result) = &state.result {
-                let chunk_response =
-                    build_chunk_response(&query_id, partition, &batches, job_result);
-                (StatusCode::OK, Json(chunk_response)).into_response()
+                match build_chunk_response(&query_id, partition, &batches, job_result) {
+                    Ok(chunk_response) => {
+                        (StatusCode::OK, Json(chunk_response)).into_response()
+                    }
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e})),
+                    )
+                        .into_response(),
+                }
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -451,11 +487,28 @@ pub(crate) async fn get_chunk(
     };
 
     if state.status != JobStatus::Succeeded {
+        let (status_code, error_msg) = match state.status {
+            JobStatus::Failed => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Query execution failed".to_string(),
+            ),
+            JobStatus::Cancelled => (
+                StatusCode::GONE,
+                "Query was cancelled".to_string(),
+            ),
+            JobStatus::Closed => (
+                StatusCode::GONE,
+                "Query results have expired".to_string(),
+            ),
+            // Pending or Running
+            _ => (
+                StatusCode::CONFLICT,
+                format!("Query not yet complete (status: {})", state.status),
+            ),
+        };
         return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("Query not yet complete (status: {})", state.status)
-            })),
+            status_code,
+            Json(serde_json::json!({"error": error_msg})),
         )
             .into_response();
     }
@@ -465,9 +518,16 @@ pub(crate) async fn get_chunk(
     match result {
         Ok(batches) => {
             if let Some(job_result) = &state.result {
-                let chunk_response =
-                    build_chunk_response(&query_id, chunk_index, &batches, job_result);
-                (StatusCode::OK, Json(chunk_response)).into_response()
+                match build_chunk_response(&query_id, chunk_index, &batches, job_result) {
+                    Ok(chunk_response) => {
+                        (StatusCode::OK, Json(chunk_response)).into_response()
+                    }
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e})),
+                    )
+                        .into_response(),
+                }
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -542,12 +602,15 @@ pub(crate) async fn list(
 
     match executor.list_jobs(status_filter).await {
         Ok(jobs) => {
+            let limit = query.limit.unwrap_or(100);
             let queries: Vec<QuerySummary> = jobs
                 .into_iter()
-                .take(query.limit.unwrap_or(100))
+                .take(limit)
                 .map(|job| {
-                    let sql_preview = if job.sql.len() > 100 {
-                        format!("{}...", &job.sql[..97])
+                    // Truncate SQL preview safely using chars (not bytes)
+                    let sql_preview = if job.sql.chars().count() > 100 {
+                        let truncated: String = job.sql.chars().take(97).collect();
+                        format!("{truncated}...")
                     } else {
                         job.sql.clone()
                     };
@@ -620,14 +683,16 @@ fn build_chunk_response(
     chunk_index: usize,
     batches: &[arrow::array::RecordBatch],
     job_result: &crate::jobs::JobResult,
-) -> ChunkResponse {
+) -> std::result::Result<ChunkResponse, String> {
+    use crate::jobs::DEFAULT_CHUNK_SIZE;
+
     // Calculate row count and offset
     let row_count: usize = batches
         .iter()
         .map(arrow::array::RecordBatch::num_rows)
         .sum();
 
-    // Calculate row offset based on chunk index (approximate using default chunk size)
+    // Calculate row offset based on chunk index using the configured chunk size
     let row_offset = chunk_index.saturating_mul(DEFAULT_CHUNK_SIZE);
 
     // Determine next chunk info
@@ -644,53 +709,47 @@ fn build_chunk_response(
             (None, None)
         };
 
-    // Convert batches to JSON
-    let data_array = batches_to_json(batches);
+    // Convert batches to JSON - propagate error if serialization fails
+    let data_array = batches_to_json(batches)?;
 
-    ChunkResponse {
+    Ok(ChunkResponse {
         chunk_index,
         row_offset,
         row_count,
         next_chunk_index,
         next_chunk_url,
         data_array: Some(data_array),
-    }
+    })
 }
 
-fn batches_to_json(batches: &[arrow::array::RecordBatch]) -> Vec<serde_json::Value> {
+/// Converts record batches to JSON values.
+/// Returns an error if any batch fails to serialize rather than returning partial results.
+fn batches_to_json(
+    batches: &[arrow::array::RecordBatch],
+) -> std::result::Result<Vec<serde_json::Value>, String> {
     let mut result = Vec::new();
 
     for batch in batches {
         let buf = Vec::new();
         let mut writer = arrow_json::ArrayWriter::new(buf);
 
-        // Log errors but continue - data correctness note: partial results are returned
-        // with visible errors rather than silently failing. The caller can check logs.
-        if let Err(e) = writer.write(batch) {
-            tracing::error!(error = %e, "Failed to serialize RecordBatch to JSON; partial results may be returned");
-            continue;
-        }
-        if let Err(e) = writer.finish() {
-            tracing::error!(error = %e, "Failed to finish JSON serialization; partial results may be returned");
-            continue;
-        }
+        writer
+            .write(batch)
+            .map_err(|e| format!("Failed to serialize RecordBatch to JSON: {e}"))?;
+        writer
+            .finish()
+            .map_err(|e| format!("Failed to finalize JSON serialization: {e}"))?;
 
-        let Ok(json_str) = String::from_utf8(writer.into_inner()) else {
-            tracing::error!("Invalid UTF-8 in JSON output; partial results may be returned");
-            continue;
-        };
+        let json_str = String::from_utf8(writer.into_inner())
+            .map_err(|e| format!("Invalid UTF-8 in JSON output: {e}"))?;
 
-        let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) else {
-            tracing::error!(
-                "Failed to parse JSON array from serialized output; partial results may be returned"
-            );
-            continue;
-        };
+        let arr = serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
+            .map_err(|e| format!("Failed to parse JSON array: {e}"))?;
 
         result.extend(arr);
     }
 
-    result
+    Ok(result)
 }
 
 fn error_to_response(error: &crate::jobs::Error) -> Response {
@@ -726,7 +785,10 @@ fn error_to_response(error: &crate::jobs::Error) -> Response {
 }
 
 /// Converts a Unix timestamp in milliseconds to ISO 8601 format.
+/// Returns a sentinel string for invalid timestamps rather than silently returning epoch.
 fn ms_to_iso8601(ms: u64) -> String {
+    use chrono::DateTime;
+
     // Convert milliseconds to seconds and nanoseconds for chrono
     // The casts are safe: secs < 2^63 for reasonable timestamps (until year 292M+)
     // nanos < 1_000_000_000 which fits in u32
@@ -735,7 +797,16 @@ fn ms_to_iso8601(ms: u64) -> String {
     #[expect(clippy::cast_possible_truncation)]
     let nanos = ((ms % 1000) * 1_000_000) as u32;
 
-    DateTime::from_timestamp(secs, nanos)
-        .unwrap_or_default()
-        .to_rfc3339()
+    match DateTime::from_timestamp(secs, nanos) {
+        Some(dt) => dt.to_rfc3339(),
+        None => {
+            // Data correctness: never silently coerce invalid timestamps to Unix epoch.
+            // Instead, log and return a clearly invalid sentinel value.
+            tracing::error!(
+                timestamp_ms = ms,
+                "Invalid Unix timestamp; returning sentinel ISO 8601 string"
+            );
+            format!("INVALID_TIMESTAMP({ms})")
+        }
+    }
 }

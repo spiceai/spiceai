@@ -66,8 +66,12 @@ pub enum Error {
     #[snafu(display("Invalid job ID format: {job_id}"))]
     InvalidJobId { job_id: String },
 
-    #[snafu(display("Integer overflow while calculating {field}"))]
-    IntegerOverflow { field: String },
+    #[snafu(display("Integer overflow while calculating {field}: {left_value} + {right_value}"))]
+    IntegerOverflow {
+        field: String,
+        left_value: usize,
+        right_value: usize,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -232,26 +232,15 @@ impl JobExecutor {
 
 /// Categorizes an error message into an error code.
 ///
-/// This is a best-effort categorization based on string matching of error messages.
-/// It may not correctly categorize all `DataFusion` errors, especially if error messages
-/// change between versions or if SQL queries contain keywords like 'timeout' in comments.
-/// The categorization is intended for informational purposes in API responses.
-fn categorize_error(message: &str) -> &'static str {
-    let lower = message.to_lowercase();
-
-    if lower.contains("syntax") || lower.contains("parse") {
-        "SYNTAX_ERROR"
-    } else if lower.contains("table") && lower.contains("not found") {
-        "TABLE_NOT_FOUND"
-    } else if lower.contains("column") && lower.contains("not found") {
-        "COLUMN_NOT_FOUND"
-    } else if lower.contains("timeout") {
-        "QUERY_TIMEOUT"
-    } else if lower.contains("memory") || lower.contains("oom") {
-        "RESOURCE_EXHAUSTED"
-    } else if lower.contains("permission") || lower.contains("unauthorized") {
-        "PERMISSION_DENIED"
-    } else {
-        "QUERY_EXECUTION"
-    }
+/// Returns a generic "QUERY_EXECUTION" error code rather than attempting to
+/// infer categories from error message text. String-based error categorization
+/// is unreliable because:
+/// - Error messages can contain user-controlled content (e.g., SQL with "timeout" in comments)
+/// - Error message formats can change between DataFusion versions
+/// - Misclassification can mislead users about the actual error
+///
+/// For reliable error categorization, use structured error types from DataFusion
+/// rather than string matching.
+fn categorize_error(_message: &str) -> &'static str {
+    "QUERY_EXECUTION"
 }

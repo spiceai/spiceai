@@ -582,6 +582,12 @@ impl Runtime {
     }
 
     /// Returns the job executor for async SQL queries if available (cluster mode only).
+    ///
+    /// This uses `try_read()` to avoid blocking the caller. If another thread holds
+    /// a write lock (e.g., during initialization), this returns `None`. The caller
+    /// should be aware that a `None` result could mean either:
+    /// 1. Async jobs are not enabled (not in cluster mode), or
+    /// 2. The executor is being initialized (rare, transient condition)
     #[must_use]
     pub fn job_executor(&self) -> Option<Arc<jobs::JobExecutor>> {
         self.job_executor

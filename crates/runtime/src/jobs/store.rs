@@ -220,32 +220,43 @@ impl JobStore {
             total_rows = total_rows.checked_add(batch_rows).ok_or_else(|| {
                 super::error::Error::IntegerOverflow {
                     field: "total_row_count".to_string(),
+                    left_value: total_rows,
+                    right_value: batch_rows,
                 }
             })?;
 
             current_chunk_batches.push(batch);
-            current_chunk_rows = current_chunk_rows.checked_add(batch_rows).ok_or_else(|| {
-                super::error::Error::IntegerOverflow {
-                    field: "chunk_row_count".to_string(),
-                }
-            })?;
+            current_chunk_rows =
+                current_chunk_rows
+                    .checked_add(batch_rows)
+                    .ok_or_else(|| super::error::Error::IntegerOverflow {
+                        field: "chunk_row_count".to_string(),
+                        left_value: current_chunk_rows,
+                        right_value: batch_rows,
+                    })?;
 
             // Flush chunk if we've reached the chunk size
             if current_chunk_rows >= self.chunk_size {
                 let bytes = self
                     .write_chunk(job_id, chunk_index, &current_chunk_batches)
                     .await?;
-                total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
-                    super::error::Error::IntegerOverflow {
-                        field: "total_byte_count".to_string(),
-                    }
-                })?;
+                total_bytes =
+                    total_bytes
+                        .checked_add(bytes)
+                        .ok_or_else(|| super::error::Error::IntegerOverflow {
+                            field: "total_byte_count".to_string(),
+                            left_value: total_bytes,
+                            right_value: bytes,
+                        })?;
                 chunk_indices.push(chunk_index);
-                chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
-                    super::error::Error::IntegerOverflow {
-                        field: "chunk_index".to_string(),
-                    }
-                })?;
+                chunk_index =
+                    chunk_index
+                        .checked_add(1)
+                        .ok_or_else(|| super::error::Error::IntegerOverflow {
+                            field: "chunk_index".to_string(),
+                            left_value: chunk_index,
+                            right_value: 1,
+                        })?;
                 current_chunk_batches.clear();
                 current_chunk_rows = 0;
             }
@@ -256,26 +267,41 @@ impl JobStore {
             let bytes = self
                 .write_chunk(job_id, chunk_index, &current_chunk_batches)
                 .await?;
-            total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
-                super::error::Error::IntegerOverflow {
-                    field: "total_byte_count".to_string(),
-                }
-            })?;
+            total_bytes =
+                total_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| super::error::Error::IntegerOverflow {
+                        field: "total_byte_count".to_string(),
+                        left_value: total_bytes,
+                        right_value: bytes,
+                    })?;
             chunk_indices.push(chunk_index);
         }
 
-        // Build schema info
+        // Build schema info - use Display instead of Debug for stable type names
         let columns: Vec<ColumnSchema> = schema
             .fields()
             .iter()
             .enumerate()
-            .map(|(i, field)| ColumnSchema {
-                name: field.name().clone(),
-                type_name: field.data_type().to_string(),
-                type_precision: None, // TODO: extract from decimal types
-                type_scale: None,
-                nullable: field.is_nullable(),
-                position: i,
+            .map(|(i, field)| {
+                // Extract precision and scale for decimal types
+                let (type_precision, type_scale) = match field.data_type() {
+                    arrow::datatypes::DataType::Decimal128(precision, scale)
+                    | arrow::datatypes::DataType::Decimal256(precision, scale) => {
+                        #[expect(clippy::cast_possible_wrap)]
+                        let scale_i32 = *scale as i32;
+                        (Some(u32::from(*precision)), Some(scale_i32))
+                    }
+                    _ => (None, None),
+                };
+                ColumnSchema {
+                    name: field.name().clone(),
+                    type_name: field.data_type().to_string(),
+                    type_precision,
+                    type_scale,
+                    nullable: field.is_nullable(),
+                    position: i,
+                }
             })
             .collect();
 
@@ -347,7 +373,7 @@ impl JobStore {
         let cursor = std::io::Cursor::new(bytes.as_ref());
         let reader = StreamReader::try_new(cursor, None).context(DeserializeChunkSnafu)?;
 
-        // Collect all batches, propagating any errors that occur
+        // Collect all batches, propagating any errors that occur during deserialization
         let batches: Vec<RecordBatch> = reader
             .collect::<std::result::Result<Vec<_>, _>>()
             .context(DeserializeChunkSnafu)?;
@@ -387,8 +413,24 @@ impl JobStore {
         let mut stream = self.store.list(Some(&chunks_prefix));
 
         while let Some(entry) = stream.next().await {
-            if let Ok(meta) = entry {
-                let _ = self.store.delete(&meta.location).await;
+            match entry {
+                Ok(meta) => {
+                    if let Err(err) = self.store.delete(&meta.location).await {
+                        tracing::warn!(
+                            job_id,
+                            path = %meta.location,
+                            error = %err,
+                            "Failed to delete job chunk from object store"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        job_id,
+                        error = %err,
+                        "Failed to list job chunks from object store"
+                    );
+                }
             }
         }
 
