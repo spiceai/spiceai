@@ -140,9 +140,9 @@ mod tests {
 
     #[test]
     fn test_store_memory_params_missing_thoughts() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let result: Result<StoreMemoryParams, _> = serde_json::from_str(json);
-        assert!(result.is_err());
+        let _ = result.expect_err("should fail to parse");
     }
 
     #[test]
@@ -212,5 +212,3 @@ mod tests {
         assert_eq!(tool.name(), "store_memory");
     }
 }
-
-

@@ -47,7 +47,7 @@ async fn rate_limit_guard() {
 }
 
 /// Retry an async operation with exponential backoff for rate limiting.
-#[allow(dead_code)]
+#[expect(dead_code)]
 async fn retry_with_backoff<T, E, F, Fut>(mut op: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
@@ -93,7 +93,7 @@ fn test_user_id() -> String {
 }
 
 /// Helper to clean up a user's memories, ignoring errors
-#[allow(dead_code)]
+#[expect(dead_code)]
 async fn cleanup_user(client: &Mem0Client, user_id: &str) {
     let delete_request = DeleteMemoryRequest {
         user_id: Some(user_id.to_string()),
@@ -105,7 +105,7 @@ async fn cleanup_user(client: &Mem0Client, user_id: &str) {
 }
 
 /// Helper to add a memory with retry logic
-#[allow(dead_code)]
+#[expect(dead_code)]
 async fn add_memory_with_retry(
     client: &Mem0Client,
     content: &str,
@@ -127,7 +127,7 @@ async fn add_memory_with_retry(
 }
 
 /// Helper to search memories with retry logic
-#[allow(dead_code)]
+#[expect(dead_code)]
 async fn search_with_retry(
     client: &Mem0Client,
     query: &str,
@@ -1104,8 +1104,7 @@ async fn test_full_crud_workflow() {
     // Allow for eventual consistency - warn but don't fail if some memories remain
     if remaining_count > 0 {
         eprintln!(
-            "Warning: {} memories remained after deletion (eventual consistency)",
-            remaining_count
+            "Warning: {remaining_count} memories remained after deletion (eventual consistency)"
         );
     }
 }
@@ -1300,8 +1299,10 @@ async fn test_search_with_various_top_k_values() {
         );
 
         let memories = search_result.expect("search should succeed");
+        #[expect(clippy::cast_sign_loss)]
+        let top_k_usize = top_k as usize;
         assert!(
-            memories.len() <= top_k as usize,
+            memories.len() <= top_k_usize,
             "Should return at most {top_k} results, got {}",
             memories.len()
         );
@@ -1632,10 +1633,8 @@ async fn test_graph_memory_search_with_relationships() {
 
     let memories = search_result.expect("search should succeed");
     // We should find at least one memory about Charlie
-    assert!(
-        !memories.is_empty() || true, // API may not return results immediately
-        "Should find memories about Charlie"
-    );
+    // Note: API may not return results immediately due to eventual consistency
+    let _ = memories;
 
     // Clean up
     let delete_request = DeleteMemoryRequest {
@@ -1920,7 +1919,7 @@ async fn test_graph_memory_multi_hop_relationships() {
         };
 
         let result = client.add_memories(add_request).await;
-        assert!(result.is_ok(), "Should add memory: {}", content);
+        assert!(result.is_ok(), "Should add memory: {content}");
         // Small delay between adds
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

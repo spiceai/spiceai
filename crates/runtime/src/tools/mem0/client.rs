@@ -200,10 +200,6 @@ pub struct AddMemoryRequest {
     pub enable_graph: Option<bool>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl Default for AddMemoryRequest {
     fn default() -> Self {
         Self {
@@ -281,10 +277,6 @@ pub struct SearchMemoryRequest {
     pub enable_graph: Option<bool>,
 }
 
-fn default_version() -> String {
-    "v2".to_string()
-}
-
 impl Default for SearchMemoryRequest {
     fn default() -> Self {
         Self {
@@ -340,7 +332,7 @@ pub struct GraphRelation {
     /// The source entity of the relationship
     pub source: String,
 
-    /// The type/name of the relationship (e.g., "works_at", "lives_in", "met_at")
+    /// The type/name of the relationship (e.g., `works_at`, `lives_in`, `met_at`)
     pub relation: String,
 
     /// The target entity of the relationship
@@ -1020,8 +1012,6 @@ mod tests {
     #[test]
     fn test_classify_retryable_error_rate_limit() {
         // Test that rate limit status codes are correctly classified
-        use reqwest::StatusCode;
-
         // We can't easily construct reqwest errors, but we verify the logic
         // by checking the error message parsing in execute_with_retry
         let api_error_429 = super::Error::ApiError {

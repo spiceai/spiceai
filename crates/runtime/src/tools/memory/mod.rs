@@ -143,11 +143,10 @@ mod tests {
     #[test]
     fn test_try_from_single_element() {
         let elements = vec![MemoryTableElement {
-            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
-                .expect("valid uuid"),
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid"),
             value: "test memory".to_string(),
             created_by: Some("user1".to_string()),
-            created_at: 1704067200, // 2024-01-01 00:00:00 UTC
+            created_at: 1_704_067_200, // 2024-01-01 00:00:00 UTC
         }];
 
         let batch = try_from(&elements).expect("should create record batch");
@@ -162,10 +161,7 @@ mod tests {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("id should be string array");
-        assert_eq!(
-            id_array.value(0),
-            "550e8400-e29b-41d4-a716-446655440000"
-        );
+        assert_eq!(id_array.value(0), "550e8400-e29b-41d4-a716-446655440000");
 
         // Verify value column
         let value_array = batch
