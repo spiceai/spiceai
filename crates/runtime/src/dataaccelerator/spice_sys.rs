@@ -198,7 +198,8 @@ impl Error {
         feature = "sqlite",
         feature = "duckdb",
         feature = "postgres",
-        feature = "turso"
+        feature = "turso",
+        feature = "kafka"
     ))]
     fn external(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self::External { source: err.into() }
