@@ -203,7 +203,12 @@ impl AcceleratorEngineRegistry {
 
     pub async fn unregister_all(&self) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.clear();
+        // Shutdown each accelerator before clearing the registry
+        for (engine, accelerator) in registry.drain() {
+            if let Err(e) = accelerator.shutdown().await {
+                tracing::error!("Failed to shutdown accelerator engine {engine}: {e}");
+            }
+        }
     }
 
     #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
