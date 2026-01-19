@@ -29,9 +29,8 @@ use std::{fmt::Debug, path::PathBuf};
 use std::sync::Arc;
 
 use component::{
-    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval,
-    model::Model, runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool, view::View,
-    worker::Worker,
+    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, model::Model,
+    runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool, view::View, worker::Worker,
 };
 
 use crate::component::Nameable;
