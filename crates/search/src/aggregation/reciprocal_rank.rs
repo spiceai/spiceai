@@ -23,7 +23,7 @@ use crate::{
 use super::{AggregationResult, CandidateAggregation, DatafusionSnafu};
 use super::{Error, Result};
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::common::Column;
 use datafusion::datasource::MemTable;
@@ -253,11 +253,14 @@ fn verify_schema_compatibility(schemas: &[SchemaRef]) -> Result<()> {
         // Note: We don't check nullability because different search sources may have different
         // nullability for the same logical column (e.g., vector search vs full-text search).
         // DataFusion can handle the union/join with different nullability.
+        // We use semantic type equality (e.g., Utf8 and LargeUtf8 are compatible) because
+        // different search sources may produce different string representations (e.g., chunked
+        // text produces LargeUtf8 while non-chunked produces Utf8).
         let correct_columns = s.fields().iter().all(|f| {
             let Some((_, f2)) = schema.column_with_name(f.name()) else {
                 return false;
             };
-            f2.data_type() == f.data_type()
+            are_types_compatible(f2.data_type(), f.data_type())
         });
         if schema.fields().len() != s.fields().len() || !correct_columns {
             return Err(Error::InconsistentColumns {
@@ -272,6 +275,31 @@ fn verify_schema_compatibility(schemas: &[SchemaRef]) -> Result<()> {
 
 fn ith_search_value_column(i: usize) -> String {
     format!("{SEARCH_VALUE_COLUMN_NAME}_{i}")
+}
+
+/// Checks if two data types are compatible for schema aggregation purposes.
+///
+/// String types (`Utf8`, `LargeUtf8`, `Utf8View`) are considered compatible because
+/// different search sources may produce different string representations:
+/// - Non-chunked columns typically produce `Utf8`
+/// - Chunked columns (via substring operations) may produce `LargeUtf8`
+/// - View-based outputs may produce `Utf8View`
+///
+/// DataFusion can handle these differences during JOIN/COALESCE operations via implicit casting.
+fn are_types_compatible(t1: &DataType, t2: &DataType) -> bool {
+    if t1 == t2 {
+        return true;
+    }
+
+    // Treat all string types as compatible
+    let is_string_type =
+        |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+
+    if is_string_type(t1) && is_string_type(t2) {
+        return true;
+    }
+
+    false
 }
 
 /// Generates the LogicalPlan for the RRF aggregation using LogicalPlanBuilder API.
@@ -494,6 +522,33 @@ mod tests {
         assert!(
             result.is_ok(),
             "Schemas with different nullability should pass validation"
+        );
+    }
+
+    /// Test that verify_schema_compatibility accepts Utf8 and LargeUtf8 as semantically equivalent.
+    /// This is the specific case that was failing in the multi-column search test:
+    /// when chunking is enabled on one column, it produces LargeUtf8, while non-chunked
+    /// columns produce Utf8. These should be considered compatible.
+    #[test]
+    fn test_verify_schema_compatibility_accepts_utf8_and_large_utf8() {
+        // Schema with Utf8 value column (non-chunked)
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false), // Utf8
+            Field::new("pk", DataType::Int64, false),
+        ]));
+
+        // Schema with LargeUtf8 value column (chunked)
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::LargeUtf8, false), // LargeUtf8
+            Field::new("pk", DataType::Int64, false),
+        ]));
+
+        let result = verify_schema_compatibility(&[schema1, schema2]);
+        assert!(
+            result.is_ok(),
+            "Utf8 and LargeUtf8 should be considered semantically equivalent"
         );
     }
 }
