@@ -249,12 +249,15 @@ fn verify_schema_compatibility(schemas: &[SchemaRef]) -> Result<()> {
         }
 
         // Check that the schema is the same across all streams (i.e. all same as the first).
-        // Ensure ALL columns are in the first schema with matching types and nullability.
+        // Ensure ALL columns are in the first schema with matching types.
+        // Note: We don't check nullability because different search sources may have different
+        // nullability for the same logical column (e.g., vector search vs full-text search).
+        // DataFusion can handle the union/join with different nullability.
         let correct_columns = s.fields().iter().all(|f| {
             let Some((_, f2)) = schema.column_with_name(f.name()) else {
                 return false;
             };
-            f2.data_type() == f.data_type() && f2.is_nullable() == f.is_nullable()
+            f2.data_type() == f.data_type()
         });
         if schema.fields().len() != s.fields().len() || !correct_columns {
             return Err(Error::InconsistentColumns {
@@ -469,5 +472,28 @@ mod tests {
 
         let result = verify_schema_compatibility(&[schema1, schema2]);
         assert!(result.is_ok(), "Compatible schemas should pass validation");
+    }
+
+    /// Test that verify_schema_compatibility accepts schemas with different nullability
+    /// since nullability differences don't prevent DataFusion from handling the aggregation.
+    #[test]
+    fn test_verify_schema_compatibility_accepts_different_nullability() {
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, false), // NOT nullable
+        ]));
+
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new(SEARCH_VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("pk", DataType::Utf8, true), // nullable - different!
+        ]));
+
+        let result = verify_schema_compatibility(&[schema1, schema2]);
+        assert!(
+            result.is_ok(),
+            "Schemas with different nullability should pass validation"
+        );
     }
 }
