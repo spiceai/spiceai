@@ -116,6 +116,14 @@ impl BloomFilter {
         self.bits.len() * 8
     }
 
+    /// Returns the estimated memory usage in bytes.
+    ///
+    /// Alias for `memory_usage` for consistency with other components.
+    #[must_use]
+    pub fn memory_usage_bytes(&self) -> usize {
+        self.memory_usage()
+    }
+
     /// Inserts a hash into the bloom filter.
     #[inline]
     pub fn insert(&mut self, hash: u64) {
