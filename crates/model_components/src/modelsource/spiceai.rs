@@ -32,7 +32,6 @@ use std::time::Duration;
 
 use regex::Regex;
 
-#[expect(clippy::too_many_lines, reason = "Large function due to API upgrade")]
 #[async_trait]
 impl ModelSource for SpiceAI {
     async fn pull(&self, params: Arc<HashMap<String, SecretString>>) -> super::Result<String> {

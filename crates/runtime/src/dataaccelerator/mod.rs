@@ -206,7 +206,7 @@ impl AcceleratorEngineRegistry {
         registry.clear();
     }
 
-    #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,

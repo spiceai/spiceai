@@ -650,10 +650,6 @@ impl CayenneAccelerator {
     ///
     /// Returns `Ok(true)` if a new bucket was created, `Ok(false)` if the bucket already existed.
     /// Returns `Err` if the bucket creation or verification fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "S3 Express bucket creation requires extensive setup, creation, and verification steps"
-    )]
     async fn create_s3_express_bucket_if_needed(
         bucket_name: &str,
         zone_id: &str,
@@ -1089,10 +1085,6 @@ impl CayenneAccelerator {
     /// Build an S3 object store for S3 Express One Zone storage.
     ///
     /// Returns `None` if the path is not an S3 path, or an error if S3 configuration is invalid.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "S3 object store setup requires extensive configuration"
-    )]
     async fn build_s3_object_store(
         source: &dyn AccelerationSource,
     ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
@@ -1696,10 +1688,6 @@ impl DataAccelerator for CayenneAccelerator {
     /// Initializes a `Cayenne` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Initialization requires extensive validation, S3 bucket setup, and directory management"
-    )]
     async fn init(
         &self,
         source: &dyn AccelerationSource,

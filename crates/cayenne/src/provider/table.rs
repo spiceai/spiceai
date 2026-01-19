@@ -1314,10 +1314,6 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if any chunk write fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Progress tracking for S3 Express uploads adds necessary complexity"
-    )]
     async fn chunk_and_write_parallel(
         &self,
         mut stream: SendableRecordBatchStream,
@@ -1533,10 +1529,6 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the write operation fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Parallel chunked writing requires orchestration logic"
-    )]
     async fn chunk_and_write_parallel_to_snapshot(
         &self,
         mut stream: SendableRecordBatchStream,

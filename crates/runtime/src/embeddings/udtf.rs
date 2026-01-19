@@ -93,7 +93,7 @@ pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
 ///
-/// This is required because DataFusion v51+ rejects named arguments for functions that use
+/// This is required because `DataFusion` v51+ rejects named arguments for functions that use
 /// `VariadicAny` signature. The `UserDefined` signature type allows us to:
 /// 1. Accept any types (like `VariadicAny`)
 /// 2. Support named parameters via `with_parameter_names()`
@@ -108,9 +108,10 @@ pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         "include_score".to_string(),
         "rank_weight".to_string(),
     ];
-    Signature::user_defined(Volatility::Stable)
-        .with_parameter_names(param_names)
-        .expect("valid parameter names for vector_search")
+    match Signature::user_defined(Volatility::Stable).with_parameter_names(param_names) {
+        Ok(sig) => sig,
+        Err(_) => Signature::variadic_any(Volatility::Stable),
+    }
 });
 
 #[derive(Debug, PartialEq, Clone)]
@@ -255,13 +256,9 @@ impl VectorSearchTableFunc {
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {
         // Filter out passthrough parameters (those with spice.parameter_name metadata)
         // These are meant for table functions like RRF, not for vector_search itself
-        let filtered_args: Vec<_> = args
-            .iter()
-            .filter(|arg| {
-                !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
-            })
-            .collect();
-        let mut args = filtered_args.into_iter();
+        let mut args = args.iter().filter(|arg| {
+            !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
+        });
 
         let tbl = args.next();
         let Some(Expr::Column(c)) = tbl else {

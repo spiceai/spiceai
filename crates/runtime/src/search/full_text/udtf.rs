@@ -62,7 +62,7 @@ pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
 ///
-/// This is required because DataFusion v51+ rejects named arguments for functions that use
+/// This is required because `DataFusion` v51+ rejects named arguments for functions that use
 /// `VariadicAny` signature. The `UserDefined` signature type allows us to:
 /// 1. Accept any types (like `VariadicAny`)
 /// 2. Support named parameters via `with_parameter_names()`
@@ -77,9 +77,10 @@ pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         "include_score".to_string(),
         "rank_weight".to_string(),
     ];
+    // SAFETY: These are valid ASCII parameter names
     Signature::user_defined(Volatility::Stable)
         .with_parameter_names(param_names)
-        .expect("valid parameter names for text_search")
+        .unwrap_or_else(|_| unreachable!("valid parameter names for text_search"))
 });
 
 #[derive(Debug, PartialEq, Clone)]
