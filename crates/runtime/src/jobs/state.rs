@@ -223,7 +223,7 @@ impl JobState {
     #[must_use]
     pub fn is_expired(&self) -> bool {
         if let Some(expires_at) = self.expires_at_ms {
-            now_ms_or_zero() > expires_at
+            now_ms_or_zero() >= expires_at
         } else {
             false
         }

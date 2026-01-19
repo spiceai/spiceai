@@ -22,6 +22,8 @@ limitations under the License.
 //! - `GetAsyncQueryResult` - Get the result of a completed async query
 //! - `CancelAsyncQuery` - Cancel a running async query
 
+use std::fmt;
+
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
@@ -32,12 +34,133 @@ use crate::datafusion::job_executor_context_extension::get_job_executor;
 use crate::jobs::{JobState, JobStatus};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-/// Action type strings for async query operations.
+/// Action types for async query operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncActionType {
+    /// Submit a SQL query for async execution.
+    SubmitAsyncQuery,
+    /// Get the status of an async query.
+    GetAsyncQueryStatus,
+    /// Get the result of a completed async query.
+    GetAsyncQueryResult,
+    /// Cancel a running async query.
+    CancelAsyncQuery,
+}
+
+impl AsyncActionType {
+    /// Returns the action type string for Flight protocol.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SubmitAsyncQuery => "SubmitAsyncQuery",
+            Self::GetAsyncQueryStatus => "GetAsyncQueryStatus",
+            Self::GetAsyncQueryResult => "GetAsyncQueryResult",
+            Self::CancelAsyncQuery => "CancelAsyncQuery",
+        }
+    }
+
+    /// Parses an action type string from the Flight protocol.
+    #[must_use]
+    #[expect(dead_code, reason = "API for external consumers")]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "SubmitAsyncQuery" => Some(Self::SubmitAsyncQuery),
+            "GetAsyncQueryStatus" => Some(Self::GetAsyncQueryStatus),
+            "GetAsyncQueryResult" => Some(Self::GetAsyncQueryResult),
+            "CancelAsyncQuery" => Some(Self::CancelAsyncQuery),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AsyncActionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Module providing action type string constants for backward compatibility.
 pub mod action_types {
-    pub const SUBMIT_ASYNC_QUERY: &str = "SubmitAsyncQuery";
-    pub const GET_ASYNC_QUERY_STATUS: &str = "GetAsyncQueryStatus";
-    pub const GET_ASYNC_QUERY_RESULT: &str = "GetAsyncQueryResult";
-    pub const CANCEL_ASYNC_QUERY: &str = "CancelAsyncQuery";
+    use super::AsyncActionType;
+    pub const SUBMIT_ASYNC_QUERY: &str = AsyncActionType::SubmitAsyncQuery.as_str();
+    pub const GET_ASYNC_QUERY_STATUS: &str = AsyncActionType::GetAsyncQueryStatus.as_str();
+    pub const GET_ASYNC_QUERY_RESULT: &str = AsyncActionType::GetAsyncQueryResult.as_str();
+    pub const CANCEL_ASYNC_QUERY: &str = AsyncActionType::CancelAsyncQuery.as_str();
+}
+
+/// Strongly-typed query status for API responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QueryStatus {
+    /// Query is queued but not yet running.
+    Pending,
+    /// Query is actively executing.
+    Running,
+    /// Query completed successfully, results available.
+    Succeeded,
+    /// Query execution failed.
+    Failed,
+    /// Query was cancelled by user.
+    Cancelled,
+    /// Query results have been cleaned up / expired.
+    Closed,
+}
+
+impl From<JobStatus> for QueryStatus {
+    fn from(status: JobStatus) -> Self {
+        match status {
+            JobStatus::Pending => Self::Pending,
+            JobStatus::Running => Self::Running,
+            JobStatus::Succeeded => Self::Succeeded,
+            JobStatus::Failed => Self::Failed,
+            JobStatus::Cancelled => Self::Cancelled,
+            JobStatus::Closed => Self::Closed,
+        }
+    }
+}
+
+impl fmt::Display for QueryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => write!(f, "PENDING"),
+            Self::Running => write!(f, "RUNNING"),
+            Self::Succeeded => write!(f, "SUCCEEDED"),
+            Self::Failed => write!(f, "FAILED"),
+            Self::Cancelled => write!(f, "CANCELLED"),
+            Self::Closed => write!(f, "CLOSED"),
+        }
+    }
+}
+
+/// Strongly-typed query ID to avoid mixing with regular strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct QueryId(pub String);
+
+impl QueryId {
+    /// Creates a new query ID from a string.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Returns the query ID as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for QueryId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl fmt::Display for QueryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 /// Request to submit an async query.
@@ -54,25 +177,25 @@ pub struct SubmitAsyncQueryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitAsyncQueryResponse {
     /// The unique query ID.
-    pub query_id: String,
+    pub query_id: QueryId,
     /// Current status of the query.
-    pub status: String,
+    pub status: QueryStatus,
 }
 
 /// Request to get the status of an async query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAsyncQueryStatusRequest {
     /// The query ID to check.
-    pub query_id: String,
+    pub query_id: QueryId,
 }
 
 /// Response with the status of an async query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAsyncQueryStatusResponse {
     /// The query ID.
-    pub query_id: String,
+    pub query_id: QueryId,
     /// Current status: pending, running, succeeded, failed, cancelled, closed.
-    pub status: String,
+    pub status: QueryStatus,
     /// Error message if the query failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<AsyncQueryError>,
@@ -103,7 +226,7 @@ pub struct AsyncQueryResultMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAsyncQueryResultRequest {
     /// The query ID.
-    pub query_id: String,
+    pub query_id: QueryId,
     /// Which chunk to retrieve (0-indexed).
     #[serde(default)]
     pub chunk_index: usize,
@@ -113,18 +236,18 @@ pub struct GetAsyncQueryResultRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelAsyncQueryRequest {
     /// The query ID to cancel.
-    pub query_id: String,
+    pub query_id: QueryId,
 }
 
 /// Response from cancelling an async query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelAsyncQueryResponse {
     /// The query ID.
-    pub query_id: String,
+    pub query_id: QueryId,
     /// Whether the cancellation was successful.
     pub cancelled: bool,
     /// Current status after cancellation attempt.
-    pub status: String,
+    pub status: QueryStatus,
 }
 
 /// Handles the `SubmitAsyncQuery` action.
@@ -143,8 +266,8 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
         .map_err(|e| Status::internal(format!("Failed to submit query: {e}")))?;
 
     let response = SubmitAsyncQueryResponse {
-        query_id: state.job_id,
-        status: state.status.to_string(),
+        query_id: QueryId::new(state.job_id),
+        status: QueryStatus::from(state.status),
     };
 
     serde_json::to_vec(&response)
@@ -162,7 +285,7 @@ pub async fn handle_get_async_query_status(body: &[u8]) -> Result<Vec<u8>, Statu
     })?;
 
     let state = executor
-        .get_status(&request.query_id)
+        .get_status(request.query_id.as_str())
         .await
         .map_err(|e| Status::not_found(format!("Query not found: {e}")))?;
 
@@ -185,20 +308,33 @@ pub async fn handle_get_async_query_result(body: &[u8]) -> Result<Vec<u8>, Statu
 
     // Check job status first
     let state = executor
-        .get_status(&request.query_id)
+        .get_status(request.query_id.as_str())
         .await
         .map_err(|e| Status::not_found(format!("Query not found: {e}")))?;
 
-    if state.status != JobStatus::Succeeded {
-        return Err(Status::failed_precondition(format!(
-            "Query not complete (status: {})",
-            state.status
-        )));
+    // Return appropriate error for non-succeeded terminal states
+    match state.status {
+        JobStatus::Succeeded => {}
+        JobStatus::Failed => {
+            return Err(Status::internal("Query execution failed"));
+        }
+        JobStatus::Cancelled => {
+            return Err(Status::cancelled("Query was cancelled"));
+        }
+        JobStatus::Closed => {
+            return Err(Status::not_found("Query results have expired"));
+        }
+        _ => {
+            return Err(Status::failed_precondition(format!(
+                "Query not yet complete (status: {})",
+                state.status
+            )));
+        }
     }
 
     // Get the result chunk
     let batches = executor
-        .get_chunk(&request.query_id, request.chunk_index)
+        .get_chunk(request.query_id.as_str(), request.chunk_index)
         .await
         .map_err(|e| Status::internal(format!("Failed to get result chunk: {e}")))?;
 
@@ -217,14 +353,14 @@ pub async fn handle_cancel_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     })?;
 
     let state = executor
-        .cancel(&request.query_id)
+        .cancel(request.query_id.as_str())
         .await
         .map_err(|e| Status::internal(format!("Failed to cancel query: {e}")))?;
 
     let response = CancelAsyncQueryResponse {
-        query_id: state.job_id,
+        query_id: QueryId::new(state.job_id),
         cancelled: state.status == JobStatus::Cancelled,
-        status: state.status.to_string(),
+        status: QueryStatus::from(state.status),
     };
 
     serde_json::to_vec(&response)
@@ -243,8 +379,8 @@ fn job_state_to_status_response(state: &JobState) -> GetAsyncQueryStatusResponse
     });
 
     GetAsyncQueryStatusResponse {
-        query_id: state.job_id.clone(),
-        status: state.status.to_string(),
+        query_id: QueryId::new(state.job_id.clone()),
+        status: QueryStatus::from(state.status),
         error,
         result,
     }
