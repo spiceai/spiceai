@@ -51,7 +51,7 @@ use runtime_table_partition::{
 };
 use snafu::{OptionExt, prelude::*};
 
-use crate::dataaccelerator::BootstrapStatus;
+use crate::dataaccelerator::{BootstrapStatus, upsert_dedup::UpsertDedupTableProvider};
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
     dataaccelerator::{
@@ -274,11 +274,7 @@ impl DuckDBPartitionCreator {
             .ok_or("Expected PolyTableProvider but got different table provider type")?;
 
         let writer = poly_table.writer();
-
-        let writer = writer
-            .as_any()
-            .downcast_ref::<DuckDBTableWriter>()
-            .ok_or("Expected DuckDBTableWriter but got different writer type")?;
+        let writer = extract_duckdb_writer(&writer)?;
 
         // Extract UpsertOptions from cmd options
         let upsert_options = Self::extract_upsert_options(&cmd);
@@ -440,6 +436,14 @@ impl PartitionCreator for DuckDBPartitionCreator {
             })
             .collect())
     }
+
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        if self.cmd.constraints.is_empty() {
+            None
+        } else {
+            Some(&self.cmd.constraints)
+        }
+    }
 }
 
 fn create_factory() -> DuckDBTableProviderFactory {
@@ -466,6 +470,28 @@ async fn get_pool(
             .get_or_init_instance_with_builder(pool_builder)
             .await?,
     ))
+}
+
+/// Extracts the `DuckDBTableWriter` from a table provider, handling the case where
+/// it may be wrapped in an `UpsertDedupTableProvider` when upsert options are enabled.
+fn extract_duckdb_writer(
+    writer: &Arc<dyn TableProvider>,
+) -> std::result::Result<&DuckDBTableWriter, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(w) = writer.as_any().downcast_ref::<DuckDBTableWriter>() {
+        Ok(w)
+    } else if let Some(upsert_provider) = writer.as_any().downcast_ref::<UpsertDedupTableProvider>()
+    {
+        upsert_provider
+            .inner()
+            .as_any()
+            .downcast_ref::<DuckDBTableWriter>()
+            .ok_or_else(|| "UpsertDedupTableProvider inner is not DuckDBTableWriter".into())
+    } else {
+        Err(
+            "Expected DuckDBTableWriter or UpsertDedupTableProvider but got different writer type"
+                .into(),
+        )
+    }
 }
 
 register_data_accelerator!(

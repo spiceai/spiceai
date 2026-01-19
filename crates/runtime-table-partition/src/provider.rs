@@ -182,7 +182,7 @@ impl TableProvider for PartitionTableProvider {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        None
+        self.creator.constraints()
     }
 
     fn table_type(&self) -> TableType {

@@ -15,11 +15,9 @@ limitations under the License.
 */
 
 use meter::METER;
+pub use opentelemetry::KeyValue;
 use opentelemetry::metrics::UpDownCounter;
-use opentelemetry::{
-    KeyValue,
-    metrics::{Counter, Histogram},
-};
+use opentelemetry::metrics::{Counter, Histogram};
 use std::{sync::LazyLock, time::Duration};
 
 #[cfg(feature = "anonymous_telemetry")]
@@ -222,4 +220,56 @@ static QUERY_SPILLED_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 pub fn track_spilled_rows(value: u64, dimensions: &[KeyValue]) {
     QUERY_SPILLED_ROWS.add(value, dimensions);
+}
+
+// Hash Index Metrics
+
+static HASH_INDEX_BUILDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("hash_index_builds")
+        .with_description("Number of hash index builds completed.")
+        .with_unit("builds")
+        .build()
+});
+
+pub fn track_hash_index_build(dimensions: &[KeyValue]) {
+    HASH_INDEX_BUILDS.add(1, dimensions);
+}
+
+static HASH_INDEX_BUILD_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("hash_index_build_duration_ms")
+        .with_description("Time spent building hash indexes in milliseconds.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+pub fn track_hash_index_build_duration(duration: Duration, dimensions: &[KeyValue]) {
+    HASH_INDEX_BUILD_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+static HASH_INDEX_ENTRIES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("hash_index_entries")
+        .with_description("Number of entries in hash indexes.")
+        .with_boundaries(ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec())
+        .with_unit("entries")
+        .build()
+});
+
+pub fn track_hash_index_entries(entries: u64, dimensions: &[KeyValue]) {
+    HASH_INDEX_ENTRIES.record(entries, dimensions);
+}
+
+static HASH_INDEX_MEMORY_BYTES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("hash_index_memory_bytes")
+        .with_description("Memory used by hash indexes in bytes.")
+        .with_unit("By")
+        .build()
+});
+
+pub fn track_hash_index_memory_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    HASH_INDEX_MEMORY_BYTES.record(bytes, dimensions);
 }

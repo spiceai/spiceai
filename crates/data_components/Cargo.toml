@@ -55,7 +55,7 @@ git2 = { workspace = true }
 globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
-hash-index = { path = "../hash-index" }
+hash-index = { path = "../hash-index", features = ["metrics"] }
 http.workspace = true
 httpdate.workspace = true
 iceberg.workspace = true
