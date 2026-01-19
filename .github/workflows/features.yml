@@ -77,7 +77,6 @@ jobs:
       - name: Check all feature combinations
         run: |
           cargo hack check --no-default-features --each-feature --profile lint \
-            --features duckdb,postgres,sqlite,mysql,keyring-secret-store,flightsql,aws-secrets-manager,databricks,delta_lake,dremio,clickhouse,debezium,dynamodb,oracle,mongodb \
             --exclude-features default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}

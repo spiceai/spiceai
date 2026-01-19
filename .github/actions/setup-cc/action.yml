@@ -16,7 +16,7 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        brew install cmake pkg-config openssl unixodbc protobuf llvm libnfs lld
+        brew install cmake pkg-config openssl unixodbc protobuf llvm libnfs
 
     - name: Install cc (Windows)
       if: runner.os == 'Windows'
