@@ -280,6 +280,8 @@ async fn test_megascience_permutations(
     )]
     column_config: megascience::ColumnConfigOptions,
 ) {
+    use runtime::spice_data_base_path;
+
     let slug =
         format!("{acceleration_opt}-{vector_engine}-{table_option}-{column_config}_megascience");
     if let Err(e) = validate_combination(
