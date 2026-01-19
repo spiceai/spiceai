@@ -146,7 +146,6 @@ pub async fn start_scheduler_registry(
     );
 
     // Initialize job executor for async SQL queries
-    {
         let job_store = crate::jobs::JobStore::new(
             Arc::clone(&store),
             base_prefix.clone(),
@@ -158,7 +157,6 @@ pub async fn start_scheduler_registry(
             "Initialized async SQL jobs API with state location: {}",
             config.state_location
         );
-    }
 
     let record = SchedulerRecord {
         schema_version: SCHEDULER_SCHEMA_VERSION,
