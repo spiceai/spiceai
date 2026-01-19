@@ -30,6 +30,7 @@ mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
 pub use tracing_util::in_tracing_context;
 pub mod arrow;
+pub mod expr;
 pub mod stream_utils;
 pub mod time_format;
 
