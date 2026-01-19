@@ -1983,8 +1983,11 @@ impl DataAccelerator for CayenneAccelerator {
         if partition_by.is_empty() {
             // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let (write_provider, delete_provider) =
-                upsert_dedup::wrap_with_upsert_dedup_if_needed(cayenne_table, &cmd.options, cmd.constraints.clone());
+            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+                cayenne_table,
+                &cmd.options,
+                cmd.constraints.clone(),
+            );
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(
@@ -2117,8 +2120,11 @@ impl DataAccelerator for CayenneAccelerator {
             );
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let (write_provider, delete_provider) =
-                upsert_dedup::wrap_with_upsert_dedup_if_needed(partition_provider, &cmd.options, cmd.constraints.clone());
+            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+                partition_provider,
+                &cmd.options,
+                cmd.constraints.clone(),
+            );
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(

@@ -357,8 +357,11 @@ impl DataAccelerator for SqliteAccelerator {
         let sqlite_writer = Arc::new(sqlite_writer.clone());
 
         // Wrap with upsert deduplication if needed
-        let (write_provider, delete_provider) =
-            upsert_dedup::wrap_with_upsert_dedup_if_needed(sqlite_writer, &cmd.options, cmd.constraints.clone());
+        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            sqlite_writer,
+            &cmd.options,
+            cmd.constraints.clone(),
+        );
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,
