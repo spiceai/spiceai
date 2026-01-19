@@ -1,3 +1,10 @@
 [profile.default]
 retries = { backoff = "exponential", count = 5, delay = "2s", max-delay = "30s", jitter = true }
 fail-fast = false
+# Timeout for slow tests to prevent hung tests blocking CI
+slow-timeout = { period = "120s", terminate-after = 3 }
+# Use all available test threads for faster execution.
+# Tests must be written to be thread-safe and robust under maximum parallelism.
+# If you encounter flaky tests or resource contention in CI, consider reducing this
+# to a fixed number of threads or a lower expression (for example, "num-cpus/2").
+test-threads = "num-cpus"

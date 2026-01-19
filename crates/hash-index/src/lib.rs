@@ -58,7 +58,8 @@ pub use extract::{
     KeyExtractor, PrimitiveKeyExtractor, RowConverterKeyExtractor, Utf8KeyExtractor,
 };
 pub use index::{
-    HashIndex, HashIndexBuilder, NUM_SHARDS, RowLocation, hash_key, hash_key_bytes, index_threshold,
+    HashIndex, HashIndexBuilder, InsertResult, NUM_SHARDS, RowLocation, hash_key, hash_key_bytes,
+    index_threshold,
 };
 
 use snafu::prelude::*;
@@ -90,6 +91,16 @@ pub enum Error {
     /// Duplicate key detected during index build.
     #[snafu(display("Duplicate key detected"))]
     DuplicateKey,
+
+    /// Hash collision detected between different keys during index build.
+    /// This indicates two different keys produced the same hash value.
+    #[snafu(display(
+        "Index build failed due to a hash collision between different keys. This is a rare condition that prevents the index from guaranteeing data correctness. Try rebuilding the index with a different dataset ordering."
+    ))]
+    HashCollision {
+        /// The hash value that caused the collision (for internal debugging).
+        hash: u64,
+    },
 }
 
 /// Result type for hash index operations.

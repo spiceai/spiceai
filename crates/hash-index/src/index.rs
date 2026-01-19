@@ -33,15 +33,15 @@ limitations under the License.
 
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use arrow::array::RecordBatch;
 use parking_lot::RwLock;
-use snafu::ensure;
 use twox_hash::XxHash3_64;
 
+use crate::Result;
 use crate::bloom::BloomFilter;
 use crate::extract::create_key_extractor;
-use crate::{DuplicateKeySnafu, Result};
 
 /// Fixed seed for deterministic hashing across instances.
 const HASH_SEED: u64 = 0x5370_6963_6541_4920; // "SpiceAI " in hex
@@ -238,11 +238,25 @@ impl HashIndexBuilder {
     }
 
     fn build_internal(self, partitions: &[Vec<RecordBatch>]) -> Result<HashIndex> {
+        let start_time = Instant::now();
+
         let total_rows: usize = partitions
             .iter()
             .flat_map(|p| p.iter())
             .map(RecordBatch::num_rows)
             .sum();
+
+        let num_partitions = partitions.len();
+        let num_batches: usize = partitions.iter().map(Vec::len).sum();
+        let key_columns_display = self.key_columns.join(", ");
+
+        tracing::info!(
+            rows = total_rows,
+            partitions = num_partitions,
+            batches = num_batches,
+            key_columns = %key_columns_display,
+            "Building hash index"
+        );
 
         let capacity = self.expected_rows.max(total_rows).max(1024);
         let per_shard = (capacity / NUM_SHARDS).max(16);
@@ -262,6 +276,19 @@ impl HashIndexBuilder {
             key_columns: self.key_columns.clone(),
             bloom,
         };
+
+        // Progress tracking for large indexes
+        // Use a max threshold (1M rows) to ensure more frequent updates for extremely large indexes
+        let progress_interval = if total_rows > 1_000_000 {
+            // Log every 10% or 1M rows, whichever is smaller
+            (total_rows / 10).min(1_000_000)
+        } else if total_rows > 100_000 {
+            total_rows / 5 // Log every 20%
+        } else {
+            usize::MAX // Don't log progress for small tables
+        };
+        let mut rows_processed: usize = 0;
+        let mut last_progress_log: usize = 0;
 
         // Insert all entries
         for (partition_idx, partition) in partitions.iter().enumerate() {
@@ -286,11 +313,109 @@ impl HashIndexBuilder {
                     if self.allow_duplicates {
                         index.insert_or_replace(hash, location);
                     } else {
-                        let inserted = index.insert(hash, location);
-                        ensure!(inserted, DuplicateKeySnafu);
+                        match index.insert(hash, location) {
+                            InsertResult::Inserted => {}
+                            InsertResult::HashCollision(existing_loc) => {
+                                // Hash collision detected. Verify if keys are actually equal
+                                // by comparing their raw byte representations.
+                                let existing_batch = &partitions[existing_loc.partition as usize]
+                                    [existing_loc.batch as usize];
+                                let existing_extractor =
+                                    create_key_extractor(existing_batch, &self.key_columns)?;
+
+                                let current_key_bytes = extractor.key_bytes(row);
+                                let existing_key_bytes =
+                                    existing_extractor.key_bytes(existing_loc.row as usize);
+
+                                // Note: Null keys are filtered at line 301-303 (Skip null keys),
+                                // so key_bytes() should never return None here. If it does,
+                                // treat it as a hash collision (different keys) to be safe.
+                                match (current_key_bytes, existing_key_bytes) {
+                                    (Some(current), Some(existing)) if current == existing => {
+                                        // Same key bytes = true duplicate key
+                                        return Err(crate::Error::DuplicateKey);
+                                    }
+                                    _ => {
+                                        // Different key bytes (or null) = hash collision.
+                                        // Per DATA CORRECTNESS principles: lookups must never fail to find
+                                        // existing data. Since our hash table doesn't support chaining,
+                                        // we must fail the index build rather than silently drop keys.
+                                        return Err(crate::Error::HashCollision { hash });
+                                    }
+                                }
+                            }
+                        }
                     }
+
+                    rows_processed += 1;
+                }
+
+                // Log progress for large indexes
+                if rows_processed - last_progress_log >= progress_interval {
+                    let percent = (rows_processed * 100) / total_rows;
+                    let elapsed = start_time.elapsed();
+                    // Cast precision loss is acceptable for logging display purposes
+                    #[expect(clippy::cast_precision_loss)]
+                    let rows_per_sec_f64 = if elapsed.as_secs_f64() > 0.0 {
+                        rows_processed as f64 / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    // Truncation/sign loss acceptable: rows/sec won't exceed u64::MAX
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let rows_per_sec = rows_per_sec_f64 as u64;
+                    tracing::info!(
+                        progress_percent = percent,
+                        rows_indexed = rows_processed,
+                        rows_per_sec = rows_per_sec,
+                        "Hash index build progress"
+                    );
+                    last_progress_log = rows_processed;
                 }
             }
+        }
+
+        let elapsed = start_time.elapsed();
+        let indexed_entries = index.len();
+        // Cast precision loss is acceptable for logging display purposes
+        #[expect(clippy::cast_precision_loss)]
+        let rows_per_sec_f64 = if elapsed.as_secs_f64() > 0.0 {
+            indexed_entries as f64 / elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        // Truncation/sign loss acceptable: rows/sec won't exceed u64::MAX
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rows_per_sec = rows_per_sec_f64 as u64;
+
+        // Estimate memory usage: each shard has slots, each slot is 16 bytes (hash + location)
+        let memory_bytes = index.memory_usage_bytes();
+        #[expect(clippy::cast_precision_loss)]
+        let memory_mb = memory_bytes as f64 / 1_048_576.0;
+
+        // Truncation/sign loss acceptable: elapsed_ms won't exceed u64::MAX for practical builds
+        #[expect(clippy::cast_possible_truncation)]
+        let elapsed_ms = elapsed.as_millis() as u64;
+
+        tracing::info!(
+            entries = indexed_entries,
+            elapsed_ms = elapsed_ms,
+            rows_per_sec = rows_per_sec,
+            memory_bytes = memory_bytes,
+            memory_mb = format!("{memory_mb:.2}"),
+            bloom_filter = self.use_bloom_filter,
+            "Hash index build complete"
+        );
+
+        // Record OTel metrics when the metrics feature is enabled
+        #[cfg(feature = "metrics")]
+        {
+            let dimensions = &[];
+            telemetry::track_hash_index_build(dimensions);
+            telemetry::track_hash_index_build_duration(elapsed, dimensions);
+            // usize to u64 never truncates on 64-bit, and widens safely on 32-bit
+            telemetry::track_hash_index_entries(indexed_entries as u64, dimensions);
+            telemetry::track_hash_index_memory_bytes(memory_bytes as u64, dimensions);
         }
 
         Ok(index)
@@ -334,7 +459,7 @@ impl Shard {
         table.get(hash)
     }
 
-    fn insert(&self, hash: u64, location: RowLocation) -> bool {
+    fn insert(&self, hash: u64, location: RowLocation) -> InsertResult {
         let mut table = self.table.write();
         table.insert(hash, location)
     }
@@ -358,6 +483,19 @@ impl Shard {
         table.slots.fill(Slot::default());
         table.len = 0;
     }
+
+    fn capacity(&self) -> usize {
+        self.table.read().slots.len()
+    }
+}
+
+/// Result of an insert operation into the hash table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertResult {
+    /// Successfully inserted.
+    Inserted,
+    /// Hash collision detected. Contains the location of the existing entry.
+    HashCollision(RowLocation),
 }
 
 // Truncation for u64 -> usize is intentional on 32-bit platforms.
@@ -396,7 +534,7 @@ impl ShardTable {
         }
     }
 
-    fn insert(&mut self, hash: u64, location: RowLocation) -> bool {
+    fn insert(&mut self, hash: u64, location: RowLocation) -> InsertResult {
         if self.len * 4 >= self.slots.len() * 3 {
             self.grow();
         }
@@ -410,11 +548,11 @@ impl ShardTable {
                 slot.hash = hash;
                 slot.location = location;
                 self.len += 1;
-                return true;
+                return InsertResult::Inserted;
             }
 
             if slot.hash == hash {
-                return false; // Duplicate
+                return InsertResult::HashCollision(slot.location);
             }
 
             idx = (idx + 1) & self.mask;
@@ -649,15 +787,19 @@ impl HashIndex {
     }
 
     /// Inserts a new entry.
-    pub fn insert(&self, hash: u64, location: RowLocation) -> bool {
-        let inserted = self.shard(hash).insert(hash, location);
-        if inserted {
+    ///
+    /// Returns `InsertResult::Inserted` if the entry was successfully inserted,
+    /// or `InsertResult::HashCollision(existing_location)` if an entry with the
+    /// same hash already exists.
+    pub fn insert(&self, hash: u64, location: RowLocation) -> InsertResult {
+        let result = self.shard(hash).insert(hash, location);
+        if matches!(result, InsertResult::Inserted) {
             self.len.fetch_add(1, Ordering::Relaxed);
             if let Some(bloom) = &self.bloom {
                 bloom.write().insert(hash);
             }
         }
-        inserted
+        result
     }
 
     /// Inserts or replaces an entry.
@@ -681,6 +823,32 @@ impl HashIndex {
             self.len.fetch_sub(1, Ordering::Relaxed);
         }
         result
+    }
+
+    /// Returns the estimated memory usage in bytes.
+    ///
+    /// This includes the hash table slots across all shards and the bloom filter
+    /// if enabled. The actual memory usage may be slightly higher due to allocator
+    /// overhead and struct padding.
+    #[must_use]
+    pub fn memory_usage_bytes(&self) -> usize {
+        // Each slot is 16 bytes (8 byte hash + 8 byte RowLocation which packs into 8 bytes)
+        const SLOT_SIZE: usize = 16;
+
+        let mut total: usize = 0;
+
+        // Sum up all shard capacities
+        for shard in self.shards.iter() {
+            total += shard.capacity() * SLOT_SIZE;
+        }
+
+        // Add bloom filter memory if present
+        if let Some(bloom) = &self.bloom {
+            // Bloom filter uses 1 bit per entry, roughly
+            total += bloom.read().memory_usage_bytes();
+        }
+
+        total
     }
 
     /// Clears all entries.
