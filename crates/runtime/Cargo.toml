@@ -284,6 +284,7 @@ nfs = ["runtime-object-store/nfs"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
 openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 oracle = ["data_components/oracle"]
+pingora = ["cache/pingora"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",
