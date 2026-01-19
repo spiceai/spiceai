@@ -246,6 +246,8 @@ pub struct AcceleratedTable {
     /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
     /// `None` if no insert has occurred yet (and no bootstrap timestamp was provided).
     last_updated_at: Option<Arc<AtomicI64>>,
+    /// Sender for batched cache writes. Only used in caching refresh mode.
+    batch_write_tx: Option<caching::CacheWriteSender>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -679,6 +681,23 @@ impl Builder {
             handlers.push(refresh_handle);
         }
 
+        // For caching mode, create the batched write channel and spawn consumer task.
+        let batch_write_tx = if refresh_mode == RefreshMode::Caching {
+            let (tx, rx) = caching::create_cache_write_channel();
+            let consumer_handle = caching::spawn_batched_cache_write_task(
+                rx,
+                Arc::clone(&self.accelerator),
+                self.dataset_name.to_string(),
+                Arc::clone(&accelerator_write_mutex),
+                Arc::clone(&in_flight_revalidations),
+            );
+            // The consumer task will be automatically stopped (aborted) when AcceleratedTable is dropped
+            handlers.push(consumer_handle);
+            Some(tx)
+        } else {
+            None
+        };
+
         if let Some(retention) = self.retention {
             let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
                 self.dataset_name.clone(),
@@ -768,6 +787,7 @@ impl Builder {
             accelerator_write_mutex,
             in_flight_revalidations,
             last_updated_at,
+            batch_write_tx,
         })
     }
 }
@@ -1012,6 +1032,10 @@ impl TableProvider for AcceleratedTable {
                 };
 
                 let federated_provider = self.federated.table_provider().await;
+                // SAFETY: batch_write_tx is always Some in caching mode (set in start())
+                let batch_write_tx = self.batch_write_tx.clone().ok_or_else(|| {
+                    DataFusionError::Internal("batch_write_tx missing in caching mode".to_string())
+                })?;
                 Arc::new(caching::CachingAccelerationScanExec::new(
                     input,
                     self.cache_ttl,
@@ -1027,6 +1051,7 @@ impl TableProvider for AcceleratedTable {
                     Arc::clone(&self.accelerator_write_mutex),
                     Arc::clone(&self.in_flight_revalidations),
                     Arc::clone(&self.synchronized_children),
+                    batch_write_tx,
                 ))
             }
             (false, ZeroResultsAction::ReturnEmpty) => input,

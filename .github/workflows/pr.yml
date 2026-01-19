@@ -37,6 +37,17 @@ concurrency:
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
   RUST_PROFILE: ${{ github.event.inputs.profile_option || 'lint' }}
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # Use fast linkers for PR builds (mold for x86_64, lld for aarch64)
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: clang
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
@@ -49,7 +60,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
-          fetch-depth: 0
+          # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
       - name: Check for code changes
         id: check
@@ -66,6 +78,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          fetch-depth: 1
 
       - name: Cache Go modules
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -110,6 +124,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          fetch-depth: 1
 
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -154,8 +170,6 @@ jobs:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          CARGO_INCREMENTAL: 0
-          CARGO_NET_GIT_FETCH_WITH_CLI: true
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Validate datafusion-table-providers commit
@@ -177,6 +191,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          fetch-depth: 1
 
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -242,8 +258,6 @@ jobs:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-          CARGO_INCREMENTAL: 0
-          CARGO_NET_GIT_FETCH_WITH_CLI: true
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
           AWS_S3_CLIENT_ID: ${{ secrets.AWS_S3_CLIENT_ID }}
           AWS_S3_IDENTITY_POOL_ID: ${{ secrets.AWS_S3_IDENTITY_POOL_ID }}
@@ -256,7 +270,7 @@ jobs:
 
       - name: Build testoperator
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: cargo build -p testoperator --all-features
+        run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
         if: needs.check_changes.outputs.relevant_changes == 'true'
