@@ -85,12 +85,27 @@ lint: lint-go lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
-	## All except metal, cuda - using --all-targets for single clippy pass (allow-expect-in-tests=true handles test exceptions)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	## All except metal, cuda
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures \
@@ -105,12 +120,27 @@ lint-rust:
 
 lint-rust-fix:
 	cargo fmt --all
-	## All except metal, cuda - using --all-targets for single clippy pass (allow-expect-in-tests=true handles test exceptions)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --all-targets --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	## All except metal, cuda
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
 		-Aclippy::module_name_repetitions \
 		-Aclippy::large_futures \

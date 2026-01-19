@@ -38,6 +38,7 @@ runs:
             - 'Cargo.lock'
             - 'go.mod'
             - 'go.sum'
+            - 'Makefile'
 
     - name: Check for relevant changes
       id: check_changes
