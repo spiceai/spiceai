@@ -206,7 +206,7 @@ impl AcceleratorEngineRegistry {
         // Shutdown each accelerator before clearing the registry
         for (engine, accelerator) in registry.drain() {
             if let Err(e) = accelerator.shutdown().await {
-                tracing::warn!("Failed to shutdown accelerator engine {engine}: {e}");
+                tracing::error!("Failed to shutdown accelerator engine {engine}: {e}");
             }
         }
     }

@@ -518,7 +518,8 @@ impl MetastoreBackend for SqliteMetastore {
                 // PRAGMA optimize may return rows indicating what was optimized
                 tracing::info!("Running optimize on Cayenne catalog");
                 let mut stmt = conn.prepare("PRAGMA optimize")?;
-                let _ = stmt.query([])?.next(); // Consume any results
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes
 
                 Ok::<_, rusqlite::Error>(())
             })
@@ -529,13 +530,11 @@ impl MetastoreBackend for SqliteMetastore {
                 },
             )?;
 
-            // Explicitly close the connection to ensure clean shutdown.
-            // Clone creates a handle to the same background thread, and closing it
-            // will close the underlying connection. Subsequent operations on the
-            // original handle will return ConnectionClosed error.
-            if let Err(e) = conn.clone().close().await {
-                tracing::warn!("Failed to close Cayenne catalog connection: {e}");
-            }
+            // Note: We intentionally do not explicitly close the connection here.
+            // Closing a cloned handle would leave a closed connection stored in the
+            // OnceCell, and any subsequent use of the metastore would see a closed
+            // connection and fail. Instead, we rely on normal drop semantics to
+            // clean up the background connection when the metastore is dropped.
         }
 
         Ok(())
