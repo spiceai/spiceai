@@ -281,6 +281,31 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.responses_llms)));
     }
 
+    // Add async queries API routes when job executor is available (cluster mode)
+    if let Some(job_executor) = rt.job_executor() {
+        tracing::info!("Enabling async SQL queries API (/v1/queries)");
+        let queries_router = Router::new()
+            .route("/v1/queries", post(v1::queries::submit))
+            .route("/v1/queries", get(v1::queries::list))
+            .route("/v1/queries/{query_id}", get(v1::queries::get_query))
+            .route(
+                "/v1/queries/{query_id}/status",
+                get(v1::queries::get_status),
+            )
+            .route(
+                "/v1/queries/{query_id}/results",
+                get(v1::queries::get_results),
+            )
+            .route(
+                "/v1/queries/{query_id}/results/chunks/{chunk_index}",
+                get(v1::queries::get_chunk),
+            )
+            .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel))
+            .layer(Extension(job_executor));
+
+        authenticated_router = authenticated_router.merge(queries_router);
+    }
+
     #[cfg(feature = "mcp")]
     {
         let (sse_server, mcp_router) = SseServer::new(SseServerConfig {
