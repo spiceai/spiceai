@@ -401,7 +401,10 @@ mod tests {
                 .into_owned();
             // Then normalize the list
             let result = list_regex
-                .replace_all(&count_normalized, super::FILE_GROUPS_LIST_FILTER_REPLACEMENT)
+                .replace_all(
+                    &count_normalized,
+                    super::FILE_GROUPS_LIST_FILTER_REPLACEMENT,
+                )
                 .into_owned();
             assert_eq!(result, expected, "Failed for input: {input}");
         }
