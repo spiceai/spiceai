@@ -107,8 +107,10 @@ impl McpToolCatalog {
             loop {
                 interval.tick().await;
 
-                // Acquire the lock, perform the ping, and drop the lock before any long-running await.
-                // This avoids holding the lock across the network call which could block other operations.
+                // Perform the heartbeat ping. The read lock is held during the ping call.
+                // Note: The underlying McpClient wraps a RunningService which is not Clone,
+                // so we cannot clone the client to release the lock before the network call.
+                // This is acceptable because the ping timeout is bounded.
                 let heartbeat_result = {
                     let client_guard = client_clone.read().await;
                     client_guard.ping().await
