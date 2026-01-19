@@ -297,6 +297,7 @@ async fn test_megascience_permutations(
     // use some hash of slug
     let mut z = DefaultHasher::new();
     slug.hash(&mut z);
+    std::fs::create_dir_all(spice_data_base_path()).expect("failed to create spice data base path");
     let acceleration = acceleration_opt.to_acceleration(&z.finish().to_string());
 
     let mut app = AppBuilder::new(slug);
