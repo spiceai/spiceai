@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Display;
+
 use super::{default_true, is_default_or_none};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -36,10 +38,8 @@ pub enum HashingAlgorithm {
     Siphash,
     #[serde(rename = "ahash")]
     Ahash,
-    #[serde(rename = "blake3")]
-    Blake3,
-    #[default]
     #[serde(rename = "xxh3")]
+    #[default]
     XXH3,
     #[serde(rename = "xxh32")]
     XXH32,
@@ -47,6 +47,28 @@ pub enum HashingAlgorithm {
     XXH64,
     #[serde(rename = "xxh128")]
     XXH128,
+    #[serde(rename = "blake3")]
+    Blake3,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CacheEngine {
+    /// Moka cache engine (default) - stable, built-in TTL, no race conditions
+    #[default]
+    Moka,
+    /// Pingora-LRU cache engine - 2-3x faster, sharded architecture, manual TTL handling with a rare race condition. Note: table-specific invalidation uses manual key iteration (O(n) operation).
+    Pingora,
+}
+
+impl Display for CacheEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheEngine::Moka => write!(f, "Moka"),
+            CacheEngine::Pingora => write!(f, "Pingora-LRU"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -106,6 +128,8 @@ pub struct CacheConfig {
     pub caching_policy: CachingPolicy,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    #[serde(default)]
+    pub engine: CacheEngine,
 }
 
 impl Default for CacheConfig {
@@ -116,6 +140,7 @@ impl Default for CacheConfig {
             item_ttl: None,
             caching_policy: CachingPolicy::default(),
             hashing_algorithm: HashingAlgorithm::default(),
+            engine: CacheEngine::default(),
         }
     }
 }
@@ -137,6 +162,8 @@ pub struct SQLResultsCacheConfig {
     pub hashing_algorithm: HashingAlgorithm,
     #[serde(default)]
     pub cache_key_type: CacheKeyType,
+    #[serde(default)]
+    pub engine: CacheEngine,
     /// Maximum age for serving stale cached results while revalidating in the background.
     /// When set, cached results past their TTL (but within this additional window) will be
     /// served immediately while a background refresh is triggered.
@@ -159,6 +186,7 @@ impl Default for SQLResultsCacheConfig {
             caching_policy: CachingPolicy::default(),
             hashing_algorithm: HashingAlgorithm::default(),
             cache_key_type: CacheKeyType::default(),
+            engine: CacheEngine::default(),
             stale_while_revalidate_ttl: None,
             encoding: Encoding::default(),
         }
@@ -179,6 +207,8 @@ pub struct ResultsCache {
     pub cache_key_type: CacheKeyType,
     #[serde(default)]
     pub hashing_algorithm: HashingAlgorithm,
+    #[serde(default)]
+    pub engine: CacheEngine,
     /// Maximum stale-while-revalidate duration to add to the cache TTL.
     pub max_stale_while_revalidate: Option<String>,
 }
@@ -192,6 +222,7 @@ impl Default for ResultsCache {
             caching_policy: CachingPolicy::default(),
             cache_key_type: CacheKeyType::default(),
             hashing_algorithm: HashingAlgorithm::default(),
+            engine: CacheEngine::default(),
             max_stale_while_revalidate: None,
         }
     }
@@ -206,6 +237,7 @@ impl From<ResultsCache> for SQLResultsCacheConfig {
             caching_policy: val.caching_policy,
             hashing_algorithm: val.hashing_algorithm,
             cache_key_type: val.cache_key_type,
+            engine: val.engine,
             stale_while_revalidate_ttl: None,
             encoding: Encoding::default(),
         }

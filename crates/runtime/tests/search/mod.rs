@@ -150,7 +150,7 @@ impl AccelerationOptions {
                 engine: Some("duckdb".to_string()),
                 mode: Mode::File,
                 params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
-                    "duckdb_file_path".to_string(),
+                    "duckdb_file".to_string(),
                     format!(".spice/data/duckdb_acceleration_{unique_id}.db"),
                 )]))),
                 ..Default::default()
