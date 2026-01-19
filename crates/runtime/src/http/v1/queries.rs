@@ -33,10 +33,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
-use crate::jobs::{DEFAULT_CHUNK_SIZE, JobExecutor, JobState, JobStatus};
+use crate::jobs::{JobExecutor, JobState, JobStatus};
 
 /// Request body for submitting a new query.
 #[derive(Debug, Deserialize)]
@@ -291,19 +290,18 @@ pub(crate) async fn get_query(
             let mut response = job_state_to_response(&state);
 
             // If succeeded, include first chunk data
-            if state.status == JobStatus::Succeeded {
-                if let Ok(batches) = executor.get_chunk(&query_id, 0).await {
-                    if let Some(result) = &state.result {
-                        match build_chunk_response(&query_id, 0, &batches, result) {
-                            Ok(first_chunk) => response.result = Some(first_chunk),
-                            Err(e) => {
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(serde_json::json!({"error": e})),
-                                )
-                                    .into_response();
-                            }
-                        }
+            if state.status == JobStatus::Succeeded
+                && let Ok(batches) = executor.get_chunk(&query_id, 0).await
+                && let Some(result) = &state.result
+            {
+                match build_chunk_response(&query_id, 0, &batches, result) {
+                    Ok(first_chunk) => response.result = Some(first_chunk),
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": e})),
+                        )
+                            .into_response();
                     }
                 }
             }
@@ -397,9 +395,8 @@ pub(crate) async fn get_results(
             // Pending or Running - use 425 Too Early
             // Safety: 425 is a valid HTTP status code (RFC 8470), so from_u16 cannot fail
             _ => {
-                let too_early = match StatusCode::from_u16(425) {
-                    Ok(code) => code,
-                    Err(_) => unreachable!("425 is a valid HTTP status code"),
+                let Ok(too_early) = StatusCode::from_u16(425) else {
+                    unreachable!("425 is a valid HTTP status code")
                 };
                 (
                     too_early,
@@ -778,16 +775,15 @@ fn ms_to_iso8601(ms: u64) -> String {
     #[expect(clippy::cast_possible_truncation)]
     let nanos = ((ms % 1000) * 1_000_000) as u32;
 
-    match DateTime::from_timestamp(secs, nanos) {
-        Some(dt) => dt.to_rfc3339(),
-        None => {
-            // Data correctness: never silently coerce invalid timestamps to Unix epoch.
-            // Instead, log and return a clearly invalid sentinel value.
-            tracing::error!(
-                timestamp_ms = ms,
-                "Invalid Unix timestamp; returning sentinel ISO 8601 string"
-            );
-            format!("INVALID_TIMESTAMP({ms})")
-        }
+    if let Some(dt) = DateTime::from_timestamp(secs, nanos) {
+        dt.to_rfc3339()
+    } else {
+        // Data correctness: never silently coerce invalid timestamps to Unix epoch.
+        // Instead, log and return a clearly invalid sentinel value.
+        tracing::error!(
+            timestamp_ms = ms,
+            "Invalid Unix timestamp; returning sentinel ISO 8601 string"
+        );
+        format!("INVALID_TIMESTAMP({ms})")
     }
 }

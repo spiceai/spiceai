@@ -232,14 +232,14 @@ impl JobExecutor {
 
 /// Categorizes an error message into an error code.
 ///
-/// Returns a generic "QUERY_EXECUTION" error code rather than attempting to
+/// Returns a generic `QUERY_EXECUTION` error code rather than attempting to
 /// infer categories from error message text. String-based error categorization
 /// is unreliable because:
 /// - Error messages can contain user-controlled content (e.g., SQL with "timeout" in comments)
-/// - Error message formats can change between DataFusion versions
+/// - Error message formats can change between `DataFusion` versions
 /// - Misclassification can mislead users about the actual error
 ///
-/// For reliable error categorization, use structured error types from DataFusion
+/// For reliable error categorization, use structured error types from `DataFusion`
 /// rather than string matching.
 fn categorize_error(_message: &str) -> &'static str {
     "QUERY_EXECUTION"

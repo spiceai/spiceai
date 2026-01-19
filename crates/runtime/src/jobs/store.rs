@@ -284,9 +284,7 @@ impl JobStore {
                 let (type_precision, type_scale) = match field.data_type() {
                     arrow::datatypes::DataType::Decimal128(precision, scale)
                     | arrow::datatypes::DataType::Decimal256(precision, scale) => {
-                        #[expect(clippy::cast_possible_wrap)]
-                        let scale_i32 = *scale as i32;
-                        (Some(u32::from(*precision)), Some(scale_i32))
+                        (Some(u32::from(*precision)), Some(i32::from(*scale)))
                     }
                     _ => (None, None),
                 };
