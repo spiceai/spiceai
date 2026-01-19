@@ -24,9 +24,13 @@ mod common;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+
 use datafusion::prelude::SessionContext;
+
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };

@@ -28,16 +28,24 @@ limitations under the License.
 mod common;
 
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::{
     metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder,
     MetadataCatalog,
 };
+
 use common::TestFixture;
+
 use data_components::delete::DeletionTableProvider;
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::execution::context::SessionContext;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;

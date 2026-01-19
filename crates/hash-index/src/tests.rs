@@ -1899,7 +1899,11 @@ fn test_zero_hash_works_correctly() {
     // Insert using hash = 0
     let location = RowLocation::new(0, 0, 42);
     let inserted = index.insert(0, location);
-    assert!(inserted, "Insert with hash=0 should succeed");
+    assert_eq!(
+        inserted,
+        InsertResult::Inserted,
+        "Insert with hash=0 should succeed"
+    );
 
     // get_by_hash(0) should return the location
     let result = index.get_by_hash(0);
@@ -1917,15 +1921,20 @@ fn test_zero_and_one_hash_are_distinct() {
 
     // Insert with hash = 0
     let loc1 = RowLocation::new(0, 0, 1);
-    assert!(index.insert(0, loc1), "Insert with hash=0 should succeed");
+    assert_eq!(
+        index.insert(0, loc1),
+        InsertResult::Inserted,
+        "Insert with hash=0 should succeed"
+    );
 
     // Insert with hash = 1 - this should succeed as a distinct key
     let loc2 = RowLocation::new(0, 0, 2);
     let inserted = index.insert(1, loc2);
 
     // Hash 0 and hash 1 are distinct keys, so both should be stored
-    assert!(
+    assert_eq!(
         inserted,
+        InsertResult::Inserted,
         "Insert with hash=1 should succeed because 0 and 1 are distinct keys"
     );
 
@@ -1953,7 +1962,11 @@ fn test_max_hash_normalized() {
     // Insert using hash = u64::MAX (the sentinel value)
     let location = RowLocation::new(0, 0, 42);
     let inserted = index.insert(u64::MAX, location);
-    assert!(inserted, "Insert with hash=u64::MAX should succeed");
+    assert_eq!(
+        inserted,
+        InsertResult::Inserted,
+        "Insert with hash=u64::MAX should succeed"
+    );
 
     // get_by_hash(u64::MAX) should return the location
     let result = index.get_by_hash(u64::MAX);
@@ -1970,7 +1983,7 @@ fn test_max_hash_normalized() {
     let loc2 = RowLocation::new(0, 0, 99);
     let inserted2 = index.insert(u64::MAX - 1, loc2);
     assert!(
-        !inserted2,
+        matches!(inserted2, InsertResult::HashCollision(_)),
         "Insert with hash=u64::MAX-1 should fail because u64::MAX normalizes to u64::MAX-1"
     );
 }

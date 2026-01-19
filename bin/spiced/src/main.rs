@@ -16,10 +16,6 @@ limitations under the License.
 
 // Spice runtime requires at least 64-bit pointer size (8 bytes).
 // This compile-time assertion prevents building on 32-bit platforms.
-#[expect(
-    clippy::disallowed_macros,
-    reason = "compile-time assertion, not runtime panic"
-)]
 const _: () = assert!(
     size_of::<usize>() >= 8,
     "Spice runtime requires a 64-bit platform (usize must be at least 8 bytes)"

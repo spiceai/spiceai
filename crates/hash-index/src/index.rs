@@ -41,10 +41,6 @@ limitations under the License.
 
 // Compile-time assertion: require at least 64-bit pointer size (8 bytes).
 // This is a build-time check that prevents compiling on unsupported platforms.
-#[expect(
-    clippy::disallowed_macros,
-    reason = "compile-time assertion, not runtime panic"
-)]
 const _: () = assert!(
     size_of::<usize>() >= 8,
     "hash-index requires a 64-bit platform (usize must be at least 8 bytes)"
