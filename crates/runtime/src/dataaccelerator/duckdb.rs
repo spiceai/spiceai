@@ -515,9 +515,7 @@ impl DataAccelerator for DuckDBAccelerator {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to parse retention_sql for dataset {}: {}. Retention SQL will not be applied.",
-                            dataset_name, e
-                        );
+                            "Failed to parse retention_sql for dataset {dataset_name}: {e}. Retention SQL will not be applied.");
                     }
                 }
             }
