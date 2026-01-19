@@ -703,6 +703,7 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{ExprFunctionExt, lit};
+    #[cfg(feature = "models")]
     use llms::model2vec::Model2Vec;
     use runtime_request_context::{Protocol, RequestContext};
     use std::collections::BTreeMap;
@@ -771,6 +772,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "models")]
     async fn make_test_runtime() -> Result<Runtime> {
         let rt = RuntimeBuilder::new().build().await;
         rt.df
@@ -800,6 +802,7 @@ mod tests {
         Ok(rt)
     }
 
+    #[cfg(feature = "models")]
     async fn make_fruit_dataframe(runtime: &Runtime) -> Result<DataFrame> {
         let rowid_expr = row_number()
             .order_by(vec![col("content").sort(false, false)])
@@ -841,6 +844,7 @@ mod tests {
         Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(stub_udf), vec![]))
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     // #[ignore = "https://github.com/spiceai/spiceai/issues/7861"] // For some reason, BytesProcessedExec is failing to acquire a RequestContext even though the other RRF tests do fine
     // https://github.com/spiceai/spiceai/issues/7861
@@ -886,6 +890,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_recency_unboosting_disjoint() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -951,6 +956,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_rank_weighting() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -976,6 +982,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fuse_queries() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -1001,6 +1008,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fuse_queries_auto_hash_and_special_idents() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -1029,6 +1037,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fuse_with_case_sensitive_columns() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -1060,6 +1069,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fuse_with_dupes() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -1084,6 +1094,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_score_computation() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
