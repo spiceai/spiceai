@@ -21140,8 +21140,3 @@ checksum = "ea2db9186c0a6ad1aa7012046f3fadc8db9001691b367c510f5867f17f975752"
 dependencies = [
  "zune-core 0.5.1",
 ]
-
-[[patch.unused]]
-name = "arrow-odbc"
-version = "21.0.0"
-source = "git+https://github.com/pacman82/arrow-odbc?rev=7316b13ac969eea8bef7b496a2ba334ebd4e6e06#7316b13ac969eea8bef7b496a2ba334ebd4e6e06"

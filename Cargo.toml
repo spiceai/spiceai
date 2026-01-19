@@ -360,8 +360,6 @@ delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a14c73d9" } # spiceai-1.4.2
 
-arrow-odbc = { git = "https://github.com/pacman82/arrow-odbc", rev = "7316b13ac969eea8bef7b496a2ba334ebd4e6e06" }
-
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
