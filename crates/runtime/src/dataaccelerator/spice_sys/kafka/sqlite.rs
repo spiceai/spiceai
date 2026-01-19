@@ -146,12 +146,7 @@ mod tests {
         dataset.acceleration = Some(Acceleration {
             engine: Engine::Sqlite,
             mode: Mode::File,
-            params: [(
-                "sqlite_file".to_string(),
-                db_file,
-            )]
-            .into_iter()
-            .collect(),
+            params: [("sqlite_file".to_string(), db_file)].into_iter().collect(),
             ..Default::default()
         });
 
