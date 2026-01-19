@@ -1422,7 +1422,10 @@ mod tests {
             assert_eq!(seq, 1);
 
             // Perform graceful shutdown - this checkpoints the WAL
-            catalog.shutdown().await.expect("Failed to shutdown catalog");
+            catalog
+                .shutdown()
+                .await
+                .expect("Failed to shutdown catalog");
 
             // Catalog goes out of scope here, connection is dropped
         }
@@ -1430,7 +1433,10 @@ mod tests {
         // Phase 2: Reopen catalog and verify all data persisted correctly
         {
             let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen catalog");
-            catalog.init().await.expect("Failed to reinitialize catalog");
+            catalog
+                .init()
+                .await
+                .expect("Failed to reinitialize catalog");
 
             // Verify table exists with correct metadata
             let table = catalog
@@ -1485,9 +1491,11 @@ mod tests {
         );
         let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
 
         let table_name = "cycle_test_table";
         let base_path = "/tmp/cayenne_cycle_test";
@@ -1508,7 +1516,10 @@ mod tests {
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
 
-            table_id = catalog.create_table(options).await.expect("Failed to create table");
+            table_id = catalog
+                .create_table(options)
+                .await
+                .expect("Failed to create table");
             catalog.shutdown().await.expect("Shutdown failed");
         }
 
@@ -1530,7 +1541,10 @@ mod tests {
                     deletion_type: DeletionType::default(),
                     sequence_number: i + 1,
                 };
-                catalog.add_delete_file(delete_file).await.expect("Failed to add delete file");
+                catalog
+                    .add_delete_file(delete_file)
+                    .await
+                    .expect("Failed to add delete file");
             }
 
             catalog.shutdown().await.expect("Shutdown failed");
@@ -1541,12 +1555,18 @@ mod tests {
             let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
             catalog.init().await.expect("Failed to init");
 
-            let delete_files = catalog.get_table_delete_files(table_id).await.expect("Failed to get delete files");
+            let delete_files = catalog
+                .get_table_delete_files(table_id)
+                .await
+                .expect("Failed to get delete files");
             assert_eq!(delete_files.len(), 5, "All 5 delete files should persist");
 
             // Increment sequence number multiple times
             for _ in 0..3 {
-                catalog.increment_sequence_number(table_id).await.expect("Failed to increment");
+                catalog
+                    .increment_sequence_number(table_id)
+                    .await
+                    .expect("Failed to increment");
             }
 
             catalog.shutdown().await.expect("Shutdown failed");
@@ -1557,10 +1577,19 @@ mod tests {
             let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
             catalog.init().await.expect("Failed to init");
 
-            let table = catalog.get_table(table_name).await.expect("Table should exist");
-            assert_eq!(table.current_sequence_number, 3, "Sequence number should be 3 after 3 increments");
+            let table = catalog
+                .get_table(table_name)
+                .await
+                .expect("Table should exist");
+            assert_eq!(
+                table.current_sequence_number, 3,
+                "Sequence number should be 3 after 3 increments"
+            );
 
-            let delete_files = catalog.get_table_delete_files(table_id).await.expect("Failed to get delete files");
+            let delete_files = catalog
+                .get_table_delete_files(table_id)
+                .await
+                .expect("Failed to get delete files");
             assert_eq!(delete_files.len(), 5);
 
             // Verify delete file sequence numbers
@@ -1580,15 +1609,14 @@ mod tests {
     /// Test that data persists even without explicit shutdown (WAL should still be readable).
     #[tokio::test]
     async fn test_data_persists_without_explicit_shutdown() {
-        let test_db = format!(
-            "sqlite://./.test_no_shutdown_{}.db",
-            uuid::Uuid::now_v7()
-        );
+        let test_db = format!("sqlite://./.test_no_shutdown_{}.db", uuid::Uuid::now_v7());
         let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
 
         let table_name = "no_shutdown_table";
 
@@ -1608,11 +1636,20 @@ mod tests {
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
 
-            table_id = catalog.create_table(options).await.expect("Failed to create table");
+            table_id = catalog
+                .create_table(options)
+                .await
+                .expect("Failed to create table");
 
             // Add some data
-            catalog.increment_sequence_number(table_id).await.expect("Failed to increment");
-            catalog.increment_sequence_number(table_id).await.expect("Failed to increment");
+            catalog
+                .increment_sequence_number(table_id)
+                .await
+                .expect("Failed to increment");
+            catalog
+                .increment_sequence_number(table_id)
+                .await
+                .expect("Failed to increment");
 
             // NO explicit shutdown - catalog just drops
         }
@@ -1622,7 +1659,10 @@ mod tests {
             let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
             catalog.init().await.expect("Failed to init");
 
-            let table = catalog.get_table(table_name).await.expect("Table should exist");
+            let table = catalog
+                .get_table(table_name)
+                .await
+                .expect("Table should exist");
             assert_eq!(table.table_id, table_id);
             assert_eq!(table.current_sequence_number, 2, "Sequence should be 2");
 
@@ -1645,9 +1685,11 @@ mod tests {
         );
         let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
 
         // Create and add insert records
         let table_id;
@@ -1665,18 +1707,30 @@ mod tests {
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
 
-            table_id = catalog.create_table(options).await.expect("Failed to create table");
+            table_id = catalog
+                .create_table(options)
+                .await
+                .expect("Failed to create table");
 
             // Add individual insert records
-            catalog.add_insert_record(table_id, vec![1, 2, 3, 4], 1).await.expect("Failed to add insert record");
-            catalog.add_insert_record(table_id, vec![5, 6, 7, 8], 2).await.expect("Failed to add insert record");
+            catalog
+                .add_insert_record(table_id, vec![1, 2, 3, 4], 1)
+                .await
+                .expect("Failed to add insert record");
+            catalog
+                .add_insert_record(table_id, vec![5, 6, 7, 8], 2)
+                .await
+                .expect("Failed to add insert record");
 
             // Add batch insert records
-            catalog.add_insert_records_batch(
-                table_id,
-                vec![vec![9, 10], vec![11, 12], vec![13, 14]],
-                3,
-            ).await.expect("Failed to add batch insert records");
+            catalog
+                .add_insert_records_batch(
+                    table_id,
+                    vec![vec![9, 10], vec![11, 12], vec![13, 14]],
+                    3,
+                )
+                .await
+                .expect("Failed to add batch insert records");
 
             catalog.shutdown().await.expect("Shutdown failed");
         }
@@ -1686,7 +1740,10 @@ mod tests {
             let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
             catalog.init().await.expect("Failed to init");
 
-            let records = catalog.get_insert_records(table_id).await.expect("Failed to get insert records");
+            let records = catalog
+                .get_insert_records(table_id)
+                .await
+                .expect("Failed to get insert records");
 
             assert_eq!(records.len(), 5, "Should have 5 insert records");
 
@@ -1715,15 +1772,14 @@ mod tests {
     /// Test snapshot sequences persist across restart.
     #[tokio::test]
     async fn test_snapshot_sequences_persist_across_restart() {
-        let test_db = format!(
-            "sqlite://./.test_snapshot_seq_{}.db",
-            uuid::Uuid::now_v7()
-        );
+        let test_db = format!("sqlite://./.test_snapshot_seq_{}.db", uuid::Uuid::now_v7());
         let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
 
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
 
         let snapshot_1 = uuid::Uuid::now_v7().to_string();
         let snapshot_2 = uuid::Uuid::now_v7().to_string();
@@ -1745,11 +1801,23 @@ mod tests {
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
 
-            table_id = catalog.create_table(options).await.expect("Failed to create table");
+            table_id = catalog
+                .create_table(options)
+                .await
+                .expect("Failed to create table");
 
-            catalog.set_snapshot_sequence(table_id, &snapshot_1, 10).await.expect("Failed to set snapshot seq");
-            catalog.set_snapshot_sequence(table_id, &snapshot_2, 20).await.expect("Failed to set snapshot seq");
-            catalog.set_snapshot_sequence(table_id, &snapshot_3, 30).await.expect("Failed to set snapshot seq");
+            catalog
+                .set_snapshot_sequence(table_id, &snapshot_1, 10)
+                .await
+                .expect("Failed to set snapshot seq");
+            catalog
+                .set_snapshot_sequence(table_id, &snapshot_2, 20)
+                .await
+                .expect("Failed to set snapshot seq");
+            catalog
+                .set_snapshot_sequence(table_id, &snapshot_3, 30)
+                .await
+                .expect("Failed to set snapshot seq");
 
             catalog.shutdown().await.expect("Shutdown failed");
         }
@@ -1759,15 +1827,27 @@ mod tests {
             let catalog = CayenneCatalog::new(&test_db).expect("Failed to reopen");
             catalog.init().await.expect("Failed to init");
 
-            let seq_1 = catalog.get_snapshot_sequence(table_id, &snapshot_1).await.expect("Failed to get seq");
-            let seq_2 = catalog.get_snapshot_sequence(table_id, &snapshot_2).await.expect("Failed to get seq");
-            let seq_3 = catalog.get_snapshot_sequence(table_id, &snapshot_3).await.expect("Failed to get seq");
+            let seq_1 = catalog
+                .get_snapshot_sequence(table_id, &snapshot_1)
+                .await
+                .expect("Failed to get seq");
+            let seq_2 = catalog
+                .get_snapshot_sequence(table_id, &snapshot_2)
+                .await
+                .expect("Failed to get seq");
+            let seq_3 = catalog
+                .get_snapshot_sequence(table_id, &snapshot_3)
+                .await
+                .expect("Failed to get seq");
 
             assert_eq!(seq_1, Some(10));
             assert_eq!(seq_2, Some(20));
             assert_eq!(seq_3, Some(30));
 
-            let all_seqs = catalog.get_all_snapshot_sequences(table_id).await.expect("Failed to get all seqs");
+            let all_seqs = catalog
+                .get_all_snapshot_sequences(table_id)
+                .await
+                .expect("Failed to get all seqs");
             assert_eq!(all_seqs.len(), 3);
 
             catalog.shutdown().await.expect("Shutdown failed");

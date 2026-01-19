@@ -508,11 +508,10 @@ impl MetastoreBackend for SqliteMetastore {
                     tracing::info!("Truncating Cayenne catalog WAL log");
                     // Truncate the WAL log to persist changes and reduce file size
                     // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
-                    let _: (i32, i32, i32) = conn.query_row(
-                        "PRAGMA wal_checkpoint(TRUNCATE)",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )?;
+                    let _: (i32, i32, i32) =
+                        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })?;
                 }
 
                 // Run optimize to improve query performance for future connections
