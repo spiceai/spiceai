@@ -4577,7 +4577,7 @@ dependencies = [
  "db_connection_pool",
  "delta_kernel",
  "document_parse",
- "duckdb 1.4.3",
+ "duckdb",
  "dynamodb-streams",
  "flight_client",
  "futures",
@@ -5166,7 +5166,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-table-providers",
- "duckdb 1.4.3",
+ "duckdb",
  "futures",
  "itertools 0.14.0",
  "object_store",
@@ -5405,7 +5405,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=f8b5137f#f8b5137f96461ba57f83d78a282150e0a7e257d8"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=5d8b2b9256f8010fda0b5a875b946d24c489d6b1#5d8b2b9256f8010fda0b5a875b946d24c489d6b1"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -5422,7 +5422,7 @@ dependencies = [
  "datafusion",
  "datafusion-federation",
  "datafusion-physical-expr",
- "duckdb 1.4.2",
+ "duckdb",
  "dyn-clone",
  "fallible-iterator 0.3.0",
  "fundu",
@@ -5975,24 +5975,6 @@ checksum = "d3a5ccdfd6c5e7e2fea9c5cf256f2a08216047fab19c621c3da64e9ae4a1462d"
 
 [[package]]
 name = "duckdb"
-version = "1.4.2"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a14c73d9#a14c73d986bd7d25fa7c1de4f3bd344888d5e60e"
-dependencies = [
- "arrow",
- "cast",
- "fallible-iterator 0.3.0",
- "fallible-streaming-iterator",
- "hashlink",
- "libduckdb-sys 1.4.2",
- "num",
- "num-integer",
- "r2d2",
- "rust_decimal",
- "strum 0.27.2",
-]
-
-[[package]]
-name = "duckdb"
 version = "1.4.3"
 source = "git+https://github.com/spiceai/duckdb-rs.git?rev=1f28290b70664c5765781a705e362ae2fe7b89f4#1f28290b70664c5765781a705e362ae2fe7b89f4"
 dependencies = [
@@ -6002,7 +5984,7 @@ dependencies = [
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink",
- "libduckdb-sys 1.4.3",
+ "libduckdb-sys",
  "num",
  "num-integer",
  "r2d2",
@@ -9212,20 +9194,6 @@ name = "libc"
 version = "0.2.180"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
-
-[[package]]
-name = "libduckdb-sys"
-version = "1.4.2"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a14c73d9#a14c73d986bd7d25fa7c1de4f3bd344888d5e60e"
-dependencies = [
- "cc",
- "flate2",
- "pkg-config",
- "serde",
- "serde_json",
- "tar",
- "vcpkg",
-]
 
 [[package]]
 name = "libduckdb-sys"
@@ -14247,7 +14215,7 @@ dependencies = [
  "db_connection_pool",
  "dirs",
  "document_parse",
- "duckdb 1.4.3",
+ "duckdb",
  "dynamodb-streams",
  "event_stream",
  "flight_client",
@@ -14389,7 +14357,7 @@ dependencies = [
  "chrono",
  "criterion 0.7.0",
  "datafusion",
- "duckdb 1.4.3",
+ "duckdb",
  "fundu",
  "futures",
  "hex",
@@ -17303,7 +17271,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion",
- "duckdb 1.4.3",
+ "duckdb",
  "flight_client",
  "futures",
  "indicatif 0.18.3",
@@ -18169,7 +18137,7 @@ name = "tpc-extension"
 version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
- "duckdb 1.4.3",
+ "duckdb",
  "runtime",
  "snafu",
  "tracing",

@@ -350,7 +350,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "cdfdc714b" }               # spiceai-51+metadata
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "cdfdc714b" }                   # spiceai-51+metadata
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "f8b5137f" } # spiceai (DF51 + spice features)
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "5d8b2b9256f8010fda0b5a875b946d24c489d6b1" } # spiceai-51
 
 # spiceai-51: DF51 base + TLS, API key auth, UDF sync patches (rebased onto 51.0.0-rc1)
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "8c3ee9019ed24108eb775d6e9ad3fc53a0362c29" }      # spiceai:spiceai-51 (DF51 + spice patches)
@@ -358,6 +358,7 @@ ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", re
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "8c3ee9019ed24108eb775d6e9ad3fc53a0362c29" } # spiceai:spiceai-51
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
+# Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "1f28290b70664c5765781a705e362ae2fe7b89f4" } # duckdb-1.4.3
 
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
