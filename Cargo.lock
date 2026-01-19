@@ -4577,7 +4577,7 @@ dependencies = [
  "db_connection_pool",
  "delta_kernel",
  "document_parse",
- "duckdb",
+ "duckdb 1.4.3",
  "dynamodb-streams",
  "flight_client",
  "futures",
@@ -5166,7 +5166,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-table-providers",
- "duckdb",
+ "duckdb 1.4.3",
  "futures",
  "itertools 0.14.0",
  "object_store",
@@ -5422,7 +5422,7 @@ dependencies = [
  "datafusion",
  "datafusion-federation",
  "datafusion-physical-expr",
- "duckdb",
+ "duckdb 1.4.2",
  "dyn-clone",
  "fallible-iterator 0.3.0",
  "fundu",
@@ -5979,12 +5979,30 @@ version = "1.4.2"
 source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a14c73d9#a14c73d986bd7d25fa7c1de4f3bd344888d5e60e"
 dependencies = [
  "arrow",
+ "cast",
+ "fallible-iterator 0.3.0",
+ "fallible-streaming-iterator",
+ "hashlink",
+ "libduckdb-sys 1.4.2",
+ "num",
+ "num-integer",
+ "r2d2",
+ "rust_decimal",
+ "strum 0.27.2",
+]
+
+[[package]]
+name = "duckdb"
+version = "1.4.3"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=1f28290b70664c5765781a705e362ae2fe7b89f4#1f28290b70664c5765781a705e362ae2fe7b89f4"
+dependencies = [
+ "arrow",
  "calamine",
  "cast",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink",
- "libduckdb-sys",
+ "libduckdb-sys 1.4.3",
  "num",
  "num-integer",
  "r2d2",
@@ -9207,6 +9225,22 @@ dependencies = [
  "serde_json",
  "tar",
  "vcpkg",
+]
+
+[[package]]
+name = "libduckdb-sys"
+version = "1.4.3"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=1f28290b70664c5765781a705e362ae2fe7b89f4#1f28290b70664c5765781a705e362ae2fe7b89f4"
+dependencies = [
+ "cc",
+ "flate2",
+ "pkg-config",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tar",
+ "vcpkg",
+ "zip 6.0.0",
 ]
 
 [[package]]
@@ -14213,7 +14247,7 @@ dependencies = [
  "db_connection_pool",
  "dirs",
  "document_parse",
- "duckdb",
+ "duckdb 1.4.3",
  "dynamodb-streams",
  "event_stream",
  "flight_client",
@@ -14355,7 +14389,7 @@ dependencies = [
  "chrono",
  "criterion 0.7.0",
  "datafusion",
- "duckdb",
+ "duckdb 1.4.3",
  "fundu",
  "futures",
  "hex",
@@ -17269,7 +17303,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion",
- "duckdb",
+ "duckdb 1.4.3",
  "flight_client",
  "futures",
  "indicatif 0.18.3",
@@ -18135,7 +18169,7 @@ name = "tpc-extension"
 version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
- "duckdb",
+ "duckdb 1.4.3",
  "runtime",
  "snafu",
  "tracing",
@@ -21041,6 +21075,20 @@ name = "zip"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "flate2",
+ "indexmap 2.13.0",
+ "memchr",
+ "zopfli",
+]
+
+[[package]]
+name = "zip"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb2a05c7c36fde6c09b08576c9f7fb4cda705990f73b58fe011abf7dfb24168b"
 dependencies = [
  "arbitrary",
  "crc32fast",
