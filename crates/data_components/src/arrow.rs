@@ -24,10 +24,12 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use hash_index::HashIndexBuilder;
 use std::sync::Arc;
 
 use crate::delete::DeletionTableProviderAdapter;
 
+use self::indexed::SecondaryIndex;
 use self::write::MemTable;
 
 pub mod indexed;
@@ -68,6 +70,80 @@ fn extract_primary_key_columns(
     Vec::new()
 }
 
+/// Represents an index type from the spicepod configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    /// A standard index that allows duplicates (not fully utilized yet with hash index).
+    Enabled,
+    /// A unique index that enforces uniqueness.
+    Unique,
+}
+
+impl IndexType {
+    fn from_str(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("unique") {
+            Self::Unique
+        } else {
+            Self::Enabled
+        }
+    }
+}
+
+/// Parses the indexes option string into column names and their index types.
+/// Format: "col1:enabled;col2:unique;(col3,col4):unique" (compound key with columns col3 and col4)
+fn parse_indexes_option(
+    indexes_str: &str,
+    schema: &arrow::datatypes::Schema,
+) -> DataFusionResult<Vec<(Vec<String>, IndexType)>> {
+    let mut indexes = Vec::new();
+
+    for entry in indexes_str.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = entry.split(':').collect();
+        let Some(col_part) = parts.first().map(|s| s.trim()) else {
+            continue;
+        };
+        if col_part.is_empty() {
+            continue;
+        }
+
+        // Parse column reference - may be compound like "(col1, col2)" or just "col1"
+        let columns: Vec<String> = if col_part.starts_with('(') && col_part.ends_with(')') {
+            // Compound key: "(col1, col2)"
+            col_part[1..col_part.len() - 1]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            vec![col_part.to_string()]
+        };
+
+        // Validate all columns exist in schema
+        for col in &columns {
+            if schema.field_with_name(col).is_err() {
+                return Err(DataFusionError::Configuration(format!(
+                    "Index column '{col}' not found in schema"
+                )));
+            }
+        }
+
+        let index_type = if parts.len() > 1 {
+            IndexType::from_str(parts[1].trim())
+        } else {
+            IndexType::Enabled
+        };
+
+        indexes.push((columns, index_type));
+    }
+
+    Ok(indexes)
+}
+
 #[async_trait]
 impl TableProviderFactory for ArrowFactory {
     async fn create(
@@ -94,8 +170,49 @@ impl TableProviderFactory for ArrowFactory {
                     "hash_index requires a primary_key to be specified".to_string(),
                 ));
             }
-            let indexed_table =
+            let mut indexed_table =
                 IndexedMemTable::try_new(Arc::clone(&schema), vec![], primary_key_columns)?;
+
+            // Parse and create secondary indexes if specified
+            if let Some(indexes_str) = cmd.options.get("indexes") {
+                let indexes_config = parse_indexes_option(indexes_str, &schema)?;
+                let mut secondary_indexes = Vec::new();
+
+                for (columns, index_type) in indexes_config {
+                    let is_unique = index_type == IndexType::Unique;
+                    let index_name = columns.join("_");
+
+                    // Warn about compound secondary indexes not being used for query optimization yet
+                    if columns.len() > 1 {
+                        tracing::warn!(
+                            index_name = %index_name,
+                            columns = ?columns,
+                            "Compound secondary index created but will not be used for query optimization. Only single-column secondary indexes currently accelerate queries."
+                        );
+                    }
+
+                    // Build hash index for secondary columns
+                    // Note: For empty table, we create the index structure; it will be populated on insert
+                    let partitions: Vec<Vec<arrow::array::RecordBatch>> = vec![];
+                    let hash_index = HashIndexBuilder::new(columns.clone())
+                        .allow_duplicates(!is_unique)
+                        .build(&partitions)
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to build secondary index '{index_name}': {e}"
+                            ))
+                        })?;
+
+                    secondary_indexes.push(SecondaryIndex::new(
+                        index_name,
+                        columns,
+                        is_unique,
+                        Arc::new(hash_index),
+                    ));
+                }
+
+                indexed_table = indexed_table.with_secondary_indexes(secondary_indexes);
+            }
 
             // Apply constraints
             let indexed_table = indexed_table
@@ -328,5 +445,166 @@ mod tests {
 
         // With hash_index not specified, should still create successfully (uses non-indexed table)
         assert!(table.as_any().is::<DeletionTableProviderAdapter>());
+    }
+
+    // =============================================================================
+    // parse_indexes_option Unit Tests
+    // =============================================================================
+
+    fn create_schema_with_columns(columns: &[(&str, arrow::datatypes::DataType)]) -> Schema {
+        Schema::new(
+            columns
+                .iter()
+                .map(|(name, dt)| Field::new(*name, dt.clone(), false))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn test_parse_indexes_single_column_enabled() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        let result = parse_indexes_option("col1:enabled", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec!["col1".to_string()]);
+        assert_eq!(result[0].1, IndexType::Enabled);
+    }
+
+    #[test]
+    fn test_parse_indexes_single_column_unique() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        let result = parse_indexes_option("col2:unique", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec!["col2".to_string()]);
+        assert_eq!(result[0].1, IndexType::Unique);
+    }
+
+    #[test]
+    fn test_parse_indexes_compound_key_unique() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+            ("col3", arrow::datatypes::DataType::Int32),
+        ]);
+
+        let result = parse_indexes_option("(col1,col2):unique", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec!["col1".to_string(), "col2".to_string()]);
+        assert_eq!(result[0].1, IndexType::Unique);
+    }
+
+    #[test]
+    fn test_parse_indexes_multiple_indexes() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+            ("col3", arrow::datatypes::DataType::Int32),
+        ]);
+
+        let result = parse_indexes_option("col1:unique;col2:enabled;(col2,col3):unique", &schema)
+            .expect("parse failed");
+        assert_eq!(result.len(), 3);
+
+        assert_eq!(result[0].0, vec!["col1".to_string()]);
+        assert_eq!(result[0].1, IndexType::Unique);
+
+        assert_eq!(result[1].0, vec!["col2".to_string()]);
+        assert_eq!(result[1].1, IndexType::Enabled);
+
+        assert_eq!(result[2].0, vec!["col2".to_string(), "col3".to_string()]);
+        assert_eq!(result[2].1, IndexType::Unique);
+    }
+
+    #[test]
+    fn test_parse_indexes_empty_string() {
+        let schema = create_schema_with_columns(&[("col1", arrow::datatypes::DataType::Int64)]);
+
+        let result = parse_indexes_option("", &schema).expect("parse failed");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_indexes_malformed_entries_skipped() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        // Empty entries are skipped, only valid entry is parsed
+        let result = parse_indexes_option(";;col1:unique;;", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec!["col1".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_indexes_invalid_column_returns_error() {
+        let schema = create_schema_with_columns(&[("col1", arrow::datatypes::DataType::Int64)]);
+
+        let result = parse_indexes_option("nonexistent:unique", &schema);
+        assert!(result.is_err());
+        let err = result.expect_err("expected error");
+        assert!(
+            err.to_string().contains("nonexistent"),
+            "Error should mention the invalid column name"
+        );
+    }
+
+    #[test]
+    fn test_parse_indexes_compound_key_with_invalid_column() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        let result = parse_indexes_option("(col1,invalid):unique", &schema);
+        let _ = result.expect_err("expected error for invalid column");
+    }
+
+    #[test]
+    fn test_parse_indexes_default_type_is_enabled() {
+        let schema = create_schema_with_columns(&[("col1", arrow::datatypes::DataType::Int64)]);
+
+        // No type specified - should default to Enabled
+        let result = parse_indexes_option("col1", &schema).expect("parse failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, IndexType::Enabled);
+    }
+
+    #[test]
+    fn test_parse_indexes_whitespace_handling() {
+        let schema = create_schema_with_columns(&[
+            ("col1", arrow::datatypes::DataType::Int64),
+            ("col2", arrow::datatypes::DataType::Utf8),
+        ]);
+
+        // Whitespace around entries and values should be trimmed
+        let result = parse_indexes_option("  col1 : unique ; ( col1 , col2 ) : enabled  ", &schema)
+            .expect("parse failed");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, vec!["col1".to_string()]);
+        assert_eq!(result[0].1, IndexType::Unique);
+        assert_eq!(result[1].0, vec!["col1".to_string(), "col2".to_string()]);
+        assert_eq!(result[1].1, IndexType::Enabled);
+    }
+
+    #[test]
+    fn test_parse_indexes_case_insensitive_type() {
+        let schema = create_schema_with_columns(&[("col1", arrow::datatypes::DataType::Int64)]);
+
+        let result1 = parse_indexes_option("col1:UNIQUE", &schema).expect("parse failed");
+        assert_eq!(result1[0].1, IndexType::Unique);
+
+        let result2 = parse_indexes_option("col1:Unique", &schema).expect("parse failed");
+        assert_eq!(result2[0].1, IndexType::Unique);
+
+        let result3 = parse_indexes_option("col1:ENABLED", &schema).expect("parse failed");
+        assert_eq!(result3[0].1, IndexType::Enabled);
     }
 }

@@ -23,6 +23,7 @@ pub mod config;
 pub mod databricks;
 pub mod embeddings;
 pub mod google;
+#[cfg(feature = "local_embed")]
 pub mod model2vec;
 pub mod openai;
 pub mod perplexity;

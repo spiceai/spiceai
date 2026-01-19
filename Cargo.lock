@@ -7461,6 +7461,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "rand 0.9.2",
  "snafu",
+ "telemetry",
  "tokio",
  "tracing",
  "twox-hash",

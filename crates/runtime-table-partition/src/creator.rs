@@ -18,8 +18,8 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 use datafusion::{
-    error::DataFusionError, logical_expr::TableProviderFilterPushDown, prelude::Expr,
-    scalar::ScalarValue,
+    common::Constraints, error::DataFusionError, logical_expr::TableProviderFilterPushDown,
+    prelude::Expr, scalar::ScalarValue,
 };
 use snafu::prelude::*;
 
@@ -64,4 +64,9 @@ pub trait PartitionCreator: Debug + Send + Sync {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError>;
+
+    /// Returns the constraints (primary key, unique, etc.) for partitions.
+    fn constraints(&self) -> Option<&Constraints> {
+        None
+    }
 }
