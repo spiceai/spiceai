@@ -60,6 +60,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 mod actions;
+mod async_actions;
 mod do_exchange;
 mod do_get;
 mod do_put;
@@ -518,13 +519,14 @@ pub async fn start(
     // Create the OpenTelemetry MetricsService
     let otel_service = create_metrics_service(rt.datafusion());
 
+    // Get job executor if available (cluster mode)
+    let job_executor = rt.job_executor();
+
     let mut server = server
-        .layer(RequestContextLayer::new(
-            app,
-            rt.datafusion(),
-            session_store,
-            rt.secrets(),
-        ))
+        .layer(
+            RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
+                .with_job_executor(job_executor),
+        )
         .layer(WriteRateLimitLayer::new(RateLimiter::direct(
             rate_limits.flight_write_limit,
         )))
