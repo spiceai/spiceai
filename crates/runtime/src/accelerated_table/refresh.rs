@@ -472,6 +472,7 @@ pub struct Refresher {
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
+    /// Notification for completion of refresh operation
     on_complete_notification: Option<Arc<Notify>>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
@@ -695,12 +696,6 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                let on_dataset_ready = self.on_complete_notification.as_ref().map(|n| {
-                    DatasetReadyNotification::new(
-                        Arc::clone(n),
-                        Arc::clone(&self.initial_load_completed),
-                    )
-                });
                 let (snapshot_interval_task, on_batch_process_callback) = match snapshot_trigger {
                     None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
                     Some(SnapshotCreateTrigger::Interval(duration)) => (
@@ -711,7 +706,7 @@ impl Refresher {
                             Arc::clone(&self.accelerator_write_mutex),
                             dataset_name.clone(),
                             Arc::clone(&federated_schema),
-                            on_dataset_ready,
+                            Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
                             self.last_updated_at.clone(),
                         ),
@@ -726,7 +721,7 @@ impl Refresher {
                             Arc::clone(&self.accelerator_write_mutex),
                             &self.dataset_name,
                             self.federated.schema(),
-                            on_dataset_ready,
+                            Arc::clone(&self.runtime_status),
                             self.last_updated_at.clone(),
                         ),
                     ),
@@ -789,28 +784,20 @@ impl Refresher {
                 None => (None, true),
                 Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
                 Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
-                Some(SnapshotCreateTrigger::Interval(duration)) => {
-                    let on_dataset_ready = self.on_complete_notification.as_ref().map(|n| {
-                        DatasetReadyNotification::new(
-                            Arc::clone(n),
-                            Arc::clone(&self.initial_load_completed),
-                        )
-                    });
-                    (
-                        spawn_snapshot_interval_task(
-                            Some(*duration),
-                            checkpointer.clone(),
-                            snapshot_manager.clone(),
-                            Arc::clone(&self.accelerator_write_mutex),
-                            dataset_name.clone(),
-                            Arc::clone(&federated_schema),
-                            on_dataset_ready,
-                            self.bootstrap_status.clone(),
-                            self.last_updated_at.clone(),
-                        ),
-                        false,
-                    )
-                }
+                Some(SnapshotCreateTrigger::Interval(duration)) => (
+                    spawn_snapshot_interval_task(
+                        Some(*duration),
+                        checkpointer.clone(),
+                        snapshot_manager.clone(),
+                        Arc::clone(&self.accelerator_write_mutex),
+                        dataset_name.clone(),
+                        Arc::clone(&federated_schema),
+                        Arc::clone(&self.runtime_status),
+                        self.bootstrap_status.clone(),
+                        self.last_updated_at.clone(),
+                    ),
+                    false,
+                ),
             };
         self.snapshot_interval_task = snapshot_interval_task;
 
@@ -1016,34 +1003,6 @@ async fn notify_refresh_done(
     }
 
     metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
-}
-
-/// A notification wrapper that handles "already ready" state.
-/// Subscribers are notified immediately if already ready, otherwise they wait.
-#[derive(Clone)]
-pub struct DatasetReadyNotification {
-    notify: Arc<Notify>,
-    is_ready: Arc<AtomicBool>,
-}
-
-impl DatasetReadyNotification {
-    pub fn new(notify: Arc<Notify>, is_ready: Arc<AtomicBool>) -> Arc<Self> {
-        Arc::new(Self { notify, is_ready })
-    }
-
-    /// Wait until the dataset is ready. Returns immediately if already ready.
-    pub async fn wait(&self) {
-        // IMPORTANT: Create the future FIRST, before checking the condition.
-        // This ensures we'll catch any notification that happens after this point.
-        let notified = self.notify.notified();
-
-        if self.is_ready.load(Ordering::Acquire) {
-            return;
-        }
-
-        // Any notify_waiters() call that happened after we created `notified` will wake us up.
-        notified.await;
-    }
 }
 
 #[cfg(test)]

@@ -74,9 +74,11 @@ jobs:
       # Use cargo-hack to efficiently check all feature combinations
       # This reuses build artifacts between checks, making it much faster than
       # running individual cargo check commands
+      # Note: --each-feature already includes a run with --no-default-features,
+      # so we don't need to specify it separately
       - name: Check all feature combinations
         run: |
-          cargo hack check --no-default-features --each-feature --profile lint \
+          cargo hack check --each-feature --profile lint \
             --exclude-features default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
