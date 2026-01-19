@@ -539,8 +539,7 @@ impl DataAccelerator for DuckDBAccelerator {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to parse on_refresh_sort_columns for dataset {}: {}. Sorting will not be applied.",
-                            dataset_name, e
+                            "Failed to parse on_refresh_sort_columns for dataset {dataset_name}: {e}. Sorting will not be applied."
                         );
                     }
                 }
