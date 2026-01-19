@@ -25,6 +25,20 @@ pub const CAYENNE_PATH_FILTER_REPLACEMENT: &str = "$1/<CAYENNE_PATH>.vortex";
 const VORTEX_RANGE_FILTER_PATTERN: &str = r"(\.vortex):\d+\.\.\d+";
 const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
 
+// Normalize input_partitions count which varies based on system resources
+const INPUT_PARTITIONS_FILTER_PATTERN: &str = r"input_partitions=\d+";
+const INPUT_PARTITIONS_FILTER_REPLACEMENT: &str = "input_partitions=N";
+
+// Normalize file_groups count which varies based on data distribution and parallelism
+const FILE_GROUPS_COUNT_FILTER_PATTERN: &str = r"file_groups=\{(\d+) groups?:";
+const FILE_GROUPS_COUNT_FILTER_REPLACEMENT: &str = "file_groups={N groups:";
+
+// Normalize the detailed file list within file_groups to a single placeholder
+// This handles cases where the number and arrangement of files varies between runs
+const FILE_GROUPS_LIST_FILTER_PATTERN: &str =
+    r"file_groups=\{N groups: \[\[[^\]]*\](?:, \[[^\]]*\])*(?:, \.\.\.)?\]\}";
+const FILE_GROUPS_LIST_FILTER_REPLACEMENT: &str = "file_groups={N groups: [...]}";
+
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
 }
@@ -68,6 +82,9 @@ pub async fn record_explain_plan(
             (path_filter_pattern.as_str(), "/data"),
             (CAYENNE_PATH_FILTER_PATTERN, CAYENNE_PATH_FILTER_REPLACEMENT),
             (VORTEX_RANGE_FILTER_PATTERN, VORTEX_RANGE_FILTER_REPLACEMENT),
+            (INPUT_PARTITIONS_FILTER_PATTERN, INPUT_PARTITIONS_FILTER_REPLACEMENT),
+            (FILE_GROUPS_COUNT_FILTER_PATTERN, FILE_GROUPS_COUNT_FILTER_REPLACEMENT),
+            (FILE_GROUPS_LIST_FILTER_PATTERN, FILE_GROUPS_LIST_FILTER_REPLACEMENT),
             (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
             (r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#, "<GROUPING_PAIR>"),
             (r#"grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\),\s*grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\)"#, "<GROUPING_PAIR>")
@@ -99,7 +116,8 @@ pub async fn record_explain_plan(
 ///
 /// The approach: when we find `PartitionedUnionExec`, we identify child subtrees
 /// by their indentation level. Lines at the first child's indent level start new
-/// subtrees. We sort all subtrees alphabetically.
+/// subtrees. We sort all subtrees alphabetically and deduplicate identical ones,
+/// adding a count suffix for repeated subtrees.
 fn sort_partitioned_union_children(explain_plan: &str) -> String {
     // if no PartitionedUnionExec, return unchanged
     if !explain_plan.contains("PartitionedUnionExec") {
@@ -167,10 +185,30 @@ fn sort_partitioned_union_children(explain_plan: &str) -> String {
                 a_str.cmp(&b_str)
             });
 
-            // Add sorted subtrees to result
-            for subtree in &subtrees {
+            // Deduplicate consecutive identical subtrees, tracking counts
+            let mut deduped_subtrees: Vec<(Vec<&str>, usize)> = Vec::new();
+            for subtree in subtrees {
+                if let Some(last) = deduped_subtrees.last_mut() {
+                    if last.0 == subtree {
+                        last.1 += 1;
+                        continue;
+                    }
+                }
+                deduped_subtrees.push((subtree, 1));
+            }
+
+            // Add deduplicated subtrees to result
+            for (subtree, count) in &deduped_subtrees {
+                // Add count annotation to the first line if there are duplicates
+                let mut is_first = true;
                 for subtree_line in subtree {
-                    result.push((*subtree_line).to_string());
+                    if is_first && *count > 1 {
+                        // Annotate with count
+                        result.push(format!("{subtree_line} (x{count})"));
+                    } else {
+                        result.push((*subtree_line).to_string());
+                    }
+                    is_first = false;
                 }
             }
 
@@ -268,6 +306,104 @@ mod tests {
                 .into_owned();
 
             assert_eq!(fully_redacted, expected, "Failed for input: {input}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_input_partitions_filter() -> Result<(), String> {
+        let test_cases = [
+            (
+                "RepartitionExec: partitioning=Hash([o_custkey@0], 32), input_partitions=132",
+                "RepartitionExec: partitioning=Hash([o_custkey@0], 32), input_partitions=N",
+            ),
+            (
+                "RepartitionExec: partitioning=Hash([o_custkey@0], 32), input_partitions=160",
+                "RepartitionExec: partitioning=Hash([o_custkey@0], 32), input_partitions=N",
+            ),
+            (
+                "CoalesceBatchesExec: target_batch_size=8192, input_partitions=16",
+                "CoalesceBatchesExec: target_batch_size=8192, input_partitions=N",
+            ),
+        ];
+
+        let regex = regex::Regex::new(super::INPUT_PARTITIONS_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+
+        for (input, expected) in test_cases {
+            let result = regex
+                .replace_all(input, super::INPUT_PARTITIONS_FILTER_REPLACEMENT)
+                .into_owned();
+            assert_eq!(result, expected, "Failed for input: {input}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_groups_count_filter() -> Result<(), String> {
+        let test_cases = [
+            (
+                "DataSourceExec: file_groups={4 groups: [[/data/orders/...], ...]}, projection=[o_custkey]",
+                "DataSourceExec: file_groups={N groups: [[/data/orders/...], ...]}, projection=[o_custkey]",
+            ),
+            (
+                "DataSourceExec: file_groups={32 groups: [[/data/orders/...], ...]}, projection=[o_custkey]",
+                "DataSourceExec: file_groups={N groups: [[/data/orders/...], ...]}, projection=[o_custkey]",
+            ),
+            (
+                "DataSourceExec: file_groups={1 group: [[/data/nation/...]]}, projection=[n_name]",
+                "DataSourceExec: file_groups={N groups: [[/data/nation/...]]}, projection=[n_name]",
+            ),
+        ];
+
+        let regex = regex::Regex::new(super::FILE_GROUPS_COUNT_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+
+        for (input, expected) in test_cases {
+            let result = regex
+                .replace_all(input, super::FILE_GROUPS_COUNT_FILTER_REPLACEMENT)
+                .into_owned();
+            assert_eq!(result, expected, "Failed for input: {input}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_groups_full_normalization() -> Result<(), String> {
+        // Test the combined effect of both count and list normalization
+        let test_cases = [
+            (
+                "DataSourceExec: file_groups={4 groups: [[/data/orders/a.vortex], [/data/orders/b.vortex], [/data/orders/c.vortex], [/data/orders/d.vortex]]}, projection=[o_custkey]",
+                "DataSourceExec: file_groups={N groups: [...]}, projection=[o_custkey]",
+            ),
+            (
+                "DataSourceExec: file_groups={32 groups: [[/data/orders/a.vortex], [/data/orders/b.vortex], ...]}, projection=[o_custkey]",
+                "DataSourceExec: file_groups={N groups: [...]}, projection=[o_custkey]",
+            ),
+            (
+                "DataSourceExec: file_groups={1 group: [[/data/nation/n.vortex]]}, projection=[n_name]",
+                "DataSourceExec: file_groups={N groups: [...]}, projection=[n_name]",
+            ),
+        ];
+
+        let count_regex = regex::Regex::new(super::FILE_GROUPS_COUNT_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+        let list_regex = regex::Regex::new(super::FILE_GROUPS_LIST_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+
+        for (input, expected) in test_cases {
+            // First normalize the count
+            let count_normalized = count_regex
+                .replace_all(input, super::FILE_GROUPS_COUNT_FILTER_REPLACEMENT)
+                .into_owned();
+            // Then normalize the list
+            let result = list_regex
+                .replace_all(&count_normalized, super::FILE_GROUPS_LIST_FILTER_REPLACEMENT)
+                .into_owned();
+            assert_eq!(result, expected, "Failed for input: {input}");
         }
 
         Ok(())
