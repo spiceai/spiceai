@@ -19,7 +19,8 @@ use std::{collections::BTreeMap, hash::Hash, time::Duration};
 use crate::{
     metrics::{Builder, BuilderTarget, ExtendedMetrics},
     spicetest::text_to_sql::{
-        parse::extract_tables_and_projection, task_history::TaskHistoryMetrics,
+        parse::{attempt_parse_table_and_projection, extract_tables_and_projection},
+        task_history::TaskHistoryMetrics,
     },
 };
 use anyhow::Result;
@@ -198,7 +199,7 @@ impl ExtendedMetrics for TextToSqlMetric {
 
 impl TextToSqlMetric {
     #[expect(clippy::too_many_arguments)]
-    pub fn try_new(
+    pub fn new(
         question: String,
         generated_sql: &str,
         expected_sql: &str,
@@ -210,11 +211,16 @@ impl TextToSqlMetric {
         return_sql: bool,
         task_history_metrics: &TaskHistoryMetrics,
         correct_output_schema: f64,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Self {
         let expected = extract_tables_and_projection(expected_logical_plan);
-        let generated = generated_logical_plan.map(extract_tables_and_projection);
-
-        Ok(Self {
+        let generated = generated_logical_plan
+            .map(extract_tables_and_projection)
+            .or_else(|| {
+                attempt_parse_table_and_projection(generated_sql)
+                    .inspect_err(|e| eprintln!("Error in 'attempt_parse_table_and_projection'.{e}"))
+                    .ok()
+            });
+        Self {
             question,
             generated_sql: generated_sql.to_string(),
             expected_sql: expected_sql.to_string(),
@@ -242,7 +248,7 @@ impl TextToSqlMetric {
                 .map(|g| intersection_over_union(&expected.1, &g.1))
                 .unwrap_or_default(),
             correct_output_schema,
-        })
+        }
     }
 }
 
@@ -397,7 +403,7 @@ impl TextToSqlRunMetric {
 }
 
 /// Calculate the Intersection over Union (`IoU`) between two sets.
-fn intersection_over_union<T: Eq + Hash>(
+pub(crate) fn intersection_over_union<T: Eq + Hash>(
     set_a: &std::collections::HashSet<T>,
     set_b: &std::collections::HashSet<T>,
 ) -> f64 {

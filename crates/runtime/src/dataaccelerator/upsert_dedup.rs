@@ -75,6 +75,12 @@ impl UpsertDedupTableProvider {
     fn needs_dedup(&self) -> bool {
         self.upsert_options.remove_duplicates || self.upsert_options.last_write_wins
     }
+
+    /// Returns a reference to the inner table provider.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn TableProvider> {
+        &self.inner
+    }
 }
 
 impl std::fmt::Debug for UpsertDedupTableProvider {
