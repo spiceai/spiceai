@@ -2,11 +2,6 @@ version: v1
 kind: Spicepod
 name: core-evals
 
-runtime:
-  flight:
-    max_message_size: 1G
-
-
 models:
   - name: judge
     from: openai:gpt-4.1-2025-04-14
