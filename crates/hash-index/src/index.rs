@@ -47,6 +47,7 @@ const _: () = assert!(
 );
 
 use std::hash::Hash;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -463,14 +464,17 @@ struct ShardTable {
 }
 
 /// Sentinel value used to mark empty slots in the hash table.
-/// We use `u64::MAX` as the empty marker to avoid collision with common hash values.
+/// We use `u64::MAX` as the empty marker because it is an extremely unlikely hash
+/// value in practice, so very few real hashes need to be remapped away from it.
 const EMPTY_SLOT_SENTINEL: u64 = u64::MAX;
 
 /// Normalizes a hash value to avoid collision with the empty-slot sentinel.
 /// If the hash equals `EMPTY_SLOT_SENTINEL` (`u64::MAX`), it is mapped to `u64::MAX - 1`.
-/// This ensures no valid key can produce a hash that looks like an empty slot.
-/// Using `u64::MAX` as sentinel avoids the collision issue that would occur with 0,
-/// where remapping 0→1 would create collisions between distinct keys.
+/// This means hashes of `u64::MAX` and `u64::MAX - 1` are not distinguished, but such
+/// values are vanishingly rare for our hash functions in practice.
+/// Using `u64::MAX` as the sentinel makes this collision extremely unlikely compared to
+/// using `0`, which is a much more common hash value and would cause more frequent
+/// remapping and potential collisions.
 #[inline]
 const fn normalize_hash(hash: u64) -> u64 {
     if hash == EMPTY_SLOT_SENTINEL {
