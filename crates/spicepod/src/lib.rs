@@ -29,7 +29,7 @@ use std::{fmt::Debug, path::PathBuf};
 use std::sync::Arc;
 
 use component::{
-    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, memory::Memory,
+    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval,
     model::Model, runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool, view::View,
     worker::Worker,
 };
@@ -148,8 +148,6 @@ pub struct Spicepod {
     pub management: Option<Management>,
 
     pub snapshots: Option<Snapshots>,
-
-    pub memory: Option<Memory>,
 }
 
 fn detect_duplicate_component_names(
@@ -421,7 +419,6 @@ fn from_definition(
         runtime: spicepod_definition.runtime,
         management: spicepod_definition.management,
         snapshots: spicepod_definition.snapshots,
-        memory: spicepod_definition.memory,
     }
 }
 

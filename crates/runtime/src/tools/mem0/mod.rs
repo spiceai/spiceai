@@ -18,6 +18,31 @@ limitations under the License.
 //!
 //! This module provides tools for storing, searching, and retrieving memories
 //! using the Mem0 platform API (<https://mem0.ai>).
+//!
+//! ## Configuration
+//!
+//! Mem0 is configured as a tool in the `spicepod.yaml`:
+//!
+//! ```yaml
+//! tools:
+//!   - name: memory
+//!     from: mem0:memory
+//!     params:
+//!       mem0_api_key: ${secrets:MEM0_API_KEY}
+//!       mem0_user_id: default-user
+//! ```
+//!
+//! ## Parameters
+//!
+//! - `mem0_api_key`: API key for mem0.ai (required)
+//! - `mem0_user_id`: User identifier for memory scoping (optional, defaults to "default-user")
+//! - `mem0_agent_id`: Agent identifier for memory scoping (optional)
+//! - `mem0_app_id`: Application identifier for memory scoping (optional)
+//! - `mem0_run_id`: Run identifier for memory scoping (optional)
+//! - `mem0_org_id`: Organization identifier (optional)
+//! - `mem0_project_id`: Project identifier (optional)
+//! - `mem0_base_url`: Custom API base URL (optional)
+//! - `mem0_graph_memory`: Enable graph memory extraction ("enabled" to enable, optional)
 
 pub mod catalog;
 pub mod client;

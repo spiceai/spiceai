@@ -19,7 +19,6 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampSecondArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::sql::TableReference;
-use spicepod::component::memory::Memory;
 use uuid::Uuid;
 
 use crate::{Runtime, component::validate_identifier};
@@ -28,8 +27,6 @@ pub mod builtin;
 pub mod catalog;
 pub mod engine;
 pub mod load;
-#[cfg(feature = "mem0")]
-pub mod mem0_engine;
 pub mod store;
 
 pub use engine::{MemoryEngine, get_memory_engine};
@@ -108,9 +105,197 @@ async fn memory_table_name(
     }
 }
 
-/// Get the memory configuration from the runtime.
-pub async fn get_memory_config(rt: &Arc<Runtime>) -> Option<Memory> {
-    let app_lock = rt.app.read().await;
-    let app = app_lock.as_deref()?;
-    app.memory.clone()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Array;
+    use arrow_schema::DataType;
+
+    #[test]
+    fn test_memory_table_schema_fields() {
+        let schema = &*MEMORY_TABLE_SCHEMA;
+        assert_eq!(schema.fields().len(), 4);
+
+        let id_field = schema.field(0);
+        assert_eq!(id_field.name(), "id");
+        assert_eq!(id_field.data_type(), &DataType::Utf8);
+        assert!(!id_field.is_nullable());
+
+        let value_field = schema.field(1);
+        assert_eq!(value_field.name(), "value");
+        assert_eq!(value_field.data_type(), &DataType::Utf8);
+        assert!(!value_field.is_nullable());
+
+        let created_by_field = schema.field(2);
+        assert_eq!(created_by_field.name(), "created_by");
+        assert_eq!(created_by_field.data_type(), &DataType::Utf8);
+        assert!(created_by_field.is_nullable());
+
+        let created_at_field = schema.field(3);
+        assert_eq!(created_at_field.name(), "created_at");
+        assert_eq!(
+            created_at_field.data_type(),
+            &DataType::Timestamp(TimeUnit::Second, None)
+        );
+        assert!(!created_at_field.is_nullable());
+    }
+
+    #[test]
+    fn test_try_from_single_element() {
+        let elements = vec![MemoryTableElement {
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+                .expect("valid uuid"),
+            value: "test memory".to_string(),
+            created_by: Some("user1".to_string()),
+            created_at: 1704067200, // 2024-01-01 00:00:00 UTC
+        }];
+
+        let batch = try_from(&elements).expect("should create record batch");
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 4);
+        assert_eq!(batch.schema(), *MEMORY_TABLE_SCHEMA);
+
+        // Verify id column
+        let id_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("id should be string array");
+        assert_eq!(
+            id_array.value(0),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+
+        // Verify value column
+        let value_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("value should be string array");
+        assert_eq!(value_array.value(0), "test memory");
+
+        // Verify created_by column
+        let created_by_array = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("created_by should be string array");
+        assert_eq!(created_by_array.value(0), "user1");
+        assert!(!created_by_array.is_null(0));
+
+        // Verify created_at column
+        let created_at_array = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .expect("created_at should be timestamp array");
+        assert_eq!(created_at_array.value(0), 1_704_067_200);
+    }
+
+    #[test]
+    fn test_try_from_multiple_elements() {
+        let elements = vec![
+            MemoryTableElement {
+                id: Uuid::new_v4(),
+                value: "first memory".to_string(),
+                created_by: Some("user1".to_string()),
+                created_at: 1_704_067_200,
+            },
+            MemoryTableElement {
+                id: Uuid::new_v4(),
+                value: "second memory".to_string(),
+                created_by: None,
+                created_at: 1_704_153_600,
+            },
+            MemoryTableElement {
+                id: Uuid::new_v4(),
+                value: "third memory".to_string(),
+                created_by: Some("user2".to_string()),
+                created_at: 1_704_240_000,
+            },
+        ];
+
+        let batch = try_from(&elements).expect("should create record batch");
+
+        assert_eq!(batch.num_rows(), 3);
+
+        let value_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("value should be string array");
+        assert_eq!(value_array.value(0), "first memory");
+        assert_eq!(value_array.value(1), "second memory");
+        assert_eq!(value_array.value(2), "third memory");
+
+        // Check nullable created_by field
+        let created_by_array = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("created_by should be string array");
+        assert_eq!(created_by_array.value(0), "user1");
+        assert!(created_by_array.is_null(1));
+        assert_eq!(created_by_array.value(2), "user2");
+    }
+
+    #[test]
+    fn test_try_from_empty_slice() {
+        let elements: Vec<MemoryTableElement> = vec![];
+
+        let batch = try_from(&elements).expect("should create empty record batch");
+
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 4);
+        assert_eq!(batch.schema(), *MEMORY_TABLE_SCHEMA);
+    }
+
+    #[test]
+    fn test_try_from_with_special_characters() {
+        let elements = vec![MemoryTableElement {
+            id: Uuid::new_v4(),
+            value: "Memory with 'quotes' and \"double quotes\" and\nnewlines".to_string(),
+            created_by: Some("user@example.com".to_string()),
+            created_at: 1_704_067_200,
+        }];
+
+        let batch = try_from(&elements).expect("should create record batch with special chars");
+
+        let value_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("value should be string array");
+        assert_eq!(
+            value_array.value(0),
+            "Memory with 'quotes' and \"double quotes\" and\nnewlines"
+        );
+    }
+
+    #[test]
+    fn test_try_from_with_unicode() {
+        let elements = vec![MemoryTableElement {
+            id: Uuid::new_v4(),
+            value: "Memory with unicode: 你好 🎉 émoji".to_string(),
+            created_by: Some("用户".to_string()),
+            created_at: 1_704_067_200,
+        }];
+
+        let batch = try_from(&elements).expect("should create record batch with unicode");
+
+        let value_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("value should be string array");
+        assert_eq!(value_array.value(0), "Memory with unicode: 你好 🎉 émoji");
+
+        let created_by_array = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("created_by should be string array");
+        assert_eq!(created_by_array.value(0), "用户");
+    }
 }

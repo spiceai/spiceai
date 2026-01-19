@@ -106,3 +106,111 @@ impl SpiceModelTool for StoreMemoryTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_store_memory_params_deserialization() {
+        let json = r#"{"thoughts": ["remember this", "and this too"]}"#;
+        let params: StoreMemoryParams =
+            serde_json::from_str(json).expect("should deserialize params");
+        assert_eq!(params.thoughts.len(), 2);
+        assert_eq!(params.thoughts[0], "remember this");
+        assert_eq!(params.thoughts[1], "and this too");
+    }
+
+    #[test]
+    fn test_store_memory_params_empty_thoughts() {
+        let json = r#"{"thoughts": []}"#;
+        let params: StoreMemoryParams =
+            serde_json::from_str(json).expect("should deserialize empty thoughts");
+        assert!(params.thoughts.is_empty());
+    }
+
+    #[test]
+    fn test_store_memory_params_single_thought() {
+        let json = r#"{"thoughts": ["single thought"]}"#;
+        let params: StoreMemoryParams =
+            serde_json::from_str(json).expect("should deserialize single thought");
+        assert_eq!(params.thoughts.len(), 1);
+        assert_eq!(params.thoughts[0], "single thought");
+    }
+
+    #[test]
+    fn test_store_memory_params_missing_thoughts() {
+        let json = r#"{}"#;
+        let result: Result<StoreMemoryParams, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_store_memory_params_with_special_characters() {
+        let json = r#"{"thoughts": ["thought with \"quotes\"", "thought\nwith\nnewlines"]}"#;
+        let params: StoreMemoryParams =
+            serde_json::from_str(json).expect("should deserialize special chars");
+        assert_eq!(params.thoughts[0], "thought with \"quotes\"");
+        assert_eq!(params.thoughts[1], "thought\nwith\nnewlines");
+    }
+
+    #[test]
+    fn test_store_memory_params_with_unicode() {
+        let json = r#"{"thoughts": ["remember 你好", "émoji 🎉"]}"#;
+        let params: StoreMemoryParams =
+            serde_json::from_str(json).expect("should deserialize unicode");
+        assert_eq!(params.thoughts[0], "remember 你好");
+        assert_eq!(params.thoughts[1], "émoji 🎉");
+    }
+
+    #[tokio::test]
+    async fn test_store_memory_tool_default_name() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = StoreMemoryTool::new(rt, None, None);
+        assert_eq!(tool.name(), "store_memory");
+    }
+
+    #[tokio::test]
+    async fn test_store_memory_tool_custom_name() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = StoreMemoryTool::new(rt, Some("custom_store"), None);
+        assert_eq!(tool.name(), "custom_store");
+    }
+
+    #[tokio::test]
+    async fn test_store_memory_tool_default_description() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = StoreMemoryTool::new(rt, None, None);
+        let desc = tool.description().expect("should have description");
+        assert!(desc.contains("Record"));
+        assert!(desc.contains("user"));
+    }
+
+    #[tokio::test]
+    async fn test_store_memory_tool_custom_description() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = StoreMemoryTool::new(rt, None, Some("Custom description"));
+        let desc = tool.description().expect("should have description");
+        assert_eq!(desc, "Custom description");
+    }
+
+    #[tokio::test]
+    async fn test_store_memory_tool_has_parameters() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = StoreMemoryTool::new(rt, None, None);
+        let params = tool.parameters();
+        assert!(params.is_some());
+
+        let params = params.expect("should have parameters");
+        assert!(params.is_object());
+    }
+
+    #[tokio::test]
+    async fn test_store_memory_tool_from_runtime() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = StoreMemoryTool::from(&rt);
+        assert_eq!(tool.name(), "store_memory");
+    }
+}
+
+

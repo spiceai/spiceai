@@ -109,3 +109,155 @@ impl SpiceToolCatalog for MemoryToolCatalog {
         self.get_tool(name, None, None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spicepod::component::tool::Tool;
+
+    fn create_tool(from: &str, name: &str) -> Tool {
+        Tool {
+            name: name.to_string(),
+            from: from.to_string(),
+            description: None,
+            params: std::collections::HashMap::new(),
+            env: std::collections::HashMap::new(),
+            depends_on: vec![],
+            metrics: None,
+        }
+    }
+
+    #[test]
+    fn test_catalog_name() {
+        assert_eq!(MemoryToolCatalog::name(), "memory");
+    }
+
+    #[tokio::test]
+    async fn test_construct_invalid_from_no_colon() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+        let component = create_tool("memory", "my_tool");
+        let params = std::collections::HashMap::new();
+
+        let result = catalog.construct(&component, params);
+        assert!(result.is_err());
+        let err = result.err().expect("should have error");
+        assert!(
+            err.to_string().contains("Invalid component"),
+            "Error should mention invalid component: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_construct_invalid_from_wrong_prefix() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+        let component = create_tool("other:load", "my_tool");
+        let params = std::collections::HashMap::new();
+
+        let result = catalog.construct(&component, params);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_construct_unknown_tool_id() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+        let component = create_tool("memory:unknown", "my_tool");
+        let params = std::collections::HashMap::new();
+
+        let result = catalog.construct(&component, params);
+        assert!(result.is_err());
+        let err = result.err().expect("should have error");
+        assert!(
+            err.to_string().contains("not found"),
+            "Error should mention tool not found: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_construct_load_tool() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+        let component = create_tool("memory:load", "custom_load");
+        let params = std::collections::HashMap::new();
+
+        let result = catalog.construct(&component, params);
+        assert!(result.is_ok());
+        let tool = result.expect("should create tool");
+        assert_eq!(tool.name(), "custom_load");
+    }
+
+    #[tokio::test]
+    async fn test_construct_store_tool() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+        let component = create_tool("memory:store", "custom_store");
+        let params = std::collections::HashMap::new();
+
+        let result = catalog.construct(&component, params);
+        assert!(result.is_ok());
+        let tool = result.expect("should create tool");
+        assert_eq!(tool.name(), "custom_store");
+    }
+
+    #[tokio::test]
+    async fn test_construct_with_custom_description() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+        let mut component = create_tool("memory:load", "my_load");
+        component.description = Some("Custom description for loading memories".to_string());
+        let params = std::collections::HashMap::new();
+
+        let result = catalog.construct(&component, params);
+        assert!(result.is_ok());
+        let tool = result.expect("should create tool");
+        assert_eq!(tool.name(), "my_load");
+        assert_eq!(
+            tool.description().map(|d| d.to_string()),
+            Some("Custom description for loading memories".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_all_returns_both_tools() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+
+        let tools = catalog.all().await;
+        assert_eq!(tools.len(), 2);
+
+        let names: Vec<_> = tools.iter().map(|t| t.name().to_string()).collect();
+        assert!(names.contains(&"load_memory".to_string()));
+        assert!(names.contains(&"store_memory".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_catalog_get_load() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+
+        let tool = catalog.get("load").await;
+        assert!(tool.is_some());
+        assert_eq!(tool.expect("should have tool").name(), "load");
+    }
+
+    #[tokio::test]
+    async fn test_catalog_get_store() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+
+        let tool = catalog.get("store").await;
+        assert!(tool.is_some());
+        assert_eq!(tool.expect("should have tool").name(), "store");
+    }
+
+    #[tokio::test]
+    async fn test_catalog_get_unknown() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let catalog = MemoryToolCatalog::new(rt);
+
+        let tool = catalog.get("unknown").await;
+        assert!(tool.is_none());
+    }
+}

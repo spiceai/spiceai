@@ -26,7 +26,6 @@ use crate::component::embeddings::Embeddings;
 use crate::component::eval::Eval;
 use crate::component::is_default;
 use crate::component::management::Management;
-use crate::component::memory::Memory;
 use crate::component::runtime::Runtime;
 use crate::component::secret::Secret;
 use crate::component::snapshot::Snapshots;
@@ -77,10 +76,6 @@ pub struct SpicepodDefinition {
     /// Optional acceleration snapshot configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshots: Option<Snapshots>,
-
-    /// Optional memory configuration for memory tools (`store_memory`, `load_memory`)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory: Option<Memory>,
 
     /// Optional extensions configuration
     #[serde(skip_serializing_if = "HashMap::is_empty")]

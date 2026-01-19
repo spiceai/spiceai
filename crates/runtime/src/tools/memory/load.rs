@@ -99,3 +99,100 @@ impl SpiceModelTool for LoadMemoryTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_memory_params_deserialization() {
+        let json = r#"{"last": "1h"}"#;
+        let params: LoadMemoryParams =
+            serde_json::from_str(json).expect("should deserialize params");
+        assert_eq!(params.last, "1h");
+    }
+
+    #[test]
+    fn test_load_memory_params_various_intervals() {
+        let test_cases = [
+            (r#"{"last": "30m"}"#, "30m"),
+            (r#"{"last": "2h30m"}"#, "2h30m"),
+            (r#"{"last": "1d"}"#, "1d"),
+            (r#"{"last": "5s"}"#, "5s"),
+            (r#"{"last": "PT1H"}"#, "PT1H"),
+        ];
+
+        for (json, expected) in test_cases {
+            let params: LoadMemoryParams =
+                serde_json::from_str(json).expect("should deserialize params");
+            assert_eq!(params.last, expected, "Failed for JSON: {json}");
+        }
+    }
+
+    #[test]
+    fn test_load_memory_params_missing_last() {
+        let json = r#"{}"#;
+        let result: Result<LoadMemoryParams, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_memory_params_serialization() {
+        let params = LoadMemoryParams {
+            last: "2h".to_string(),
+        };
+        let json = serde_json::to_string(&params).expect("should serialize params");
+        assert!(json.contains("\"last\":\"2h\""));
+    }
+
+    #[tokio::test]
+    async fn test_load_memory_tool_default_name() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = LoadMemoryTool::new(rt, None, None);
+        assert_eq!(tool.name(), "load_memory");
+    }
+
+    #[tokio::test]
+    async fn test_load_memory_tool_custom_name() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = LoadMemoryTool::new(rt, Some("custom_load"), None);
+        assert_eq!(tool.name(), "custom_load");
+    }
+
+    #[tokio::test]
+    async fn test_load_memory_tool_default_description() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = LoadMemoryTool::new(rt, None, None);
+        let desc = tool.description().expect("should have description");
+        assert!(desc.contains("Load"));
+        assert!(desc.contains("memories"));
+    }
+
+    #[tokio::test]
+    async fn test_load_memory_tool_custom_description() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = LoadMemoryTool::new(rt, None, Some("Custom load description"));
+        let desc = tool.description().expect("should have description");
+        assert_eq!(desc, "Custom load description");
+    }
+
+    #[tokio::test]
+    async fn test_load_memory_tool_has_parameters() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = LoadMemoryTool::new(rt, None, None);
+        let params = tool.parameters();
+        assert!(params.is_some());
+
+        let params = params.expect("should have parameters");
+        assert!(params.is_object());
+    }
+
+    #[tokio::test]
+    async fn test_load_memory_tool_from_runtime() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        let tool = LoadMemoryTool::from(&rt);
+        assert_eq!(tool.name(), "load_memory");
+    }
+}
+
+

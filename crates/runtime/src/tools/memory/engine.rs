@@ -17,14 +17,7 @@ limitations under the License.
 //! Memory engine abstraction for `store_memory` and `load_memory` tools.
 //!
 //! This module provides a unified interface for memory storage backends.
-//! The engine can be configured in the spicepod:
-//!
-//! ```yaml
-//! memory:
-//!   engine: builtin  # or "mem0"
-//!   params:
-//!     api_key: ${secrets:MEM0_API_KEY}  # for mem0 engine
-//! ```
+//! The builtin memory engine uses SQL-based storage with a memory connector dataset.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -64,31 +57,11 @@ pub trait MemoryEngine: Send + Sync {
 
 /// Get the configured memory engine for the runtime.
 ///
-/// Returns the appropriate engine based on the `memory.engine` configuration:
-/// - `builtin` (default): SQL-based storage using a memory connector dataset
-/// - `mem0`: External memory service via mem0.ai API
+/// Returns the builtin memory engine which uses SQL-based storage.
 pub async fn get_memory_engine(
     rt: Arc<Runtime>,
 ) -> Result<Arc<dyn MemoryEngine>, Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(feature = "mem0")]
-    use super::mem0_engine::Mem0MemoryEngine;
-    use super::{builtin::BuiltinMemoryEngine, get_memory_config};
+    use super::builtin::BuiltinMemoryEngine;
 
-    let memory_config = get_memory_config(&rt).await;
-    let engine_name = memory_config.as_ref().map_or("builtin", |m| m.engine());
-
-    match engine_name {
-        "builtin" => Ok(Arc::new(BuiltinMemoryEngine::new(rt))),
-        #[cfg(feature = "mem0")]
-        "mem0" => {
-            let config = memory_config.ok_or("mem0 engine requires memory configuration")?;
-            let engine = Mem0MemoryEngine::from_config(&rt, &config).await?;
-            Ok(Arc::new(engine))
-        }
-        #[cfg(not(feature = "mem0"))]
-        "mem0" => Err("mem0 feature is not enabled. Compile with --features mem0".into()),
-        other => {
-            Err(format!("Unknown memory engine: {other}. Supported engines: builtin, mem0").into())
-        }
-    }
+    Ok(Arc::new(BuiltinMemoryEngine::new(rt)))
 }
