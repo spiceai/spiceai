@@ -637,7 +637,7 @@ fn build_chunk_response(
             (
                 Some(next_idx),
                 Some(format!(
-                    "/api/v1/queries/{query_id}/results/chunks/{next_idx}"
+                    "/v1/queries/{query_id}/results/chunks/{next_idx}"
                 )),
             )
         } else {
