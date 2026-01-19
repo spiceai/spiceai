@@ -849,6 +849,7 @@ impl HashIndex {
     /// or `InsertResult::HashCollision(existing_location)` if an entry with the
     /// same hash already exists.
     pub fn insert(&self, hash: u64, location: RowLocation) -> InsertResult {
+        let hash = normalize_hash(hash);
         let result = self.shard(hash).insert(hash, location);
         if matches!(result, InsertResult::Inserted) {
             self.len.fetch_add(1, Ordering::Relaxed);
