@@ -704,7 +704,7 @@ impl DataAccelerator for TursoAccelerator {
 
         // Wrap with upsert deduplication if needed
         let (write_provider, delete_provider) =
-            upsert_dedup::wrap_with_upsert_dedup_if_needed(turso_provider, &cmd.options);
+            upsert_dedup::wrap_with_upsert_dedup_if_needed(turso_provider, &cmd.options, cmd.constraints.clone());
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,

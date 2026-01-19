@@ -553,7 +553,7 @@ pub(crate) async fn create_table_provider(
 
     // Wrap with upsert deduplication if needed
     let (write_provider, delete_provider) =
-        upsert_dedup::wrap_with_upsert_dedup_if_needed(duckdb_writer, &cmd.options);
+        upsert_dedup::wrap_with_upsert_dedup_if_needed(duckdb_writer, &cmd.options, cmd.constraints.clone());
 
     let mut schema_metadata = HashMap::new();
     schema_metadata.insert(

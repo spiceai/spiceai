@@ -52,6 +52,9 @@ pub struct UpsertDedupTableProvider {
     deletion_provider: Arc<dyn DeletionTableProvider>,
     /// Options controlling deduplication behavior
     upsert_options: UpsertOptions,
+    /// Constraints for deduplication (e.g., primary key)
+    /// Stored explicitly because the inner provider may not expose constraints
+    constraints: Constraints,
 }
 
 impl UpsertDedupTableProvider {
@@ -60,14 +63,20 @@ impl UpsertDedupTableProvider {
     /// # Arguments
     /// * `inner` - The underlying table provider to wrap (must implement `DeletionTableProvider`)
     /// * `upsert_options` - Options controlling deduplication behavior
+    /// * `constraints` - Constraints for deduplication (e.g., primary key)
     #[must_use]
-    pub fn new(inner: Arc<dyn DeletionTableProvider>, upsert_options: UpsertOptions) -> Self {
+    pub fn new(
+        inner: Arc<dyn DeletionTableProvider>,
+        upsert_options: UpsertOptions,
+        constraints: Constraints,
+    ) -> Self {
         // Clone the Arc as TableProvider for regular operations
         let inner_tp: Arc<dyn TableProvider> = Arc::<dyn DeletionTableProvider>::clone(&inner);
         Self {
             inner: inner_tp,
             deletion_provider: inner,
             upsert_options,
+            constraints,
         }
     }
 
@@ -106,7 +115,11 @@ impl TableProvider for UpsertDedupTableProvider {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
+        if self.constraints.is_empty() {
+            None
+        } else {
+            Some(&self.constraints)
+        }
     }
 
     fn supports_filters_pushdown(
@@ -320,11 +333,16 @@ pub fn wrap_with_upsert_dedup_if_needed<
 >(
     provider: Arc<T>,
     options: &std::collections::HashMap<String, String, S>,
+    constraints: Constraints,
 ) -> (Arc<dyn TableProvider>, Arc<dyn DeletionTableProvider>) {
     let upsert_options = extract_upsert_options(options);
 
     if upsert_options.remove_duplicates || upsert_options.last_write_wins {
-        let wrapper = Arc::new(UpsertDedupTableProvider::new(provider, upsert_options));
+        let wrapper = Arc::new(UpsertDedupTableProvider::new(
+            provider,
+            upsert_options,
+            constraints,
+        ));
         (Arc::<UpsertDedupTableProvider>::clone(&wrapper), wrapper)
     } else {
         (Arc::<T>::clone(&provider), provider)
