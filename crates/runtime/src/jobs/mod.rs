@@ -29,7 +29,5 @@ mod store;
 
 pub use error::{Error, Result};
 pub use executor::JobExecutor;
-pub use state::{
-    JobResult, JobResultManifest, JobSchema, JobState, JobStatus, DEFAULT_CHUNK_SIZE,
-};
+pub use state::{DEFAULT_CHUNK_SIZE, JobResult, JobResultManifest, JobSchema, JobState, JobStatus};
 pub use store::JobStore;

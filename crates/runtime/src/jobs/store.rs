@@ -226,37 +226,34 @@ impl JobStore {
             })?;
 
             current_chunk_batches.push(batch);
-            current_chunk_rows =
-                current_chunk_rows
-                    .checked_add(batch_rows)
-                    .ok_or_else(|| super::error::Error::IntegerOverflow {
-                        field: "chunk_row_count".to_string(),
-                        left_value: current_chunk_rows,
-                        right_value: batch_rows,
-                    })?;
+            current_chunk_rows = current_chunk_rows.checked_add(batch_rows).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "chunk_row_count".to_string(),
+                    left_value: current_chunk_rows,
+                    right_value: batch_rows,
+                }
+            })?;
 
             // Flush chunk if we've reached the chunk size
             if current_chunk_rows >= self.chunk_size {
                 let bytes = self
                     .write_chunk(job_id, chunk_index, &current_chunk_batches)
                     .await?;
-                total_bytes =
-                    total_bytes
-                        .checked_add(bytes)
-                        .ok_or_else(|| super::error::Error::IntegerOverflow {
-                            field: "total_byte_count".to_string(),
-                            left_value: total_bytes,
-                            right_value: bytes,
-                        })?;
+                total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                    super::error::Error::IntegerOverflow {
+                        field: "total_byte_count".to_string(),
+                        left_value: total_bytes,
+                        right_value: bytes,
+                    }
+                })?;
                 chunk_indices.push(chunk_index);
-                chunk_index =
-                    chunk_index
-                        .checked_add(1)
-                        .ok_or_else(|| super::error::Error::IntegerOverflow {
-                            field: "chunk_index".to_string(),
-                            left_value: chunk_index,
-                            right_value: 1,
-                        })?;
+                chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                    super::error::Error::IntegerOverflow {
+                        field: "chunk_index".to_string(),
+                        left_value: chunk_index,
+                        right_value: 1,
+                    }
+                })?;
                 current_chunk_batches.clear();
                 current_chunk_rows = 0;
             }
@@ -267,14 +264,13 @@ impl JobStore {
             let bytes = self
                 .write_chunk(job_id, chunk_index, &current_chunk_batches)
                 .await?;
-            total_bytes =
-                total_bytes
-                    .checked_add(bytes)
-                    .ok_or_else(|| super::error::Error::IntegerOverflow {
-                        field: "total_byte_count".to_string(),
-                        left_value: total_bytes,
-                        right_value: bytes,
-                    })?;
+            total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "total_byte_count".to_string(),
+                    left_value: total_bytes,
+                    right_value: bytes,
+                }
+            })?;
             chunk_indices.push(chunk_index);
         }
 

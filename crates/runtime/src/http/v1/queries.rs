@@ -392,14 +392,8 @@ pub(crate) async fn get_results(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Query execution failed".to_string(),
             ),
-            JobStatus::Cancelled => (
-                StatusCode::GONE,
-                "Query was cancelled".to_string(),
-            ),
-            JobStatus::Closed => (
-                StatusCode::GONE,
-                "Query results have expired".to_string(),
-            ),
+            JobStatus::Cancelled => (StatusCode::GONE, "Query was cancelled".to_string()),
+            JobStatus::Closed => (StatusCode::GONE, "Query results have expired".to_string()),
             // Pending or Running - use 425 Too Early
             // Safety: 425 is a valid HTTP status code (RFC 8470), so from_u16 cannot fail
             _ => {
@@ -407,7 +401,10 @@ pub(crate) async fn get_results(
                     Ok(code) => code,
                     Err(_) => unreachable!("425 is a valid HTTP status code"),
                 };
-                (too_early, format!("Query not yet complete (status: {})", state.status))
+                (
+                    too_early,
+                    format!("Query not yet complete (status: {})", state.status),
+                )
             }
         };
         return (
@@ -426,9 +423,7 @@ pub(crate) async fn get_results(
         Ok(batches) => {
             if let Some(job_result) = &state.result {
                 match build_chunk_response(&query_id, partition, &batches, job_result) {
-                    Ok(chunk_response) => {
-                        (StatusCode::OK, Json(chunk_response)).into_response()
-                    }
+                    Ok(chunk_response) => (StatusCode::OK, Json(chunk_response)).into_response(),
                     Err(e) => (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": e})),
@@ -492,25 +487,15 @@ pub(crate) async fn get_chunk(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Query execution failed".to_string(),
             ),
-            JobStatus::Cancelled => (
-                StatusCode::GONE,
-                "Query was cancelled".to_string(),
-            ),
-            JobStatus::Closed => (
-                StatusCode::GONE,
-                "Query results have expired".to_string(),
-            ),
+            JobStatus::Cancelled => (StatusCode::GONE, "Query was cancelled".to_string()),
+            JobStatus::Closed => (StatusCode::GONE, "Query results have expired".to_string()),
             // Pending or Running
             _ => (
                 StatusCode::CONFLICT,
                 format!("Query not yet complete (status: {})", state.status),
             ),
         };
-        return (
-            status_code,
-            Json(serde_json::json!({"error": error_msg})),
-        )
-            .into_response();
+        return (status_code, Json(serde_json::json!({"error": error_msg}))).into_response();
     }
 
     let result = executor.get_chunk(&query_id, chunk_index).await;
@@ -519,9 +504,7 @@ pub(crate) async fn get_chunk(
         Ok(batches) => {
             if let Some(job_result) = &state.result {
                 match build_chunk_response(&query_id, chunk_index, &batches, job_result) {
-                    Ok(chunk_response) => {
-                        (StatusCode::OK, Json(chunk_response)).into_response()
-                    }
+                    Ok(chunk_response) => (StatusCode::OK, Json(chunk_response)).into_response(),
                     Err(e) => (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": e})),
@@ -701,9 +684,7 @@ fn build_chunk_response(
             let next_idx = chunk_index.saturating_add(1);
             (
                 Some(next_idx),
-                Some(format!(
-                    "/v1/queries/{query_id}/results/chunks/{next_idx}"
-                )),
+                Some(format!("/v1/queries/{query_id}/results/chunks/{next_idx}")),
             )
         } else {
             (None, None)
