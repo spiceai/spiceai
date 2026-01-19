@@ -1594,7 +1594,7 @@ mod tests {
 
             // Verify delete file sequence numbers
             let mut seq_nums: Vec<i64> = delete_files.iter().map(|f| f.sequence_number).collect();
-            seq_nums.sort();
+            seq_nums.sort_unstable();
             assert_eq!(seq_nums, vec![1, 2, 3, 4, 5]);
 
             catalog.shutdown().await.expect("Shutdown failed");
