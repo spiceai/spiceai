@@ -400,6 +400,19 @@ testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrenc
 3. Gate code: `#[cfg(feature = "newdb")]`
 4. Update Makefile lint targets
 
+### Git Dependencies in Cargo.toml
+
+- **Always use full 40-character SHA hashes** for git dependencies, never abbreviated SHAs
+- Full SHAs ensure reproducible builds and avoid ambiguity
+
+```toml
+# GOOD - full SHA
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" }
+
+# BAD - abbreviated SHA
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a1b2c3d" }
+```
+
 ## Development Workflow
 
 ### Setup (macOS/Linux)
