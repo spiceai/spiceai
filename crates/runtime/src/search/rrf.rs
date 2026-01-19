@@ -714,7 +714,7 @@ mod tests {
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
     /// Shared embedding model for tests to avoid concurrent file lock contention.
-    /// Model loading from HuggingFace uses file locks; creating multiple models in parallel
+    /// Model loading from `HuggingFace` uses file locks; creating multiple models in parallel
     /// can fail with lock acquisition errors.
     static TEST_EMBEDDING_MODEL: LazyLock<Arc<Model2Vec>> = LazyLock::new(|| {
         Arc::new(
