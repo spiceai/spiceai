@@ -100,10 +100,18 @@ impl SpiceTest<NotStarted> {
 
         // Add tasks to channel.
         tokio::spawn(async move {
-            for request in requests {
+            let num_requests = requests.len();
+            for (i, request) in requests.into_iter().enumerate() {
                 if let Err(e) = tx.send(request).await {
                     eprintln!("Failed to send request to workers: {e}");
                     break;
+                }
+                // Worst case buffer channel is full => at least (i - buffer_size) processed.
+                if (0 == i || i > buffer_size) && i.is_multiple_of(5) {
+                    println!(
+                        "[TextToSqlWorkers]: Complete {}/{num_requests} requests",
+                        i.checked_sub(buffer_size).unwrap_or_default(),
+                    );
                 }
             }
         });

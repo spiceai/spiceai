@@ -19,6 +19,7 @@ use std::time::SystemTime;
 
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
+use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::traits::RequestOptionsBuilder;
 use async_openai::types::chat::{
@@ -50,7 +51,7 @@ use async_trait::async_trait;
 #[async_trait]
 impl Chat for Anthropic {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
-        None
+        Some(&StructuredOutputSqlGeneration {})
     }
 
     async fn chat_stream(

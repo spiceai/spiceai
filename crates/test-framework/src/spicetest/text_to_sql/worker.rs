@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::spicetest::text_to_sql::{
     TextToSqlMetric,
+    metrics::intersection_over_union,
     parse::{logical_plan, sql_schema},
     task_history::find_task_history_metrics,
 };
@@ -116,114 +117,122 @@ impl TextToSqlWorker {
     pub fn start(self) -> JoinHandle<Result<TextToSqlWorkerResult>> {
         tokio::spawn(async move {
             let mut results: BTreeMap<String, TextToSqlMetric> = BTreeMap::new();
-            let mut processed_count = 0usize;
 
             while let Ok(request) = self.request_rx.recv().await {
-                let start = Instant::now();
-                let mut is_error = false;
-                let mut generated_sql_opt: Option<String> = None;
-                let mut generated_schema_opt: Option<Schema> = None;
-
-                let trace_id = random_trace_id();
-                match nsql_request(&self.http_client, &self.http_base_url, &request, &trace_id)
-                    .await
-                {
-                    Ok(NSQLResponse::Sql(sql)) => {
-                        generated_sql_opt = Some(sql);
+                match self.process_request(&request).await {
+                    Ok(metric) => {
+                        results.insert(request.id.clone(), metric);
                     }
-                    Ok(NSQLResponse::Data(schema)) => {
-                        generated_schema_opt = Some(schema);
+                    Err(e) => {
+                        eprintln!(
+                            "[TextToSqlWorker-{}]: Failed to process request '{}': {e}",
+                            self.id, request.id
+                        );
                     }
-                    Err(_) => {
-                        is_error = true;
-                    }
-                }
-
-                let duration = start.elapsed();
-
-                let (sql, task_history_metrics) =
-                    find_task_history_metrics(&self.spice_client, &trace_id)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("could not find task history metrics. Error: {e}")
-                        })?;
-
-                let generated_sql = generated_sql_opt.or(sql).unwrap_or_default();
-
-                // Calculate generated schema & logical plan if absent.
-                let generated_schema = match generated_schema_opt {
-                    Some(schema) => Some(schema),
-                    None => sql_schema(
-                        self.http_client.clone(),
-                        &self.http_base_url,
-                        &generated_sql,
-                    )
-                    .await
-                    .ok(),
-                };
-
-                let generated_logical_plan = logical_plan(
-                    self.http_client.clone(),
-                    &self.http_base_url,
-                    &generated_sql,
-                )
-                .await
-                .ok();
-
-                // Calculate expected schema & logical plan if absent.
-                let expected_schema = sql_schema(
-                    self.http_client.clone(),
-                    &self.http_base_url,
-                    &request.expected_sql,
-                )
-                .await?;
-
-                let expected_logical_plan = logical_plan(
-                    self.http_client.clone(),
-                    &self.http_base_url,
-                    &request.expected_sql,
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("could not compute expected logical plan. Error: {e}")
-                })?;
-
-                results.insert(
-                    request.id.clone(),
-                    TextToSqlMetric::try_new(
-                        request.question,
-                        &generated_sql,
-                        &request.expected_sql,
-                        &expected_logical_plan,
-                        generated_logical_plan.as_ref(),
-                        is_error,
-                        duration,
-                        request.sample_data_enabled,
-                        request.return_sql,
-                        &task_history_metrics,
-                        generated_schema
-                            .map(|s| u8::from(s == expected_schema))
-                            .unwrap_or_default()
-                            .into(),
-                    )?,
-                );
-
-                processed_count += 1;
-                if processed_count.is_multiple_of(10) {
-                    println!(
-                        "[TextToSqlWorker-{}]: processed {processed_count} requests",
-                        self.id
-                    );
                 }
             }
 
-            println!(
-                "[TextToSqlWorker-{}]: DONE, {processed_count} completed",
-                self.id
-            );
+            println!("[TextToSqlWorker-{}]: DONE", self.id);
 
             Ok(TextToSqlWorkerResult { results })
         })
+    }
+
+    async fn process_request(&self, request: &TextToSqlRequest) -> Result<TextToSqlMetric> {
+        let start = Instant::now();
+        let mut is_error = false;
+        let mut generated_sql_opt: Option<String> = None;
+        let mut generated_schema_opt: Option<Schema> = None;
+
+        let trace_id = random_trace_id();
+        match nsql_request(&self.http_client, &self.http_base_url, request, &trace_id).await {
+            Ok(NSQLResponse::Sql(sql)) => {
+                generated_sql_opt = Some(sql);
+            }
+            Ok(NSQLResponse::Data(schema)) => {
+                generated_schema_opt = Some(schema);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[TextToSqlWorker-{}]: NSQL request failed for '{}': {e}",
+                    self.id, request.id
+                );
+                is_error = true;
+            }
+        }
+
+        let duration = start.elapsed();
+
+        let (sql, task_history_metrics) = find_task_history_metrics(&self.spice_client, &trace_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not find task history metrics. Error: {e}"))?;
+
+        let generated_sql = generated_sql_opt.or(sql).unwrap_or_default();
+
+        // Calculate generated schema & logical plan if absent.
+        let generated_schema = match generated_schema_opt {
+            Some(schema) => Some(schema),
+            None => sql_schema(
+                self.http_client.clone(),
+                &self.http_base_url,
+                &generated_sql,
+            )
+            .await
+            .ok(),
+        };
+
+        let generated_logical_plan = logical_plan(
+            self.http_client.clone(),
+            &self.http_base_url,
+            &generated_sql,
+        )
+        .await
+        .inspect_err(|e| eprintln!("could not compute logical plan for generated SQL. Error: {e}"))
+        .ok();
+
+        // Calculate expected schema & logical plan if absent.
+        let expected_schema = sql_schema(
+            self.http_client.clone(),
+            &self.http_base_url,
+            &request.expected_sql,
+        )
+        .await
+        .inspect_err(|e| eprintln!("could not compute schema for expected SQL. Error: {e}"))
+        .ok();
+
+        let expected_logical_plan = logical_plan(
+            self.http_client.clone(),
+            &self.http_base_url,
+            &request.expected_sql,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("could not compute expected logical plan. Error: {e}"))?;
+
+        Ok(TextToSqlMetric::new(
+            request.question.clone(),
+            &generated_sql,
+            &request.expected_sql,
+            &expected_logical_plan,
+            generated_logical_plan.as_ref(),
+            is_error,
+            duration,
+            request.sample_data_enabled,
+            request.return_sql,
+            &task_history_metrics,
+            schema_similarity(generated_schema.as_ref(), expected_schema.as_ref()),
+        ))
+    }
+}
+
+/// Computes the schema similarity between two Arrow schemas using Intersection over Union (`IoU`).
+fn schema_similarity(a: Option<&Schema>, b: Option<&Schema>) -> f64 {
+    match (a, b) {
+        (Some(schema_a), Some(schema_b)) => {
+            let fields_a = schema_a.fields().into_iter().collect();
+            let fields_b = schema_b.fields().into_iter().collect();
+            intersection_over_union(&fields_a, &fields_b)
+        }
+        _ => 0.0,
     }
 }
 
