@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use std::time::SystemTime;
 
+use crate::anthropic::types::{EffortLevel, OutputConfig, OutputFormat};
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
@@ -34,15 +35,16 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
     ChatCompletionResponseStream, ChatCompletionToolChoiceOption, CompletionUsage,
     CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, FunctionCall,
-    FunctionName, Role, StopConfiguration, ToolChoiceOptions,
+    FunctionName, ReasoningEffort, ResponseFormat, ResponseFormatJsonSchema, Role,
+    StopConfiguration, ToolChoiceOptions,
 };
 use serde_json::json;
 
 use super::Anthropic;
 use super::types::{
     AnthropicModelVariant, ContentBlock, ContentParam, MessageCreateParams, MessageCreateResponse,
-    MessageParam, MessageRole, MetadataParam, ResponseContentBlock, StopReason, TextBlockParam,
-    ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam, default_max_tokens,
+    MessageParam, MessageRole, MetadataParam, ResponseContentBlock, ResponseTextBlock, StopReason,
+    TextBlockParam, ToolChoiceParam, ToolResultBlockParam, ToolUseBlockParam, default_max_tokens,
     tool_from_completion_tools,
 };
 use super::types_stream::transform_stream;
@@ -115,11 +117,14 @@ impl TryFrom<MessageCreateResponse> for CreateChatCompletionResponse {
                 index: 0,
                 logprobs: None,
                 finish_reason: match value.stop_reason {
-                    Some(StopReason::StopSequence | StopReason::EndTurn) => {
-                        Some(FinishReason::Stop)
+                    Some(
+                        StopReason::StopSequence | StopReason::EndTurn | StopReason::PauseTurn,
+                    ) => Some(FinishReason::Stop),
+                    Some(StopReason::MaxTokens | StopReason::ModelContextWindowExceeded) => {
+                        Some(FinishReason::Length)
                     }
-                    Some(StopReason::MaxTokens) => Some(FinishReason::Length),
                     Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                    Some(StopReason::Refusal) => Some(FinishReason::ContentFilter),
                     None => None,
                 },
                 message: create_completion_message(&value.content, &value.role).map_err(|e| {
@@ -166,8 +171,15 @@ fn create_completion_message(
                     },
                 )))
             }
-            ResponseContentBlock::Text(TextBlockParam { text, .. }) => {
+            ResponseContentBlock::Text(ResponseTextBlock { text, .. }) => {
                 content.push_str(text);
+                None
+            }
+            ResponseContentBlock::Thinking(_) => {
+                // Internal thinking is not exposed to the user
+                None
+            }
+            ResponseContentBlock::RedactedThinking(_) | ResponseContentBlock::ServerToolUse(_) => {
                 None
             }
         })
@@ -405,6 +417,42 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
             tools: value
                 .tools
                 .map(|t| t.iter().filter_map(tool_from_completion_tools).collect()),
+            thinking: None,
+            service_tier: None,
+            container: None,
+            context_management: None,
+            mcp_servers: None,
+            output_config: match value.reasoning_effort {
+                None | Some(ReasoningEffort::None) => None,
+                Some(ReasoningEffort::Minimal | ReasoningEffort::Low) => {
+                    Some(OutputConfig {
+                        effort: Some(EffortLevel::Low),
+                    })
+                }
+                Some(ReasoningEffort::Medium) => Some(OutputConfig {
+                    effort: Some(EffortLevel::Medium),
+                }),
+                Some(ReasoningEffort::High | ReasoningEffort::Xhigh) => Some(OutputConfig {
+                    effort: Some(EffortLevel::High),
+                }),
+            },
+            output_format: value.response_format.and_then(|rf| match rf {
+                ResponseFormat::JsonObject => {
+                    tracing::warn!("Anthropic does not support arbitrary JSON object response format. Only `type: \"json_schema\"` or `type: \"text\"`.");
+                    None
+                }
+                ResponseFormat::JsonSchema {
+                    json_schema:
+                        ResponseFormatJsonSchema {
+                            schema: Some(schema_v),
+                            ..
+                        },
+                } => Some(OutputFormat {
+                    format_type: "json_schema".to_string(),
+                    schema: schema_v,
+                }),
+                _ => None,
+            }),
         })
     }
 }
