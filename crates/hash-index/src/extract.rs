@@ -69,6 +69,12 @@ pub trait KeyExtractor: Send + Sync {
 
     /// Computes the hash for an owned key.
     fn hash_owned_key(key: &Self::Key) -> u64;
+
+    /// Returns the raw bytes representation of the key at the given row.
+    ///
+    /// This is used for key equality comparison when hash collisions occur.
+    /// Returns `None` if the key is null.
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>>;
 }
 
 /// Key extractor for primitive integer types.
@@ -139,6 +145,15 @@ impl<T: PrimitiveKey> KeyExtractor for PrimitiveKeyExtractor<T> {
         key.hash(&mut hasher);
         hasher.finish()
     }
+
+    #[inline]
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        if T::is_null(&self.array, row) {
+            None
+        } else {
+            Some(T::value_bytes(&self.array, row))
+        }
+    }
 }
 
 /// Trait for primitive key types with optimized array access.
@@ -160,6 +175,9 @@ pub trait PrimitiveKey: Clone + Eq + Hash + Send + Sync + 'static {
 
     /// Returns the value at `row` (assumes non-null).
     fn value(array: &Self::ArrayType, row: usize) -> Self::Native;
+
+    /// Returns the value at `row` as bytes for comparison.
+    fn value_bytes(array: &Self::ArrayType, row: usize) -> Vec<u8>;
 }
 
 macro_rules! impl_primitive_key {
@@ -191,6 +209,11 @@ macro_rules! impl_primitive_key {
             #[inline]
             fn value(array: &Self::ArrayType, row: usize) -> Self::Native {
                 array.value(row)
+            }
+
+            #[inline]
+            fn value_bytes(array: &Self::ArrayType, row: usize) -> Vec<u8> {
+                array.value(row).to_le_bytes().to_vec()
             }
         }
     };
@@ -294,6 +317,15 @@ impl KeyExtractor for Utf8KeyExtractor {
         key.hash(&mut hasher);
         hasher.finish()
     }
+
+    #[inline]
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        if self.array.is_null(row) {
+            None
+        } else {
+            Some(self.array.value(row).as_bytes().to_vec())
+        }
+    }
 }
 
 /// Key extractor for binary columns.
@@ -376,6 +408,15 @@ impl KeyExtractor for BinaryKeyExtractor {
         let mut hasher = new_hasher();
         key.hash(&mut hasher);
         hasher.finish()
+    }
+
+    #[inline]
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        if self.array.is_null(row) {
+            None
+        } else {
+            Some(self.array.value(row).to_vec())
+        }
     }
 }
 
@@ -494,6 +535,11 @@ impl KeyExtractor for RowConverterKeyExtractor {
         key.as_ref().hash(&mut hasher);
         hasher.finish()
     }
+
+    #[inline]
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        Some(self.rows.row(row).as_ref().to_vec())
+    }
 }
 
 /// Creates the appropriate key extractor based on the column data type.
@@ -556,6 +602,12 @@ pub trait KeyExtractorDyn: Send + Sync {
 
     /// Computes the hash for the key at the given row.
     fn hash_key(&self, row: usize) -> Option<u64>;
+
+    /// Returns the raw bytes representation of the key at the given row.
+    ///
+    /// This is used to compare keys for equality when hash collisions occur.
+    /// Returns `None` if the key is null.
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>>;
 }
 
 impl<E: KeyExtractor> KeyExtractorDyn for E {
@@ -565,6 +617,10 @@ impl<E: KeyExtractor> KeyExtractorDyn for E {
 
     fn hash_key(&self, row: usize) -> Option<u64> {
         KeyExtractor::hash_key(self, row)
+    }
+
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        KeyExtractor::key_bytes(self, row)
     }
 }
 

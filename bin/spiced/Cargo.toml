@@ -82,6 +82,7 @@ default = [
     "turso",
     "smb",
     "mem0",
+    "pingora",
     "scylladb",
 ]
 delta_lake = ["runtime/delta_lake"]
@@ -105,6 +106,7 @@ mysql = ["runtime/mysql"]
 nfs = ["runtime/nfs"]
 odbc = ["runtime/odbc"]
 oracle = ["runtime/oracle"]
+pingora = ["runtime/pingora"]
 postgres = ["runtime/postgres"]
 postgres-write = ["runtime/postgres-write"]
 release = []
