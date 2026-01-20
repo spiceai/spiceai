@@ -34,7 +34,7 @@ on:
           - 'bird-bench-small[card_games]'
           - 'bird-bench-small[codebase_community]'
           - 'bird-bench-small[debit_card_specializing]'
-          - 'bird-bench-small[european_football2]'
+          - 'bird-bench-small[european_football_2]'
           - 'bird-bench-small[financial]'
           - 'bird-bench-small[formula_1]'
           - 'bird-bench-small[superhero]'

@@ -319,7 +319,7 @@ pub enum BenchmarkQueryset {
     BirdBenchSmallCodebaseCommunity,
     #[serde(rename = "bird-bench-small[debit_card_specializing]")]
     BirdBenchSmallDebitCardSpecializing,
-    #[serde(rename = "bird-bench-small[european_football2]")]
+    #[serde(rename = "bird-bench-small[european_football_2]")]
     BirdBenchSmallEuropeanFootball2,
     #[serde(rename = "bird-bench-small[financial]")]
     BirdBenchSmallFinancial,
