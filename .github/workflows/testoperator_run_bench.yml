@@ -207,6 +207,11 @@ jobs:
           bash -c 'while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done' || false
         timeout-minutes: 1
 
+      - name: Wait for all datasets to be ready
+        run: |
+          bash -c 'while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done' || false
+        timeout-minutes: 5
+
       - name: Print spiced logs
         if: always()
         run: |
