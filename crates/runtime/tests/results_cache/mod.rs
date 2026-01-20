@@ -17,10 +17,9 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use arrow::array::{Array, RecordBatch};
+use arrow::array::RecordBatch;
 use cache::result::CacheStatus;
 use futures::TryStreamExt;
-use tempfile::TempDir;
 
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use spicepod::{
@@ -105,38 +104,4 @@ async fn execute_query_and_check_cache_status(
     assert_eq!(query_result.cache_status, expected_cache_status);
 
     Ok(records)
-}
-
-async fn execute_query_collect(rt: &Arc<Runtime>, query: &str) -> Result<Vec<RecordBatch>, String> {
-    let query = QueryBuilder::new(query, rt.datafusion()).build();
-
-    let query_result = query
-        .run()
-        .await
-        .map_err(|e| format!("Failed to execute query: {e}"))?;
-
-    query_result
-        .data
-        .try_collect::<Vec<RecordBatch>>()
-        .await
-        .map_err(|e| format!("Failed to collect query results: {e}"))
-}
-
-fn extract_int_column(batches: &[RecordBatch]) -> Vec<i32> {
-    use arrow::array::Int32Array;
-
-    let mut values = Vec::new();
-    for batch in batches {
-        if batch.num_columns() > 0 {
-            let column = batch.column(0);
-            if let Some(int_array) = column.as_any().downcast_ref::<Int32Array>() {
-                for i in 0..int_array.len() {
-                    if !int_array.is_null(i) {
-                        values.push(int_array.value(i));
-                    }
-                }
-            }
-        }
-    }
-    values
 }
