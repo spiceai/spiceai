@@ -148,7 +148,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use iceberg::CatalogBuilder;
     use iceberg_catalog_rest::RestCatalogBuilder;
-    use iceberg_datafusion::IcebergStaticTableProvider;
+    use iceberg_datafusion::IcebergTableProvider;
     use std::sync::Arc;
 
     use super::*;
@@ -194,18 +194,13 @@ mod tests {
             .await;
         println!("{tables:?}");
 
-        let table = catalog
-            .load_table(&TableIdent::new(
-                NamespaceIdent::new("nyc".to_string()),
-                "taxis".to_string(),
-            ))
-            .await
-            .expect("Failed to load table");
-        println!("{table:?}");
-
-        let df_table_provider = IcebergStaticTableProvider::try_new_from_table(table)
-            .await
-            .expect("Failed to create table provider");
+        let df_table_provider = IcebergTableProvider::try_new(
+            Arc::new(catalog),
+            NamespaceIdent::new("nyc".to_string()),
+            "taxis".to_string(),
+        )
+        .await
+        .expect("Failed to create table provider");
 
         let ctx = SessionContext::new();
         ctx.register_table("ice_ice_baby", Arc::new(df_table_provider))
