@@ -69,12 +69,15 @@ limitations under the License.
 //! # Test Structure
 //!
 //! The tests share a single runtime instance to avoid the overhead of starting
-//! a new PostgreSQL container and loading all 24 TPC-DS tables for each query.
+//! a new PostgreSQL container and loading tables for each query. Only the 5
+//! tables required by the tested queries are loaded (not all 24 TPC-DS tables).
 //! The shared environment is initialized lazily on the first test and reused
 //! by all subsequent tests.
 //!
+//! Tables loaded: `store_sales`, `web_sales`, `date_dim`, `item`, `store`
+//!
 //! Test flow:
-//! 1. First test triggers initialization: starts PostgreSQL, loads all datasets
+//! 1. First test triggers initialization: starts PostgreSQL, loads required datasets
 //! 2. All tests (q36, q70, q86) execute queries against the shared runtime
 //! 3. Container cleanup happens when the test process exits
 //!
@@ -172,6 +175,13 @@ async fn get_shared_env() -> Result<&'static SharedTestEnv, anyhow::Error> {
 /// This function generates a spicepod configuration that:
 /// 1. Reads TPC-DS SF1 parquet files from an S3-compatible endpoint (MinIO in CI)
 /// 2. Accelerates the data into a PostgreSQL database
+///
+/// Only loads the tables required by queries Q36, Q70, and Q86:
+/// - store_sales (Q36, Q70)
+/// - web_sales (Q86)
+/// - date_dim (Q36, Q70, Q86)
+/// - item (Q36, Q86)
+/// - store (Q36, Q70)
 #[expect(clippy::expect_used)]
 fn get_tpcds_spicepod_yaml(pg_port: usize, pg_db: &str) -> String {
     let minio_endpoint =
@@ -186,8 +196,9 @@ fn get_tpcds_spicepod_yaml(pg_port: usize, pg_db: &str) -> String {
 kind: Spicepod
 name: tpcds-s3-postgres-test
 datasets:
-  - from: s3://benchmarks/tpcds_sf1/catalog_sales.parquet
-    name: catalog_sales
+  # store_sales - used by Q36, Q70 (largest table, ~2M rows at SF1)
+  - from: s3://benchmarks/tpcds_sf1/store_sales.parquet
+    name: store_sales
     params: &s3_params
       file_format: parquet
       allow_http: true
@@ -205,39 +216,8 @@ datasets:
         pg_db: {pg_db}
         pg_port: {pg_port}
         pg_sslmode: disable
-      primary_key: (cs_item_sk, cs_order_number)
-  - from: s3://benchmarks/tpcds_sf1/catalog_returns.parquet
-    name: catalog_returns
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (cr_item_sk, cr_order_number)
-  - from: s3://benchmarks/tpcds_sf1/inventory.parquet
-    name: inventory
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (inv_date_sk, inv_item_sk, inv_warehouse_sk)
-  - from: s3://benchmarks/tpcds_sf1/store_sales.parquet
-    name: store_sales
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
       primary_key: (ss_item_sk, ss_ticket_number)
-  - from: s3://benchmarks/tpcds_sf1/store_returns.parquet
-    name: store_returns
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (sr_item_sk, sr_ticket_number)
+  # web_sales - used by Q86
   - from: s3://benchmarks/tpcds_sf1/web_sales.parquet
     name: web_sales
     params: *s3_params
@@ -246,38 +226,7 @@ datasets:
       engine: postgres
       params: *pg_params
       primary_key: (ws_item_sk, ws_order_number)
-  - from: s3://benchmarks/tpcds_sf1/web_returns.parquet
-    name: web_returns
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (wr_item_sk, wr_order_number)
-  - from: s3://benchmarks/tpcds_sf1/customer.parquet
-    name: customer
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (c_customer_sk)
-  - from: s3://benchmarks/tpcds_sf1/customer_address.parquet
-    name: customer_address
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (ca_address_sk)
-  - from: s3://benchmarks/tpcds_sf1/customer_demographics.parquet
-    name: customer_demographics
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (cd_demo_sk)
+  # date_dim - used by Q36, Q70, Q86
   - from: s3://benchmarks/tpcds_sf1/date_dim.parquet
     name: date_dim
     params: *s3_params
@@ -286,14 +235,7 @@ datasets:
       engine: postgres
       params: *pg_params
       primary_key: (d_date_sk)
-  - from: s3://benchmarks/tpcds_sf1/household_demographics.parquet
-    name: household_demographics
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (hd_demo_sk)
+  # item - used by Q36, Q86
   - from: s3://benchmarks/tpcds_sf1/item.parquet
     name: item
     params: *s3_params
@@ -302,22 +244,7 @@ datasets:
       engine: postgres
       params: *pg_params
       primary_key: (i_item_sk)
-  - from: s3://benchmarks/tpcds_sf1/promotion.parquet
-    name: promotion
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (p_promo_sk)
-  - from: s3://benchmarks/tpcds_sf1/ship_mode.parquet
-    name: ship_mode
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (sm_ship_mode_sk)
+  # store - used by Q36, Q70
   - from: s3://benchmarks/tpcds_sf1/store.parquet
     name: store
     params: *s3_params
@@ -326,70 +253,6 @@ datasets:
       engine: postgres
       params: *pg_params
       primary_key: (s_store_sk)
-  - from: s3://benchmarks/tpcds_sf1/time_dim.parquet
-    name: time_dim
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (t_time_sk)
-  - from: s3://benchmarks/tpcds_sf1/warehouse.parquet
-    name: warehouse
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (w_warehouse_sk)
-  - from: s3://benchmarks/tpcds_sf1/web_page.parquet
-    name: web_page
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (wp_web_page_sk)
-  - from: s3://benchmarks/tpcds_sf1/web_site.parquet
-    name: web_site
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (web_site_sk)
-  - from: s3://benchmarks/tpcds_sf1/reason.parquet
-    name: reason
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (r_reason_sk)
-  - from: s3://benchmarks/tpcds_sf1/call_center.parquet
-    name: call_center
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (cc_call_center_sk)
-  - from: s3://benchmarks/tpcds_sf1/income_band.parquet
-    name: income_band
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (ib_income_band_sk)
-  - from: s3://benchmarks/tpcds_sf1/catalog_page.parquet
-    name: catalog_page
-    params: *s3_params
-    acceleration:
-      enabled: true
-      engine: postgres
-      params: *pg_params
-      primary_key: (cp_catalog_page_sk)
 "#,
         minio_endpoint = minio_endpoint,
         minio_access_key = minio_access_key,
