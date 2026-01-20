@@ -16,22 +16,17 @@ limitations under the License.
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParamsBuilder, ScanParamsBuilder};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::utils::FilterStringVisitor;
+use crate::key_filter::{contains_or, try_match_index};
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::logical_expr::{BinaryExpr, Expr};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub struct DynamoDBRequestPlanBuilder {
     schema: DynamoDBTableSchema,
-}
-
-#[derive(Debug)]
-enum KeyFilter {
-    Partition(Expr),
-    Sort(Expr),
 }
 
 /// Builds optimized `DynamoDB` request plans (Query or Scan) from `DataFusion` filter expressions and projections.
@@ -283,8 +278,7 @@ impl DynamoDBRequestPlanBuilder {
     }
 
     fn separate_key_filters(&self, filters: &[Expr]) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {
-        let has_or = filters.iter().any(contains_or);
-        if has_or {
+        if filters.iter().any(contains_or) {
             return (None, filters.to_vec());
         }
 
@@ -351,92 +345,6 @@ impl DynamoDBRequestPlanBuilder {
     }
 }
 
-/// Attempts to match filters against a primary index (`partition_key` + `sort_key`)
-fn try_match_index(
-    filters: &[Expr],
-    partition_key: &str,
-    sort_key: Option<&str>,
-) -> Option<(Expr, Option<Expr>, Vec<Expr>)> {
-    let mut partition_expr = None;
-    let mut sort_expr = None;
-    let mut other_filters = Vec::new();
-
-    for filter in filters {
-        if let Some(extracted) = try_extract_key_filter(filter, partition_key, sort_key) {
-            match extracted {
-                KeyFilter::Partition(expr) => {
-                    if partition_expr.is_some() {
-                        return None;
-                    }
-                    partition_expr = Some(expr);
-                }
-                KeyFilter::Sort(expr) => {
-                    if sort_expr.is_some() {
-                        return None;
-                    }
-                    sort_expr = Some(expr);
-                }
-            }
-        } else {
-            other_filters.push(filter.clone());
-        }
-    }
-
-    partition_expr.map(|p| (p, sort_expr, other_filters))
-}
-
-fn contains_or(expr: &Expr) -> bool {
-    expr.apply(|expr| match expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left: _,
-            op: Operator::Or,
-            ..
-        }) => Err(DataFusionError::External("".into())),
-        _ => Ok(TreeNodeRecursion::Continue),
-    })
-    .is_err()
-}
-
-/// Extracts key filter if the expression matches the specified partition or sort key
-fn try_extract_key_filter(
-    expr: &Expr,
-    partition_key: &str,
-    sort_key: Option<&str>,
-) -> Option<KeyFilter> {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            let left_col = match left.as_ref() {
-                Expr::Column(col) => Some(col.name.as_str()),
-                _ => None,
-            };
-            let right_col = match right.as_ref() {
-                Expr::Column(col) => Some(col.name.as_str()),
-                _ => None,
-            };
-
-            // Partition key matching (either side)
-            if matches!(op, Operator::Eq)
-                && (left_col == Some(partition_key) || right_col == Some(partition_key))
-            {
-                return Some(KeyFilter::Partition(expr.clone()));
-            }
-
-            // Sort key matching (either side)
-            if let Some(sk) = sort_key
-                && (left_col == Some(sk) || right_col == Some(sk))
-                && matches!(
-                    op,
-                    Operator::Eq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
-                )
-            {
-                return Some(KeyFilter::Sort(expr.clone()));
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,7 +352,7 @@ mod tests {
     use aws_sdk_dynamodb::types::AttributeValue;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::ScalarValue;
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::logical_expr::{col, lit, Operator};
     use std::sync::Arc;
 
     fn create_test_schema() -> DynamoDBTableSchema {
