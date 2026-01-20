@@ -31,11 +31,14 @@ use tokio::{
     task::JoinHandle,
 };
 
+use std::sync::atomic::AtomicI64;
 use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use super::refresh::Refresh;
+use crate::accelerated_table::refresh_task::RefreshTaskBuilder;
 use datafusion::{datasource::TableProvider, sql::TableReference};
+use imap::types::QuotaResourceName::Atom;
 use opentelemetry::KeyValue;
 use spicepod::metric::Metrics;
 
@@ -55,6 +58,7 @@ pub struct RefreshTaskRunnerBuilder {
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     /// Shared with `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
+    last_updated_at: Arc<AtomicI64>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -84,6 +88,7 @@ impl RefreshTaskRunnerBuilder {
             io_runtime,
             resource_monitor: None,
             accelerator_write_mutex,
+            last_updated_at: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -122,6 +127,12 @@ impl RefreshTaskRunnerBuilder {
     }
 
     #[must_use]
+    pub fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> Self {
+        self.last_updated_at = last_updated_at;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
             self.runtime_status,
@@ -133,6 +144,7 @@ impl RefreshTaskRunnerBuilder {
             self.accelerator_write_mutex,
         )
         .with_disable_federation(self.disable_federation)
+        .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_metrics(self.metrics);
 
         if let Some(semaphore) = self.semaphore {

@@ -159,27 +159,27 @@ pub enum SnapshotsResetExpiryOnLoad {
 pub enum SnapshotsCreationPolicy {
     Always,
     #[default]
-    Changed,
+    OnChange,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
-    *b == SnapshotBehavior::Disabled
+    *b == SnapshotBehavior::default()
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_compaction(c: &SnapshotsCompaction) -> bool {
-    *c == SnapshotsCompaction::Disabled
+    *c == SnapshotsCompaction::default()
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshots_reset_expiry_on_load(c: &SnapshotsResetExpiryOnLoad) -> bool {
-    *c == SnapshotsResetExpiryOnLoad::Disabled
+    *c == SnapshotsResetExpiryOnLoad::default()
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshots_creation_policy(c: &SnapshotsCreationPolicy) -> bool {
-    *c == SnapshotsCreationPolicy::Changed
+    *c == SnapshotsCreationPolicy::default()
 }
 
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]

@@ -691,7 +691,7 @@ impl SnapshotManager {
         // Check if we should skip due to no updates
         if matches!(
             self.snapshots_creation_policy,
-            SnapshotsCreationPolicy::Changed
+            SnapshotsCreationPolicy::OnChange
         ) && let Some(last_updated_at) = last_updated_at
             && let Ok(Some(handle)) = self.load_metadata().await
             && let Some(dataset_meta) = handle.metadata.datasets.get(&self.dataset_name)
