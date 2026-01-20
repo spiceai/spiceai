@@ -245,7 +245,8 @@ pub struct AcceleratedTable {
     in_flight_revalidations: caching::InFlightRevalidations,
     /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
     /// `None` if no insert has occurred yet (and no bootstrap timestamp was provided).
-    last_updated_at: Option<Arc<AtomicI64>>,
+    /// Shared with `RefreshTask`
+    last_updated_at: Arc<AtomicI64>,
     /// Sender for batched cache writes. Only used in caching refresh mode.
     batch_write_tx: Option<caching::CacheWriteSender>,
 }
@@ -635,11 +636,12 @@ impl Builder {
         let in_flight_revalidations: caching::InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
         // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
-        // Initialize from bootstrap metadata if available, otherwise None.
-        let last_updated_at: Option<Arc<AtomicI64>> = self
-            .bootstrap_status
-            .last_updated_at()
-            .map(|ts| Arc::new(AtomicI64::new(ts)));
+        // Initialize from bootstrap metadata if available.
+        let last_updated_at = Arc::new(
+            self.bootstrap_status
+                .last_updated_at()
+                .map_or(AtomicI64::new(0), AtomicI64::new),
+        );
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -657,7 +659,7 @@ impl Builder {
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
-        refresher.with_last_updated_at(last_updated_at.clone());
+        refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.with_metrics(self.metrics);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
@@ -920,6 +922,15 @@ impl AcceleratedTable {
 
         Ok(filters_to_reapply)
     }
+
+    #[expect(clippy::cast_possible_truncation)]
+    fn update_last_updated_at(&self) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        self.last_updated_at.store(now_ms, Ordering::Release);
+    }
 }
 
 impl Drop for AcceleratedTable {
@@ -1066,21 +1077,13 @@ impl TableProvider for AcceleratedTable {
         Ok(Arc::new(SchemaCastScanExec::new(plan, self.schema())))
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     async fn insert_into(
         &self,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        // Update last_updated_at timestamp
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        if let Some(ref last_updated_at) = self.last_updated_at {
-            last_updated_at.store(now_ms, Ordering::Release);
-        }
+        self.update_last_updated_at();
 
         // When on_conflict is configured, writes go only to the accelerator
         // (the federated source may not support writes, e.g., file connector).
