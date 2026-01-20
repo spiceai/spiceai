@@ -944,7 +944,7 @@ impl Refresher {
             .with_cpu_runtime(self.cpu_runtime.clone())
             .with_metrics(self.metrics.clone())
             .with_on_stream_batch_process_callback(on_batch_process_callback)
-            .with_last_updated_at(Arc::clone(&self.last_updated_at.clone))
+            .with_last_updated_at(Arc::clone(&self.last_updated_at))
             .build(),
         );
 
