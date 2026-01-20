@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_glue::{Client, types::Table};
-use aws_sdk_sts::config::ProvideCredentials;
+use aws_sdk_s3::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
     CatalogBuilder, NamespaceIdent, TableIdent,
