@@ -22,7 +22,7 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
-use arrow::datatypes::SchemaRef;
+use arrow::{compute::concat_batches, datatypes::SchemaRef};
 use async_trait::async_trait;
 use data_components::delete::DeletionTableProvider;
 use datafusion::{
@@ -271,9 +271,11 @@ impl ExecutionPlan for UpsertDedupExec {
         // Create a stream that validates constraints and applies deduplication to each batch.
         // The validate_batch_with_constraints function handles both constraint validation and
         // deduplication based on UpsertOptions (remove_duplicates, last_write_wins).
+        let stream_schema = Arc::clone(&schema);
         let validated_stream = input_stream.then(move |batch_result| {
             let constraints = constraints.clone();
             let upsert_options = upsert_options.clone();
+            let schema = Arc::clone(&stream_schema);
             async move {
                 let batch = batch_result?;
 
@@ -287,10 +289,16 @@ impl ExecutionPlan for UpsertDedupExec {
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                // Return the first batch (we passed in one batch)
-                validated_batches.into_iter().next().ok_or_else(|| {
-                    DataFusionError::Internal("Expected validated batch".to_string())
-                })
+                // Concatenate all returned batches into a single batch.
+                // The validate_batch_with_constraints function may return multiple batches
+                // after deduplication (e.g., from df.collect()), so we need to merge them.
+                if validated_batches.is_empty() {
+                    return Err(DataFusionError::Internal(
+                        "Expected validated batch".to_string(),
+                    ));
+                }
+                concat_batches(&schema, &validated_batches)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
             }
         });
 

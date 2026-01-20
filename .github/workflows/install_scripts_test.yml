@@ -403,7 +403,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup WSL
-        uses: Vampire/setup-wsl@v5
+        uses: Vampire/setup-wsl@v6
         with:
           distribution: ${{ matrix.distro }}
           additional-packages: curl wget
