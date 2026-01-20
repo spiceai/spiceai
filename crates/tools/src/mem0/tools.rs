@@ -483,8 +483,8 @@ impl SpiceModelTool for DeleteMemoryTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::client::Mem0Config;
+    use super::*;
     use secrecy::SecretString;
 
     fn create_test_client() -> Arc<Mem0Client> {
