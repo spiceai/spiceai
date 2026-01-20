@@ -27,8 +27,20 @@ env:
 
 jobs:
   build:
-    name: Features Check
+    name: Features Check (${{ matrix.name }})
     runs-on: spiceai-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Split 1/2: Features A-F (alloc-*, anonymous_telemetry, aws-secrets-manager, clickhouse, databricks, debezium, delta_lake, dremio, duckdb, dynamodb, flightsql, ftp)
+          - name: '1/2'
+            exclude_features: 'default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock,imap,keyring-secret-store,mongodb,mssql,mysql,nfs,oracle,pingora,postgres,postgres-write,scylladb,sftp,sharepoint,smb,snowflake,sqlite,turso'
+            check_openapi: true
+          # Split 2/2: Features I-T (imap, keyring-secret-store, mongodb, mssql, mysql, nfs, oracle, pingora, postgres, postgres-write, scylladb, sftp, sharepoint, smb, snowflake, sqlite, turso)
+          - name: '2/2'
+            exclude_features: 'default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock,alloc-jemalloc,alloc-mimalloc,alloc-snmalloc,alloc-system,anonymous_telemetry,aws-secrets-manager,clickhouse,databricks,debezium,delta_lake,dev,dremio,duckdb,dynamodb,flightsql,ftp'
+            check_openapi: false
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -76,16 +88,17 @@ jobs:
       # running individual cargo check commands
       # Note: --each-feature already includes a run with --no-default-features,
       # so we don't need to specify it separately
-      - name: Check all feature combinations
+      - name: Check feature combinations
         run: |
           cargo hack check --each-feature --profile lint \
-            --exclude-features default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock
+            --exclude-features ${{ matrix.exclude_features }}
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Check runtime/openapi feature
+        if: ${{ matrix.check_openapi }}
         run: cargo check --no-default-features --features runtime/openapi --profile lint
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
