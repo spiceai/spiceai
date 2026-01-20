@@ -248,7 +248,7 @@ jobs:
 
   # Second parallel feature check job (runs on separate machine)
   check-features-2:
-    name: Features Check (2/${{ needs.setup.outputs.num_groups }})
+    name: Features Check (2/2)
     needs: setup
     if: needs.setup.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
