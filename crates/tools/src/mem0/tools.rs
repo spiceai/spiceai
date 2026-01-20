@@ -24,12 +24,18 @@ use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
-use crate::tools::SpiceModelTool;
+use crate::SpiceModelTool;
 
 use super::client::{
     AddMemoryRequest, AddMemoryResponse, DeleteMemoryRequest, GetMemoriesRequest, Mem0Client,
     Message, SearchMemoryRequest,
 };
+
+/// Generate JSON schema parameters for a type.
+fn parameters<T: JsonSchema>() -> Option<Value> {
+    let schema = schemars::schema_for!(T);
+    serde_json::to_value(schema).ok()
+}
 
 /// Parameters for the add memory tool.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -95,7 +101,7 @@ impl SpiceModelTool for AddMemoryTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        crate::tools::utils::parameters::<AddMemoryParams>()
+        parameters::<AddMemoryParams>()
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -212,7 +218,7 @@ impl SpiceModelTool for SearchMemoryTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        crate::tools::utils::parameters::<SearchMemoryParams>()
+        parameters::<SearchMemoryParams>()
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -317,7 +323,7 @@ impl SpiceModelTool for GetMemoriesTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        crate::tools::utils::parameters::<GetMemoriesParams>()
+        parameters::<GetMemoriesParams>()
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -419,7 +425,7 @@ impl SpiceModelTool for DeleteMemoryTool {
     }
 
     fn parameters(&self) -> Option<Value> {
-        crate::tools::utils::parameters::<DeleteMemoryParams>()
+        parameters::<DeleteMemoryParams>()
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -478,7 +484,7 @@ impl SpiceModelTool for DeleteMemoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::mem0::client::Mem0Config;
+    use super::super::client::Mem0Config;
     use secrecy::SecretString;
 
     fn create_test_client() -> Arc<Mem0Client> {

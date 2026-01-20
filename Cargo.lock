@@ -17916,8 +17916,17 @@ name = "tools"
 version = "1.11.0-unstable"
 dependencies = [
  "async-trait",
+ "reqwest",
  "rmcp",
+ "schemars 1.1.0",
+ "secrecy",
+ "serde",
  "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+ "util",
 ]
 
 [[package]]

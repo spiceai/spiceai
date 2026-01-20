@@ -19,9 +19,6 @@ limitations under the License.
 //! This module provides tools for storing, searching, and retrieving memories
 //! using the Mem0 platform API (<https://mem0.ai>).
 //!
-//! The core client and tool implementations live in the `tools` crate.
-//! This module provides the runtime-specific factory and catalog integration.
-//!
 //! ## Configuration
 //!
 //! Mem0 is configured as a tool in the `spicepod.yaml`:
@@ -47,35 +44,40 @@ limitations under the License.
 //! - `mem0_base_url`: Custom API base URL (optional)
 //! - `mem0_graph_memory`: Enable graph memory extraction ("enabled" to enable, optional)
 
-pub mod catalog;
-pub mod factory;
+pub mod client;
+pub mod tools;
 
-// Re-export from tools crate for backward compatibility
-// Use `::tools` to refer to the external `tools` crate, not `crate::tools` module
-pub use ::tools::mem0::client;
-pub use ::tools::mem0::tools;
-pub use ::tools::mem0::{Error, Result};
+use snafu::Snafu;
 
-use crate::parameters::ParameterSpec;
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Invalid mem0 directive 'from: mem0:{id}'"))]
+    InvalidMem0Directive { id: String },
 
-/// Parameter definitions for mem0 tool configuration.
-pub const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("api_key")
-        .secret()
-        .required()
-        .description("API key for mem0.ai platform authentication."),
-    ParameterSpec::component("user_id")
-        .description("User identifier for memory scoping. Defaults to 'default-user'."),
-    ParameterSpec::component("agent_id").description("Agent identifier for memory scoping."),
-    ParameterSpec::component("org_id")
-        .description("Organization identifier for multi-tenant deployments."),
-    ParameterSpec::component("project_id")
-        .description("Project identifier for organizing memories."),
-    ParameterSpec::runtime("base_url")
-        .description("Custom API base URL for self-hosted or alternative endpoints.")
-        .default("https://api.mem0.ai/v1"),
-    ParameterSpec::runtime("graph_memory")
-        .description("Enable graph memory for relationship extraction. Set to 'enabled' to enable.")
-        .one_of(&["enabled", "disabled"])
-        .default("disabled"),
-];
+    #[snafu(display("Missing required parameter: {param}"))]
+    MissingRequiredParameter { param: String },
+
+    #[snafu(display("Failed to make request to mem0 API: {source}"))]
+    RequestFailed { source: reqwest::Error },
+
+    #[snafu(display("Failed to parse mem0 API response: {source}"))]
+    ResponseParseFailed { source: reqwest::Error },
+
+    #[snafu(display("Mem0 API error: {message}"))]
+    ApiError { message: String },
+
+    #[snafu(display("Failed to build HTTP client: {message}"))]
+    ClientBuildFailed { message: String },
+
+    #[snafu(display(
+        "Mem0 API rate limit exceeded after {retries} retries. Consider reducing request frequency. See: https://docs.mem0.ai/platform/quickstart"
+    ))]
+    RateLimitExceeded { retries: usize },
+
+    #[snafu(display(
+        "All {max_retries} retry attempts failed for mem0 API request. Check network connectivity and mem0 service availability."
+    ))]
+    AllRetriesFailed { max_retries: usize },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;

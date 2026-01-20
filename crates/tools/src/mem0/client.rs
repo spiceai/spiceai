@@ -27,13 +27,13 @@ limitations under the License.
 use reqwest::{Client, header};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 use std::collections::HashMap;
 use std::time::Duration;
 use util::ExponentialBackoff;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
 use super::{Error, RequestFailedSnafu, ResponseParseFailedSnafu, Result};
-use snafu::ResultExt;
 
 const MEM0_API_BASE_URL: &str = "https://api.mem0.ai";
 

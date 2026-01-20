@@ -11,7 +11,25 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+reqwest = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+secrecy.workspace = true
+serde = { workspace = true, optional = true }
 serde_json.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, optional = true }
+tracing.workspace = true
+tracing-futures = { workspace = true, optional = true }
+util = { path = "../util", optional = true }
+
 [features]
 mcp = ["dep:rmcp"]
+mem0 = [
+    "dep:reqwest",
+    "dep:schemars",
+    "dep:serde",
+    "dep:tokio",
+    "dep:tracing-futures",
+    "dep:util",
+]
