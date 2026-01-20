@@ -2220,10 +2220,7 @@ fn test_large_binary_array() {
         DataType::LargeBinary,
         false,
     )]));
-    let array = LargeBinaryArray::from(vec![
-        b"largekey1".as_slice(),
-        b"largekey2".as_slice(),
-    ]);
+    let array = LargeBinaryArray::from(vec![b"largekey1".as_slice(), b"largekey2".as_slice()]);
     let batch =
         RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("failed to create batch");
 
@@ -2724,7 +2721,11 @@ fn test_insert_or_replace_length_consistency() {
         index.insert_or_replace(hash, RowLocation::simple(0, i as u32));
     }
 
-    assert_eq!(index.len(), 1000, "Should have 1000 entries after initial insert");
+    assert_eq!(
+        index.len(),
+        1000,
+        "Should have 1000 entries after initial insert"
+    );
 
     // Replace all 1000 keys with new locations - len should stay the same
     for i in 0..1000_i64 {
