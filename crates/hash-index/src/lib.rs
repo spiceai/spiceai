@@ -92,6 +92,15 @@ pub enum Error {
     #[snafu(display("Duplicate key detected"))]
     DuplicateKey,
 
+    /// Index overflow: partition, batch, or row index exceeds `u32::MAX`.
+    #[snafu(display("Index overflow: {context} index {value} exceeds u32::MAX"))]
+    IndexOverflow {
+        /// What type of index overflowed (partition, batch, or row).
+        context: &'static str,
+        /// The value that overflowed.
+        value: usize,
+    },
+
     /// Hash collision detected between different keys during index build.
     /// This indicates two different keys produced the same hash value.
     #[snafu(display(

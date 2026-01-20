@@ -14,6 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::mem::size_of;
+
+// Spice runtime requires at least 64-bit pointer size (8 bytes).
+// This compile-time assertion prevents building on 32-bit platforms.
+const _: () = assert!(
+    size_of::<usize>() >= 8,
+    "Spice runtime requires a 64-bit platform (usize must be at least 8 bytes)"
+);
+
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
 use opentelemetry::global;
