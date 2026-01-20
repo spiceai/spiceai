@@ -640,7 +640,7 @@ impl Builder {
         let last_updated_at = Arc::new(
             self.bootstrap_status
                 .last_updated_at()
-                .map_or(AtomicI64::new(0), |ts| AtomicI64::new(ts)),
+                .map_or(AtomicI64::new(0), AtomicI64::new),
         );
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
