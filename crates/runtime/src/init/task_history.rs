@@ -80,11 +80,15 @@ impl Runtime {
 
         tracing::info!("{}", config_details);
 
+        // Determine if we're in cluster mode (scheduler_id column needed)
+        let is_cluster_mode = self.df.cluster_config.effective_role().is_some();
+
         match task_history::TaskSpan::instantiate_table(
             self.status(),
             retention_period_secs,
             retention_check_interval_secs,
             Arc::clone(&self),
+            is_cluster_mode,
         )
         .await
         {
