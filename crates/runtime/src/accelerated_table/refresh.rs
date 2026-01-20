@@ -745,7 +745,7 @@ impl Refresher {
             Arc::clone(&self.accelerator_write_mutex),
         )
         .with_disable_federation(self.disable_federation)
-        .with_last_updated_at(self.last_updated_at.clone());
+        .with_last_updated_at(Arc::clone(&self.last_updated_at));
 
         if let Some(semaphore) = &self.semaphore {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
@@ -774,7 +774,7 @@ impl Refresher {
         let snapshot_mutex = Arc::clone(&self.accelerator_write_mutex);
 
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
-        let last_updated_at = self.last_updated_at.clone();
+        let last_updated_at = Arc::clone(&self.last_updated_at);
 
         let synchronize_with = self.synchronize_with.clone();
 
@@ -795,7 +795,7 @@ impl Refresher {
                         Arc::clone(&federated_schema),
                         Arc::clone(&self.runtime_status),
                         self.bootstrap_status.clone(),
-                        self.last_updated_at.clone(),
+                        Arc::clone(&self.last_updated_at),
                     ),
                     false,
                 ),
@@ -944,7 +944,7 @@ impl Refresher {
             .with_cpu_runtime(self.cpu_runtime.clone())
             .with_metrics(self.metrics.clone())
             .with_on_stream_batch_process_callback(on_batch_process_callback)
-            .with_last_updated_at(self.last_updated_at.clone())
+            .with_last_updated_at(Arc::clone(&self.last_updated_at.clone))
             .build(),
         );
 
