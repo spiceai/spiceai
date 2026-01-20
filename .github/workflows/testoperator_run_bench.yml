@@ -1,86 +1,86 @@
 name: benchmark e2e tests
 run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
-# on:
-#   workflow_dispatch:
-#     inputs:
-#       spiced_commit:
-#         description: 'spiced build commit'
-#         required: false
-#         type: string
-#       spicepod_path:
-#         description: 'The spicepod file to test with'
-#         required: true
-#         type: string
-#       query_set:
-#         description: 'Query set'
-#         required: true
-#         default: 'tpch'
-#         type: choice
-#         options:
-#           - 'tpch'
-#           - 'tpch[parameterized]'
-#           - 'tpcds'
-#           - 'clickbench'
-#       query_overrides:
-#         description: 'Query overrides'
-#         required: false
-#         type: choice
-#         default: ''
-#         options:
-#           - ''
-#           - 'sqlite'
-#           - 'postgresql'
-#           - 'mysql'
-#           - 'dremio'
-#           - 'odbc-athena'
-#           - 'odbc-databricks'
-#           - 'oracle'
-#           - 'duckdb'
-#           - 'duckdb-zero-results'
-#           - 'duckdb-partitioned'
-#           - 'snowflake'
-#           - 'spark'
-#           - 'iceberg-sf1'
-#           - 'spicecloud-catalog'
-#           - 'glue-catalog'
-#           - 'databricks-catalog'
-#           - 'spicecloud'
-#           - 'iceberg-hadoop'
-#           - 'dynamodb'
-#       ready_wait:
-#         description: 'How long (in seconds) to wait for spiced to start'
-#         required: true
-#         default: '30'
-#         type: string
-#       runner_type:
-#         description: 'Runner type'
-#         required: true
-#         default: 'spiceai-dev-runners'
-#         type: choice
-#         options:
-#           - 'spiceai-dev-runners'
-#           - 'spiceai-dev-large-runners'
-#           - 'spiceai-dev-hybrid-runners'
-#       scale_factor:
-#         description: 'Scale factor for the benchmark'
-#         required: false
-#         type: string
-#         default: '1'
-#       update_snapshots:
-#         description: 'Update the snapshots?'
-#         required: false
-#         default: 'default'
-#         type: choice
-#         options:
-#           - 'default'
-#           - 'always'
-#           - 'no'
-#       validate_results:
-#         description: 'Validate the results?'
-#         required: false
-#         type: boolean
-#         default: false
+on:
+  workflow_dispatch:
+    # inputs:
+    #   spiced_commit:
+    #     description: 'spiced build commit'
+    #     required: false
+    #     type: string
+    #   spicepod_path:
+    #     description: 'The spicepod file to test with'
+    #     required: true
+    #     type: string
+    #   query_set:
+    #     description: 'Query set'
+    #     required: true
+    #     default: 'tpch'
+    #     type: choice
+    #     options:
+    #       - 'tpch'
+    #       - 'tpch[parameterized]'
+    #       - 'tpcds'
+    #       - 'clickbench'
+    #   query_overrides:
+    #     description: 'Query overrides'
+    #     required: false
+    #     type: choice
+    #     default: ''
+    #     options:
+    #       - ''
+    #       - 'sqlite'
+    #       - 'postgresql'
+    #       - 'mysql'
+    #       - 'dremio'
+    #       - 'odbc-athena'
+    #       - 'odbc-databricks'
+    #       - 'oracle'
+    #       - 'duckdb'
+    #       - 'duckdb-zero-results'
+    #       - 'duckdb-partitioned'
+    #       - 'snowflake'
+    #       - 'spark'
+    #       - 'iceberg-sf1'
+    #       - 'spicecloud-catalog'
+    #       - 'glue-catalog'
+    #       - 'databricks-catalog'
+    #       - 'spicecloud'
+    #       - 'iceberg-hadoop'
+    #       - 'dynamodb'
+    #   ready_wait:
+    #     description: 'How long (in seconds) to wait for spiced to start'
+    #     required: true
+    #     default: '30'
+    #     type: string
+    #   runner_type:
+    #     description: 'Runner type'
+    #     required: true
+    #     default: 'spiceai-dev-runners'
+    #     type: choice
+    #     options:
+    #       - 'spiceai-dev-runners'
+    #       - 'spiceai-dev-large-runners'
+    #       - 'spiceai-dev-hybrid-runners'
+    #   scale_factor:
+    #     description: 'Scale factor for the benchmark'
+    #     required: false
+    #     type: string
+    #     default: '1'
+    #   update_snapshots:
+    #     description: 'Update the snapshots?'
+    #     required: false
+    #     default: 'default'
+    #     type: choice
+    #     options:
+    #       - 'default'
+    #       - 'always'
+    #       - 'no'
+    #   validate_results:
+    #     description: 'Validate the results?'
+    #     required: false
+    #     type: boolean
+    #     default: false
 
 jobs:
   test-dremio:
