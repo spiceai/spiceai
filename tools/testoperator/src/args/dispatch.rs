@@ -324,7 +324,7 @@ pub enum BenchmarkQueryset {
     #[serde(rename = "bird-bench-small[financial]")]
     BirdBenchSmallFinancial,
     #[serde(rename = "bird-bench-small[formula_1]")]
-    BirdBenchSmallformula_1,
+    BirdBenchSmallFormula1,
     #[serde(rename = "bird-bench-small[superhero]")]
     BirdBenchSmallSuperhero,
     #[serde(rename = "bird-bench-small[thrombosis_prediction]")]
