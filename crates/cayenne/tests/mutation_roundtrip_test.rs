@@ -35,13 +35,21 @@ use arrow::array::{
     Array, BinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     TimestampMillisecondArray,
 };
+
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
 use cayenne::{metadata::CreateTableOptions, CayenneTableProvider, MetadataCatalog};
+
 use common::TestFixture;
+
 use data_components::delete::DeletionTableProvider;
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::execution::context::SessionContext;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;

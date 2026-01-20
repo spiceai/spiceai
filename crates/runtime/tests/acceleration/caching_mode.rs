@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+
 //! Tests for caching mode acceleration behavior.
 //!
 //! This module contains tests for the caching acceleration mode, which allows HTTP

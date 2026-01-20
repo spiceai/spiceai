@@ -713,6 +713,24 @@ mod tests {
     pub static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
+    /// Shared embedding model for tests to avoid concurrent file lock contention.
+    /// Model loading from `HuggingFace` uses file locks; creating multiple models in parallel
+    /// can fail with lock acquisition errors.
+    static TEST_EMBEDDING_MODEL: LazyLock<Arc<Model2Vec>> = LazyLock::new(|| {
+        Arc::new(
+            Model2Vec::from_params(
+                "minishlab/potion-base-2M",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("Must make embedding model"),
+        )
+    });
+
     macro_rules! spice_named_lit {
         ($name:literal, $value:expr) => {{
             let scalar_value = ScalarValue::from($value);
@@ -779,18 +797,9 @@ mod tests {
             .config_mut()
             .set_extension(Arc::clone(&TEST_REQUEST_CONTEXT));
 
-        let embedding_model = Arc::new(
-            Model2Vec::from_params(
-                "minishlab/potion-base-2M",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("Must make embedding model"),
-        );
+        // Use shared embedding model to avoid file lock contention in parallel tests
+        let embedding_model: Arc<dyn llms::embeddings::Embed> =
+            Arc::clone(&TEST_EMBEDDING_MODEL) as Arc<dyn llms::embeddings::Embed>;
         rt.embeds
             .write()
             .await

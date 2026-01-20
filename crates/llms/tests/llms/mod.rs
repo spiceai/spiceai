@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+
 use async_openai::types::chat::{
     ChatCompletionMessageToolCalls, ChatCompletionStreamOptions, CreateChatCompletionRequest,
     CreateChatCompletionResponse,
