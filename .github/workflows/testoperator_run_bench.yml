@@ -93,13 +93,20 @@ jobs:
       - name: Install Spice CLI
         run: |
           curl https://install.spiceai.org | /bin/bash
+
+      - name: Add Spice bin to PATH
+        run: |
           echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+      - name: Check installation
+        run: |
+          spice version
 
       - name: Init spicepod
         run: |
           mkdir -p dremio-test
           cd dremio-test
-          $HOME/.spice/bin/spice init
+          spice init
 
       - name: Create spicepod.yaml
         run: |
@@ -185,16 +192,20 @@ jobs:
               params: *dremio_params
           EOF
 
-      - name: Run spiced
+      - name: Run spice runtime
         run: |
           cd dremio-test
-          $HOME/.spice/bin/spiced > spiced.log 2>&1 &
+          spice run > spiced.log 2>&1 &
           echo $! > spiced.pid
-          sleep 30
         env:
           DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT }}
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME }}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD }}
+
+      - name: Wait for Spice runtime healthy
+        run: |
+          bash -c 'while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done' || false
+        timeout-minutes: 1
 
       - name: Print spiced logs
         if: always()
