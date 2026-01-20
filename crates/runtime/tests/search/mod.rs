@@ -280,6 +280,8 @@ async fn test_megascience_permutations(
     )]
     column_config: megascience::ColumnConfigOptions,
 ) {
+    use runtime::spice_data_base_path;
+
     let slug =
         format!("{acceleration_opt}-{vector_engine}-{table_option}-{column_config}_megascience");
     if let Err(e) = validate_combination(
@@ -297,6 +299,7 @@ async fn test_megascience_permutations(
     // use some hash of slug
     let mut z = DefaultHasher::new();
     slug.hash(&mut z);
+    std::fs::create_dir_all(spice_data_base_path()).expect("failed to create spice data base path");
     let acceleration = acceleration_opt.to_acceleration(&z.finish().to_string());
 
     let mut app = AppBuilder::new(slug);
