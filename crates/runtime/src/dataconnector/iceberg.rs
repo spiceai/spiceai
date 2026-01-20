@@ -303,10 +303,6 @@ impl IcebergDataConnector {
 
         Ok(Arc::new(table_provider))
     }
-
-    /// Creates an `IcebergTableProvider` that supports both read and write operations.
-    ///
-    /// Unlike `IcebergStaticTableProvider`, this provider retains a reference to the catalog
 }
 
 #[async_trait]
