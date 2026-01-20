@@ -19,7 +19,7 @@ limitations under the License.
 //! This query calculates gross margin (net profit / extended sales price) by item category
 //! and class using ROLLUP for hierarchical aggregation.
 
-const Q36_QUERY: &str = r#"
+const Q36_QUERY: &str = r"
 select
     sum(ss_net_profit)/sum(ss_ext_sales_price) as gross_margin
    ,i_category
@@ -47,7 +47,7 @@ select
   ,case when grouping(i_category)+grouping(i_class) = 0 then i_category end
   ,rank_within_parent
    LIMIT 100
-"#;
+";
 
 #[tokio::test]
 async fn test_tpcds_q36() -> Result<(), anyhow::Error> {

@@ -14,27 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! TPC-DS integration tests with S3 source and PostgreSQL acceleration.
+//! TPC-DS integration tests with S3 source and `PostgreSQL` acceleration.
 //!
 //! These tests verify that TPC-DS queries execute correctly when data is loaded from
-//! an S3-compatible storage (rustfs locally, MinIO in CI) and accelerated into a
-//! PostgreSQL database.
+//! an S3-compatible storage (rustfs locally, `MinIO` in CI) and accelerated into a
+//! `PostgreSQL` database.
 //!
 //! # CI Environment
 //!
-//! In CI, the TPC-DS data is pre-loaded in MinIO and the following environment
+//! In CI, the TPC-DS data is pre-loaded in `MinIO` and the following environment
 //! variables are automatically set:
-//! - `MINIO_ENDPOINT`: The MinIO/S3 endpoint URL
-//! - `MINIO_ACCESS_KEY_ID`: The MinIO/S3 access key
-//! - `MINIO_SECRET_ACCESS_KEY`: The MinIO/S3 secret key
+//! - `MINIO_ENDPOINT`: The `MinIO`/S3 endpoint URL
+//! - `MINIO_ACCESS_KEY_ID`: The `MinIO`/S3 access key
+//! - `MINIO_SECRET_ACCESS_KEY`: The `MinIO`/S3 secret key
 //!
 //! # Running Tests Locally
 //!
 //! To run these tests locally, you need to:
 //!
 //! 1. **Install dependencies:**
-//!    - Docker (for rustfs and PostgreSQL containers)
-//!    - DuckDB CLI (`brew install duckdb` on macOS)
+//!    - Docker (for rustfs and `PostgreSQL` containers)
+//!    - `DuckDB` CLI (`brew install duckdb` on macOS)
 //!
 //! 2. **Run the setup script:**
 //!    ```bash
@@ -45,7 +45,7 @@ limitations under the License.
 //!
 //!    This script will:
 //!    - Start a rustfs container (S3-compatible storage) on port 9000
-//!    - Use DuckDB to generate TPC-DS SF1 data (~1GB)
+//!    - Use `DuckDB` to generate TPC-DS SF1 data (~1GB)
 //!    - Export all 24 TPC-DS tables to Parquet format
 //!    - Upload the Parquet files to rustfs
 //!
@@ -69,7 +69,7 @@ limitations under the License.
 //! # Test Structure
 //!
 //! The tests share a single runtime instance to avoid the overhead of starting
-//! a new PostgreSQL container and loading tables for each query. Only the 5
+//! a new `PostgreSQL` container and loading tables for each query. Only the 5
 //! tables required by the tested queries are loaded (not all 24 TPC-DS tables).
 //! The shared environment is initialized lazily on the first test and reused
 //! by all subsequent tests.
@@ -77,7 +77,7 @@ limitations under the License.
 //! Tables loaded: `store_sales`, `web_sales`, `date_dim`, `item`, `store`
 //!
 //! Test flow:
-//! 1. First test triggers initialization: starts PostgreSQL, loads required datasets
+//! 1. First test triggers initialization: starts `PostgreSQL`, loads required datasets
 //! 2. All tests (q36, q70, q86) execute queries against the shared runtime
 //! 3. Container cleanup happens when the test process exits
 //!
@@ -109,7 +109,7 @@ mod q36;
 mod q70;
 mod q86;
 
-/// Shared test environment containing the runtime and PostgreSQL container.
+/// Shared test environment containing the runtime and `PostgreSQL` container.
 /// Initialized once and reused across all TPC-DS query tests.
 struct SharedTestEnv {
     rt: Arc<Runtime>,
@@ -120,7 +120,7 @@ struct SharedTestEnv {
 /// Global shared test environment, initialized lazily on first use.
 static SHARED_ENV: OnceCell<SharedTestEnv> = OnceCell::const_new();
 
-/// Initializes the shared test environment (PostgreSQL container + Runtime with all datasets).
+/// Initializes the shared test environment (`PostgreSQL` container + Runtime with all datasets).
 /// This is called once and the result is cached for all subsequent tests.
 async fn init_shared_env() -> Result<SharedTestEnv, anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -170,16 +170,16 @@ async fn get_shared_env() -> Result<&'static SharedTestEnv, anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("Failed to initialize shared test environment: {e}"))
 }
 
-/// Creates a spicepod YAML string for TPC-DS with MinIO S3 source and PostgreSQL acceleration.
+/// Creates a spicepod YAML string for TPC-DS with `MinIO` S3 source and `PostgreSQL` acceleration.
 ///
 /// This function generates a spicepod configuration that:
-/// 1. Reads TPC-DS SF1 parquet files from an S3-compatible endpoint (MinIO in CI)
-/// 2. Accelerates the data into a PostgreSQL database
+/// 1. Reads TPC-DS SF1 parquet files from an S3-compatible endpoint (`MinIO` in CI)
+/// 2. Accelerates the data into a `PostgreSQL` database
 ///
 /// Only loads the tables required by queries Q36, Q70, and Q86:
-/// - store_sales (Q36, Q70)
-/// - web_sales (Q86)
-/// - date_dim (Q36, Q70, Q86)
+/// - `store_sales` (Q36, Q70)
+/// - `web_sales` (Q86)
+/// - `date_dim` (Q36, Q70, Q86)
 /// - item (Q36, Q86)
 /// - store (Q36, Q70)
 #[expect(clippy::expect_used)]
@@ -191,8 +191,10 @@ fn get_tpcds_spicepod_yaml(pg_port: usize, pg_db: &str) -> String {
     let minio_secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY")
         .expect("MINIO_SECRET_ACCESS_KEY environment variable must be set");
 
+    let pg_password = PG_PASSWORD;
+
     format!(
-        r#"version: v1
+        r"version: v1
 kind: Spicepod
 name: tpcds-s3-postgres-test
 datasets:
@@ -253,17 +255,11 @@ datasets:
       engine: postgres
       params: *pg_params
       primary_key: (s_store_sk)
-"#,
-        minio_endpoint = minio_endpoint,
-        minio_access_key = minio_access_key,
-        minio_secret_key = minio_secret_key,
-        pg_password = PG_PASSWORD,
-        pg_db = pg_db,
-        pg_port = pg_port,
+",
     )
 }
 
-/// Creates the test database in PostgreSQL.
+/// Creates the test database in `PostgreSQL`.
 async fn create_database(port: usize, db_name: &str) -> Result<(), anyhow::Error> {
     let pool = PostgresConnectionPool::new(get_pg_params(port)).await?;
     let conn = pool
@@ -283,10 +279,10 @@ async fn create_database(port: usize, db_name: &str) -> Result<(), anyhow::Error
     Ok(())
 }
 
-/// Runs a TPC-DS query against the shared accelerated PostgreSQL runtime.
+/// Runs a TPC-DS query against the shared accelerated `PostgreSQL` runtime.
 ///
 /// This function:
-/// 1. Gets or initializes the shared test environment (PostgreSQL + Runtime)
+/// 1. Gets or initializes the shared test environment (`PostgreSQL` + Runtime)
 /// 2. Executes the query and validates that results are returned
 ///
 /// The shared environment is initialized once on the first test and reused

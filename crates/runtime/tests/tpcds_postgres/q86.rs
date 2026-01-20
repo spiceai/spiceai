@@ -19,7 +19,7 @@ limitations under the License.
 //! This query calculates net paid amounts from web sales, grouped by item category
 //! and class using ROLLUP for hierarchical totals.
 
-const Q86_QUERY: &str = r#"
+const Q86_QUERY: &str = r"
 select
     sum(ws_net_paid) as total_sum
    ,i_category
@@ -43,7 +43,7 @@ select
    case when grouping(i_category)+grouping(i_class) = 0 then i_category end,
    rank_within_parent
   LIMIT 100
-"#;
+";
 
 #[tokio::test]
 async fn test_tpcds_q86() -> Result<(), anyhow::Error> {

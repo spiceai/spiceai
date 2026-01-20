@@ -20,7 +20,7 @@ limitations under the License.
 //! using ROLLUP for hierarchical totals. It includes a correlated subquery to
 //! filter states by their ranking based on total net profit.
 
-const Q70_QUERY: &str = r#"
+const Q70_QUERY: &str = r"
 select
     sum(ss_net_profit) as total_sum
    ,s_state
@@ -56,7 +56,7 @@ select
   ,case when grouping(s_state)+grouping(s_county) = 0 then s_state end
   ,rank_within_parent
   LIMIT 100
-"#;
+";
 
 #[tokio::test]
 async fn test_tpcds_q70() -> Result<(), anyhow::Error> {
