@@ -35,7 +35,7 @@ jobs:
         include:
           # Split 1/2: Features A-F (alloc-*, anonymous_telemetry, aws-secrets-manager, clickhouse, databricks, debezium, delta_lake, dremio, duckdb, dynamodb, flightsql, ftp)
           - name: '1/2'
-            exclude_features: 'default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock,imap,keyring-secret-store,mongodb,mssql,mysql,nfs,oracle,pingora,postgres,postgres-write,scylladb,sftp,sharepoint,smb,snowflake,sqlite,turso'
+            exclude_features: 'default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock,imap,keyring-secret-store,mongodb,mssql,mysql,oracle,pingora,postgres,postgres-write,scylladb,sftp,sharepoint,smb,snowflake,sqlite,turso'
             check_openapi: true
           # Split 2/2: Features I-T (imap, keyring-secret-store, mongodb, mssql, mysql, nfs, oracle, pingora, postgres, postgres-write, scylladb, sftp, sharepoint, smb, snowflake, sqlite, turso)
           - name: '2/2'
