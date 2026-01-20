@@ -36,7 +36,6 @@ use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use super::refresh::Refresh;
-use crate::accelerated_table::refresh_task::RefreshTaskBuilder;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use opentelemetry::KeyValue;
 use spicepod::metric::Metrics;

@@ -1366,6 +1366,7 @@ impl RefreshTask {
             .await;
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     fn update_last_updated_at(&self) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

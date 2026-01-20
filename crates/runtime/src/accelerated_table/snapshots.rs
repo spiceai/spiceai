@@ -173,7 +173,7 @@ pub fn create_periodic_snapshot_callback(
                 let federated_schema = Arc::<Schema>::clone(&federated_schema);
                 let dataset_name = dataset_name.clone();
                 let dataset_ready = Arc::clone(&dataset_ready);
-                let last_updated_at = last_updated_at.clone();
+                let last_updated_at = Arc::clone(&last_updated_at);
 
                 Box::pin(async move {
                     // Only count batches after the dataset is ready

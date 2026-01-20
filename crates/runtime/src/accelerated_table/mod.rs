@@ -637,11 +637,11 @@ impl Builder {
             Arc::new(Mutex::new(std::collections::HashSet::new()));
         // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
         // Initialize from bootstrap metadata if available, otherwise None.
-        let last_updated_at: Arc<AtomicI64> = self
-            .bootstrap_status
-            .last_updated_at()
-            .map(|ts| Arc::new(AtomicI64::new(ts)))
-            .unwrap_or(Arc::new(AtomicI64::new(0)));
+        let last_updated_at = Arc::new(
+            self.bootstrap_status
+                .last_updated_at()
+                .map_or(AtomicI64::new(0), |ts| AtomicI64::new(ts)),
+        );
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
@@ -923,6 +923,7 @@ impl AcceleratedTable {
         Ok(filters_to_reapply)
     }
 
+    #[expect(clippy::cast_possible_truncation)]
     fn update_last_updated_at(&self) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1076,7 +1077,6 @@ impl TableProvider for AcceleratedTable {
         Ok(Arc::new(SchemaCastScanExec::new(plan, self.schema())))
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     async fn insert_into(
         &self,
         state: &dyn Session,
