@@ -277,16 +277,14 @@ impl IcebergDataConnector {
             catalog_builder = catalog_builder.with_file_io_extension(custom_loader);
         }
 
-        let catalog_client: Arc<dyn Catalog> = Arc::new(
-            catalog_builder
-                .build()
-                .await
-                .map_err(|e| Error::UnableToGetReadProvider {
+        let catalog_client: Arc<dyn Catalog> =
+            Arc::new(catalog_builder.build().await.map_err(|e| {
+                Error::UnableToGetReadProvider {
                     dataconnector: "iceberg".into(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
-                })?,
-        );
+                }
+            })?);
 
         // Create IcebergTableProvider with catalog reference for read/write support
         let table_provider = IcebergTableProvider::try_new(
