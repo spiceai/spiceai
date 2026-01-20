@@ -1,0 +1,43 @@
+name: Check Cargo Features
+description: 'Check that cargo features compile correctly using cargo-hack'
+
+inputs:
+  exclude_features:
+    description: 'Comma-separated list of features to exclude from checking'
+    required: true
+  check_openapi:
+    description: 'Whether to also check the runtime/openapi feature'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Cache cargo-hack binary
+      id: cache-cargo-hack
+      uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+      with:
+        path: ~/.cargo/bin/cargo-hack
+        key: cargo-hack-${{ runner.os }}-${{ runner.arch }}-0.6.31
+
+    - name: Install cargo-hack
+      if: steps.cache-cargo-hack.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install cargo-hack --version 0.6.31 --locked
+
+    # Use cargo-hack to efficiently check all feature combinations
+    # This reuses build artifacts between checks, making it much faster than
+    # running individual cargo check commands
+    # Note: --each-feature already includes a run with --no-default-features,
+    # so we don't need to specify it separately
+    - name: Check feature combinations
+      shell: bash
+      run: |
+        echo "Excluding features: ${{ inputs.exclude_features }}"
+        cargo hack check --each-feature --profile lint \
+          --exclude-features ${{ inputs.exclude_features }}
+
+    - name: Check runtime/openapi feature
+      if: ${{ inputs.check_openapi == 'true' }}
+      shell: bash
+      run: cargo check --no-default-features --features runtime/openapi --profile lint

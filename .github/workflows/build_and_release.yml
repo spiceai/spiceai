@@ -62,7 +62,6 @@ jobs:
     runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
-
     steps:
       - name: Set up matrix
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
@@ -135,6 +134,19 @@ jobs:
             }
 
             return matrix;
+
+  setup-features:
+    name: Setup features matrix
+    runs-on: spiceai-macos
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+      num_groups: ${{ steps.generate-matrix.outputs.num_groups }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: ./.github/actions/setup-rust
+      - name: Generate feature matrix
+        id: generate-matrix
+        run: python3 .github/scripts/generate_feature_matrix.py --num-groups 2
 
   build:
     name: Build ${{ matrix.target.name }} binaries
@@ -514,3 +526,25 @@ jobs:
             --body "${RELEASE_BODY}" \
             --prerelease "$PRE_RELEASE" \
             ${RELEASE_ARTIFACT[*]}
+
+  check-features-1:
+    name: Check features (group 1)
+    runs-on: spiceai-dev-runners
+    needs: setup-features
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/check-features
+        with:
+          exclude_features: ${{ fromJson(needs.setup-features.outputs.matrix).include[0].exclude_features }}
+
+  check-features-2:
+    name: Check features (group 2)
+    runs-on: spiceai-dev-runners
+    needs: setup-features
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+      - uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/check-features
+        with:
+          exclude_features: ${{ fromJson(needs.setup-features.outputs.matrix).include[1].exclude_features }}

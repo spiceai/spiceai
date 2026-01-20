@@ -53,10 +53,13 @@ jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a success when skipped).
-  check_changes:
+  setup:
+    name: Setup
     runs-on: spiceai-macos
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      num_groups: ${{ steps.set-matrix.outputs.num_groups }}
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -67,22 +70,27 @@ jobs:
         id: check
         uses: ./.github/actions/check-code-changes
 
-  # Run Go linting in parallel with Rust linting
-  lint-go:
-    name: Go Lint
+      - name: Generate feature matrix
+        id: set-matrix
+        if: steps.check.outputs.relevant_changes == 'true'
+        run: python .github/scripts/generate_feature_matrix.py --num-groups 2
+
+  # Go: Lint then Build
+  go-lint-build:
+    name: Go Lint and Build
     runs-on: spiceai-dev-runners
-    needs: check_changes
+    needs: setup
     env:
       GOVER: 1.25.5
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
 
       - name: Cache Go modules
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
           path: |
@@ -93,42 +101,49 @@ jobs:
             ${{ runner.os }}-go-
 
       - name: Set up Go
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
         with:
           go-version: ${{ env.GOVER }}
           cache: false
 
       - name: Install golangci-lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         run: |
           # Install golangci-lint v2.8.0+ which supports Go 1.25
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.8.0
 
       - name: Install make
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y make
 
       - name: Run Go lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         run: make lint-go
 
-  # Run Rust linting in parallel with Go linting
-  lint-rust:
-    name: Rust Lint
+      - name: Build Go CLI
+        if: needs.setup.outputs.relevant_changes == 'true'
+        run: make build-cli
+
+  # Rust: Lint, Build, Test, then Check Features
+  rust-lint-build-test:
+    name: Rust Lint, Build and Test
     runs-on: spiceai-dev-runners
-    needs: check_changes
+    needs: setup
+    env:
+      FEATURE_MATRIX: ${{ needs.setup.outputs.matrix }}
+      NUM_GROUPS: ${{ needs.setup.outputs.num_groups }}
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
 
       - name: Cache Cargo registry
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
           path: |
@@ -140,31 +155,36 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Set up Rust
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
 
+      - name: Set up Nextest
+        if: needs.setup.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-nextest
+
       - name: Set up sccache
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
       - name: Install Protoc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up make
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-make
 
       - name: Set up cc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
+      # Step 1: Lint
       - name: Run Rust lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         run: make lint-rust
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
@@ -173,87 +193,13 @@ jobs:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Validate datafusion-table-providers commit
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         run: bash .github/scripts/validate_table_providers_commit.sh
 
-      - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
-
-  # Build and test after linting passes
-  build-test:
-    name: Build and Test
-    runs-on: spiceai-dev-runners
-    needs: [check_changes, lint-go, lint-rust]
-    env:
-      GOVER: 1.25.5
-
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          fetch-depth: 1
-
-      - name: Cache Cargo registry
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Set up Go
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
-
-      - name: Set up Rust
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-rust
-
-      - name: Set up Nextest
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-nextest
-
-      - name: Check if sccache can be set up
-        run: |
-          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
-            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
-          else
-            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-          fi
-
-      - name: Set up sccache
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        uses: ./.github/actions/setup-sccache
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-
-      - name: Install Protoc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up make
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-make
-
-      - name: Set up cc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: ./.github/actions/setup-cc
-
-      - name: Build CLI and run nextest
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make build-cli nextest
+      # Step 2: Build and Test
+      - name: Run nextest
+        if: needs.setup.outputs.relevant_changes == 'true'
+        run: make nextest
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
@@ -269,15 +215,23 @@ jobs:
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
 
       - name: Build testoperator
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         run: cargo build -p testoperator --all-features --locked
 
+      # Step 3: Check all feature combinations (leverages build cache from above)
+      - name: Check features
+        if: needs.setup.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/check-features
+        with:
+          exclude_features: ${{ fromJson(needs.setup.outputs.matrix).include[0].exclude_features }}
+          check_openapi: 'true'
+
       - name: Show sccache stats
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: needs.setup.outputs.relevant_changes == 'true'
         run: |
           if git diff --exit-code Cargo.lock; then
             echo "Cargo.lock is up to date"
@@ -291,3 +245,38 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Second parallel feature check job (runs on separate machine)
+  check-features-2:
+    name: Features Check (2/${{ needs.setup.outputs.num_groups }})
+    needs: setup
+    if: needs.setup.outputs.relevant_changes == 'true'
+    runs-on: spiceai-macos
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+
+      - name: Check features
+        uses: ./.github/actions/check-features
+        with:
+          exclude_features: ${{ fromJson(needs.setup.outputs.matrix).include[1].exclude_features }}
+          check_openapi: 'false'
+
+      - name: Show sccache stats
+        run: sccache --show-stats
