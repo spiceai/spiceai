@@ -203,11 +203,8 @@ impl DataConnectorFactory for ScyllaDbFactory {
                         Arc::clone(&keyspace),
                         compute_context,
                     );
-                    let scylladb_factory = ScyllaDbTableFactory::new(
-                        Arc::new(pool),
-                        session,
-                        keyspace,
-                    );
+                    let scylladb_factory =
+                        ScyllaDbTableFactory::new(Arc::new(pool), session, keyspace);
                     Ok(Arc::new(ScyllaDb { scylladb_factory }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => {

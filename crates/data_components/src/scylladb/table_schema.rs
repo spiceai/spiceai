@@ -84,11 +84,7 @@ impl ScyllaDBTableSchema {
     /// # Returns
     ///
     /// A `ScyllaDBTableSchema` with partition and clustering key information.
-    pub async fn fetch(
-        session: &Session,
-        keyspace: &str,
-        table: &str,
-    ) -> Result<Self, Error> {
+    pub async fn fetch(session: &Session, keyspace: &str, table: &str) -> Result<Self, Error> {
         // Escape single quotes to prevent CQL injection
         let escaped_keyspace = keyspace.replace('\'', "''");
         let escaped_table = table.replace('\'', "''");
@@ -145,8 +141,10 @@ impl ScyllaDBTableSchema {
         partition_keys.sort_by_key(|(pos, _)| *pos);
         clustering_keys.sort_by_key(|(pos, _)| *pos);
 
-        let partition_keys: Vec<String> = partition_keys.into_iter().map(|(_, name)| name).collect();
-        let clustering_keys: Vec<String> = clustering_keys.into_iter().map(|(_, name)| name).collect();
+        let partition_keys: Vec<String> =
+            partition_keys.into_iter().map(|(_, name)| name).collect();
+        let clustering_keys: Vec<String> =
+            clustering_keys.into_iter().map(|(_, name)| name).collect();
 
         Ok(Self::new(keyspace, table, partition_keys, clustering_keys))
     }
@@ -244,7 +242,10 @@ impl ScyllaDBTableSchema {
     /// partition key equality filter is found, otherwise returns `None` and all
     /// filters in the other list.
     #[must_use]
-    pub fn separate_key_filters(&self, filters: &[Expr]) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {
+    pub fn separate_key_filters(
+        &self,
+        filters: &[Expr],
+    ) -> (Option<(Expr, Option<Expr>)>, Vec<Expr>) {
         let Some(pk) = self.partition_key() else {
             return (None, filters.to_vec());
         };
@@ -315,7 +316,10 @@ mod tests {
 
         let result = schema.supports_filters_pushdown(&filter_refs);
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], TableProviderFilterPushDown::Unsupported));
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
     }
 
     #[test]
@@ -328,7 +332,7 @@ mod tests {
         ];
 
         let (key_filters, other_filters) = schema.separate_key_filters(&filters);
-        
+
         assert!(key_filters.is_some());
         let (pk, ck) = key_filters.expect("should have key filters");
         assert!(matches!(pk, Expr::BinaryExpr(_)));

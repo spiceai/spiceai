@@ -136,16 +136,17 @@ impl TableProvider for ScyllaDbTable {
         let (key_filters, _other_filters) = self.table_schema.separate_key_filters(filters);
 
         // Build the list of filters to push down to CQL
-        let pushdown_filters: Vec<Expr> = if let Some((partition_filter, clustering_filter)) = key_filters {
-            let mut filters = vec![partition_filter];
-            if let Some(ck_filter) = clustering_filter {
-                filters.push(ck_filter);
-            }
-            filters
-        } else {
-            // No partition key filter - cannot push down any filters
-            Vec::new()
-        };
+        let pushdown_filters: Vec<Expr> =
+            if let Some((partition_filter, clustering_filter)) = key_filters {
+                let mut filters = vec![partition_filter];
+                if let Some(ck_filter) = clustering_filter {
+                    filters.push(ck_filter);
+                }
+                filters
+            } else {
+                // No partition key filter - cannot push down any filters
+                Vec::new()
+            };
 
         self.base_table
             .scan(state, projection, &pushdown_filters, limit)
@@ -169,8 +170,16 @@ impl fmt::Debug for ScyllaDbTableFactory {
 
 impl ScyllaDbTableFactory {
     #[must_use]
-    pub fn new(pool: Arc<ScyllaDbConnectionPool>, session: Arc<ScyllaSession>, keyspace: Arc<str>) -> Self {
-        Self { pool, session, keyspace }
+    pub fn new(
+        pool: Arc<ScyllaDbConnectionPool>,
+        session: Arc<ScyllaSession>,
+        keyspace: Arc<str>,
+    ) -> Self {
+        Self {
+            pool,
+            session,
+            keyspace,
+        }
     }
 }
 
@@ -185,9 +194,7 @@ impl Read for ScyllaDbTableFactory {
         // Get keyspace and table names from reference
         let (keyspace, table) = match &table_reference {
             TableReference::Full { schema, table, .. }
-            | TableReference::Partial { schema, table } => {
-                (schema.to_string(), table.to_string())
-            }
+            | TableReference::Partial { schema, table } => (schema.to_string(), table.to_string()),
             TableReference::Bare { table } => (self.keyspace.to_string(), table.to_string()),
         };
 
@@ -293,7 +300,10 @@ mod tests {
 
         let result = schema.supports_filters_pushdown(&filter_refs);
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], TableProviderFilterPushDown::Unsupported));
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
     }
 
     #[test]
@@ -312,7 +322,7 @@ mod tests {
         ];
 
         let (key_filters, other_filters) = schema.separate_key_filters(&filters);
-        
+
         assert!(key_filters.is_some());
         let (pk, ck) = key_filters.expect("should have key filters");
         assert!(matches!(pk, Expr::BinaryExpr(_)));

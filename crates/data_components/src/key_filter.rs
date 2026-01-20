@@ -259,7 +259,10 @@ mod tests {
 
         for expr in operators {
             let result = try_extract_key_filter(&expr, "user_id", None);
-            assert!(result.is_none(), "Expected None for partition key with non-equality: {expr:?}");
+            assert!(
+                result.is_none(),
+                "Expected None for partition key with non-equality: {expr:?}"
+            );
         }
     }
 
@@ -268,7 +271,7 @@ mod tests {
         // DataFusion's col() lowercases unquoted identifiers per SQL standard
         // col("User_Id") becomes Column { name: "user_id" }
         let expr = col("User_Id").eq(lit("value"));
-        
+
         // Matches lowercase key name because col() normalized it
         let result = try_extract_key_filter(&expr, "user_id", None);
         assert!(matches!(result, Some(KeyFilter::Partition(_))));
@@ -417,9 +420,11 @@ mod tests {
     #[test]
     fn test_contains_or_nested_deep() {
         // Deeply nested OR
-        let expr = col("a")
-            .eq(lit(1))
-            .and(col("b").eq(lit(2)).and(col("c").eq(lit(3)).or(col("d").eq(lit(4)))));
+        let expr = col("a").eq(lit(1)).and(
+            col("b")
+                .eq(lit(2))
+                .and(col("c").eq(lit(3)).or(col("d").eq(lit(4)))),
+        );
         assert!(contains_or(&expr));
     }
 
@@ -535,9 +540,11 @@ mod tests {
 
     #[test]
     fn test_try_match_index_with_or() {
-        let filters = vec![col("user_id")
-            .eq(lit("user1"))
-            .or(col("user_id").eq(lit("user2")))];
+        let filters = vec![
+            col("user_id")
+                .eq(lit("user1"))
+                .or(col("user_id").eq(lit("user2"))),
+        ];
 
         let result = try_match_index(&filters, "user_id", Some("timestamp"));
         assert!(result.is_none());
