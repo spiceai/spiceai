@@ -427,6 +427,8 @@ impl KeyExtractor for BinaryKeyExtractor {
 pub struct RowConverterKeyExtractor {
     converter: Arc<RowConverter>,
     rows: arrow_row::Rows,
+    /// The key arrays for null checking - a row is null if ANY key column is null
+    key_arrays: Vec<ArrayRef>,
 }
 
 impl RowConverterKeyExtractor {
@@ -468,6 +470,7 @@ impl RowConverterKeyExtractor {
         Ok(Self {
             converter: Arc::new(converter),
             rows,
+            key_arrays,
         })
     }
 
@@ -496,13 +499,24 @@ impl RowConverterKeyExtractor {
             .convert_columns(&key_arrays)
             .map_err(|e| Error::Arrow { source: e })?;
 
-        Ok(Self { converter, rows })
+        Ok(Self {
+            converter,
+            rows,
+            key_arrays,
+        })
     }
 
     /// Returns a reference to the row converter for reuse.
     #[must_use]
     pub fn converter(&self) -> Arc<RowConverter> {
         Arc::clone(&self.converter)
+    }
+
+    /// Checks if any key column has a null value at the given row.
+    /// Returns `true` if the composite key is null (any column is null).
+    #[inline]
+    fn is_null(&self, row: usize) -> bool {
+        self.key_arrays.iter().any(|arr| arr.is_null(row))
     }
 }
 
@@ -516,13 +530,20 @@ impl KeyExtractor for RowConverterKeyExtractor {
 
     #[inline]
     fn extract_key(&self, row: usize) -> Option<Self::Key> {
-        // RowConverter doesn't track nulls directly, so we return Some
-        // The caller should check for nulls in the source columns if needed
-        Some(self.rows.row(row).owned())
+        // A composite key is null if ANY of its constituent columns is null
+        if self.is_null(row) {
+            None
+        } else {
+            Some(self.rows.row(row).owned())
+        }
     }
 
     #[inline]
     fn hash_key(&self, row: usize) -> Option<u64> {
+        // A composite key is null if ANY of its constituent columns is null
+        if self.is_null(row) {
+            return None;
+        }
         let row_bytes = self.rows.row(row);
         let mut hasher = new_hasher();
         row_bytes.as_ref().hash(&mut hasher);
@@ -538,7 +559,12 @@ impl KeyExtractor for RowConverterKeyExtractor {
 
     #[inline]
     fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
-        Some(self.rows.row(row).as_ref().to_vec())
+        // A composite key is null if ANY of its constituent columns is null
+        if self.is_null(row) {
+            None
+        } else {
+            Some(self.rows.row(row).as_ref().to_vec())
+        }
     }
 }
 
