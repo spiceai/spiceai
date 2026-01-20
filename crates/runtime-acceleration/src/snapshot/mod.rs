@@ -1653,8 +1653,6 @@ impl SnapshotManager {
                 snapshot_last_updated_at_ms: last_updated_at,
             };
 
-            println!("Snapshot entry: {snapshot_entry:#?}");
-
             dataset_entry.snapshots.push(snapshot_entry);
             dataset_entry.current_snapshot_id = Some(next_snapshot_id);
 
