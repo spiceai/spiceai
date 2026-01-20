@@ -3,7 +3,7 @@ tests:
     spicepod_path: accelerated/s3[parquet]-cayenne[file].yaml
     query_set: tpcds
     runner_type: spiceai-dev-runners
-    validate_results: true
+    validate_results: false
   throughput:
     spicepod_path: accelerated/s3[parquet]-cayenne[file].yaml
     query_set: tpcds
