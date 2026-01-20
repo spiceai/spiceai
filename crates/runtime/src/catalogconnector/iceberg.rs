@@ -137,10 +137,12 @@ impl IcebergCatalog {
                     source: Box::new(e),
                 })?;
 
+        let writable = catalog.access == crate::component::access::AccessMode::ReadWrite;
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(hadoop_catalog),
             None,
             catalog.include.as_ref(),
+            writable,
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -357,10 +359,12 @@ impl CatalogConnector for IcebergCatalog {
             catalog_client = catalog_client.with_file_io_extension(loader);
         }
 
+        let writable = catalog.access == crate::component::access::AccessMode::ReadWrite;
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
             namespace.map(|n| n.name().clone()),
             catalog.include.as_ref(),
+            writable,
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
