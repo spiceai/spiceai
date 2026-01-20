@@ -83,6 +83,135 @@ on:
         default: false
 
 jobs:
+  test-dremio:
+    name: Run benchmark e2e tests
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Install Spice CLI
+        run: |
+          curl https://install.spiceai.org | /bin/bash
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+      - name: Init spicepod
+        run: |
+          mkdir -p dremio-test
+          cd dremio-test
+          $HOME/.spice/bin/spice init
+
+      - name: Create spicepod.yaml
+        run: |
+          cat > dremio-test/spicepod.yaml << 'EOF'
+          version: v1
+          kind: Spicepod
+          name: dremio-federated
+          datasets:
+            - from: dremio:tpcds.call_center
+              name: call_center
+              params: &dremio_params
+                dremio_endpoint: ${secrets:DREMIO_ENDPOINT}
+                dremio_username: ${secrets:DREMIO_USERNAME}
+                dremio_password: ${secrets:DREMIO_PASSWORD}
+            - from: dremio:tpcds.catalog_page
+              name: catalog_page
+              params: *dremio_params
+            - from: dremio:tpcds.catalog_returns
+              name: catalog_returns
+              params: *dremio_params
+            - from: dremio:tpcds.catalog_sales
+              name: catalog_sales
+              params: *dremio_params
+            - from: dremio:tpcds.customer
+              name: customer
+              params: *dremio_params
+            - from: dremio:tpcds.customer_address
+              name: customer_address
+              params: *dremio_params
+            - from: dremio:tpcds.customer_demographics
+              name: customer_demographics
+              params: *dremio_params
+            - from: dremio:tpcds.date_dim
+              name: date_dim
+              params: *dremio_params
+            - from: dremio:tpcds.household_demographics
+              name: household_demographics
+              params: *dremio_params
+            - from: dremio:tpcds.income_band
+              name: income_band
+              params: *dremio_params
+            - from: dremio:tpcds.inventory
+              name: inventory
+              params: *dremio_params
+            - from: dremio:tpcds.item
+              name: item
+              params: *dremio_params
+            - from: dremio:tpcds.promotion
+              name: promotion
+              params: *dremio_params
+            - from: dremio:tpcds.reason
+              name: reason
+              params: *dremio_params
+            - from: dremio:tpcds.ship_mode
+              name: ship_mode
+              params: *dremio_params
+            - from: dremio:tpcds.store
+              name: store
+              params: *dremio_params
+            - from: dremio:tpcds.store_returns
+              name: store_returns
+              params: *dremio_params
+            - from: dremio:tpcds.store_sales
+              name: store_sales
+              params: *dremio_params
+            - from: dremio:tpcds.time_dim
+              name: time_dim
+              params: *dremio_params
+            - from: dremio:tpcds.warehouse
+              name: warehouse
+              params: *dremio_params
+            - from: dremio:tpcds.web_page
+              name: web_page
+              params: *dremio_params
+            - from: dremio:tpcds.web_returns
+              name: web_returns
+              params: *dremio_params
+            - from: dremio:tpcds.web_sales
+              name: web_sales
+              params: *dremio_params
+            - from: dremio:tpcds.web_site
+              name: web_site
+              params: *dremio_params
+          EOF
+
+      - name: Run spiced
+        run: |
+          cd dremio-test
+          $HOME/.spice/bin/spiced > spiced.log 2>&1 &
+          echo $! > spiced.pid
+          sleep 30
+        env:
+          DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT }}
+          DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME }}
+          DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD }}
+
+      - name: Print spiced logs
+        if: always()
+        run: |
+          if [ -f dremio-test/spiced.log ]; then
+            cat dremio-test/spiced.log
+          else
+            echo "No spiced.log file found"
+          fi
+
   run-bench:
     name: Run benchmark e2e tests
     runs-on: ${{ github.event.inputs.runner_type }}
