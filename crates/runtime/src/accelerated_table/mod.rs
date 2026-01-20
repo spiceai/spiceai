@@ -636,11 +636,15 @@ impl Builder {
         let in_flight_revalidations: caching::InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
         // Create last_updated_at atomic to track insert_into timestamps, shared with Refresher for snapshots.
-        // Initialize from bootstrap metadata if available, otherwise None.
+        // Initialize from bootstrap metadata if available.
         let last_updated_at = Arc::new(
             self.bootstrap_status
                 .last_updated_at()
                 .map_or(AtomicI64::new(0), AtomicI64::new),
+        );
+        println!(
+            "!!!!! Bootstrap status: {} - {:#?}",
+            self.dataset_name, self.bootstrap_status
         );
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
