@@ -71,7 +71,6 @@ async fn test_add_and_search_memory() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -142,7 +141,6 @@ async fn test_get_memories() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -199,7 +197,6 @@ async fn test_delete_specific_memory() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -252,7 +249,6 @@ async fn test_memory_with_metadata() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -297,7 +293,6 @@ async fn test_search_with_threshold() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -356,7 +351,6 @@ async fn test_empty_search_query() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -422,7 +416,6 @@ async fn test_very_long_memory_content() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -463,7 +456,6 @@ async fn test_multiple_messages_in_single_request() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -532,7 +524,6 @@ async fn test_search_nonexistent_user() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     // Search for a user that doesn't exist
@@ -566,7 +557,6 @@ async fn test_delete_nonexistent_memory() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     // Try to delete a memory that doesn't exist
@@ -590,7 +580,6 @@ async fn test_concurrent_memory_additions() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -667,7 +656,6 @@ async fn test_concurrent_searches() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -753,7 +741,6 @@ async fn test_mixed_concurrent_operations() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -864,7 +851,6 @@ async fn test_full_crud_workflow() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -1015,7 +1001,6 @@ async fn test_pagination_workflow() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -1089,7 +1074,6 @@ async fn test_agent_scoped_memories() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -1160,7 +1144,6 @@ async fn test_search_with_various_top_k_values() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -1222,7 +1205,6 @@ async fn test_async_vs_sync_mode() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -1298,7 +1280,6 @@ async fn test_rapid_add_delete_cycles() {
 
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -1351,7 +1332,6 @@ async fn test_different_user_isolation() {
     rate_limit_guard().await;
 
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -1447,7 +1427,6 @@ async fn test_graph_memory_add_with_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -1486,7 +1465,6 @@ async fn test_graph_memory_add_with_relationships() {
 async fn test_graph_memory_search_with_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -1551,7 +1529,6 @@ async fn test_graph_memory_get_all_with_context() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -1603,7 +1580,6 @@ async fn test_graph_memory_get_all_with_context() {
 async fn test_graph_memory_multiple_entities() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -1681,7 +1657,6 @@ async fn test_graph_memory_organization_hierarchy() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -1739,7 +1714,6 @@ async fn test_graph_memory_disabled() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -1790,7 +1764,6 @@ async fn test_graph_memory_disabled() {
 async fn test_graph_memory_multi_hop_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 
@@ -1854,7 +1827,6 @@ async fn test_graph_memory_client_config() {
     rate_limit_guard().await;
     let Some(api_key) = get_api_key() else {
         return;
-        return;
     };
 
     // Create a client with enable_graph=true by default
@@ -1917,7 +1889,6 @@ async fn test_graph_memory_location_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
         return;
-        return;
     };
 
     let user_id = test_user_id();
@@ -1974,7 +1945,6 @@ async fn test_graph_memory_location_relationships() {
 async fn test_graph_memory_temporal_relationships() {
     rate_limit_guard().await;
     let Some(client) = create_test_client() else {
-        return;
         return;
     };
 

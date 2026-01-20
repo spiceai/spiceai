@@ -182,10 +182,8 @@ pub struct AddMemoryRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 
-    #[serde(default = "default_true")]
     pub infer: bool,
 
-    #[serde(default = "default_true")]
     pub async_mode: bool,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,7 +254,6 @@ pub struct SearchMemoryRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filters: Option<serde_json::Value>,
 
-    #[serde(default = "default_version")]
     pub version: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]

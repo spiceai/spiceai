@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::TryStreamExt;
 use serde_json::{Value, json};
+use snafu::ResultExt;
 use std::sync::{Arc, Weak};
 use uuid::Uuid;
 
@@ -83,7 +84,7 @@ impl MemoryEngine for BuiltinMemoryEngine {
         rt.datafusion()
             .write_data(&table_name, data_update)
             .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            .boxed()?;
 
         Ok(json!({
             "success": true,
@@ -97,11 +98,7 @@ impl MemoryEngine for BuiltinMemoryEngine {
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let rt = self.runtime()?;
         let table_name = memory_table_name(&rt).await?;
-        let last_duration = fundu::parse_duration(last_interval).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Failed to parse interval '{last_interval}': {e}").into()
-            },
-        )?;
+        let last_duration = fundu::parse_duration(last_interval).boxed()?;
 
         let batches = rt
             .datafusion()
@@ -112,11 +109,11 @@ impl MemoryEngine for BuiltinMemoryEngine {
             .build()
             .run()
             .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+            .boxed()?
             .data
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            .boxed()?;
 
         let history = batches
             .iter()

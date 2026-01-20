@@ -49,7 +49,30 @@ pub mod client;
 pub mod factory;
 pub mod tools;
 
+use crate::parameters::ParameterSpec;
 use snafu::Snafu;
+
+/// Parameter definitions for mem0 tool configuration.
+pub const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::component("api_key")
+        .secret()
+        .required()
+        .description("API key for mem0.ai platform authentication."),
+    ParameterSpec::component("user_id")
+        .description("User identifier for memory scoping. Defaults to 'default-user'."),
+    ParameterSpec::component("agent_id").description("Agent identifier for memory scoping."),
+    ParameterSpec::component("org_id")
+        .description("Organization identifier for multi-tenant deployments."),
+    ParameterSpec::component("project_id")
+        .description("Project identifier for organizing memories."),
+    ParameterSpec::runtime("base_url")
+        .description("Custom API base URL for self-hosted or alternative endpoints.")
+        .default("https://api.mem0.ai/v1"),
+    ParameterSpec::runtime("graph_memory")
+        .description("Enable graph memory for relationship extraction. Set to 'enabled' to enable.")
+        .one_of(&["enabled", "disabled"])
+        .default("disabled"),
+];
 
 #[derive(Debug, Snafu)]
 pub enum Error {
