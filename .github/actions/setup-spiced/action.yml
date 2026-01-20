@@ -68,12 +68,12 @@ runs:
           features="models"
         fi
 
-        PLATFORM="${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}"
+        PLATFORM="${{ steps.platform.outputs.os }}_${{ steps.platform.outputs.arch }}"
         EXT="${{ steps.platform.outputs.ext }}"
 
         for hash in "${commit_hashes[@]}"; do
           echo "Checking $hash in MinIO for $PLATFORM"
-          if mc stat spice-minio/artifacts/spiced/${PLATFORM}/$hash/spiced_${features}_${PLATFORM}.${EXT}; then
+          if mc stat spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$hash/spiced_${features}_${PLATFORM}.${EXT}; then
             echo "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
             exit 0

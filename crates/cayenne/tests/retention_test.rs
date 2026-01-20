@@ -21,13 +21,21 @@ limitations under the License.
 mod common;
 
 use arrow::array::{Int64Array, RecordBatch};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+
 use common::TestFixture;
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::prelude::*;
+
 use datafusion_execution::SendableRecordBatchStream;
+
 use std::sync::Arc;
 
 test_with_backends!(test_retention_filters_apply_on_insert_impl);

@@ -1889,3 +1889,101 @@ fn test_data_integrity_allow_duplicates_last_wins() {
     // Total unique keys
     assert_eq!(index.len(), 3);
 }
+
+/// Test that hash index correctly handles hash value 0.
+/// Hash 0 should be stored and retrieved correctly without any collision issues.
+#[test]
+fn test_zero_hash_works_correctly() {
+    let index = HashIndex::new(vec!["id".to_string()]);
+
+    // Insert using hash = 0
+    let location = RowLocation::new(0, 0, 42);
+    let inserted = index.insert(0, location);
+    assert_eq!(
+        inserted,
+        InsertResult::Inserted,
+        "Insert with hash=0 should succeed"
+    );
+
+    // get_by_hash(0) should return the location
+    let result = index.get_by_hash(0);
+    assert!(result.is_some(), "Keys with hash=0 should be retrievable");
+    assert_eq!(result, Some(location));
+
+    // Verify the index length is correct
+    assert_eq!(index.len(), 1);
+}
+
+/// Test that hash 0 and hash 1 do NOT collide (they are distinct keys).
+#[test]
+fn test_zero_and_one_hash_are_distinct() {
+    let index = HashIndex::new(vec!["id".to_string()]);
+
+    // Insert with hash = 0
+    let loc1 = RowLocation::new(0, 0, 1);
+    assert_eq!(
+        index.insert(0, loc1),
+        InsertResult::Inserted,
+        "Insert with hash=0 should succeed"
+    );
+
+    // Insert with hash = 1 - this should succeed as a distinct key
+    let loc2 = RowLocation::new(0, 0, 2);
+    let inserted = index.insert(1, loc2);
+
+    // Hash 0 and hash 1 are distinct keys, so both should be stored
+    assert_eq!(
+        inserted,
+        InsertResult::Inserted,
+        "Insert with hash=1 should succeed because 0 and 1 are distinct keys"
+    );
+
+    // Verify both entries can be retrieved independently
+    let result_0 = index.get_by_hash(0);
+    let result_1 = index.get_by_hash(1);
+    assert_eq!(result_0, Some(loc1), "Hash 0 should return loc1");
+    assert_eq!(result_1, Some(loc2), "Hash 1 should return loc2");
+    assert_ne!(
+        result_0, result_1,
+        "Hash 0 and 1 should return different results"
+    );
+
+    // Verify index contains both entries
+    assert_eq!(index.len(), 2);
+}
+
+/// Test that hash index correctly handles the sentinel value (u64::MAX).
+/// Keys that hash to u64::MAX are normalized to u64::MAX - 1 to avoid collision
+/// with the empty slot marker.
+#[test]
+fn test_max_hash_normalized() {
+    let index = HashIndex::new(vec!["id".to_string()]);
+
+    // Insert using hash = u64::MAX (the sentinel value)
+    let location = RowLocation::new(0, 0, 42);
+    let inserted = index.insert(u64::MAX, location);
+    assert_eq!(
+        inserted,
+        InsertResult::Inserted,
+        "Insert with hash=u64::MAX should succeed"
+    );
+
+    // get_by_hash(u64::MAX) should return the location
+    let result = index.get_by_hash(u64::MAX);
+    assert!(
+        result.is_some(),
+        "Keys with hash=u64::MAX should be retrievable after normalization"
+    );
+    assert_eq!(result, Some(location));
+
+    // Verify the index length is correct
+    assert_eq!(index.len(), 1);
+
+    // u64::MAX and u64::MAX - 1 will collide since u64::MAX is normalized to u64::MAX - 1
+    let loc2 = RowLocation::new(0, 0, 99);
+    let inserted2 = index.insert(u64::MAX - 1, loc2);
+    assert!(
+        matches!(inserted2, InsertResult::HashCollision(_)),
+        "Insert with hash=u64::MAX-1 should fail because u64::MAX normalizes to u64::MAX-1"
+    );
+}
