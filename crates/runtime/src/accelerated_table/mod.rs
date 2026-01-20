@@ -642,10 +642,6 @@ impl Builder {
                 .last_updated_at()
                 .map_or(AtomicI64::new(0), AtomicI64::new),
         );
-        println!(
-            "!!!!! Bootstrap status: {} - {:#?}",
-            self.dataset_name, self.bootstrap_status
-        );
         let mut refresher = refresh::Refresher::new(
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
