@@ -38,7 +38,6 @@ use tokio::sync::{Mutex, RwLock};
 use super::refresh::Refresh;
 use crate::accelerated_table::refresh_task::RefreshTaskBuilder;
 use datafusion::{datasource::TableProvider, sql::TableReference};
-use imap::types::QuotaResourceName::Atom;
 use opentelemetry::KeyValue;
 use spicepod::metric::Metrics;
 
