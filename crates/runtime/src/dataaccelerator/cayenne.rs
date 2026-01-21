@@ -437,7 +437,8 @@ impl CayenneAccelerator {
     ///
     /// S3 Express One Zone buckets have the naming convention: `{base-name}--{zone-id}--x-s3`
     /// Example: `s3://mybucket--usw2-az1--x-s3/prefix/`
-    fn is_s3_express_path(path: &str) -> bool {
+    #[must_use]
+    pub fn is_s3_express_path(path: &str) -> bool {
         path.starts_with("s3://") && path.contains("--x-s3")
     }
 
@@ -777,6 +778,9 @@ impl CayenneAccelerator {
             bucket_name
         );
 
+        // Note: Validation uses default timeout/unsigned_payload settings because this runs
+        // during bucket creation/verification, before user parameters are parsed. The defaults
+        // (120s timeout, unsigned payload enabled) are appropriate for validation requests.
         let object_store = Self::build_s3_object_store_for_validation(
             bucket_name,
             zone_id,
@@ -784,8 +788,8 @@ impl CayenneAccelerator {
             access_key_id.clone(),
             secret_access_key.clone(),
             session_token.clone(),
-            None, // Use default timeout for validation
-            None, // Use default unsigned_payload for validation
+            None,
+            None,
         )
         .await?;
 
@@ -1397,11 +1401,19 @@ impl CayenneAccelerator {
             }
 
             // Parse upload concurrency for parallel file writes
-            config.upload_concurrency = parse_usize(
+            let parsed_upload_concurrency = parse_usize(
                 acceleration,
                 "cayenne_upload_concurrency",
                 config.upload_concurrency,
             );
+            if parsed_upload_concurrency == 0 {
+                tracing::warn!(
+                    "Invalid cayenne_upload_concurrency value of 0. Using minimum value of 1."
+                );
+                config.upload_concurrency = 1;
+            } else {
+                config.upload_concurrency = parsed_upload_concurrency;
+            }
 
             tracing::debug!(
                 "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, sort_columns={:?}, compression_strategy={:?}",
@@ -1644,7 +1656,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Allow HTTP (non-TLS) connections to S3. Default: false.")
         .default("false"),
     ParameterSpec::component("cayenne_s3_unsigned_payload")
-        .description("Use unsigned payload for S3 requests. Skips SHA-256 computation for request body, improving upload performance. S3 Express One Zone uses session-based auth, making payload signing unnecessary. Default: true.")
+        .description("Use unsigned payload for S3 Express One Zone requests. Only applies when S3 Express mode is enabled (via cayenne_s3_zone_ids or directory bucket path). Skips SHA-256 computation for request body, improving upload performance. S3 Express One Zone uses session-based auth, making payload signing unnecessary. Default: true.")
         .default("true"),
     // S3 Express One Zone auto-generation parameter
     ParameterSpec::component("cayenne_s3_zone_ids")

@@ -1303,7 +1303,7 @@ impl CayenneTableProvider {
     ///
     /// This method optimizes throughput by:
     /// - Streaming chunk formation (no buffering of all chunks)
-    /// - Parallel writes with bounded concurrency (max 4 concurrent writes)
+    /// - Parallel writes with bounded concurrency (configurable via `VortexConfig.upload_concurrency`)
     /// - Zero-copy batch handling (Arc references)
     ///
     /// # Returns
