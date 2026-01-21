@@ -1373,7 +1373,7 @@ impl DataFusion {
             && (acceleration_settings
                 .params
                 .get("cayenne_file_path")
-                .is_some_and(|path| path.contains("--x-s3"))
+                .is_some_and(|path| path.starts_with("s3://") && path.contains("--x-s3"))
                 || acceleration_settings
                     .params
                     .contains_key("cayenne_s3_zone_ids"));

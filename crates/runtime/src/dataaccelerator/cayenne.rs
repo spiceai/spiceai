@@ -784,6 +784,8 @@ impl CayenneAccelerator {
             access_key_id.clone(),
             secret_access_key.clone(),
             session_token.clone(),
+            None, // Use default timeout for validation
+            None, // Use default unsigned_payload for validation
         )
         .await?;
 
@@ -854,6 +856,11 @@ impl CayenneAccelerator {
     ///
     /// This ensures validation uses the exact same client configuration (credentials, endpoint, S3 Express mode)
     /// that will be used for actual data uploads, preventing configuration mismatches.
+    ///
+    /// Optional parameters allow callers to match the main client configuration:
+    /// - `timeout`: Client timeout (defaults to 120s if None)
+    /// - `unsigned_payload`: Whether to skip payload signing (defaults to true if None)
+    #[expect(clippy::too_many_arguments)]
     async fn build_s3_object_store_for_validation(
         bucket_name: &str,
         zone_id: &str,
@@ -861,6 +868,8 @@ impl CayenneAccelerator {
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
         session_token: Option<String>,
+        timeout: Option<std::time::Duration>,
+        unsigned_payload: Option<bool>,
     ) -> Result<Arc<dyn object_store::ObjectStore>> {
         let io_runtime = tokio::runtime::Handle::current();
         let mut s3_builder = AmazonS3Builder::from_env()
@@ -868,15 +877,20 @@ impl CayenneAccelerator {
             .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
             .with_region(region);
 
-        // Configure S3 Express One Zone mode with unsigned payload for better performance
+        // Use provided settings or defaults
+        let effective_unsigned_payload = unsigned_payload.unwrap_or(true);
+        let effective_timeout = timeout.unwrap_or(std::time::Duration::from_secs(120));
+
+        // Configure S3 Express One Zone mode
         tracing::debug!(
-            "Building validation object store for S3 Express bucket (zone: {})",
-            zone_id
+            "Building validation object store for S3 Express bucket (zone: {}, unsigned_payload: {})",
+            zone_id,
+            effective_unsigned_payload
         );
         s3_builder = s3_builder
             .with_s3_express(true)
             .with_virtual_hosted_style_request(true)
-            .with_unsigned_payload(true);
+            .with_unsigned_payload(effective_unsigned_payload);
 
         // Build the S3 Express endpoint with virtual-hosted-style format
         let express_endpoint =
@@ -884,9 +898,8 @@ impl CayenneAccelerator {
         tracing::debug!("Validation using S3 Express endpoint: {express_endpoint}");
         s3_builder = s3_builder.with_endpoint(&express_endpoint);
 
-        // Set default timeout for S3 Express validation requests
-        let client_options =
-            ClientOptions::default().with_timeout(std::time::Duration::from_secs(120)); // 2 minutes per request
+        // Set timeout for S3 Express validation requests
+        let client_options = ClientOptions::default().with_timeout(effective_timeout);
         s3_builder = s3_builder.with_client_options(client_options);
 
         // Handle credentials

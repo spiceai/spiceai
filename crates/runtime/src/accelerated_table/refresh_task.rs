@@ -1361,6 +1361,7 @@ impl RefreshTask {
             let table_name =
                 include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref());
             tracing::warn!(
+                error = %error,
                 "Failed to load data for {} {table_name}: S3 upload speed too slow. This typically occurs when uploading to S3 Express One Zone from outside AWS or over a slow network connection. Consider: (1) Running Spice closer to your S3 bucket (same region/AZ), (2) Reducing dataset size or using incremental refresh, (3) Increasing 'cayenne_target_file_size_mb' to reduce the number of files uploaded.",
                 self.component_type(),
             );
