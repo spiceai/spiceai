@@ -869,11 +869,6 @@ impl Refresher {
                             }
 
                             if create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
-                                // Wait for the runtime to be fully ready before creating the first snapshot.
-                                // This ensures snapshots aren't uploaded until after "All components are loaded".
-                                if !runtime_status.is_ready() {
-                                    runtime_status.wait_for_ready().await;
-                                }
                                 create_checkpoint_and_snapshot(
                                     checkpointer,
                                     snapshot_manager.as_ref(),
