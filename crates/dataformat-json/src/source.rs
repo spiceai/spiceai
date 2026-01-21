@@ -30,9 +30,8 @@ use datafusion::error::{DataFusionError, Result};
 
 use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
 use datafusion_datasource::file_compression_type::FileCompressionType;
-use datafusion_datasource::file_meta::FileMeta;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
-use datafusion_datasource::{PartitionedFile, RangeCalculation, calculate_range};
+use datafusion_datasource::{PartitionedFile, RangeCalculation, TableSchema, calculate_range};
 
 use arrow::datatypes::SchemaRef;
 use arrow::json::ReaderBuilder;
@@ -88,7 +87,7 @@ pub struct SpiceJsonSource {
 }
 
 impl SpiceJsonSource {
-    /// Initialize a [`SpiceJsonSource`] with default values
+    /// Initialize a [`SpiceJsonSource`] with default settings
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -116,7 +115,7 @@ impl FileSource for SpiceJsonSource {
     ) -> Arc<dyn FileOpener> {
         Arc::new(SpiceJsonOpener {
             batch_size: self.batch_size.or(base_config.batch_size).unwrap_or(8192),
-            base_flattened_schema: Arc::clone(&base_config.file_schema),
+            base_flattened_schema: Arc::clone(base_config.file_schema()),
             projected_schema: base_config.projected_file_schema(),
             file_compression_type: base_config.file_compression_type,
             object_store,
@@ -129,15 +128,16 @@ impl FileSource for SpiceJsonSource {
         self
     }
 
+    fn with_schema(&self, _schema: TableSchema) -> Arc<dyn FileSource> {
+        Arc::new(self.clone())
+    }
+
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
         conf.batch_size = Some(batch_size);
         Arc::new(conf)
     }
 
-    fn with_schema(&self, _schema: SchemaRef) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
-    }
     fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
         conf.projected_statistics = Some(statistics);
@@ -169,14 +169,14 @@ impl FileOpener for SpiceJsonOpener {
     ///
     /// If `unnest_struct` is set, the struct is unnested with the given separator.
     ///
-    /// If `file_meta.range` is `None`, the entire file is opened.
-    /// Else `file_meta.range` is `Some(FileRange{start, end})`, which corresponds to the byte range [start, end) within the file.
+    /// If `partitioned_file.range` is `None`, the entire file is opened.
+    /// Else `partitioned_file.range` is `Some(FileRange{start, end})`, which corresponds to the byte range [start, end) within the file.
     ///
     /// Note: `start` or `end` might be in the middle of some lines. In such cases, the following rules
     /// are applied to determine which lines to read:
     /// 1. The first line of the partition is the line in which the index of the first character >= `start`.
     /// 2. The last line of the partition is the line in which the byte at position `end - 1` resides.
-    fn open(&self, file_meta: FileMeta, _file: PartitionedFile) -> Result<FileOpenFuture> {
+    fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
         let store = Arc::clone(&self.object_store);
         let base_flattened_schema = Arc::clone(&self.base_flattened_schema);
         let original_nested_schema = self
@@ -201,17 +201,18 @@ impl FileOpener for SpiceJsonOpener {
         let file_compression_type = self.file_compression_type;
         let array_to_ndjson = self.array_to_ndjson;
         let unnest_struct_separator = self.unnest_struct.clone();
+        let file_range = partitioned_file.range.clone();
 
         tracing::trace!(
             "FileOpener::open called for file: file_path={}, file_size={}, range={:?}, thread_id={:?}",
-            file_meta.location().to_string(),
-            file_meta.object_meta.size,
-            file_meta.range,
+            partitioned_file.object_meta.location.as_ref(),
+            partitioned_file.object_meta.size,
+            partitioned_file.range,
             std::thread::current().id()
         );
 
         Ok(Box::pin(async move {
-            let calculated_range = calculate_range(&file_meta, &store, None).await?;
+            let calculated_range = calculate_range(&partitioned_file, &store, None).await?;
 
             let range = match calculated_range {
                 RangeCalculation::Range(None) => None,
@@ -226,12 +227,14 @@ impl FileOpener for SpiceJsonOpener {
                 ..Default::default()
             };
 
-            let result = store.get_opts(file_meta.location(), options).await?;
+            let result = store
+                .get_opts(&partitioned_file.object_meta.location, options)
+                .await?;
 
             match result.payload {
                 #[cfg(not(target_arch = "wasm32"))]
                 GetResultPayload::File(mut file, _) => {
-                    let bytes = if file_meta.range.is_none() {
+                    let bytes = if file_range.is_none() {
                         file_compression_type.convert_read(file)?
                     } else {
                         file.seek(SeekFrom::Start(result.range.start as _))?;

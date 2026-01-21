@@ -60,7 +60,7 @@ pub fn spawn_snapshot_interval_task(
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
-    last_updated_at: Option<Arc<AtomicI64>>,
+    last_updated_at: Arc<AtomicI64>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
     let checkpointer = checkpointer?;
@@ -113,7 +113,7 @@ pub fn spawn_snapshot_interval_task(
                 &federated_schema,
                 &accelerator_write_mutex,
                 &dataset_name,
-                last_updated_at.as_ref(),
+                &last_updated_at,
             )
             .await;
 
@@ -136,7 +136,7 @@ pub fn create_periodic_snapshot_callback(
     dataset_name: &TableReference,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
-    last_updated_at: Option<Arc<AtomicI64>>,
+    last_updated_at: Arc<AtomicI64>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
@@ -173,7 +173,7 @@ pub fn create_periodic_snapshot_callback(
                 let federated_schema = Arc::<Schema>::clone(&federated_schema);
                 let dataset_name = dataset_name.clone();
                 let dataset_ready = Arc::clone(&dataset_ready);
-                let last_updated_at = last_updated_at.clone();
+                let last_updated_at = Arc::clone(&last_updated_at);
 
                 Box::pin(async move {
                     // Only count batches after the dataset is ready
@@ -193,7 +193,7 @@ pub fn create_periodic_snapshot_callback(
                             &federated_schema,
                             &accelerator_write_mutex,
                             &dataset_name,
-                            last_updated_at.as_ref(),
+                            &last_updated_at,
                         )
                         .await;
                     }
@@ -213,7 +213,7 @@ pub async fn create_checkpoint_and_snapshot(
     federated_schema: &Arc<Schema>,
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
-    last_updated_at: Option<&Arc<AtomicI64>>,
+    last_updated_at: &Arc<AtomicI64>,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     if let Err(e) = checkpointer.checkpoint(federated_schema).await {
@@ -222,7 +222,10 @@ pub async fn create_checkpoint_and_snapshot(
     }
 
     if let Some(snapshot_manager) = snapshot_manager {
-        let updated_at = last_updated_at.map(|a| a.load(Ordering::Acquire));
+        let updated_at = match last_updated_at.load(Ordering::Acquire) {
+            0 => None,
+            i => Some(i),
+        };
 
         match snapshot_manager
             .create_snapshot(federated_schema, lock_guard, updated_at)

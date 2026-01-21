@@ -588,8 +588,11 @@ pub(crate) async fn create_table_provider(
     };
 
     // Wrap with upsert deduplication if needed
-    let (write_provider, delete_provider) =
-        upsert_dedup::wrap_with_upsert_dedup_if_needed(duckdb_writer, &cmd.options);
+    let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+        duckdb_writer,
+        &cmd.options,
+        cmd.constraints.clone(),
+    );
 
     let mut schema_metadata = HashMap::new();
     schema_metadata.insert(
@@ -827,6 +830,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -947,6 +951,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -1100,6 +1105,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -1339,6 +1345,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -1561,6 +1568,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,

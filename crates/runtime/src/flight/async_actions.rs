@@ -386,10 +386,6 @@ fn job_state_to_status_response(state: &JobState) -> GetAsyncQueryStatusResponse
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "tonic::Status is the standard error type for Flight services"
-)]
 fn serialize_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, Status> {
     if batches.is_empty() {
         // Return empty schema response

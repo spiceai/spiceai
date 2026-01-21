@@ -19,13 +19,11 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion_execution::config::SessionConfig;
-use vortex::compressor::CompactCompressor;
-use vortex::file::WriteStrategyBuilder;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexFormat, VortexOptions};
 use vortex_session::VortexSession;
 
-use crate::metadata::{CompressionStrategy, VortexConfig};
+use crate::metadata::VortexConfig;
 
 /// Shared context for Cayenne table operations.
 ///
@@ -107,20 +105,16 @@ impl CayenneContext {
     /// The format contains a `VortexFileCache` that can be accessed via `file_cache()`
     /// and shared with other `VortexFormat` instances using `new_with_cache()`.
     fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
-        // Create a configured Vortex session with selected encodings
+        // Create a Vortex session with default encodings
+        // Note: Write strategy configuration (e.g., compression) is applied at write time via
+        // `session.write_options().with_strategy(...)`, not at the VortexFormat level
         let vortex_session = VortexSession::default();
-
-        let vortex_session = if matches!(config.compression_strategy, CompressionStrategy::Zstd) {
-            vortex_session
-                .set(WriteStrategyBuilder::new().with_compressor(CompactCompressor::default()))
-        } else {
-            vortex_session
-        };
 
         // Configure VortexFormat - it creates its own VortexFileCache internally
         let vortex_opts = VortexOptions {
             footer_cache_size_mb: config.footer_cache_mb,
             segment_cache_size_mb: config.segment_cache_mb,
+            ..VortexOptions::default()
         };
 
         Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))

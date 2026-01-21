@@ -484,7 +484,7 @@ pub struct Refresher {
     bootstrap_status: BootstrapStatus,
     /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
     /// Shared with `AcceleratedTable`.
-    last_updated_at: Option<Arc<AtomicI64>>,
+    last_updated_at: Arc<AtomicI64>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -536,7 +536,7 @@ impl Refresher {
             resource_monitor: None,
             accelerator_write_mutex,
             bootstrap_status: BootstrapStatus::none(),
-            last_updated_at: None,
+            last_updated_at: Arc::new(AtomicI64::from(0)),
         }
     }
 
@@ -575,7 +575,7 @@ impl Refresher {
         self
     }
 
-    pub fn with_last_updated_at(&mut self, last_updated_at: Option<Arc<AtomicI64>>) -> &mut Self {
+    pub fn with_last_updated_at(&mut self, last_updated_at: Arc<AtomicI64>) -> &mut Self {
         self.last_updated_at = last_updated_at;
         self
     }
@@ -708,7 +708,7 @@ impl Refresher {
                             Arc::clone(&federated_schema),
                             Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
-                            self.last_updated_at.clone(),
+                            Arc::clone(&self.last_updated_at),
                         ),
                         None,
                     ),
@@ -722,7 +722,7 @@ impl Refresher {
                             &self.dataset_name,
                             self.federated.schema(),
                             Arc::clone(&self.runtime_status),
-                            self.last_updated_at.clone(),
+                            Arc::clone(&self.last_updated_at),
                         ),
                     ),
                 };
@@ -744,7 +744,8 @@ impl Refresher {
             self.io_runtime.clone(),
             Arc::clone(&self.accelerator_write_mutex),
         )
-        .with_disable_federation(self.disable_federation);
+        .with_disable_federation(self.disable_federation)
+        .with_last_updated_at(Arc::clone(&self.last_updated_at));
 
         if let Some(semaphore) = &self.semaphore {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
@@ -773,7 +774,7 @@ impl Refresher {
         let snapshot_mutex = Arc::clone(&self.accelerator_write_mutex);
 
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
-        let last_updated_at = self.last_updated_at.clone();
+        let last_updated_at = Arc::clone(&self.last_updated_at);
 
         let synchronize_with = self.synchronize_with.clone();
 
@@ -794,7 +795,7 @@ impl Refresher {
                         Arc::clone(&federated_schema),
                         Arc::clone(&self.runtime_status),
                         self.bootstrap_status.clone(),
-                        self.last_updated_at.clone(),
+                        Arc::clone(&self.last_updated_at),
                     ),
                     false,
                 ),
@@ -873,7 +874,7 @@ impl Refresher {
                                     &federated_schema,
                                     &snapshot_mutex,
                                     &dataset_name,
-                                    last_updated_at.as_ref(),
+                                    &last_updated_at,
                                 ).await;
                             }
                         }
@@ -943,6 +944,7 @@ impl Refresher {
             .with_cpu_runtime(self.cpu_runtime.clone())
             .with_metrics(self.metrics.clone())
             .with_on_stream_batch_process_callback(on_batch_process_callback)
+            .with_last_updated_at(Arc::clone(&self.last_updated_at))
             .build(),
         );
 

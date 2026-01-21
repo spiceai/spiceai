@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_glue::{Client, types::Table};
-use aws_sdk_sts::config::ProvideCredentials;
+use aws_sdk_s3::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
     CatalogBuilder, NamespaceIdent, TableIdent,
@@ -455,14 +455,18 @@ async fn create_iceberg_provider(
 
     let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());
 
-    let table_provider = IcebergTableProvider::try_new(Arc::new(catalog), identifier)
-        .await
-        .map_err(|e| super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
-            source: e.into(),
-        })?;
+    let table_provider = IcebergTableProvider::try_new(
+        Arc::new(catalog),
+        identifier.namespace().clone(),
+        identifier.name().to_string(),
+    )
+    .await
+    .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+        dataconnector: PREFIX.to_string(),
+        connector_component: dataset.into(),
+        message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+        source: e.into(),
+    })?;
 
     Ok(Arc::new(table_provider))
 }

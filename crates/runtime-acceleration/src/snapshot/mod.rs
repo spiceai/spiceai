@@ -89,12 +89,6 @@ struct DatasetMetadata {
     snapshots: Vec<SnapshotEntry>,
     #[serde(rename = "current-snapshot-id")]
     current_snapshot_id: Option<u64>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "last-updated-at-ms"
-    )]
-    last_updated_at_ms: Option<i64>,
     #[serde(default)]
     properties: HashMap<String, String>,
 }
@@ -119,6 +113,12 @@ struct SnapshotEntry {
     snapshot_checksum_algorithm: String,
     #[serde(rename = "snapshot-size")]
     snapshot_size: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "snapshot-last-updated-at-ms"
+    )]
+    snapshot_last_updated_at_ms: Option<i64>,
 }
 
 impl SnapshotMetadata {
@@ -691,11 +691,12 @@ impl SnapshotManager {
         // Check if we should skip due to no updates
         if matches!(
             self.snapshots_creation_policy,
-            SnapshotsCreationPolicy::Changed
+            SnapshotsCreationPolicy::OnChange
         ) && let Some(last_updated_at) = last_updated_at
             && let Ok(Some(handle)) = self.load_metadata().await
             && let Some(dataset_meta) = handle.metadata.datasets.get(&self.dataset_name)
-            && dataset_meta.last_updated_at_ms == Some(last_updated_at)
+            && let Some(snapshot_entry) = dataset_meta.snapshots.last()
+            && snapshot_entry.snapshot_last_updated_at_ms == Some(last_updated_at)
         {
             tracing::info!(
                 "Skipping snapshot creation - no updates since last snapshot. dataset={} last_updated_at_ms={}",
@@ -1316,7 +1317,7 @@ impl SnapshotManager {
                 schema,
                 bytes_downloaded: actual_size,
                 checksum: actual_checksum,
-                last_updated_at: dataset_metadata.last_updated_at_ms,
+                last_updated_at: entry.snapshot_last_updated_at_ms,
             })
         } else {
             tracing::warn!(
@@ -1649,13 +1650,11 @@ impl SnapshotManager {
                 snapshot_checksum: checksum_for_metadata,
                 snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
                 snapshot_size: size,
+                snapshot_last_updated_at_ms: last_updated_at,
             };
 
             dataset_entry.snapshots.push(snapshot_entry);
             dataset_entry.current_snapshot_id = Some(next_snapshot_id);
-
-            // Store timestamp metadata on the dataset entry
-            dataset_entry.last_updated_at_ms = last_updated_at;
 
             let serialized = serde_json::to_vec_pretty(&metadata).map_err(|source| {
                 SnapshotUploadError::UploadSerializeMetadata {
@@ -1924,7 +1923,6 @@ mod tests {
             current_schema_id: 0,
             snapshots,
             current_snapshot_id,
-            last_updated_at_ms: None,
             properties: HashMap::new(),
         }
     }
@@ -1978,6 +1976,7 @@ mod tests {
             snapshot_checksum: checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_last_updated_at_ms: None,
         };
 
         let schema = sample_schema();
@@ -2055,6 +2054,7 @@ mod tests {
             snapshot_checksum: "0000".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: first_contents.len() as u64,
+            snapshot_last_updated_at_ms: None,
         };
 
         let valid_checksum = compute_sha256_hex(second_contents.as_ref());
@@ -2065,6 +2065,7 @@ mod tests {
             snapshot_checksum: valid_checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: second_contents.len() as u64,
+            snapshot_last_updated_at_ms: None,
         };
 
         let schema = sample_schema();
@@ -2170,6 +2171,7 @@ mod tests {
             SNAPSHOT_CHECKSUM_ALGORITHM
         );
         assert_eq!(entry.snapshot, snapshot_uri(&uploaded_path));
+        assert_eq!(entry.snapshot_last_updated_at_ms, None);
 
         let metadata_schema = dataset
             .current_schema()
@@ -2177,9 +2179,6 @@ mod tests {
             .to_schema_ref()
             .expect("deserialize schema");
         assert_eq!(metadata_schema.as_ref(), schema.as_ref());
-
-        // Verify no timestamp fields when None passed
-        assert_eq!(dataset.last_updated_at_ms, None);
     }
 
     #[tokio::test]
@@ -2231,7 +2230,11 @@ mod tests {
             .expect("dataset metadata present");
 
         // Verify timestamp field is stored
-        assert_eq!(dataset.last_updated_at_ms, Some(1_704_153_600_000));
+        let snapshot_entry = dataset.snapshots.last().expect("snapshot");
+        assert_eq!(
+            snapshot_entry.snapshot_last_updated_at_ms,
+            Some(1_704_153_600_000)
+        );
     }
 
     #[tokio::test]
@@ -2280,8 +2283,8 @@ mod tests {
             .get(DATASET_NAME)
             .expect("dataset metadata present");
 
-        // Verify updated_at is None
-        assert_eq!(dataset.last_updated_at_ms, None);
+        let snapshot_entry = dataset.snapshots.last().expect("snapshot");
+        assert_eq!(snapshot_entry.snapshot_last_updated_at_ms, None);
     }
 
     #[tokio::test]
@@ -2310,6 +2313,7 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_last_updated_at_ms: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -2374,6 +2378,7 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64 + 1,
+            snapshot_last_updated_at_ms: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -2438,6 +2443,7 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: "MD5".to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_last_updated_at_ms: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -2507,6 +2513,7 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_last_updated_at_ms: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
@@ -2816,6 +2823,7 @@ mod tests {
             snapshot_checksum: checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_last_updated_at_ms: None,
         };
 
         let schema = sample_schema();

@@ -164,7 +164,7 @@ impl DistributeFileScanOptimizer {
             .iter()
             .flat_map(|fg| fg.iter().cloned())
             .map(|mut pf| {
-                let mut stats = Statistics::new_unknown(file_scan_config.file_schema.as_ref());
+                let mut stats = Statistics::new_unknown(file_scan_config.file_schema().as_ref());
 
                 // We can deduce the byte size from the read range
                 stats.total_byte_size =
@@ -254,16 +254,16 @@ impl DistributeFileScanOptimizer {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let (stage_with_stats, agg_stats) = compute_all_files_statistics(
             stage,
-            Arc::clone(&original_file_scan.file_schema),
+            Arc::clone(original_file_scan.file_schema()),
             true,
             true,
         )?;
 
         // Copy all existing attributes including projection, excluding file groups as they are potentially
-        // expensive to clone for large scans
+        // expensive to clone for large scans.
         let new_scan = FileScanConfigBuilder::new(
             original_file_scan.object_store_url.clone(),
-            Arc::clone(&original_file_scan.file_schema),
+            Arc::clone(original_file_scan.file_schema()),
             Arc::clone(&original_file_scan.file_source),
         )
         .with_batch_size(original_file_scan.batch_size)
@@ -275,11 +275,10 @@ impl DistributeFileScanOptimizer {
         .with_metadata_cols(original_file_scan.metadata_cols.clone())
         .with_object_versioning_type(original_file_scan.object_versioning_type.clone())
         .with_output_ordering(original_file_scan.output_ordering.clone())
-        .with_projection(original_file_scan.projection.clone())
         .with_statistics(agg_stats)
         .with_table_partition_cols(
             original_file_scan
-                .table_partition_cols
+                .table_partition_cols()
                 .iter()
                 .map(|field| field.as_ref().clone())
                 .collect(),
@@ -345,7 +344,7 @@ impl PhysicalOptimizerRule for DistributeFileScanOptimizer {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            Ok(Transformed::yes(Arc::new(UnionExec::new(exploded_scans))))
+            Ok(Transformed::yes(UnionExec::try_new(exploded_scans)?))
         })?;
 
         Ok(transformed.data)

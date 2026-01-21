@@ -16,12 +16,25 @@ limitations under the License.
 
 //! Durable storage for Spice operational data related to acceleration.
 
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "turso",
+    feature = "postgres"
+))]
 use std::path::Path;
 #[cfg(any(feature = "duckdb", feature = "turso"))]
 use std::sync::Arc;
 
 use super::AccelerationSource;
-use snafu::{OptionExt, ResultExt, Snafu};
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "turso",
+    feature = "postgres"
+))]
+use snafu::ResultExt;
+use snafu::{OptionExt, Snafu};
 
 #[cfg(feature = "postgres")]
 use {
@@ -50,6 +63,12 @@ use {
 };
 
 use crate::component::dataset::acceleration::Engine;
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "turso",
+    feature = "postgres"
+))]
 use crate::dataaccelerator::get_registered_accelerator;
 
 pub mod dataset_checkpoint;
@@ -175,6 +194,13 @@ pub enum Error {
 }
 
 impl Error {
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "duckdb",
+        feature = "postgres",
+        feature = "turso",
+        feature = "kafka"
+    ))]
     fn external(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self::External { source: err.into() }
     }

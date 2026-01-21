@@ -425,7 +425,7 @@ mod tests {
         let data_source_1 = create_data_source_exec(files_1);
         let data_source_2 = create_data_source_exec(files_2);
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![data_source_1, data_source_2]));
+            UnionExec::try_new(vec![data_source_1, data_source_2]).expect("create union");
         let projection_exec = ProjectionExec::try_new(
             vec![(
                 col("id", union_exec.schema().as_ref()).expect("Must bind expr"),
@@ -481,7 +481,7 @@ mod tests {
         let data_source_1 = create_data_source_exec(files_1);
         let data_source_2 = create_data_source_exec(files_2);
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![data_source_1, data_source_2]));
+            UnionExec::try_new(vec![data_source_1, data_source_2]).expect("create union");
 
         let filter_expr = Arc::new(BinaryExpr::new(
             col("id", union_exec.schema().as_ref()).expect("Must bind expr"),
@@ -524,7 +524,7 @@ mod tests {
         let data_source_1 = create_data_source_exec(files_1);
         let data_source_2 = create_data_source_exec(files_2);
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![data_source_1, data_source_2]));
+            UnionExec::try_new(vec![data_source_1, data_source_2]).expect("create union");
 
         let projection_exec = ProjectionExec::try_new(Vec::<ProjectionExpr>::new(), union_exec)
             .expect("Must make projection_exec");
@@ -586,7 +586,7 @@ mod tests {
 
         // Create a UnionExec
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![data_source1, data_source2]));
+            UnionExec::try_new(vec![data_source1, data_source2]).expect("create union");
 
         // Verify all schemas match
         assert_eq!(union_exec.schema().fields().len(), 3);
@@ -670,7 +670,7 @@ mod tests {
         };
 
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![data_source1, data_source2]));
+            UnionExec::try_new(vec![data_source1, data_source2]).expect("create union");
 
         // Child projection outputs 3 columns from a 2-column input schema.
         let child_projection = ProjectionExec::try_new(
@@ -770,7 +770,7 @@ mod tests {
         );
 
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![repartition1, repartition2]));
+            UnionExec::try_new(vec![repartition1, repartition2]).expect("create union");
 
         let projection_exec = ProjectionExec::try_new(
             vec![(
@@ -879,7 +879,8 @@ mod tests {
         let filter2: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(filter_expr2, data_source2).expect("Must create filter"));
 
-        let union_exec: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(vec![filter1, filter2]));
+        let union_exec: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![filter1, filter2]).expect("create union");
 
         let projection_exec = ProjectionExec::try_new(
             vec![(
@@ -982,7 +983,7 @@ mod tests {
         );
 
         let union_exec: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![repartition1, repartition2]));
+            UnionExec::try_new(vec![repartition1, repartition2]).expect("create union");
 
         let projection_exec = ProjectionExec::try_new(
             vec![(

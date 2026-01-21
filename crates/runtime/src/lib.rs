@@ -1325,6 +1325,7 @@ pub fn spice_data_base_path() -> String {
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
+#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
 #[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     make_spice_data_sub_directory(&[])?;

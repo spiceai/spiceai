@@ -33,6 +33,7 @@ mod checkpoint_turso;
 mod cron;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
+mod hash_index;
 #[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
 #[cfg(not(target_os = "windows"))]

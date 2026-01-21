@@ -199,13 +199,13 @@ mod test {
             ),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            "CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)",
+            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
         );
         test(
             Field::new("timestamp", DataType::Utf8, false),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            "CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)",
+            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
         );
     }
 
@@ -258,7 +258,7 @@ mod test {
 
         assert_eq!(
             result.to_string(),
-            "timestamp > UInt64(1620000000000) AND CAST(partition_ts AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, None)"
+            "timestamp > UInt64(1620000000000) AND CAST(partition_ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)"
         );
     }
 
@@ -286,7 +286,7 @@ mod test {
 
         assert_eq!(
             result.to_string(),
-            r#"CAST(timestamp AS Timestamp(Nanosecond, None)) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
+            r#"CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
         );
     }
 

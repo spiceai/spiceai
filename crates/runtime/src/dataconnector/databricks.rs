@@ -22,9 +22,9 @@ use crate::token_providers::databricks::{
 };
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::databricks::{
-    DatabricksDelta, DatabricksSparkConnect, DatabricksSqlWarehouse, sql_warehouse,
-};
+#[cfg(feature = "spark")]
+use data_components::databricks::DatabricksSparkConnect;
+use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
 use data_components::unity_catalog::Endpoint;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -55,6 +55,7 @@ pub enum Error {
     ))]
     InvalidUsessl { value: String },
 
+    #[cfg(feature = "spark")]
     #[snafu(display(
         "Failed to connect to Databricks Spark. {source} Verify the connector configuration, and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
@@ -174,6 +175,7 @@ impl Databricks {
                     initialization,
                 })
             }
+            #[cfg(feature = "spark")]
             "spark_connect" => {
                 let cluster_id = params
                     .get("cluster_id")
@@ -197,6 +199,11 @@ impl Databricks {
                 )
                 .await
             }
+            #[cfg(not(feature = "spark"))]
+            "spark_connect" => Err(Error::InvalidMode {
+                value: "spark_connect (feature disabled - requires spark-connect-rs with arrow 57)"
+                    .to_string(),
+            }),
             _ => Err(Error::InvalidMode {
                 value: mode.to_string(),
             }),
@@ -263,6 +270,7 @@ impl Databricks {
         }
     }
 
+    #[cfg(feature = "spark")]
     async fn build_spark_connect_connector(
         endpoint: &str,
         auth_credentials: AuthCredentials<'_>,

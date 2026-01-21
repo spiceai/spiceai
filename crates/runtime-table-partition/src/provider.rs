@@ -291,7 +291,7 @@ impl TableProvider for PartitionTableProvider {
             mut plans if plans.len() == 1 => plans.pop().ok_or_else(|| {
                 DataFusionError::Execution("expected an ExecutionPlan".to_string())
             })?,
-            plans => Arc::new(PartitionedUnionExec::new(plans)),
+            plans => Arc::new(PartitionedUnionExec::try_new(plans)?),
         };
 
         if let Some(limit) = limit {
@@ -412,13 +412,13 @@ impl DeletionSink for PartitionedDeletionSink {
 
 #[derive(Debug)]
 struct PartitionedUnionExec {
-    inner_union: Arc<UnionExec>,
+    inner_union: Arc<dyn ExecutionPlan>,
 }
 
 impl PartitionedUnionExec {
-    fn new(partitions: Vec<Arc<dyn ExecutionPlan>>) -> Self {
-        let inner_union = Arc::new(UnionExec::new(partitions));
-        Self { inner_union }
+    fn try_new(partitions: Vec<Arc<dyn ExecutionPlan>>) -> Result<Self, DataFusionError> {
+        let inner_union = UnionExec::try_new(partitions)?;
+        Ok(Self { inner_union })
     }
 }
 
@@ -481,7 +481,7 @@ impl ExecutionPlan for PartitionedUnionExec {
             ));
         }
 
-        Ok(Arc::new(PartitionedUnionExec::new(children)))
+        Ok(Arc::new(PartitionedUnionExec::try_new(children)?))
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {

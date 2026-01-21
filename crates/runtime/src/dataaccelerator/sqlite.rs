@@ -116,8 +116,8 @@ impl SqliteAccelerator {
         }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new()
-                .with_decimal_between(true)
                 .with_batch_insert_use_prepared_statements(true)
+                .with_decimal_between(true)
                 .with_function_support(deny_spice_specific_functions()),
         }
     }
@@ -357,8 +357,11 @@ impl DataAccelerator for SqliteAccelerator {
         let sqlite_writer = Arc::new(sqlite_writer.clone());
 
         // Wrap with upsert deduplication if needed
-        let (write_provider, delete_provider) =
-            upsert_dedup::wrap_with_upsert_dedup_if_needed(sqlite_writer, &cmd.options);
+        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            sqlite_writer,
+            &cmd.options,
+            cmd.constraints.clone(),
+        );
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,
@@ -419,6 +422,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
