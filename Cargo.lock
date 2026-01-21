@@ -14418,6 +14418,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion",
+ "datafusion-catalog",
  "datafusion-datasource",
  "datafusion-federation",
  "datafusion-optimizer-rules",
