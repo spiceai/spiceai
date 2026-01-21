@@ -33,8 +33,3 @@ runs:
         choco install cmake pkgconfiglite llvm -y
         echo "C:\Program Files\CMake\bin" >> $env:GITHUB_PATH
         echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
-
-    - name: Install protoc
-      uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-      with:
-        repo-token: ${{ secrets.GITHUB_TOKEN }}
