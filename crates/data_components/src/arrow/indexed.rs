@@ -163,7 +163,7 @@ impl IndexedMemTable {
                 .sum();
 
             // Use provided parallelism or fall back to CPU count
-            let parallelism = parallelism.unwrap_or_else(num_cpus::get);
+            let parallelism = parallelism.unwrap_or_else(util::cpu_count::get);
             let threshold = index_threshold(parallelism);
 
             // Build the hash index only if row count exceeds threshold

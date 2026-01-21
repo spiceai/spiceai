@@ -818,10 +818,8 @@ pub async fn initialize_cluster_executor(
             (advertise_host.to_string(), bind_addr.port())
         } else {
             // Fall back to hostname and bind_addr port
-            let hostname = gethostname::gethostname().into_string().map_err(|_| {
-                FailedToStartClusterExecutor {
-                    source: "Unable to determine executor hostname".to_string().into(),
-                }
+            let hostname = util::hostname::get().map_err(|_| FailedToStartClusterExecutor {
+                source: "Unable to determine executor hostname".to_string().into(),
             })?;
             (hostname, bind_addr.port())
         };

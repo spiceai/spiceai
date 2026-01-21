@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,10 +21,15 @@ use std::{
 };
 
 pub mod ansi_colors;
+pub mod cpu_count;
+pub mod duration_format;
 pub mod fibonacci_backoff;
 pub mod home_dir;
+pub mod hostname;
+pub mod httpdate;
 pub mod levenshtein;
 pub mod retry_strategy;
+pub mod rfc3339;
 pub mod security;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
@@ -186,10 +191,8 @@ This function will propagate `SystemTimeError` from `time.elapsed()`
 #[expect(clippy::cast_possible_truncation)]
 pub fn humantime_elapsed(time: SystemTime) -> Result<String, SystemTimeError> {
     time.elapsed()
-        .map(|elapsed| {
-            humantime::format_duration(Duration::from_millis(elapsed.as_millis() as u64))
-        })
-        .map(|s| format!("{s}"))
+        .map(|elapsed| Duration::from_millis(elapsed.as_millis() as u64))
+        .map(|d| format!("{}", duration_format::format_duration(d)))
 }
 
 /// Create a new array which is `None` at each `null_idxs`. Each element in `data` is in the new

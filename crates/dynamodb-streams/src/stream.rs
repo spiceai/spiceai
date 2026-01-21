@@ -261,7 +261,7 @@ fn combine_shard_batches(poll_results: &[ShardPollResult]) -> DynamoDBStreamBatc
             tracing::trace!(
                 "Shard {} included in watermark: {}",
                 shard_result.shard_id,
-                humantime::format_rfc3339(watermark),
+                util::rfc3339::format_rfc3339(watermark),
             );
             shard_watermarks.push(watermark);
         }

@@ -72,7 +72,6 @@ graphql-parser.workspace = true
 headers-accept = "0.3.0"
 http.workspace = true
 http-body-util = "0.1.3"
-humantime = { workspace = true, optional = true }
 hyper = "1.7.0"
 hyper-util = { version = "0.1.19", features = ["service"] }
 iceberg.workspace = true
@@ -185,7 +184,6 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 uuid = { workspace = true, features = ["v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
-gethostname.workspace = true
 
 [build-dependencies]
 serde_yaml.workspace = true
@@ -254,7 +252,7 @@ duckdb = [
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
 ]
-dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb", "dep:dynamodb-streams", "dep:humantime"]
+dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb", "dep:dynamodb-streams"]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]

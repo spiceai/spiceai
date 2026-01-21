@@ -59,7 +59,7 @@ fn u64_to_i64_telemetry(value: u64, metric_name: &str) -> i64 {
 }
 
 async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
-    let hostname = hostname::get()
+    let hostname = util::hostname::get_raw()
         .unwrap_or_else(|_| "unknown".into())
         .into_encoded_bytes();
 

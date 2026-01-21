@@ -57,7 +57,6 @@ graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http.workspace = true
-httpdate.workspace = true
 iceberg.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
@@ -65,7 +64,6 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
 mailparse = { workspace = true, optional = true }
-num_cpus = "1.16"
 object_store = { workspace = true }
 opendal = "0.55"
 oracle = { version = "0.6", optional = true }

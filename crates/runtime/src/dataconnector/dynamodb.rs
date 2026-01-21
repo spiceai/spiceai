@@ -421,7 +421,7 @@ impl DataConnector for DynamoDB {
                                 stream::once(async move {
                                     tracing::info!("Bootstrapping DynamoDB table {} complete, starting changes stream. \
                                         Table will be marked as Ready once stream lag reaches < '{}'",
-                                        dataset_name_2, humantime::format_duration(acceptable_lag));
+                                        dataset_name_2, util::duration_format::format_duration(acceptable_lag));
 
                                     let committer = DynamoDBStreamCommitter::new(dynamodb_sys_cloned, checkpoint_cloned);
                                     if let Err(err) = committer.commit() {
@@ -564,9 +564,9 @@ async fn changes_stream_from_checkpoint(
                             "Processing DynamoDB Streams batch: table_name={}, watermark={}, lag={}, shards={}, records={}",
                             dataset_name,
                             watermark
-                                .map_or_else(|| "-".to_string(), |w| humantime::format_rfc3339(w).to_string()),
+                                .map_or_else(|| "-".to_string(), |w| util::rfc3339::format_rfc3339(w).to_string()),
                             lag
-                                .map_or_else(|| "-".to_string(), |l| humantime::format_duration(l).to_string()),
+                                .map_or_else(|| "-".to_string(), |l| util::duration_format::format_duration(l).to_string()),
                             checkpoint.shards.len(),
                             change_batch.record.num_rows(),
                         );

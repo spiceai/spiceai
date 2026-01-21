@@ -174,8 +174,6 @@ graph-rs-sdk = { git = "https://github.com/spiceai/graph-rs-sdk", rev = "f8703df
 graphql-parser = "0.4.0"
 hf-hub = { version = "0.4", features = ["tokio"] }
 http = "1.3.1"
-httpdate = "1.0"
-humantime = "2.1.0"
 iceberg = "0.8.0"
 iceberg-catalog-glue = "0.8.0"
 iceberg-catalog-rest = "0.8.0"
@@ -185,6 +183,7 @@ imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe179
 indexmap = "2"
 insta = { version = "1.46.1", features = ["filters"] }
 itertools = "0.14"
+libc = "0.2"
 linkme = "0.3.35"
 logos = "0.16.0"
 mailparse = "0.16.1"

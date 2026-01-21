@@ -724,7 +724,7 @@ impl HttpTableProvider {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|date_str| {
                         // Parse HTTP date format (RFC 2822/RFC 1123)
-                        httpdate::parse_http_date(date_str).ok()
+                        util::httpdate::parse_http_date(date_str)
                     });
 
                 let content = response

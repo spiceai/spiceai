@@ -13,7 +13,7 @@ tracing.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 snafu.workspace = true
-num_cpus.workspace = true
+util = { path = "../util" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

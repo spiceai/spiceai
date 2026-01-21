@@ -425,6 +425,8 @@ testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrenc
 - Excessive transitive dependencies for simple functionality
 - Only partial functionality needed (use 10% of a large crate)
 
+**NEVER replace security/encryption crates**: Always use well-vetted, actively maintained external crates for cryptography, TLS, authentication, and security-sensitive functionality (e.g., `rustls`, `ring`, `aws-lc-rs`, `openssl`, `sha2`, `aes`, `rsa`, `ed25519`, `jwt`, `oauth2`, password hashing). Implementing custom security code introduces serious vulnerability risks.
+
 **Before adding a new dependency, ask**:
 
 1. Can this be implemented in <150 lines of code? → Implement it
