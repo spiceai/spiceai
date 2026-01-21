@@ -48,7 +48,7 @@ limitations under the License.
 //! - AWS IAM roles / instance profiles for S3
 //! - Azure Managed Identity for ABFS
 //! - Google Cloud default credentials for GCS
-//! - Environment variables (AWS_ACCESS_KEY_ID, AZURE_STORAGE_ACCOUNT, etc.)
+//! - Environment variables (`AWS_ACCESS_KEY_ID`, `AZURE_STORAGE_ACCOUNT`, etc.)
 //!
 //! ## Partition Inference
 //! Hive-style partitions are automatically inferred from paths:
@@ -114,8 +114,8 @@ fn is_url_like(name: &str) -> bool {
 /// - Infers schema from the files
 #[derive(Debug)]
 pub struct SpiceUrlTableFactory {
-    /// Weak reference to the session state for schema inference
-    /// Uses parking_lot::RwLock because that's what SessionContext uses internally
+    /// Weak reference to the session state for schema inference.
+    /// Uses `parking_lot::RwLock` because that's what `SessionContext` uses internally.
     state: RwLock<Option<Weak<RwLock<SessionState>>>>,
 }
 

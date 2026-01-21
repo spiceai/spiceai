@@ -194,8 +194,9 @@ impl RuntimeBuilder {
             .is_none_or(|app| app.runtime.task_history.enabled);
 
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
-        let url_tables_enabled =
-            App::get_runtime_param_opt::<String>(&self.app, "url_tables").as_deref() == Some("enabled");
+        let url_tables_enabled = App::get_runtime_param_opt::<String>(&self.app, "url_tables")
+            .as_deref()
+            == Some("enabled");
 
         let mut caching_config = self
             .app
