@@ -735,8 +735,8 @@ impl RefreshTask {
             .await;
 
         self.maybe_update_last_updated_at(
-            data_update.update_type,
-            refresh_stat.map(|s| s.num_rows).unwrap_or(0),
+            &data_update.update_type,
+            refresh_stat.map_or(0, |s| s.num_rows),
         );
 
         Ok(())
@@ -1375,7 +1375,7 @@ impl RefreshTask {
     ///
     /// - For `Overwrite` and `Changes`: Always updates (data is replaced/modified)
     /// - For `Append`: Only updates if rows were actually written (`num_rows > 0`)
-    fn maybe_update_last_updated_at(&self, update_type: UpdateType, num_rows: usize) {
+    fn maybe_update_last_updated_at(&self, update_type: &UpdateType, num_rows: usize) {
         let should_update = match update_type {
             UpdateType::Overwrite | UpdateType::Changes => true,
             UpdateType::Append => num_rows > 0,
