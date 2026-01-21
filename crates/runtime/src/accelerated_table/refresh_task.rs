@@ -121,6 +121,8 @@ pub struct RefreshTaskBuilder {
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
     last_updated_at: Arc<AtomicI64>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
 }
 
 impl RefreshTaskBuilder {
@@ -149,6 +151,7 @@ impl RefreshTaskBuilder {
             accelerator_write_mutex,
             on_stream_batch_process_callback: None,
             last_updated_at: Arc::new(AtomicI64::new(0)),
+            is_s3_express_acceleration: false,
         }
     }
 
@@ -201,6 +204,13 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    #[must_use]
+    pub fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> RefreshTaskBuilder {
+        self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -250,6 +260,7 @@ impl RefreshTaskBuilder {
             accelerator_write_mutex: self.accelerator_write_mutex,
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
             last_updated_at: self.last_updated_at,
+            is_s3_express_acceleration: self.is_s3_express_acceleration,
         }
     }
 }
@@ -272,6 +283,8 @@ pub struct RefreshTask {
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
     last_updated_at: Arc<AtomicI64>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -1336,6 +1349,20 @@ impl RefreshTask {
             return;
         }
 
+        // Check for S3 Express One Zone upload speed error and provide user-friendly message.
+        // ClientUploadSpeedTooSlow is specific to S3 Express One Zone (directory buckets).
+        if self.is_s3_express_acceleration && error.to_string().contains("ClientUploadSpeedTooSlow")
+        {
+            tracing::warn!(
+                "Failed to load data for {} {}: S3 upload speed too slow. This typically occurs when uploading to S3 Express One Zone from outside AWS or over a slow network connection. Consider: (1) Running Spice closer to your S3 bucket (same region/AZ), (2) Reducing dataset size or using incremental refresh, (3) Increasing 'cayenne_target_file_size_mb' to reduce the number of files uploaded.",
+                self.component_type(),
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+            );
+            self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
+                .await;
+            return;
+        }
+
         // For all errors that result from calling DataFusion, check if they are due to the task being cancelled and ignore them
         match error {
             super::Error::UnableToGetDataFromConnector { source }
@@ -1429,14 +1456,17 @@ impl DataLoadTracing {
             let size = util::human_readable_bytes(self.bytes_received);
             let elapsed_str = format!("{}s", elapsed.as_secs());
 
+            // Note: size and throughput are based on uncompressed in-memory Arrow data size,
+            // not actual network transfer. Actual network bytes may be significantly smaller
+            // due to compression.
             if is_spice_internal_dataset(&self.dataset) {
                 tracing::debug!(
-                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    "Dataset {} received {pretty_records} records ({size} uncompressed) in {elapsed_str}, {throughput}",
                     self.dataset
                 );
             } else {
                 tracing::info!(
-                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    "Dataset {} received {pretty_records} records ({size} uncompressed) in {elapsed_str}, {throughput}",
                     self.dataset
                 );
             }
