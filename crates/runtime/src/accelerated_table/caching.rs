@@ -17,6 +17,7 @@ limitations under the License.
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
 use arrow::array::StringArray;
@@ -99,12 +100,14 @@ pub fn create_cache_write_channel() -> (CacheWriteSender, CacheWriteReceiver) {
 /// Spawns a background task that batches cache writes on interval basis.
 ///
 /// Removes cache keys from `in_flight_revalidations` after writes complete.
+/// Updates `last_updated_at` after successful writes to support `snapshots_creation_policy: on_change`.
 pub fn spawn_batched_cache_write_task(
     mut rx: CacheWriteReceiver,
     accelerator: Arc<dyn TableProvider>,
     dataset_name: String,
     accelerator_write_mutex: Arc<Mutex<()>>,
     in_flight_revalidations: InFlightRevalidations,
+    last_updated_at: Arc<AtomicI64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut batch_buffer: Vec<CacheWriteRequest> = Vec::new();
@@ -137,6 +140,7 @@ pub fn spawn_batched_cache_write_task(
                                 &dataset_name,
                                 &accelerator_write_mutex,
                                 &in_flight_revalidations,
+                                &last_updated_at,
                             ).await;
                         }
                         break;
@@ -152,6 +156,7 @@ pub fn spawn_batched_cache_write_task(
                             &dataset_name,
                             &accelerator_write_mutex,
                             &in_flight_revalidations,
+                            &last_updated_at,
                         ).await;
                     }
                 }
@@ -169,6 +174,7 @@ async fn flush_cache_writes(
     dataset_name: &str,
     accelerator_write_mutex: &Arc<Mutex<()>>,
     in_flight_revalidations: &InFlightRevalidations,
+    last_updated_at: &Arc<AtomicI64>,
 ) {
     if buffer.is_empty() {
         return;
@@ -249,6 +255,9 @@ async fn flush_cache_writes(
     if let Err(e) = result {
         tracing::warn!("Failed to flush cache updates for dataset {dataset_name}: {e}");
     } else if insert_rows > 0 || upsert_rows > 0 {
+        // Update last_updated_at for snapshots_creation_policy: on_change support
+        super::AcceleratedTable::set_timestamp_to_now(last_updated_at);
+
         tracing::trace!(
             "Cache write completed for dataset={dataset_name}: inserts={insert_rows} rows, upserts={upsert_count}, {upsert_rows} rows in {write_ms}ms"
         );
@@ -1797,12 +1806,14 @@ mod tests {
     ) -> (CacheWriteSender, tokio::task::JoinHandle<()>) {
         let (tx, rx) = create_cache_write_channel();
         let accelerator_write_mutex = Arc::new(Mutex::new(()));
+        let last_updated_at = Arc::new(AtomicI64::new(0));
         let handle = spawn_batched_cache_write_task(
             rx,
             Arc::clone(accelerator) as Arc<dyn TableProvider>,
             "test_dataset".to_string(),
             accelerator_write_mutex,
             Arc::clone(in_flight_revalidations),
+            last_updated_at,
         );
         (tx, handle)
     }

@@ -10,13 +10,13 @@ runs:
       run: |
         sudo apt-get update
         # Install mold linker for faster linking (20-30% faster link times)
-        sudo apt-get install -y build-essential cmake pkg-config libssl-dev unixodbc unixodbc-dev protobuf-compiler libclang-dev libnfs-dev mold lld clang
+        sudo apt-get install -y build-essential cmake pkg-config libssl-dev unixodbc unixodbc-dev libclang-dev libnfs-dev mold lld clang
 
     - name: Install cc (macOS)
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        brew install cmake pkg-config openssl unixodbc protobuf llvm libnfs
+        brew install cmake pkg-config openssl unixodbc llvm libnfs
 
     - name: Install cc (Windows)
       if: runner.os == 'Windows'
@@ -30,6 +30,6 @@ runs:
           [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
         }
-        choco install cmake pkgconfiglite protoc llvm -y
+        choco install cmake pkgconfiglite llvm -y
         echo "C:\Program Files\CMake\bin" >> $env:GITHUB_PATH
         echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH

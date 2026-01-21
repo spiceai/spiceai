@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
+use arrow::array::RecordBatch;
+use datafusion::prelude::*;
 use futures::StreamExt;
 
 use runtime::Runtime;
@@ -460,6 +462,175 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
             let schema = arrow::util::pretty::pretty_format_batches(&batches)
             .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!(format!("s3_schema_source_path_authenticated_parts"), schema);
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test that URL tables can be queried directly via SQL API.
+///
+/// This tests the `DynamicUrlSchemaProvider` and `SpiceUrlTableFactory` integration
+/// which enables queries like: `SELECT * FROM 's3://bucket/path/'`
+#[tokio::test]
+async fn s3_url_table_sql_api() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime_datafusion=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            // Create a minimal app with URL tables enabled via runtime param
+            let app = AppBuilder::new("s3_url_table_sql")
+                .with_runtime_params(HashMap::from([("url_tables".to_string(), "enabled".to_string())]))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for runtime to start"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            // Test querying a single parquet file directly via URL in SQL
+            let mut query_result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT * FROM 's3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet' LIMIT 10",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            assert_eq!(batches.len(), 1, "Should have one batch of results");
+            assert_eq!(batches[0].num_rows(), 10, "Should have 10 rows");
+
+            // Test querying a directory/prefix via URL in SQL
+            // Using the hive_partitioned_data which is a publicly accessible directory
+            let mut query_result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT * FROM 's3://spiceai-public-datasets/hive_partitioned_data/' LIMIT 10",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            let mut batches = vec![];
+            while let Some(batch) = query_result.data.next().await {
+                batches.push(batch?);
+            }
+
+            assert_eq!(batches.len(), 1, "Should have one batch of results");
+            assert_eq!(batches[0].num_rows(), 10, "Should have 10 rows");
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test that URL tables can be queried directly via `DataFrame` API.
+///
+/// This tests the `DynamicUrlSchemaProvider` integration with `DataFusion`'s
+/// `table()` method for programmatic `DataFrame` access to S3 URLs.
+#[tokio::test]
+async fn s3_url_table_dataframe_api() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime_datafusion=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            // Create a minimal app with URL tables enabled via runtime param
+            let app = AppBuilder::new("s3_url_table_df")
+                .with_runtime_params(HashMap::from([(
+                    "url_tables".to_string(),
+                    "enabled".to_string(),
+                )]))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for runtime to start"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            // Test querying a single parquet file directly via DataFrame API
+            let df = rt
+                .datafusion()
+                .ctx
+                .table("s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet")
+                .await?
+                .limit(0, Some(10))?;
+
+            let batches = df.collect().await?;
+            assert_eq!(batches.len(), 1, "Should have one batch of results");
+            assert_eq!(batches[0].num_rows(), 10, "Should have 10 rows");
+
+            // Test querying a directory/prefix via DataFrame API
+            // Using the hive_partitioned_data which is a publicly accessible directory
+            let df = rt
+                .datafusion()
+                .ctx
+                .table("s3://spiceai-public-datasets/hive_partitioned_data/")
+                .await?
+                .limit(0, Some(10))?;
+
+            let batches = df.collect().await?;
+            assert_eq!(batches.len(), 1, "Should have one batch of results");
+            assert_eq!(batches[0].num_rows(), 10, "Should have 10 rows");
+
+            // Test that DataFrame API allows filtering
+            // Use col() with proper identifier to preserve case sensitivity
+            let df = rt
+                .datafusion()
+                .ctx
+                .table("s3://spiceai-public-datasets/taxi_small_samples/taxi_sample.parquet")
+                .await?
+                .filter(col("\"VendorID\"").eq(lit(1)))?
+                .limit(0, Some(5))?;
+
+            let batches = df.collect().await?;
+            assert!(!batches.is_empty(), "Should have results after filtering");
+
+            // Verify LIMIT is applied correctly
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert!(
+                total_rows <= 5,
+                "LIMIT 5 should return at most 5 rows, got {total_rows}"
+            );
+
+            // Verify all rows have VendorID = 1
+            // Note: taxi_sample.parquet contains mixed VendorID values (1 and 2),
+            // so this assertion validates that the filter is actually working.
+            for batch in &batches {
+                let vendor_col = batch
+                    .column_by_name("VendorID")
+                    .expect("VendorID column should exist");
+                let vendor_array = vendor_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("VendorID should be Int64Array");
+                for i in 0..vendor_array.len() {
+                    assert_eq!(vendor_array.value(i), 1, "All VendorID values should be 1");
+                }
+            }
 
             Ok(())
         })
