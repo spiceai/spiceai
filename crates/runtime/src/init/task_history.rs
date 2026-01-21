@@ -96,7 +96,8 @@ impl Runtime {
         .map_err(|source| Error::UnableToTrackTaskHistory { source })?;
 
         // In cluster scheduler mode, wrap the local table with FederatedTaskHistoryTable
-        // to enable cluster-wide task history queries
+        // to enable cluster-wide task history queries, and also register the local table
+        // separately for use by the GetTaskHistory RPC handler
         let table_to_register: Arc<dyn TableProvider> =
             if matches!(effective_role, Some(ClusterRole::Scheduler)) {
                 let schema = local_table.schema();
@@ -115,9 +116,22 @@ impl Runtime {
                     "Registering federated task_history table with scheduler_id={scheduler_id}"
                 );
 
+                // Register the local table under a separate name for RPC handlers to use
+                // This avoids infinite recursion when peers query each other
+                let local_table_provider: Arc<dyn TableProvider> = local_table as Arc<dyn TableProvider>;
+                self.df
+                    .register_table_as_writable_and_with_schema(
+                        TableReference::partial(
+                            SPICE_RUNTIME_SCHEMA,
+                            task_history::LOCAL_TASK_HISTORY_TABLE,
+                        ),
+                        Arc::clone(&local_table_provider),
+                    )
+                    .context(UnableToCreateBackendSnafu)?;
+
                 let federated = task_history::federated::FederatedTaskHistoryTable::new(
                     schema,
-                    local_table,
+                    local_table_provider,
                     self.scheduler_peers(),
                     self.df.cluster_config.client_tls_config().cloned(),
                     scheduler_id,

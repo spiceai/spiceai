@@ -19,10 +19,16 @@ limitations under the License.
 //! This service handles scheduler-executor communication for cluster mode,
 //! including app definition retrieval and secret expansion.
 
+use std::ops::ControlFlow;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use app::App;
 use arrow::array::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
-use datafusion::sql::TableReference;
+use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 use futures::{Stream, StreamExt, TryStreamExt};
 use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::executor_control_message::Message as ExecutorMessage;
@@ -46,7 +52,7 @@ use crate::cluster::SchedulerPeers;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
-use crate::task_history::DEFAULT_TASK_HISTORY_TABLE;
+use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
@@ -234,24 +240,17 @@ impl ClusterService for ClusterServiceImpl {
             request.sql
         );
 
-        // Validate the SQL only queries the task_history table for security
-        let task_history_table =
-            TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
-        let expected_table_name = task_history_table.to_quoted_string();
+        // Parse and rewrite the SQL to query local_task_history instead of task_history.
+        // This avoids infinite recursion: the federated task_history table would fan out
+        // to peers, but peers need to query their local data only.
+        let local_sql = rewrite_task_history_sql(&request.sql).map_err(|e| {
+            Status::invalid_argument(format!("Invalid task history query: {e}"))
+        })?;
 
-        // Simple validation: ensure the query references the expected table
-        if !request.sql.contains(SPICE_RUNTIME_SCHEMA)
-            || !request.sql.contains(DEFAULT_TASK_HISTORY_TABLE)
-        {
-            return Err(Status::invalid_argument(format!(
-                "Query must reference the {expected_table_name} table"
-            )));
-        }
-
-        // Execute the query against local task_history
+        // Execute the query against local_task_history
         let query_result = self
             .datafusion
-            .query_builder(&request.sql)
+            .query_builder(&local_sql)
             .build()
             .run()
             .await
@@ -435,4 +434,152 @@ fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::erro
     }
 
     Ok(buffer)
+}
+
+/// Rewrites a task history SQL query to use `local_task_history` instead of `task_history`.
+///
+/// This function parses the SQL, validates it references the expected table, and rewrites
+/// all table references from `runtime.task_history` to `runtime.local_task_history`.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The SQL cannot be parsed
+/// - The query contains multiple statements
+/// - The query doesn't reference the `runtime.task_history` table
+fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
+    let dialect = PostgreSqlDialect {};
+    let mut statements =
+        Parser::parse_sql(&dialect, sql).map_err(|e| format!("Failed to parse SQL: {e}"))?;
+
+    if statements.len() != 1 {
+        return Err(format!(
+            "Expected single SQL statement, got {}",
+            statements.len()
+        ));
+    }
+
+    let statement = &mut statements[0];
+
+    // Track whether we found and rewrote the task_history table
+    let mut found_task_history = false;
+
+    // Visit all table references and rewrite task_history -> local_task_history
+    let _ = visit_relations_mut(statement, |table_name| {
+        // Check if this is runtime.task_history (2 parts) or just task_history (1 part)
+        let parts: Vec<&str> = table_name
+            .0
+            .iter()
+            .filter_map(|part| match part {
+                ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
+                ObjectNamePart::Function(_) => None,
+            })
+            .collect();
+
+        let is_task_history_table = match parts.as_slice() {
+            [schema, table] => {
+                *schema == SPICE_RUNTIME_SCHEMA && *table == DEFAULT_TASK_HISTORY_TABLE
+            }
+            [table] => *table == DEFAULT_TASK_HISTORY_TABLE,
+            _ => false,
+        };
+
+        if is_task_history_table {
+            found_task_history = true;
+
+            // Rewrite the table name: find and replace the task_history identifier
+            for part in &mut table_name.0 {
+                if let ObjectNamePart::Identifier(ident) = part {
+                    if ident.value == DEFAULT_TASK_HISTORY_TABLE {
+                        *ident = Ident::new(LOCAL_TASK_HISTORY_TABLE);
+                    }
+                }
+            }
+        }
+
+        ControlFlow::<()>::Continue(())
+    });
+
+    if !found_task_history {
+        return Err(format!(
+            "Query must reference the \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\" table"
+        ));
+    }
+
+    Ok(statement.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rewrite_task_history_sql_simple() {
+        let sql = r#"SELECT * FROM "runtime"."task_history""#;
+        let result = rewrite_task_history_sql(sql).expect("should rewrite");
+        assert!(
+            result.contains("local_task_history"),
+            "Expected local_task_history in: {result}"
+        );
+        assert!(
+            !result.contains(r#""task_history""#),
+            "Should not contain task_history: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_with_where() {
+        let sql = r#"SELECT * FROM "runtime"."task_history" WHERE task = 'sql'"#;
+        let result = rewrite_task_history_sql(sql).expect("should rewrite");
+        assert!(
+            result.contains("local_task_history"),
+            "Expected local_task_history in: {result}"
+        );
+        assert!(
+            result.contains("task = 'sql'"),
+            "Should preserve WHERE clause: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_with_limit() {
+        let sql = r#"SELECT * FROM "runtime"."task_history" LIMIT 100"#;
+        let result = rewrite_task_history_sql(sql).expect("should rewrite");
+        assert!(
+            result.contains("local_task_history"),
+            "Expected local_task_history in: {result}"
+        );
+        assert!(
+            result.contains("LIMIT 100"),
+            "Should preserve LIMIT: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_rejects_other_tables() {
+        let sql = r#"SELECT * FROM "runtime"."other_table""#;
+        let result = rewrite_task_history_sql(sql);
+        assert!(result.is_err(), "Should reject queries to other tables");
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_rejects_multiple_statements() {
+        let sql = r#"SELECT * FROM "runtime"."task_history"; DROP TABLE foo"#;
+        let result = rewrite_task_history_sql(sql);
+        assert!(
+            result.is_err(),
+            "Should reject multiple statements: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_with_filter_and_limit() {
+        let sql =
+            r#"SELECT * FROM "runtime"."task_history" WHERE status = Utf8("completed") LIMIT 50"#;
+        let result = rewrite_task_history_sql(sql).expect("should rewrite");
+        assert!(
+            result.contains("local_task_history"),
+            "Expected local_task_history in: {result}"
+        );
+    }
 }

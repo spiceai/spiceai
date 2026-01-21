@@ -43,6 +43,9 @@ pub mod federated;
 pub mod otel_exporter;
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
+/// Internal table name for the local (non-federated) task history table.
+/// Used by cluster RPC handlers to query local data without triggering federated fan-out.
+pub const LOCAL_TASK_HISTORY_TABLE: &str = "local_task_history";
 pub const DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS: u64 = 8 * 60 * 60; // 8 hours
 pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
 
