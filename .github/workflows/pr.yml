@@ -70,6 +70,10 @@ jobs:
         id: check
         uses: ./.github/actions/check-code-changes
 
+      - name: Set up Rust
+        if: steps.check.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-rust
+
       - name: Generate feature matrix
         id: set-matrix
         if: steps.check.outputs.relevant_changes == 'true'
@@ -227,6 +231,10 @@ jobs:
         with:
           exclude_features: ${{ fromJson(needs.setup.outputs.matrix).include[0].exclude_features }}
           check_openapi: 'true'
+          package: spiced
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Show sccache stats
         if: needs.setup.outputs.relevant_changes == 'true'
@@ -279,6 +287,10 @@ jobs:
         with:
           exclude_features: ${{ fromJson(needs.setup.outputs.matrix).include[1].exclude_features }}
           check_openapi: 'false'
+          package: spiced
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Show sccache stats
         run: sccache --show-stats

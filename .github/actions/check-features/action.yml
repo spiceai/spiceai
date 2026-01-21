@@ -1,5 +1,5 @@
 name: Check Cargo Features
-description: 'Check that cargo features compile correctly using cargo-hack'
+description: 'Check that cargo features can be built successfully using cargo-hack. Requires Rust, make, and cc to be set up before calling this action.'
 
 inputs:
   exclude_features:
@@ -9,6 +9,10 @@ inputs:
     description: 'Whether to also check the runtime/openapi feature'
     required: false
     default: 'false'
+  package:
+    description: 'Package to check (e.g., spiced). If empty, checks all workspace packages.'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -34,7 +38,15 @@ runs:
       shell: bash
       run: |
         echo "Excluding features: ${{ inputs.exclude_features }}"
+        PACKAGE_FLAG=""
+        if [ -n "${{ inputs.package }}" ]; then
+          PACKAGE_FLAG="-p ${{ inputs.package }}"
+          echo "Scoping to package: ${{ inputs.package }}"
+        else
+          echo "Checking all workspace packages"
+        fi
         cargo hack check --each-feature --profile lint \
+          $PACKAGE_FLAG \
           --exclude-features "${{ inputs.exclude_features }}"
 
     - name: Check runtime/openapi feature

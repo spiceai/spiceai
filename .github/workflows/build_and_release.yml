@@ -536,6 +536,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
       - uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-make
+      - uses: ./.github/actions/setup-cc
       - uses: ./.github/actions/check-features
         with:
           exclude_features: ${{ fromJson(needs.setup-features.outputs.matrix).include[0].exclude_features }}
@@ -547,6 +549,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
       - uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-make
+      - uses: ./.github/actions/setup-cc
       - uses: ./.github/actions/check-features
         with:
           exclude_features: ${{ fromJson(needs.setup-features.outputs.matrix).include[1].exclude_features }}
