@@ -355,10 +355,10 @@ and port are correctly configured, and that the host is reachable.
 
 ### Data Transfer
 
-Since filter pushdown is disabled, **all table data is transferred** for each query. Consider:
+Partition key equality filters are pushed down to ScyllaDB, so queries that constrain the partition key transfer only the matching partitions instead of the entire table. Other filters are evaluated in Spice, which may still require scanning more data on the connector side. Consider:
 
 1. **Use acceleration**: Enable Spice acceleration to cache data locally
-2. **Partition wisely**: Design keyspaces with query patterns in mind
+2. **Partition wisely**: Design keyspaces and partition keys to align with common query filters
 3. **Limit result sets**: Use LIMIT clauses when possible
 
 ### Memory Usage
