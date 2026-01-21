@@ -1010,10 +1010,10 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
-        // For caching mode, extend projection to include fetched_at for freshness checking if needed.
+        // For caching mode with filters, extend projection to include fetched_at for freshness checking if needed.
         // Added columns will be automatically stripped by `SchemaCastScanExec`, similar to
         // fallback-to-source on cache miss where results return all columns.
-        let extended_projection = if is_caching_mode {
+        let extended_projection = if is_caching_mode && !filters.is_empty() {
             extend_projection_for_caching(projection, &self.accelerator.schema())
         } else {
             None
