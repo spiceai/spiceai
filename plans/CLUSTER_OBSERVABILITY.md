@@ -1,5 +1,16 @@
 # Cluster Observability Implementation Plan
 
+## Status
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| Phase 1 | Protobuf Schema Updates | ✅ Complete |
+| Phase 2 | Task History with `scheduler_id` | ✅ Complete |
+| Phase 3 | GetTaskHistory RPC Implementation | 🔲 Not Started |
+| Phase 4 | Executor Control Stream | 🔲 Not Started |
+| Phase 5 | Cluster Metrics Endpoint | 🔲 Not Started |
+| Phase 6 | Wire Everything Together | 🔲 Not Started |
+
 ## Overview
 
 This document outlines the implementation plan for adding unified observability features to Spice's cluster mode. The features enable operators to have a single view of task history and metrics across all nodes in a Spice cluster.

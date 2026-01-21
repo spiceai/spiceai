@@ -20,6 +20,10 @@ service ClusterService {
     // Called by executors during initialization.
     rpc GetSchedulers(GetSchedulersRequest) returns (GetSchedulersResponse);
 
+    // Query task history from this scheduler.
+    // Used for federated task history queries across the cluster.
+    rpc GetTaskHistory(GetTaskHistoryRequest) returns (GetTaskHistoryResponse);
+
     // Bidirectional control stream for executor-scheduler communication.
     // Initiated by executors, used for liveness tracking.
     rpc ControlStream(stream ExecutorControlMessage) returns (stream SchedulerControlMessage);
@@ -60,6 +64,18 @@ message SchedulerInstance {
 // Response message for GetSchedulers RPC.
 message GetSchedulersResponse {
     repeated SchedulerInstance schedulers = 1;
+}
+
+// Request message for GetTaskHistory RPC.
+message GetTaskHistoryRequest {
+    // SQL query to execute against the local task_history table.
+    string sql = 1;
+}
+
+// Response message for GetTaskHistory RPC.
+message GetTaskHistoryResponse {
+    // Arrow IPC-encoded RecordBatch containing the query results.
+    bytes arrow_ipc = 1;
 }
 
 // Message sent from executor to scheduler on the control stream.

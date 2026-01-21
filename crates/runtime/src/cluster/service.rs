@@ -20,13 +20,16 @@ limitations under the License.
 //! including app definition retrieval and secret expansion.
 
 use app::App;
-use futures::{Stream, StreamExt};
+use arrow::array::RecordBatch;
+use arrow_ipc::writer::StreamWriter;
+use datafusion::sql::TableReference;
+use futures::{Stream, StreamExt, TryStreamExt};
 use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::executor_control_message::Message as ExecutorMessage;
 use runtime_proto::{
     ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
-    GetAppDefinitionResponse, GetSchedulersRequest, GetSchedulersResponse, SchedulerControlMessage,
-    SchedulerInstance,
+    GetAppDefinitionResponse, GetSchedulersRequest, GetSchedulersResponse, GetTaskHistoryRequest,
+    GetTaskHistoryResponse, SchedulerControlMessage, SchedulerInstance,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -39,6 +42,8 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::cluster::SchedulerPeers;
+use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
+use crate::task_history::DEFAULT_TASK_HISTORY_TABLE;
 
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
@@ -46,6 +51,7 @@ pub struct ClusterServiceImpl {
     secrets: Arc<RwLock<Secrets>>,
     advertise_address: String,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+    datafusion: Arc<DataFusion>,
 }
 
 impl ClusterServiceImpl {
@@ -56,12 +62,14 @@ impl ClusterServiceImpl {
         secrets: Arc<RwLock<Secrets>>,
         advertise_address: String,
         scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+        datafusion: Arc<DataFusion>,
     ) -> Self {
         Self {
             app,
             secrets,
             advertise_address,
             scheduler_peers,
+            datafusion,
         }
     }
 }
@@ -199,7 +207,50 @@ impl ClusterService for ClusterServiceImpl {
 
         Ok(Response::new(GetSchedulersResponse { schedulers }))
     }
+    async fn get_task_history(
+        &self,
+        request: Request<GetTaskHistoryRequest>,
+    ) -> Result<Response<GetTaskHistoryResponse>, Status> {
+        let request = request.into_inner();
 
+        tracing::debug!("ClusterService::get_task_history executing query: {}", request.sql);
+
+        // Validate the SQL only queries the task_history table for security
+        let task_history_table =
+            TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
+        let expected_table_name = task_history_table.to_quoted_string();
+
+        // Simple validation: ensure the query references the expected table
+        if !request.sql.contains(SPICE_RUNTIME_SCHEMA)
+            || !request.sql.contains(DEFAULT_TASK_HISTORY_TABLE)
+        {
+            return Err(Status::invalid_argument(format!(
+                "Query must reference the {expected_table_name} table"
+            )));
+        }
+
+        // Execute the query against local task_history
+        let query_result = self
+            .datafusion
+            .query_builder(&request.sql)
+            .build()
+            .run()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+
+        // Collect all record batches
+        let batches: Vec<RecordBatch> = query_result
+            .data
+            .try_collect()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to collect query results: {e}")))?;
+
+        // Encode as Arrow IPC
+        let arrow_ipc = encode_batches_to_ipc(&batches)
+            .map_err(|e| Status::internal(format!("Failed to encode results as Arrow IPC: {e}")))?;
+
+        Ok(Response::new(GetTaskHistoryResponse { arrow_ipc }))
+    }
     type ControlStreamStream =
         Pin<Box<dyn Stream<Item = Result<SchedulerControlMessage, Status>> + Send>>;
 
@@ -292,4 +343,26 @@ fn handle_executor_message(executor_id: &str, message: ExecutorMessage) {
             );
         }
     }
+}
+
+/// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
+///
+/// Returns an empty vec if no batches are provided.
+fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::error::ArrowError> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let schema = batches[0].schema();
+    let mut buffer = Vec::new();
+
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &schema)?;
+        for batch in batches {
+            writer.write(batch)?;
+        }
+        writer.finish()?;
+    }
+
+    Ok(buffer)
 }

@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 use crate::{
-    Error, Result, Runtime, UnableToCreateBackendSnafu, datafusion::SPICE_RUNTIME_SCHEMA,
-    task_history,
+    Error, Result, Runtime, UnableToCreateBackendSnafu, config::ClusterRole,
+    datafusion::SPICE_RUNTIME_SCHEMA, task_history,
 };
+use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use std::fmt::Write;
@@ -81,9 +82,10 @@ impl Runtime {
         tracing::info!("{}", config_details);
 
         // Determine if we're in cluster mode (scheduler_id column needed)
-        let is_cluster_mode = self.df.cluster_config.effective_role().is_some();
+        let effective_role = self.df.cluster_config.effective_role();
+        let is_cluster_mode = effective_role.is_some();
 
-        match task_history::TaskSpan::instantiate_table(
+        let local_table = task_history::TaskSpan::instantiate_table(
             self.status(),
             retention_period_secs,
             retention_check_interval_secs,
@@ -91,18 +93,49 @@ impl Runtime {
             is_cluster_mode,
         )
         .await
-        {
-            Ok(table) => self
-                .df
-                .register_table_as_writable_and_with_schema(
-                    TableReference::partial(
-                        SPICE_RUNTIME_SCHEMA,
-                        task_history::DEFAULT_TASK_HISTORY_TABLE,
-                    ),
-                    table,
-                )
-                .context(UnableToCreateBackendSnafu),
-            Err(source) => Err(Error::UnableToTrackTaskHistory { source }),
-        }
+        .map_err(|source| Error::UnableToTrackTaskHistory { source })?;
+
+        // In cluster scheduler mode, wrap the local table with FederatedTaskHistoryTable
+        // to enable cluster-wide task history queries
+        let table_to_register: Arc<dyn TableProvider> =
+            if matches!(effective_role, Some(ClusterRole::Scheduler)) {
+                let schema = local_table.schema();
+
+                // Compute scheduler_id: {advertise_host}:{bind_port}
+                let scheduler_id = if let Some(advertise_host) =
+                    self.df.cluster_config.node_advertise_address()
+                {
+                    let bind_port = self.df.cluster_config.node_bind_address().port();
+                    format!("{advertise_host}:{bind_port}")
+                } else {
+                    // Fallback: use bind address directly (shouldn't happen in valid scheduler config)
+                    self.df.cluster_config.node_bind_address().to_string()
+                };
+
+                tracing::debug!(
+                    "Registering federated task_history table with scheduler_id={scheduler_id}"
+                );
+
+                let federated = task_history::federated::FederatedTaskHistoryTable::new(
+                    schema,
+                    local_table,
+                    self.scheduler_peers(),
+                    self.df.cluster_config.client_tls_config().cloned(),
+                    scheduler_id,
+                );
+                Arc::new(federated)
+            } else {
+                local_table
+            };
+
+        self.df
+            .register_table_as_writable_and_with_schema(
+                TableReference::partial(
+                    SPICE_RUNTIME_SCHEMA,
+                    task_history::DEFAULT_TASK_HISTORY_TABLE,
+                ),
+                table_to_register,
+            )
+            .context(UnableToCreateBackendSnafu)
     }
 }

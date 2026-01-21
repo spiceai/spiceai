@@ -105,6 +105,7 @@ pub async fn start_internal_cluster_server(
         Arc::clone(&rt.secrets),
         advertise_address,
         rt.scheduler_peers(),
+        Arc::clone(&rt.df),
     );
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 
