@@ -4,12 +4,15 @@ tests:
     query_set: tpcds
     runner_type: spiceai-dev-runners
     validate_results: false
+    query_overrides: cayenne
   throughput:
     spicepod_path: accelerated/file[parquet]-cayenne[file].yaml
     query_set: tpcds
     runner_type: spiceai-dev-large-runners
+    query_overrides: cayenne
   load:
     spicepod_path: accelerated/file[parquet]-cayenne[file].yaml
     query_set: tpcds
     runner_type: spiceai-dev-large-runners
     duration: 28800
+    query_overrides: cayenne

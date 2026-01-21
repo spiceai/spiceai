@@ -155,6 +155,8 @@ pub enum QueryOverridesArg {
     #[serde(rename = "dynamodb")]
     #[value(name = "dynamodb")]
     DynamoDB,
+    #[value(name = "cayenne")]
+    Cayenne,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -263,6 +265,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
             QueryOverridesArg::IcebergHadoop => QueryOverrides::IcebergHadoop,
             QueryOverridesArg::DynamoDB => QueryOverrides::DynamoDB,
+            QueryOverridesArg::Cayenne => QueryOverrides::Cayenne,
         }
     }
 }

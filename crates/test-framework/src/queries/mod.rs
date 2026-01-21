@@ -567,6 +567,7 @@ pub enum QueryOverrides {
     GlueCatalog,
     Spicecloud,
     DynamoDB,
+    Cayenne,
 }
 
 impl QueryOverrides {
@@ -581,6 +582,7 @@ impl QueryOverrides {
             "odbc_athena" => Some(Self::ODBCAthena),
             "duckdb" => Some(Self::DuckDB),
             "dynamodb" => Some(Self::DynamoDB),
+            "cayenne" => Some(Self::Cayenne),
             _ => None,
         }
     }
@@ -853,6 +855,9 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Dremio) => remove_tpcds_query!(
             queries, 8, 38, 87, // LEFT SEMI, and LEFT ANTI
             64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
+        ),
+        Some(QueryOverrides::Cayenne) => remove_tpcds_query!(
+            queries, 34  // https://github.com/spiceai/spiceai/issues/9037
         ),
         Some(_) | None => queries,
     }

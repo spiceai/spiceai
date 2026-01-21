@@ -51,6 +51,7 @@ on:
           - 'databricks-catalog'
           - 'spicecloud'
           - 'iceberg-hadoop'
+          - 'cayenne'
       runner_type:
         description: 'Runner type'
         required: true
