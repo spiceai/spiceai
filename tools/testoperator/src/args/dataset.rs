@@ -155,6 +155,7 @@ pub enum QueryOverridesArg {
     #[serde(rename = "dynamodb")]
     #[value(name = "dynamodb")]
     DynamoDB,
+    #[serde(rename = "cayenne")]
     #[value(name = "cayenne")]
     Cayenne,
 }
