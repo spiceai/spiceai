@@ -23,7 +23,6 @@ use async_openai::types::embeddings::CreateEmbeddingRequest;
 use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::scalar::ScalarValue;
 use datafusion::sql::sqlparser::ast::Expr;
 
 // To avoid a circular dependency, we define a placeholder for a SearchKey
@@ -101,15 +100,19 @@ impl CacheKey<'_> {
                 sql.hash(&mut hasher);
                 if let Some(params) = param_values {
                     match params {
-                        ParamValues::List(vec) => vec.hash(&mut hasher),
+                        ParamValues::List(vec) => {
+                            for item in vec {
+                                item.value().hash(&mut hasher);
+                            }
+                        }
                         ParamValues::Map(hash_map) => {
                             // implementing Hash for HashMap
-                            let mut pairs: Vec<(&String, &ScalarValue)> = hash_map.iter().collect();
+                            let mut pairs: Vec<_> = hash_map.iter().collect();
                             pairs.sort_by(|a, b| a.0.cmp(b.0)); // Sort by keys
 
                             for (key, value) in pairs {
                                 key.hash(&mut hasher);
-                                value.hash(&mut hasher);
+                                value.value().hash(&mut hasher);
                             }
                         }
                     }

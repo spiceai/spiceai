@@ -26,12 +26,37 @@ use std::{sync::Arc, time::SystemTime};
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::dataaccelerator::{AccelerationSource, spice_sys::OpenOption};
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+#[cfg(any(
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "postgres",
+    feature = "turso"
+))]
+use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::datatypes::SchemaRef;
 use runtime_acceleration::{dataset_checkpoint::DatasetCheckpointer, snapshot::SnapshotBehavior};
+#[cfg(any(
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "postgres",
+    feature = "turso"
+))]
 use serde_json;
 use snafu::ResultExt;
 
+#[cfg(any(
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "postgres",
+    feature = "turso"
+))]
 const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
+#[cfg(any(
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "postgres",
+    feature = "turso"
+))]
 const SCHEMA_MIGRATION_01_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
 
@@ -103,6 +128,12 @@ impl DatasetCheckpoint {
 
     async fn init(connection: &AccelerationConnection) -> Result<()> {
         // First create the initial table
+        #[cfg(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres",
+            feature = "turso"
+        ))]
         match connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => Self::init_duckdb(pool)?,
@@ -114,16 +145,15 @@ impl DatasetCheckpoint {
             AccelerationConnection::Turso(pool) => Self::init_turso(pool).await?,
             #[cfg(all(not(windows), feature = "sqlite"))]
             AccelerationConnection::Cayenne(conn) => Self::init_sqlite(conn).await?,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres",
-                feature = "turso"
-            )))]
-            _ => return Err(Error::NoAccelerationConnection),
         }
 
         // Then add the schema column if it doesn't exist
+        #[cfg(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres",
+            feature = "turso"
+        ))]
         match connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => Self::migrate_duckdb(pool)?,
@@ -135,22 +165,44 @@ impl DatasetCheckpoint {
             AccelerationConnection::Turso(pool) => Self::migrate_turso(pool).await?,
             #[cfg(all(not(windows), feature = "sqlite"))]
             AccelerationConnection::Cayenne(conn) => Self::migrate_sqlite(conn).await?,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres",
-                feature = "turso"
-            )))]
-            _ => return Err(Error::NoAccelerationConnection),
         }
 
+        #[cfg(not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres",
+            feature = "turso"
+        )))]
+        {
+            let _ = connection;
+            Err(Error::NoAccelerationConnection)
+        }
+
+        #[cfg(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres",
+            feature = "turso"
+        ))]
         Ok(())
     }
 
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "duckdb",
+        feature = "postgres",
+        feature = "turso"
+    ))]
     fn serialize_schema(schema: &SchemaRef) -> Result<String> {
         serde_json::to_string(schema).map_err(Error::external)
     }
 
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "duckdb",
+        feature = "postgres",
+        feature = "turso"
+    ))]
     fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
         let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
         Ok(std::sync::Arc::new(schema))

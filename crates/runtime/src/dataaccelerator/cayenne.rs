@@ -54,7 +54,7 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotAdapter};
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -650,10 +650,6 @@ impl CayenneAccelerator {
     ///
     /// Returns `Ok(true)` if a new bucket was created, `Ok(false)` if the bucket already existed.
     /// Returns `Err` if the bucket creation or verification fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "S3 Express bucket creation requires extensive setup, creation, and verification steps"
-    )]
     async fn create_s3_express_bucket_if_needed(
         bucket_name: &str,
         zone_id: &str,
@@ -1089,10 +1085,6 @@ impl CayenneAccelerator {
     /// Build an S3 object store for S3 Express One Zone storage.
     ///
     /// Returns `None` if the path is not an S3 path, or an error if S3 configuration is invalid.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "S3 object store setup requires extensive configuration"
-    )]
     async fn build_s3_object_store(
         source: &dyn AccelerationSource,
     ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
@@ -1401,7 +1393,7 @@ impl CayenneAccelerator {
         cmd: &CreateExternalTable,
         source: &dyn AccelerationSource,
     ) -> Result<SchemaRef> {
-        let full_schema: arrow::datatypes::Schema = cmd.schema.as_ref().clone().into();
+        let full_schema: arrow::datatypes::Schema = cmd.schema.as_arrow().clone();
         let unsupported_type_action = Self::get_unsupported_type_action(source);
         let transformed_schema =
             transform_schema_for_vortex(&full_schema, unsupported_type_action)?;
@@ -1663,6 +1655,16 @@ impl DataAccelerator for CayenneAccelerator {
             })
     }
 
+    fn snapshot_adapter(&self, source: &dyn AccelerationSource) -> SnapshotAdapter {
+        let Ok(data_dir) = self.cayenne_data_dir(source) else {
+            return SnapshotAdapter::default();
+        };
+
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+
+        SnapshotAdapter::cayenne(PathBuf::from(metadata_dir), PathBuf::from(data_dir))
+    }
+
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
         if !source.is_file_accelerated() {
             return true; // memory mode Vortex is always initialized
@@ -1696,16 +1698,12 @@ impl DataAccelerator for CayenneAccelerator {
     /// Initializes a `Cayenne` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Initialization requires extensive validation, S3 bucket setup, and directory management"
-    )]
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         tracing::warn!(
-            "Cayenne data accelerator (Alpha) is in preview and should not be used in production."
+            "Cayenne data accelerator (Alpha) is in preview and is not recommended for production."
         );
 
         if !source.is_file_accelerated() {
@@ -1995,8 +1993,11 @@ impl DataAccelerator for CayenneAccelerator {
         if partition_by.is_empty() {
             // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let (write_provider, delete_provider) =
-                upsert_dedup::wrap_with_upsert_dedup_if_needed(cayenne_table, &cmd.options);
+            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+                cayenne_table,
+                &cmd.options,
+                cmd.constraints.clone(),
+            );
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(
@@ -2129,8 +2130,11 @@ impl DataAccelerator for CayenneAccelerator {
             );
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let (write_provider, delete_provider) =
-                upsert_dedup::wrap_with_upsert_dedup_if_needed(partition_provider, &cmd.options);
+            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+                partition_provider,
+                &cmd.options,
+                cmd.constraints.clone(),
+            );
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(

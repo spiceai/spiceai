@@ -37,6 +37,7 @@ keyring = { version = "3.6.3", features = [
 
 [dev-dependencies]
 rand.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 
 [features]

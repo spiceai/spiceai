@@ -211,7 +211,7 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -377,8 +377,17 @@ pub trait DataAccelerator: Send + Sync {
     fn parameters(&self) -> &'static [ParameterSpec];
 
     /// Provides snapshot handling configuration for this accelerator.
-    fn snapshot_adapter(&self) -> SnapshotAdapter {
-        SnapshotAdapter::default()
+    ///
+    /// Returns the appropriate `SnapshotAdapter` for this engine type.
+    /// File-based accelerators (`DuckDB`, `SQLite`) return `SnapshotAdapter::file`,
+    /// while directory-based accelerators (Cayenne) return `SnapshotAdapter::cayenne`.
+    fn snapshot_adapter(&self, source: &dyn AccelerationSource) -> SnapshotAdapter {
+        // Default: use file-based adapter if file_path is available
+        if let Ok(path) = self.file_path(source) {
+            SnapshotAdapter::file(PathBuf::from(path))
+        } else {
+            SnapshotAdapter::default()
+        }
     }
 
     /// Initialize the accelerator for a component
@@ -579,6 +588,7 @@ impl AcceleratorExternalTableBuilder {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -635,6 +645,27 @@ pub async fn acceleration_file_path(
     let file = accelerator.file_path(source)?;
 
     Ok(PathBuf::from(file))
+}
+
+/// Gets the appropriate snapshot adapter for the given acceleration source.
+///
+/// This function retrieves the registered accelerator for the source's engine
+/// and returns the engine-specific snapshot adapter. Different engines use
+/// different adapter types:
+/// - File-based engines (`DuckDB`, `SQLite`): `SnapshotAdapter::file`
+/// - Directory-based engines (Cayenne): `SnapshotAdapter::cayenne`
+pub async fn acceleration_snapshot_adapter(
+    source: &dyn AccelerationSource,
+) -> Result<SnapshotAdapter, FilePathError> {
+    let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
+
+    let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+        .await
+        .context(AcceleratorEngineUnavailableSnafu {
+            engine: acceleration_settings.engine,
+        })?;
+
+    Ok(accelerator.snapshot_adapter(source))
 }
 
 pub(crate) fn get_primary_keys_from_constraints(
@@ -986,6 +1017,7 @@ mod accelerator_compat_tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -2242,6 +2274,7 @@ mod accelerator_compat_tests {
                     file_type: String::new(),
                     table_partition_cols: vec![],
                     if_not_exists: true,
+                    or_replace: false,
                     definition: None,
                     order_exprs: vec![],
                     unbounded: false,

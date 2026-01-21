@@ -53,7 +53,9 @@ use crate::{
 };
 use app::App;
 use datafusion::sql::TableReference;
-use futures::{StreamExt, future::join_all};
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+use futures::StreamExt;
+use futures::future::join_all;
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
@@ -935,6 +937,7 @@ impl Runtime {
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
+    #[cfg(any(feature = "duckdb", feature = "sqlite"))]
     pub(crate) async fn get_initialized_datasets(
         self: Arc<Self>,
         app: &Arc<App>,

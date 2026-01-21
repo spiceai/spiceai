@@ -507,12 +507,12 @@ impl PrimaryKeyValue {
     ///
     /// This is critical for data correctness: after a hash lookup, we must verify
     /// the actual key matches to handle hash collisions correctly.
+    ///
+    /// Returns `false` if the column doesn't exist or doesn't match.
     fn matches_batch(&self, batch: &RecordBatch, pk_column: &str) -> bool {
         let Ok(col_idx) = batch.schema().index_of(pk_column) else {
-            unreachable!(
-                "Primary key column '{}' missing from RecordBatch schema during index verification",
-                pk_column
-            );
+            // Column doesn't exist - no match
+            return false;
         };
         let column = batch.column(col_idx);
 

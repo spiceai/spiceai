@@ -175,6 +175,8 @@ jobs:
       - name: Validate datafusion-table-providers commit
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: bash .github/scripts/validate_table_providers_commit.sh
+        env:
+          BRANCH: spiceai-51
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}

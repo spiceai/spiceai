@@ -1314,10 +1314,6 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if any chunk write fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Progress tracking for S3 Express uploads adds necessary complexity"
-    )]
     async fn chunk_and_write_parallel(
         &self,
         mut stream: SendableRecordBatchStream,
@@ -1533,10 +1529,6 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the write operation fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Parallel chunked writing requires orchestration logic"
-    )]
     async fn chunk_and_write_parallel_to_snapshot(
         &self,
         mut stream: SendableRecordBatchStream,
@@ -3384,7 +3376,7 @@ impl CayenneTableProvider {
 
         // Union the filtered existing data with new input
         let union_plan: Arc<dyn ExecutionPlan> =
-            Arc::new(UnionExec::new(vec![filtered_existing, new_input]));
+            UnionExec::try_new(vec![filtered_existing, new_input])?;
 
         // Generate a new snapshot ID
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
@@ -4561,7 +4553,7 @@ impl TableProvider for CayenneTableProvider {
             // UNION the filtered main plan with unfiltered protected snapshot plans
             let mut all_plans = vec![filtered_main_plan];
             all_plans.extend(protected_snapshot_plans);
-            let union_plan = Arc::new(UnionExec::new(all_plans));
+            let union_plan: Arc<dyn ExecutionPlan> = UnionExec::try_new(all_plans)?;
 
             // Strip extra PK columns if needed
             if need_projection_strip {
@@ -5375,6 +5367,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,

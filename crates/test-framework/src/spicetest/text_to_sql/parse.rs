@@ -124,7 +124,8 @@ fn extract_tables_from_set_expr(
         | SetExpr::Insert(_)
         | SetExpr::Update(_)
         | SetExpr::Table(_)
-        | SetExpr::Delete(_) => {}
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_) => {}
     }
 }
 
@@ -177,7 +178,8 @@ fn extract_table_from_factor(
         | TableFactor::Pivot { .. }
         | TableFactor::Unpivot { .. }
         | TableFactor::MatchRecognize { .. }
-        | TableFactor::XmlTable { .. } => {}
+        | TableFactor::XmlTable { .. }
+        | TableFactor::SemanticView { .. } => {}
     }
 }
 
@@ -279,7 +281,8 @@ fn extract_projections_from_set_expr(
         | SetExpr::Insert(_)
         | SetExpr::Update(_)
         | SetExpr::Table(_)
-        | SetExpr::Delete(_) => {}
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_) => {}
     }
 }
 

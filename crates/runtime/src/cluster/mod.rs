@@ -704,7 +704,7 @@ pub async fn initialize_cluster_executor(
     let tls_enabled = client_tls_config.is_some();
     let config_producer_tls = client_tls_config.clone();
 
-    // Configure mTLS for executor-to-executor gRPC connections (e.g., shuffle fetch)
+    // Configure executor session config
     let config_producer: ConfigProducer = Arc::new(move || {
         let mut config = SessionConfig::new_with_ballista()
             .with_option_extension(SpiceClusterConfig::default())

@@ -99,21 +99,27 @@ impl JobStore {
 
     /// Generates a new unique job ID.
     ///
-    /// Returns a Databricks-style formatted ID like "01ABC-DEF-456-789".
+    /// Returns a Databricks-style formatted ID like "01ABC-DEF-456-7890AB".
     /// Uses `UUIDv7` which contains a millisecond timestamp plus random bits.
     #[must_use]
     pub fn generate_job_id() -> String {
-        // Format: 01ABC-DEF-456-789 style (Databricks-like)
-        // UUIDv7 structure: 48-bit timestamp (ms) + 4-bit version + 12-bit rand + 62-bit rand
-        // We use characters 0-16 to include timestamp + version + random bits for uniqueness
+        // Format: 01ABC-DEF-456-7890AB style (Databricks-like)
+        // UUIDv7 hex structure (32 chars):
+        //   0-11:  48-bit ms timestamp
+        //   12:    version nibble (always '7')
+        //   13-15: 12-bit random
+        //   16:    variant nibble (always '8'-'b', only 2 random bits)
+        //   17-31: 60-bit random
+        //
+        // For uniqueness we use timestamp prefix + random suffix from chars 17+
         let uuid = Uuid::now_v7();
         let hex = uuid.simple().to_string();
         format!(
             "{}-{}-{}-{}",
-            &hex[0..5],
-            &hex[5..8],
-            &hex[8..11],
-            &hex[11..14]
+            &hex[0..5],   // timestamp
+            &hex[5..8],   // timestamp
+            &hex[8..11],  // timestamp
+            &hex[17..23]  // 6 chars (24 bits) of pure randomness
         )
         .to_uppercase()
     }
@@ -704,12 +710,17 @@ mod tests {
 
     #[test]
     fn test_generate_job_id() {
-        let id1 = JobStore::generate_job_id();
-        let id2 = JobStore::generate_job_id();
+        // Generate multiple IDs to verify uniqueness
+        let ids: std::collections::HashSet<String> =
+            (0..100).map(|_| JobStore::generate_job_id()).collect();
 
-        // Even without sleep, UUIDv7 includes random bits that should differ
-        assert_ne!(id1, id2, "UUIDv7-based job IDs should be unique");
-        assert_eq!(id1.len(), 17); // 5 + 1 + 3 + 1 + 3 + 1 + 3
-        assert_eq!(id1.matches('-').count(), 3);
+        // All 100 IDs should be unique
+        assert_eq!(ids.len(), 100, "All generated job IDs should be unique");
+
+        // Verify format of generated IDs
+        for id in &ids {
+            assert_eq!(id.len(), 20, "Job ID should be 20 characters"); // 5 + 1 + 3 + 1 + 3 + 1 + 6
+            assert_eq!(id.matches('-').count(), 3, "Job ID should have 3 dashes");
+        }
     }
 }

@@ -220,7 +220,7 @@ async fn gather_and_limit_providers(
     }
 
     Ok(Arc::new(GlobalLimitExec::new(
-        Arc::new(UnionExec::new(physical_plans)),
+        UnionExec::try_new(physical_plans)?,
         0,
         limit,
     )))

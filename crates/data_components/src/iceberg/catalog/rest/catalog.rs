@@ -194,18 +194,10 @@ mod tests {
             .await;
         println!("{tables:?}");
 
-        let table = catalog
-            .load_table(&TableIdent::new(
-                NamespaceIdent::new("nyc".to_string()),
-                "taxis".to_string(),
-            ))
-            .await
-            .expect("Failed to load table");
-        println!("{table:?}");
-
         let df_table_provider = IcebergTableProvider::try_new(
             Arc::new(catalog),
-            TableIdent::new(NamespaceIdent::new("nyc".to_string()), "taxis".to_string()),
+            NamespaceIdent::new("nyc".to_string()),
+            "taxis".to_string(),
         )
         .await
         .expect("Failed to create table provider");

@@ -1987,3 +1987,761 @@ fn test_max_hash_normalized() {
         "Insert with hash=u64::MAX-1 should fail because u64::MAX normalizes to u64::MAX-1"
     );
 }
+
+// =============================================================================
+// Error Handling Tests
+// =============================================================================
+
+#[test]
+fn test_error_key_column_not_found() {
+    let batch = create_int64_batch(vec![1, 2, 3]);
+    let partitions = vec![vec![batch]];
+
+    let result = HashIndexBuilder::new(vec!["nonexistent_column".to_string()]).build(&partitions);
+
+    let err = result.expect_err("should fail with missing column");
+    let err_msg = format!("{err}");
+    assert!(
+        err_msg.contains("not found"),
+        "Error should mention column not found: {err_msg}"
+    );
+}
+
+#[test]
+fn test_error_empty_key_columns() {
+    let batch = create_int64_batch(vec![1, 2, 3]);
+    let partitions = vec![vec![batch]];
+
+    // Empty key columns list should error
+    let result = HashIndexBuilder::new(vec![]).build(&partitions);
+
+    let err = result.expect_err("should fail with empty key columns");
+    let err_msg = format!("{err}");
+    assert!(
+        err_msg.contains("not found") || err_msg.contains("no columns"),
+        "Error should mention missing columns: {err_msg}"
+    );
+}
+
+#[test]
+fn test_error_unsupported_key_type_timestamp() {
+    use arrow::array::TimestampNanosecondArray;
+
+    // Timestamp types fall back to RowConverter which should work
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        false,
+    )]));
+    let array = TimestampNanosecondArray::from(vec![1_000_000_000, 2_000_000_000]);
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+
+    // Timestamp should work via RowConverter fallback
+    let result = HashIndexBuilder::new(vec!["ts".to_string()]).build(&partitions);
+    assert!(
+        result.is_ok(),
+        "Timestamp should work via RowConverter: {:?}",
+        result.err()
+    );
+}
+
+// =============================================================================
+// Builder Configuration Tests
+// =============================================================================
+
+#[test]
+fn test_try_build_below_threshold_returns_none() {
+    let batch = create_int64_batch(vec![1, 2, 3, 4, 5]);
+    let partitions = vec![vec![batch]];
+
+    // Set threshold higher than row count
+    let result = HashIndexBuilder::new(vec!["id".to_string()])
+        .with_min_rows_threshold(100)
+        .try_build(&partitions)
+        .expect("try_build should succeed");
+
+    assert!(
+        result.is_none(),
+        "Should return None when below threshold (5 rows < 100 threshold)"
+    );
+}
+
+#[test]
+fn test_try_build_above_threshold_returns_some() {
+    let ids: Vec<i64> = (0..1000).collect();
+    let batch = create_int64_batch(ids);
+    let partitions = vec![vec![batch]];
+
+    let result = HashIndexBuilder::new(vec!["id".to_string()])
+        .with_min_rows_threshold(100)
+        .try_build(&partitions)
+        .expect("try_build should succeed");
+
+    assert!(
+        result.is_some(),
+        "Should return Some when above threshold (1000 rows > 100 threshold)"
+    );
+    assert_eq!(result.as_ref().map(HashIndex::len), Some(1000));
+}
+
+#[test]
+fn test_builder_with_bloom_filter_disabled() {
+    let batch = create_int64_batch(vec![1, 2, 3]);
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .with_bloom_filter(false)
+        .build(&partitions)
+        .expect("failed to build index");
+
+    assert!(!index.has_bloom_filter());
+    // Lookups should still work
+    assert!(index.get(&1_i64).is_some());
+}
+
+#[test]
+fn test_builder_with_expected_rows() {
+    let ids: Vec<i64> = (0..100).collect();
+    let batch = create_int64_batch(ids);
+    let partitions = vec![vec![batch]];
+
+    // Pre-size for 1000 rows
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .with_expected_rows(1000)
+        .build(&partitions)
+        .expect("failed to build index");
+
+    assert_eq!(index.len(), 100);
+    // Verify lookups work
+    assert!(index.get(&50_i64).is_some());
+}
+
+// =============================================================================
+// Clone and Contains Tests
+// =============================================================================
+
+#[test]
+fn test_hash_index_clone() {
+    let ids: Vec<i64> = (0..100).collect();
+    let batch = create_int64_batch(ids.clone());
+    let partitions = vec![vec![batch]];
+
+    let original = HashIndexBuilder::new(vec!["id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    let cloned = original.clone();
+
+    // Both should have same content
+    assert_eq!(original.len(), cloned.len());
+    for id in &ids {
+        assert_eq!(original.get(id), cloned.get(id));
+    }
+
+    // Modifying clone should not affect original
+    let new_hash = hash_key(&999_i64);
+    cloned.insert(new_hash, RowLocation::simple(0, 999));
+
+    assert_eq!(cloned.len(), 101);
+    assert_eq!(original.len(), 100);
+}
+
+#[test]
+fn test_contains_method() {
+    let batch = create_int64_batch(vec![1, 2, 3]);
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    assert!(index.contains(hash_key(&1_i64)));
+    assert!(index.contains(hash_key(&2_i64)));
+    assert!(index.contains(hash_key(&3_i64)));
+    assert!(!index.contains(hash_key(&999_i64)));
+}
+
+// =============================================================================
+// Binary Key Tests
+// =============================================================================
+
+#[test]
+fn test_binary_key_extraction() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Binary, false)]));
+    let array = BinaryArray::from(vec![
+        b"key1".as_slice(),
+        b"key2".as_slice(),
+        b"\x00\x01\x02".as_slice(),
+    ]);
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    assert_eq!(index.len(), 3);
+    // Verify all keys are indexed
+    assert!(index.get(&b"key1".as_slice()).is_some());
+    assert!(index.get(&b"key2".as_slice()).is_some());
+    assert!(index.get(&b"\x00\x01\x02".as_slice()).is_some());
+}
+
+#[test]
+fn test_binary_key_with_nulls() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Binary, true)]));
+    let array = BinaryArray::from(vec![
+        Some(b"key1".as_slice()),
+        None,
+        Some(b"key3".as_slice()),
+    ]);
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // Null row should be excluded
+    assert_eq!(index.len(), 2);
+}
+
+#[test]
+fn test_large_binary_array() {
+    use arrow::array::LargeBinaryArray;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::LargeBinary,
+        false,
+    )]));
+    let array = LargeBinaryArray::from(vec![b"largekey1".as_slice(), b"largekey2".as_slice()]);
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    assert_eq!(index.len(), 2);
+}
+
+#[test]
+fn test_large_string_array() {
+    use arrow::array::LargeStringArray;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::LargeUtf8,
+        false,
+    )]));
+    let array = LargeStringArray::from(vec!["large_str_1", "large_str_2", "large_str_3"]);
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    assert_eq!(index.len(), 3);
+}
+
+// =============================================================================
+// Composite Key Advanced Tests
+// =============================================================================
+
+#[test]
+fn test_composite_key_with_all_nulls_row_skipped() {
+    // Test that a row with null values in ANY composite key column is skipped.
+    // This is the correct behavior, matching single-column null handling.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let id_array = Int64Array::from(vec![Some(1), None, Some(3)]);
+    let name_array = StringArray::from(vec![Some("alice"), None, Some("carol")]);
+
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)])
+        .expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string(), "name".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // Row 1 (index 1) has null in both columns, so it should be skipped.
+    // Only rows 0 and 2 should be indexed.
+    assert_eq!(index.len(), 2);
+}
+
+#[test]
+fn test_composite_key_four_columns() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, false),
+        Field::new("year", DataType::Int32, false),
+        Field::new("month", DataType::Int32, false),
+        Field::new("product_id", DataType::Int64, false),
+    ]));
+
+    let region_array = StringArray::from(vec!["US", "US", "EU"]);
+    let year_array = Int32Array::from(vec![2024, 2024, 2024]);
+    let month_array = Int32Array::from(vec![1, 2, 1]);
+    let product_id_array = Int64Array::from(vec![100, 100, 100]);
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(region_array),
+            Arc::new(year_array),
+            Arc::new(month_array),
+            Arc::new(product_id_array),
+        ],
+    )
+    .expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec![
+        "region".to_string(),
+        "year".to_string(),
+        "month".to_string(),
+        "product_id".to_string(),
+    ])
+    .build(&partitions)
+    .expect("failed to build index");
+
+    assert_eq!(index.len(), 3);
+}
+
+// =============================================================================
+// Bloom Filter Edge Cases
+// =============================================================================
+
+#[test]
+fn test_bloom_filter_memory_usage_bytes() {
+    use crate::BloomFilter;
+
+    let bloom = BloomFilter::new(1000);
+    // memory_usage and memory_usage_bytes should return the same value
+    assert_eq!(bloom.memory_usage(), bloom.memory_usage_bytes());
+}
+
+#[test]
+fn test_bloom_filter_with_zero_items() {
+    use crate::BloomFilter;
+
+    // A bloom filter sized for 0 items should have minimum capacity
+    let bloom = BloomFilter::new(0);
+    assert!(!bloom.is_empty(), "Should have minimum capacity, not empty");
+    assert!(bloom.num_bits() >= 64, "Should have at least 64 bits");
+}
+
+#[test]
+fn test_empty_bloom_filter_always_positive() {
+    use crate::BloomFilter;
+
+    let bloom = BloomFilter::empty();
+    assert!(bloom.is_empty());
+    // Empty bloom filter always returns true (must fall through to hash table)
+    assert!(bloom.might_contain(0));
+    assert!(bloom.might_contain(12345));
+    assert!(bloom.might_contain(u64::MAX));
+}
+
+// =============================================================================
+// HashIndex Constructor Variants
+// =============================================================================
+
+#[test]
+fn test_hash_index_with_capacity() {
+    let index = HashIndex::with_capacity(vec!["id".to_string()], 10000);
+
+    assert!(index.is_empty());
+    assert_eq!(index.len(), 0);
+
+    // Should be able to insert efficiently
+    for i in 0..1000_i64 {
+        let hash = hash_key(&i);
+        index.insert(hash, RowLocation::simple(0, i as u32));
+    }
+
+    assert_eq!(index.len(), 1000);
+}
+
+#[test]
+fn test_hash_index_with_bloom_filter() {
+    let index = HashIndex::with_bloom_filter(vec!["id".to_string()], 1000);
+
+    assert!(index.has_bloom_filter());
+    assert!(index.is_empty());
+
+    // Insert some entries
+    for i in 0..100_i64 {
+        let hash = hash_key(&i);
+        index.insert(hash, RowLocation::simple(0, i as u32));
+    }
+
+    // Bloom filter should work
+    assert!(index.might_contain(hash_key(&50_i64)));
+}
+
+#[test]
+fn test_hash_index_builder_method() {
+    let builder = HashIndex::builder(vec!["id".to_string()]);
+    let batch = create_int64_batch(vec![1, 2, 3]);
+    let partitions = vec![vec![batch]];
+
+    let index = builder.build(&partitions).expect("failed to build");
+    assert_eq!(index.len(), 3);
+}
+
+// =============================================================================
+// Debug and Display Tests
+// =============================================================================
+
+#[test]
+fn test_hash_index_debug() {
+    let batch = create_int64_batch(vec![1, 2, 3]);
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    let debug_str = format!("{index:?}");
+    assert!(debug_str.contains("HashIndex"));
+    assert!(debug_str.contains("len"));
+    assert!(debug_str.contains("key_columns"));
+}
+
+#[test]
+fn test_row_location_default() {
+    let loc = RowLocation::default();
+    assert_eq!(loc.partition, 0);
+    assert_eq!(loc.batch, 0);
+    assert_eq!(loc.row, 0);
+}
+
+// =============================================================================
+// Memory Usage Tests
+// =============================================================================
+
+#[test]
+fn test_memory_usage_bytes() {
+    let ids: Vec<i64> = (0..10000).collect();
+    let batch = create_int64_batch(ids);
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .with_bloom_filter(true)
+        .build(&partitions)
+        .expect("failed to build index");
+
+    let memory = index.memory_usage_bytes();
+    // Should be reasonable for 10k entries
+    // Each slot is ~16 bytes, with 256 shards
+    assert!(
+        memory > 0,
+        "Memory usage should be positive: {memory} bytes"
+    );
+    assert!(
+        memory < 10_000_000,
+        "Memory usage should be reasonable: {memory} bytes"
+    );
+}
+
+// =============================================================================
+// Stress Tests for Linear Probing
+// =============================================================================
+
+#[test]
+fn test_delete_chain_maintenance() {
+    // Test that backward-shift deletion maintains probe chains correctly
+    let index = HashIndex::new(vec!["id".to_string()]);
+
+    // Insert 1000 entries
+    for i in 0..1000_i64 {
+        let hash = hash_key(&i);
+        index.insert(hash, RowLocation::simple(0, i as u32));
+    }
+
+    // Delete every third entry
+    for i in (0..1000_i64).step_by(3) {
+        let hash = hash_key(&i);
+        index.remove(hash);
+    }
+
+    // Verify remaining entries are still findable
+    for i in 0..1000_i64 {
+        if i % 3 == 0 {
+            assert!(
+                index.get(&i).is_none(),
+                "Deleted key {i} should not be found"
+            );
+        } else {
+            assert!(
+                index.get(&i).is_some(),
+                "Key {i} should still be findable after nearby deletions"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_insert_delete_insert_cycle() {
+    let index = HashIndex::new(vec!["id".to_string()]);
+
+    // Perform multiple cycles of insert-delete-insert
+    for cycle in 0..5 {
+        // Insert 100 entries
+        for i in 0..100_i64 {
+            let key = cycle * 1000 + i;
+            let hash = hash_key(&key);
+            // Both outcomes are acceptable: successful insert or hash collision
+            // with a key from a previous cycle that wasn't deleted
+            let _ = index.insert(hash, RowLocation::simple(cycle as u32, i as u32));
+        }
+
+        // Delete half
+        for i in 0..50_i64 {
+            let key = cycle * 1000 + i;
+            let hash = hash_key(&key);
+            index.remove(hash);
+        }
+    }
+
+    // Verify index is in consistent state
+    assert!(!index.is_empty(), "Index should have some entries");
+}
+
+// =============================================================================
+// index_threshold Function Tests
+// =============================================================================
+
+#[test]
+fn test_index_threshold_calculation() {
+    use crate::index_threshold;
+
+    // With parallelism = 1
+    assert_eq!(index_threshold(1), 256);
+
+    // With parallelism = 8 (common default)
+    assert_eq!(index_threshold(8), 2048);
+
+    // With parallelism = 64
+    assert_eq!(index_threshold(64), 16384);
+}
+
+// =============================================================================
+// Batch Bloom Filter Tests
+// =============================================================================
+
+#[test]
+fn test_batch_bloom_filter_from() {
+    use crate::{BatchBloomFilter, BloomFilter};
+
+    let bloom = BloomFilter::new(100);
+    let mut batch_bloom: BatchBloomFilter = bloom.into();
+
+    // Should work as expected
+    batch_bloom.inner_mut().insert(12345);
+    assert!(batch_bloom.inner().might_contain(12345));
+}
+
+// =============================================================================
+// Bug Regression Tests
+// =============================================================================
+
+/// Bug #1: RowConverterKeyExtractor::hash_key should return None for rows with null keys
+/// in composite key columns, but it currently always returns Some.
+///
+/// For single-column keys (primitive, string, binary), null values correctly return None
+/// and are excluded from the index. Composite keys should behave the same way.
+///
+/// Verify that composite keys with null values in any column are correctly excluded.
+#[test]
+fn test_composite_key_null_values_excluded() {
+    // Create a batch with composite key where one row has null in the key column
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, true), // nullable
+        Field::new("id", DataType::Int64, false),
+    ]));
+
+    let region_array = StringArray::from(vec![Some("US"), None, Some("EU")]);
+    let id_array = Int64Array::from(vec![1, 2, 3]);
+
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(region_array), Arc::new(id_array)])
+        .expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["region".to_string(), "id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // Row 1 has null in region column, so it should be excluded.
+    // Only rows 0 (US, 1) and 2 (EU, 3) should be indexed.
+    assert_eq!(
+        index.len(),
+        2,
+        "Composite key with null value should NOT be indexed"
+    );
+}
+
+/// Test that null in the second column of a composite key also excludes the row.
+#[test]
+fn test_composite_key_null_in_second_column_excluded() {
+    // Create a batch where the null is in the second key column
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, true), // nullable in second column
+    ]));
+
+    let region_array = StringArray::from(vec!["US", "EU", "APAC"]);
+    let id_array = Int64Array::from(vec![Some(1), None, Some(3)]);
+
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(region_array), Arc::new(id_array)])
+        .expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["region".to_string(), "id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // Row 1 (EU, null) should be excluded because id is null
+    // Only rows 0 (US, 1) and 2 (APAC, 3) should be indexed
+    assert_eq!(
+        index.len(),
+        2,
+        "Composite key with null in any column should NOT be indexed"
+    );
+}
+
+/// Additional test: Verify single-column nullable key correctly excludes nulls
+/// (This should pass - it's the baseline correct behavior)
+#[test]
+fn test_single_column_null_key_excluded_baseline() {
+    // Single column with nulls - should correctly exclude null rows
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let id_array = Int64Array::from(vec![Some(1), None, Some(3)]);
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(id_array)]).expect("failed to create batch");
+
+    let partitions = vec![vec![batch]];
+
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .build(&partitions)
+        .expect("failed to build index");
+
+    // This correctly excludes null - only 2 rows indexed
+    assert_eq!(
+        index.len(),
+        2,
+        "Single column null key should be excluded (this is correct behavior)"
+    );
+}
+
+/// Bug #2: Race condition in insert_or_replace length tracking.
+///
+/// The insert_or_replace method reads shard.len() before and after the operation
+/// using separate lock acquisitions, creating a TOCTOU race condition.
+///
+/// This test attempts to trigger the race by having multiple threads do
+/// concurrent insert_or_replace operations on overlapping keys.
+#[test]
+fn test_concurrent_insert_or_replace_length_correctness() {
+    let index = Arc::new(HashIndex::new(vec!["id".to_string()]));
+    let num_threads = 8;
+    let ops_per_thread = 1000;
+
+    // All threads will insert/replace the same set of 100 keys
+    // This maximizes contention and likelihood of hitting the race
+    let keys: Vec<i64> = (0..100).collect();
+
+    let handles: Vec<_> = (0..num_threads)
+        .map(|thread_id| {
+            let index = Arc::clone(&index);
+            let keys = keys.clone();
+
+            thread::spawn(move || {
+                for op in 0..ops_per_thread {
+                    let key = keys[op % keys.len()];
+                    let hash = hash_key(&key);
+                    let loc = RowLocation::simple(thread_id as u32, op as u32);
+                    index.insert_or_replace(hash, loc);
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("thread panicked");
+    }
+
+    let final_len = index.len();
+
+    // With the race condition, the final_len may not equal the number of unique keys (100)
+    // because the len counter can get out of sync.
+    //
+    // A correct implementation should always have exactly 100 entries.
+    // Note: The race may not manifest every run, but repeated runs should catch it.
+    assert_eq!(
+        final_len, 100,
+        "After concurrent insert_or_replace of 100 unique keys, index should have exactly 100 entries. \
+         Got {final_len}. This may indicate a race condition in length tracking."
+    );
+
+    // Additional sanity check: verify all 100 keys are actually in the index
+    for key in &keys {
+        assert!(
+            index.get(key).is_some(),
+            "Key {key} should be in index after insert_or_replace"
+        );
+    }
+}
+
+/// Stress test for insert_or_replace to detect length counter drift over time.
+#[test]
+fn test_insert_or_replace_length_consistency() {
+    let index = HashIndex::new(vec!["id".to_string()]);
+
+    // Insert 1000 unique keys
+    for i in 0..1000_i64 {
+        let hash = hash_key(&i);
+        index.insert_or_replace(hash, RowLocation::simple(0, i as u32));
+    }
+
+    assert_eq!(
+        index.len(),
+        1000,
+        "Should have 1000 entries after initial insert"
+    );
+
+    // Replace all 1000 keys with new locations - len should stay the same
+    for i in 0..1000_i64 {
+        let hash = hash_key(&i);
+        index.insert_or_replace(hash, RowLocation::simple(1, i as u32));
+    }
+
+    assert_eq!(
+        index.len(),
+        1000,
+        "Length should remain 1000 after replacing all keys (no new entries)"
+    );
+
+    // Verify all keys point to the new locations
+    for i in 0..1000_i64 {
+        let loc = index.get(&i).expect("key should exist");
+        assert_eq!(loc.batch, 1, "Key {i} should have been replaced to batch 1");
+    }
+}
