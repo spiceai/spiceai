@@ -857,7 +857,7 @@ pub fn get_tpcds_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
             64  // OUT_OF_MEMORY ERROR https://github.com/spiceai/spiceai/issues/8765
         ),
         Some(QueryOverrides::Cayenne) => remove_tpcds_query!(
-            queries, 34  // https://github.com/spiceai/spiceai/issues/9037
+            queries, 34 // https://github.com/spiceai/spiceai/issues/9037
         ),
         Some(_) | None => queries,
     }
