@@ -350,9 +350,7 @@ pub enum Error {
     ))]
     UnsupportedRefreshCompleteForStream,
 
-    #[snafu(display(
-        "Caching refresh mode only supports 'time_interval' for snapshots_trigger"
-    ))]
+    #[snafu(display("Caching refresh mode only supports 'time_interval' for snapshots_trigger"))]
     UnsupportedSnapshotTriggerForCaching,
 
     #[snafu(display(

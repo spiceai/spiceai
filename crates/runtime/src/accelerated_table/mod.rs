@@ -692,6 +692,7 @@ impl Builder {
                 self.dataset_name.to_string(),
                 Arc::clone(&accelerator_write_mutex),
                 Arc::clone(&in_flight_revalidations),
+                Arc::clone(&last_updated_at),
             );
             // The consumer task will be automatically stopped (aborted) when AcceleratedTable is dropped
             handlers.push(consumer_handle);
@@ -923,13 +924,19 @@ impl AcceleratedTable {
         Ok(filters_to_reapply)
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     fn update_last_updated_at(&self) {
+        Self::set_timestamp_to_now(&self.last_updated_at);
+    }
+
+    /// Sets an `AtomicI64` timestamp to the current time in milliseconds.
+    /// Used by both `AcceleratedTable` instance methods and the caching background task.
+    #[expect(clippy::cast_possible_truncation)]
+    pub(crate) fn set_timestamp_to_now(last_updated_at: &AtomicI64) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        self.last_updated_at.store(now_ms, Ordering::Release);
+        last_updated_at.store(now_ms, Ordering::Release);
     }
 }
 
