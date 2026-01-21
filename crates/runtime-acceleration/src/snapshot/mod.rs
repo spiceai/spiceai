@@ -1093,12 +1093,6 @@ impl SnapshotManager {
             return Ok(None);
         };
 
-        tracing::info!(
-            "Downloading current snapshot. dataset={} snapshot={} sha={sha}",
-            self.dataset_name,
-            current_entry.snapshot,
-            sha = current_entry.snapshot_checksum.as_str(),
-        );
         self.download_snapshot_entry(&current_entry, &dataset_metadata, checkpointer_factory)
             .await
             .map(Some)
