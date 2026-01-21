@@ -296,7 +296,7 @@ tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 turso = { version = "0.3.2", default-features = false, features = ["experimental_indexes"] }
 twox-hash = "2.1.2"
-url = "2.5"
+url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util" }
 uuid = "1"
 # We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
