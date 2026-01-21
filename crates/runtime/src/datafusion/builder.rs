@@ -55,7 +55,9 @@ use {
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
+#[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
@@ -88,7 +90,7 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .enable_ident_normalization = false;
 
     df_config.options_mut().optimizer.expand_views_at_output = true;
-    df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
+    df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
     df_config
         .options_mut()
         .execution

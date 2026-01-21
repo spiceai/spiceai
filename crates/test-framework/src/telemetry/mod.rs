@@ -158,35 +158,24 @@ impl Telemetry {
                             .await?,
                     );
 
-                    let mut rm = ResourceMetrics {
-                        resource: self.resource.clone(),
-                        scope_metrics: vec![],
-                    };
+                    let mut rm = ResourceMetrics::default();
 
                     self.reader.collect(&mut rm)?;
 
-                    // Replace the resource from the provider with our potentially deferred resource.
-                    // The provider was initialized with an empty resource, but we set the
-                    // actual resource later via set_resource() once all attributes are known.
-                    rm.resource = self.resource.clone();
+                    // Note: In OpenTelemetry SDK 0.31+, ResourceMetrics.resource is set by the
+                    // pipeline during collection and cannot be overridden.
 
-                    telemetry_exporter
-                        .export(&mut rm)
-                        .await
-                        .unwrap_or_else(|err| {
-                            println!("Failed to export initial telemetry: {err:?}");
-                        });
+                    telemetry_exporter.export(&rm).await.unwrap_or_else(|err| {
+                        println!("Failed to export initial telemetry: {err:?}");
+                    });
                 } else {
                     println!("No API key provided, telemetry is disabled");
                 }
             }
             TelemetryBackend::Otlp(config) => {
-                let mut rm = ResourceMetrics {
-                    resource: self.resource.clone(),
-                    scope_metrics: vec![],
-                };
+                let mut rm = ResourceMetrics::default();
+                // Note: Resource is set by the pipeline during collection.
                 self.reader.collect(&mut rm)?;
-                rm.resource = self.resource.clone();
 
                 let exporter = MetricExporter::builder()
                     .with_tonic()
@@ -194,7 +183,7 @@ impl Telemetry {
                     .with_endpoint(config.endpoint.as_ref())
                     .build()?;
                 exporter
-                    .export(&mut rm)
+                    .export(&rm)
                     .await
                     .unwrap_or_else(|err| println!("Failed to export OTLP telemetry: {err:?}"));
             }

@@ -26,6 +26,7 @@ pub mod responses;
 pub mod models;
 pub mod nsql;
 pub mod packages;
+pub mod queries;
 pub mod query;
 pub mod ready;
 pub mod search;

@@ -32,12 +32,19 @@ mod common;
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use arrow::record_batch::RecordBatch;
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+
 use data_components::delete::DeletionTableProvider;
+
 use datafusion::prelude::{col, lit, Expr, SessionContext};
+
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };

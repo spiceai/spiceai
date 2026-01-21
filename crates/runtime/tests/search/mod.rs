@@ -59,17 +59,17 @@ use std::{
 };
 
 use super::models::sort_json_keys;
+#[cfg(feature = "s3_vectors")]
+use crate::search::s3_vectors::prepare_for_aws_tests;
 use crate::{
     DEFAULT_TRACING_MODELS, configure_test_datafusion, init_tracing,
     models::{create_api_bindings_config, http_post, search::replace_s3_vector_index_names},
-    search::{
-        s3_vectors::prepare_for_aws_tests,
-        tables::{SearchTable, enrich_table},
-    },
+    search::tables::{SearchTable, enrich_table},
     utils::{init_tracing_with_task_history, runtime_ready_check, test_request_context},
 };
 
 pub mod megascience;
+#[cfg(feature = "s3_vectors")]
 mod s3_vectors;
 mod tables;
 
@@ -150,7 +150,7 @@ impl AccelerationOptions {
                 engine: Some("duckdb".to_string()),
                 mode: Mode::File,
                 params: Some(spicepod::param::Params::from_string_map(HashMap::from([(
-                    "duckdb_file_path".to_string(),
+                    "duckdb_file".to_string(),
                     format!(".spice/data/duckdb_acceleration_{unique_id}.db"),
                 )]))),
                 ..Default::default()
@@ -280,6 +280,8 @@ async fn test_megascience_permutations(
     )]
     column_config: megascience::ColumnConfigOptions,
 ) {
+    use runtime::spice_data_base_path;
+
     let slug =
         format!("{acceleration_opt}-{vector_engine}-{table_option}-{column_config}_megascience");
     if let Err(e) = validate_combination(
@@ -297,6 +299,7 @@ async fn test_megascience_permutations(
     // use some hash of slug
     let mut z = DefaultHasher::new();
     slug.hash(&mut z);
+    std::fs::create_dir_all(spice_data_base_path()).expect("failed to create spice data base path");
     let acceleration = acceleration_opt.to_acceleration(&z.finish().to_string());
 
     let mut app = AppBuilder::new(slug);
@@ -320,6 +323,7 @@ async fn test_megascience_permutations(
             )),
         );
     }
+    #[cfg(feature = "s3_vectors")]
     prepare_for_aws_tests(&vector_store, vector_store.enabled)
         .await
         .expect("could not prepare vector store for tests");

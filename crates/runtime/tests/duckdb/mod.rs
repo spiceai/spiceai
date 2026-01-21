@@ -804,3 +804,163 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
         }))
         .await
 }
+
+/// Test that verifies `DuckDB` connection pool handles concurrent queries correctly.
+///
+/// **Critical for**: `duckdb-rs` fork (`spiceai/duckdb-rs`, spiceai-57)
+///
+/// This test exercises the connection pool improvements in the duckdb-rs fork by
+/// running multiple concurrent queries against a DuckDB-accelerated dataset.
+/// The connection pool must efficiently manage connections and avoid deadlocks
+/// or connection exhaustion under concurrent load.
+///
+/// **Patches tested**:
+/// - Connection pool improvements for memory allocation
+/// - Arrow 57 compatibility in duckdb-rs
+/// - `register_arrow_scan_view` method for arrow stream support
+///
+/// **What happens without the patch**: Concurrent queries may fail with connection
+/// errors, deadlocks, or memory issues due to inefficient connection handling.
+#[tokio::test]
+async fn test_duckdb_connection_pool_concurrent_queries() -> Result<(), String> {
+    use spicepod::param::Params;
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = std::env::temp_dir().join("spiced_duckdb_pool_test");
+            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+            defer! {
+                let _ = std::fs::remove_dir_all(&temp_dir);
+            }
+
+            // Create a CSV file with more data for meaningful concurrent queries
+            let csv_file = temp_dir.join("test_concurrent.csv");
+            let mut csv_content = String::from("id,category,value\n");
+            for i in 1..=1000 {
+                let _ = writeln!(csv_content, "{},{},{}", i, ['A', 'B', 'C'][i % 3], i * 10);
+            }
+            std::fs::write(&csv_file, csv_content).expect("failed to write csv");
+
+            let mut accel_params = HashMap::new();
+            // Use memory mode for faster operations
+            accel_params.insert("duckdb_memory_limit".to_string(), "256MB".to_string());
+
+            let mut dataset = Dataset::new(
+                format!("file:{}", csv_file.display()),
+                "concurrent_test".to_string(),
+            );
+            dataset.name = "concurrent_test".to_string();
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Full),
+                params: Some(Params::from_string_map(accel_params)),
+                ..Acceleration::default()
+            });
+
+            let app = AppBuilder::new("duckdb_pool_test")
+                .with_dataset(dataset)
+                .build();
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Run multiple concurrent queries to test connection pool
+            let queries = [
+                "SELECT COUNT(*) FROM concurrent_test",
+                "SELECT category, SUM(value) FROM concurrent_test GROUP BY category",
+                "SELECT AVG(value) FROM concurrent_test WHERE category = 'A'",
+                "SELECT MAX(value), MIN(value) FROM concurrent_test",
+                "SELECT * FROM concurrent_test WHERE id < 100 ORDER BY id",
+                "SELECT category, COUNT(*) FROM concurrent_test GROUP BY category",
+                "SELECT value FROM concurrent_test WHERE value > 5000 ORDER BY value DESC LIMIT 10",
+                "SELECT DISTINCT category FROM concurrent_test ORDER BY category",
+            ];
+
+            let num_iterations = 3;
+            let mut handles = Vec::new();
+
+            for iteration in 0..num_iterations {
+                for (i, query) in queries.iter().enumerate() {
+                    let rt_clone = Arc::clone(&rt);
+                    let query = (*query).to_string();
+                    let handle = tokio::spawn(async move {
+                        let result = rt_clone
+                            .datafusion()
+                            .query_builder(&query)
+                            .build()
+                            .run()
+                            .await;
+
+                        match result {
+                            Ok(query_result) => {
+                                let batches: Result<Vec<RecordBatch>, _> =
+                                    query_result.data.try_collect().await;
+                                match batches {
+                                    Ok(b) => {
+                                        tracing::debug!(
+                                            "Query {}-{} completed: {} batches",
+                                            iteration,
+                                            i,
+                                            b.len()
+                                        );
+                                        Ok(())
+                                    }
+                                    Err(e) => {
+                                        Err(format!("Query {iteration}-{i} collection failed: {e}"))
+                                    }
+                                }
+                            }
+                            Err(e) => Err(format!("Query {iteration}-{i} execution failed: {e}")),
+                        }
+                    });
+                    handles.push(handle);
+                }
+            }
+
+            // Wait for all concurrent queries to complete
+            let results: Vec<_> = futures::future::join_all(handles).await;
+
+            // Check for any failures
+            let mut errors = Vec::new();
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => errors.push(format!("Task {i}: {e}")),
+                    Err(e) => errors.push(format!("Task {i} panicked: {e}")),
+                }
+            }
+
+            if !errors.is_empty() {
+                return Err(format!(
+                    "DuckDB connection pool test FAILED - {} queries failed out of {}:\n{}",
+                    errors.len(),
+                    num_iterations * queries.len(),
+                    errors.join("\n")
+                ));
+            }
+
+            tracing::info!(
+                "DuckDB connection pool test PASSED - {} concurrent queries completed successfully",
+                num_iterations * queries.len()
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}

@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::accelerated_table::SnapshotCreateTrigger;
-use crate::accelerated_table::refresh::DatasetReadyNotification;
+use crate::status::RuntimeStatus;
 use arrow_schema::Schema;
 use datafusion::common::TableReference;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -44,7 +44,7 @@ pub type SnapshotCallback =
 
 /// Spawns a task that periodically creates snapshots at the specified interval.
 ///
-/// If `dataset_ready_notification` is provided, the task will wait for the dataset to be ready
+/// If `runtime_status` is provided, the task will wait for the dataset to be ready
 /// before starting the snapshot interval loop. This prevents creating snapshots before
 /// the dataset has finished its initial load or bootstrap.
 ///
@@ -58,9 +58,9 @@ pub fn spawn_snapshot_interval_task(
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: TableReference,
     federated_schema: Arc<Schema>,
-    dataset_ready_notification: Option<Arc<DatasetReadyNotification>>,
+    runtime_status: Arc<RuntimeStatus>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
-    last_updated_at: Option<Arc<AtomicI64>>,
+    last_updated_at: Arc<AtomicI64>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
     let checkpointer = checkpointer?;
@@ -73,19 +73,12 @@ pub fn spawn_snapshot_interval_task(
 
     Some(tokio::spawn(async move {
         // Wait for the dataset to be ready before starting snapshot creation
-        if let Some(notify) = dataset_ready_notification {
-            tracing::debug!(
-                "Snapshot interval task for {dataset_name} waiting for dataset to be ready"
-            );
-            notify.wait().await;
-            tracing::debug!(
-                "Snapshot interval task for {dataset_name} starting after dataset ready"
-            );
-        } else {
-            tracing::debug!(
-                "Snapshot interval task for {dataset_name} starting immediately, no dataset_ready_notification provided"
-            );
-        }
+        tracing::debug!(
+            "Snapshot interval task for {dataset_name} waiting for dataset to be ready"
+        );
+        // Wait for the dataset to become ready
+        runtime_status.wait_for_dataset_ready(&dataset_name).await;
+        tracing::debug!("Snapshot interval task for {dataset_name} starting after dataset ready");
 
         // Determine initial delay based on bootstrapping status and checkpoint time
         let initial_delay = if bootstrap_status.is_bootstrapped() {
@@ -120,7 +113,7 @@ pub fn spawn_snapshot_interval_task(
                 &federated_schema,
                 &accelerator_write_mutex,
                 &dataset_name,
-                last_updated_at.as_ref(),
+                &last_updated_at,
             )
             .await;
 
@@ -132,7 +125,7 @@ pub fn spawn_snapshot_interval_task(
 
 /// Creates a callback that triggers snapshot creation after a specified number of batch updates.
 ///
-/// If `dataset_ready_notification` is provided, batch counting will only start after the dataset
+/// If `runtime_status` is provided, batch counting will only start after the dataset
 /// is ready. This prevents counting batches during the initial load/bootstrap phase.
 #[expect(clippy::too_many_arguments)]
 pub fn create_periodic_snapshot_callback(
@@ -142,8 +135,8 @@ pub fn create_periodic_snapshot_callback(
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: &TableReference,
     federated_schema: Arc<Schema>,
-    dataset_ready_notification: Option<Arc<DatasetReadyNotification>>,
-    last_updated_at: Option<Arc<AtomicI64>>,
+    runtime_status: Arc<RuntimeStatus>,
+    last_updated_at: Arc<AtomicI64>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
@@ -157,24 +150,20 @@ pub fn create_periodic_snapshot_callback(
             let batches_processed = Arc::new(RwLock::new(0i64));
 
             // Track whether the dataset is ready (batch counting should start)
-            let dataset_ready = Arc::new(AtomicBool::new(dataset_ready_notification.is_none()));
+            let dataset_ready = Arc::new(AtomicBool::new(false));
 
             // Spawn a task to set dataset_ready when notified
-            if let Some(notify) = dataset_ready_notification {
-                let dataset_ready_clone = Arc::clone(&dataset_ready);
-                let dataset_name_clone = dataset_name.clone();
-                tokio::spawn(async move {
-                    notify.wait().await;
-                    dataset_ready_clone.store(true, Ordering::Release);
-                    tracing::debug!(
-                        "Batch-based snapshot counting for {dataset_name_clone} starting after dataset ready"
-                    );
-                });
-            } else {
+            let dataset_ready_clone = Arc::clone(&dataset_ready);
+            let dataset_name_clone = dataset_name.clone();
+            tokio::spawn(async move {
+                runtime_status
+                    .wait_for_dataset_ready(&dataset_name_clone)
+                    .await;
+                dataset_ready_clone.store(true, Ordering::Release);
                 tracing::debug!(
-                    "Batch-based snapshot counting for {dataset_name} starting immediately, no dataset_ready_notification provided"
+                    "Batch-based snapshot counting for {dataset_name_clone} starting after dataset ready"
                 );
-            }
+            });
 
             let callback = Arc::new(Mutex::new(Box::new(move || {
                 let checkpointer = Arc::clone(&checkpointer);
@@ -184,7 +173,7 @@ pub fn create_periodic_snapshot_callback(
                 let federated_schema = Arc::<Schema>::clone(&federated_schema);
                 let dataset_name = dataset_name.clone();
                 let dataset_ready = Arc::clone(&dataset_ready);
-                let last_updated_at = last_updated_at.clone();
+                let last_updated_at = Arc::clone(&last_updated_at);
 
                 Box::pin(async move {
                     // Only count batches after the dataset is ready
@@ -204,7 +193,7 @@ pub fn create_periodic_snapshot_callback(
                             &federated_schema,
                             &accelerator_write_mutex,
                             &dataset_name,
-                            last_updated_at.as_ref(),
+                            &last_updated_at,
                         )
                         .await;
                     }
@@ -224,7 +213,7 @@ pub async fn create_checkpoint_and_snapshot(
     federated_schema: &Arc<Schema>,
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
-    last_updated_at: Option<&Arc<AtomicI64>>,
+    last_updated_at: &Arc<AtomicI64>,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     if let Err(e) = checkpointer.checkpoint(federated_schema).await {
@@ -233,7 +222,10 @@ pub async fn create_checkpoint_and_snapshot(
     }
 
     if let Some(snapshot_manager) = snapshot_manager {
-        let updated_at = last_updated_at.map(|a| a.load(Ordering::Acquire));
+        let updated_at = match last_updated_at.load(Ordering::Acquire) {
+            0 => None,
+            i => Some(i),
+        };
 
         match snapshot_manager
             .create_snapshot(federated_schema, lock_guard, updated_at)

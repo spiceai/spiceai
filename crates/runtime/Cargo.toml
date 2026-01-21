@@ -96,7 +96,7 @@ once_cell = "1.21.3"
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.30", features = [
+opentelemetry-proto = { version = "0.31", features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",
@@ -284,6 +284,7 @@ nfs = ["runtime-object-store/nfs"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
 openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 oracle = ["data_components/oracle"]
+pingora = ["cache/pingora"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",

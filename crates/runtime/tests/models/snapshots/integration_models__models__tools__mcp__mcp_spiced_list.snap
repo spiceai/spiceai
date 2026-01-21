@@ -4,61 +4,6 @@ expression: tools_list
 ---
 [
   {
-    "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
-    "name": "search",
-    "parameters": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "additional_columns": {
-          "default": [],
-          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "datasets": {
-          "default": null,
-          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "limit": {
-          "default": null,
-          "description": "Number of documents to return for each dataset",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "text": {
-          "description": "The text to search documents for similarity",
-          "type": "string"
-        },
-        "where": {
-          "default": null,
-          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "text"
-      ],
-      "title": "SearchRequestBaseJson",
-      "type": "object"
-    }
-  },
-  {
     "description": "Get the readiness status of the Spice.ai runtime",
     "name": "get_readiness",
     "parameters": null
@@ -83,61 +28,6 @@ expression: tools_list
         "last"
       ],
       "title": "LoadMemoryParams",
-      "type": "object"
-    }
-  },
-  {
-    "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
-    "name": "mcp_from_spiced/search",
-    "parameters": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "additional_columns": {
-          "default": [],
-          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "datasets": {
-          "default": null,
-          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "limit": {
-          "default": null,
-          "description": "Number of documents to return for each dataset",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "text": {
-          "description": "The text to search documents for similarity",
-          "type": "string"
-        },
-        "where": {
-          "default": null,
-          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "text"
-      ],
-      "title": "SearchRequestBaseJson",
       "type": "object"
     }
   },
@@ -238,6 +128,61 @@ expression: tools_list
         "limit"
       ],
       "title": "DistinctColumnsParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search across available, searchable datasets in Spice.ai runtime",
+    "name": "mcp_from_spiced/search",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "additional_columns": {
+          "default": [],
+          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "datasets": {
+          "default": null,
+          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Number of documents to return for each dataset",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "The text to search documents for similarity",
+          "type": "string"
+        },
+        "where": {
+          "default": null,
+          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "SearchRequestBaseJson",
       "type": "object"
     }
   },
@@ -403,6 +348,61 @@ expression: tools_list
         "limit"
       ],
       "title": "DistinctColumnsParams",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search across available, searchable datasets in Spice.ai runtime",
+    "name": "search",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "additional_columns": {
+          "default": [],
+          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "datasets": {
+          "default": null,
+          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Number of documents to return for each dataset",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "The text to search documents for similarity",
+          "type": "string"
+        },
+        "where": {
+          "default": null,
+          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "SearchRequestBaseJson",
       "type": "object"
     }
   },
