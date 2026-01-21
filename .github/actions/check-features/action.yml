@@ -35,7 +35,7 @@ runs:
       run: |
         echo "Excluding features: ${{ inputs.exclude_features }}"
         cargo hack check --each-feature --profile lint \
-          --exclude-features ${{ inputs.exclude_features }}
+          --exclude-features "${{ inputs.exclude_features }}"
 
     - name: Check runtime/openapi feature
       if: ${{ inputs.check_openapi == 'true' }}
