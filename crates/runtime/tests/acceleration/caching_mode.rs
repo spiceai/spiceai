@@ -943,6 +943,32 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
                 "Should have results from cache with no filters"
             );
 
+            // Query with specific projection (only 'content' column) and no filters
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .select(vec![col("content")])?
+                .limit(0, Some(1))?;
+
+            let batches = df.collect().await?;
+            assert!(
+                !batches.is_empty(),
+                "Should have results from cache with projection and no filters"
+            );
+            // Verify only the 'content' column is returned
+            assert_eq!(
+                batches[0].num_columns(),
+                1,
+                "Should only return the projected column"
+            );
+            assert_eq!(
+                batches[0].schema().field(0).name(),
+                "content",
+                "Should return the 'content' column"
+            );
+
             Ok(())
         })
         .await
