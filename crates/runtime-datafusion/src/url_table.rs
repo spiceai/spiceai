@@ -523,14 +523,13 @@ mod tests {
 
         // Without state set, try_new should return an error for valid URLs (including directories)
         let result = factory.try_new("s3://bucket/data.parquet").await;
-        assert!(result.is_err());
+        let _ = result.expect_err("should return error without state");
 
         let result = factory.try_new("s3://bucket/data/").await;
-        assert!(result.is_err());
+        let _ = result.expect_err("should return error without state");
 
         // Non-URL should return Ok(None)
         let result = factory.try_new("my_table").await;
-        assert!(result.is_ok());
         assert!(result.expect("should be Ok").is_none());
     }
 

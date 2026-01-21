@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
+use arrow::array::RecordBatch;
 use datafusion::prelude::*;
 use futures::StreamExt;
 
@@ -469,8 +470,8 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
 
 /// Test that URL tables can be queried directly via SQL API.
 ///
-/// This tests the DynamicUrlSchemaProvider and SpiceUrlTableFactory integration
-/// which enables queries like: SELECT * FROM 's3://bucket/path/'
+/// This tests the `DynamicUrlSchemaProvider` and `SpiceUrlTableFactory` integration
+/// which enables queries like: `SELECT * FROM 's3://bucket/path/'`
 #[tokio::test]
 async fn s3_url_table_sql_api() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,runtime_datafusion=debug,info"));
@@ -539,10 +540,10 @@ async fn s3_url_table_sql_api() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test that URL tables can be queried directly via DataFrame API.
+/// Test that URL tables can be queried directly via `DataFrame` API.
 ///
-/// This tests the DynamicUrlSchemaProvider integration with DataFusion's
-/// table() method for programmatic DataFrame access to S3 URLs.
+/// This tests the `DynamicUrlSchemaProvider` integration with `DataFusion`'s
+/// `table()` method for programmatic `DataFrame` access to S3 URLs.
 #[tokio::test]
 async fn s3_url_table_dataframe_api() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,runtime_datafusion=debug,info"));
@@ -609,7 +610,7 @@ async fn s3_url_table_dataframe_api() -> Result<(), anyhow::Error> {
             assert!(!batches.is_empty(), "Should have results after filtering");
 
             // Verify LIMIT is applied correctly
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
             assert!(
                 total_rows <= 5,
                 "LIMIT 5 should return at most 5 rows, got {total_rows}"
