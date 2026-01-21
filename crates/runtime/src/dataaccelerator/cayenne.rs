@@ -1143,7 +1143,7 @@ impl CayenneAccelerator {
             get_param("cayenne_s3_allow_http").is_some_and(|v| v.eq_ignore_ascii_case("true"));
         // Default to unsigned payload (true) for better performance; can be disabled if needed
         let s3_unsigned_payload = get_param("cayenne_s3_unsigned_payload")
-            .map_or(true, |v| !v.eq_ignore_ascii_case("false"));
+            .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
 
         // Extract zone ID from bucket name for S3 Express One Zone endpoint
         let zone_id = Self::extract_zone_id_from_bucket(bucket_name);

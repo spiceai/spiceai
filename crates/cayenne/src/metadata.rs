@@ -189,9 +189,14 @@ pub struct VortexConfig {
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
-    /// Each file uses multipart uploads internally via object_store.
+    /// Each file uses multipart uploads internally via `object_store`.
     /// Defaults to 4 for balanced I/O throughput vs resource usage.
+    #[serde(default = "default_upload_concurrency")]
     pub upload_concurrency: usize,
+}
+
+const fn default_upload_concurrency() -> usize {
+    4
 }
 
 impl Default for VortexConfig {
