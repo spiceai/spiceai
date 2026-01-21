@@ -8,7 +8,7 @@
 | Phase 2 | Task History with `scheduler_id` | ✅ Complete |
 | Phase 3 | GetTaskHistory RPC Implementation | ✅ Complete |
 | Phase 4 | Executor Control Stream | ✅ Complete |
-| Phase 5 | Cluster Metrics Endpoint | 🔲 Not Started |
+| Phase 5 | Cluster Metrics Endpoint | 🔄 In Progress |
 | Phase 6 | Wire Everything Together | 🔲 Not Started |
 
 ## Overview

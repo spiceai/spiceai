@@ -112,6 +112,8 @@ pub async fn start_internal_cluster_server(
         rt.scheduler_peers(),
         Arc::clone(&rt.df),
         Arc::clone(&executor_registry),
+        // TODO(Phase 6): Wire up MetricsReader from Runtime for cluster metrics collection
+        None,
     );
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 

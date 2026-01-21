@@ -105,6 +105,7 @@ mod metrics_server;
 pub mod model;
 mod opentelemetry;
 pub mod otel_push_exporter;
+pub mod metrics_reader;
 pub mod resource_monitor;
 
 pub use runtime_parameters as parameters;
@@ -899,7 +900,8 @@ impl Runtime {
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
-                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
+                // TODO(Phase 6): Wire up ClusterMetricsCollector for cluster mode
+                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config, None)
                     .await
                     .context(UnableToStartMetricsServerSnafu)
             })

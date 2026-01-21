@@ -37,6 +37,8 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::ClientTlsConfig;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
+
+
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -273,7 +275,9 @@ async fn handle_scheduler_message(
             );
 
             // Collect local OTLP metrics
-            // TODO: Implement actual metrics collection in Phase 5
+            // TODO(Phase 6): Wire up MetricsReader to collect actual executor metrics.
+            // For now, executors return empty metrics. The MetricsReader needs to be
+            // passed through ControlStreamManager::new() and spawn_control_stream().
             let otlp_metrics = Vec::new();
 
             let response = ExecutorControlMessage {

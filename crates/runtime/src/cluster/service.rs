@@ -45,6 +45,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::cluster::SchedulerPeers;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
+use crate::metrics_reader::MetricsReader;
 use crate::task_history::DEFAULT_TASK_HISTORY_TABLE;
 
 /// Internal cluster service for scheduler-executor communication.
@@ -55,6 +56,8 @@ pub struct ClusterServiceImpl {
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
     datafusion: Arc<DataFusion>,
     executor_registry: Arc<ExecutorRegistry>,
+    /// Metrics reader for collecting local OTLP metrics on demand.
+    metrics_reader: Option<MetricsReader>,
 }
 
 impl ClusterServiceImpl {
@@ -67,6 +70,7 @@ impl ClusterServiceImpl {
         scheduler_peers: Arc<RwLock<SchedulerPeers>>,
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
+        metrics_reader: Option<MetricsReader>,
     ) -> Self {
         Self {
             app,
@@ -75,6 +79,7 @@ impl ClusterServiceImpl {
             scheduler_peers,
             datafusion,
             executor_registry,
+            metrics_reader,
         }
     }
 
@@ -270,8 +275,14 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         _request: Request<GetMetricsRequest>,
     ) -> Result<Response<GetMetricsResponse>, Status> {
-        // TODO: Implement in Phase 5 - collect local OTLP metrics and return
-        Err(Status::unimplemented("GetMetrics is not yet implemented"))
+        // Collect local OTLP metrics and return as protobuf bytes
+        let otlp_metrics = self
+            .metrics_reader
+            .as_ref()
+            .map(MetricsReader::collect_otlp)
+            .unwrap_or_default();
+
+        Ok(Response::new(GetMetricsResponse { otlp_metrics }))
     }
 
     type ControlStreamStream =
