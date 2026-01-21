@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 use datafusion::prelude::*;
@@ -477,8 +477,10 @@ async fn s3_url_table_sql_api() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            // Create a minimal app without any datasets - we'll query S3 directly via URL
-            let app = AppBuilder::new("s3_url_table_sql").build();
+            // Create a minimal app with URL tables enabled via runtime param
+            let app = AppBuilder::new("s3_url_table_sql")
+                .with_runtime_params(HashMap::from([("url_tables".to_string(), "enabled".to_string())]))
+                .build();
 
             configure_test_datafusion();
             let rt = Runtime::builder().with_app(app).build().await;
@@ -547,8 +549,10 @@ async fn s3_url_table_dataframe_api() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            // Create a minimal app without any datasets - we'll query S3 directly via URL
-            let app = AppBuilder::new("s3_url_table_df").build();
+            // Create a minimal app with URL tables enabled via runtime param
+            let app = AppBuilder::new("s3_url_table_df")
+                .with_runtime_params(HashMap::from([("url_tables".to_string(), "enabled".to_string())]))
+                .build();
 
             configure_test_datafusion();
             let rt = Runtime::builder().with_app(app).build().await;
