@@ -39,7 +39,6 @@ use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
-use ballista_executor::metrics::LoggingMetricsCollector;
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process;
@@ -340,6 +339,7 @@ fn update_scheduler_pollers(
 mod control_stream_client;
 pub mod datafusion;
 mod executor_registry;
+mod metrics_collector;
 mod scheduler_registry;
 mod servers;
 mod service;
@@ -910,7 +910,7 @@ pub async fn initialize_cluster_executor(
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service - use advertise address for scheduler to contact this executor
-        host: Some(advertise_host),
+        host: Some(advertise_host.clone()),
         port: u32::from(advertise_port),
         // grpc_port is used only for push mode, and not initialized for pull mode (default)
         grpc_port: 0,
@@ -921,13 +921,17 @@ pub async fn initialize_cluster_executor(
         }),
     };
 
+    // Use advertise address as node_id for metrics
+    let metrics_node_id = format!("{advertise_host}:{advertise_port}");
+    let metrics_collector = metrics_collector::OtelExecutorMetricsCollector::new(metrics_node_id);
+
     let executor = Arc::new(Executor::new(
         executor_meta,
         &work_dir,
         runtime_producer,
         config_producer,
         Arc::new(BallistaFunctionRegistry::default()),
-        Arc::new(LoggingMetricsCollector::default()),
+        Arc::new(metrics_collector),
         concurrent_tasks as usize,
         None,
     ));
@@ -1121,6 +1125,16 @@ async fn create_scheduler_server(
         BallistaShuffleFormat::ArrowIpc
     };
 
+    // Create metrics collector with the scheduler's advertise address as node_id
+    let metrics_node_id = rt
+        .df
+        .cluster_config
+        .scheduler_url_string()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| bind_addr.to_string());
+    let scheduler_metrics_collector =
+        Arc::new(metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id));
+
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
         bind_port: bind_addr.port(),
@@ -1159,6 +1173,7 @@ async fn create_scheduler_server(
             )
         })),
         override_create_grpc_client_endpoint,
+        override_metrics_collector: Some(scheduler_metrics_collector),
         ..Default::default()
     };
 

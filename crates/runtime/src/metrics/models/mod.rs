@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{Counter, Gauge, Histogram, LazyLock, Meter, UpDownCounter, global};
+use super::{global, Counter, Gauge, Histogram, LazyLock, Meter, UpDownCounter};
 
 pub(crate) static MODELS_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("model"));
 

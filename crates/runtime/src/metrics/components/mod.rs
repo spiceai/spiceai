@@ -17,10 +17,10 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
-use opentelemetry::{KeyValue, metrics::UpDownCounter};
+use opentelemetry::{metrics::UpDownCounter, KeyValue};
 use snafu::prelude::*;
 
-use super::{LazyLock, Meter, global};
+use super::{global, LazyLock, Meter};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

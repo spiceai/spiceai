@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{Counter, LazyLock, Meter, global};
+use super::{global, Counter, LazyLock, Meter};
 
 pub(crate) static RUNTIME_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("runtime"));
 
