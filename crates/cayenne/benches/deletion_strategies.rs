@@ -17,9 +17,9 @@ limitations under the License.
 //! Benchmarks for deletion vector strategies in Cayenne.
 //!
 //! This benchmarks the three deletion strategies:
-//! 1. Int64Pk - Single Int64 primary key using HashSet<i64>
-//! 2. RowConverterBased - Composite/non-integer PKs using RowConverter
-//! 3. PositionBased - No PK, uses RoaringBitmap
+//! 1. `Int64Pk` - Single Int64 primary key using `HashSet<i64>`
+//! 2. `RowConverterBased` - Composite/non-integer PKs using `RowConverter`
+//! 3. `PositionBased` - No PK, uses `RoaringBitmap`
 //!
 //! Each strategy is tested for:
 //! - Single row deletion
@@ -28,6 +28,7 @@ limitations under the License.
 //! - Insert after deletion
 
 #![allow(clippy::expect_used)]
+#![allow(clippy::cast_possible_wrap)]
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};

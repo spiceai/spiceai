@@ -294,6 +294,7 @@ impl RuntimeBuilder {
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
             scheduler_peers: Arc::new(RwLock::new(HashMap::new())),
+            job_executor: Arc::new(RwLock::new(None)), // Initialized later when scheduler registry starts
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };

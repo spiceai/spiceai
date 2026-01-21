@@ -183,7 +183,6 @@ impl Query {
 
         let client_tls_config = self.df.cluster_config.client_tls_config().cloned();
         let tls_enabled = client_tls_config.is_some();
-
         let mut cfg = self
             .df
             .ctx

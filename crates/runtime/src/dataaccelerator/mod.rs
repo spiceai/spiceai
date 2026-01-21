@@ -203,10 +203,15 @@ impl AcceleratorEngineRegistry {
 
     pub async fn unregister_all(&self) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.clear();
+        // Shutdown each accelerator before clearing the registry
+        for (engine, accelerator) in registry.drain() {
+            if let Err(e) = accelerator.shutdown().await {
+                tracing::error!("Failed to shutdown accelerator engine {engine}: {e}");
+            }
+        }
     }
 
-    #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -574,6 +579,7 @@ impl AcceleratorExternalTableBuilder {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -981,6 +987,7 @@ mod accelerator_compat_tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -2237,6 +2244,7 @@ mod accelerator_compat_tests {
                     file_type: String::new(),
                     table_partition_cols: vec![],
                     if_not_exists: true,
+                    or_replace: false,
                     definition: None,
                     order_exprs: vec![],
                     unbounded: false,

@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+
 //! Tests for caching mode acceleration behavior.
 //!
 //! This module contains tests for the caching acceleration mode, which allows HTTP
@@ -923,6 +925,9 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
                 !initial_batches.is_empty(),
                 "Should have results from HTTP request"
             );
+
+            // Wait for batched cache write to flush (500ms interval + buffer)
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
             // Query cache again - should now return cached data
             let df = status

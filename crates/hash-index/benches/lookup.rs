@@ -14,6 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Benchmark code has different lint requirements than production code
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::needless_pass_by_value,
+    clippy::semicolon_if_nothing_returned,
+    clippy::redundant_closure_for_method_calls,
+    clippy::uninlined_format_args,
+    clippy::explicit_iter_loop
+)]
+
 //! Comprehensive benchmarks for the SIMD hash index.
 //!
 //! Benchmark categories:
@@ -31,7 +45,7 @@ use arrow::array::{BinaryArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use hash_index::{HashIndex, HashIndexBuilder, NUM_SHARDS, RowLocation, hash_key, index_threshold};
+use hash_index::{HashIndex, HashIndexBuilder, RowLocation, hash_key, index_threshold};
 use rand::Rng;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -228,8 +242,7 @@ fn bench_point_lookup(c: &mut Criterion) {
         let lookup_keys: Vec<i64> = (0..num_lookups)
             .map(|_| rng.random_range(0..size))
             .collect();
-        #[allow(clippy::redundant_closure)]
-        let lookup_hashes: Vec<u64> = lookup_keys.iter().map(|k| hash_key(k)).collect();
+        let lookup_hashes: Vec<u64> = lookup_keys.iter().map(hash_key).collect();
 
         group.throughput(Throughput::Elements(num_lookups as u64));
         group.bench_with_input(
@@ -317,8 +330,7 @@ fn bench_batch_lookup(c: &mut Criterion) {
         for batch_size in batch_sizes {
             let lookup_keys: Vec<i64> =
                 (0..batch_size).map(|_| rng.random_range(0..size)).collect();
-            #[allow(clippy::redundant_closure)]
-            let lookup_hashes: Vec<u64> = lookup_keys.iter().map(|k| hash_key(k)).collect();
+            let lookup_hashes: Vec<u64> = lookup_keys.iter().map(hash_key).collect();
 
             group.throughput(Throughput::Elements(batch_size as u64));
             group.bench_with_input(
@@ -495,7 +507,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
     group.throughput(Throughput::Elements(num_ops as u64));
     group.bench_with_input(
         BenchmarkId::new("read_heavy", num_ops),
-        &(index.clone(), ops.clone()),
+        &(index.clone(), ops),
         |b, (idx, operations): &(HashIndex, Vec<(bool, i64)>)| {
             b.iter(|| {
                 for &(is_read, key) in operations {

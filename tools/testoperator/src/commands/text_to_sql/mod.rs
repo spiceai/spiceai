@@ -86,7 +86,7 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
         }
     });
     metrics.show_run(run_status)?;
-    let () = emit_telemetry(telemetry, &metrics, memory_usage_opt).await?;
+    let () = emit_telemetry(&args.model, telemetry, &metrics, memory_usage_opt).await?;
 
     let mut spiced_instance = test.end()?;
     if !args.common.is_external_instance() {
@@ -99,6 +99,7 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
 #[expect(clippy::cast_sign_loss)]
 #[expect(clippy::cast_possible_truncation)]
 async fn emit_telemetry(
+    model_name: &str,
     mut telemetry: Telemetry,
     metrics: &QueryMetrics<TextToSqlMetric, TextToSqlRunMetric>,
     memory_usage: Option<(f64, f64)>,
@@ -111,6 +112,7 @@ async fn emit_telemetry(
                 KeyValue::new("name", metrics.run_name.clone()),
                 KeyValue::new("spiced_version", metrics.spiced_version.clone()),
                 KeyValue::new("spiced_commit_sha", metrics.commit_sha.clone()),
+                KeyValue::new("model_name", model_name.to_string()),
                 KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
                 KeyValue::new("branch_name", git::get_branch_name()),
             ])

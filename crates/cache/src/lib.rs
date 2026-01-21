@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ use result::search::CachedSearchResult;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::caching::HashingAlgorithm;
 
+pub mod backend;
 pub mod lru_cache;
 pub mod metrics;
 mod simple_cache;
@@ -41,7 +42,15 @@ pub mod encoding;
 pub mod key;
 pub mod result;
 
+pub use backend::CacheBackend;
+pub use backend::CacheBackendBuilder;
+pub use backend::MokaBackend;
+
+#[cfg(feature = "pingora")]
+pub use backend::PingoraBackend;
+
 pub use lru_cache::LruCache;
+pub use metrics::CacheMetrics;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::get_logical_plan_input_tables;
@@ -387,6 +396,7 @@ impl QueryResultsCacheProvider {
             cache_ttl,
             hash_builder,
             config.caching_policy,
+            config.engine,
         ));
 
         let encoder = encoding::get_encoder(config.encoding);

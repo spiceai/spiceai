@@ -58,7 +58,7 @@ pub(crate) fn cosine_distance_to_sql(
                 Ok(ast::Expr::Cast {
                     expr: Box::new(array),
                     data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
-                        Box::new(ast::DataType::Float(None)),
+                        Box::new(ast::DataType::Float(ast::ExactNumberInfo::None)),
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,
@@ -75,7 +75,7 @@ pub(crate) fn cosine_distance_to_sql(
                 Ok(ast::Expr::Cast {
                     expr: Box::new(array),
                     data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
-                        Box::new(ast::DataType::Float(None)),
+                        Box::new(ast::DataType::Float(ast::ExactNumberInfo::None)),
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,

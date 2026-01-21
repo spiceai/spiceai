@@ -78,6 +78,7 @@ use snafu::{OptionExt, ResultExt};
 use spicepod::metric::Metrics;
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::atomic::AtomicI64;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::{
@@ -119,6 +120,7 @@ pub struct RefreshTaskBuilder {
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
+    last_updated_at: Arc<AtomicI64>,
 }
 
 impl RefreshTaskBuilder {
@@ -146,6 +148,7 @@ impl RefreshTaskBuilder {
             resource_monitor: None,
             accelerator_write_mutex,
             on_stream_batch_process_callback: None,
+            last_updated_at: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -189,6 +192,12 @@ impl RefreshTaskBuilder {
         callback: Option<StreamBatchProcessCallback>,
     ) -> RefreshTaskBuilder {
         self.on_stream_batch_process_callback = callback;
+        self
+    }
+
+    #[must_use]
+    pub fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> RefreshTaskBuilder {
+        self.last_updated_at = last_updated_at;
         self
     }
 
@@ -240,6 +249,7 @@ impl RefreshTaskBuilder {
             resource_monitor: self.resource_monitor,
             accelerator_write_mutex: self.accelerator_write_mutex,
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
+            last_updated_at: self.last_updated_at,
         }
     }
 }
@@ -261,6 +271,7 @@ pub struct RefreshTask {
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
+    last_updated_at: Arc<AtomicI64>,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -1353,6 +1364,16 @@ impl RefreshTask {
         );
         self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
             .await;
+    }
+
+    #[expect(clippy::cast_possible_truncation)]
+    fn update_last_updated_at(&self) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        self.last_updated_at
+            .store(now_ms, std::sync::atomic::Ordering::Release);
     }
 }
 

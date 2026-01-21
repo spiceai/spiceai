@@ -69,6 +69,12 @@ pub trait KeyExtractor: Send + Sync {
 
     /// Computes the hash for an owned key.
     fn hash_owned_key(key: &Self::Key) -> u64;
+
+    /// Returns the raw bytes representation of the key at the given row.
+    ///
+    /// This is used for key equality comparison when hash collisions occur.
+    /// Returns `None` if the key is null.
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>>;
 }
 
 /// Key extractor for primitive integer types.
@@ -139,6 +145,15 @@ impl<T: PrimitiveKey> KeyExtractor for PrimitiveKeyExtractor<T> {
         key.hash(&mut hasher);
         hasher.finish()
     }
+
+    #[inline]
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        if T::is_null(&self.array, row) {
+            None
+        } else {
+            Some(T::value_bytes(&self.array, row))
+        }
+    }
 }
 
 /// Trait for primitive key types with optimized array access.
@@ -160,6 +175,9 @@ pub trait PrimitiveKey: Clone + Eq + Hash + Send + Sync + 'static {
 
     /// Returns the value at `row` (assumes non-null).
     fn value(array: &Self::ArrayType, row: usize) -> Self::Native;
+
+    /// Returns the value at `row` as bytes for comparison.
+    fn value_bytes(array: &Self::ArrayType, row: usize) -> Vec<u8>;
 }
 
 macro_rules! impl_primitive_key {
@@ -191,6 +209,11 @@ macro_rules! impl_primitive_key {
             #[inline]
             fn value(array: &Self::ArrayType, row: usize) -> Self::Native {
                 array.value(row)
+            }
+
+            #[inline]
+            fn value_bytes(array: &Self::ArrayType, row: usize) -> Vec<u8> {
+                array.value(row).to_le_bytes().to_vec()
             }
         }
     };
@@ -294,6 +317,15 @@ impl KeyExtractor for Utf8KeyExtractor {
         key.hash(&mut hasher);
         hasher.finish()
     }
+
+    #[inline]
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        if self.array.is_null(row) {
+            None
+        } else {
+            Some(self.array.value(row).as_bytes().to_vec())
+        }
+    }
 }
 
 /// Key extractor for binary columns.
@@ -377,6 +409,15 @@ impl KeyExtractor for BinaryKeyExtractor {
         key.hash(&mut hasher);
         hasher.finish()
     }
+
+    #[inline]
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        if self.array.is_null(row) {
+            None
+        } else {
+            Some(self.array.value(row).to_vec())
+        }
+    }
 }
 
 /// Key extractor for composite keys using Arrow's `RowConverter`.
@@ -386,6 +427,8 @@ impl KeyExtractor for BinaryKeyExtractor {
 pub struct RowConverterKeyExtractor {
     converter: Arc<RowConverter>,
     rows: arrow_row::Rows,
+    /// The key arrays for null checking - a row is null if ANY key column is null
+    key_arrays: Vec<ArrayRef>,
 }
 
 impl RowConverterKeyExtractor {
@@ -427,6 +470,7 @@ impl RowConverterKeyExtractor {
         Ok(Self {
             converter: Arc::new(converter),
             rows,
+            key_arrays,
         })
     }
 
@@ -455,13 +499,24 @@ impl RowConverterKeyExtractor {
             .convert_columns(&key_arrays)
             .map_err(|e| Error::Arrow { source: e })?;
 
-        Ok(Self { converter, rows })
+        Ok(Self {
+            converter,
+            rows,
+            key_arrays,
+        })
     }
 
     /// Returns a reference to the row converter for reuse.
     #[must_use]
     pub fn converter(&self) -> Arc<RowConverter> {
         Arc::clone(&self.converter)
+    }
+
+    /// Checks if any key column has a null value at the given row.
+    /// Returns `true` if the composite key is null (any column is null).
+    #[inline]
+    fn is_null(&self, row: usize) -> bool {
+        self.key_arrays.iter().any(|arr| arr.is_null(row))
     }
 }
 
@@ -475,13 +530,20 @@ impl KeyExtractor for RowConverterKeyExtractor {
 
     #[inline]
     fn extract_key(&self, row: usize) -> Option<Self::Key> {
-        // RowConverter doesn't track nulls directly, so we return Some
-        // The caller should check for nulls in the source columns if needed
-        Some(self.rows.row(row).owned())
+        // A composite key is null if ANY of its constituent columns is null
+        if self.is_null(row) {
+            None
+        } else {
+            Some(self.rows.row(row).owned())
+        }
     }
 
     #[inline]
     fn hash_key(&self, row: usize) -> Option<u64> {
+        // A composite key is null if ANY of its constituent columns is null
+        if self.is_null(row) {
+            return None;
+        }
         let row_bytes = self.rows.row(row);
         let mut hasher = new_hasher();
         row_bytes.as_ref().hash(&mut hasher);
@@ -493,6 +555,16 @@ impl KeyExtractor for RowConverterKeyExtractor {
         let mut hasher = new_hasher();
         key.as_ref().hash(&mut hasher);
         hasher.finish()
+    }
+
+    #[inline]
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        // A composite key is null if ANY of its constituent columns is null
+        if self.is_null(row) {
+            None
+        } else {
+            Some(self.rows.row(row).as_ref().to_vec())
+        }
     }
 }
 
@@ -556,6 +628,12 @@ pub trait KeyExtractorDyn: Send + Sync {
 
     /// Computes the hash for the key at the given row.
     fn hash_key(&self, row: usize) -> Option<u64>;
+
+    /// Returns the raw bytes representation of the key at the given row.
+    ///
+    /// This is used to compare keys for equality when hash collisions occur.
+    /// Returns `None` if the key is null.
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>>;
 }
 
 impl<E: KeyExtractor> KeyExtractorDyn for E {
@@ -565,6 +643,10 @@ impl<E: KeyExtractor> KeyExtractorDyn for E {
 
     fn hash_key(&self, row: usize) -> Option<u64> {
         KeyExtractor::hash_key(self, row)
+    }
+
+    fn key_bytes(&self, row: usize) -> Option<Vec<u8>> {
+        KeyExtractor::key_bytes(self, row)
     }
 }
 

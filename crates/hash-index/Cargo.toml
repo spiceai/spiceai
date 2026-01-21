@@ -16,8 +16,13 @@ arrow-row.workspace = true
 arrow-schema.workspace = true
 parking_lot.workspace = true
 snafu.workspace = true
+telemetry = { path = "../telemetry", optional = true }
 tracing.workspace = true
 twox-hash.workspace = true
+
+[features]
+default = []
+metrics = ["telemetry"]
 
 [dev-dependencies]
 criterion = "0.6"
