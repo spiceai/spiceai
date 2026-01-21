@@ -2,4 +2,4 @@ tests:
   bench:
     spicepod_path: federated/abfs[parquet].yaml
     query_set: tpcds
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners

@@ -48,6 +48,9 @@ on:
           - 'release-lto'
         default: 'release'
 
+permissions:
+  contents: write
+
 env:
   # CI performance optimizations
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
@@ -59,7 +62,7 @@ env:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -88,7 +91,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                runner: "spiceai-dev-runners",
+                runner: "spicehq-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
@@ -121,6 +124,11 @@ jobs:
                 target_arch_go: "amd64",
                 tags: ["default", "models"],
               });
+            }
+
+            // Filter out Windows for releases
+            if (context.ref && context.ref.startsWith('refs/tags/v')) {
+              return matrix.filter(m => m.target_os !== 'windows');
             }
 
             // If running via workflow_dispatch, filter based on input
@@ -429,8 +437,6 @@ jobs:
             target_arch: aarch64
           - target_os: darwin
             target_arch: aarch64
-          - target_os: windows
-            target_arch: x86_64
 
     runs-on: ubuntu-latest
     steps:

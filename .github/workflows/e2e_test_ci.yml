@@ -65,7 +65,7 @@ env:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -78,7 +78,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                builder: "spiceai-dev-runners",
+                builder: "spicehq-dev-runners",
                 runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",

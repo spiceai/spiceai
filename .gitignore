@@ -68,6 +68,8 @@ data/
 !test/nsql_bench/data
 !crates/runtime/tests/acceleration/data
 !crates/runtime/tests/acceleration/spicepods
+merge_conflict_report.md
+pr_body.md
 
 # Database files
 *.db

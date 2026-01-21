@@ -1,0 +1,86 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-duckdb[file]_indexes
+
+runtime:
+  dataset_load_parallelism: 1
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: true
+    captured_plan: explain
+    min_plan_duration: 50ms
+
+refresh_check_interval: &refresh_check_interval 3m
+
+datasets:
+  - from: s3://benchmarks/saffron/v2/number_info_sf1
+    name: number_info
+    time_column: __iceberg_processed_time
+    time_format: timestamptz
+    params: &params_s3
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      enabled: true
+      retention_sql: DELETE FROM number_info WHERE __deleted != 'false'
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      refresh_mode: append
+      primary_key: NumberSid
+      on_conflict:
+        NumberSid: upsert
+      params:
+        duckdb_preserve_insertion_order: false
+        duckdb_memory_limit: 16GiB
+      indexes:
+        '(AccountSid, NumberPoolSid, NumberType)': enabled
+        '(NumberPoolSid, SupportedDestRegion, IsAvailable)': enabled
+        '(NumberPoolSid, NumberRegion)': enabled
+        '(AreaCodeRegion, NumberType)': enabled
+
+  - from: s3://benchmarks/saffron/v2/number_caps_sf1
+    name: number_caps
+    time_column: __iceberg_processed_time
+    time_format: timestamptz
+    params: *params_s3
+    acceleration:
+      enabled: true
+      retention_sql: DELETE FROM number_caps WHERE __deleted != 'false'
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      refresh_mode: append
+      primary_key: '(NumberSid, Capability)'
+      on_conflict:
+        '(NumberSid, Capability)': upsert
+      params:
+        duckdb_preserve_insertion_order: false
+        duckdb_memory_limit: 16GiB
+      indexes:
+        NumberSid: enabled
+
+  - from: s3://benchmarks/saffron/v2/sender_info_sf1
+    name: sender_info
+    time_column: __iceberg_processed_time
+    time_format: timestamptz
+    params: *params_s3
+    acceleration:
+      enabled: true
+      retention_sql: DELETE FROM sender_info WHERE __deleted != 'false'
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      refresh_mode: append
+      primary_key: AutoId
+      on_conflict:
+        AutoId: upsert
+      params:
+        duckdb_preserve_insertion_order: false
+        duckdb_memory_limit: 16GiB

@@ -2,14 +2,14 @@ tests:
   bench:
     spicepod_path: federated/s3[parquet].yaml
     query_set: tpch[parameterized]
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     validate_results: true
   throughput:
     spicepod_path: federated/s3[parquet].yaml
     query_set: tpch[parameterized]
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
   load:
     spicepod_path: federated/s3[parquet].yaml
     query_set: tpch[parameterized]
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
     duration: 28800

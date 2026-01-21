@@ -26,6 +26,7 @@ use crate::{
 };
 
 pub mod parameterized;
+pub mod saffron;
 pub mod scenario;
 pub mod validation;
 
@@ -150,6 +151,48 @@ macro_rules! generate_clickbench_query_overrides {
           ),*
       ]
   }
+}
+
+macro_rules! generate_saffron_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("saffron_q", stringify!($i)).into(),
+                    include_str!(concat!("./saffron/q", stringify!($i), ".sql")).into(),
+                    false
+                )
+            ),*
+        ]
+    }
+}
+
+macro_rules! generate_saffron_views_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("saffron_q", stringify!($i)).into(),
+                    include_str!(concat!("./saffron/views/q", stringify!($i), ".sql")).into(),
+                    true
+                )
+            ),*
+        ]
+    }
+}
+
+macro_rules! generate_saffron_duckdb_cte_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("saffron_q", stringify!($i)).into(),
+                    include_str!(concat!("./saffron/duckdb_cte/q", stringify!($i), ".sql")).into(),
+                    true
+                )
+            ),*
+        ]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -290,6 +333,8 @@ pub enum QuerySet {
     Tpcds,
     Clickbench,
     ParameterizedTpch,
+    #[serde(rename = "saffron[parameterized]")]
+    ParameterizedSaffron,
     /// Scenario query set loaded from a file
     Scenario {
         #[serde(skip)]
@@ -326,18 +371,20 @@ impl From<&(&'static str, u32)> for TableWithRowCount {
 }
 
 impl QuerySet {
-    #[expect(clippy::unused_async)]
     pub async fn get_queries(
         &self,
         overrides: Option<QueryOverrides>,
-        _instance: Option<&SpicedInstance>,
-        _random_param_set_count: Option<usize>,
+        instance: Option<&SpicedInstance>,
+        random_param_set_count: Option<usize>,
     ) -> anyhow::Result<Vec<Query>> {
         match self {
             QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
             QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides)),
             QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
             QuerySet::Scenario { queries, .. } => Ok(queries.clone()),
+            QuerySet::ParameterizedSaffron => {
+                get_saffron_test_queries(overrides, instance, random_param_set_count).await
+            }
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
                     "parameterized",
@@ -418,6 +465,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithRowCount::from)
                 .collect(),
+            QuerySet::ParameterizedSaffron => [].iter().map(TableWithRowCount::from).collect(),
         }
     }
 
@@ -471,6 +519,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithTimeColumn::from)
                 .collect(),
+            QuerySet::ParameterizedSaffron => [].iter().map(TableWithTimeColumn::from).collect(),
         }
     }
 
@@ -488,6 +537,10 @@ impl QuerySet {
                 } else {
                     Ok(Some(validation_data))
                 }
+            }
+            QuerySet::ParameterizedSaffron => {
+                let validation_data = saffron::get_saffron_expected_results(base_path)?;
+                Ok(Some(validation_data))
             }
             // TPCH and other query sets use built-in validation
             _ => Ok(None),
@@ -524,7 +577,9 @@ impl QuerySet {
                     "tpcds_q76",
                 ]
             }
-            QuerySet::Clickbench | QuerySet::Scenario { .. } => vec![],
+            QuerySet::Clickbench | QuerySet::Scenario { .. } | QuerySet::ParameterizedSaffron => {
+                vec![]
+            }
         }
     }
 }
@@ -536,6 +591,7 @@ impl Display for QuerySet {
             QuerySet::Tpcds => write!(f, "tpcds"),
             QuerySet::Clickbench => write!(f, "clickbench"),
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
+            QuerySet::ParameterizedSaffron => write!(f, "saffron[parameterized]"),
             QuerySet::Scenario { scenario_set, .. } => {
                 if let Some(name) = &scenario_set.name {
                     write!(f, "scenario[{name}]")
@@ -566,6 +622,8 @@ pub enum QueryOverrides {
     SpicecloudCatalog,
     GlueCatalog,
     Spicecloud,
+    SaffronViews,
+    SaffronDuckdbCTE,
     DynamoDB,
 }
 
@@ -904,6 +962,33 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
     }
 
     queries
+}
+
+pub async fn get_saffron_test_queries(
+    overrides: Option<QueryOverrides>,
+    instance: Option<&SpicedInstance>,
+    random_param_set_count: Option<usize>,
+) -> anyhow::Result<Vec<Query>> {
+    let queries = match overrides {
+        Some(QueryOverrides::SaffronViews) => {
+            generate_saffron_views_queries!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+        }
+        Some(QueryOverrides::SaffronDuckdbCTE) => {
+            generate_saffron_duckdb_cte_queries!(4, 6)
+        }
+        _ => generate_saffron_queries!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+    };
+
+    match (random_param_set_count, instance) {
+        (Some(count), Some(instance)) if count > 0 => {
+            // Generate randomized parameter sets for load testing
+            saffron::generate_randomized_saffron_queries(queries, instance, count, overrides).await
+        }
+        _ => {
+            // Use fixed parameters for deterministic testing
+            Ok(saffron::add_saffron_fixed_parameters(queries))
+        }
+    }
 }
 
 #[cfg(test)]
