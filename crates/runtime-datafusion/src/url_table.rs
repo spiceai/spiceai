@@ -62,10 +62,10 @@ use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
+use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::{
     ListingTable, ListingTableConfig, ListingTableConfigExt, ListingTableUrl,
 };
-use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion_catalog::UrlTableFactory;
@@ -81,11 +81,14 @@ const SUPPORTED_SCHEMES: &[&str] = &["s3", "abfs", "abfss", "http", "https", "gs
 /// - Directories/prefixes: `s3://bucket/path/` (with or without trailing slash)
 /// - Glob patterns: `s3://bucket/path/*.parquet`
 fn is_url_like(name: &str) -> bool {
-    SUPPORTED_SCHEMES
-        .iter()
-        .any(|scheme| name.starts_with(&format!("{scheme}://")))
+    // Parse scheme without allocating - find "://" and extract the prefix
+    if let Some(pos) = name.find("://") {
+        let scheme = &name[..pos];
+        SUPPORTED_SCHEMES.contains(&scheme)
+    } else {
+        false
+    }
 }
-
 
 /// A factory that creates [`ListingTable`] providers from object store URLs.
 ///
@@ -170,7 +173,7 @@ impl UrlTableFactory for SpiceUrlTableFactory {
         }; // Lock is dropped here
 
         // Infer options and schema from the URL
-        let config = match ListingTableConfig::new(table_url.clone())
+        let config = match ListingTableConfig::new(table_url)
             .infer_options(&state)
             .await
         {
@@ -379,12 +382,16 @@ mod tests {
 
         // Azure Blob Storage URLs
         assert!(is_url_like("abfs://container@account/path/file.parquet"));
-        assert!(is_url_like("abfss://container@account.dfs.core.windows.net/path/file.parquet"));
+        assert!(is_url_like(
+            "abfss://container@account.dfs.core.windows.net/path/file.parquet"
+        ));
 
         // HTTP/HTTPS URLs
         assert!(is_url_like("https://example.com/data.parquet"));
         assert!(is_url_like("http://localhost:8080/data.csv"));
-        assert!(is_url_like("https://raw.githubusercontent.com/repo/data.json"));
+        assert!(is_url_like(
+            "https://raw.githubusercontent.com/repo/data.json"
+        ));
 
         // Google Cloud Storage URLs
         assert!(is_url_like("gs://bucket/data.parquet"));

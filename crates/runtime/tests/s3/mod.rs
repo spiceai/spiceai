@@ -607,7 +607,17 @@ async fn s3_url_table_dataframe_api() -> Result<(), anyhow::Error> {
 
             let batches = df.collect().await?;
             assert!(!batches.is_empty(), "Should have results after filtering");
+
+            // Verify LIMIT is applied correctly
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert!(
+                total_rows <= 5,
+                "LIMIT 5 should return at most 5 rows, got {total_rows}"
+            );
+
             // Verify all rows have VendorID = 1
+            // Note: taxi_sample.parquet contains mixed VendorID values (1 and 2),
+            // so this assertion validates that the filter is actually working.
             for batch in &batches {
                 let vendor_col = batch
                     .column_by_name("VendorID")
