@@ -1650,6 +1650,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("compression_strategy")
         .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
         .default("btrblocks"),
+    ParameterSpec::component("cayenne_upload_concurrency")
+        .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Default: 4.")
+        .default("4"),
 ];
 
 #[async_trait]
