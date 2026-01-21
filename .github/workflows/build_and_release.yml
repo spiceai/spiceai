@@ -144,6 +144,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
       - uses: ./.github/actions/setup-rust
+      - name: Verify cargo is available
+        run: cargo --version
       - name: Generate feature matrix
         id: generate-matrix
         run: python3 .github/scripts/generate_feature_matrix.py --num-groups 2
