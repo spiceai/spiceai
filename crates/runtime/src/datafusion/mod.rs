@@ -78,10 +78,20 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "postgres", not(windows)))]
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres",
+    not(windows)
+))]
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::SnapshotAdapter;
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "postgres", not(windows)))]
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres",
+    not(windows)
+))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
@@ -2200,7 +2210,12 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(any(feature = "duckdb", feature = "sqlite", feature = "postgres", not(windows)))]
+    #[cfg(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    ))]
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => AccelerationEngine::DuckDB,
@@ -2219,14 +2234,24 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(not(any(feature = "duckdb", feature = "sqlite", feature = "postgres", not(windows))))]
+    #[cfg(not(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    )))]
     {
         let _ = snapshot_adapter;
         let _ = snapshot_creation_trigger;
         return Err(Error::UnsupportedAccelerationEngineForSnapshots);
     }
 
-    #[cfg(any(feature = "duckdb", feature = "sqlite", feature = "postgres", not(windows)))]
+    #[cfg(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    ))]
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),
         acceleration_settings.snapshot_behavior.clone(),
