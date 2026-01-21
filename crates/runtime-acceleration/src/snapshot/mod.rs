@@ -688,23 +688,37 @@ impl SnapshotManager {
         lock_guard: OwnedMutexGuard<()>,
         last_updated_at: Option<i64>,
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
-        // Check if we should skip due to no updates
+        // Check if we should skip due to no updates (on_change policy)
         if matches!(
             self.snapshots_creation_policy,
             SnapshotsCreationPolicy::OnChange
-        ) && let Some(last_updated_at) = last_updated_at
-            && let Ok(Some(handle)) = self.load_metadata().await
-            && let Some(dataset_meta) = handle.metadata.datasets.get(&self.dataset_name)
-            && let Some(snapshot_entry) = dataset_meta.snapshots.last()
-            && snapshot_entry.snapshot_last_updated_at_ms == Some(last_updated_at)
-        {
-            tracing::info!(
-                "Skipping snapshot creation - no updates since last snapshot. dataset={} last_updated_at_ms={}",
-                self.dataset_name,
-                last_updated_at
-            );
-            metrics::record_snapshot_skipped(&self.dataset_name);
-            return Ok(None);
+        ) {
+            // Skip if no writes have occurred in this session (last_updated_at is None/0).
+            // This avoids creating snapshots before the first refresh completes.
+            if last_updated_at.is_none() {
+                tracing::info!(
+                    "Skipping snapshot creation - no data writes have occurred yet. dataset={}",
+                    self.dataset_name
+                );
+                metrics::record_snapshot_skipped(&self.dataset_name);
+                return Ok(None);
+            }
+
+            // Check if the timestamp matches the last stored snapshot to avoid duplicates.
+            if let Some(last_updated_at) = last_updated_at
+                && let Ok(Some(handle)) = self.load_metadata().await
+                && let Some(dataset_meta) = handle.metadata.datasets.get(&self.dataset_name)
+                && let Some(snapshot_entry) = dataset_meta.snapshots.last()
+                && snapshot_entry.snapshot_last_updated_at_ms == Some(last_updated_at)
+            {
+                tracing::info!(
+                    "Skipping snapshot creation - no updates since last snapshot. dataset={} last_updated_at_ms={}",
+                    self.dataset_name,
+                    last_updated_at
+                );
+                metrics::record_snapshot_skipped(&self.dataset_name);
+                return Ok(None);
+            }
         }
 
         let start_time = Instant::now();
@@ -2975,5 +2989,214 @@ mod tests {
     #[test]
     fn turso_engine_does_not_support_compaction() {
         generic_engine_compaction_support(&AccelerationEngine::Turso, false);
+    }
+
+    // ==================== OnChange Policy Tests ====================
+
+    #[cfg(feature = "duckdb")]
+    fn build_manager_with_on_change_policy(
+        store: &Arc<InMemory>,
+        local_path: PathBuf,
+        schema: &SchemaRef,
+    ) -> SnapshotManager {
+        build_manager(
+            Arc::clone(store),
+            local_path,
+            BootstrapOnFailureBehavior::Fallback,
+            schema,
+            false,
+        )
+        .with_snapshots_creation_policy(SnapshotsCreationPolicy::OnChange)
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn on_change_policy_skips_when_no_writes_occurred() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-on-change-no-writes".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        let schema = sample_schema();
+        let manager = build_manager_with_on_change_policy(&store, local_path, &schema);
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
+        // With OnChange policy and None last_updated_at, snapshot should be skipped
+        let result = manager
+            .create_snapshot(&schema, lock_guard, None)
+            .await
+            .expect("create_snapshot should not error");
+
+        assert!(
+            result.is_none(),
+            "Snapshot should be skipped when no writes occurred (last_updated_at is None)"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn on_change_policy_skips_when_timestamp_matches_previous() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-on-change-duplicate".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        let schema = sample_schema();
+
+        // First, create a snapshot with Always policy to establish baseline
+        let manager_always = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Fallback,
+            &schema,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = Arc::clone(&mutex).lock_owned().await;
+        let timestamp = 1_704_153_600_000_i64; // 2024-01-02 00:00:00 UTC
+
+        let first_result = manager_always
+            .create_snapshot(&schema, lock_guard, Some(timestamp))
+            .await
+            .expect("first snapshot");
+        assert!(first_result.is_some(), "First snapshot should be created");
+
+        // Now try with OnChange policy and same timestamp - should skip
+        let manager_on_change = build_manager_with_on_change_policy(&store, local_path, &schema);
+
+        let lock_guard2 = Arc::clone(&mutex).lock_owned().await;
+        let second_result = manager_on_change
+            .create_snapshot(&schema, lock_guard2, Some(timestamp))
+            .await
+            .expect("second snapshot should not error");
+
+        assert!(
+            second_result.is_none(),
+            "Snapshot should be skipped when timestamp matches previous snapshot"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn on_change_policy_creates_first_snapshot_with_valid_timestamp() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-on-change-first".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        let schema = sample_schema();
+        // Use OnChange policy directly - no previous snapshot exists
+        let manager = build_manager_with_on_change_policy(&store, local_path, &schema);
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        let timestamp = 1_704_153_600_000_i64;
+
+        // First snapshot with valid timestamp should be created even with OnChange policy
+        let result = manager
+            .create_snapshot(&schema, lock_guard, Some(timestamp))
+            .await
+            .expect("create_snapshot should not error");
+
+        assert!(
+            result.is_some(),
+            "First snapshot should be created with OnChange policy when timestamp is valid and no previous snapshot exists"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn on_change_policy_creates_snapshot_when_timestamp_differs() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-on-change-new-update".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        let schema = sample_schema();
+
+        // First, create a snapshot to establish baseline
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Fallback,
+            &schema,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = Arc::clone(&mutex).lock_owned().await;
+        let first_timestamp = 1_704_153_600_000_i64;
+
+        let first_result = manager
+            .create_snapshot(&schema, lock_guard, Some(first_timestamp))
+            .await
+            .expect("first snapshot");
+        assert!(first_result.is_some(), "First snapshot should be created");
+
+        // Now try with OnChange policy and different timestamp - should create
+        let manager_on_change = build_manager_with_on_change_policy(&store, local_path, &schema);
+
+        let lock_guard2 = Arc::clone(&mutex).lock_owned().await;
+        let second_timestamp = 1_704_240_000_000_i64; // Next day
+
+        let second_result = manager_on_change
+            .create_snapshot(&schema, lock_guard2, Some(second_timestamp))
+            .await
+            .expect("second snapshot");
+
+        assert!(
+            second_result.is_some(),
+            "Snapshot should be created when timestamp differs from previous"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn always_policy_creates_snapshot_even_when_no_writes() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-always-no-writes".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        let schema = sample_schema();
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path,
+            BootstrapOnFailureBehavior::Fallback,
+            &schema,
+            false,
+        );
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
+        // With Always policy, snapshot should be created even with None last_updated_at
+        let result = manager
+            .create_snapshot(&schema, lock_guard, None)
+            .await
+            .expect("create_snapshot should not error");
+
+        assert!(
+            result.is_some(),
+            "With Always policy, snapshot should be created even when no writes occurred"
+        );
     }
 }
