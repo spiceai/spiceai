@@ -105,6 +105,8 @@ pub fn spawn_snapshot_interval_task(
         }
 
         let mut ticker = interval(interval_duration);
+        // Consume the first tick which returns immediately per tokio::time::interval behavior
+        ticker.tick().await;
 
         loop {
             create_checkpoint_and_snapshot(
