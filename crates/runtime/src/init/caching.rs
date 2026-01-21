@@ -24,9 +24,47 @@ use crate::{Runtime, datafusion::SPICE_RUNTIME_SCHEMA};
 
 const DEFAULT_CACHED_PLANS_MAX_CAPACITY: u64 = 512;
 
+/// Context for determining which caches should be initialized based on spicepod configuration.
+#[derive(Debug, Clone, Default)]
+pub struct CachingContext {
+    /// True if the app has any datasets or views with full_text_search enabled.
+    pub has_full_text_search: bool,
+    /// True if the app has any embeddings (top-level, dataset-level, or column-level).
+    pub has_embeddings: bool,
+}
+
+impl CachingContext {
+    /// Creates a new `CachingContext` with all features disabled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a `CachingContext` that enables all caches (for backwards compatibility).
+    #[must_use]
+    pub fn all_enabled() -> Self {
+        Self {
+            has_full_text_search: true,
+            has_embeddings: true,
+        }
+    }
+
+    #[must_use]
+    pub fn with_full_text_search(mut self, enabled: bool) -> Self {
+        self.has_full_text_search = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_embeddings(mut self, enabled: bool) -> Self {
+        self.has_embeddings = enabled;
+        self
+    }
+}
+
 impl Runtime {
     #[must_use]
-    pub fn init_caching(cache_config: Option<&CachingConfig>) -> Arc<Caching> {
+    pub fn init_caching(cache_config: Option<&CachingConfig>, context: &CachingContext) -> Arc<Caching> {
         let Some(cache_config) = cache_config else {
             return Arc::new(Caching::new());
         };
@@ -37,14 +75,24 @@ impl Runtime {
             .sql_results
             .clone()
             .unwrap_or(SQLResultsCacheConfig::default());
-        let search_results_config = cache_config
-            .search_results
-            .clone()
-            .unwrap_or(CacheConfig::default());
-        let embeddings_config = cache_config
-            .embeddings
-            .clone()
-            .unwrap_or(CacheConfig::default());
+        // Only use search config if full_text_search is actually used in the spicepod
+        let search_results_config = if context.has_full_text_search {
+            cache_config
+                .search_results
+                .clone()
+                .unwrap_or(CacheConfig::default())
+        } else {
+            CacheConfig { enabled: false, ..CacheConfig::default() }
+        };
+        // Only use embeddings config if embeddings are actually used in the spicepod
+        let embeddings_config = if context.has_embeddings {
+            cache_config
+                .embeddings
+                .clone()
+                .unwrap_or(CacheConfig::default())
+        } else {
+            CacheConfig { enabled: false, ..CacheConfig::default() }
+        };
 
         if sql_results_config.enabled {
             match QueryResultsCacheProvider::try_new(

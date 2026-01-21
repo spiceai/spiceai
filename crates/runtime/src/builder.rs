@@ -17,6 +17,7 @@ limitations under the License.
 use crate::cluster::ResolvedClusterConfig;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
+use crate::init::caching::CachingContext;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -210,7 +211,10 @@ impl RuntimeBuilder {
             caching_config.sql_results = Some(results_cache.into());
         }
 
-        let caching = Runtime::init_caching(Some(&caching_config));
+        // Compute caching context based on whether the spicepod actually uses search/embeddings
+        let caching_context = Self::compute_caching_context(self.app.as_deref());
+
+        let caching = Runtime::init_caching(Some(&caching_config), &caching_context);
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
 
         // Create resource monitor early so it can be passed to DataFusion
@@ -314,6 +318,55 @@ impl RuntimeBuilder {
         register_udfs(&rt).await;
 
         rt
+    }
+
+    /// Computes the caching context based on whether the spicepod actually uses
+    /// full-text search or embeddings features.
+    ///
+    /// - Search cache is needed if any dataset or view has `full_text_search` enabled on a column.
+    /// - Embeddings cache is needed if the app has top-level embeddings, or if any dataset or view
+    ///   has column-level or dataset-level embeddings defined.
+    fn compute_caching_context(app: Option<&App>) -> CachingContext {
+        let Some(app) = app else {
+            return CachingContext::new();
+        };
+
+        // Check if any dataset has full_text_search enabled on any column
+        let has_full_text_search_in_datasets = app.datasets.iter().any(|ds| {
+            ds.columns
+                .iter()
+                .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
+        });
+
+        // Check if any view has full_text_search enabled on any column
+        let has_full_text_search_in_views = app.views.iter().any(|v| {
+            v.columns
+                .iter()
+                .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
+        });
+
+        let has_full_text_search = has_full_text_search_in_datasets || has_full_text_search_in_views;
+
+        // Check if app has top-level embeddings defined
+        let has_top_level_embeddings = !app.embeddings.is_empty();
+
+        // Check if any dataset has embeddings defined (dataset-level or column-level)
+        let has_embeddings_in_datasets = app.datasets.iter().any(|ds| {
+            !ds.embeddings.is_empty() || ds.columns.iter().any(|c| !c.embeddings.is_empty())
+        });
+
+        // Check if any view has embeddings defined on columns
+        let has_embeddings_in_views = app
+            .views
+            .iter()
+            .any(|v| v.columns.iter().any(|c| !c.embeddings.is_empty()));
+
+        let has_embeddings =
+            has_top_level_embeddings || has_embeddings_in_datasets || has_embeddings_in_views;
+
+        CachingContext::new()
+            .with_full_text_search(has_full_text_search)
+            .with_embeddings(has_embeddings)
     }
 
     async fn load_secrets(app: Option<&Arc<App>>) -> Secrets {
