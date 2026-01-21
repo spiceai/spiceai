@@ -16,7 +16,7 @@ limitations under the License.
 
 //! `ScyllaDB` connector module with CQL dialect and partition key filter pushdown support.
 //!
-//! This module provides a TableProvider implementation for ScyllaDB/Cassandra databases
+//! This module provides a `TableProvider` implementation for ScyllaDB/Cassandra databases
 //! with intelligent filter pushdown. While CQL doesn't support most SQL constructs
 //! (JOINs, subqueries, CAST, window functions, etc.), it does support efficient
 //! filtering on primary key columns:
@@ -24,7 +24,7 @@ limitations under the License.
 //! - **Partition key equality**: `WHERE partition_key = value`
 //! - **Clustering key comparisons**: `WHERE pk = value AND ck > value`
 //!
-//! Non-key filters and complex expressions are evaluated locally by DataFusion.
+//! Non-key filters and complex expressions are evaluated locally by `DataFusion`.
 
 mod cql_dialect;
 pub mod table_schema;
@@ -70,10 +70,10 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// `ScyllaDB` table wrapper with partition key filter pushdown.
 ///
-/// This TableProvider enables efficient queries by:
+/// This `TableProvider` enables efficient queries by:
 /// 1. Pushing down partition key equality filters to CQL
 /// 2. Optionally pushing down clustering key comparisons
-/// 3. Evaluating all other filters locally in DataFusion
+/// 3. Evaluating all other filters locally in `DataFusion`
 ///
 /// ## Filter Pushdown Rules
 ///
@@ -260,7 +260,7 @@ mod tests {
             vec!["timestamp".to_string()],
         );
 
-        let filters = vec![col("user_id").eq(lit("user123"))];
+        let filters = [col("user_id").eq(lit("user123"))];
         let filter_refs: Vec<&Expr> = filters.iter().collect();
 
         let result = schema.supports_filters_pushdown(&filter_refs);
@@ -277,7 +277,7 @@ mod tests {
             vec!["timestamp".to_string()],
         );
 
-        let filters = vec![col("timestamp").gt(lit("2024-01-01"))];
+        let filters = [col("timestamp").gt(lit("2024-01-01"))];
         let filter_refs: Vec<&Expr> = filters.iter().collect();
 
         let result = schema.supports_filters_pushdown(&filter_refs);
@@ -295,7 +295,7 @@ mod tests {
             vec!["timestamp".to_string()],
         );
 
-        let filters = vec![col("status").eq(lit("active"))];
+        let filters = [col("status").eq(lit("active"))];
         let filter_refs: Vec<&Expr> = filters.iter().collect();
 
         let result = schema.supports_filters_pushdown(&filter_refs);

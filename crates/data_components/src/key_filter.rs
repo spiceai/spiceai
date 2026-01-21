@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Common utilities for extracting partition/sort key filters from DataFusion expressions.
+//! Common utilities for extracting partition/sort key filters from `DataFusion` expressions.
 //!
 //! This module provides reusable logic for identifying filter expressions that can be
-//! pushed down to key-value or NoSQL databases like DynamoDB and ScyllaDB. These databases
+//! pushed down to key-value or `NoSQL` databases like `DynamoDB` and `ScyllaDB`. These databases
 //! require specific filter patterns on primary key columns for efficient queries.
 //!
 //! # Key Concepts
@@ -129,7 +129,7 @@ pub fn try_match_index(
 
 /// Checks if an expression contains an OR operator.
 ///
-/// OR conditions typically cannot be pushed down to key-based queries in NoSQL databases
+/// OR conditions typically cannot be pushed down to key-based queries in `NoSQL` databases
 /// because they would require multiple partition lookups or a scan.
 #[must_use]
 pub fn contains_or(expr: &Expr) -> bool {
@@ -206,6 +206,7 @@ fn extract_column_name(expr: &Expr) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::Column;
     use datafusion::logical_expr::{col, lit};
 
     // =========================================================================
@@ -391,7 +392,6 @@ mod tests {
         // Note: col("user.id") creates a qualified column (relation="user", name="id")
         // This is by design in DataFusion - dots are table qualifiers
         // For actual dotted column names, use Expr::Column(Column::new_unqualified("user.id"))
-        use datafusion::common::Column;
         let expr = Expr::Column(Column::new_unqualified("user.id")).eq(lit("value"));
         let result = try_extract_key_filter(&expr, "user.id", None);
         assert!(matches!(result, Some(KeyFilter::Partition(_))));

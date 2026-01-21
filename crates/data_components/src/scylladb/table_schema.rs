@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! ScyllaDB/Cassandra table schema utilities.
+//! `ScyllaDB`/Cassandra table schema utilities.
 //!
 //! This module provides functionality to query and store table metadata,
-//! including partition keys and clustering keys, from ScyllaDB's system tables.
+//! including partition keys and clustering keys, from `ScyllaDB`'s system tables.
 
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use scylla::client::session::Session;
@@ -39,9 +39,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Encapsulates ScyllaDB table schema with partition and clustering key information.
+/// Encapsulates `ScyllaDB` table schema with partition and clustering key information.
 ///
-/// This struct stores the primary key structure of a ScyllaDB/Cassandra table,
+/// This struct stores the primary key structure of a `ScyllaDB`/Cassandra table,
 /// enabling efficient filter pushdown by identifying which filters can be
 /// used in CQL WHERE clauses.
 #[derive(Debug, Clone)]
@@ -71,13 +71,13 @@ impl ScyllaDBTableSchema {
         }
     }
 
-    /// Fetches table schema from ScyllaDB system tables.
+    /// Fetches table schema from `ScyllaDB` system tables.
     ///
     /// Queries `system_schema.columns` to retrieve partition and clustering key columns.
     ///
     /// # Arguments
     ///
-    /// * `session` - The ScyllaDB session to query
+    /// * `session` - The `ScyllaDB` session to query
     /// * `keyspace` - The keyspace name
     /// * `table` - The table name
     ///
@@ -210,24 +210,23 @@ impl ScyllaDBTableSchema {
             .iter()
             .map(|&expr| {
                 // Only support simple partition key (not composite) for now
-                if let Some(pk) = partition_key {
-                    if let Some(key_filter) =
+                if let Some(pk) = partition_key
+                    && let Some(key_filter) =
                         key_filter::try_extract_key_filter(expr, pk, clustering_key)
-                    {
-                        // Check for OR conditions which CQL doesn't support
-                        if key_filter::contains_or(expr) {
-                            return TableProviderFilterPushDown::Unsupported;
-                        }
+                {
+                    // Check for OR conditions which CQL doesn't support
+                    if key_filter::contains_or(expr) {
+                        return TableProviderFilterPushDown::Unsupported;
+                    }
 
-                        match key_filter {
-                            key_filter::KeyFilter::Partition(_) => {
-                                return TableProviderFilterPushDown::Exact;
-                            }
-                            key_filter::KeyFilter::Sort(_) => {
-                                // Sort key can only be pushed if partition key is also present
-                                // This is checked at query time, mark as Inexact to keep filter
-                                return TableProviderFilterPushDown::Inexact;
-                            }
+                    match key_filter {
+                        key_filter::KeyFilter::Partition(_) => {
+                            return TableProviderFilterPushDown::Exact;
+                        }
+                        key_filter::KeyFilter::Sort(_) => {
+                            // Sort key can only be pushed if partition key is also present
+                            // This is checked at query time, mark as Inexact to keep filter
+                            return TableProviderFilterPushDown::Inexact;
                         }
                     }
                 }
@@ -288,7 +287,7 @@ mod tests {
     #[test]
     fn test_partition_key_filter_supported() {
         let schema = create_test_schema();
-        let filters = vec![col("user_id").eq(lit("user123"))];
+        let filters = [col("user_id").eq(lit("user123"))];
         let filter_refs: Vec<&Expr> = filters.iter().collect();
 
         let result = schema.supports_filters_pushdown(&filter_refs);
@@ -299,7 +298,7 @@ mod tests {
     #[test]
     fn test_clustering_key_filter_inexact() {
         let schema = create_test_schema();
-        let filters = vec![col("timestamp").gt(lit("2024-01-01"))];
+        let filters = [col("timestamp").gt(lit("2024-01-01"))];
         let filter_refs: Vec<&Expr> = filters.iter().collect();
 
         let result = schema.supports_filters_pushdown(&filter_refs);
@@ -311,7 +310,7 @@ mod tests {
     #[test]
     fn test_regular_column_unsupported() {
         let schema = create_test_schema();
-        let filters = vec![col("status").eq(lit("active"))];
+        let filters = [col("status").eq(lit("active"))];
         let filter_refs: Vec<&Expr> = filters.iter().collect();
 
         let result = schema.supports_filters_pushdown(&filter_refs);
