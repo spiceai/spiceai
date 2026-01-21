@@ -26,7 +26,7 @@ use crate::datafusion::is_spice_internal_dataset;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use ::cache::Caching;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
@@ -1074,7 +1074,25 @@ impl TableProvider for AcceleratedTable {
             )),
         };
 
-        Ok(Arc::new(SchemaCastScanExec::new(plan, self.schema())))
+        // Compute the target schema based on user's original projection.
+        // SchemaCastScanExec strips extra columns (like fetched_at added for caching)
+        // and casts types. The schema should match what the user requested.
+        let target_schema = match projection {
+            Some(indices) => {
+                let full_schema = self.schema();
+                let projected_fields: Vec<_> = indices
+                    .iter()
+                    .filter_map(|&i| full_schema.fields().get(i).cloned())
+                    .collect();
+                Arc::new(Schema::new_with_metadata(
+                    projected_fields,
+                    full_schema.metadata().clone(),
+                ))
+            }
+            None => self.schema(),
+        };
+
+        Ok(Arc::new(SchemaCastScanExec::new(plan, target_schema)))
     }
 
     async fn insert_into(

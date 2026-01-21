@@ -96,6 +96,17 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
         })
         .collect::<Result<Vec<Arc<dyn Array>>>>()?;
 
+    // Handle empty schema case (e.g., for aggregate queries like `SELECT COUNT(1) FROM table`).
+    // Arrow requires either columns or an explicit row count when creating a RecordBatch.
+    if cols.is_empty() {
+        return RecordBatch::try_new_with_options(
+            schema,
+            cols,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(record_batch.num_rows())),
+        )
+        .context(UnableToConvertRecordBatchSnafu);
+    }
+
     RecordBatch::try_new(schema, cols).context(UnableToConvertRecordBatchSnafu)
 }
 
@@ -407,6 +418,25 @@ mod test {
     fn test_string_to_timestamp_conversion() {
         let result = try_cast_to(batch_input(), to_schema()).expect("converted");
         assert_eq!(3, result.num_rows());
+    }
+
+    /// Test that `try_cast_to` handles empty schema correctly.
+    /// This is needed for aggregate queries like `SELECT COUNT(1) FROM table`
+    /// which have an empty projection (no columns selected from the table).
+    #[test]
+    fn test_try_cast_to_empty_schema() {
+        // Input batch has columns but we want to cast to an empty schema
+        let input_batch = batch_input();
+        assert_eq!(3, input_batch.num_rows());
+        assert_eq!(3, input_batch.num_columns());
+
+        // Target schema has no columns (like projection=[] for COUNT queries)
+        let empty_schema = Arc::new(Schema::empty());
+
+        // This should succeed, preserving the row count
+        let result = try_cast_to(input_batch, empty_schema).expect("should handle empty schema");
+        assert_eq!(3, result.num_rows(), "row count should be preserved");
+        assert_eq!(0, result.num_columns(), "should have no columns");
     }
 
     fn parse_json_to_batch(json_data: &str, schema: SchemaRef) -> RecordBatch {

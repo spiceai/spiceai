@@ -25,7 +25,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
-use datafusion::physical_expr::OrderingRequirements;
+use datafusion::physical_expr::{EquivalenceProperties, OrderingRequirements};
 use datafusion::physical_plan::execution_plan::{
     CardinalityEffect, InvariantLevel, check_default_invariants,
 };
@@ -43,18 +43,51 @@ use futures::StreamExt;
 use std::any::Any;
 use std::clone::Clone;
 use std::fmt;
-use std::ops::Deref;
 use std::sync::Arc;
 
 pub struct SchemaCastScanExec {
     input: Arc<dyn ExecutionPlan>,
-    schema: SchemaRef,
+    /// The target schema requested by the caller
+    target_schema: SchemaRef,
+    /// The actual output schema (target schema with nullability adjustments from input)
+    output_schema: SchemaRef,
     properties: PlanProperties,
 }
 
 impl SchemaCastScanExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Self {
-        let eq_properties = input.equivalence_properties().clone();
+        // Compute the actual output schema: iterate over target schema fields,
+        // but adjust nullability based on input schema to avoid "non-nullable but contains null values" errors.
+        let input_schema = input.schema();
+        let output_schema = Arc::new(
+            Schema::new(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|target_field| {
+                        if let Ok(input_field) = input_schema.field_with_name(target_field.name()) {
+                            // Use target field but make it nullable if input is nullable
+                            if input_field.is_nullable() && !target_field.is_nullable() {
+                                Field::new(
+                                    target_field.name(),
+                                    target_field.data_type().clone(),
+                                    true, // Make nullable to match input
+                                )
+                                .with_metadata(target_field.metadata().clone())
+                            } else {
+                                target_field.as_ref().clone()
+                            }
+                        } else {
+                            target_field.as_ref().clone()
+                        }
+                    })
+                    .collect::<Vec<Field>>(),
+            )
+            .with_metadata(schema.metadata().clone()),
+        );
+
+        // Create equivalence properties with the actual output schema
+        let eq_properties = EquivalenceProperties::new(Arc::clone(&output_schema));
         let emission_type = input.pipeline_behavior();
         let boundedness = input.boundedness();
         let properties = PlanProperties::new(
@@ -65,7 +98,8 @@ impl SchemaCastScanExec {
         );
         Self {
             input,
-            schema,
+            target_schema: schema,
+            output_schema,
             properties,
         }
     }
@@ -81,7 +115,8 @@ impl fmt::Debug for SchemaCastScanExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SchemaCastScanExec")
             .field("input", &self.input)
-            .field("schema", &self.schema)
+            .field("target_schema", &self.target_schema)
+            .field("output_schema", &self.output_schema)
             .field("properties", &self.properties)
             .finish()
     }
@@ -112,22 +147,7 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(
-            Schema::new(
-                self.input
-                    .schema()
-                    .fields()
-                    .into_iter()
-                    .map(|field| {
-                        self.schema
-                            .field_with_name(field.name())
-                            .ok()
-                            .map_or(field.deref().clone(), Clone::clone)
-                    })
-                    .collect::<Vec<Field>>(),
-            )
-            .with_metadata(self.input.schema().metadata().clone()),
-        )
+        Arc::clone(&self.output_schema)
     }
 
     fn check_invariants(&self, check: InvariantLevel) -> Result<()> {
@@ -161,7 +181,7 @@ impl ExecutionPlan for SchemaCastScanExec {
         if children.len() == 1 {
             Ok(Arc::new(Self::new(
                 Arc::clone(&children[0]),
-                Arc::clone(&self.schema),
+                Arc::clone(&self.target_schema),
             )))
         } else {
             Err(DataFusionError::Execution(
@@ -297,6 +317,144 @@ impl TableProvider for EnsureSchema {
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let input = self.input.scan(state, projection, filters, limit).await?;
-        Ok(Arc::new(SchemaCastScanExec::new(input, self.schema())))
+
+        // Compute target schema based on projection, not full table schema.
+        // When projection is specified, only include those fields.
+        let target_schema = match projection {
+            Some(indices) => {
+                let full_schema = self.schema();
+                let projected_fields: Vec<_> = indices
+                    .iter()
+                    .filter_map(|&i| full_schema.fields().get(i).cloned())
+                    .collect();
+                Arc::new(Schema::new_with_metadata(
+                    projected_fields,
+                    full_schema.metadata().clone(),
+                ))
+            }
+            None => self.schema(),
+        };
+
+        Ok(Arc::new(SchemaCastScanExec::new(input, target_schema)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::empty::EmptyExec;
+
+    fn input_schema_with_extra_column() -> SchemaRef {
+        // Input has 3 columns including an internal "fetched_at" column
+        Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, true),
+            Field::new("fetched_at", DataType::Int64, true),
+        ]))
+    }
+
+    fn expected_output_schema() -> SchemaRef {
+        // User expects only 2 columns (no fetched_at)
+        Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, true),
+        ]))
+    }
+
+    #[test]
+    fn test_schema_returns_expected_schema_not_input_schema() {
+        // Simulates the cache HIT scenario from GitHub issue #9019:
+        // Input has 3 columns (including internal fetched_at), but user only requested 2 columns.
+        // SchemaCastScanExec should return the expected 2-column schema, not the input's 3-column schema.
+        let input = Arc::new(EmptyExec::new(input_schema_with_extra_column()));
+        let expected_schema = expected_output_schema();
+
+        let schema_cast = SchemaCastScanExec::new(input, Arc::clone(&expected_schema));
+
+        let actual_schema = schema_cast.schema();
+        assert_eq!(
+            actual_schema.fields().len(),
+            2,
+            "Schema should have 2 fields, not 3 (fetched_at should be stripped)"
+        );
+        assert_eq!(
+            actual_schema.field(0).name(),
+            "request_path",
+            "First field should be request_path"
+        );
+        assert_eq!(
+            actual_schema.field(1).name(),
+            "content",
+            "Second field should be content"
+        );
+        // The schema should exactly match the expected schema
+        assert_eq!(
+            actual_schema.fields(),
+            expected_schema.fields(),
+            "Schema should match expected output schema"
+        );
+    }
+
+    #[test]
+    fn test_schema_preserves_when_input_matches_expected() {
+        // When input and expected schemas match, SchemaCastScanExec should return that schema.
+        let matching_schema = expected_output_schema();
+        let input = Arc::new(EmptyExec::new(Arc::clone(&matching_schema)));
+
+        let schema_cast = SchemaCastScanExec::new(input, Arc::clone(&matching_schema));
+
+        let actual_schema = schema_cast.schema();
+        assert_eq!(
+            actual_schema.fields(),
+            matching_schema.fields(),
+            "Schema should match when input equals expected"
+        );
+    }
+
+    #[test]
+    fn test_schema_makes_fields_nullable_when_input_is_nullable() {
+        // When input schema has nullable fields but target schema has non-nullable,
+        // the output should be nullable to avoid "non-nullable but contains null values" errors.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, true), // nullable in input
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false), // non-nullable in target
+        ]));
+
+        let input = Arc::new(EmptyExec::new(input_schema));
+        let schema_cast = SchemaCastScanExec::new(input, target_schema);
+
+        let actual_schema = schema_cast.schema();
+        assert!(
+            actual_schema
+                .field_with_name("content")
+                .is_ok_and(Field::is_nullable),
+            "content field should be nullable because input is nullable"
+        );
+    }
+
+    #[test]
+    fn test_schema_handles_empty_projection() {
+        // Test for aggregate queries like `SELECT COUNT(1) FROM table` which have
+        // an empty projection (projection=[]) - no columns selected from the table.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let empty_schema = Arc::new(Schema::empty());
+
+        let input = Arc::new(EmptyExec::new(input_schema));
+        let schema_cast = SchemaCastScanExec::new(input, empty_schema);
+
+        let actual_schema = schema_cast.schema();
+        assert_eq!(
+            actual_schema.fields().len(),
+            0,
+            "Schema should have 0 fields for empty projection"
+        );
     }
 }
