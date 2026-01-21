@@ -734,6 +734,8 @@ impl RefreshTask {
         self.set_refresh_status(sql, status::ComponentStatus::Ready)
             .await;
 
+        self.update_last_updated_at();
+
         Ok(())
     }
 
