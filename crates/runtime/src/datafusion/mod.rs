@@ -350,6 +350,9 @@ pub enum Error {
     ))]
     UnsupportedRefreshCompleteForStream,
 
+    #[snafu(display("Caching refresh mode only supports 'time_interval' for snapshots_trigger"))]
+    UnsupportedSnapshotTriggerForCaching,
+
     #[snafu(display(
         "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
     ))]
@@ -2181,7 +2184,20 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    let snapshot_creation_trigger = if is_streaming_refresh {
+    // Caching mode only supports time_interval - no "refresh complete" or "stream_batches" events.
+    let is_caching = matches!(refresh_mode, RefreshMode::Caching);
+
+    let snapshot_creation_trigger = if is_caching {
+        match snapshot_trigger {
+            None | Some(SnapshotsTrigger::TimeInterval) => {
+                let interval = parse_interval(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Interval(interval)
+            }
+            Some(SnapshotsTrigger::RefreshComplete | SnapshotsTrigger::StreamBatches) => {
+                return Err(Error::UnsupportedSnapshotTriggerForCaching);
+            }
+        }
+    } else if is_streaming_refresh {
         match snapshot_trigger {
             None | Some(SnapshotsTrigger::TimeInterval) => {
                 let interval = parse_interval(&snapshot_threshold)?;

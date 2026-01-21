@@ -1366,14 +1366,8 @@ impl RefreshTask {
             .await;
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     fn update_last_updated_at(&self) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        self.last_updated_at
-            .store(now_ms, std::sync::atomic::Ordering::Release);
+        super::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
     }
 }
 
