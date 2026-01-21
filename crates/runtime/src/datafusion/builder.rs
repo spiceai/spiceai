@@ -68,6 +68,7 @@ use datafusion_optimizer_rules::{
 use runtime_datafusion::{
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
+    url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
@@ -354,6 +355,17 @@ impl DataFusionBuilder {
         }
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
+
+        // Enable URL-based table resolution (e.g., SELECT * FROM 's3://bucket/data.parquet')
+        // This wraps the catalog list with DynamicUrlCatalogList which intercepts URL-like table names
+        let url_table_factory = Arc::new(SpiceUrlTableFactory::new());
+        let current_catalog_list = Arc::clone(ctx.state().catalog_list());
+        let dynamic_catalog_list =
+            Arc::new(DynamicUrlCatalogList::new(current_catalog_list, Arc::clone(&url_table_factory)));
+        ctx.register_catalog_list(dynamic_catalog_list);
+
+        // Register the session state with the factory so it can infer schemas
+        url_table_factory.with_state(ctx.state_weak_ref());
 
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 

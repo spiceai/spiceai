@@ -21,6 +21,7 @@ pub mod extension;
 pub mod join_accumulator;
 pub mod optimizer_rule;
 pub mod schema_provider;
+pub mod url_table;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
