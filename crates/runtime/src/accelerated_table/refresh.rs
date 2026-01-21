@@ -775,7 +775,6 @@ impl Refresher {
 
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
         let last_updated_at = Arc::clone(&self.last_updated_at);
-        let runtime_status = Arc::clone(&self.runtime_status);
 
         let synchronize_with = self.synchronize_with.clone();
 
