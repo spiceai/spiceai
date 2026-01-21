@@ -54,7 +54,7 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotAdapter};
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -1653,6 +1653,16 @@ impl DataAccelerator for CayenneAccelerator {
                 engine: Engine::Cayenne,
                 source: err.into(),
             })
+    }
+
+    fn snapshot_adapter(&self, source: &dyn AccelerationSource) -> SnapshotAdapter {
+        let Ok(data_dir) = self.cayenne_data_dir(source) else {
+            return SnapshotAdapter::default();
+        };
+
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+
+        SnapshotAdapter::cayenne(PathBuf::from(metadata_dir), PathBuf::from(data_dir))
     }
 
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {

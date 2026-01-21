@@ -20,7 +20,7 @@ arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { workspace = true, optional = true }
+aws-config.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
@@ -229,11 +229,10 @@ tar = "0.4"
 
 [features]
 aws-secrets-manager = [
-    "dep:aws-config",
     "dep:aws-sdk-sts",
     "runtime-secrets/aws-secrets-manager",
 ]
-bedrock = ["dep:aws-config"]
+bedrock = []
 clickhouse = [
     "dep:clickhouse-rs",
     "db_connection_pool/clickhouse",
