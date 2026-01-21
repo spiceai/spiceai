@@ -400,6 +400,12 @@ fn add_labels_to_metric_data_points(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_proto::tonic::common::v1::{any_value::Value, AnyValue};
+    use opentelemetry_proto::tonic::metrics::v1::{
+        number_data_point::Value as NumberValue, Gauge, Metric, NumberDataPoint, ResourceMetrics,
+        ScopeMetrics, Sum,
+    };
+    use opentelemetry_proto::tonic::resource::v1::Resource;
 
     #[test]
     fn test_normalize_endpoint() {
@@ -427,5 +433,198 @@ mod tests {
         add_node_labels(&mut request, "node-1", ROLE_SCHEDULER);
         // Should not panic with empty request
         assert!(request.resource_metrics.is_empty());
+    }
+
+    #[test]
+    fn test_add_node_labels_with_gauge_metrics() {
+        let mut request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "test_gauge".to_string(),
+                        description: "A test gauge".to_string(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(
+                            opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 0,
+                                    time_unix_nano: 0,
+                                    value: Some(NumberValue::AsDouble(42.5)),
+                                    exemplars: Vec::new(),
+                                    flags: 0,
+                                }],
+                            }),
+                        ),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        add_node_labels(&mut request, "executor-1", ROLE_EXECUTOR);
+
+        // Check resource attributes
+        let resource = request.resource_metrics[0]
+            .resource
+            .as_ref()
+            .expect("resource should exist");
+        assert_eq!(resource.attributes.len(), 2);
+
+        let node_id_attr = resource
+            .attributes
+            .iter()
+            .find(|kv| kv.key == NODE_ID_LABEL)
+            .expect("node_id label should exist");
+        assert_eq!(
+            node_id_attr.value,
+            Some(AnyValue {
+                value: Some(Value::StringValue("executor-1".to_string()))
+            })
+        );
+
+        let role_attr = resource
+            .attributes
+            .iter()
+            .find(|kv| kv.key == NODE_ROLE_LABEL)
+            .expect("role label should exist");
+        assert_eq!(
+            role_attr.value,
+            Some(AnyValue {
+                value: Some(Value::StringValue(ROLE_EXECUTOR.to_string()))
+            })
+        );
+
+        // Check data point attributes
+        let gauge = match &request.resource_metrics[0].scope_metrics[0].metrics[0].data {
+            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(g)) => g,
+            _ => panic!("expected gauge"),
+        };
+        assert_eq!(gauge.data_points[0].attributes.len(), 2);
+    }
+
+    #[test]
+    fn test_add_node_labels_with_counter_metrics() {
+        let mut request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "requests_total".to_string(),
+                        description: "Total requests".to_string(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(
+                            Sum {
+                                data_points: vec![NumberDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 0,
+                                    time_unix_nano: 0,
+                                    value: Some(NumberValue::AsInt(100)),
+                                    exemplars: Vec::new(),
+                                    flags: 0,
+                                }],
+                                aggregation_temporality: 2,
+                                is_monotonic: true,
+                            },
+                        )),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        add_node_labels(&mut request, "scheduler-1", ROLE_SCHEDULER);
+
+        // Check data point attributes for Sum metric
+        let sum = match &request.resource_metrics[0].scope_metrics[0].metrics[0].data {
+            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(s)) => s,
+            _ => panic!("expected sum"),
+        };
+        assert_eq!(sum.data_points[0].attributes.len(), 2);
+
+        let has_node_id = sum.data_points[0]
+            .attributes
+            .iter()
+            .any(|kv| kv.key == NODE_ID_LABEL);
+        let has_role = sum.data_points[0]
+            .attributes
+            .iter()
+            .any(|kv| kv.key == NODE_ROLE_LABEL);
+
+        assert!(has_node_id, "node_id label should be added to data points");
+        assert!(has_role, "role label should be added to data points");
+    }
+
+    #[test]
+    fn test_add_node_labels_idempotent() {
+        let mut request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![
+                        KeyValue {
+                            key: NODE_ID_LABEL.to_string(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue("existing-node".to_string())),
+                            }),
+                        },
+                        KeyValue {
+                            key: NODE_ROLE_LABEL.to_string(),
+                            value: Some(AnyValue {
+                                value: Some(Value::StringValue(ROLE_SCHEDULER.to_string())),
+                            }),
+                        },
+                    ],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_metrics: vec![],
+                schema_url: String::new(),
+            }],
+        };
+
+        // Call add_node_labels with different values
+        add_node_labels(&mut request, "new-node", ROLE_EXECUTOR);
+
+        // Labels should NOT be duplicated - original values preserved
+        let resource = request.resource_metrics[0]
+            .resource
+            .as_ref()
+            .expect("resource should exist");
+
+        // Should still have exactly 2 attributes, not 4
+        assert_eq!(
+            resource.attributes.len(),
+            2,
+            "labels should not be duplicated"
+        );
+
+        // Original values should be preserved
+        let node_id_attr = resource
+            .attributes
+            .iter()
+            .find(|kv| kv.key == NODE_ID_LABEL)
+            .expect("node_id should exist");
+        assert_eq!(
+            node_id_attr.value,
+            Some(AnyValue {
+                value: Some(Value::StringValue("existing-node".to_string()))
+            }),
+            "original node_id should be preserved"
+        );
     }
 }

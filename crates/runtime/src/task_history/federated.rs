@@ -370,4 +370,33 @@ mod tests {
             "SELECT * FROM \"runtime\".\"task_history\" LIMIT 100"
         );
     }
+
+    #[test]
+    fn test_build_peer_sql_with_filters() {
+        use datafusion::prelude::*;
+
+        let table_ref = "\"runtime\".\"task_history\"";
+
+        // Single filter
+        let filter = col("status").eq(lit("completed"));
+        assert_eq!(
+            build_peer_sql(table_ref, &[filter], None),
+            "SELECT * FROM \"runtime\".\"task_history\" WHERE status = Utf8(\"completed\")"
+        );
+
+        // Filter with limit
+        let filter = col("task_id").eq(lit("task-123"));
+        assert_eq!(
+            build_peer_sql(table_ref, &[filter], Some(50)),
+            "SELECT * FROM \"runtime\".\"task_history\" WHERE task_id = Utf8(\"task-123\") LIMIT 50"
+        );
+
+        // Multiple filters (combined with AND)
+        let filter1 = col("status").eq(lit("running"));
+        let filter2 = col("execution_time").gt(lit(100));
+        assert_eq!(
+            build_peer_sql(table_ref, &[filter1, filter2], None),
+            "SELECT * FROM \"runtime\".\"task_history\" WHERE status = Utf8(\"running\") AND execution_time > Int32(100)"
+        );
+    }
 }

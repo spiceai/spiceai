@@ -964,13 +964,18 @@ pub async fn initialize_cluster_executor(
     let control_stream_executor_id = executor_advertise_id;
     let control_stream_tls_config = client_tls_config.clone();
     let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
+    let control_stream_metrics_reader = rt.metrics_reader().cloned();
 
     let poll_manager = tokio::spawn(async move {
         let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
         let mut known_schedulers: HashSet<String> = HashSet::new();
 
-        let mut control_stream_manager =
-            ControlStreamManager::new(control_stream_executor_id, control_stream_tls_config);
+        // Initialize control stream manager for metrics collection
+        let mut control_stream_manager = ControlStreamManager::new(
+            control_stream_executor_id,
+            control_stream_tls_config,
+            control_stream_metrics_reader,
+        );
 
         let mut current_addresses = initial_scheduler_addresses_for_manager;
         if current_addresses.is_empty() {

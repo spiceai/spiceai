@@ -172,6 +172,9 @@ fn parse_query_string(query: &str) -> HashMap<String, String> {
         .filter_map(|pair| {
             let mut parts = pair.splitn(2, '=');
             let key = parts.next()?;
+            if key.is_empty() {
+                return None;
+            }
             let value = parts.next().unwrap_or("");
             Some((key.to_string(), value.to_string()))
         })
@@ -840,5 +843,91 @@ mod tests {
         let request = ExportMetricsServiceRequest::default();
         let output = otlp_to_prometheus_text(&request);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_string_empty_value() {
+        // Handle `key=` with no value
+        let params = parse_query_string("scope=&foo=bar");
+        assert_eq!(params.get("scope"), Some(&String::new()));
+        assert_eq!(params.get("foo"), Some(&"bar".to_string()));
+
+        // Just `key=`
+        let params = parse_query_string("key=");
+        assert_eq!(params.get("key"), Some(&String::new()));
+    }
+
+    #[test]
+    fn test_parse_query_string_multiple_equals() {
+        // Handle `key=value=with=equals`
+        let params = parse_query_string("filter=status=active");
+        // The value should be everything after the first `=`
+        assert_eq!(params.get("filter"), Some(&"status=active".to_string()));
+
+        let params = parse_query_string("query=a=b=c&other=value");
+        assert_eq!(params.get("query"), Some(&"a=b=c".to_string()));
+        assert_eq!(params.get("other"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_otlp_to_prometheus_histogram() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Histogram as OtlpHistogram, HistogramDataPoint, Metric as OtlpMetric, ResourceMetrics,
+            ScopeMetrics,
+        };
+
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![OtlpMetric {
+                        name: "http_request_duration_seconds".to_string(),
+                        description: "HTTP request duration".to_string(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(
+                            opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(
+                                OtlpHistogram {
+                                    data_points: vec![HistogramDataPoint {
+                                        attributes: Vec::new(),
+                                        start_time_unix_nano: 0,
+                                        time_unix_nano: 0,
+                                        count: 100,
+                                        sum: Some(50.0),
+                                        bucket_counts: vec![10, 30, 40, 15, 5],
+                                        explicit_bounds: vec![0.01, 0.05, 0.1, 0.5],
+                                        exemplars: Vec::new(),
+                                        flags: 0,
+                                        min: None,
+                                        max: None,
+                                    }],
+                                    aggregation_temporality: 2,
+                                },
+                            ),
+                        ),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let output = otlp_to_prometheus_text(&request);
+
+        // Check help and type
+        assert!(output.contains("# HELP http_request_duration_seconds HTTP request duration"));
+        assert!(output.contains("# TYPE http_request_duration_seconds histogram"));
+
+        // Check bucket lines (cumulative counts)
+        assert!(output.contains("http_request_duration_seconds_bucket{le=\"0.01\"} 10"));
+        assert!(output.contains("http_request_duration_seconds_bucket{le=\"0.05\"} 40")); // 10 + 30
+        assert!(output.contains("http_request_duration_seconds_bucket{le=\"0.1\"} 80")); // 10 + 30 + 40
+        assert!(output.contains("http_request_duration_seconds_bucket{le=\"0.5\"} 95")); // 10 + 30 + 40 + 15
+        assert!(output.contains("http_request_duration_seconds_bucket{le=\"+Inf\"} 100")); // all
+
+        // Check sum and count
+        assert!(output.contains("http_request_duration_seconds_sum 50"));
+        assert!(output.contains("http_request_duration_seconds_count 100"));
     }
 }

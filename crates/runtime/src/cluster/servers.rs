@@ -54,6 +54,7 @@ fn server_with_cluster_mtls(
 pub async fn start_internal_cluster_server(
     rt: Arc<Runtime>,
     shutdown_signal: Option<CancellationToken>,
+    executor_registry: Arc<ExecutorRegistry>,
 ) -> ClusterServerResult<()> {
     let bind_address = rt.df.cluster_config.node_bind_address();
 
@@ -102,9 +103,6 @@ pub async fn start_internal_cluster_server(
         })
         .unwrap_or_else(|| bind_address.to_string());
 
-    // Create the executor registry for managing control stream connections
-    let executor_registry = Arc::new(ExecutorRegistry::new());
-
     let cluster_service = ClusterServiceImpl::new(
         Arc::clone(&rt.app),
         Arc::clone(&rt.secrets),
@@ -112,8 +110,7 @@ pub async fn start_internal_cluster_server(
         rt.scheduler_peers(),
         Arc::clone(&rt.df),
         Arc::clone(&executor_registry),
-        // TODO(Phase 6): Wire up MetricsReader from Runtime for cluster metrics collection
-        None,
+        rt.metrics_reader().cloned(),
     );
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 

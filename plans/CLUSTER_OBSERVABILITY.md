@@ -8,8 +8,8 @@
 | Phase 2 | Task History with `scheduler_id` | ✅ Complete |
 | Phase 3 | GetTaskHistory RPC Implementation | ✅ Complete |
 | Phase 4 | Executor Control Stream | ✅ Complete |
-| Phase 5 | Cluster Metrics Endpoint | 🔄 In Progress |
-| Phase 6 | Wire Everything Together | 🔲 Not Started |
+| Phase 5 | Cluster Metrics Endpoint | ✅ Complete |
+| Phase 6 | Wire Everything Together | ✅ Complete |
 
 ## Overview
 
@@ -319,17 +319,41 @@ fn otlp_to_prometheus(
 
 ### Phase 6: Wire Everything Together
 
+**Note:** This phase also includes items deferred from Phase 5:
+- Wire `MetricsReader` to executor control stream client for actual metrics collection
+- Wire `MetricsReader` to `ClusterServiceImpl` for `GetMetrics` RPC
+- Create and pass `ClusterMetricsCollector` to metrics server in cluster mode
+
 **Files to modify:**
 - `crates/runtime/src/cluster/service.rs` - Update constructor
-- `bin/spiced/src/lib.rs` - Create and wire components
+- `crates/runtime/src/cluster/servers.rs` - Pass MetricsReader
+- `crates/runtime/src/cluster/control_stream_client.rs` - Accept MetricsReader
+- `crates/runtime/src/lib.rs` - Create and wire components
+- `bin/spiced/src/lib.rs` - Create MetricsReader for cluster mode
 
 **Steps:**
 
-#### 6.1 Update ClusterServiceImpl
+#### 6.1 Create MetricsReader for Cluster Mode
+- In `bin/spiced/src/lib.rs`, create a `MetricsReader` when in cluster mode
+- Add it to the `SdkMeterProvider` alongside existing readers
+- Store reference for passing to cluster components
+
+#### 6.2 Update ClusterServiceImpl
+- Accept `MetricsReader` in constructor (for `GetMetrics` RPC)
 - Accept `ExecutorRegistry` and `DataFusion` in constructor
 - Store references for RPC handlers
 
-#### 6.2 Update Runtime Initialization
+#### 6.3 Wire Executor Control Stream Client
+- Update `ControlStreamManager::new()` to accept `Option<MetricsReader>`
+- Pass `MetricsReader` to `spawn_control_stream()`
+- Use `MetricsReader::collect_otlp()` in `handle_scheduler_message()` instead of returning empty Vec
+
+#### 6.4 Create and Wire ClusterMetricsCollector
+- Create `ClusterMetricsCollector` when in scheduler mode
+- Pass to metrics server `start()` function
+- Collector needs: `SchedulerPeers`, `ExecutorRegistry`, `ClientTlsConfig`, node_id, local metrics fn
+
+#### 6.5 Update Runtime Initialization
 - Create `ExecutorRegistry` when in scheduler mode
 - Create `ClusterMetricsCollector` when in scheduler mode
 - Pass to `ClusterServiceImpl`
@@ -348,10 +372,13 @@ fn otlp_to_prometheus(
 | `crates/runtime/src/init/task_history.rs` | Modify | Cluster mode handling |
 | `crates/runtime/src/cluster/service.rs` | Modify | Add RPC handlers, executor registry |
 | `crates/runtime/src/cluster/executor_registry.rs` | **New** | Track executor connections |
-| `crates/runtime/src/cluster/mod.rs` | Modify | Add executor control stream client |
-| `crates/runtime/src/metrics_server/mod.rs` | Modify | Handle `?scope=cluster` |
+| `crates/runtime/src/cluster/control_stream_client.rs` | **New** | Executor-side control stream |
+| `crates/runtime/src/cluster/servers.rs` | Modify | Wire up cluster service components |
+| `crates/runtime/src/metrics_server/mod.rs` | Modify | Handle `?scope=cluster`, OTLP→Prometheus |
 | `crates/runtime/src/metrics_server/cluster.rs` | **New** | Cluster metrics collection/merging |
-| `bin/spiced/src/lib.rs` | Modify | Wire up new components |
+| `crates/runtime/src/metrics_reader.rs` | **New** | On-demand OTLP metrics collection |
+| `crates/runtime/src/lib.rs` | Modify | Wire up metrics server with cluster collector |
+| `bin/spiced/src/lib.rs` | Modify | Wire up new components, create MetricsReader |
 
 ---
 
@@ -366,17 +393,157 @@ fn otlp_to_prometheus(
 ## Testing Strategy
 
 ### Unit Tests
-- Task history schema with/without `scheduler_id`
-- OTLP metrics merging logic
-- Arrow IPC encoding/decoding for task history
-- Executor registry connection management
 
-### Integration Tests
-- Multi-scheduler task history federation
-- Cluster metrics endpoint with multiple schedulers
-- Cluster metrics endpoint with executors
-- Executor control stream lifecycle (connect/disconnect/reconnect)
-- Partial failure handling
+The following unit tests are implemented in the respective modules:
+
+#### `control_stream_client.rs`
+- `test_normalize_scheduler_endpoint` - Verify URL normalization with/without scheme
+- `test_control_stream_manager_new` - Verify manager initialization
+- `test_control_stream_manager_update_schedulers_empty` - Handle empty scheduler list
+
+#### `metrics_server/cluster.rs`
+- `test_normalize_endpoint` - Verify endpoint URL normalization
+- `test_add_node_labels_to_empty_request` - Handle empty OTLP request
+- `test_add_node_labels_with_gauge_metrics` - Verify labels added to gauge metrics
+- `test_add_node_labels_with_counter_metrics` - Verify labels added to counter metrics
+- `test_add_node_labels_idempotent` - Labels not duplicated on repeated calls
+
+#### `executor_registry.rs`
+- `test_register_unregister` - Basic registration lifecycle
+- `test_reconnect_replaces_connection` - Re-registration replaces old connection
+- `test_request_metrics_empty_registry` - Handle empty registry
+- `test_multiple_executors` - Manage multiple executor connections
+- `test_unregister_nonexistent` - Handle unregistering unknown executor
+
+#### `metrics_server/mod.rs`
+- `test_parse_query_string` - Parse `?scope=cluster&foo=bar`
+- `test_parse_query_string_empty_value` - Handle `key=` with no value
+- `test_parse_query_string_multiple_equals` - Handle `key=value=with=equals`
+- `test_otlp_to_prometheus_gauge` - Convert OTLP gauge to Prometheus format
+- `test_otlp_to_prometheus_counter` - Convert OTLP counter to Prometheus format
+- `test_otlp_to_prometheus_histogram` - Convert OTLP histogram to Prometheus format
+- `test_otlp_to_prometheus_empty` - Handle empty OTLP request
+- `test_sanitize_metric_name` - Prometheus metric name sanitization
+- `test_sanitize_label_name` - Prometheus label name sanitization
+- `test_escape_label_value` - Escape special characters in label values
+
+#### `task_history/federated.rs`
+- `test_normalize_scheduler_endpoint` - URL normalization for peer queries
+- `test_build_peer_sql` - SQL generation for peer queries
+- `test_build_peer_sql_with_limit` - SQL with LIMIT clause
+
+#### `metrics_reader.rs`
+- `test_metrics_reader_default` - Default reader doesn't panic
+- `test_otel_value_to_proto_*` - Convert OpenTelemetry values to protobuf
+
+### Manual E2E Tests
+
+These tests require a running cluster and should be verified manually:
+
+#### 1. Multi-Scheduler Task History Federation
+
+**Setup:**
+```bash
+# Terminal 1: Start scheduler 1
+spiced --role scheduler --node-bind-address 0.0.0.0:50051 --metrics 127.0.0.1:9091
+
+# Terminal 2: Start scheduler 2 with peer discovery
+spiced --role scheduler --node-bind-address 0.0.0.0:50052 --metrics 127.0.0.1:9092 \
+  --scheduler-address 127.0.0.1:50051
+```
+
+**Verify:**
+1. Execute queries on each scheduler to generate task history
+2. Query `SELECT * FROM runtime.task_history` on scheduler 1
+3. Verify results include `scheduler_id` column
+4. Verify results contain tasks from both schedulers
+
+#### 2. Executor Control Stream Lifecycle
+
+**Setup:**
+```bash
+# Terminal 1: Start scheduler
+spiced --role scheduler --node-bind-address 0.0.0.0:50051
+
+# Terminal 2: Start executor
+spiced --role executor --scheduler-address 127.0.0.1:50051
+```
+
+**Verify:**
+1. Check scheduler logs for "Control stream established" at DEBUG level
+2. Kill executor (Ctrl+C)
+3. Check scheduler logs for disconnect
+4. Restart executor
+5. Verify reconnection logged
+
+#### 3. Cluster Metrics Endpoint
+
+**Setup:**
+```bash
+# Start scheduler with metrics enabled
+spiced --role scheduler --node-bind-address 0.0.0.0:50051 --metrics 127.0.0.1:9090
+```
+
+**Verify:**
+```bash
+# Local metrics (default)
+curl http://127.0.0.1:9090/metrics
+
+# Cluster-scoped metrics
+curl "http://127.0.0.1:9090/metrics?scope=cluster"
+```
+
+Expected: Cluster metrics include `spice_node_id` and `spice_node_role` labels on all metrics.
+
+#### 4. Cluster Metrics with Executors
+
+**Setup:**
+```bash
+# Terminal 1: Scheduler
+spiced --role scheduler --node-bind-address 0.0.0.0:50051 --metrics 127.0.0.1:9090
+
+# Terminal 2: Executor
+spiced --role executor --scheduler-address 127.0.0.1:50051 --metrics 127.0.0.1:9091
+```
+
+**Verify:**
+```bash
+curl "http://127.0.0.1:9090/metrics?scope=cluster"
+```
+
+Expected: Metrics from both scheduler (`spice_node_role="scheduler"`) and executor (`spice_node_role="executor"`).
+
+#### 5. Partial Failure Handling
+
+**Setup:**
+```bash
+# Start 3 schedulers
+spiced --role scheduler --node-bind-address 0.0.0.0:50051 --metrics 127.0.0.1:9091
+spiced --role scheduler --node-bind-address 0.0.0.0:50052 --scheduler-address 127.0.0.1:50051
+spiced --role scheduler --node-bind-address 0.0.0.0:50053 --scheduler-address 127.0.0.1:50051
+```
+
+**Verify:**
+1. Kill one scheduler
+2. Query `runtime.task_history` on a running scheduler
+3. Verify error message includes the failed peer's address
+
+### Test Commands
+
+```bash
+# Run all cluster observability unit tests
+cargo test -p runtime control_stream
+cargo test -p runtime executor_registry
+cargo test -p runtime metrics_server
+cargo test -p runtime metrics_reader
+cargo test -p runtime federated
+
+# Run with verbose output
+cargo test -p runtime -- --nocapture
+
+# Run specific test
+cargo test -p runtime test_add_node_labels_with_gauge_metrics
+```
 
 ---
 

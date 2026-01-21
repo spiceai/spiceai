@@ -21,6 +21,7 @@ limitations under the License.
 //! to request metrics from executors on-demand.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ballista_core::utils::create_grpc_client_endpoint;
@@ -36,6 +37,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::ClientTlsConfig;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
+
+use crate::metrics_reader::MetricsReader;
 
 
 
@@ -59,6 +62,7 @@ fn spawn_control_stream(
     scheduler_address: String,
     executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
+    metrics_reader: Option<Arc<MetricsReader>>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -223,10 +227,10 @@ fn spawn_control_stream(
                                         &executor_id,
                                         message,
                                         &outbound_tx,
+                                        metrics_reader.as_deref(),
                                     )
                                     .await;
                                 }
-                            }
                             }
                             Some(Err(e)) => {
                                 tracing::debug!(
@@ -266,6 +270,7 @@ async fn handle_scheduler_message(
     executor_id: &str,
     message: SchedulerMessage,
     outbound_tx: &mpsc::Sender<ExecutorControlMessage>,
+    metrics_reader: Option<&MetricsReader>,
 ) {
     match message {
         SchedulerMessage::RequestMetrics(request) => {
@@ -274,11 +279,14 @@ async fn handle_scheduler_message(
                 request.request_id
             );
 
-            // Collect local OTLP metrics
-            // TODO(Phase 6): Wire up MetricsReader to collect actual executor metrics.
-            // For now, executors return empty metrics. The MetricsReader needs to be
-            // passed through ControlStreamManager::new() and spawn_control_stream().
-            let otlp_metrics = Vec::new();
+            // Collect local OTLP metrics using the MetricsReader if available
+            let otlp_metrics = match metrics_reader {
+                Some(reader) => reader.collect_otlp(),
+                None => {
+                    tracing::debug!("No MetricsReader available, returning empty metrics");
+                    Vec::new()
+                }
+            };
 
             let response = ExecutorControlMessage {
                 executor_id: executor_id.to_string(),
@@ -313,6 +321,7 @@ fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
 pub struct ControlStreamManager {
     executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
+    metrics_reader: Option<Arc<MetricsReader>>,
     streams: HashMap<String, ControlStreamHandle>,
     known_schedulers: HashSet<String>,
 }
@@ -320,10 +329,15 @@ pub struct ControlStreamManager {
 impl ControlStreamManager {
     /// Creates a new control stream manager.
     #[must_use]
-    pub fn new(executor_id: String, client_tls_config: Option<ClientTlsConfig>) -> Self {
+    pub fn new(
+        executor_id: String,
+        client_tls_config: Option<ClientTlsConfig>,
+        metrics_reader: Option<MetricsReader>,
+    ) -> Self {
         Self {
             executor_id,
             client_tls_config,
+            metrics_reader: metrics_reader.map(Arc::new),
             streams: HashMap::new(),
             known_schedulers: HashSet::new(),
         }
@@ -357,6 +371,7 @@ impl ControlStreamManager {
                 address.clone(),
                 self.executor_id.clone(),
                 self.client_tls_config.clone(),
+                self.metrics_reader.clone(),
             );
             self.streams.insert(address, handle);
         }
@@ -385,5 +400,96 @@ impl ControlStreamManager {
 impl Drop for ControlStreamManager {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_scheduler_endpoint_without_scheme() {
+        assert_eq!(
+            normalize_scheduler_endpoint("localhost:50051", false),
+            "http://localhost:50051"
+        );
+        assert_eq!(
+            normalize_scheduler_endpoint("localhost:50051", true),
+            "https://localhost:50051"
+        );
+        assert_eq!(
+            normalize_scheduler_endpoint("192.168.1.10:50052", false),
+            "http://192.168.1.10:50052"
+        );
+    }
+
+    #[test]
+    fn test_normalize_scheduler_endpoint_with_scheme() {
+        // Already has scheme - should not be modified
+        assert_eq!(
+            normalize_scheduler_endpoint("http://localhost:50051", false),
+            "http://localhost:50051"
+        );
+        assert_eq!(
+            normalize_scheduler_endpoint("https://localhost:50051", true),
+            "https://localhost:50051"
+        );
+        // Scheme takes precedence over tls_enabled flag
+        assert_eq!(
+            normalize_scheduler_endpoint("http://localhost:50051", true),
+            "http://localhost:50051"
+        );
+        assert_eq!(
+            normalize_scheduler_endpoint("https://localhost:50051", false),
+            "https://localhost:50051"
+        );
+    }
+
+    #[test]
+    fn test_control_stream_manager_new() {
+        let manager = ControlStreamManager::new(
+            "executor-1".to_string(),
+            None, // no TLS
+            None, // no metrics reader
+        );
+        assert!(manager.known_schedulers.is_empty());
+        assert!(manager.streams.is_empty());
+        assert_eq!(manager.executor_id, "executor-1");
+    }
+
+    #[test]
+    fn test_control_stream_manager_new_with_metrics_reader() {
+        let reader = MetricsReader::new();
+        let manager = ControlStreamManager::new(
+            "executor-2".to_string(),
+            None,
+            Some(reader),
+        );
+        assert!(manager.metrics_reader.is_some());
+    }
+
+    #[test]
+    fn test_control_stream_manager_update_schedulers_empty() {
+        let mut manager = ControlStreamManager::new(
+            "executor-1".to_string(),
+            None,
+            None,
+        );
+        manager.update_schedulers(vec![]);
+        assert!(manager.known_schedulers.is_empty());
+        assert!(manager.streams.is_empty());
+    }
+
+    #[test]
+    fn test_control_stream_manager_shutdown_empty() {
+        let mut manager = ControlStreamManager::new(
+            "executor-1".to_string(),
+            None,
+            None,
+        );
+        // Should not panic on empty manager
+        manager.shutdown();
+        assert!(manager.known_schedulers.is_empty());
+        assert!(manager.streams.is_empty());
     }
 }

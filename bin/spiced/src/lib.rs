@@ -252,6 +252,13 @@ pub async fn run(args: Args) -> Result<()> {
     let is_cluster_mode =
         args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
 
+    // Create MetricsReader for cluster mode to enable on-demand OTLP metrics collection
+    let metrics_reader = if is_cluster_mode {
+        Some(runtime::metrics_reader::MetricsReader::new())
+    } else {
+        None
+    };
+
     match resolved_cluster_config {
         Ok(resolved_cluster_config) => {
             builder = builder.with_resolved_cluster_config(resolved_cluster_config);
@@ -263,6 +270,11 @@ pub async fn run(args: Args) -> Result<()> {
         Err(_) => {
             // No cluster mode specified, silently continue in standalone mode
         }
+    }
+
+    // Add metrics reader to runtime for cluster observability
+    if let Some(ref reader) = metrics_reader {
+        builder = builder.with_metrics_reader(reader.clone());
     }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
@@ -341,7 +353,7 @@ pub async fn run(args: Args) -> Result<()> {
             .and_then(|c| c.otel_exporter.as_ref())
             .filter(|c| c.enabled);
 
-        init_metrics(&rt.datafusion(), metrics_registry.clone(), otel_config)
+        init_metrics(&rt.datafusion(), metrics_registry.clone(), otel_config, metrics_reader)
             .context(UnableToInitializeMetricsSnafu)?;
     }
 
@@ -447,6 +459,7 @@ fn init_metrics(
     df: &Arc<DataFusion>,
     registry: prometheus::Registry,
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
+    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::builder().build();
 
@@ -470,6 +483,12 @@ fn init_metrics(
         .with_resource(resource)
         .with_reader(prometheus_exporter)
         .with_reader(spice_metrics_reader);
+
+    // Add cluster metrics reader for on-demand OTLP collection in cluster mode
+    if let Some(reader) = metrics_reader {
+        provider_builder = provider_builder.with_reader(reader);
+        tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection");
+    }
 
     // Add OTEL push exporter if configured
     if let Some(config) = otel_config {

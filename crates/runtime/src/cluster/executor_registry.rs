@@ -262,4 +262,46 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.expect("should succeed").is_empty());
     }
+
+    #[tokio::test]
+    async fn test_multiple_executors() {
+        let registry = ExecutorRegistry::new();
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        registry.register("executor-1".to_string(), tx1).await;
+        registry.register("executor-2".to_string(), tx2).await;
+        registry.register("executor-3".to_string(), tx3).await;
+
+        let mut executors = registry.connected_executors().await;
+        executors.sort(); // Sort for deterministic comparison
+
+        assert_eq!(executors.len(), 3);
+        assert_eq!(executors, vec!["executor-1", "executor-2", "executor-3"]);
+
+        // Unregister one
+        registry.unregister("executor-2").await;
+
+        let mut executors = registry.connected_executors().await;
+        executors.sort();
+
+        assert_eq!(executors.len(), 2);
+        assert_eq!(executors, vec!["executor-1", "executor-3"]);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_nonexistent() {
+        let registry = ExecutorRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+
+        registry.register("executor-1".to_string(), tx).await;
+
+        // Unregistering a non-existent executor should not panic
+        registry.unregister("executor-nonexistent").await;
+
+        // Original executor should still be registered
+        let executors = registry.connected_executors().await;
+        assert_eq!(executors, vec!["executor-1"]);
+    }
 }
