@@ -551,7 +551,10 @@ async fn s3_url_table_dataframe_api() -> Result<(), anyhow::Error> {
         .scope(async {
             // Create a minimal app with URL tables enabled via runtime param
             let app = AppBuilder::new("s3_url_table_df")
-                .with_runtime_params(HashMap::from([("url_tables".to_string(), "enabled".to_string())]))
+                .with_runtime_params(HashMap::from([(
+                    "url_tables".to_string(),
+                    "enabled".to_string(),
+                )]))
                 .build();
 
             configure_test_datafusion();
