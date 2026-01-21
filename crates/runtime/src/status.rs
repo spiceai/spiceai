@@ -395,6 +395,20 @@ impl RuntimeStatus {
         let component_name = format!("cluster:{node_name}");
         self.wait_for_component_ready(&component_name).await;
     }
+
+    /// Waits for the entire runtime to be ready (all registered components have been ready at least once).
+    ///
+    /// This polls the `is_ready()` status at a regular interval until the runtime is ready.
+    /// If the runtime is already ready, this returns immediately.
+    pub async fn wait_for_ready(&self) {
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+        loop {
+            if self.is_ready() {
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
 }
 
 #[cfg(test)]
