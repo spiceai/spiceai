@@ -48,6 +48,7 @@ use runtime_acceleration::snapshot::{
 };
 use serde_json::{Value, json};
 use spicepod::acceleration::SnapshotsCompaction;
+use spicepod::acceleration::SnapshotsCreationPolicy;
 use spicepod::{
     acceleration::{
         Acceleration, Mode, RefreshOnStartup, SnapshotBehavior as DatasetSnapshotBehavior,
@@ -977,7 +978,10 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                 AccelerationEngine::DuckDB,
             )
             .await
-            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for concurrent test"))?;
+            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for concurrent test"))?
+            // Use Always policy since this test is about concurrent snapshot creation,
+            // not about the on_change optimization
+            .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
 
             let snapshot_results = try_join_all((0..10).map(|_| {
                 let manager_clone = manager.clone();
