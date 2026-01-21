@@ -43,7 +43,6 @@ use futures::StreamExt;
 use std::any::Any;
 use std::clone::Clone;
 use std::fmt;
-use std::ops::Deref;
 use std::sync::Arc;
 
 pub struct SchemaCastScanExec {
@@ -118,11 +117,11 @@ impl ExecutionPlan for SchemaCastScanExec {
                     .schema()
                     .fields()
                     .into_iter()
-                    .map(|field| {
+                    .filter_map(|field| {
                         self.schema
                             .field_with_name(field.name())
                             .ok()
-                            .map_or(field.deref().clone(), Clone::clone)
+                            .map(Clone::clone)
                     })
                     .collect::<Vec<Field>>(),
             )
