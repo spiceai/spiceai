@@ -427,11 +427,18 @@ testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrenc
 
 **Before adding a new dependency, ask**:
 
-1. Can this be implemented in <500 lines of code? → Implement it
+1. Can this be implemented in <150 lines of code? → Implement it
 2. Is this a one-time or rarely-used feature? → Implement it
 3. Does the crate pull in >5 transitive dependencies for simple functionality? → Implement it
 4. Is there an existing dependency that already provides this? → Use existing
 5. Is this a core, complex domain (crypto, compression, parsing)? → Use well-vetted crate
+
+**When implementing replacements**:
+
+- **Prefer OS-level APIs**: Use platform APIs consistent across Linux and macOS (e.g., environment variables, POSIX APIs) over external crates
+- **Place in common location**: Add implementations to the `util` crate (`crates/util/src/`) so they can be reused across the project
+- **Comprehensive unit tests**: Include tests for all edge cases (empty inputs, Unicode, boundary values, special characters, error conditions)
+- **No replacement comments**: Don't document which external crate is being replaced in module docs
 
 ```rust
 // GOOD - simple functionality, implement yourself
@@ -567,6 +574,7 @@ export PATH="$PATH:$HOME/.spice/bin"
 7. Ensure clippy passes
 8. Add to Makefile lint targets
 9. Ensure no blocking ops in async context (`spawn_blocking` or `rayon`)
+10. New files use the current year only (e.g., `Copyright 2026`); updated files use a range ending in the current year (e.g., `Copyright 2024-2026`)
 
 ## References
 

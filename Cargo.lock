@@ -233,15 +233,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
-name = "ansi_term"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d52a9bb7ec0cf484c551830a7ce27bd20d67eac647e1befb56b0be4ee39a55d2"
-dependencies = [
- "winapi",
-]
-
-[[package]]
 name = "anstream"
 version = "0.6.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6670,7 +6661,6 @@ dependencies = [
 name = "flightrepl"
 version = "1.11.0-unstable"
 dependencies = [
- "ansi_term",
  "arrow-flight",
  "arrow-json",
  "clap 4.5.54",
@@ -6687,6 +6677,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "util",
  "winver",
 ]
 
@@ -10309,7 +10300,6 @@ dependencies = [
  "anyhow",
  "arrow",
  "async-trait",
- "dirs",
  "ndarray 0.15.6",
  "regex",
  "reqwest",
@@ -14213,7 +14203,6 @@ dependencies = [
  "datafusion-spark",
  "datafusion-table-providers",
  "db_connection_pool",
- "dirs",
  "document_parse",
  "duckdb",
  "dynamodb-streams",
@@ -14254,7 +14243,6 @@ dependencies = [
  "notify",
  "ns_lookup",
  "object_store",
- "once_cell",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
@@ -14308,7 +14296,6 @@ dependencies = [
  "spice-cloud",
  "spiceai",
  "spicepod",
- "strsim 0.11.1",
  "sysinfo 0.37.2",
  "tar",
  "telemetry",

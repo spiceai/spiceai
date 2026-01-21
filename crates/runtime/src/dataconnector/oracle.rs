@@ -23,12 +23,11 @@ use data_components::oracle::connection::{
     OracleConnectionParams, OracleConnectionPool, OracleDirectConnectionParamsBuilder,
 };
 use datafusion::datasource::TableProvider;
-use once_cell::sync::OnceCell;
 use snafu::{ResultExt, Snafu};
 use std::fs;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::{any::Any, future::Future};
 
 use super::{
@@ -41,7 +40,8 @@ const DEFAULT_WALLET_PATH: &str = ".oracle";
 // Ensures that the wallet certificate is only saved once, even if multiple datasets
 // attempt to initialize concurrently. This avoids race conditions when writing the
 // cwallet.sso file and ensures the Oracle OCI client is initialized with a valid wallet.
-static WALLET_INIT: OnceCell<()> = OnceCell::new();
+// Uses Mutex<Option<()>> pattern since OnceLock::get_or_try_init is still unstable.
+static WALLET_INIT: OnceLock<Mutex<Option<()>>> = OnceLock::new();
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -175,10 +175,16 @@ impl Oracle {
     /// the wallet concurrently, only the first call will perform the write and initialization;
     /// subsequent calls will no-op.
     pub fn save_wallet_cert_once(cert_base64_str: &str, wallet_path: &str) -> Result<()> {
-        WALLET_INIT.get_or_try_init(|| {
-            Self::save_wallet_cert(cert_base64_str, wallet_path)?;
-            Ok(())
+        let mutex = WALLET_INIT.get_or_init(|| Mutex::new(None));
+        let mut guard = mutex.lock().map_err(|_| Error::MissingParameter {
+            parameter: "wallet initialization lock poisoned".to_string(),
         })?;
+
+        if guard.is_none() {
+            Self::save_wallet_cert(cert_base64_str, wallet_path)?;
+            *guard = Some(());
+        }
+
         Ok(())
     }
 

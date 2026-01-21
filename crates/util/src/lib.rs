@@ -20,7 +20,10 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 
+pub mod ansi_colors;
 pub mod fibonacci_backoff;
+pub mod home_dir;
+pub mod levenshtein;
 pub mod retry_strategy;
 pub mod security;
 pub use backoff::Error as RetryError;
