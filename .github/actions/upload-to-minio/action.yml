@@ -40,7 +40,9 @@ runs:
       shell: bash
       run: |
         if [ -f "${{ inputs.source_path }}" ]; then
-          mc cp ${{ inputs.source_path }} ${{ inputs.destination_path }}
+          if ! mc cp ${{ inputs.source_path }} ${{ inputs.destination_path }}; then
+            echo "::warning::Failed to upload ${{ inputs.source_path }} to MinIO."
+          fi
         else
           echo "File ${{ inputs.source_path }} not found, skipping upload"
         fi
