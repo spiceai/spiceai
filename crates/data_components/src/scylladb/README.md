@@ -491,7 +491,7 @@ datasets:
 - **No aggregations**: COUNT, SUM, AVG, etc. are computed locally
 - **No subqueries**: Nested queries are not supported
 - **No window functions**: RANK, ROW_NUMBER, etc. not supported
-- **Limited WHERE clauses**: CQL requires partition key in WHERE; we fetch all data
+- **Limited WHERE clauses**: Partition key equality filters are pushed down to CQL; other filters are evaluated locally and may require fetching more data
 - **No ORDER BY pushdown**: Sorting is done locally
 
 ### Connector Limitations
