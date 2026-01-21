@@ -47,8 +47,7 @@ use runtime_acceleration::snapshot::{
     AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
 use serde_json::{Value, json};
-use spicepod::acceleration::SnapshotsCompaction;
-use spicepod::acceleration::SnapshotsCreationPolicy;
+use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy};
 use spicepod::{
     acceleration::{
         Acceleration, Mode, RefreshOnStartup, SnapshotBehavior as DatasetSnapshotBehavior,
@@ -1069,7 +1068,8 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
                 AccelerationEngine::DuckDB,
             )
             .await
-            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?;
+            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?
+            .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
 
             let conn = Connection::open(&fixture.local_db_path)
                 .context("Opening DuckDB acceleration file for modification")?;
@@ -1304,7 +1304,8 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
                 AccelerationEngine::DuckDB,
             )
                 .await
-                .ok_or_else(|| anyhow!("Failed to create SnapshotManager with compaction enabled"))?;
+                .ok_or_else(|| anyhow!("Failed to create SnapshotManager with compaction enabled"))?
+                .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
 
             // Create compacted snapshot
             let mutex = Arc::new(Mutex::new(()));
