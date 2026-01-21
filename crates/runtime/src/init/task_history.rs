@@ -102,15 +102,14 @@ impl Runtime {
                 let schema = local_table.schema();
 
                 // Compute scheduler_id: {advertise_host}:{bind_port}
-                let scheduler_id = if let Some(advertise_host) =
-                    self.df.cluster_config.node_advertise_address()
-                {
-                    let bind_port = self.df.cluster_config.node_bind_address().port();
-                    format!("{advertise_host}:{bind_port}")
-                } else {
-                    // Fallback: use bind address directly (shouldn't happen in valid scheduler config)
-                    self.df.cluster_config.node_bind_address().to_string()
-                };
+                let scheduler_id =
+                    if let Some(advertise_host) = self.df.cluster_config.node_advertise_address() {
+                        let bind_port = self.df.cluster_config.node_bind_address().port();
+                        format!("{advertise_host}:{bind_port}")
+                    } else {
+                        // Fallback: use bind address directly (shouldn't happen in valid scheduler config)
+                        self.df.cluster_config.node_bind_address().to_string()
+                    };
 
                 tracing::debug!(
                     "Registering federated task_history table with scheduler_id={scheduler_id}"

@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::ClusterTlsConfig;
 use crate::cluster::ClusterServiceImpl;
+use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::flight::{Error, is_address_in_use_error};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
@@ -100,12 +101,17 @@ pub async fn start_internal_cluster_server(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| bind_address.to_string());
+
+    // Create the executor registry for managing control stream connections
+    let executor_registry = Arc::new(ExecutorRegistry::new());
+
     let cluster_service = ClusterServiceImpl::new(
         Arc::clone(&rt.app),
         Arc::clone(&rt.secrets),
         advertise_address,
         rt.scheduler_peers(),
         Arc::clone(&rt.df),
+        Arc::clone(&executor_registry),
     );
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 

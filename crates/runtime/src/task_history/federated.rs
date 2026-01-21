@@ -32,14 +32,14 @@ use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_plan::execution_plan::execute_stream;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::execution_plan::execute_stream;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
-use futures::future::join_all;
 use futures::TryStreamExt;
-use runtime_proto::cluster_service_client::ClusterServiceClient;
+use futures::future::join_all;
 use runtime_proto::GetTaskHistoryRequest;
+use runtime_proto::cluster_service_client::ClusterServiceClient;
 use tokio::sync::RwLock;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
@@ -139,12 +139,19 @@ impl FederatedTaskHistoryTable {
         }
 
         let cursor = std::io::Cursor::new(arrow_ipc);
-        let reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| (peer_address.clone(), format!("failed to read Arrow IPC: {e}")))?;
+        let reader = StreamReader::try_new(cursor, None).map_err(|e| {
+            (
+                peer_address.clone(),
+                format!("failed to read Arrow IPC: {e}"),
+            )
+        })?;
 
-        let batches: Vec<RecordBatch> = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| (peer_address.clone(), format!("failed to collect batches: {e}")))?;
+        let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>().map_err(|e| {
+            (
+                peer_address.clone(),
+                format!("failed to collect batches: {e}"),
+            )
+        })?;
 
         Ok(batches)
     }
@@ -232,8 +239,14 @@ impl TableProvider for FederatedTaskHistoryTable {
 
         // We need to clone the state for the local query
         // Since Session is not Clone, we'll execute the local query inline
-        let local_result =
-            Self::query_local(local_table, state, local_projection.as_ref(), &local_filters, local_limit).await;
+        let local_result = Self::query_local(
+            local_table,
+            state,
+            local_projection.as_ref(),
+            &local_filters,
+            local_limit,
+        )
+        .await;
 
         // Wait for all peer results
         let peer_results = join_all(peer_futures).await;

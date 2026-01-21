@@ -339,11 +339,13 @@ fn update_scheduler_pollers(
 
 mod control_stream_client;
 pub mod datafusion;
+mod executor_registry;
 mod scheduler_registry;
 mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
+pub use executor_registry::ExecutorRegistry;
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -1007,7 +1009,9 @@ pub async fn initialize_cluster_executor(
                     );
                     continue;
                 }
+                // Update control streams with new scheduler membership
                 control_stream_manager.update_schedulers(addresses.clone());
+
                 update_scheduler_pollers(
                     &mut pollers,
                     &mut known_schedulers,

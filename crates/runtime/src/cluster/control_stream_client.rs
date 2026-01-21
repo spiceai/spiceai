@@ -17,8 +17,8 @@ limitations under the License.
 //! Executor-side control stream client for scheduler communication.
 //!
 //! This module provides functionality for executors to establish and maintain
-//! bidirectional control streams with schedulers. These streams currently send
-//! periodic heartbeats for liveness tracking.
+//! bidirectional control streams with schedulers. These streams allow schedulers
+//! to request metrics from executors on-demand.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -26,8 +26,11 @@ use std::time::Duration;
 use ballista_core::utils::create_grpc_client_endpoint;
 use futures::StreamExt;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
-use runtime_proto::executor_control_message::Message as ExecutorMessage;
-use runtime_proto::{ExecutorControlMessage, ExecutorHeartbeat, SchedulerControlMessage};
+use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
+use runtime_proto::{
+    ExecutorControlMessage, ExecutorHeartbeat, MetricsResponse,
+    executor_control_message::Message as ExecutorMessage,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -48,7 +51,8 @@ struct ControlStreamHandle {
 /// The stream will:
 /// 1. Connect to the scheduler
 /// 2. Send periodic heartbeats
-/// 3. Reconnect on failure with exponential backoff
+/// 3. Respond to metrics requests from the scheduler
+/// 4. Reconnect on failure with exponential backoff
 fn spawn_control_stream(
     scheduler_address: String,
     executor_id: String,
@@ -198,6 +202,7 @@ fn spawn_control_stream(
             tracing::debug!("Control stream established to scheduler {scheduler_address}");
             backoff.reset();
 
+            // Process inbound messages (metrics requests)
             loop {
                 tokio::select! {
                     () = token.cancelled() => {
@@ -209,8 +214,17 @@ fn spawn_control_stream(
                     }
                     result = inbound.next() => {
                         match result {
-                            Some(Ok(message)) => {
-                                handle_scheduler_message(&scheduler_address, message);
+                            Some(Ok(msg)) => {
+                                if let Some(message) = msg.message {
+                                    handle_scheduler_message(
+                                        &scheduler_address,
+                                        &executor_id,
+                                        message,
+                                        &outbound_tx,
+                                    )
+                                    .await;
+                                }
+                            }
                             }
                             Some(Err(e)) => {
                                 tracing::debug!(
@@ -245,11 +259,37 @@ fn spawn_control_stream(
 }
 
 /// Handles a message from the scheduler on the control stream.
-fn handle_scheduler_message(scheduler_address: &str, message: SchedulerControlMessage) {
-    tracing::trace!(
-        message = ?message,
-        "Ignoring control message from scheduler {scheduler_address}"
-    );
+async fn handle_scheduler_message(
+    scheduler_address: &str,
+    executor_id: &str,
+    message: SchedulerMessage,
+    outbound_tx: &mpsc::Sender<ExecutorControlMessage>,
+) {
+    match message {
+        SchedulerMessage::RequestMetrics(request) => {
+            tracing::debug!(
+                "Received metrics request from {scheduler_address}: request_id={}",
+                request.request_id
+            );
+
+            // Collect local OTLP metrics
+            // TODO: Implement actual metrics collection in Phase 5
+            let otlp_metrics = Vec::new();
+
+            let response = ExecutorControlMessage {
+                executor_id: executor_id.to_string(),
+                message: Some(ExecutorMessage::Metrics(MetricsResponse {
+                    request_id: request.request_id,
+                    otlp_metrics,
+                })),
+            };
+
+            if let Err(e) = outbound_tx.send(response).await {
+                tracing::warn!("Failed to send metrics response to {scheduler_address}: {e}");
+            }
+        }
+    }
+}
 }
 
 /// Normalizes a scheduler endpoint address to a URL with scheme.

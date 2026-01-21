@@ -193,10 +193,7 @@ impl TaskSpan {
         // Get the schema from the registered table to ensure we use the correct schema
         // (with or without scheduler_id depending on cluster mode)
         let table_ref = TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
-        let table_provider = df
-            .get_table(&table_ref)
-            .await
-            .context(TableNotFoundSnafu)?;
+        let table_provider = df.get_table(&table_ref).await.context(TableNotFoundSnafu)?;
         let schema = table_provider.schema();
 
         let data = Self::to_record_batch(spans, schema.as_ref())
@@ -264,10 +261,7 @@ impl TaskSpan {
             .context(UnableToUpdateTracesSnafu)?;
 
         // Get the schema from the registered table
-        let table_provider = df
-            .get_table(&table_ref)
-            .await
-            .context(TableNotFoundSnafu)?;
+        let table_provider = df.get_table(&table_ref).await.context(TableNotFoundSnafu)?;
         let schema = table_provider.schema();
 
         df.write_data(

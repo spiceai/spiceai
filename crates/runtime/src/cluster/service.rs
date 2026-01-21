@@ -28,8 +28,9 @@ use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::executor_control_message::Message as ExecutorMessage;
 use runtime_proto::{
     ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
-    GetAppDefinitionResponse, GetSchedulersRequest, GetSchedulersResponse, GetTaskHistoryRequest,
-    GetTaskHistoryResponse, SchedulerControlMessage, SchedulerInstance,
+    GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
+    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, SchedulerControlMessage,
+    SchedulerInstance,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -42,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::cluster::SchedulerPeers;
+use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::task_history::DEFAULT_TASK_HISTORY_TABLE;
 
@@ -52,6 +54,7 @@ pub struct ClusterServiceImpl {
     advertise_address: String,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
     datafusion: Arc<DataFusion>,
+    executor_registry: Arc<ExecutorRegistry>,
 }
 
 impl ClusterServiceImpl {
@@ -63,6 +66,7 @@ impl ClusterServiceImpl {
         advertise_address: String,
         scheduler_peers: Arc<RwLock<SchedulerPeers>>,
         datafusion: Arc<DataFusion>,
+        executor_registry: Arc<ExecutorRegistry>,
     ) -> Self {
         Self {
             app,
@@ -70,7 +74,14 @@ impl ClusterServiceImpl {
             advertise_address,
             scheduler_peers,
             datafusion,
+            executor_registry,
         }
+    }
+
+    /// Returns the executor registry for use by other components.
+    #[must_use]
+    pub fn executor_registry(&self) -> Arc<ExecutorRegistry> {
+        Arc::clone(&self.executor_registry)
     }
 }
 
@@ -213,7 +224,10 @@ impl ClusterService for ClusterServiceImpl {
     ) -> Result<Response<GetTaskHistoryResponse>, Status> {
         let request = request.into_inner();
 
-        tracing::debug!("ClusterService::get_task_history executing query: {}", request.sql);
+        tracing::debug!(
+            "ClusterService::get_task_history executing query: {}",
+            request.sql
+        );
 
         // Validate the SQL only queries the task_history table for security
         let task_history_table =
@@ -251,6 +265,15 @@ impl ClusterService for ClusterServiceImpl {
 
         Ok(Response::new(GetTaskHistoryResponse { arrow_ipc }))
     }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<GetMetricsRequest>,
+    ) -> Result<Response<GetMetricsResponse>, Status> {
+        // TODO: Implement in Phase 5 - collect local OTLP metrics and return
+        Err(Status::unimplemented("GetMetrics is not yet implemented"))
+    }
+
     type ControlStreamStream =
         Pin<Box<dyn Stream<Item = Result<SchedulerControlMessage, Status>> + Send>>;
 
@@ -262,10 +285,12 @@ impl ClusterService for ClusterServiceImpl {
         let cancel = CancellationToken::new();
         let inbound_cancel = cancel.clone();
 
-        // Create a channel for outbound messages to the executor (unused for now).
+        // Create a channel for outbound messages to the executor
         let (outbound_tx, outbound_rx) = mpsc::channel::<SchedulerControlMessage>(32);
 
         // We need to identify the executor from its first message.
+        // Spawn a task to handle the bidirectional stream.
+        let executor_registry = Arc::clone(&self.executor_registry);
         let inbound_task = tokio::spawn(async move {
             let executor_id = match inbound.next().await {
                 Some(Ok(msg)) => {
@@ -276,8 +301,9 @@ impl ClusterService for ClusterServiceImpl {
                     }
                     tracing::debug!("Executor control stream connected: {executor_id}");
 
+                    // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, message);
+                        handle_executor_message(&executor_id, message, &executor_registry).await;
                     }
                     executor_id
                 }
@@ -291,6 +317,11 @@ impl ClusterService for ClusterServiceImpl {
                 }
             };
 
+            // Register the executor with the registry.
+            let pending_requests = executor_registry
+                .register(executor_id.clone(), outbound_tx.clone())
+                .await;
+
             loop {
                 tokio::select! {
                     () = inbound_cancel.cancelled() => {
@@ -301,19 +332,33 @@ impl ClusterService for ClusterServiceImpl {
                         match result {
                             Some(Ok(msg)) => {
                                 if let Some(message) = msg.message {
-                                    handle_executor_message(&executor_id, message);
+                                    // Handle metrics responses by completing pending requests.
+                                    if let ExecutorMessage::Metrics(response) = &message {
+                                        let mut pending = pending_requests.write().await;
+                                        if let Some(sender) = pending.remove(&response.request_id) {
+                                            let _ = sender.send(response.clone());
+                                        } else {
+                                            tracing::warn!(
+                                                "Received metrics response for unknown request_id: {}",
+                                                response.request_id
+                                            );
+                                        }
+                                    } else {
+                                        handle_executor_message(
+                                            &executor_id,
+                                            message,
+                                            &executor_registry,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                             Some(Err(e)) => {
-                                tracing::debug!(
-                                    "Executor control stream error for {executor_id}: {e}"
-                                );
+                                tracing::debug!("Executor control stream error for {executor_id}: {e}");
                                 break;
                             }
                             None => {
-                                tracing::debug!(
-                                    "Executor control stream closed by executor {executor_id}"
-                                );
+                                tracing::debug!("Executor control stream closed by executor {executor_id}");
                                 break;
                             }
                         }
@@ -321,6 +366,8 @@ impl ClusterService for ClusterServiceImpl {
                 }
             }
 
+            // Unregister the executor when the stream ends.
+            executor_registry.unregister(&executor_id).await;
             tracing::debug!("Executor control stream ended: {executor_id}");
         });
 
@@ -330,11 +377,17 @@ impl ClusterService for ClusterServiceImpl {
             task: inbound_task,
             _outbound_tx: outbound_tx,
         };
+
         Ok(Response::new(Box::pin(stream)))
     }
 }
 
-fn handle_executor_message(executor_id: &str, message: ExecutorMessage) {
+/// Handles an executor control message (heartbeat, etc.)
+async fn handle_executor_message(
+    executor_id: &str,
+    message: ExecutorMessage,
+    _registry: &ExecutorRegistry,
+) {
     match message {
         ExecutorMessage::Heartbeat(heartbeat) => {
             tracing::trace!(
@@ -342,9 +395,15 @@ fn handle_executor_message(executor_id: &str, message: ExecutorMessage) {
                 heartbeat.timestamp_ms
             );
         }
+        ExecutorMessage::Metrics(_) => {
+            // Metrics responses are handled separately in the stream handler
+            // This shouldn't be reached, but log if it is
+            tracing::warn!(
+                "Unexpected metrics response in handle_executor_message for {executor_id}"
+            );
+        }
     }
 }
-
 /// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
 ///
 /// Returns an empty vec if no batches are provided.
