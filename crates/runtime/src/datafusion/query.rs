@@ -211,9 +211,9 @@ impl Query {
             // is 16MB which is too small for queries returning large batches.
             .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024)
             // Enable result fetch metrics callback to track final result fetching from executors
-            .with_ballista_result_fetch_metrics_callback(
-                OtelResultFetchMetricsCallback::new_arc(scheduler_url.to_string()),
-            );
+            .with_ballista_result_fetch_metrics_callback(OtelResultFetchMetricsCallback::new_arc(
+                scheduler_url.to_string(),
+            ));
 
         if let Some(tls_config) = client_tls_config {
             cfg = cfg.with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {

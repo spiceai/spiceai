@@ -40,8 +40,6 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -243,9 +241,8 @@ impl ClusterService for ClusterServiceImpl {
         // Parse and rewrite the SQL to query local_task_history instead of task_history.
         // This avoids infinite recursion: the federated task_history table would fan out
         // to peers, but peers need to query their local data only.
-        let local_sql = rewrite_task_history_sql(&request.sql).map_err(|e| {
-            Status::invalid_argument(format!("Invalid task history query: {e}"))
-        })?;
+        let local_sql = rewrite_task_history_sql(&request.sql)
+            .map_err(|e| Status::invalid_argument(format!("Invalid task history query: {e}")))?;
 
         // Execute the query against local_task_history
         let query_result = self
@@ -301,6 +298,7 @@ impl ClusterService for ClusterServiceImpl {
         // We need to identify the executor from its first message.
         // Spawn a task to handle the bidirectional stream.
         let executor_registry = Arc::clone(&self.executor_registry);
+        let outbound_tx_for_registry = outbound_tx.clone();
         let inbound_task = tokio::spawn(async move {
             let executor_id = match inbound.next().await {
                 Some(Ok(msg)) => {
@@ -313,7 +311,7 @@ impl ClusterService for ClusterServiceImpl {
 
                     // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, message, &executor_registry).await;
+                        handle_executor_message(&executor_id, &message, &executor_registry);
                     }
                     executor_id
                 }
@@ -329,7 +327,7 @@ impl ClusterService for ClusterServiceImpl {
 
             // Register the executor with the registry.
             let pending_requests = executor_registry
-                .register(executor_id.clone(), outbound_tx.clone())
+                .register(executor_id.clone(), outbound_tx_for_registry)
                 .await;
 
             loop {
@@ -356,10 +354,9 @@ impl ClusterService for ClusterServiceImpl {
                                     } else {
                                         handle_executor_message(
                                             &executor_id,
-                                            message,
+                                            &message,
                                             &executor_registry,
-                                        )
-                                        .await;
+                                        );
                                     }
                                 }
                             }
@@ -393,9 +390,9 @@ impl ClusterService for ClusterServiceImpl {
 }
 
 /// Handles an executor control message (heartbeat, etc.)
-async fn handle_executor_message(
+fn handle_executor_message(
     executor_id: &str,
-    message: ExecutorMessage,
+    message: &ExecutorMessage,
     _registry: &ExecutorRegistry,
 ) {
     match message {
@@ -489,10 +486,10 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 
             // Rewrite the table name: find and replace the task_history identifier
             for part in &mut table_name.0 {
-                if let ObjectNamePart::Identifier(ident) = part {
-                    if ident.value == DEFAULT_TASK_HISTORY_TABLE {
-                        *ident = Ident::new(LOCAL_TASK_HISTORY_TABLE);
-                    }
+                if let ObjectNamePart::Identifier(ident) = part
+                    && ident.value == DEFAULT_TASK_HISTORY_TABLE
+                {
+                    *ident = Ident::new(LOCAL_TASK_HISTORY_TABLE);
                 }
             }
         }

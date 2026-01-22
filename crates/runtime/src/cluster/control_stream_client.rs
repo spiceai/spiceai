@@ -40,8 +40,6 @@ use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
 use crate::metrics_reader::MetricsReader;
 
-
-
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -280,12 +278,11 @@ async fn handle_scheduler_message(
             );
 
             // Collect local OTLP metrics using the MetricsReader if available
-            let otlp_metrics = match metrics_reader {
-                Some(reader) => reader.collect_otlp(),
-                None => {
-                    tracing::debug!("No MetricsReader available, returning empty metrics");
-                    Vec::new()
-                }
+            let otlp_metrics = if let Some(reader) = metrics_reader {
+                reader.collect_otlp()
+            } else {
+                tracing::debug!("No MetricsReader available, returning empty metrics");
+                Vec::new()
             };
 
             let response = ExecutorControlMessage {
@@ -301,7 +298,6 @@ async fn handle_scheduler_message(
             }
         }
     }
-}
 }
 
 /// Normalizes a scheduler endpoint address to a URL with scheme.
@@ -460,21 +456,13 @@ mod tests {
     #[test]
     fn test_control_stream_manager_new_with_metrics_reader() {
         let reader = MetricsReader::new();
-        let manager = ControlStreamManager::new(
-            "executor-2".to_string(),
-            None,
-            Some(reader),
-        );
+        let manager = ControlStreamManager::new("executor-2".to_string(), None, Some(reader));
         assert!(manager.metrics_reader.is_some());
     }
 
     #[test]
     fn test_control_stream_manager_update_schedulers_empty() {
-        let mut manager = ControlStreamManager::new(
-            "executor-1".to_string(),
-            None,
-            None,
-        );
+        let mut manager = ControlStreamManager::new("executor-1".to_string(), None, None);
         manager.update_schedulers(vec![]);
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -482,11 +470,7 @@ mod tests {
 
     #[test]
     fn test_control_stream_manager_shutdown_empty() {
-        let mut manager = ControlStreamManager::new(
-            "executor-1".to_string(),
-            None,
-            None,
-        );
+        let mut manager = ControlStreamManager::new("executor-1".to_string(), None, None);
         // Should not panic on empty manager
         manager.shutdown();
         assert!(manager.known_schedulers.is_empty());

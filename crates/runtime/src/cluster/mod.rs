@@ -707,26 +707,6 @@ pub async fn initialize_cluster_executor(
 
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
     let tls_enabled = client_tls_config.is_some();
-    let config_producer_tls = client_tls_config.clone();
-
-    // Configure executor session config - shuffle_memory_mode will be set after we fetch the app definition
-    let config_producer: ConfigProducer = Arc::new(move || {
-        let mut config = SessionConfig::new_with_ballista()
-            .with_option_extension(SpiceClusterConfig::default())
-            .with_ballista_use_tls(tls_enabled)
-            // Use 100MB max message size to match other gRPC configurations in the codebase.
-            // The default Ballista config is 16MB which is too small for shuffle operations
-            // with large batches.
-            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024);
-
-        if let Some(tls_config) = config_producer_tls.clone() {
-            config = config.with_ballista_override_create_grpc_client_endpoint({
-                Arc::new(move |ep| ep.tls_config(tls_config.clone()).boxed())
-            });
-        }
-
-        config
-    });
 
     // Generate executor_id early so we can use it for both the app definition request and executor registration
     let executor_id = Uuid::new_v4().to_string();
@@ -1162,10 +1142,10 @@ async fn create_scheduler_server(
         .df
         .cluster_config
         .scheduler_url_string()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| bind_addr.to_string());
-    let scheduler_metrics_collector =
-        Arc::new(metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id));
+        .map_or_else(|| bind_addr.to_string(), ToString::to_string);
+    let scheduler_metrics_collector = Arc::new(
+        metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id),
+    );
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),

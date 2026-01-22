@@ -114,7 +114,7 @@ impl ExecutorConnection {
 /// - Request metrics from all connected executors
 #[derive(Default)]
 pub struct ExecutorRegistry {
-    /// Map of executor_id -> connection
+    /// Map of `executor_id` -> connection
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
 }
 
@@ -166,7 +166,7 @@ impl ExecutorRegistry {
 
     /// Requests metrics from all connected executors.
     ///
-    /// Returns a list of (executor_id, otlp_metrics) tuples for successful responses.
+    /// Returns a list of (`executor_id`, `otlp_metrics`) tuples for successful responses.
     /// If any executor fails, returns an error containing the list of failed executors.
     pub async fn request_metrics_from_all(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let connections = self.connections.read().await;

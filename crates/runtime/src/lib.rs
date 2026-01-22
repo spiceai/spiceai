@@ -101,11 +101,11 @@ pub mod internal_table;
 pub mod jobs;
 mod management;
 mod metrics;
+pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
 pub mod otel_push_exporter;
-pub mod metrics_reader;
 pub mod resource_monitor;
 
 pub use runtime_parameters as parameters;
@@ -150,6 +150,9 @@ pub enum Error {
 
     #[snafu(display("Unable to start internal cluster server: {source}"))]
     UnableToStartClusterServer { source: flight::Error },
+
+    #[snafu(display("Failed to start cluster scheduler: executor registry missing"))]
+    MissingSchedulerExecutorRegistry,
 
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
@@ -711,15 +714,17 @@ impl Runtime {
             reason = "type alias scoped to cluster setup"
         )]
         type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
-        
+
         // Create executor registry for scheduler mode (will be None for non-scheduler)
-        let scheduler_executor_registry: Option<Arc<cluster::ExecutorRegistry>> =
-            if matches!(self.df.cluster_config.effective_role(), Some(ClusterRole::Scheduler)) {
-                Some(Arc::new(cluster::ExecutorRegistry::new()))
-            } else {
-                None
-            };
-        
+        let scheduler_executor_registry: Option<Arc<cluster::ExecutorRegistry>> = if matches!(
+            self.df.cluster_config.effective_role(),
+            Some(ClusterRole::Scheduler)
+        ) {
+            Some(Arc::new(cluster::ExecutorRegistry::new()))
+        } else {
+            None
+        };
+
         let maybe_cluster_future: Option<BoxedClusterFuture> =
             match self.df.cluster_config.effective_role() {
                 Some(ClusterRole::Scheduler) => {
@@ -728,7 +733,11 @@ impl Runtime {
                     let internal_server_shutdown = CancellationToken::new();
                     let self_ref = Arc::clone(&self);
                     let cloned_shutdown = internal_server_shutdown.clone();
-                    let executor_registry = Arc::clone(scheduler_executor_registry.as_ref().expect("executor registry should be created for scheduler mode"));
+                    let executor_registry = Arc::clone(
+                        scheduler_executor_registry
+                            .as_ref()
+                            .context(MissingSchedulerExecutorRegistrySnafu)?,
+                    );
                     let internal_server_fut = async move {
                         cluster::start_internal_cluster_server(
                             Arc::clone(&self_ref),
@@ -945,26 +954,33 @@ impl Runtime {
                     Arc::new(move || {
                         metrics_reader_for_collector
                             .as_ref()
-                            .map(|r| r.collect_otlp())
+                            .map(metrics_reader::MetricsReader::collect_otlp)
                             .unwrap_or_default()
                     });
 
-                Some(Arc::new(metrics_server::cluster::ClusterMetricsCollector::new(
-                    self.scheduler_peers(),
-                    Arc::clone(executor_registry),
-                    self.df.cluster_config.client_tls_config().cloned(),
-                    node_id,
-                    local_metrics_collector,
-                )))
+                Some(Arc::new(
+                    metrics_server::cluster::ClusterMetricsCollector::new(
+                        self.scheduler_peers(),
+                        Arc::clone(executor_registry),
+                        self.df.cluster_config.client_tls_config().cloned(),
+                        node_id,
+                        local_metrics_collector,
+                    ),
+                ))
             } else {
                 None
             };
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
-                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config, cluster_collector)
-                    .await
-                    .context(UnableToStartMetricsServerSnafu)
+                metrics_server::start(
+                    metrics_endpoint,
+                    prometheus_registry,
+                    cloned_tls_config,
+                    cluster_collector,
+                )
+                .await
+                .context(UnableToStartMetricsServerSnafu)
             })
             .await;
 

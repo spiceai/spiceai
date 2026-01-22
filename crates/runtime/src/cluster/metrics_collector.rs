@@ -328,7 +328,6 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
     fn record_stage_started(&self, _job_id: &str, _stage_id: usize, task_count: usize) {
         // Record the number of tasks per stage when it starts
         let labels = [KeyValue::new("node_id", self.node_id.clone())];
-        #[expect(clippy::cast_possible_truncation)]
         cluster::SCHEDULER_TASKS_PER_STAGE.record(task_count as u64, &labels);
     }
 
@@ -430,7 +429,6 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
     // =========================================================================
 
     fn set_active_executor_count(&self, count: usize) {
-        #[expect(clippy::cast_possible_truncation)]
         cluster::set_active_executor_count(&self.node_id, count as u64);
     }
 

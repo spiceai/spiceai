@@ -51,16 +51,16 @@ use crate::task_history::DEFAULT_TASK_HISTORY_TABLE;
 /// A federated table provider that queries task history across all schedulers.
 ///
 /// When `scan()` is called, this provider:
-/// 1. Queries the local task_history table directly (via stored reference)
+/// 1. Queries the local `task_history` table directly (via stored reference)
 /// 2. Fans out to all peer schedulers via the `GetTaskHistory` RPC
 /// 3. Combines all results into a single result set
 ///
 /// If any peer fails, the entire query fails with an error containing
 /// the identifiers of the failed peers.
 pub struct FederatedTaskHistoryTable {
-    /// Schema for the task_history table (with scheduler_id column)
+    /// Schema for the `task_history` table (with `scheduler_id` column)
     schema: SchemaRef,
-    /// Local task_history table provider (direct reference to avoid recursion)
+    /// Local `task_history` table provider (direct reference to avoid recursion)
     local_table: Arc<dyn TableProvider>,
     /// Peer schedulers for fan-out queries
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
@@ -322,7 +322,7 @@ fn build_peer_sql(table_ref: &str, filters: &[Expr], limit: Option<usize>) -> St
         // Convert filter expressions to SQL WHERE clause
         let where_clause = filters
             .iter()
-            .map(|e| e.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(" AND ");
 

@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! This module provides functionality to collect metrics from all nodes in a Spice cluster:
 //! - Local metrics from this scheduler
-//! - Metrics from peer schedulers via GetMetrics RPC
+//! - Metrics from peer schedulers via `GetMetrics` RPC
 //! - Metrics from executors via control stream
 //!
 //! All metrics are merged and labeled with `node_id` and `node_role`.
@@ -32,8 +32,8 @@ use opentelemetry_proto::tonic::{
     metrics::v1::ResourceMetrics as OtlpResourceMetrics,
 };
 use prost::Message;
-use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::GetMetricsRequest;
+use runtime_proto::cluster_service_client::ClusterServiceClient;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 use tonic::transport::ClientTlsConfig;
@@ -59,7 +59,7 @@ pub enum Error {
     ExecutorCollectionFailed { failed_executors: String },
 
     #[snafu(display("Failed to decode OTLP metrics from {node_id}: {reason}"))]
-    DecodeError { node_id: String, reason: String },
+    DecodeMetrics { node_id: String, reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -105,17 +105,17 @@ impl ClusterMetricsCollector {
     ///
     /// This method:
     /// 1. Collects local metrics
-    /// 2. Fans out GetMetrics RPC to all peer schedulers
+    /// 2. Fans out `GetMetrics` RPC to all peer schedulers
     /// 3. Requests metrics from all executors via control stream
     /// 4. Merges all metrics and adds node labels
     ///
     /// If any peer or executor fails, returns an error with the list of failed nodes.
     pub async fn collect(&self) -> Result<ExportMetricsServiceRequest> {
         // Collect metrics in parallel from all sources
-        let (local_result, scheduler_results, executor_results) = tokio::join!(
-            self.collect_local(),
+        let local_result = self.collect_local();
+        let (scheduler_results, executor_results) = tokio::join!(
             self.collect_from_schedulers(),
-            self.collect_from_executors(),
+            self.collect_from_executors()
         );
 
         // Check for failures
@@ -127,13 +127,13 @@ impl ClusterMetricsCollector {
 
         // Add local metrics with labels
         let local_metrics = local_result;
-        if !local_metrics.is_empty() {
-            if let Ok(mut request) = ExportMetricsServiceRequest::decode(local_metrics.as_slice()) {
-                add_node_labels(&mut request, &self.node_id, ROLE_SCHEDULER);
-                merged
-                    .resource_metrics
-                    .append(&mut request.resource_metrics);
-            }
+        if !local_metrics.is_empty()
+            && let Ok(mut request) = ExportMetricsServiceRequest::decode(local_metrics.as_slice())
+        {
+            add_node_labels(&mut request, &self.node_id, ROLE_SCHEDULER);
+            merged
+                .resource_metrics
+                .append(&mut request.resource_metrics);
         }
 
         // Add scheduler metrics with labels
@@ -176,11 +176,11 @@ impl ClusterMetricsCollector {
     }
 
     /// Collects local metrics from this node.
-    async fn collect_local(&self) -> Vec<u8> {
+    fn collect_local(&self) -> Vec<u8> {
         (self.local_metrics_collector)()
     }
 
-    /// Collects metrics from all peer schedulers via GetMetrics RPC.
+    /// Collects metrics from all peer schedulers via `GetMetrics` RPC.
     async fn collect_from_schedulers(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let peers = self.scheduler_peers.read().await;
 
@@ -248,7 +248,7 @@ impl ClusterMetricsCollector {
     }
 }
 
-/// Fetches metrics from a single scheduler via GetMetrics RPC.
+/// Fetches metrics from a single scheduler via `GetMetrics` RPC.
 async fn fetch_metrics_from_scheduler(
     address: &str,
     tls_enabled: bool,
@@ -256,8 +256,7 @@ async fn fetch_metrics_from_scheduler(
 ) -> std::result::Result<Vec<u8>, String> {
     let endpoint_url = normalize_endpoint(address, tls_enabled);
 
-    let endpoint =
-        create_grpc_client_endpoint(endpoint_url.clone()).map_err(|e| e.to_string())?;
+    let endpoint = create_grpc_client_endpoint(endpoint_url.clone()).map_err(|e| e.to_string())?;
 
     let endpoint = if let Some(tls_config) = tls_config {
         endpoint.tls_config(tls_config).map_err(|e| e.to_string())?
@@ -305,10 +304,7 @@ fn add_labels_to_resource_metrics(
     // Add labels to resource attributes
     if let Some(ref mut resource) = resource_metrics.resource {
         // Check if labels already exist
-        let has_node_id = resource
-            .attributes
-            .iter()
-            .any(|kv| kv.key == NODE_ID_LABEL);
+        let has_node_id = resource.attributes.iter().any(|kv| kv.key == NODE_ID_LABEL);
         let has_role = resource
             .attributes
             .iter()
@@ -405,10 +401,10 @@ fn add_labels_to_metric_data_points(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry_proto::tonic::common::v1::{any_value::Value, AnyValue};
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value::Value};
     use opentelemetry_proto::tonic::metrics::v1::{
-        number_data_point::Value as NumberValue, Gauge, Metric, NumberDataPoint, ResourceMetrics,
-        ScopeMetrics, Sum,
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+        number_data_point::Value as NumberValue,
     };
     use opentelemetry_proto::tonic::resource::v1::Resource;
 
@@ -509,9 +505,10 @@ mod tests {
         );
 
         // Check data point attributes
-        let gauge = match &request.resource_metrics[0].scope_metrics[0].metrics[0].data {
-            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(g)) => g,
-            _ => panic!("expected gauge"),
+        let Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge)) =
+            &request.resource_metrics[0].scope_metrics[0].metrics[0].data
+        else {
+            panic!("expected gauge");
         };
         assert_eq!(gauge.data_points[0].attributes.len(), 2);
     }
@@ -556,9 +553,10 @@ mod tests {
         add_node_labels(&mut request, "scheduler-1", ROLE_SCHEDULER);
 
         // Check data point attributes for Sum metric
-        let sum = match &request.resource_metrics[0].scope_metrics[0].metrics[0].data {
-            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(s)) => s,
-            _ => panic!("expected sum"),
+        let Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum)) =
+            &request.resource_metrics[0].scope_metrics[0].metrics[0].data
+        else {
+            panic!("expected sum");
         };
         assert_eq!(sum.data_points[0].attributes.len(), 2);
 
@@ -678,22 +676,22 @@ mod tests {
         };
 
         // Call add_node_labels (simulating cluster metrics collector behavior)
-        add_node_labels(
-            &mut request,
-            "scheduler1.mac.local:50052",
-            ROLE_SCHEDULER,
-        );
+        add_node_labels(&mut request, "scheduler1.mac.local:50052", ROLE_SCHEDULER);
 
         // Check data point attributes - should have exactly 2 (node_id and node_role)
-        let gauge = match &request.resource_metrics[0].scope_metrics[0].metrics[0].data {
-            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(g)) => g,
-            _ => panic!("expected gauge"),
+        let Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge)) =
+            &request.resource_metrics[0].scope_metrics[0].metrics[0].data
+        else {
+            panic!("expected gauge");
         };
 
         let attributes = &gauge.data_points[0].attributes;
 
         // Count occurrences of node_id
-        let node_id_count = attributes.iter().filter(|kv| kv.key == NODE_ID_LABEL).count();
+        let node_id_count = attributes
+            .iter()
+            .filter(|kv| kv.key == NODE_ID_LABEL)
+            .count();
         assert_eq!(
             node_id_count, 1,
             "node_id should appear exactly once, but found {node_id_count}"

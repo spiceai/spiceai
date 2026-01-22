@@ -26,11 +26,11 @@ use std::sync::{Arc, Weak};
 
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
-    common::v1::{any_value::Value, AnyValue},
+    common::v1::{AnyValue, any_value::Value},
 };
 use opentelemetry_sdk::metrics::{
-    data::ResourceMetrics, reader::MetricReader, InstrumentKind, ManualReader, Pipeline,
-    Temporality,
+    InstrumentKind, ManualReader, Pipeline, Temporality, data::ResourceMetrics,
+    reader::MetricReader,
 };
 use prost::Message;
 
@@ -269,7 +269,7 @@ fn convert_metric_data_i64(
 
     match data {
         MetricData::Gauge(gauge) => {
-            let start_time = gauge.start_time().map(system_time_to_nanos).unwrap_or(0);
+            let start_time = gauge.start_time().map_or(0, system_time_to_nanos);
             let time = system_time_to_nanos(gauge.time());
             Some(otlp::metric::Data::Gauge(otlp::Gauge {
                 data_points: gauge
@@ -345,7 +345,7 @@ fn convert_metric_data_u64(
 
     match data {
         MetricData::Gauge(gauge) => {
-            let start_time = gauge.start_time().map(system_time_to_nanos).unwrap_or(0);
+            let start_time = gauge.start_time().map_or(0, system_time_to_nanos);
             let time = system_time_to_nanos(gauge.time());
             Some(otlp::metric::Data::Gauge(otlp::Gauge {
                 data_points: gauge
@@ -421,7 +421,7 @@ fn convert_metric_data_f64(
 
     match data {
         MetricData::Gauge(gauge) => {
-            let start_time = gauge.start_time().map(system_time_to_nanos).unwrap_or(0);
+            let start_time = gauge.start_time().map_or(0, system_time_to_nanos);
             let time = system_time_to_nanos(gauge.time());
             Some(otlp::metric::Data::Gauge(otlp::Gauge {
                 data_points: gauge
@@ -486,7 +486,7 @@ fn convert_metric_data_f64(
     }
 }
 
-/// Converts SDK attributes from an iterator to OTLP KeyValue list.
+/// Converts SDK attributes from an iterator to OTLP `KeyValue` list.
 fn convert_attributes_iter<'a>(
     attrs: impl Iterator<Item = &'a opentelemetry::KeyValue>,
 ) -> Vec<opentelemetry_proto::tonic::common::v1::KeyValue> {
@@ -517,8 +517,7 @@ fn temporality_to_proto(temporality: opentelemetry_sdk::metrics::Temporality) ->
 /// Converts a `SystemTime` to nanoseconds since Unix epoch.
 fn system_time_to_nanos(time: std::time::SystemTime) -> u64 {
     time.duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -548,10 +547,10 @@ mod tests {
 
     #[test]
     fn test_otel_value_to_proto_f64() {
-        let value = opentelemetry::Value::F64(3.14);
+        let value = opentelemetry::Value::F64(std::f64::consts::PI);
         let proto = otel_value_to_proto(&value);
         if let Value::DoubleValue(v) = proto {
-            assert!((v - 3.14).abs() < f64::EPSILON);
+            assert!((v - std::f64::consts::PI).abs() < f64::EPSILON);
         } else {
             panic!("Expected DoubleValue");
         }

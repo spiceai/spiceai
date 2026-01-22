@@ -118,7 +118,8 @@ impl Runtime {
 
                 // Register the local table under a separate name for RPC handlers to use
                 // This avoids infinite recursion when peers query each other
-                let local_table_provider: Arc<dyn TableProvider> = local_table as Arc<dyn TableProvider>;
+                let local_table_provider: Arc<dyn TableProvider> =
+                    local_table as Arc<dyn TableProvider>;
                 self.df
                     .register_table_as_writable_and_with_schema(
                         TableReference::partial(

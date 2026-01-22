@@ -353,12 +353,17 @@ pub async fn run(args: Args) -> Result<()> {
             .and_then(|c| c.otel_exporter.as_ref())
             .filter(|c| c.enabled);
 
-        init_metrics(&rt.datafusion(), metrics_registry.clone(), otel_config, metrics_reader)
-            .context(UnableToInitializeMetricsSnafu)?;
+        init_metrics(
+            &rt.datafusion(),
+            metrics_registry.clone(),
+            otel_config,
+            metrics_reader,
+        )
+        .context(UnableToInitializeMetricsSnafu)?;
     } else if let Some(reader) = metrics_reader {
         // In cluster mode without --metrics, we still need to register the MetricsReader
         // so executors can respond to metrics requests from schedulers
-        init_cluster_metrics_only(reader).context(UnableToInitializeMetricsSnafu)?;
+        init_cluster_metrics_only(reader);
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -523,9 +528,7 @@ fn init_metrics(
 ///
 /// This is used by executors that don't have `--metrics` enabled but still need to
 /// respond to metrics requests from schedulers via the control stream.
-fn init_cluster_metrics_only(
-    metrics_reader: runtime::metrics_reader::MetricsReader,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn init_cluster_metrics_only(metrics_reader: runtime::metrics_reader::MetricsReader) {
     let resource = Resource::builder().build();
 
     let provider = SdkMeterProvider::builder()
@@ -535,8 +538,6 @@ fn init_cluster_metrics_only(
 
     global::set_meter_provider(provider);
     tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection (no Prometheus)");
-
-    Ok(())
 }
 
 /// Creates an OTEL periodic reader from the spicepod config

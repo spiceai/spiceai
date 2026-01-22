@@ -102,7 +102,11 @@ where
                 );
             }
             None => {
-                process_tcp_stream(stream, prometheus_registry.clone(), cluster_collector.clone());
+                process_tcp_stream(
+                    stream,
+                    prometheus_registry.clone(),
+                    cluster_collector.clone(),
+                );
             }
         }
     }
@@ -143,8 +147,7 @@ async fn serve_connection<S>(
     stream: S,
     prometheus_registry: prometheus::Registry,
     cluster_collector: Option<Arc<ClusterMetricsCollector>>,
-)
-where
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let service = hyper::service::service_fn(move |req: Request<body::Incoming>| {
@@ -198,8 +201,7 @@ async fn handle_http_request(
 
         let is_cluster_scope = query_params
             .get(SCOPE_PARAM)
-            .map(|v| v == SCOPE_CLUSTER)
-            .unwrap_or(false);
+            .is_some_and(|v| v == SCOPE_CLUSTER);
 
         if is_cluster_scope {
             // Cluster-wide metrics requested
@@ -214,9 +216,7 @@ async fn handle_http_request(
                         format!("# Error collecting cluster metrics: {e}\n").into()
                     }
                 },
-                None => {
-                    "# Cluster metrics not available (not running in cluster mode)\n".into()
-                }
+                None => "# Cluster metrics not available (not running in cluster mode)\n".into(),
             }
         } else {
             // Local metrics only (original behavior)
@@ -256,6 +256,7 @@ async fn handle_http_request(
 ///
 /// This function handles the conversion of OTLP protobuf metrics (collected from
 /// cluster nodes) into the Prometheus text format for scraping.
+#[expect(clippy::cast_precision_loss)]
 fn otlp_to_prometheus_text(request: &ExportMetricsServiceRequest) -> String {
     use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 
@@ -272,8 +273,14 @@ fn otlp_to_prometheus_text(request: &ExportMetricsServiceRequest) -> String {
                         write_help_type(&mut output, &name, description, "gauge");
                         for dp in &gauge.data_points {
                             let labels = format_attributes(&dp.attributes);
-                            let value = extract_number_value(&dp.value);
-                            write_metric_line(&mut output, &name, &labels, value, dp.time_unix_nano);
+                            let value = extract_number_value(dp.value.as_ref());
+                            write_metric_line(
+                                &mut output,
+                                &name,
+                                &labels,
+                                value,
+                                dp.time_unix_nano,
+                            );
                         }
                     }
                     Some(Data::Sum(sum)) => {
@@ -281,8 +288,14 @@ fn otlp_to_prometheus_text(request: &ExportMetricsServiceRequest) -> String {
                         write_help_type(&mut output, &name, description, type_str);
                         for dp in &sum.data_points {
                             let labels = format_attributes(&dp.attributes);
-                            let value = extract_number_value(&dp.value);
-                            write_metric_line(&mut output, &name, &labels, value, dp.time_unix_nano);
+                            let value = extract_number_value(dp.value.as_ref());
+                            write_metric_line(
+                                &mut output,
+                                &name,
+                                &labels,
+                                value,
+                                dp.time_unix_nano,
+                            );
                         }
                     }
                     Some(Data::Histogram(histogram)) => {
@@ -386,11 +399,10 @@ fn otlp_to_prometheus_text(request: &ExportMetricsServiceRequest) -> String {
                             );
                         }
                     }
-                    Some(Data::ExponentialHistogram(_)) => {
+                    Some(Data::ExponentialHistogram(_)) | None => {
                         // Prometheus doesn't natively support exponential histograms
                         // Skip for now
                     }
-                    None => {}
                 }
             }
         }
@@ -408,8 +420,13 @@ fn write_help_type(output: &mut String, name: &str, description: &str, type_str:
 }
 
 /// Writes a single metric line in Prometheus format.
-#[expect(clippy::cast_precision_loss)]
-fn write_metric_line(output: &mut String, name: &str, labels: &str, value: f64, timestamp_nanos: u64) {
+fn write_metric_line(
+    output: &mut String,
+    name: &str,
+    labels: &str,
+    value: f64,
+    timestamp_nanos: u64,
+) {
     if labels.is_empty() {
         if timestamp_nanos > 0 {
             let timestamp_ms = timestamp_nanos / 1_000_000;
@@ -490,8 +507,9 @@ fn escape_label_value(value: &str) -> String {
 }
 
 /// Extracts a numeric value from OTLP number data point.
+#[expect(clippy::cast_precision_loss)]
 fn extract_number_value(
-    value: &Option<opentelemetry_proto::tonic::metrics::v1::number_data_point::Value>,
+    value: Option<&opentelemetry_proto::tonic::metrics::v1::number_data_point::Value>,
 ) -> f64 {
     use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 
@@ -713,10 +731,22 @@ mod tests {
 
     #[test]
     fn test_sanitize_metric_name() {
-        assert_eq!(sanitize_metric_name("http_requests_total"), "http_requests_total");
-        assert_eq!(sanitize_metric_name("http.requests.total"), "http_requests_total");
-        assert_eq!(sanitize_metric_name("http-requests-total"), "http_requests_total");
-        assert_eq!(sanitize_metric_name("metric:with:colons"), "metric:with:colons");
+        assert_eq!(
+            sanitize_metric_name("http_requests_total"),
+            "http_requests_total"
+        );
+        assert_eq!(
+            sanitize_metric_name("http.requests.total"),
+            "http_requests_total"
+        );
+        assert_eq!(
+            sanitize_metric_name("http-requests-total"),
+            "http_requests_total"
+        );
+        assert_eq!(
+            sanitize_metric_name("metric:with:colons"),
+            "metric:with:colons"
+        );
     }
 
     #[test]
@@ -765,13 +795,15 @@ mod tests {
                         description: "A test gauge".to_string(),
                         unit: String::new(),
                         metadata: Vec::new(),
-                        data: Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(
-                            Gauge {
+                        data: Some(
+                            opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(Gauge {
                                 data_points: vec![NumberDataPoint {
                                     attributes: vec![KeyValue {
                                         key: "host".to_string(),
                                         value: Some(AnyValue {
-                                            value: Some(Value::StringValue("localhost".to_string())),
+                                            value: Some(Value::StringValue(
+                                                "localhost".to_string(),
+                                            )),
                                         }),
                                     }],
                                     start_time_unix_nano: 0,
@@ -780,8 +812,8 @@ mod tests {
                                     exemplars: Vec::new(),
                                     flags: 0,
                                 }],
-                            },
-                        )),
+                            }),
+                        ),
                     }],
                     schema_url: String::new(),
                 }],
