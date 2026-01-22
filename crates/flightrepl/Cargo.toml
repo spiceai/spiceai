@@ -9,7 +9,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ansi_term = "0.12.1"
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-json.workspace = true
 clap.workspace = true
@@ -33,6 +32,7 @@ tonic = { workspace = true, features = [
   "tls-native-roots",
 ] }
 tracing.workspace = true
+util = { path = "../util" }
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"
