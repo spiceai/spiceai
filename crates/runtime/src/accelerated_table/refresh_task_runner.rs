@@ -57,6 +57,8 @@ pub struct RefreshTaskRunnerBuilder {
     /// Shared with `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
     last_updated_at: Arc<AtomicI64>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -87,6 +89,7 @@ impl RefreshTaskRunnerBuilder {
             resource_monitor: None,
             accelerator_write_mutex,
             last_updated_at: Arc::new(AtomicI64::new(0)),
+            is_s3_express_acceleration: false,
         }
     }
 
@@ -130,6 +133,13 @@ impl RefreshTaskRunnerBuilder {
         self
     }
 
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    #[must_use]
+    pub fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> Self {
+        self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTaskRunner {
         let mut refresh_task_builder = RefreshTask::builder(
@@ -154,6 +164,9 @@ impl RefreshTaskRunnerBuilder {
         if let Some(resource_monitor) = self.resource_monitor {
             refresh_task_builder = refresh_task_builder.with_resource_monitor(resource_monitor);
         }
+
+        refresh_task_builder =
+            refresh_task_builder.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let refresh_task = Arc::new(refresh_task_builder.build());
 

@@ -189,7 +189,7 @@ jobs:
         if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'aarch64'
         run: |
           sudo apt-get update
-          sudo apt-get install build-essential libssl-dev pkg-config cmake unixodbc unixodbc-dev -y
+          sudo apt-get install build-essential libssl-dev pkg-config cmake unixodbc unixodbc-dev unzip -y
 
       # The x86_64 runner does not unixodbc pre-installed
       - name: Install missing tools (Linux x86_64)
