@@ -87,7 +87,8 @@ RUN cp -r /etc/ssl/certs /spice_sandbox/etc/ssl/certs
 RUN cp -r /usr/share/zoneinfo /spice_sandbox/usr/share/zoneinfo
 
 # Copy every dependent library reported by ldd
-RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
+# The sed removes trailing colons/parens that appear in ldd output, and grep -v filters memory addresses
+RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | sed 's/[:)]$//' | grep -v '^/spice_sandbox' | sort -u | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
 
 # Copy additional required libraries
 RUN find /lib /usr/lib -name 'libpthread.so.0' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;
