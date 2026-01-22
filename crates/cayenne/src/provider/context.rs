@@ -100,6 +100,12 @@ impl CayenneContext {
         !self.config.sort_columns.is_empty()
     }
 
+    /// Get the maximum number of concurrent file uploads.
+    #[must_use]
+    pub fn upload_concurrency(&self) -> usize {
+        self.config.upload_concurrency.max(1)
+    }
+
     /// Create a `VortexFormat` from configuration.
     ///
     /// The format contains a `VortexFileCache` that can be accessed via `file_cache()`

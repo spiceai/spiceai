@@ -323,6 +323,8 @@ pub struct Builder {
     caching_stale_if_error: bool,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     bootstrap_status: BootstrapStatus,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
 }
 
 impl Builder {
@@ -364,6 +366,7 @@ impl Builder {
             caching_stale_if_error: false,
             resource_monitor: None,
             bootstrap_status: BootstrapStatus::none(),
+            is_s3_express_acceleration: false,
         }
     }
 
@@ -534,6 +537,12 @@ impl Builder {
         self
     }
 
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    pub fn s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
+        self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
     /// Build the accelerated table
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
@@ -674,6 +683,8 @@ impl Builder {
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
         }
+
+        refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let refresh_handle = refresher.start(acceleration_refresh_mode).await?;
         let refresher = Arc::new(refresher);
