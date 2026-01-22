@@ -1777,18 +1777,6 @@ impl DataAccelerator for CayenneAccelerator {
                 }));
             }
 
-            // Validate refresh_mode - append and full are supported
-            if let Some(refresh_mode) = acceleration.refresh_mode
-                && refresh_mode != RefreshMode::Append
-                && refresh_mode != RefreshMode::Full
-            {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(format!(
-                        "Cayenne data accelerator supports append and full refresh modes, but {refresh_mode:?} was specified. Please set refresh_mode to either append or full"
-                    )),
-                }));
-            }
-
             // Validate that refresh_append_overlap is not specified
             if acceleration.refresh_append_overlap.is_some() {
                 return Err(Box::new(Error::InvalidConfiguration {
