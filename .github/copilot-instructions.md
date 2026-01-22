@@ -406,7 +406,7 @@ testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrenc
 - **Ballista**: Distributed compute
 - **Delta Lake**: `delta_kernel`, `deltalake`
 - **Async runtime**: `tokio`, `futures`, `async-trait`
-- **Serialization**: `serde`, `serde_json`, `serde_yaml`
+- **Serialization**: `serde`, `serde_json`
 - **Error handling**: `snafu`, `thiserror`
 - **Logging/Tracing**: `tracing`, `tracing-subscriber`
 - **Database drivers**: Official/well-maintained drivers (e.g., `tokio-postgres`, `mysql_async`, `duckdb`)
