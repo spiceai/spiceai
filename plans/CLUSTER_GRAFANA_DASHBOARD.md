@@ -1,8 +1,8 @@
-# Spice Cluster Grafana Dashboard Plan
+# Spice Distributed Nodes Grafana Dashboard Plan
 
 ## Overview
 
-This document specifies a comprehensive Grafana dashboard for monitoring Spice's Ballista-based cluster mode. The dashboard provides visibility into cluster health, scheduler performance, executor utilization, shuffle efficiency, and error tracking.
+This document specifies a comprehensive Grafana dashboard for monitoring Spice's Ballista-based distributed query execution. The dashboard provides visibility into distributed node health, scheduler performance, executor utilization, shuffle efficiency, and error tracking.
 
 **Data Source**: Prometheus (scraping `/metrics?scope=cluster` endpoint)
 
@@ -16,8 +16,7 @@ Define these template variables for flexible filtering:
 
 | Variable | Label | Query | Multi | Include All |
 |----------|-------|-------|-------|-------------|
-| `$cluster` | Cluster | `label_values(node_status, cluster)` | No | No |
-| `$node` | Node | `label_values(node_status{cluster="$cluster"}, node_id)` | Yes | Yes |
+| `$node` | Node | `label_values(node_status, node_id)` | Yes | Yes |
 | `$role` | Role | `scheduler,executor` (custom) | Yes | Yes |
 | `$interval` | Interval | `$__auto_interval_interval` (auto) | No | No |
 
@@ -25,13 +24,13 @@ Define these template variables for flexible filtering:
 
 ## Dashboard Layout
 
-### Row 1: Cluster Overview
+### Row 1: Distributed Overview
 
 **Collapsed by default**: No
 
-#### Panel 1.1: Cluster Health Status
+#### Panel 1.1: Distributed Health Status
 - **Type**: Stat
-- **Description**: Overall cluster health indicator
+- **Description**: Overall distributed system health indicator
 - **Query**:
   ```promql
   min(node_status{node_id=~"$node"})
@@ -55,9 +54,9 @@ Define these template variables for flexible filtering:
   sum(scheduler_active_executors_count{node_id=~"$node"})
   ```
 
-#### Panel 1.3: Task Throughput (Cluster-wide)
+#### Panel 1.3: Task Throughput (Distributed)
 - **Type**: Stat
-- **Description**: Tasks completed per second across the cluster
+- **Description**: Tasks completed per second across distributed nodes
 - **Query**:
   ```promql
   sum(rate(node_tasks_total{status="completed", node_id=~"$node"}[$interval]))
@@ -479,7 +478,7 @@ Define these template variables for flexible filtering:
 
 | Alert | Expression | For | Severity |
 |-------|------------|-----|----------|
-| ClusterUnhealthy | `min(node_status) != 1` | 2m | critical |
+| DistributedUnhealthy | `min(node_status) != 1` | 2m | critical |
 | NoActiveExecutors | `sum(scheduler_active_executors_count) == 0` | 1m | critical |
 | HighTaskFailureRate | `sum(rate(node_task_failures[5m])) / sum(rate(node_tasks_total[5m])) > 0.1` | 5m | critical |
 
@@ -505,13 +504,15 @@ Define these template variables for flexible filtering:
 
 ## Dashboard JSON Export
 
+**Output file**: `monitoring/grafana-distributed-dashboard.json`
+
 The dashboard can be exported from Grafana and stored in version control. Key settings:
 
 ```json
 {
-  "title": "Spice Cluster Overview",
-  "uid": "spice-cluster",
-  "tags": ["spice", "cluster", "ballista"],
+  "title": "Spice Distributed Overview",
+  "uid": "spice-distributed",
+  "tags": ["spice", "distributed", "ballista"],
   "timezone": "browser",
   "refresh": "10s",
   "time": {
@@ -538,7 +539,7 @@ The dashboard can be exported from Grafana and stored in version control. Key se
 ## Best Practices
 
 ### Panel Organization
-1. **Top row**: High-level cluster health (glanceable)
+1. **Top row**: High-level distributed health (glanceable)
 2. **Middle rows**: Operational metrics (scheduler, executor, shuffle)
 3. **Bottom rows**: Error tracking and drill-down details
 
@@ -557,7 +558,7 @@ The dashboard can be exported from Grafana and stored in version control. Key se
 ### Variable Usage
 - Always filter by `$node` for drill-down capability
 - Use `$interval` for rate calculations (auto-adjusts to time range)
-- Enable "All" option for cluster-wide views
+- Enable "All" option for distributed-wide views
 
 ---
 
@@ -565,7 +566,7 @@ The dashboard can be exported from Grafana and stored in version control. Key se
 
 - [ ] Create dashboard in Grafana
 - [ ] Add template variables
-- [ ] Implement Row 1: Cluster Overview
+- [ ] Implement Row 1: Distributed Overview
 - [ ] Implement Row 2: Scheduler Performance
 - [ ] Implement Row 3: Stage Execution
 - [ ] Implement Row 4: Executor Performance
