@@ -4,7 +4,7 @@ The Spice open source project provides multiple distribution variants to support
 
 > **Note:** The Spice runtime is **64-bit only**. 32-bit platforms are not supported.
 
-> **Note:** Variant distributions (data, allocators, CUDA) are only available in **nightly images** for the open source project. For production-ready variants including data-only (no AI features) builds, custom allocators, CUDA, and additional connectors (ODBC, NFS), see [Spice.ai Enterprise](https://spice.ai/pricing).
+> **Note:** Variant distributions (data, allocators, CUDA) are only available in **nightly images** for the open source project. All features and distributions are available in the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://spice.ai/pricing).
 
 ## Default Distribution
 
@@ -38,7 +38,7 @@ docker pull spiceai/spiceai:latest
 
 The data distribution excludes AI/ML model support, resulting in a smaller binary size and reduced attack surface. Use this when you only need data federation and acceleration capabilities without AI features.
 
-> **Open Source:** Available in nightly builds only. **Enterprise:** Production-ready data distribution available.
+> **Open Source:** Available in nightly builds only. **[Cloud Platform & Enterprise](https://spice.ai/pricing):** Production-ready data distribution available.
 
 **Included Features:**
 
@@ -85,7 +85,7 @@ make install-metal
 
 For Linux systems with NVIDIA GPUs, CUDA distributions enable GPU-accelerated AI/ML inference. Multiple CUDA compute capability versions are available.
 
-> **Open Source:** Available in nightly builds only. **Enterprise:** Production-ready CUDA distribution available.
+> **Open Source:** Available in nightly builds only. **[Cloud Platform & Enterprise](https://spice.ai/pricing):** Production-ready CUDA distribution available.
 
 **Included Features:**
 
@@ -116,7 +116,7 @@ CUDA_COMPUTE_CAP=89 make install-cuda
 
 Different memory allocators can significantly impact performance depending on workload characteristics.
 
-> **Open Source:** Allocator variants are available in nightly builds only for testing and benchmarking. **Enterprise:** Production-ready allocator variants available.
+> **Open Source:** Allocator variants are available in nightly builds only for testing and benchmarking. **[Cloud Platform & Enterprise](https://spice.ai/pricing):** Production-ready allocator variants available.
 
 ### snmalloc (Default)
 
@@ -162,7 +162,7 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 | Windows (WSL)                 | ✅       | Nightly         | ❌     | Nightly         |
 | Windows (Native)              | ❌       | Enterprise only | ❌     | Enterprise only |
 
-> **Note:** Native Windows support for the Spice runtime is available with [Spice.ai Enterprise](https://spice.ai/pricing). Open source users on Windows should use Windows Subsystem for Linux (WSL).
+> **Note:** Native Windows support for the Spice runtime is available with the [Spice Cloud Platform and Spice.ai Enterprise](https://spice.ai/pricing). Open source users on Windows should use Windows Subsystem for Linux (WSL).
 
 ## Choosing a Distribution
 
@@ -174,9 +174,9 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 | Linux with NVIDIA GPU                   | CUDA (nightly)               |
 | Memory allocation benchmarking          | Allocator variants (nightly) |
 
-## Enterprise Connectors
+## Additional Connectors
 
-Some connectors require additional dependencies and are available with [Spice.ai Enterprise](https://spice.ai/pricing):
+Some connectors require additional dependencies and are available with the [Spice Cloud Platform and Spice.ai Enterprise](https://spice.ai/pricing):
 
 - **ODBC** - Connect to any ODBC-compatible data source
 - **NFS** - Network File System support
