@@ -19121,7 +19121,7 @@ dependencies = [
 [[package]]
 name = "vortex"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "vortex-alp",
  "vortex-array",
@@ -19159,7 +19159,7 @@ dependencies = [
 [[package]]
 name = "vortex-alp"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -19180,7 +19180,7 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arcref",
  "arrow-arith",
@@ -19228,7 +19228,7 @@ dependencies = [
 [[package]]
 name = "vortex-btrblocks"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "getrandom 0.3.4",
  "itertools 0.14.0",
@@ -19257,7 +19257,7 @@ dependencies = [
 [[package]]
 name = "vortex-buffer"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrow-buffer",
  "bitvec",
@@ -19271,7 +19271,7 @@ dependencies = [
 [[package]]
 name = "vortex-bytebool"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "num-traits",
  "vortex-array",
@@ -19285,7 +19285,7 @@ dependencies = [
 [[package]]
 name = "vortex-compute"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -19306,7 +19306,7 @@ dependencies = [
 [[package]]
 name = "vortex-datafusion"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -19337,7 +19337,7 @@ dependencies = [
 [[package]]
 name = "vortex-datetime-parts"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "num-traits",
  "prost 0.14.3",
@@ -19352,7 +19352,7 @@ dependencies = [
 [[package]]
 name = "vortex-decimal-byte-parts"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "num-traits",
  "prost 0.14.3",
@@ -19367,7 +19367,7 @@ dependencies = [
 [[package]]
 name = "vortex-dtype"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -19391,7 +19391,7 @@ dependencies = [
 [[package]]
 name = "vortex-error"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrow-schema",
  "flatbuffers",
@@ -19405,7 +19405,7 @@ dependencies = [
 [[package]]
 name = "vortex-fastlanes"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrayref",
  "fastlanes",
@@ -19427,7 +19427,7 @@ dependencies = [
 [[package]]
 name = "vortex-file"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -19470,7 +19470,7 @@ dependencies = [
 [[package]]
 name = "vortex-flatbuffers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "flatbuffers",
  "vortex-buffer",
@@ -19479,7 +19479,7 @@ dependencies = [
 [[package]]
 name = "vortex-fsst"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "fsst-rs",
  "num-traits",
@@ -19496,7 +19496,7 @@ dependencies = [
 [[package]]
 name = "vortex-io"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "async-compat",
  "async-fs",
@@ -19525,7 +19525,7 @@ dependencies = [
 [[package]]
 name = "vortex-ipc"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -19542,7 +19542,7 @@ dependencies = [
 [[package]]
 name = "vortex-layout"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arcref",
  "async-stream",
@@ -19586,7 +19586,7 @@ dependencies = [
 [[package]]
 name = "vortex-mask"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrow-buffer",
  "itertools 0.14.0",
@@ -19597,7 +19597,7 @@ dependencies = [
 [[package]]
 name = "vortex-metrics"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "getrandom 0.3.4",
  "parking_lot 0.12.5",
@@ -19608,7 +19608,7 @@ dependencies = [
 [[package]]
 name = "vortex-pco"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "pco",
  "prost 0.14.3",
@@ -19623,7 +19623,7 @@ dependencies = [
 [[package]]
 name = "vortex-proto"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "prost 0.14.3",
  "prost-types",
@@ -19632,7 +19632,7 @@ dependencies = [
 [[package]]
 name = "vortex-runend"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrow-array",
  "itertools 0.14.0",
@@ -19650,7 +19650,7 @@ dependencies = [
 [[package]]
 name = "vortex-scalar"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrow-array",
  "bytes",
@@ -19670,7 +19670,7 @@ dependencies = [
 [[package]]
 name = "vortex-scan"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -19694,7 +19694,7 @@ dependencies = [
 [[package]]
 name = "vortex-sequence"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "num-traits",
  "prost 0.14.3",
@@ -19711,7 +19711,7 @@ dependencies = [
 [[package]]
 name = "vortex-session"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "dashmap",
  "vortex-error",
@@ -19721,7 +19721,7 @@ dependencies = [
 [[package]]
 name = "vortex-sparse"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -19738,7 +19738,7 @@ dependencies = [
 [[package]]
 name = "vortex-utils"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "dashmap",
  "hashbrown 0.16.1",
@@ -19748,7 +19748,7 @@ dependencies = [
 [[package]]
 name = "vortex-vector"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "num-traits",
  "paste",
@@ -19762,7 +19762,7 @@ dependencies = [
 [[package]]
 name = "vortex-zigzag"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "vortex-array",
  "vortex-buffer",
@@ -19776,7 +19776,7 @@ dependencies = [
 [[package]]
 name = "vortex-zstd"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex?rev=623936e22bdc1daad586af4a54053240f2009d5c#623936e22bdc1daad586af4a54053240f2009d5c"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e9896bc9e080dc5a133e34099cf68277a8782a7#4e9896bc9e080dc5a133e34099cf68277a8782a7"
 dependencies = [
  "itertools 0.14.0",
  "prost 0.14.3",
