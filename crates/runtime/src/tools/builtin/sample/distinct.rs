@@ -143,7 +143,6 @@ impl SampleFrom for DistinctColumnsParams {
 
         let mut result: Vec<ArrayRef> = Vec::with_capacity(columns.len());
 
-        // Capture the current span to propagate tracing context to buffered futures
         let current_span = Span::current();
 
         let data_sample_futures = columns.iter().map(|column| {

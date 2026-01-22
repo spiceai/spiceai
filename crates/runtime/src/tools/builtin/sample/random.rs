@@ -53,7 +53,6 @@ impl SampleFrom for RandomSampleParams {
         &self,
         df: Arc<DataFusion>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        // Capture the current span to ensure sql_query spans are properly nested
         let current_span = Span::current();
 
         let batches = async {

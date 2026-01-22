@@ -88,7 +88,6 @@ impl SampleFrom for TopSamplesParams {
         let order_by = sanitize_order_by(self.order_by.as_str())
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        // Capture the current span to ensure sql_query spans are properly nested
         let current_span = Span::current();
 
         let batches = async {
