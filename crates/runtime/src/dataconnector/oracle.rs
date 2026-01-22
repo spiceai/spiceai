@@ -40,8 +40,9 @@ const DEFAULT_WALLET_PATH: &str = ".oracle";
 // Ensures that the wallet certificate is only saved once, even if multiple datasets
 // attempt to initialize concurrently. This avoids race conditions when writing the
 // cwallet.sso file and ensures the Oracle OCI client is initialized with a valid wallet.
-// Uses Mutex<Option<()>> pattern since OnceLock::get_or_try_init is still unstable.
-static WALLET_INIT: OnceLock<Mutex<Option<()>>> = OnceLock::new();
+// Stores the result of the first initialization attempt (success or error message) to
+// prevent repeated retries on failure.
+static WALLET_INIT: OnceLock<Mutex<Option<Result<(), String>>>> = OnceLock::new();
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -54,6 +55,11 @@ pub enum Error {
         "Failed to initialize Oracle wallet: A previous initialization failed and the lock is poisoned. Restart the application."
     ))]
     WalletInitializationLockPoisoned,
+
+    #[snafu(display(
+        "Failed to initialize Oracle wallet: A previous initialization attempt failed: {message}"
+    ))]
+    WalletInitializationPreviouslyFailed { message: String },
 
     #[snafu(display(
         "Failed to connect to the Oracle Server. Verify your connection configuration, and try again. {source}"
@@ -178,19 +184,27 @@ impl Oracle {
     /// Ensures safe, single initialization across concurrent dataset connections by guarding
     /// against race conditions using `WALLET_INIT`. If multiple datasets attempt to initialize
     /// the wallet concurrently, only the first call will perform the write and initialization;
-    /// subsequent calls will no-op.
+    /// subsequent calls will return the cached result (success or error).
     pub fn save_wallet_cert_once(cert_base64_str: &str, wallet_path: &str) -> Result<()> {
         let mutex = WALLET_INIT.get_or_init(|| Mutex::new(None));
         let mut guard = mutex
             .lock()
             .map_err(|_| Error::WalletInitializationLockPoisoned)?;
 
-        if guard.is_none() {
-            Self::save_wallet_cert(cert_base64_str, wallet_path)?;
-            *guard = Some(());
+        match &*guard {
+            Some(Ok(())) => Ok(()),
+            Some(Err(cached_error)) => Err(Error::WalletInitializationPreviouslyFailed {
+                message: cached_error.clone(),
+            }),
+            None => {
+                let result = Self::save_wallet_cert(cert_base64_str, wallet_path);
+                match &result {
+                    Ok(()) => *guard = Some(Ok(())),
+                    Err(e) => *guard = Some(Err(e.to_string())),
+                }
+                result
+            }
         }
-
-        Ok(())
     }
 
     /// Save base64-encoded wallet certificate as cwallet.sso file
