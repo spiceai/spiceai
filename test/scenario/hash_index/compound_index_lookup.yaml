@@ -1,0 +1,23 @@
+# Scenario queries for validating correctness of compound primary key lookups
+# Note: hash_index is enabled but compound primary keys currently do NOT use hash index optimization;
+# this covers correctness and documents a limitation for future enhancement
+name: hash_index_compound_pk_lookup
+
+queries:
+  # Partsupp table: compound primary key (ps_partkey, ps_suppkey)
+  - name: partsupp_compound_pk_lookup
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 1 AND ps_suppkey = 2
+    expected_results:
+      row_count: 1
+
+  # Lineitem table: compound primary key (l_orderkey, l_linenumber)
+  - name: lineitem_compound_pk_lookup
+    sql: SELECT * FROM lineitem WHERE l_orderkey = 1 AND l_linenumber = 1
+    expected_results:
+      row_count: 1
+
+  # Partial compound key lookup (only first column) - may or may not use index
+  - name: partsupp_partial_pk_lookup
+    sql: SELECT * FROM partsupp WHERE ps_partkey = 10
+    expected_results:
+      row_count: 4

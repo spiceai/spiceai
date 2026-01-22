@@ -20,6 +20,7 @@ use crate::args::{CommonArgs, DatasetTestArgs};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
+    opentelemetry_sdk::Resource,
     queries::QuerySet,
     spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
@@ -41,17 +42,24 @@ pub(crate) mod text_to_sql;
 pub(crate) mod throughput;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
 
+/// Create telemetry with resource attributes known upfront.
+///
+/// This ensures the `SdkMeterProvider` is created with the correct resource,
+/// so metrics recorded after this call will have the proper resource attributes.
 #[must_use]
-pub(crate) fn create_telemetry(common: &CommonArgs) -> Telemetry {
+pub(crate) fn create_telemetry_with_resource(common: &CommonArgs, resource: Resource) -> Telemetry {
     if let Some(endpoint) = &common.otlp_endpoint {
-        return Telemetry::with_otlp(OtlpExporterConfig {
-            endpoint: endpoint.clone().into(),
-            headers: common.otlp_header.clone(),
-            timeout: Duration::from_secs(10),
-        });
+        return Telemetry::with_otlp_resource(
+            OtlpExporterConfig {
+                endpoint: endpoint.clone().into(),
+                headers: common.otlp_header.clone(),
+                timeout: Duration::from_secs(10),
+            },
+            resource,
+        );
     }
 
-    Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY")
+    Telemetry::new_with_resource(&resource, "SPICEAI_BENCHMARK_METRICS_KEY")
 }
 
 /// Build a test configuration with validation data if applicable

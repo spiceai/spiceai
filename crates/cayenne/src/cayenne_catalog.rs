@@ -494,18 +494,14 @@ impl MetadataCatalog for CayenneCatalog {
             .await;
 
         match insert_result {
-            Err(CatalogError::Sqlite {
-                source: rusqlite::Error::SqliteFailure(err, _),
-            }) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
-                // Another concurrent operation inserted the same delete file
-                // Retrieve the existing delete_file_id by falling through
-            }
+            // Success or constraint violation (another concurrent operation inserted first)
+            // Either way, retrieve the delete_file_id by falling through
+            Ok(()) | Err(CatalogError::ConstraintViolation { .. }) => {}
             Err(e) => {
                 return Err(CatalogError::FailedToAddDeleteFile {
                     source: Box::new(e),
                 })
             }
-            Ok(()) => {}
         }
 
         // Retrieve the assigned delete_file_id
@@ -913,18 +909,14 @@ impl MetadataCatalog for CayenneCatalog {
             .await;
 
         match insert_result {
-            Err(CatalogError::Sqlite {
-                source: rusqlite::Error::SqliteFailure(err, _),
-            }) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
-                // Another concurrent operation inserted the same partition
-                // Retrieve the existing partition ID by falling through
-            }
+            // Success or constraint violation (another concurrent operation inserted first)
+            // Either way, retrieve the partition ID by falling through
+            Ok(()) | Err(CatalogError::ConstraintViolation { .. }) => {}
             Err(e) => {
                 return Err(CatalogError::FailedToAddPartition {
                     source: Box::new(e),
                 })
             }
-            Ok(()) => {}
         }
 
         // Retrieve the assigned partition ID
