@@ -84,6 +84,7 @@ pub mod graphql;
 pub mod http;
 #[cfg(feature = "imap")]
 pub mod imap;
+pub mod index_maintenance;
 pub mod object;
 pub mod poly;
 

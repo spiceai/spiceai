@@ -4616,6 +4616,7 @@ dependencies = [
  "snafu",
  "snowflake-api",
  "spark-connect-rs",
+ "telemetry",
  "tiberius",
  "token_provider",
  "tokio",
