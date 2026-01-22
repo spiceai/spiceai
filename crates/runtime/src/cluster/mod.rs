@@ -26,6 +26,7 @@ use crate::{
 use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::prelude::SessionConfig;
 use app::App;
+use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::BallistaCodec;
@@ -948,10 +949,37 @@ async fn create_scheduler_server(
     let current_context = Arc::clone(&rt.df.ctx);
     let io_runtime = rt.tokio_io_runtime();
 
+    // Get shuffle format from spicepod runtime params
+    let shuffle_format: String = {
+        let app_guard = rt.app().read().await;
+        app_guard
+            .as_ref()
+            .and_then(|app| app.runtime.params.get("shuffle_format"))
+            .cloned()
+            .unwrap_or_else(|| "arrow_ipc".to_string())
+    };
+
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
     let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
         .clone()
         .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
+
+    // Convert shuffle_format param to ballista ShuffleFormat
+    #[cfg(feature = "vortex-shuffle")]
+    let ballista_shuffle_format = match shuffle_format.as_str() {
+        "vortex" => BallistaShuffleFormat::Vortex,
+        _ => BallistaShuffleFormat::ArrowIpc,
+    };
+
+    #[cfg(not(feature = "vortex-shuffle"))]
+    let ballista_shuffle_format = {
+        if shuffle_format.as_str() == "vortex" {
+            tracing::warn!(
+                "Vortex shuffle format requested but 'vortex-shuffle' feature is not enabled. Falling back to ArrowIpc."
+            );
+        }
+        BallistaShuffleFormat::ArrowIpc
+    };
 
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
@@ -970,7 +998,8 @@ async fn create_scheduler_server(
         override_session_builder: Some(Arc::new(move |_cfg| {
             let cfg = current_context
                 .copied_config()
-                .with_option_extension(SpiceClusterConfig::default());
+                .with_option_extension(SpiceClusterConfig::default())
+                .with_ballista_shuffle_format(ballista_shuffle_format);
 
             Ok(
                 SessionStateBuilder::new_from_existing(current_context.as_ref().state())
