@@ -119,7 +119,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     // baseline run
     println!("Running benchmark test");
 
-    let (query_set, test_builder) = super::build_test_with_validation(
+    let (_query_set, test_builder) = super::build_test_with_validation(
         args,
         NotStarted::new()
             .with_parallel_count(1)
