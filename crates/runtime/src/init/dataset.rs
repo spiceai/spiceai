@@ -389,6 +389,17 @@ impl Runtime {
             .await
         {
             Ok(()) => {
+                // Log experimental hash_index warning once per dataset at registration
+                if ds
+                    .acceleration
+                    .as_ref()
+                    .is_some_and(Acceleration::is_hash_index_enabled)
+                {
+                    tracing::warn!(
+                        dataset = %ds.name,
+                        "hash_index is enabled for Arrow engine acceleration. Note: hash_index is experimental and may have breaking changes in future releases."
+                    );
+                }
                 tracing::info!(
                     "{}",
                     dataset_registered_trace(

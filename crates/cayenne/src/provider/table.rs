@@ -993,8 +993,9 @@ impl CayenneTableProvider {
     /// - Retention filters are applied atomically after all writes
     /// - Table statistics remain consistent
     ///
-    /// **Within a single insert**, chunks are written in parallel (bounded to 4 concurrent writes)
-    /// for optimal I/O throughput. The serialization only applies across different `insert()` calls.
+    /// **Within a single insert**, chunks are written in parallel with bounded concurrency
+    /// (configurable via `VortexConfig.upload_concurrency`, default 4) for optimal I/O throughput.
+    /// The serialization only applies across different `insert()` calls.
     ///
     /// This design ensures correctness while maintaining high performance for individual inserts.
     /// If you need higher write concurrency, consider partitioning your data across multiple tables.
@@ -1302,7 +1303,7 @@ impl CayenneTableProvider {
     ///
     /// This method optimizes throughput by:
     /// - Streaming chunk formation (no buffering of all chunks)
-    /// - Parallel writes with bounded concurrency (max 4 concurrent writes)
+    /// - Parallel writes with bounded concurrency (configurable via `VortexConfig.upload_concurrency`)
     /// - Zero-copy batch handling (Arc references)
     ///
     /// # Returns
@@ -1323,8 +1324,9 @@ impl CayenneTableProvider {
         use std::time::Instant;
         use tokio::sync::Semaphore;
 
-        // Bounded parallelism: max 4 concurrent writes to avoid overwhelming I/O
-        let semaphore = Arc::new(Semaphore::new(4));
+        // Bounded parallelism: configurable concurrent writes to optimize I/O
+        let upload_concurrency = self.context.upload_concurrency();
+        let semaphore = Arc::new(Semaphore::new(upload_concurrency));
 
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");
@@ -1553,8 +1555,9 @@ impl CayenneTableProvider {
             self.context.file_format(),
         )?;
 
-        // Bounded parallelism: max 4 concurrent writes to avoid overwhelming I/O
-        let semaphore = Arc::new(Semaphore::new(4));
+        // Bounded parallelism: configurable concurrent writes to optimize I/O
+        let upload_concurrency = self.context.upload_concurrency();
+        let semaphore = Arc::new(Semaphore::new(upload_concurrency));
 
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");

@@ -86,6 +86,7 @@ snowflake-api = { workspace = true, optional = true }
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "75badc149f3c4d783b912c88d10bae443a7330f6", features = [
     "tls",
 ], optional = true } # spiceai
+telemetry = { path = "../telemetry" }
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true
