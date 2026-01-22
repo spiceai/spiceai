@@ -14,6 +14,7 @@ use snafu::Snafu;
 
 pub mod dataset_checkpoint;
 mod engine;
+pub mod layout;
 pub mod snapshot;
 
 pub use engine::Engine;

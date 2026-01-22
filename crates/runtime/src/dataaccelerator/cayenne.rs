@@ -24,8 +24,8 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use data_components::poly::PolyTableProvider;
-use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
+use datafusion::common::{DFSchema, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{CreateExternalTable, TableProviderFilterPushDown};
@@ -54,7 +54,7 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotAdapter};
+use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -1655,14 +1655,14 @@ impl DataAccelerator for CayenneAccelerator {
             })
     }
 
-    fn snapshot_adapter(&self, source: &dyn AccelerationSource) -> SnapshotAdapter {
+    fn acceleration_layout(&self, source: &dyn AccelerationSource) -> AccelerationLayout {
         let Ok(data_dir) = self.cayenne_data_dir(source) else {
-            return SnapshotAdapter::default();
+            return AccelerationLayout::default();
         };
 
         let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
 
-        SnapshotAdapter::cayenne(PathBuf::from(metadata_dir), PathBuf::from(data_dir))
+        AccelerationLayout::cayenne(PathBuf::from(metadata_dir), PathBuf::from(data_dir))
     }
 
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
@@ -1861,7 +1861,7 @@ impl DataAccelerator for CayenneAccelerator {
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
             let snapshot_adapter =
-                runtime_acceleration::snapshot::SnapshotAdapter::cayenne(metadata_dir, path_buf);
+                runtime_acceleration::snapshot::AccelerationLayout::cayenne(metadata_dir, path_buf);
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,

@@ -32,7 +32,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
 use linkme::distributed_slice;
-use runtime_acceleration::snapshot::{SnapshotAdapter, SnapshotDownloadInfo};
+use runtime_acceleration::snapshot::{AccelerationLayout, SnapshotDownloadInfo};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -376,17 +376,19 @@ pub trait DataAccelerator: Send + Sync {
     /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
 
-    /// Provides snapshot handling configuration for this accelerator.
+    /// Returns the storage layout configuration for this accelerator.
     ///
-    /// Returns the appropriate `SnapshotAdapter` for this engine type.
-    /// File-based accelerators (`DuckDB`, `SQLite`) return `SnapshotAdapter::file`,
-    /// while directory-based accelerators (Cayenne) return `SnapshotAdapter::cayenne`.
-    fn snapshot_adapter(&self, source: &dyn AccelerationSource) -> SnapshotAdapter {
-        // Default: use file-based adapter if file_path is available
+    /// Returns the appropriate `AccelerationLayout` for this engine type:
+    /// - File-based accelerators (`DuckDB`, `SQLite`) return `AccelerationLayout::file`
+    /// - Directory-based accelerators (Cayenne) return `AccelerationLayout::cayenne`
+    ///
+    /// This is used for snapshots and size metrics.
+    fn acceleration_layout(&self, source: &dyn AccelerationSource) -> AccelerationLayout {
+        // Default: use file-based layout if file_path is available
         if let Ok(path) = self.file_path(source) {
-            SnapshotAdapter::file(PathBuf::from(path))
+            AccelerationLayout::file(PathBuf::from(path))
         } else {
-            SnapshotAdapter::default()
+            AccelerationLayout::default()
         }
     }
 
@@ -647,16 +649,18 @@ pub async fn acceleration_file_path(
     Ok(PathBuf::from(file))
 }
 
-/// Gets the appropriate snapshot adapter for the given acceleration source.
+/// Gets the storage layout for the given acceleration source.
 ///
 /// This function retrieves the registered accelerator for the source's engine
-/// and returns the engine-specific snapshot adapter. Different engines use
-/// different adapter types:
-/// - File-based engines (`DuckDB`, `SQLite`): `SnapshotAdapter::file`
-/// - Directory-based engines (Cayenne): `SnapshotAdapter::cayenne`
-pub async fn acceleration_snapshot_adapter(
+/// and returns the engine-specific layout. Different engines use
+/// different layout types:
+/// - File-based engines (`DuckDB`, `SQLite`): `AccelerationLayout::file`
+/// - Directory-based engines (Cayenne): `AccelerationLayout::cayenne`
+///
+/// This is used for snapshots and size metrics.
+pub async fn get_acceleration_layout(
     source: &dyn AccelerationSource,
-) -> Result<SnapshotAdapter, FilePathError> {
+) -> Result<AccelerationLayout, FilePathError> {
     let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
 
     let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
@@ -665,7 +669,7 @@ pub async fn acceleration_snapshot_adapter(
             engine: acceleration_settings.engine,
         })?;
 
-    Ok(accelerator.snapshot_adapter(source))
+    Ok(accelerator.acceleration_layout(source))
 }
 
 pub(crate) fn get_primary_keys_from_constraints(
