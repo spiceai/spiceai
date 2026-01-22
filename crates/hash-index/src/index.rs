@@ -165,6 +165,8 @@ pub struct HashIndexBuilder {
     allow_duplicates: bool,
     use_bloom_filter: bool,
     min_rows_threshold: usize,
+    /// Optional name for metrics (e.g., dataset name).
+    name: Option<String>,
 }
 
 impl HashIndexBuilder {
@@ -177,7 +179,18 @@ impl HashIndexBuilder {
             allow_duplicates: false,
             use_bloom_filter: true,
             min_rows_threshold: 0,
+            name: None,
         }
+    }
+
+    /// Sets an optional name for metrics (e.g., dataset name).
+    ///
+    /// This name is used in OpenTelemetry metric dimensions to identify
+    /// which dataset the index belongs to.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
     }
 
     /// Sets the expected number of rows for capacity planning.
@@ -439,12 +452,16 @@ impl HashIndexBuilder {
         // Record OTel metrics when the metrics feature is enabled
         #[cfg(feature = "metrics")]
         {
-            let dimensions = &[];
-            telemetry::track_hash_index_build(dimensions);
-            telemetry::track_hash_index_build_duration(elapsed, dimensions);
+            let dimensions: Vec<telemetry::KeyValue> = self
+                .name
+                .as_ref()
+                .map(|n| vec![telemetry::KeyValue::new("dataset", n.clone())])
+                .unwrap_or_default();
+            telemetry::track_hash_index_build(&dimensions);
+            telemetry::track_hash_index_build_duration(elapsed, &dimensions);
             // usize to u64 never truncates on 64-bit, and widens safely on 32-bit
-            telemetry::track_hash_index_entries(indexed_entries as u64, dimensions);
-            telemetry::track_hash_index_memory_bytes(memory_bytes as u64, dimensions);
+            telemetry::track_hash_index_entries(indexed_entries as u64, &dimensions);
+            telemetry::track_hash_index_memory_bytes(memory_bytes as u64, &dimensions);
         }
 
         Ok(index)

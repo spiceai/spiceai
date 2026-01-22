@@ -159,6 +159,16 @@ impl DeletionTableProviderAdapter {
     pub fn new(source: Arc<dyn DeletionTableProvider>) -> Self {
         Self { source }
     }
+
+    /// Returns a reference to the inner source table provider.
+    ///
+    /// This is useful for accessing the underlying table provider when the adapter
+    /// is wrapping another provider (e.g., `IndexedMemTable`) that needs direct access
+    /// for operations like index maintenance.
+    #[must_use]
+    pub fn source(&self) -> &Arc<dyn DeletionTableProvider> {
+        &self.source
+    }
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -194,6 +204,13 @@ impl TableProvider for DeletionTableProviderAdapter {
     }
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.source.get_column_default(column)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.source.supports_filters_pushdown(filters)
     }
 
     async fn scan(

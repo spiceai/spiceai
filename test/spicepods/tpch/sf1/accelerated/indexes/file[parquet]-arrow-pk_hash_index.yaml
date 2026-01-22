@@ -1,0 +1,68 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-arrow-pk_hash_index
+datasets:
+  - from: file:data/customer.parquet
+    name: customer
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: c_custkey
+      params:
+        hash_index: enabled
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: (l_orderkey, l_linenumber)
+      params:
+        hash_index: enabled
+  - from: file:data/nation.parquet
+    name: nation
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: n_nationkey
+      params:
+        hash_index: enabled
+  - from: file:data/orders.parquet
+    name: orders
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: o_orderkey
+      params:
+        hash_index: enabled
+  - from: file:data/part.parquet
+    name: part
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: p_partkey
+      params:
+        hash_index: enabled
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: (ps_partkey, ps_suppkey)
+      params:
+        hash_index: enabled
+  - from: file:data/region.parquet
+    name: region
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: r_regionkey
+      params:
+        hash_index: enabled
+  - from: file:data/supplier.parquet
+    name: supplier
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: s_suppkey
+      params:
+        hash_index: enabled
