@@ -60,7 +60,6 @@ use datafusion::execution::SessionState;
 use datafusion::prelude::SessionContext;
 
 use async_stream::stream;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use futures::StreamExt;
 
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
@@ -159,18 +158,35 @@ macro_rules! handle_error {
 }
 
 impl Query {
-    fn get_session_state(&self, request_context: &Arc<RequestContext>) -> Result<SessionState> {
+    /// Returns the session state for local query execution.
+    ///
+    /// For Flight SQL sessions, returns the session-specific context to preserve
+    /// prepared statements. Otherwise, returns the default local context.
+    fn get_session_state(&self, request_context: &Arc<RequestContext>) -> SessionState {
         // Check if there's a Flight SQL session-specific context
         if let Some(flight_session) =
             request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
         {
-            // For cluster mode with session context, we don't apply cluster modifications
-            // since the session state should remain local to preserve prepared statements
-            return Ok(flight_session.session_context().state());
+            // Use session-specific context to preserve prepared statements
+            return flight_session.session_context().state();
         }
 
+        // Always use local execution for synchronous APIs (/v1/sql, FlightSQL)
+        self.df.ctx.state()
+    }
+
+    /// Returns the session state configured for distributed query execution via Ballista.
+    ///
+    /// This is only used by the async queries API (`/v1/queries`) which needs to
+    /// distribute work across the cluster. Returns an error if not in scheduler mode
+    /// or if required configuration is missing.
+    fn get_distributed_session_state(&self) -> Result<SessionState> {
         if !matches!(self.df.cluster_config.role(), Some(ClusterRole::Scheduler)) {
-            return Ok(self.df.ctx.state());
+            return Err(Error::UnableToExecuteQuery {
+                source: datafusion::error::DataFusionError::Configuration(
+                    "Distributed execution requires scheduler mode".to_string(),
+                ),
+            });
         }
 
         let Some(scheduler_url) = self.df.cluster_config.scheduler_url_string() else {
@@ -218,28 +234,6 @@ impl Query {
             .map_err(|e| Error::UnableToExecuteQuery { source: e })
     }
 
-    fn should_distribute_plan(plan: &LogicalPlan) -> datafusion::common::Result<bool> {
-        let mut should_distribute = true;
-
-        let _ = plan.apply(|p| {
-            if let LogicalPlan::DescribeTable(_) = p {
-                should_distribute = false;
-            } else if let LogicalPlan::TableScan(scan) = p
-                && matches!(scan.table_name.schema(), Some(SPICE_RUNTIME_SCHEMA))
-            {
-                should_distribute = false;
-            }
-
-            if should_distribute {
-                Ok(TreeNodeRecursion::Continue)
-            } else {
-                Ok(TreeNodeRecursion::Stop)
-            }
-        })?;
-
-        Ok(should_distribute)
-    }
-
     /// Run a query and return the result.
     ///
     /// # Panics
@@ -254,6 +248,227 @@ impl Query {
         }
 
         self.run_internal(request_context).await
+    }
+
+    /// Run a query using distributed execution via Ballista.
+    ///
+    /// This method is intended for the async queries API (`/v1/queries`) which
+    /// distributes query execution across the cluster. Unlike `run()`, this method
+    /// uses Ballista to coordinate execution across multiple executor nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The runtime is not configured as a scheduler
+    /// - The scheduler address is not configured
+    /// - The query execution fails
+    pub async fn run_distributed(self) -> Result<QueryResult> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        if let Some(runtime_handle) = self.df.cpu_runtime().cloned() {
+            return self
+                .run_distributed_with_managed_runtime(request_context, runtime_handle)
+                .await;
+        }
+
+        self.run_distributed_internal(request_context).await
+    }
+
+    async fn run_distributed_with_managed_runtime(
+        self,
+        request_context: Arc<RequestContext>,
+        runtime_handle: Handle,
+    ) -> Result<QueryResult> {
+        let span = Span::current();
+
+        let runtime_request_context = Arc::clone(&request_context);
+        let future_request_context = request_context;
+
+        let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
+            runtime_handle,
+            runtime_request_context,
+            span,
+            async move {
+                self.run_distributed_internal(future_request_context)
+                    .await
+                    .map(|query_result| (query_result.cache_status, query_result.data))
+            },
+        )
+        .await
+        .map_err(|err| match err {
+            ManagedRuntimeError::Future(err) => err,
+            ManagedRuntimeError::DriverTaskEnded => Error::UnableToExecuteQuery {
+                source: DataFusionError::Execution(
+                    "Query driver task ended unexpectedly".to_string(),
+                ),
+            },
+        })?;
+
+        let (cache_status, stream) = managed_stream.into_parts();
+
+        Ok(QueryResult::new(stream, cache_status))
+    }
+
+    /// Internal implementation for distributed query execution.
+    ///
+    /// Uses Ballista to distribute query execution across cluster nodes.
+    async fn run_distributed_internal(
+        self,
+        request_context: Arc<RequestContext>,
+    ) -> Result<QueryResult> {
+        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
+
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false, distributed = true);
+
+        if let Some(traceparent) = request_context.trace_parent() {
+            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+        }
+
+        let inner_span = span.clone();
+
+        let query_result = async {
+            // Use distributed session state for Ballista execution
+            let mut session = self.get_distributed_session_state()?;
+
+            let ctx = self;
+            let tracker = ctx.tracker;
+
+            // Sets the request context as an extension on DataFusion
+            session
+                .config_mut()
+                .set_extension(Arc::clone(&request_context));
+
+            // For distributed execution, we don't use SQL results caching (cache is local)
+            // and we don't support table allowlists (security is enforced at the scheduler)
+            let plan = match &ctx.sql {
+                QueryMethod::Text {
+                    sql, parameters, ..
+                } => {
+                    let plan = match session.create_logical_plan(sql).await {
+                        Ok(plan) => plan,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let code = ErrorCode::from(&e);
+                            if let Some(t) = tracker {
+                                t.finish_with_error(&request_context, e.to_string(), code);
+                            }
+                            return Err(Error::UnableToExecuteQuery { source: e });
+                        }
+                    };
+                    // Apply parameter values if present
+                    let plan = match parameters {
+                        Some(param_values) => match plan.with_param_values(param_values.clone()) {
+                            Ok(plan) => plan,
+                            Err(e) => {
+                                let e = find_datafusion_root(e);
+                                let code = ErrorCode::from(&e);
+                                if let Some(t) = tracker {
+                                    t.finish_with_error(&request_context, e.to_string(), code);
+                                }
+                                return Err(Error::UnableToExecuteQuery { source: e });
+                            }
+                        },
+                        None => plan,
+                    };
+                    Box::new(plan)
+                }
+                QueryMethod::Plan(logical_plan) => logical_plan.clone(),
+            };
+
+            if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
+                let e = find_datafusion_root(e);
+                handle_error!(
+                    tracker,
+                    &request_context,
+                    ErrorCode::QueryPlanningError,
+                    e,
+                    UnableToExecuteQuery
+                )
+            }
+
+            let input_tables = get_logical_plan_input_tables(&plan);
+            if input_tables
+                .iter()
+                .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
+            {
+                inner_span.record("runtime_query", true);
+            }
+
+            let datasets = Arc::new(input_tables);
+            let tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));
+
+            // Start the timer for the query execution
+            let tracker = tracker.map(|mut t| {
+                t.query_execution_duration_timer = Instant::now();
+                t
+            });
+
+            // Create and execute the physical plan via Ballista
+            let physical_plan = match session.create_physical_plan(&plan).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    let error_code = ErrorCode::from(&e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        error_code,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+            };
+
+            let task_ctx = Arc::new(TaskContext::from(&session));
+
+            let stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    let error_code = ErrorCode::from(&e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        error_code,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+            };
+
+            // Distributed queries don't use result caching
+            let final_stream = attach_physical_plan_metrics_to_stream(
+                stream,
+                physical_plan,
+                Arc::clone(&request_context),
+                inner_span.clone(),
+            );
+
+            let final_stream = attach_query_active_guard_to_stream(
+                final_stream,
+                &request_context,
+                inner_span.clone(),
+            );
+
+            Ok(QueryResult::new(
+                attach_query_tracker_to_stream(
+                    inner_span,
+                    Arc::clone(&request_context),
+                    tracker,
+                    final_stream,
+                ),
+                CacheStatus::CacheDisabled,
+            ))
+        }
+        .instrument(span.clone())
+        .await;
+
+        match query_result {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
     }
 
     async fn run_with_managed_runtime(
@@ -303,7 +518,7 @@ impl Query {
         let inner_span = span.clone();
 
         let query_result = async {
-            let mut session = self.get_session_state(&request_context)?;
+            let mut session = self.get_session_state(&request_context);
 
             let ctx = self;
             let tracker = ctx.tracker;
@@ -437,16 +652,6 @@ impl Query {
                 t
             });
 
-            // Special handling in cluster mode - execute DescribeTable and runtime.* queries locally
-            let should_distribute =
-                Self::should_distribute_plan(&plan).context(UnableToExecuteQuerySnafu)?;
-
-            let session_for_execution = if should_distribute {
-                session
-            } else {
-                ctx.df.ctx.state()
-            };
-
             // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
             // They modify session state rather than producing query results, so must be
             // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
@@ -507,7 +712,7 @@ impl Query {
                         }
                     };
 
-                    let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
+                    let task_ctx = Arc::new(TaskContext::from(&session));
                     let stream = match execute_stream(Arc::clone(&df_plan), task_ctx) {
                         Ok(stream) => stream,
                         Err(e) => {
@@ -525,23 +730,22 @@ impl Query {
                     (stream, df_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
-                    let physical_plan =
-                        match session_for_execution.create_physical_plan(&plan).await {
-                            Ok(stream) => stream,
-                            Err(e) => {
-                                let e = find_datafusion_root(e);
-                                let error_code = ErrorCode::from(&e);
-                                handle_error!(
-                                    tracker,
-                                    &request_context,
-                                    error_code,
-                                    e,
-                                    UnableToExecuteQuery
-                                )
-                            }
-                        };
+                    let physical_plan = match session.create_physical_plan(&plan).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
 
-                    let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
+                    let task_ctx = Arc::new(TaskContext::from(&session));
 
                     let stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
                         Ok(stream) => stream,
