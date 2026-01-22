@@ -1367,6 +1367,20 @@ impl DataFusion {
 
         accelerated_table_builder.bootstrap_status(bootstrap_status);
 
+        // Check if this is an S3 Express One Zone acceleration (Cayenne with S3 Express config)
+        // This is used for better error messages when S3 Express upload fails
+        let is_s3_express_acceleration = acceleration_settings.engine == Engine::Cayenne
+            && (acceleration_settings
+                .params
+                .get("cayenne_file_path")
+                .is_some_and(|path| {
+                    crate::dataaccelerator::cayenne::CayenneAccelerator::is_s3_express_path(path)
+                })
+                || acceleration_settings
+                    .params
+                    .contains_key("cayenne_s3_zone_ids"));
+        accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
+
         accelerated_table_builder
             .build()
             .await
