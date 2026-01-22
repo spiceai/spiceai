@@ -1356,8 +1356,7 @@ impl RefreshTask {
 
         // Check for S3 Express One Zone upload speed error and provide user-friendly message.
         // ClientUploadSpeedTooSlow is specific to S3 Express One Zone (directory buckets).
-        if self.is_s3_express_acceleration && error.to_string().contains("ClientUploadSpeedTooSlow")
-        {
+        if self.is_s3_express_acceleration && is_s3_express_upload_speed_error(&error.to_string()) {
             let table_name =
                 include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref());
             tracing::warn!(
@@ -1649,6 +1648,17 @@ fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
     }
 }
 
+/// Check if an error message indicates an S3 Express One Zone upload speed error.
+///
+/// S3 Express One Zone (directory buckets) returns `ClientUploadSpeedTooSlow` when
+/// the client's upload speed is below the minimum threshold. This typically occurs
+/// when uploading from outside AWS or over slow network connections.
+///
+/// This function is extracted to enable unit testing of the detection logic.
+fn is_s3_express_upload_speed_error(error_message: &str) -> bool {
+    error_message.contains("ClientUploadSpeedTooSlow")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1681,5 +1691,27 @@ mod tests {
         assert_eq!(tracing.num_records_received, num_rows);
         assert_eq!(tracing.bytes_received, batch_size);
         assert!(tracing.bytes_received > 0);
+    }
+
+    #[test]
+    fn test_is_s3_express_upload_speed_error() {
+        // Should detect ClientUploadSpeedTooSlow error
+        assert!(is_s3_express_upload_speed_error(
+            "Error: ClientUploadSpeedTooSlow: Upload speed is below minimum threshold"
+        ));
+
+        // Should detect when error is part of a larger message
+        assert!(is_s3_express_upload_speed_error(
+            "Failed to upload: S3 returned ClientUploadSpeedTooSlow for bucket mybucket--usw2-az1--x-s3"
+        ));
+
+        // Should not match unrelated errors
+        assert!(!is_s3_express_upload_speed_error("Connection timeout"));
+        assert!(!is_s3_express_upload_speed_error("Access denied"));
+        assert!(!is_s3_express_upload_speed_error("NoSuchBucket"));
+
+        // Should not match partial error names
+        assert!(!is_s3_express_upload_speed_error("ClientUpload"));
+        assert!(!is_s3_express_upload_speed_error("SpeedTooSlow"));
     }
 }
