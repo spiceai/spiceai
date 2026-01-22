@@ -315,15 +315,15 @@ pub enum BenchmarkQueryset {
     BirdBenchSmallCaliforniaSchools,
     #[serde(rename = "bird-bench-small[card_games]")]
     BirdBenchSmallCardGames,
-    #[serde(rename = "bird-bench-small[community]")]
-    BirdBenchSmallCommunity,
+    #[serde(rename = "bird-bench-small[codebase_community]")]
+    BirdBenchSmallCodebaseCommunity,
     #[serde(rename = "bird-bench-small[debit_card_specializing]")]
     BirdBenchSmallDebitCardSpecializing,
-    #[serde(rename = "bird-bench-small[european_football2]")]
+    #[serde(rename = "bird-bench-small[european_football_2]")]
     BirdBenchSmallEuropeanFootball2,
     #[serde(rename = "bird-bench-small[financial]")]
     BirdBenchSmallFinancial,
-    #[serde(rename = "bird-bench-small[formula1]")]
+    #[serde(rename = "bird-bench-small[formula_1]")]
     BirdBenchSmallFormula1,
     #[serde(rename = "bird-bench-small[superhero]")]
     BirdBenchSmallSuperhero,

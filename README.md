@@ -197,6 +197,8 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `localpod`                         | [Local dataset replication][localpod] | Alpha             |                              |
 | `mongodb`                          | MongoDB                               | Alpha             |                              |
 | `sharepoint`                       | Microsoft SharePoint                  | Alpha             | Unstructured UTF-8 documents |
+| `scylladb`                         | ScyllaDB                              | Alpha             |                              |
+| `smb`                              | SMB (Server Message Block)            | Alpha             | SMB                          |
 | `elasticsearch`                    | ElasticSearch                         | Roadmap           |                              |
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
