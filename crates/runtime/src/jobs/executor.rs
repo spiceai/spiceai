@@ -170,7 +170,7 @@ impl JobExecutor {
             None
         };
 
-        // Execute the query
+        // Execute the query using distributed execution (Ballista)
         let query_result = {
             let mut builder = QueryBuilder::new(&state.sql, Arc::clone(&df));
             if let Some(p) = params {
@@ -178,7 +178,7 @@ impl JobExecutor {
             }
 
             tokio::select! {
-                result = builder.build().run() => result,
+                result = builder.build().run_distributed() => result,
                 () = cancel.cancelled() => {
                     job_store.cancel_job(job_id).await?;
                     return Ok(());
