@@ -853,7 +853,7 @@ impl AcceleratedTable {
         dataset_name: TableReference,
         layout: runtime_acceleration::snapshot::AccelerationLayout,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1)); // TODO: should be 60
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
 
         loop {
             interval.tick().await;
