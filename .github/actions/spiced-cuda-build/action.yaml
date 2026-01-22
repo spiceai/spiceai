@@ -39,7 +39,7 @@ runs:
       if: ${{ inputs.target_os == 'windows'}}
       run: |
         echo "SHELL=pwsh" >> $env:GITHUB_ENV
-        echo "BUILD_CMD=cd bin\\spiced && cargo build --profile ${{ inputs.rust-profile }} --features cuda --target-dir ../../target" >> $env:GITHUB_ENV
+        echo "BUILD_CMD=cd bin\\spiced && cargo build --profile ${{ inputs.rust-profile }} --no-default-features --features release,models,cuda --target-dir ../../target" >> $env:GITHUB_ENV
         @(
             "PACKAGE_CMD=move target\${{ inputs.rust-profile }}\spiced.exe spiced.exe -Force; ",
             "copy 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_MM }}\bin\cudart64_*.dll' .; ",
