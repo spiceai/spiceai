@@ -954,6 +954,9 @@ pub async fn initialize_cluster_executor(
     let metrics_collector =
         metrics_collector::OtelExecutorMetricsCollector::new(metrics_node_id.clone());
 
+    // Record task slots capacity for utilization metrics
+    crate::metrics::cluster::set_executor_task_slots(&metrics_node_id, u64::from(concurrent_tasks));
+
     let executor = Arc::new(Executor::new(
         executor_meta,
         &work_dir,

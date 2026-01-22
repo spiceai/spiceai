@@ -632,7 +632,7 @@
       "type": "timeseries",
       "id": 107,
       "title": "Tasks Completed Over Time",
-      "description": "Total completed tasks over time.",
+      "description": "Total completed executor tasks over time.",
       "gridPos": {
         "h": 6,
         "w": 12,
@@ -646,8 +646,8 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (role) (node_tasks_total{status=\"completed\"})",
-          "legendFormat": "{{role}}",
+          "expr": "sum by (node_id) (node_tasks_total{status=\"completed\", role=\"executor\", node_id=~\"$node\"})",
+          "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
         }
@@ -930,17 +930,6 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(scheduler_task_scheduling_latency_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
-          "legendFormat": "p50 {{node_id}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum(rate(scheduler_task_scheduling_latency_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
           "legendFormat": "p95 {{node_id}}",
           "range": true,
@@ -1043,10 +1032,10 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(scheduler_planning_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
-          "legendFormat": "p50 {{node_id}}",
+          "expr": "histogram_quantile(0.95, sum(rate(scheduler_planning_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
+          "legendFormat": "p95 {{node_id}}",
           "range": true,
-          "refId": "A"
+          "refId": "B"
         },
         {
           "datasource": {
@@ -1054,10 +1043,10 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(scheduler_planning_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
-          "legendFormat": "p95 {{node_id}}",
+          "expr": "histogram_quantile(0.99, sum(rate(scheduler_planning_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
+          "legendFormat": "p99 {{node_id}}",
           "range": true,
-          "refId": "B"
+          "refId": "A"
         }
       ],
       "title": "Query Planning Duration",
@@ -1331,17 +1320,6 @@
           },
           "pluginVersion": "11.3.1",
           "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "prometheus"
-              },
-              "editorMode": "code",
-              "expr": "histogram_quantile(0.50, sum(rate(scheduler_stage_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le))",
-              "legendFormat": "p50",
-              "range": true,
-              "refId": "A"
-            },
             {
               "datasource": {
                 "type": "prometheus",
@@ -1708,10 +1686,10 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(executor_task_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
-          "legendFormat": "p50 {{node_id}}",
+          "expr": "histogram_quantile(0.95, sum(rate(executor_task_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
+          "legendFormat": "p95 {{node_id}}",
           "range": true,
-          "refId": "A"
+          "refId": "B"
         },
         {
           "datasource": {
@@ -1719,10 +1697,10 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum(rate(executor_task_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
-          "legendFormat": "p95 {{node_id}}",
+          "expr": "histogram_quantile(0.99, sum(rate(executor_task_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le, node_id))",
+          "legendFormat": "p99 {{node_id}}",
           "range": true,
-          "refId": "B"
+          "refId": "A"
         }
       ],
       "title": "Task Execution Duration",
@@ -1915,7 +1893,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Relative utilization across executors",
+      "description": "Utilization based on total executor task time over the selected range.",
       "fieldConfig": {
         "defaults": {
           "mappings": [],
@@ -1925,10 +1903,21 @@
               {
                 "color": "green",
                 "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 95
               }
             ]
           },
-          "unit": "short"
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "decimals": 2
         },
         "overrides": []
       },
@@ -1960,7 +1949,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "executor_tasks_active{node_id=~\"$node\"}",
+          "expr": "100 * (increase(executor_task_duration_ms_sum{node_id=~\"$node\"}[$__range]) / clamp_min(executor_task_slots{node_id=~\"$node\"} * $__range_ms, 1))",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"
@@ -2341,6 +2330,28 @@
           "legendFormat": "Remote p95",
           "range": true,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum(rate(executor_shuffle_read_remote_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Remote p99",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum(rate(executor_shuffle_read_local_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Local p99",
+          "range": true,
+          "refId": "D"
         }
       ],
       "title": "Shuffle Read Latency (Local vs Remote)",
@@ -2631,10 +2642,10 @@
                 "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.50, sum(rate(scheduler_result_fetch_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le))",
-              "legendFormat": "p50",
+              "expr": "histogram_quantile(0.95, sum(rate(scheduler_result_fetch_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le))",
+              "legendFormat": "p95",
               "range": true,
-              "refId": "A"
+              "refId": "B"
             },
             {
               "datasource": {
@@ -2642,10 +2653,10 @@
                 "uid": "prometheus"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.95, sum(rate(scheduler_result_fetch_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le))",
-              "legendFormat": "p95",
+              "expr": "histogram_quantile(0.99, sum(rate(scheduler_result_fetch_duration_ms_bucket{node_id=~\"$node\"}[$__rate_interval])) by (le))",
+              "legendFormat": "p99",
               "range": true,
-              "refId": "B"
+              "refId": "A"
             }
           ],
           "title": "Result Fetch Latency",

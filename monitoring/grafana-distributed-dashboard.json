@@ -1893,7 +1893,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Relative utilization across executors",
+      "description": "Utilization based on total executor task time over the selected range.",
       "fieldConfig": {
         "defaults": {
           "mappings": [],
@@ -1903,10 +1903,21 @@
               {
                 "color": "green",
                 "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 95
               }
             ]
           },
-          "unit": "short"
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "decimals": 2
         },
         "overrides": []
       },
@@ -1938,7 +1949,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "executor_tasks_active{node_id=~\"$node\"}",
+          "expr": "100 * (increase(executor_task_duration_ms_sum{node_id=~\"$node\"}[$__range]) / clamp_min(executor_task_slots{node_id=~\"$node\"} * $__range_ms, 1))",
           "legendFormat": "{{node_id}}",
           "range": true,
           "refId": "A"

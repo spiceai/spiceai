@@ -241,6 +241,16 @@ pub(crate) static EXECUTOR_MEMORY_AVAILABLE_BYTES: LazyLock<Gauge<u64>> = LazyLo
         .build()
 });
 
+/// Maximum concurrent task slots on the executor.
+/// Labels: node_id
+pub(crate) static EXECUTOR_TASK_SLOTS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .u64_gauge("executor_task_slots")
+        .with_description("Maximum concurrent task slots on the executor.")
+        .with_unit("tasks")
+        .build()
+});
+
 // =============================================================================
 // Shuffle Metrics (shared)
 // =============================================================================
@@ -622,6 +632,15 @@ pub fn set_executor_memory_available(node_id: &str, bytes: u64) {
     EXECUTOR_MEMORY_AVAILABLE_BYTES.record(bytes, &labels);
 }
 
+/// Set the executor's task slot capacity.
+///
+/// Called once during executor startup to record the maximum number of
+/// concurrent tasks this executor can handle.
+pub fn set_executor_task_slots(node_id: &str, slots: u64) {
+    let labels = [KeyValue::new("node_id", node_id.to_string())];
+    EXECUTOR_TASK_SLOTS.record(slots, &labels);
+}
+
 /// Update the scheduler count (number of schedulers in the cluster).
 pub fn set_scheduler_count(node_id: &str, count: u64) {
     let labels = [KeyValue::new("node_id", node_id.to_string())];
@@ -779,6 +798,14 @@ mod tests {
         // Should not panic
         set_executor_memory_available("node-1", 1024 * 1024 * 1024); // 1 GB
         set_executor_memory_available("node-1", 0);
+    }
+
+    #[test]
+    fn test_set_executor_task_slots() {
+        // Should not panic
+        set_executor_task_slots("node-1", 8); // Typical CPU core count
+        set_executor_task_slots("node-2", 16);
+        set_executor_task_slots("node-3", 1); // Minimum
     }
 
     #[test]
