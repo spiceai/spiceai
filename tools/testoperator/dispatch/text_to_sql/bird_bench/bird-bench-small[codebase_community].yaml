@@ -1,23 +1,23 @@
 tests:
   text_to_sql:
     - model_name: grok41
-      benchmark_queryset: bird-bench-small[community]
+      benchmark_queryset: bird-bench-small[codebase_community]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: community
     - model_name: claude-sonnet-4-5
-      benchmark_queryset: bird-bench-small[community]
+      benchmark_queryset: bird-bench-small[codebase_community]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: community
     - model_name: grok41
-      benchmark_queryset: bird-bench-small[community]
+      benchmark_queryset: bird-bench-small[codebase_community]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: community-evidence
       use_evidence: true
     - model_name: claude-sonnet-4-5
-      benchmark_queryset: bird-bench-small[community]
+      benchmark_queryset: bird-bench-small[codebase_community]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: community-evidence
