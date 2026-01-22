@@ -58,6 +58,42 @@ pub mod metrics;
 pub use adapter::SnapshotAdapter;
 pub use behavior::SnapshotBehavior;
 use engine::{SnapshotEngine, create_snapshot_engine};
+
+/// Public API types for snapshot information exposed via HTTP endpoints.
+pub mod api {
+    use serde::{Deserialize, Serialize};
+
+    /// Summary of all snapshots for a dataset, returned by the list snapshots API.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SnapshotSummary {
+        pub dataset_name: String,
+        pub location: String,
+        pub last_updated_ms: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub current_snapshot_id: Option<u64>,
+        pub snapshots: Vec<SnapshotInfo>,
+    }
+
+    /// Information about a single snapshot.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SnapshotInfo {
+        pub snapshot_id: u64,
+        pub timestamp_ms: i64,
+        pub location: String,
+        pub checksum: String,
+        pub checksum_algorithm: String,
+        pub size_bytes: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub row_count: Option<u64>,
+        pub is_current: bool,
+    }
+
+    /// Request body for setting the current snapshot.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SetCurrentSnapshotRequest {
+        pub snapshot_id: u64,
+    }
+}
 use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy};
 
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
@@ -1715,6 +1751,270 @@ impl SnapshotManager {
             }
         }
     }
+
+    /// Returns the snapshot location URI for this dataset.
+    #[must_use]
+    pub fn snapshot_location(&self) -> &str {
+        &self.snapshot_location_uri
+    }
+
+    /// Returns the dataset name for this snapshot manager.
+    #[must_use]
+    pub fn dataset_name(&self) -> &str {
+        &self.dataset_name
+    }
+
+    /// Retrieves the snapshot summary for this dataset, including all available snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or parsing the metadata fails.
+    pub async fn get_snapshot_summary(&self) -> Result<api::SnapshotSummary, SnapshotApiError> {
+        let handle = self.load_metadata().await.map_err(|e| match e {
+            MetadataLoadError::Read { path, source } => SnapshotApiError::ReadMetadata {
+                path,
+                reason: source.to_string(),
+            },
+            MetadataLoadError::Parse { path, source } => SnapshotApiError::ParseMetadata {
+                path,
+                reason: source.to_string(),
+            },
+            MetadataLoadError::UnsupportedVersion { path, version } => {
+                SnapshotApiError::UnsupportedVersion { path, version }
+            }
+        })?;
+
+        let (location, last_updated_ms, dataset_metadata) = match handle {
+            Some(h) => {
+                let ds_meta = h.metadata.datasets.get(&self.dataset_name).cloned();
+                (h.metadata.location, h.metadata.last_updated_ms, ds_meta)
+            }
+            None => (self.snapshot_location_uri.clone(), 0, None),
+        };
+
+        let dataset_metadata = dataset_metadata.unwrap_or_else(|| DatasetMetadata {
+            name: self.dataset_name.clone(),
+            ..Default::default()
+        });
+
+        let current_snapshot_id = dataset_metadata.current_snapshot_id;
+        let snapshots: Vec<api::SnapshotInfo> = dataset_metadata
+            .snapshots
+            .iter()
+            .map(|entry| api::SnapshotInfo {
+                snapshot_id: entry.snapshot_id,
+                timestamp_ms: entry.timestamp_ms,
+                location: entry.snapshot.clone(),
+                checksum: entry.snapshot_checksum.clone(),
+                checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
+                size_bytes: entry.snapshot_size,
+                row_count: None, // Not stored in current metadata format
+                is_current: Some(entry.snapshot_id) == current_snapshot_id,
+            })
+            .collect();
+
+        Ok(api::SnapshotSummary {
+            dataset_name: self.dataset_name.clone(),
+            location,
+            last_updated_ms,
+            current_snapshot_id,
+            snapshots,
+        })
+    }
+
+    /// Retrieves information about a specific snapshot by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the metadata fails or the snapshot is not found.
+    pub async fn get_snapshot(
+        &self,
+        snapshot_id: u64,
+    ) -> Result<api::SnapshotInfo, SnapshotApiError> {
+        let handle = self.load_metadata().await.map_err(|e| match e {
+            MetadataLoadError::Read { path, source } => SnapshotApiError::ReadMetadata {
+                path,
+                reason: source.to_string(),
+            },
+            MetadataLoadError::Parse { path, source } => SnapshotApiError::ParseMetadata {
+                path,
+                reason: source.to_string(),
+            },
+            MetadataLoadError::UnsupportedVersion { path, version } => {
+                SnapshotApiError::UnsupportedVersion { path, version }
+            }
+        })?;
+
+        let Some(h) = handle else {
+            return Err(SnapshotApiError::SnapshotNotFound {
+                dataset: self.dataset_name.clone(),
+                snapshot_id,
+            });
+        };
+
+        let Some(dataset_metadata) = h.metadata.datasets.get(&self.dataset_name) else {
+            return Err(SnapshotApiError::SnapshotNotFound {
+                dataset: self.dataset_name.clone(),
+                snapshot_id,
+            });
+        };
+
+        let Some(entry) = dataset_metadata
+            .snapshots
+            .iter()
+            .find(|e| e.snapshot_id == snapshot_id)
+        else {
+            return Err(SnapshotApiError::SnapshotNotFound {
+                dataset: self.dataset_name.clone(),
+                snapshot_id,
+            });
+        };
+
+        Ok(api::SnapshotInfo {
+            snapshot_id: entry.snapshot_id,
+            timestamp_ms: entry.timestamp_ms,
+            location: entry.snapshot.clone(),
+            checksum: entry.snapshot_checksum.clone(),
+            checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
+            size_bytes: entry.snapshot_size,
+            row_count: None,
+            is_current: Some(entry.snapshot_id) == dataset_metadata.current_snapshot_id,
+        })
+    }
+
+    /// Sets the current snapshot ID for this dataset.
+    ///
+    /// This updates the metadata to point to the specified snapshot, which will be used
+    /// for bootstrapping on the next runtime restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading/writing the metadata fails or the snapshot is not found.
+    pub async fn set_current_snapshot(
+        &self,
+        snapshot_id: u64,
+    ) -> Result<(), SnapshotApiError> {
+        loop {
+        let handle = self.load_metadata().await.map_err(|e| match e {
+            MetadataLoadError::Read { path, source } => SnapshotApiError::ReadMetadata {
+                path,
+                reason: source.to_string(),
+            },
+            MetadataLoadError::Parse { path, source } => SnapshotApiError::ParseMetadata {
+                path,
+                reason: source.to_string(),
+            },
+            MetadataLoadError::UnsupportedVersion { path, version } => {
+                SnapshotApiError::UnsupportedVersion { path, version }
+            }
+        })?;
+
+            let Some(h) = handle.as_ref() else {
+                return Err(SnapshotApiError::SnapshotNotFound {
+                    dataset: self.dataset_name.clone(),
+                    snapshot_id,
+                });
+            };
+
+            let mut metadata = h.metadata.clone();
+
+            let dataset_entry = metadata.datasets.get_mut(&self.dataset_name).ok_or_else(|| {
+                SnapshotApiError::SnapshotNotFound {
+                    dataset: self.dataset_name.clone(),
+                    snapshot_id,
+                }
+            })?;
+
+            // Verify the snapshot exists
+            if !dataset_entry
+                .snapshots
+                .iter()
+                .any(|e| e.snapshot_id == snapshot_id)
+            {
+                return Err(SnapshotApiError::SnapshotNotFound {
+                    dataset: self.dataset_name.clone(),
+                    snapshot_id,
+                });
+            }
+
+            dataset_entry.current_snapshot_id = Some(snapshot_id);
+            metadata.last_updated_ms = Utc::now().timestamp_millis();
+
+            let metadata_path = self.metadata_path();
+            let metadata_path_display = metadata_path.to_string();
+
+            let serialized = serde_json::to_vec_pretty(&metadata).map_err(|err| {
+                SnapshotApiError::WriteMetadata {
+                    path: metadata_path_display.clone(),
+                    reason: err.to_string(),
+                }
+            })?;
+
+            let version = h.version.clone();
+            let put_mode = match version {
+                Some(v) => PutMode::Update(v),
+                None => PutMode::Overwrite,
+            };
+
+            let payload = PutPayload::from(serialized);
+
+            match self
+                .object_store
+                .put_opts(&metadata_path, payload.clone(), put_mode.clone().into())
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(object_store::Error::Precondition { .. }) => {
+                    // Concurrent update, retry
+                    continue;
+                }
+                Err(object_store::Error::NotSupported { .. })
+                    if matches!(put_mode, PutMode::Update(_)) =>
+                {
+                    // Object store doesn't support conditional updates, fall back to overwrite
+                    match self
+                        .object_store
+                        .put_opts(&metadata_path, payload, PutMode::Overwrite.into())
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(err) => {
+                            return Err(SnapshotApiError::WriteMetadata {
+                                path: metadata_path_display,
+                                reason: err.to_string(),
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(SnapshotApiError::WriteMetadata {
+                        path: metadata_path_display,
+                        reason: err.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Errors that can occur when using the snapshot API.
+#[derive(Debug, Snafu)]
+#[snafu(module(snapshot_api_error))]
+pub enum SnapshotApiError {
+    #[snafu(display("Failed to read snapshot metadata at {path}: {reason}"))]
+    ReadMetadata { path: String, reason: String },
+
+    #[snafu(display("Snapshot metadata at {path} is invalid: {reason}"))]
+    ParseMetadata { path: String, reason: String },
+
+    #[snafu(display("Snapshot metadata at {path} has unsupported format version {version}"))]
+    UnsupportedVersion { path: String, version: u32 },
+
+    #[snafu(display("Snapshot {snapshot_id} not found for dataset {dataset}"))]
+    SnapshotNotFound { dataset: String, snapshot_id: u64 },
+
+    #[snafu(display("Failed to write snapshot metadata to {path}: {reason}"))]
+    WriteMetadata { path: String, reason: String },
 }
 
 #[cfg(test)]

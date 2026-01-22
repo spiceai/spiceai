@@ -22,6 +22,7 @@ pub mod eval;
 pub mod iceberg;
 pub mod inference;
 pub mod responses;
+pub mod snapshots;
 
 pub mod models;
 pub mod nsql;
