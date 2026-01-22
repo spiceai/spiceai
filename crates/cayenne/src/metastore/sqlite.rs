@@ -39,13 +39,19 @@ pub struct SqliteMetastore {
     conn: OnceCell<tokio_rusqlite::Connection>,
 }
 
-/// Convert a `tokio_rusqlite::Error` to a `CatalogError`, preserving the underlying
-/// `rusqlite::Error` when possible for better error matching.
+/// Convert a `tokio_rusqlite::Error` to a `CatalogError`, distinguishing constraint violations.
 fn convert_tokio_rusqlite_error(
     e: tokio_rusqlite::Error<rusqlite::Error>,
     context: &str,
 ) -> CatalogError {
     match e {
+        tokio_rusqlite::Error::Error(rusqlite::Error::SqliteFailure(err, msg))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            CatalogError::ConstraintViolation {
+                message: msg.unwrap_or_else(|| "Constraint violation".to_string()),
+            }
+        }
         tokio_rusqlite::Error::Error(sqlite_err) => CatalogError::Sqlite { source: sqlite_err },
         other => CatalogError::Database {
             message: format!("{context}: {other}"),
