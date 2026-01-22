@@ -58,7 +58,7 @@ jobs:
           github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
 
-      # Download spiced artifacts
+      # Download spiced artifacts (not Windows - runtime uses WSL on Windows)
       - name: Download spiced artifact
         if: matrix.target_os != 'windows'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -68,40 +68,12 @@ jobs:
           github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}
 
-      - name: Download spiced.exe artifact
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
-        with:
-          name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
-          run-id: ${{ inputs.run_id }}
-
-      # Download spiced models artifacts
-      - name: Download spiced models artifact
-        if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
-        with:
-          name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
-          run-id: ${{ inputs.run_id }}
-
-      - name: Download spiced.exe models artifact
-        if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
-        with:
-          name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: ${{ env.ARTIFACT_DIR }}
-          github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
-          run-id: ${{ inputs.run_id }}
-
       # Download macOS metal artifacts
-      - name: Download spiced models metal artifact
+      - name: Download spiced metal artifact
         if: matrix.target_os == 'darwin'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
-          name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          name: spiced_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
           github-token: ${{ secrets.DOWNLOAD_ARTIFACT_TOKEN }}
           run-id: ${{ inputs.run_id }}

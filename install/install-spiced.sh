@@ -59,7 +59,26 @@ getSystemInfo() {
 }
 
 verifySupported() {
-    local supported=(linux-x86_64 linux-aarch64 darwin-aarch64 windows-x86_64)
+    # Check for Windows first and provide helpful error message
+    if [ "$OS" == "windows" ]; then
+        echo ""
+        echo "Error: Native Windows is not supported for the Spice runtime (spiced) in the open source version."
+        echo ""
+        echo "Options:"
+        echo ""
+        echo "  1. Run the Spice runtime inside Windows Subsystem for Linux (WSL):"
+        echo "     - Install WSL: wsl --install"
+        echo "     - Open a WSL terminal (e.g., Ubuntu)"
+        echo "     - Run this install script again from within WSL"
+        echo "     - For more information: https://docs.microsoft.com/en-us/windows/wsl/install"
+        echo ""
+        echo "  2. Native Windows support is available with Spice.ai Enterprise."
+        echo "     - Learn more: https://spice.ai/pricing"
+        echo ""
+        exit 1
+    fi
+
+    local supported=(linux-x86_64 linux-aarch64 darwin-aarch64)
     local current_osarch="${OS}-${ARCH}"
 
     for osarch in "${supported[@]}"; do

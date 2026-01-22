@@ -35,7 +35,7 @@ const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
@@ -59,7 +59,7 @@ impl KafkaSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(pool) => self.get_sqlite(pool).await,
@@ -70,7 +70,7 @@ impl KafkaSys {
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => None,
@@ -81,7 +81,7 @@ impl KafkaSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(pool) => self.upsert_sqlite(pool, metadata).await,
@@ -92,7 +92,7 @@ impl KafkaSys {
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => Err(Error::NoAccelerationConnection),

@@ -34,7 +34,7 @@ const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
@@ -58,7 +58,7 @@ impl DebeziumKafkaSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.get_sqlite(conn).await,
@@ -69,7 +69,7 @@ impl DebeziumKafkaSys {
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => None,
@@ -80,7 +80,7 @@ impl DebeziumKafkaSys {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.upsert_sqlite(conn, metadata).await,
@@ -91,7 +91,7 @@ impl DebeziumKafkaSys {
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => Err(Error::NoAccelerationConnection),
