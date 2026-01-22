@@ -341,7 +341,7 @@ fn add_labels_to_resource_metrics(
     }
 }
 
-/// Adds node labels to data points within a metric.
+/// Adds node labels to data points within a metric if they don't already exist.
 fn add_labels_to_metric_data_points(
     metric: &mut opentelemetry_proto::tonic::metrics::v1::Metric,
     node_id: &str,
@@ -349,48 +349,53 @@ fn add_labels_to_metric_data_points(
 ) {
     use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 
-    let node_id_kv = KeyValue {
-        key: NODE_ID_LABEL.to_string(),
-        value: Some(AnyValue {
-            value: Some(Value::StringValue(node_id.to_string())),
-        }),
-    };
-    let role_kv = KeyValue {
-        key: NODE_ROLE_LABEL.to_string(),
-        value: Some(AnyValue {
-            value: Some(Value::StringValue(role.to_string())),
-        }),
-    };
+    /// Adds labels to a data point's attributes if they don't already exist.
+    fn add_labels_if_missing(attributes: &mut Vec<KeyValue>, node_id: &str, role: &str) {
+        let has_node_id = attributes.iter().any(|kv| kv.key == NODE_ID_LABEL);
+        let has_role = attributes.iter().any(|kv| kv.key == NODE_ROLE_LABEL);
+
+        if !has_node_id {
+            attributes.push(KeyValue {
+                key: NODE_ID_LABEL.to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue(node_id.to_string())),
+                }),
+            });
+        }
+        if !has_role {
+            attributes.push(KeyValue {
+                key: NODE_ROLE_LABEL.to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue(role.to_string())),
+                }),
+            });
+        }
+    }
 
     match &mut metric.data {
         Some(Data::Gauge(gauge)) => {
             for dp in &mut gauge.data_points {
-                dp.attributes.push(node_id_kv.clone());
-                dp.attributes.push(role_kv.clone());
+                add_labels_if_missing(&mut dp.attributes, node_id, role);
             }
         }
         Some(Data::Sum(sum)) => {
             for dp in &mut sum.data_points {
-                dp.attributes.push(node_id_kv.clone());
-                dp.attributes.push(role_kv.clone());
+                add_labels_if_missing(&mut dp.attributes, node_id, role);
             }
         }
         Some(Data::Histogram(histogram)) => {
             for dp in &mut histogram.data_points {
-                dp.attributes.push(node_id_kv.clone());
-                dp.attributes.push(role_kv.clone());
+                add_labels_if_missing(&mut dp.attributes, node_id, role);
             }
         }
         Some(Data::ExponentialHistogram(exp_histogram)) => {
             for dp in &mut exp_histogram.data_points {
-                dp.attributes.push(node_id_kv.clone());
-                dp.attributes.push(role_kv.clone());
+                add_labels_if_missing(&mut dp.attributes, node_id, role);
             }
         }
         Some(Data::Summary(summary)) => {
             for dp in &mut summary.data_points {
-                dp.attributes.push(node_id_kv.clone());
-                dp.attributes.push(role_kv.clone());
+                add_labels_if_missing(&mut dp.attributes, node_id, role);
             }
         }
         None => {}
@@ -625,6 +630,84 @@ mod tests {
                 value: Some(Value::StringValue("existing-node".to_string()))
             }),
             "original node_id should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_add_node_labels_data_points_idempotent() {
+        // Test that data points with existing labels don't get duplicates
+        let mut request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "scheduler_count".to_string(),
+                        description: "Number of schedulers".to_string(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(
+                            opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    // Pre-existing node_id label from cluster metrics module
+                                    attributes: vec![KeyValue {
+                                        key: NODE_ID_LABEL.to_string(),
+                                        value: Some(AnyValue {
+                                            value: Some(Value::StringValue(
+                                                "scheduler1.mac.local:50052".to_string(),
+                                            )),
+                                        }),
+                                    }],
+                                    start_time_unix_nano: 0,
+                                    time_unix_nano: 0,
+                                    value: Some(NumberValue::AsInt(3)),
+                                    exemplars: Vec::new(),
+                                    flags: 0,
+                                }],
+                            }),
+                        ),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        // Call add_node_labels (simulating cluster metrics collector behavior)
+        add_node_labels(
+            &mut request,
+            "scheduler1.mac.local:50052",
+            ROLE_SCHEDULER,
+        );
+
+        // Check data point attributes - should have exactly 2 (node_id and node_role)
+        let gauge = match &request.resource_metrics[0].scope_metrics[0].metrics[0].data {
+            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(g)) => g,
+            _ => panic!("expected gauge"),
+        };
+
+        let attributes = &gauge.data_points[0].attributes;
+
+        // Count occurrences of node_id
+        let node_id_count = attributes.iter().filter(|kv| kv.key == NODE_ID_LABEL).count();
+        assert_eq!(
+            node_id_count, 1,
+            "node_id should appear exactly once, but found {node_id_count}"
+        );
+
+        // Should have node_role added
+        let has_role = attributes.iter().any(|kv| kv.key == NODE_ROLE_LABEL);
+        assert!(has_role, "node_role should be added");
+
+        // Total should be exactly 2 attributes
+        assert_eq!(
+            attributes.len(),
+            2,
+            "should have exactly 2 attributes (node_id and node_role)"
         );
     }
 }
