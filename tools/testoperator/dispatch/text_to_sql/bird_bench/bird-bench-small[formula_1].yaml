@@ -1,24 +1,24 @@
 tests:
   text_to_sql:
     - model_name: grok41
-      benchmark_queryset: bird-bench-small[formula1]
+      benchmark_queryset: bird-bench-small[formula_1]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
-      configuration_name: formula1
+      configuration_name: formula_1
     - model_name: claude-sonnet-4-5
-      benchmark_queryset: bird-bench-small[formula1]
+      benchmark_queryset: bird-bench-small[formula_1]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
-      configuration_name: formula1
+      configuration_name: formula_1
     - model_name: grok41
-      benchmark_queryset: bird-bench-small[formula1]
+      benchmark_queryset: bird-bench-small[formula_1]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
-      configuration_name: formula1-evidence
+      configuration_name: formula_1-evidence
       use_evidence: true
     - model_name: claude-sonnet-4-5
-      benchmark_queryset: bird-bench-small[formula1]
+      benchmark_queryset: bird-bench-small[formula_1]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
-      configuration_name: formula1-evidence
+      configuration_name: formula_1-evidence
       use_evidence: true
