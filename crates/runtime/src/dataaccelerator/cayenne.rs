@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
 use data_components::poly::PolyTableProvider;
 use datafusion::common::arrow::datatypes::SchemaRef;
-use datafusion::common::{DFSchema, TableReference};
+use datafusion::common::DFSchema;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{CreateExternalTable, TableProviderFilterPushDown};
