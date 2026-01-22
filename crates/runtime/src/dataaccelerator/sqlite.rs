@@ -275,7 +275,7 @@ impl DataAccelerator for SqliteAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                runtime_acceleration::snapshot::SnapshotAdapter::file(PathBuf::from(path)),
+                runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Sqlite,
             )
             .await;

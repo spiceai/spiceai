@@ -971,7 +971,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
-                runtime_acceleration::snapshot::SnapshotAdapter::file(
+                runtime_acceleration::snapshot::AccelerationLayout::file(
                     fixture.local_db_path.clone(),
                 ),
                 AccelerationEngine::DuckDB,
@@ -1064,7 +1064,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
-                runtime_acceleration::snapshot::SnapshotAdapter::file(fixture.local_db_path.clone()),
+                runtime_acceleration::snapshot::AccelerationLayout::file(fixture.local_db_path.clone()),
                 AccelerationEngine::DuckDB,
             )
             .await
@@ -1300,7 +1300,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             let manager_with_compaction = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior_with_compaction,
-                runtime_acceleration::snapshot::SnapshotAdapter::file(fixture.local_db_path.clone()),
+                runtime_acceleration::snapshot::AccelerationLayout::file(fixture.local_db_path.clone()),
                 AccelerationEngine::DuckDB,
             )
                 .await
