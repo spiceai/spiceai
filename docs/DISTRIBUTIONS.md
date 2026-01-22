@@ -156,23 +156,23 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 
 | Platform                      | Default | Data            | Metal | CUDA            |
 | ----------------------------- | ------- | --------------- | ----- | --------------- |
-| Linux x86_64                  | ✅      | Nightly         | ❌    | Nightly         |
-| Linux aarch64                 | ✅      | Nightly         | ❌    | ❌              |
-| macOS aarch64 (Apple Silicon) | ✅      | Nightly         | ✅    | ❌              |
-| Windows (WSL)                 | ✅      | Nightly         | ❌    | Nightly         |
-| Windows (Native)              | ❌      | Enterprise only | ❌    | Enterprise only |
+| Linux x86_64                  | ✅       | Nightly         | ❌     | Nightly         |
+| Linux aarch64                 | ✅       | Nightly         | ❌     | ❌               |
+| macOS aarch64 (Apple Silicon) | ✅       | Nightly         | ✅     | ❌               |
+| Windows (WSL)                 | ✅       | Nightly         | ❌     | Nightly         |
+| Windows (Native)              | ❌       | Enterprise only | ❌     | Enterprise only |
 
 > **Note:** Native Windows support for the Spice runtime is available with [Spice.ai Enterprise](https://spice.ai/pricing). Open source users on Windows should use Windows Subsystem for Linux (WSL).
 
 ## Choosing a Distribution
 
-| Use Case                                | Recommended Distribution        |
-| --------------------------------------- | ------------------------------- |
-| General purpose with AI capabilities    | Default                         |
-| Data federation only, minimal footprint | Data (nightly)                  |
-| macOS with GPU acceleration             | Metal                           |
-| Linux with NVIDIA GPU                   | CUDA (nightly)                  |
-| Memory allocation benchmarking          | Allocator variants (nightly)    |
+| Use Case                                | Recommended Distribution     |
+| --------------------------------------- | ---------------------------- |
+| General purpose with AI capabilities    | Default                      |
+| Data federation only, minimal footprint | Data (nightly)               |
+| macOS with GPU acceleration             | Metal                        |
+| Linux with NVIDIA GPU                   | CUDA (nightly)               |
+| Memory allocation benchmarking          | Allocator variants (nightly) |
 
 ## Enterprise Connectors
 
