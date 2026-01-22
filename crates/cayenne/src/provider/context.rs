@@ -103,7 +103,7 @@ impl CayenneContext {
     /// Get the maximum number of concurrent file uploads.
     #[must_use]
     pub fn upload_concurrency(&self) -> usize {
-        self.config.upload_concurrency.max(1)
+        self.config.upload_concurrency.min(1)
     }
 
     /// Create a `VortexFormat` from configuration.
