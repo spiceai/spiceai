@@ -1,5 +1,6 @@
-# Scenario queries for testing compound primary key hash index lookups
-# Tests compound primary keys with hash_index enabled
+# Scenario queries for validating correctness of compound primary key lookups
+# Note: hash_index is enabled but compound primary keys currently do NOT use hash index optimization;
+# this covers correctness and documents a limitation for future enhancement
 name: hash_index_compound_pk_lookup
 
 queries:

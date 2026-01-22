@@ -95,11 +95,19 @@ impl TableSink {
         }
 
         // Perform post-write index maintenance (e.g., rebuild hash indexes) if the table supports it
-        if let Err(e) = perform_index_maintenance(self.table_provider.as_ref()).await {
-            tracing::warn!(
-                "TableSink: index maintenance failed after write: {e}. Index may be stale until next refresh."
-            );
-            // Don't fail the write - data was successfully written, index rebuild is best-effort
+        match perform_index_maintenance(self.table_provider.as_ref()).await {
+            Ok(true) => {
+                tracing::debug!("TableSink: index maintenance completed successfully");
+            }
+            Ok(false) => {
+                // Table doesn't support index maintenance - this is expected for most tables
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "TableSink: index maintenance failed after write: {e}. Index may be stale until next refresh."
+                );
+                // Don't fail the write - data was successfully written, index rebuild is best-effort
+            }
         }
 
         tracing::debug!(

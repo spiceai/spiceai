@@ -921,7 +921,12 @@ impl ExecutionPlan for IndexedLookupExec {
 
         // Record OTel metrics for hash index lookups
         {
-            let dimensions: Vec<telemetry::KeyValue> = vec![];
+            let mut dimensions: Vec<telemetry::KeyValue> = Vec::new();
+
+            // Attach dataset name from schema metadata when available for better attribution
+            if let Some(dataset_name) = self.schema.metadata().get("dataset") {
+                dimensions.push(telemetry::KeyValue::new("dataset", dataset_name.clone()));
+            }
             telemetry::track_hash_index_lookups(1, &dimensions);
             telemetry::track_hash_index_lookup_rows(self.output_rows as u64, &dimensions);
         }
@@ -1353,8 +1358,8 @@ mod tests {
         assert!(table.has_index());
     }
 
-    /// Test that mixed constraints (PrimaryKey + Unique) work correctly.
-    /// Only PrimaryKey should be passed to the underlying MemTable.
+    /// Test that mixed constraints (`PrimaryKey` + `Unique`) work correctly.
+    /// Only `PrimaryKey` should be passed to the underlying `MemTable`.
     #[tokio::test]
     async fn test_mixed_constraints_primary_key_preserved() {
         use datafusion::common::{Constraint, Constraints};
