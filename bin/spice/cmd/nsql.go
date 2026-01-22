@@ -17,8 +17,6 @@ limitations under the License.
 package cmd
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -33,18 +31,9 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
+	"github.com/spiceai/spiceai/bin/spice/pkg/nsql"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
-
-type NsqlRequest struct {
-	Query string `json:"query"`
-	Model string `json:"model"`
-}
-
-type NsqlResponse struct {
-	Matches    []SearchMatch `json:"matches"`
-	DurationMs uint64        `json:"duration_ms"`
-}
 
 var nsqlCmd = &cobra.Command{
 	Use:   "nsql",
@@ -152,7 +141,7 @@ nsql> How much money have I made in each country?
 			start := time.Now()
 			go func(out chan *http.Response) {
 				defer close(out)
-				response, err := sendNsqlRequest(rtcontext, &NsqlRequest{
+				response, err := nsql.SendRequest(rtcontext, &nsql.Request{
 					Query: message,
 					Model: model,
 				})
@@ -194,20 +183,8 @@ nsql> How much money have I made in each country?
 	},
 }
 
-func sendNsqlRequest(rtcontext *context.RuntimeContext, body *NsqlRequest) (*http.Response, error) {
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("error marshaling nsql request body: %w", err)
-	}
-	response, err := rtcontext.DoLongRunning("POST", "/v1/nsql", bytes.NewReader(jsonBody), "Content-Type", "application/json", "Accept", "text/plain")
-	if err != nil {
-		return nil, fmt.Errorf("error sending nsql request: %w", err)
-	}
-
-	return response, nil
-}
-
 func init() {
 	nsqlCmd.Flags().String(constants.ModelKeyFlag, "", "Model to use for nsql")
+	nsqlCmd.AddCommand(nsqlAnalyzeCmd)
 	RootCmd.AddCommand(nsqlCmd)
 }
