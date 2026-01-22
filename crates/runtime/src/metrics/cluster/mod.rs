@@ -86,11 +86,11 @@ pub(crate) static NODE_TASKS_ACTIVE: LazyLock<UpDownCounter<i64>> = LazyLock::ne
         .build()
 });
 
-/// Task execution duration in milliseconds.
-/// Labels: node_id, role
-pub(crate) static NODE_TASK_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+/// Task execution duration in milliseconds (executor only).
+/// Labels: node_id
+pub(crate) static EXECUTOR_TASK_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     CLUSTER_METER
-        .f64_histogram("node_task_duration_ms")
+        .f64_histogram("executor_task_duration_ms")
         .with_description("Task execution duration in milliseconds.")
         .with_unit("ms")
         .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
@@ -245,67 +245,177 @@ pub(crate) static EXECUTOR_MEMORY_AVAILABLE_BYTES: LazyLock<Gauge<u64>> = LazyLo
 // Shuffle Metrics (shared)
 // =============================================================================
 
-/// Total bytes written during shuffle operations.
-/// Labels: node_id, role
-pub(crate) static NODE_SHUFFLE_WRITE_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+/// Total bytes written during shuffle operations by executors.
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_WRITE_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
-        .u64_counter("node_shuffle_write_bytes")
+        .u64_counter("executor_shuffle_write_bytes")
         .with_description("Total bytes written during shuffle operations.")
         .with_unit("By")
         .build()
 });
 
-/// Total rows written during shuffle operations.
-/// Labels: node_id, role
-pub(crate) static NODE_SHUFFLE_WRITE_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+/// Total rows written during shuffle operations by executors.
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_WRITE_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
-        .u64_counter("node_shuffle_write_rows")
+        .u64_counter("executor_shuffle_write_rows")
         .with_description("Total rows written during shuffle operations.")
         .with_unit("rows")
         .build()
 });
 
 /// Duration of shuffle write operations in milliseconds.
-/// Labels: node_id, role
-pub(crate) static NODE_SHUFFLE_WRITE_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
-    CLUSTER_METER
-        .f64_histogram("node_shuffle_write_duration_ms")
-        .with_description("Duration of shuffle write operations in milliseconds.")
-        .with_unit("ms")
-        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
-        .build()
-});
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_WRITE_DURATION_MS: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| {
+        CLUSTER_METER
+            .f64_histogram("executor_shuffle_write_duration_ms")
+            .with_description("Duration of shuffle write operations in milliseconds.")
+            .with_unit("ms")
+            .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+            .build()
+    });
 
-/// Total bytes read during shuffle operations.
-/// Labels: node_id, role
-pub(crate) static NODE_SHUFFLE_READ_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+// =============================================================================
+// Shuffle Locality Metrics (executor-side)
+// =============================================================================
+// These metrics track whether shuffle reads were served locally (from disk)
+// or remotely (via network from another executor). High local read ratios
+// indicate good data locality and efficient shuffle placement.
+
+/// Total bytes read from local shuffle files (same executor that wrote them).
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_READ_LOCAL_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
-        .u64_counter("node_shuffle_read_bytes")
-        .with_description("Total bytes read during shuffle operations.")
+        .u64_counter("executor_shuffle_read_local_bytes")
+        .with_description("Total bytes read from local shuffle files (same executor).")
         .with_unit("By")
         .build()
 });
 
-/// Total rows read during shuffle operations.
-/// Labels: node_id, role
-pub(crate) static NODE_SHUFFLE_READ_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+/// Total rows read from local shuffle files (same executor that wrote them).
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_READ_LOCAL_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
-        .u64_counter("node_shuffle_read_rows")
-        .with_description("Total rows read during shuffle operations.")
+        .u64_counter("executor_shuffle_read_local_rows")
+        .with_description("Total rows read from local shuffle files (same executor).")
         .with_unit("rows")
         .build()
 });
 
-/// Duration of shuffle read operations in milliseconds.
-/// Labels: node_id, role
-pub(crate) static NODE_SHUFFLE_READ_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+/// Count of local shuffle read operations.
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_READ_LOCAL_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     CLUSTER_METER
-        .f64_histogram("node_shuffle_read_duration_ms")
-        .with_description("Duration of shuffle read operations in milliseconds.")
-        .with_unit("ms")
-        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .u64_counter("executor_shuffle_read_local_count")
+        .with_description("Count of local shuffle read operations.")
+        .with_unit("operations")
         .build()
 });
+
+/// Duration of local shuffle read operations in milliseconds.
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_READ_LOCAL_DURATION_MS: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| {
+        CLUSTER_METER
+            .f64_histogram("executor_shuffle_read_local_duration_ms")
+            .with_description("Duration of local shuffle read operations in milliseconds.")
+            .with_unit("ms")
+            .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+            .build()
+    });
+
+/// Total bytes read from remote shuffle files (fetched from another executor).
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_READ_REMOTE_BYTES: LazyLock<Counter<u64>> =
+    LazyLock::new(|| {
+        CLUSTER_METER
+            .u64_counter("executor_shuffle_read_remote_bytes")
+            .with_description("Total bytes fetched from remote shuffle files (other executors).")
+            .with_unit("By")
+            .build()
+    });
+
+/// Total rows read from remote shuffle files (fetched from another executor).
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_READ_REMOTE_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .u64_counter("executor_shuffle_read_remote_rows")
+        .with_description("Total rows fetched from remote shuffle files (other executors).")
+        .with_unit("rows")
+        .build()
+});
+
+/// Count of remote shuffle read operations.
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_READ_REMOTE_COUNT: LazyLock<Counter<u64>> =
+    LazyLock::new(|| {
+        CLUSTER_METER
+            .u64_counter("executor_shuffle_read_remote_count")
+            .with_description("Count of remote shuffle read operations.")
+            .with_unit("operations")
+            .build()
+    });
+
+/// Duration histogram for remote shuffle read operations (network fetch time).
+/// Labels: node_id
+pub(crate) static EXECUTOR_SHUFFLE_READ_REMOTE_DURATION_MS: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| {
+        CLUSTER_METER
+            .f64_histogram("executor_shuffle_read_remote_duration_ms")
+            .with_description("Duration of remote shuffle read operations in milliseconds.")
+            .with_unit("ms")
+            .build()
+    });
+
+// =============================================================================
+// Scheduler Result Fetch Metrics
+// =============================================================================
+// These metrics track the scheduler (acting as client) fetching final query
+// results from executors after distributed query execution completes.
+
+/// Total bytes fetched by the scheduler when collecting final query results.
+/// Labels: node_id
+pub(crate) static SCHEDULER_RESULT_FETCH_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .u64_counter("scheduler_result_fetch_bytes")
+        .with_description("Total bytes fetched when collecting final query results from executors.")
+        .with_unit("By")
+        .build()
+});
+
+/// Total rows fetched by the scheduler when collecting final query results.
+/// Labels: node_id
+pub(crate) static SCHEDULER_RESULT_FETCH_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .u64_counter("scheduler_result_fetch_rows")
+        .with_description("Total rows fetched when collecting final query results from executors.")
+        .with_unit("rows")
+        .build()
+});
+
+/// Count of result fetch operations by the scheduler.
+/// Labels: node_id
+pub(crate) static SCHEDULER_RESULT_FETCH_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    CLUSTER_METER
+        .u64_counter("scheduler_result_fetch_count")
+        .with_description("Count of result fetch operations from executors.")
+        .with_unit("operations")
+        .build()
+});
+
+/// Duration of result fetch operations in milliseconds.
+/// Labels: node_id
+pub(crate) static SCHEDULER_RESULT_FETCH_DURATION_MS: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| {
+        CLUSTER_METER
+            .f64_histogram("scheduler_result_fetch_duration_ms")
+            .with_description("Duration of result fetch operations in milliseconds.")
+            .with_unit("ms")
+            .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+            .build()
+    });
 
 // =============================================================================
 // Scheduler Operations Metrics
@@ -355,14 +465,17 @@ pub fn record_task_started(node_id: &str, role: &str) {
     NODE_TASKS_ACTIVE.add(1, &labels);
 }
 
-/// Record that a task has completed successfully.
+/// Record that a task has completed successfully (executor only, with duration).
 pub fn record_task_completed(node_id: &str, role: &str, duration_ms: f64) {
     let labels = [
         KeyValue::new("node_id", node_id.to_string()),
         KeyValue::new("role", role.to_string()),
     ];
     NODE_TASKS_ACTIVE.add(-1, &labels);
-    NODE_TASK_DURATION_MS.record(duration_ms, &labels);
+
+    // Duration is only tracked for executors
+    let duration_labels = [KeyValue::new("node_id", node_id.to_string())];
+    EXECUTOR_TASK_DURATION_MS.record(duration_ms, &duration_labels);
 
     let status_labels = [
         KeyValue::new("node_id", node_id.to_string()),
@@ -395,26 +508,39 @@ pub fn record_task_failed(node_id: &str, role: &str, error_type: &str) {
     NODE_TASK_FAILURES.add(1, &failure_labels);
 }
 
-/// Record shuffle write metrics.
-pub fn record_shuffle_write(node_id: &str, role: &str, bytes: u64, rows: u64, duration_ms: f64) {
-    let labels = [
-        KeyValue::new("node_id", node_id.to_string()),
-        KeyValue::new("role", role.to_string()),
-    ];
-    NODE_SHUFFLE_WRITE_BYTES.add(bytes, &labels);
-    NODE_SHUFFLE_WRITE_ROWS.add(rows, &labels);
-    NODE_SHUFFLE_WRITE_DURATION_MS.record(duration_ms, &labels);
+/// Record shuffle write metrics (executor only).
+pub fn record_shuffle_write(node_id: &str, bytes: u64, rows: u64, duration_ms: f64) {
+    let labels = [KeyValue::new("node_id", node_id.to_string())];
+    EXECUTOR_SHUFFLE_WRITE_BYTES.add(bytes, &labels);
+    EXECUTOR_SHUFFLE_WRITE_ROWS.add(rows, &labels);
+    EXECUTOR_SHUFFLE_WRITE_DURATION_MS.record(duration_ms, &labels);
 }
 
-/// Record shuffle read metrics.
-pub fn record_shuffle_read(node_id: &str, role: &str, bytes: u64, rows: u64, duration_ms: f64) {
-    let labels = [
-        KeyValue::new("node_id", node_id.to_string()),
-        KeyValue::new("role", role.to_string()),
-    ];
-    NODE_SHUFFLE_READ_BYTES.add(bytes, &labels);
-    NODE_SHUFFLE_READ_ROWS.add(rows, &labels);
-    NODE_SHUFFLE_READ_DURATION_MS.record(duration_ms, &labels);
+/// Record local shuffle read metrics (partition read from local disk).
+pub fn record_shuffle_read_local(node_id: &str, bytes: u64, rows: u64, duration_ms: f64) {
+    let labels = [KeyValue::new("node_id", node_id.to_string())];
+    EXECUTOR_SHUFFLE_READ_LOCAL_BYTES.add(bytes, &labels);
+    EXECUTOR_SHUFFLE_READ_LOCAL_ROWS.add(rows, &labels);
+    EXECUTOR_SHUFFLE_READ_LOCAL_COUNT.add(1, &labels);
+    EXECUTOR_SHUFFLE_READ_LOCAL_DURATION_MS.record(duration_ms, &labels);
+}
+
+/// Record remote shuffle read metrics (partition fetched from another executor).
+pub fn record_shuffle_read_remote(node_id: &str, bytes: u64, rows: u64, duration_ms: f64) {
+    let labels = [KeyValue::new("node_id", node_id.to_string())];
+    EXECUTOR_SHUFFLE_READ_REMOTE_BYTES.add(bytes, &labels);
+    EXECUTOR_SHUFFLE_READ_REMOTE_ROWS.add(rows, &labels);
+    EXECUTOR_SHUFFLE_READ_REMOTE_COUNT.add(1, &labels);
+    EXECUTOR_SHUFFLE_READ_REMOTE_DURATION_MS.record(duration_ms, &labels);
+}
+
+/// Record result fetch metrics (scheduler collecting final results from executors).
+pub fn record_result_fetch(node_id: &str, bytes: u64, rows: u64, duration_ms: f64) {
+    let labels = [KeyValue::new("node_id", node_id.to_string())];
+    SCHEDULER_RESULT_FETCH_BYTES.add(bytes, &labels);
+    SCHEDULER_RESULT_FETCH_ROWS.add(rows, &labels);
+    SCHEDULER_RESULT_FETCH_COUNT.add(1, &labels);
+    SCHEDULER_RESULT_FETCH_DURATION_MS.record(duration_ms, &labels);
 }
 
 /// Record stage completion on the scheduler.
@@ -556,16 +682,24 @@ mod tests {
     #[test]
     fn test_record_shuffle_write() {
         // Should not panic
-        record_shuffle_write("node-1", "executor", 1024, 100, 50.0);
-        record_shuffle_write("node-2", "executor", 0, 0, 0.0);
-        record_shuffle_write("node-3", "executor", u64::MAX, u64::MAX, f64::MAX);
+        record_shuffle_write("node-1", 1024, 100, 50.0);
+        record_shuffle_write("node-2", 0, 0, 0.0);
+        record_shuffle_write("node-3", u64::MAX, u64::MAX, f64::MAX);
     }
 
     #[test]
-    fn test_record_shuffle_read() {
+    fn test_record_shuffle_read_local() {
         // Should not panic
-        record_shuffle_read("node-1", "executor", 2048, 200, 75.0);
-        record_shuffle_read("node-2", "executor", 0, 0, 0.0);
+        record_shuffle_read_local("node-1", 1024, 100, 10.0);
+        record_shuffle_read_local("node-2", 0, 0, 0.0);
+        record_shuffle_read_local("node-3", u64::MAX, u64::MAX, f64::MAX);
+    }
+
+    #[test]
+    fn test_record_shuffle_read_remote() {
+        // Should not panic
+        record_shuffle_read_remote("node-1", 2048, 200, 50.0);
+        record_shuffle_read_remote("node-2", 0, 0, 0.0);
     }
 
     // =========================================================================

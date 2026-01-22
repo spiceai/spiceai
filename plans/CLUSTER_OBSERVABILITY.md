@@ -33,7 +33,7 @@ Query `runtime.task_history` across all schedulers with a `scheduler_id` dimensi
 The `/metrics` Prometheus endpoint gains support for a `?scope=cluster` query parameter that triggers fan-out collection of metrics from all schedulers and executors.
 
 **Key Behaviors:**
-- Add `spice_node_id` (full advertise address) and `spice_node_role` labels to all metrics
+- Add `node_id` (full advertise address) and `node_role` labels to all metrics
 - All collection happens in parallel (local + schedulers + executors)
 - No timeout for fan-out queries
 - No caching
@@ -283,7 +283,7 @@ impl ClusterMetricsCollector {
         // If any fails, return error with failed peer identifiers
         
         // Merge all OTLP metrics
-        // Add spice_node_id and spice_node_role labels
+        // Add node_id and node_role labels
     }
 }
 ```
@@ -313,7 +313,7 @@ fn otlp_to_prometheus(
 ) -> Vec<MetricFamily>
 ```
 - Convert OTLP metrics to Prometheus `MetricFamily` format
-- Add `spice_node_id` and `spice_node_role` labels to all metrics
+- Add `node_id` and `node_role` labels to all metrics
 
 ---
 
@@ -493,7 +493,7 @@ curl http://127.0.0.1:9090/metrics
 curl "http://127.0.0.1:9090/metrics?scope=cluster"
 ```
 
-Expected: Cluster metrics include `spice_node_id` and `spice_node_role` labels on all metrics.
+Expected: Cluster metrics include `node_id` and `node_role` labels on all metrics.
 
 #### 4. Cluster Metrics with Executors
 
@@ -511,7 +511,7 @@ spiced --role executor --scheduler-address 127.0.0.1:50051 --metrics 127.0.0.1:9
 curl "http://127.0.0.1:9090/metrics?scope=cluster"
 ```
 
-Expected: Metrics from both scheduler (`spice_node_role="scheduler"`) and executor (`spice_node_role="executor"`).
+Expected: Metrics from both scheduler (`node_role="scheduler"`) and executor (`node_role="executor"`).
 
 #### 5. Partial Failure Handling
 

@@ -31,6 +31,7 @@ use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::execution_plan::execute_stream;
@@ -293,6 +294,19 @@ impl TableProvider for FederatedTaskHistoryTable {
 
         let exec = DataSourceExec::new(Arc::new(memory_source));
         Ok(Arc::new(exec))
+    }
+
+    /// Delegate inserts to the local task history table.
+    ///
+    /// The federated table only federates reads across schedulers. Writes always
+    /// go to the local table since each scheduler manages its own task history.
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.local_table.insert_into(state, input, insert_op).await
     }
 }
 

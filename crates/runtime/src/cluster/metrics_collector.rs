@@ -22,6 +22,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use ballista_core::error::Result;
+use ballista_core::extension::{ResultFetchMetricsCallback, ShuffleReadMetricsCallback};
 use ballista_executor::execution_engine::QueryStageExecutor;
 use ballista_executor::metrics::ExecutorMetricsCollector;
 use ballista_scheduler::metrics::SchedulerMetricsCollector;
@@ -116,10 +117,24 @@ impl ExecutorMetricsCollector for OtelExecutorMetricsCollector {
     ) {
         #[expect(clippy::cast_precision_loss)]
         let duration_ms_f64 = duration_ms as f64;
-        cluster::record_shuffle_write(&self.node_id, "executor", bytes, rows, duration_ms_f64);
+        cluster::record_shuffle_write(&self.node_id, bytes, rows, duration_ms_f64);
     }
 
     fn record_shuffle_read(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _partition: usize,
+        _bytes: u64,
+        _rows: u64,
+        _duration_ms: u64,
+    ) {
+        // No-op: We only track locality-aware shuffle reads via record_shuffle_read_local
+        // and record_shuffle_read_remote. This generic callback is kept for trait compatibility
+        // but the locality-specific callbacks provide more useful metrics.
+    }
+
+    fn record_shuffle_read_local(
         &self,
         _job_id: &str,
         _stage_id: usize,
@@ -130,11 +145,126 @@ impl ExecutorMetricsCollector for OtelExecutorMetricsCollector {
     ) {
         #[expect(clippy::cast_precision_loss)]
         let duration_ms_f64 = duration_ms as f64;
-        cluster::record_shuffle_read(&self.node_id, "executor", bytes, rows, duration_ms_f64);
+        cluster::record_shuffle_read_local(&self.node_id, bytes, rows, duration_ms_f64);
+    }
+
+    fn record_shuffle_read_remote(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _partition: usize,
+        _source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    ) {
+        #[expect(clippy::cast_precision_loss)]
+        let duration_ms_f64 = duration_ms as f64;
+        cluster::record_shuffle_read_remote(&self.node_id, bytes, rows, duration_ms_f64);
     }
 
     fn record_memory_available(&self, available_bytes: u64) {
         cluster::set_executor_memory_available(&self.node_id, available_bytes);
+    }
+}
+
+/// OpenTelemetry-based callback for shuffle read locality metrics.
+///
+/// This callback is passed to the Ballista shuffle reader via session config
+/// and is invoked during shuffle operations to record whether reads were
+/// local (from disk) or remote (fetched from another executor).
+///
+/// This enables tracking shuffle locality/affinity metrics to understand
+/// data placement efficiency in the cluster.
+pub struct OtelShuffleReadMetricsCallback {
+    /// The node ID used as a label in all metrics.
+    node_id: String,
+}
+
+impl OtelShuffleReadMetricsCallback {
+    /// Creates a new `OtelShuffleReadMetricsCallback` with the given node ID.
+    #[must_use]
+    pub fn new(node_id: String) -> Self {
+        Self { node_id }
+    }
+
+    /// Creates a new callback wrapped in an Arc for use with session config.
+    #[must_use]
+    pub fn new_arc(node_id: String) -> Arc<dyn ShuffleReadMetricsCallback> {
+        Arc::new(Self::new(node_id))
+    }
+}
+
+impl ShuffleReadMetricsCallback for OtelShuffleReadMetricsCallback {
+    fn record_local_read(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _partition: usize,
+        _source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    ) {
+        #[expect(clippy::cast_precision_loss)]
+        let duration_ms_f64 = duration_ms as f64;
+        cluster::record_shuffle_read_local(&self.node_id, bytes, rows, duration_ms_f64);
+    }
+
+    fn record_remote_read(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _partition: usize,
+        _source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    ) {
+        #[expect(clippy::cast_precision_loss)]
+        let duration_ms_f64 = duration_ms as f64;
+        cluster::record_shuffle_read_remote(&self.node_id, bytes, rows, duration_ms_f64);
+    }
+}
+
+/// OpenTelemetry-based callback for result fetch metrics.
+///
+/// This callback is passed to the Ballista `DistributedQueryExec` via session config
+/// and is invoked when the scheduler (acting as client) fetches final query results
+/// from executors.
+pub struct OtelResultFetchMetricsCallback {
+    /// The node ID used as a label in all metrics.
+    node_id: String,
+}
+
+impl OtelResultFetchMetricsCallback {
+    /// Creates a new `OtelResultFetchMetricsCallback` with the given node ID.
+    #[must_use]
+    pub fn new(node_id: String) -> Self {
+        Self { node_id }
+    }
+
+    /// Creates a new callback wrapped in an Arc for use with session config.
+    #[must_use]
+    pub fn new_arc(node_id: String) -> Arc<dyn ResultFetchMetricsCallback> {
+        Arc::new(Self::new(node_id))
+    }
+}
+
+impl ResultFetchMetricsCallback for OtelResultFetchMetricsCallback {
+    fn record_result_fetch(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _partition: usize,
+        _source_executor_id: &str,
+        bytes: u64,
+        rows: u64,
+        duration_ms: u64,
+    ) {
+        #[expect(clippy::cast_precision_loss)]
+        let duration_ms_f64 = duration_ms as f64;
+        cluster::record_result_fetch(&self.node_id, bytes, rows, duration_ms_f64);
     }
 }
 
@@ -269,6 +399,30 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
 
     fn record_task_retry(&self, _job_id: &str, _stage_id: usize) {
         cluster::record_task_retry(&self.node_id, "scheduler");
+    }
+
+    fn record_task_shuffle_affinity_hit(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+        // Shuffle affinity tracking is not yet implemented in the scheduler.
+        // This would require scheduler-side changes to detect when a task
+        // is assigned to an executor that has local shuffle data.
+        // For now, this is a no-op placeholder.
+    }
+
+    fn record_task_shuffle_affinity_miss(
+        &self,
+        _job_id: &str,
+        _stage_id: usize,
+        _executor_id: &str,
+    ) {
+        // Shuffle affinity tracking is not yet implemented in the scheduler.
+        // This would require scheduler-side changes to detect when a task
+        // is assigned to an executor that does NOT have local shuffle data.
+        // For now, this is a no-op placeholder.
     }
 
     // =========================================================================
@@ -448,7 +602,8 @@ mod tests {
 
         // Executor picks up and runs task
         executor.record_task_started("job-1", 1, 0);
-        executor.record_shuffle_read("job-1", 1, 0, 1024, 100, 20);
+        executor.record_shuffle_read_local("job-1", 1, 0, 512, 50, 10);
+        executor.record_shuffle_read_remote("job-1", 1, 0, "executor-2", 512, 50, 20);
 
         // Task completes (simulated without calling record_stage)
         executor.record_shuffle_write("job-1", 1, 0, 512, 50, 15);

@@ -21,7 +21,7 @@ limitations under the License.
 //! - Metrics from peer schedulers via GetMetrics RPC
 //! - Metrics from executors via control stream
 //!
-//! All metrics are merged and labeled with `spice_node_id` and `spice_node_role`.
+//! All metrics are merged and labeled with `node_id` and `node_role`.
 
 use std::sync::Arc;
 
@@ -42,8 +42,8 @@ use crate::cluster::ExecutorRegistry;
 use crate::cluster::SchedulerPeers;
 
 /// Labels added to all metrics for node identification.
-const NODE_ID_LABEL: &str = "spice_node_id";
-const NODE_ROLE_LABEL: &str = "spice_node_role";
+const NODE_ID_LABEL: &str = "node_id";
+const NODE_ROLE_LABEL: &str = "node_role";
 
 /// Node roles in the cluster.
 const ROLE_SCHEDULER: &str = "scheduler";

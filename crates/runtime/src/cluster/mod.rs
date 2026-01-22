@@ -339,7 +339,7 @@ fn update_scheduler_pollers(
 mod control_stream_client;
 pub mod datafusion;
 mod executor_registry;
-mod metrics_collector;
+pub mod metrics_collector;
 mod scheduler_registry;
 mod servers;
 mod service;
@@ -923,7 +923,36 @@ pub async fn initialize_cluster_executor(
 
     // Use advertise address as node_id for metrics
     let metrics_node_id = format!("{advertise_host}:{advertise_port}");
-    let metrics_collector = metrics_collector::OtelExecutorMetricsCollector::new(metrics_node_id);
+
+    // Configure executor session config with shuffle locality metrics callback
+    let config_producer_tls = client_tls_config.clone();
+    let config_producer_node_id = metrics_node_id.clone();
+    let config_producer: ConfigProducer = Arc::new(move || {
+        let mut config = SessionConfig::new_with_ballista()
+            .with_option_extension(SpiceClusterConfig::default())
+            .with_ballista_use_tls(tls_enabled)
+            // Use 100MB max message size to match other gRPC configurations in the codebase.
+            // The default Ballista config is 16MB which is too small for shuffle operations
+            // with large batches.
+            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024)
+            // Enable shuffle locality metrics callback to track local vs remote shuffle reads
+            .with_ballista_shuffle_read_metrics_callback(
+                metrics_collector::OtelShuffleReadMetricsCallback::new_arc(
+                    config_producer_node_id.clone(),
+                ),
+            );
+
+        if let Some(tls_config) = config_producer_tls.clone() {
+            config = config.with_ballista_override_create_grpc_client_endpoint({
+                Arc::new(move |ep| ep.tls_config(tls_config.clone()).boxed())
+            });
+        }
+
+        config
+    });
+
+    let metrics_collector =
+        metrics_collector::OtelExecutorMetricsCollector::new(metrics_node_id.clone());
 
     let executor = Arc::new(Executor::new(
         executor_meta,
