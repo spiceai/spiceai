@@ -26,6 +26,8 @@ use futures::TryStreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
+use tracing::Span;
+use tracing_futures::Instrument;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -51,8 +53,11 @@ impl SampleFrom for RandomSampleParams {
         &self,
         df: Arc<DataFusion>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        let batches = df
-            .query_builder(&format!(
+        // Capture the current span to ensure sql_query spans are properly nested
+        let current_span = Span::current();
+
+        let batches = async {
+            df.query_builder(&format!(
                 "SELECT * FROM {tbl} LIMIT {limit}",
                 limit = self.limit,
                 tbl = self.tbl,
@@ -64,7 +69,10 @@ impl SampleFrom for RandomSampleParams {
             .data
             .try_collect::<Vec<RecordBatch>>()
             .await
-            .boxed()?;
+            .boxed()
+        }
+        .instrument(current_span)
+        .await?;
 
         let schema = Arc::new(df.get_arrow_schema(self.tbl.as_str()).await.boxed()?);
 
