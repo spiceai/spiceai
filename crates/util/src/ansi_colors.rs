@@ -82,46 +82,15 @@ impl<S: AsRef<str>> Display for Painted<S> {
     }
 }
 
-/// Enable ANSI support on Windows.
+/// Enable ANSI support (no-op).
 ///
-/// On Windows, this enables virtual terminal processing for the console,
-/// which is required for ANSI escape codes to work properly.
-/// On other platforms, this is a no-op that always succeeds.
-///
-/// # Errors
-///
-/// Returns an `io::Error` if enabling virtual terminal processing fails,
-/// which can happen if stdout is not attached to a console or if the
-/// Windows console API calls fail.
-#[cfg(windows)]
-pub fn enable_ansi_support() -> std::io::Result<()> {
-    use windows_sys::Win32::System::Console::{
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, SetConsoleMode,
-    };
-
-    let stdout = std::io::stdout();
-    let handle = std::os::windows::io::AsRawHandle::as_raw_handle(&stdout);
-
-    // SAFETY: We're calling Windows API functions with a valid stdout handle.
-    // GetConsoleMode and SetConsoleMode are safe to call with any handle.
-    unsafe {
-        let mut mode: u32 = 0;
-        if GetConsoleMode(handle as _, &mut mode) == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if SetConsoleMode(handle as _, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-/// Enable ANSI support on non-Windows platforms (no-op).
+/// On modern Windows 10+ systems, ANSI escape codes are typically enabled by default.
+/// This function exists for compatibility with code that previously relied on
+/// enabling virtual terminal processing, but is now a no-op on all platforms.
 ///
 /// # Errors
 ///
-/// This function never returns an error on non-Windows platforms.
-#[cfg(not(windows))]
+/// This function never returns an error.
 #[inline]
 pub const fn enable_ansi_support() -> std::io::Result<()> {
     Ok(())

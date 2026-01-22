@@ -51,6 +51,11 @@ pub enum Error {
     MissingParameter { parameter: String },
 
     #[snafu(display(
+        "Failed to initialize Oracle wallet: A previous initialization failed and the lock is poisoned. Restart the application."
+    ))]
+    WalletInitializationLockPoisoned,
+
+    #[snafu(display(
         "Failed to connect to the Oracle Server. Verify your connection configuration, and try again. {source}"
     ))]
     UnableToCreateConnectionPool {
@@ -176,9 +181,9 @@ impl Oracle {
     /// subsequent calls will no-op.
     pub fn save_wallet_cert_once(cert_base64_str: &str, wallet_path: &str) -> Result<()> {
         let mutex = WALLET_INIT.get_or_init(|| Mutex::new(None));
-        let mut guard = mutex.lock().map_err(|_| Error::MissingParameter {
-            parameter: "wallet initialization lock poisoned".to_string(),
-        })?;
+        let mut guard = mutex
+            .lock()
+            .map_err(|_| Error::WalletInitializationLockPoisoned)?;
 
         if guard.is_none() {
             Self::save_wallet_cert(cert_base64_str, wallet_path)?;
