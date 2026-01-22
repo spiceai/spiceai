@@ -724,15 +724,20 @@ impl RefreshTask {
             return Err(e);
         }
 
-        if let (Some(start_time), Ok(refresh_stat)) =
-            (start_time, on_written_data_stat_available.try_recv())
-        {
-            self.trace_load_completed(start_time, refresh_stat.num_rows, refresh_stat.memory_size)
+        let refresh_stat = on_written_data_stat_available.try_recv().ok();
+
+        if let (Some(start_time), Some(stat)) = (start_time, &refresh_stat) {
+            self.trace_load_completed(start_time, stat.num_rows, stat.memory_size)
                 .await;
         }
 
         self.set_refresh_status(sql, status::ComponentStatus::Ready)
             .await;
+
+        self.maybe_update_last_updated_at(
+            &data_update.update_type,
+            refresh_stat.map_or(0, |s| s.num_rows),
+        );
 
         Ok(())
     }
@@ -1366,14 +1371,23 @@ impl RefreshTask {
             .await;
     }
 
-    #[expect(clippy::cast_possible_truncation)]
+    /// Updates `last_updated_at` timestamp based on refresh type and row count.
+    ///
+    /// - For `Overwrite` and `Changes`: Always updates (data is replaced/modified)
+    /// - For `Append`: Only updates if rows were actually written (`num_rows > 0`)
+    fn maybe_update_last_updated_at(&self, update_type: &UpdateType, num_rows: usize) {
+        let should_update = match update_type {
+            UpdateType::Overwrite | UpdateType::Changes => true,
+            UpdateType::Append => num_rows > 0,
+        };
+
+        if should_update {
+            self.update_last_updated_at();
+        }
+    }
+
     fn update_last_updated_at(&self) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        self.last_updated_at
-            .store(now_ms, std::sync::atomic::Ordering::Release);
+        super::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
     }
 }
 

@@ -943,6 +943,32 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
                 "Should have results from cache with no filters"
             );
 
+            // Query with specific projection (only 'content' column) and no filters
+            let df = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .select(vec![col("content")])?
+                .limit(0, Some(1))?;
+
+            let batches = df.collect().await?;
+            assert!(
+                !batches.is_empty(),
+                "Should have results from cache with projection and no filters"
+            );
+            // Verify only the 'content' column is returned
+            assert_eq!(
+                batches[0].num_columns(),
+                1,
+                "Should only return the projected column"
+            );
+            assert_eq!(
+                batches[0].schema().field(0).name(),
+                "content",
+                "Should return the 'content' column"
+            );
+
             Ok(())
         })
         .await
@@ -1103,6 +1129,60 @@ async fn test_caching_mode_different_projections() -> Result<(), anyhow::Error> 
             assert!(
                 !batches2.is_empty(),
                 "Second query with different projection should return cached data"
+            );
+
+            // Third query - select content, request_path (different column order)
+            let df3 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=smith")))?
+                .select(vec![col("content"), col("request_path")])?
+                .limit(0, Some(1))?;
+
+            let batches3 = df3.collect().await?;
+            assert!(
+                !batches3.is_empty(),
+                "Third query with content,request_path projection should return cached data"
+            );
+            assert_eq!(
+                batches3[0].schema().field(0).name(),
+                "content",
+                "First column should be content"
+            );
+            assert_eq!(
+                batches3[0].schema().field(1).name(),
+                "request_path",
+                "Second column should be request_path"
+            );
+
+            // Fourth query - select request_path, content (standard order)
+            let df4 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=smith")))?
+                .select(vec![col("request_path"), col("content")])?
+                .limit(0, Some(1))?;
+
+            let batches4 = df4.collect().await?;
+            assert!(
+                !batches4.is_empty(),
+                "Fourth query with request_path,content projection should return cached data"
+            );
+            assert_eq!(
+                batches4[0].schema().field(0).name(),
+                "request_path",
+                "First column should be request_path"
+            );
+            assert_eq!(
+                batches4[0].schema().field(1).name(),
+                "content",
+                "Second column should be content"
             );
 
             Ok(())

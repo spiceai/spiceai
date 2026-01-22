@@ -198,8 +198,13 @@ impl DataConnectorFactory for ScyllaDbFactory {
         Box::pin(async move {
             match create_scylladb_connector(params.parameters).await {
                 Ok((session, keyspace, compute_context)) => {
-                    let pool = ScyllaDbConnectionPool::new(session, keyspace, compute_context);
-                    let scylladb_factory = ScyllaDbTableFactory::new(Arc::new(pool));
+                    let pool = ScyllaDbConnectionPool::new(
+                        Arc::clone(&session),
+                        Arc::clone(&keyspace),
+                        compute_context,
+                    );
+                    let scylladb_factory =
+                        ScyllaDbTableFactory::new(Arc::new(pool), session, keyspace);
                     Ok(Arc::new(ScyllaDb { scylladb_factory }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => {

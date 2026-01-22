@@ -193,6 +193,11 @@ impl RuntimeBuilder {
             .as_ref()
             .is_none_or(|app| app.runtime.task_history.enabled);
 
+        // URL tables are opt-in via `runtime.params.url_tables=enabled`
+        let url_tables_enabled = App::get_runtime_param_opt::<String>(&self.app, "url_tables")
+            .as_deref()
+            == Some("enabled");
+
         let mut caching_config = self
             .app
             .as_ref()
@@ -227,7 +232,8 @@ impl RuntimeBuilder {
         .with_task_history(task_history)
         .with_caching(caching)
         .with_metrics(metrics)
-        .with_resource_monitor(resource_monitor.clone());
+        .with_resource_monitor(resource_monitor.clone())
+        .with_url_tables(url_tables_enabled);
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
             df_builder = df_builder.with_cluster_config(resolved_cluster_config);

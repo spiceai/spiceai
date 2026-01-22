@@ -31,7 +31,7 @@ use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, BootstrapStatus};
-use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_file_path};
+use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_snapshot_adapter};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
@@ -78,10 +78,20 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "postgres"))]
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres",
+    not(windows)
+))]
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::SnapshotAdapter;
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "postgres"))]
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres",
+    not(windows)
+))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
@@ -339,6 +349,9 @@ pub enum Error {
         "'refresh_complete' is not supported for stream-backed datasets. Use 'time_interval' or 'stream_batches' instead"
     ))]
     UnsupportedRefreshCompleteForStream,
+
+    #[snafu(display("Caching refresh mode only supports 'time_interval' for snapshots_trigger"))]
+    UnsupportedSnapshotTriggerForCaching,
 
     #[snafu(display(
         "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
@@ -1259,16 +1272,23 @@ impl DataFusion {
         }
 
         if acceleration_settings.snapshot_behavior.create_enabled() {
-            if let Ok(snapshot_path) = acceleration_file_path(dataset).await {
-                if let Some(snapshot_config) = build_snapshot_creation_config(
-                    dataset,
-                    &acceleration_settings,
-                    refresh_mode,
-                    SnapshotAdapter::file(snapshot_path),
-                )
-                .await?
-                {
-                    accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
+            if let Ok(snapshot_adapter) = acceleration_snapshot_adapter(dataset).await {
+                if snapshot_adapter.is_enabled() {
+                    if let Some(snapshot_config) = build_snapshot_creation_config(
+                        dataset,
+                        &acceleration_settings,
+                        refresh_mode,
+                        snapshot_adapter,
+                    )
+                    .await?
+                    {
+                        accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
+                    }
+                } else {
+                    tracing::warn!(
+                        "Dataset {} accelerator does not support snapshots.",
+                        dataset.name
+                    );
                 }
             } else {
                 tracing::warn!(
@@ -2164,7 +2184,20 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    let snapshot_creation_trigger = if is_streaming_refresh {
+    // Caching mode only supports time_interval - no "refresh complete" or "stream_batches" events.
+    let is_caching = matches!(refresh_mode, RefreshMode::Caching);
+
+    let snapshot_creation_trigger = if is_caching {
+        match snapshot_trigger {
+            None | Some(SnapshotsTrigger::TimeInterval) => {
+                let interval = parse_interval(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Interval(interval)
+            }
+            Some(SnapshotsTrigger::RefreshComplete | SnapshotsTrigger::StreamBatches) => {
+                return Err(Error::UnsupportedSnapshotTriggerForCaching);
+            }
+        }
+    } else if is_streaming_refresh {
         match snapshot_trigger {
             None | Some(SnapshotsTrigger::TimeInterval) => {
                 let interval = parse_interval(&snapshot_threshold)?;
@@ -2193,7 +2226,12 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(any(feature = "duckdb", feature = "sqlite", feature = "postgres"))]
+    #[cfg(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    ))]
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => AccelerationEngine::DuckDB,
@@ -2203,6 +2241,8 @@ async fn build_snapshot_creation_config(
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
         Engine::Turso => AccelerationEngine::Turso,
+        #[cfg(not(windows))]
+        Engine::Cayenne => AccelerationEngine::Cayenne,
         _ => {
             // This code is unreachable since build_snapshot_creation_config is
             // only called iff acceleration_file_path returned Some(<file_path>)
@@ -2210,14 +2250,24 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    #[cfg(not(any(feature = "duckdb", feature = "sqlite", feature = "postgres")))]
+    #[cfg(not(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    )))]
     {
         let _ = snapshot_adapter;
         let _ = snapshot_creation_trigger;
-        Err(Error::UnsupportedAccelerationEngineForSnapshots)
+        return Err(Error::UnsupportedAccelerationEngineForSnapshots);
     }
 
-    #[cfg(any(feature = "duckdb", feature = "sqlite", feature = "postgres"))]
+    #[cfg(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    ))]
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),
         acceleration_settings.snapshot_behavior.clone(),
