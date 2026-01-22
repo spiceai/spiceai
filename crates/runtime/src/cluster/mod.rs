@@ -951,7 +951,8 @@ async fn create_scheduler_server(
 
     // Get shuffle format from spicepod runtime params
     let shuffle_format: String = {
-        let app_guard = rt.app().read().await;
+        let app_ref = rt.app();
+        let app_guard = app_ref.read().await;
         app_guard
             .as_ref()
             .and_then(|app| app.runtime.params.get("shuffle_format"))

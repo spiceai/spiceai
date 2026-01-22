@@ -73,3 +73,6 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# Cluster logs
+cluster_logs/
