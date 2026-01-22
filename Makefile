@@ -280,7 +280,16 @@ install-cli-dev: build-cli-dev
 modtidy:
 	go mod tidy
 
+################################################################################
+# Target: distributed                                                          #
+################################################################################
+.PHONY: distributed
+distributed: install
+	./scripts/distributed.sh
 
+.PHONY: distributed-dev
+distributed-dev: install-dev
+	./scripts/distributed.sh
 
 
 ################################################################################
