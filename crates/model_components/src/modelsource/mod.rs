@@ -152,7 +152,7 @@ impl FromStr for ModelSourceType {
 }
 
 pub fn ensure_model_path(name: &str) -> Result<String> {
-    let mut base_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
+    let mut base_path = util::home_dir::home_dir().context(UnableToFindHomeDirSnafu)?;
     base_path.push(".spice/models");
 
     let candidate = Path::new(name);

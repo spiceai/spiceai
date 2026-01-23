@@ -27,7 +27,7 @@ jobs:
           - target_os: windows
             target_arch: x86_64
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       ARTIFACT_DIR: ./release
 

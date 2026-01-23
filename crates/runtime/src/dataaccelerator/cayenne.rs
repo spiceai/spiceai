@@ -54,7 +54,7 @@ use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_need
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotAdapter};
+use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -1702,14 +1702,14 @@ impl DataAccelerator for CayenneAccelerator {
             })
     }
 
-    fn snapshot_adapter(&self, source: &dyn AccelerationSource) -> SnapshotAdapter {
+    fn acceleration_layout(&self, source: &dyn AccelerationSource) -> AccelerationLayout {
         let Ok(data_dir) = self.cayenne_data_dir(source) else {
-            return SnapshotAdapter::default();
+            return AccelerationLayout::default();
         };
 
         let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
 
-        SnapshotAdapter::cayenne(PathBuf::from(metadata_dir), PathBuf::from(data_dir))
+        AccelerationLayout::cayenne(PathBuf::from(metadata_dir), PathBuf::from(data_dir))
     }
 
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
@@ -1774,18 +1774,6 @@ impl DataAccelerator for CayenneAccelerator {
                     detail: Arc::from(
                         "Cannot specify both 'cayenne_s3_zone_ids' and 'cayenne_file_path' with an S3 Express path. Use either 'cayenne_s3_zone_ids' for auto-generated bucket names, or 'cayenne_file_path' for explicit bucket paths.",
                     ),
-                }));
-            }
-
-            // Validate refresh_mode - append and full are supported
-            if let Some(refresh_mode) = acceleration.refresh_mode
-                && refresh_mode != RefreshMode::Append
-                && refresh_mode != RefreshMode::Full
-            {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(format!(
-                        "Cayenne data accelerator supports append and full refresh modes, but {refresh_mode:?} was specified. Please set refresh_mode to either append or full"
-                    )),
                 }));
             }
 
@@ -1908,7 +1896,7 @@ impl DataAccelerator for CayenneAccelerator {
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
             let snapshot_adapter =
-                runtime_acceleration::snapshot::SnapshotAdapter::cayenne(metadata_dir, path_buf);
+                runtime_acceleration::snapshot::AccelerationLayout::cayenne(metadata_dir, path_buf);
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
