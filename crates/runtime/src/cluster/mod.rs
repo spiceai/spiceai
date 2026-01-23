@@ -705,7 +705,7 @@ pub async fn initialize_cluster_executor(
     let tls_enabled = client_tls_config.is_some();
     let config_producer_tls = client_tls_config.clone();
 
-    // Configure executor session config
+    // Configure executor session config - shuffle_memory_mode will be set after we fetch the app definition
     let config_producer: ConfigProducer = Arc::new(move || {
         let mut config = SessionConfig::new_with_ballista()
             .with_option_extension(SpiceClusterConfig::default())
@@ -766,13 +766,48 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    // Extract temp_directory from the app definition for the executor's work_dir
-    let work_dir = app_def
+    // Get shuffle_location from app params; if set to a path (not "memory"), use it as work_dir
+    // Otherwise fall back to temp_directory from query config or system temp dir
+    // Note: shuffle_memory_mode is configured via the scheduler's override_session_builder
+    let shuffle_location = app_def.runtime.params.get("shuffle_location");
+
+    let work_dir = if shuffle_location.map(|s| s.as_str()) == Some("memory") {
+        // Memory mode: still need a work_dir for executor, use temp_directory as fallback
+        app_def
+            .runtime
+            .query
+            .as_ref()
+            .and_then(|q| q.temp_directory.clone())
+            .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
+    } else if let Some(location) = shuffle_location {
+        // Disk mode with explicit path
+        location.clone()
+    } else {
+        // Disk mode with default temp_directory
+        app_def
+            .runtime
+            .query
+            .as_ref()
+            .and_then(|q| q.temp_directory.clone())
+            .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
+    };
+
+    // Log shuffle configuration
+    let shuffle_format = app_def
         .runtime
-        .query
-        .as_ref()
-        .and_then(|q| q.temp_directory.clone())
-        .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string());
+        .params
+        .get("shuffle_format")
+        .map(String::as_str)
+        .unwrap_or("arrow_ipc");
+    let shuffle_location_display = shuffle_location
+        .map(String::as_str)
+        .unwrap_or("disk (temp_directory)");
+    tracing::info!(
+        "Executor shuffle configuration: shuffle_format={}, shuffle_location={}, work_dir={}",
+        shuffle_format,
+        shuffle_location_display,
+        work_dir
+    );
 
     let app_def = Arc::new(app_def);
 
@@ -960,23 +995,35 @@ async fn create_scheduler_server(
             .unwrap_or_else(|| "arrow_ipc".to_string())
     };
 
+    // Get shuffle_location from spicepod runtime params
+    // "memory" = in-memory shuffle, otherwise path for disk shuffle (defaults to temp_directory)
+    let shuffle_location: Option<String> = {
+        let app_ref = rt.app();
+        let app_guard = app_ref.read().await;
+        app_guard
+            .as_ref()
+            .and_then(|app| app.runtime.params.get("shuffle_location"))
+            .cloned()
+    };
+    let shuffle_memory_mode = shuffle_location.as_deref() == Some("memory");
+
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
     let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
         .clone()
         .map(|tls_config| Arc::new(move |ep: Endpoint| ep.tls_config(tls_config.clone())) as _);
 
     // Convert shuffle_format param to ballista ShuffleFormat
-    #[cfg(feature = "vortex-shuffle")]
+    #[cfg(feature = "vortex")]
     let ballista_shuffle_format = match shuffle_format.as_str() {
         "vortex" => BallistaShuffleFormat::Vortex,
         _ => BallistaShuffleFormat::ArrowIpc,
     };
 
-    #[cfg(not(feature = "vortex-shuffle"))]
+    #[cfg(not(feature = "vortex"))]
     let ballista_shuffle_format = {
         if shuffle_format.as_str() == "vortex" {
             tracing::warn!(
-                "Vortex shuffle format requested but 'vortex-shuffle' feature is not enabled. Falling back to ArrowIpc."
+                "Vortex shuffle format requested but 'vortex' feature is not enabled. Falling back to ArrowIpc."
             );
         }
         BallistaShuffleFormat::ArrowIpc
@@ -1000,7 +1047,8 @@ async fn create_scheduler_server(
             let cfg = current_context
                 .copied_config()
                 .with_option_extension(SpiceClusterConfig::default())
-                .with_ballista_shuffle_format(ballista_shuffle_format);
+                .with_ballista_shuffle_format(ballista_shuffle_format)
+                .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
 
             Ok(
                 SessionStateBuilder::new_from_existing(current_context.as_ref().state())
@@ -1022,7 +1070,15 @@ async fn create_scheduler_server(
     rt.status
         .update_cluster("scheduler", ComponentStatus::Ready);
 
-    tracing::info!("Starting Ballista scheduler on {}", bind_addr);
+    let shuffle_location_display = shuffle_location
+        .as_deref()
+        .unwrap_or("disk (temp_directory)");
+    tracing::info!(
+        "Starting Ballista scheduler on {} (shuffle_format={}, shuffle_location={})",
+        bind_addr,
+        shuffle_format,
+        shuffle_location_display
+    );
 
     scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
         cluster,

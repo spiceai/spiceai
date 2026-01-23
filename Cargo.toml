@@ -350,10 +350,10 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "1de
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "8cff5241923989720f86687bdf7d0b3c9c7dad2f" } # spiceai-51
 
-# spiceai-51: DF51 base + TLS, API key auth, UDF sync patches, Vortex shuffle format support (rebased onto 51.0.0-rc1)
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista", rev = "939286247347d8e009cfa5d536ea993324676994" }      # spiceai:lukim/vortex (DF51 + spice patches + vortex shuffle)
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista", rev = "939286247347d8e009cfa5d536ea993324676994" }  # spiceai:lukim/vortex
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista", rev = "939286247347d8e009cfa5d536ea993324676994" } # spiceai:lukim/vortex
+# Local fork of datafusion-ballista with Vortex shuffle format support
+ballista-core = { path = "../datafusion-ballista/ballista/core" }
+ballista-executor = { path = "../datafusion-ballista/ballista/executor" }
+ballista-scheduler = { path = "../datafusion-ballista/ballista/scheduler" }
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers

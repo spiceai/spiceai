@@ -322,7 +322,7 @@ turso = [
     "dep:rusqlite",
     "runtime-acceleration/turso"
 ]
-vortex-shuffle = ["ballista-core/vortex"]
+vortex = ["ballista-core/vortex", "ballista-executor/vortex"]
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso"] }
 vortex.workspace = true

@@ -284,11 +284,13 @@ modtidy:
 # Target: distributed                                                          #
 ################################################################################
 .PHONY: distributed
-distributed: install
+distributed:
+	make install SPICED_NON_DEFAULT_FEATURES="vortex"
 	./scripts/distributed.sh
 
 .PHONY: distributed-dev
-distributed-dev: install-dev
+distributed-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="vortex"
 	./scripts/distributed.sh
 
 
