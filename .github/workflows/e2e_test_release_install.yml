@@ -155,7 +155,7 @@ jobs:
           export PATH="$HOME/.spice/bin:$PATH"
           spice version
 
-      - name: start Spice runtime
+      - name: start Spice runtime and wait for healthy
         shell: wsl-bash {0}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -164,12 +164,17 @@ jobs:
           spice init app
           cd app
           spice run &
-
-      - name: wait for Spice runtime healthy
-        shell: wsl-bash {0}
-        run: |
-          bash -c 'while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done' || false
-        timeout-minutes: 1
+          # Wait for the runtime to be healthy
+          for i in $(seq 1 60); do
+            if [ "$(curl -s http://localhost:8090/health)" = "ok" ]; then
+              echo "Spice runtime is healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Spice runtime failed to start"
+          exit 1
+        timeout-minutes: 2
 
       - name: check Spice cli and runtime version
         shell: wsl-bash {0}
