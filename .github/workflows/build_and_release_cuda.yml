@@ -168,6 +168,11 @@ jobs:
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-cc
 
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run Spiced CUDA Build
         uses: ./.github/actions/spiced-cuda-build
         with:
