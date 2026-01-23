@@ -35,20 +35,20 @@ jobs:
         include:
           # Linux x86_64
           - os: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             shell: bash
           - os: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             shell: zsh
           - os: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             shell: sh
           # Linux ARM64
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             shell: bash
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             shell: zsh
           # macOS ARM64 (Apple Silicon)
           - os: macos-arm64
@@ -81,14 +81,14 @@ jobs:
         include:
           # Linux x86_64
           - os: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             shell: bash
           - os: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             shell: zsh
           # Linux ARM64
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             shell: bash
           # macOS ARM64
           - os: macos-arm64
@@ -170,9 +170,9 @@ jobs:
       matrix:
         include:
           - os: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
           - os: macos-arm64
             runner: macos-latest
     steps:
@@ -223,17 +223,17 @@ jobs:
         include:
           # Linux x86_64 variants
           - os: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             variant: ''
           - os: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             variant: models
           # Linux ARM64 variants
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             variant: ''
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             variant: models
           # macOS ARM64 variants
           - os: macos-arm64
@@ -268,9 +268,9 @@ jobs:
       matrix:
         include:
           - os: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
           - os: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
           - os: macos-arm64
             runner: macos-latest
     steps:
@@ -307,7 +307,7 @@ jobs:
   # Test HTTP client fallback (curl vs wget)
   test-http-clients:
     name: HTTP Client (${{ matrix.client }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -354,7 +354,7 @@ jobs:
   # Test error handling
   test-error-handling:
     name: Error Handling
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v6

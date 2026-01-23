@@ -432,7 +432,7 @@ jobs:
           - target_os: windows
             target_arch: x86_64
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
