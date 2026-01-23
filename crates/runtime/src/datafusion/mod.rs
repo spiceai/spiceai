@@ -31,7 +31,7 @@ use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
 use crate::dataaccelerator::{self, BootstrapStatus};
-use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_snapshot_adapter};
+use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
@@ -85,7 +85,7 @@ use query::QueryBuilder;
     not(windows)
 ))]
 use runtime_acceleration::snapshot::AccelerationEngine;
-use runtime_acceleration::snapshot::SnapshotAdapter;
+use runtime_acceleration::snapshot::AccelerationLayout;
 #[cfg(any(
     feature = "duckdb",
     feature = "sqlite",
@@ -1271,14 +1271,17 @@ impl DataFusion {
                 .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
         }
 
+        // Get the acceleration layout (used for snapshots and size metrics)
+        let acceleration_layout = get_acceleration_layout(dataset).await.ok();
+
         if acceleration_settings.snapshot_behavior.create_enabled() {
-            if let Ok(snapshot_adapter) = acceleration_snapshot_adapter(dataset).await {
-                if snapshot_adapter.is_enabled() {
+            if let Some(ref layout) = acceleration_layout {
+                if layout.is_enabled() {
                     if let Some(snapshot_config) = build_snapshot_creation_config(
                         dataset,
                         &acceleration_settings,
                         refresh_mode,
-                        snapshot_adapter,
+                        layout.clone(),
                     )
                     .await?
                     {
@@ -1296,6 +1299,11 @@ impl DataFusion {
                     dataset.name
                 );
             }
+        }
+
+        // Pass the acceleration layout for size metrics
+        if let Some(layout) = acceleration_layout {
+            accelerated_table_builder.acceleration_layout(layout);
         }
 
         accelerated_table_builder.checkpointer_opt(
@@ -2157,7 +2165,7 @@ async fn build_snapshot_creation_config(
     dataset: &Dataset,
     acceleration_settings: &Acceleration,
     refresh_mode: RefreshMode,
-    snapshot_adapter: SnapshotAdapter,
+    acceleration_layout: AccelerationLayout,
 ) -> Result<Option<SnapshotCreationConfig>> {
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
@@ -2271,7 +2279,7 @@ async fn build_snapshot_creation_config(
         not(windows)
     )))]
     {
-        let _ = snapshot_adapter;
+        let _ = acceleration_layout;
         let _ = snapshot_creation_trigger;
         return Err(Error::UnsupportedAccelerationEngineForSnapshots);
     }
@@ -2285,7 +2293,7 @@ async fn build_snapshot_creation_config(
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),
         acceleration_settings.snapshot_behavior.clone(),
-        snapshot_adapter,
+        acceleration_layout,
         acceleration_engine,
     )
     .await
@@ -2441,7 +2449,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Full,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2465,7 +2473,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2502,7 +2510,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Changes,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2539,7 +2547,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Full,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2571,7 +2579,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2603,7 +2611,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2635,7 +2643,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2663,7 +2671,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2691,7 +2699,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Full,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2722,7 +2730,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Changes,
-                SnapshotAdapter::file(snapshot_path),
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 

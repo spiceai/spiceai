@@ -22,7 +22,7 @@ on:
 
 jobs:
   check_commits:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
 
@@ -55,7 +55,7 @@ jobs:
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
@@ -238,7 +238,7 @@ jobs:
     needs: [check_commits, setup, build-amd64, build-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6

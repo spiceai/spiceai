@@ -116,7 +116,7 @@ jobs:
           ]
         target:
           - name: 'Linux x64'
-            runner: 'ubuntu-latest'
+            runner: 'ubuntu-22.04'
             target_os: 'linux'
             target_arch: 'x86_64'
             target_arch_go: 'amd64'

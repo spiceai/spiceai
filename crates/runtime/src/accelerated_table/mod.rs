@@ -325,6 +325,7 @@ pub struct Builder {
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
 }
 
 impl Builder {
@@ -366,8 +367,17 @@ impl Builder {
             caching_stale_if_error: false,
             resource_monitor: None,
             bootstrap_status: BootstrapStatus::none(),
+            acceleration_layout: None,
             is_s3_express_acceleration: false,
         }
+    }
+
+    pub fn acceleration_layout(
+        &mut self,
+        layout: runtime_acceleration::snapshot::AccelerationLayout,
+    ) -> &mut Self {
+        self.acceleration_layout = Some(layout);
+        self
     }
 
     pub fn retention(&mut self, retention: Option<Retention>) -> &mut Self {
@@ -723,6 +733,17 @@ impl Builder {
             handlers.push(retention_check_handle);
         }
 
+        // Spawn size metrics task for file-based accelerators
+        if let Some(ref layout) = self.acceleration_layout
+            && layout.is_enabled()
+        {
+            let size_metrics_handle = tokio::spawn(AcceleratedTable::start_size_metrics_task(
+                self.dataset_name.clone(),
+                layout.clone(),
+            ));
+            handlers.push(size_metrics_handle);
+        }
+
         // If the table should be ready immediately, mark it as ready.
         if self.ready_state == ReadyState::OnRegistration {
             self.runtime_status
@@ -825,6 +846,21 @@ impl AcceleratedTable {
             refresh,
             io_runtime,
         )
+    }
+
+    /// Periodically emits the `dataset_acceleration_size_bytes` metric for file-based accelerators.
+    pub(crate) async fn start_size_metrics_task(
+        dataset_name: TableReference,
+        layout: runtime_acceleration::snapshot::AccelerationLayout,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            interval.tick().await;
+
+            let size = layout.total_size();
+            metrics::SIZE_BYTES.record(size, &[KeyValue::new("dataset", dataset_name.to_string())]);
+        }
     }
 
     #[must_use]

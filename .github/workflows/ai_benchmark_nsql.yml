@@ -70,7 +70,7 @@ jobs:
 
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
