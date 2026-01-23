@@ -799,6 +799,14 @@ pub async fn initialize_cluster_executor(
         }
         Some(loc) => {
             // Local disk mode with explicit path
+            // Validate the path exists or can be created
+            let path = std::path::Path::new(loc);
+            if !path.exists() {
+                tracing::warn!(
+                    "shuffle_location '{}' does not exist. Ensure the directory exists and is writable by the executor process.",
+                    loc
+                );
+            }
             loc.to_string()
         }
         None => {
@@ -813,15 +821,28 @@ pub async fn initialize_cluster_executor(
     };
 
     // Log shuffle configuration
-    let shuffle_format = app_def
+    // Normalize shuffle_format based on feature availability
+    let raw_shuffle_format = app_def
         .runtime
         .params
         .get("shuffle_format")
-        .map(String::as_str)
-        .unwrap_or("arrow_ipc");
-    let shuffle_location_display = shuffle_location
-        .map(String::as_str)
-        .unwrap_or("disk (temp_directory)");
+        .map_or("arrow_ipc", String::as_str);
+
+    #[cfg(feature = "vortex")]
+    let shuffle_format = raw_shuffle_format;
+
+    #[cfg(not(feature = "vortex"))]
+    let shuffle_format = {
+        if raw_shuffle_format == "vortex" {
+            tracing::warn!(
+                "Vortex shuffle format requested but 'vortex' feature is not enabled. Executor will use ArrowIpc."
+            );
+            "arrow_ipc"
+        } else {
+            raw_shuffle_format
+        }
+    };
+    let shuffle_location_display = shuffle_location.map_or("disk (temp_directory)", String::as_str);
     tracing::info!(
         "Executor shuffle configuration: shuffle_format={}, shuffle_location={}, work_dir={}",
         shuffle_format,
@@ -1034,7 +1055,7 @@ async fn create_scheduler_server(
     // - other path or None -> local disk storage
     let (shuffle_storage_type, shuffle_storage_url): (Option<String>, Option<String>) =
         match shuffle_location.as_deref() {
-            Some("memory") => (None, None), // Memory mode handled separately
+            Some("memory") | None => (None, None), // Memory mode or default - handled separately
             Some(loc) if loc.starts_with("s3://") => {
                 (Some("s3".to_string()), Some(loc.to_string()))
             }
@@ -1042,7 +1063,6 @@ async fn create_scheduler_server(
                 (Some("azure".to_string()), Some(loc.to_string()))
             }
             Some(loc) => (Some("local".to_string()), Some(loc.to_string())), // Explicit local path
-            None => (None, None), // Default to local temp_directory
         };
 
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();

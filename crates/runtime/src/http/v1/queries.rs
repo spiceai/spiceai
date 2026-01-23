@@ -41,12 +41,16 @@ use crate::jobs::{JobExecutor, JobState, JobStatus};
 
 /// Check if cluster mode with scheduler role is enabled.
 /// Returns 503 error response if not in scheduler cluster mode.
+#[expect(
+    clippy::result_large_err,
+    reason = "Response type is needed for HTTP error responses"
+)]
 fn require_cluster_mode(rt: &Arc<Runtime>) -> Result<(), Response> {
     if rt.df.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "The async queries API requires cluster mode with scheduler role. Start spiced with '--role scheduler'."
+                "error": "Async queries API is only available when running as scheduler. Start with: spiced --role scheduler"
             })),
         )
             .into_response());
@@ -56,6 +60,10 @@ fn require_cluster_mode(rt: &Arc<Runtime>) -> Result<(), Response> {
 
 /// Helper to get job executor from runtime.
 /// Requires cluster mode to be enabled. Returns 503 if executor is not available yet.
+#[expect(
+    clippy::result_large_err,
+    reason = "Response type is needed for HTTP error responses"
+)]
 fn get_executor(rt: &Arc<Runtime>) -> Result<Arc<JobExecutor>, Response> {
     require_cluster_mode(rt)?;
 

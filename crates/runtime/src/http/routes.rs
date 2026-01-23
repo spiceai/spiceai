@@ -281,8 +281,12 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.responses_llms)));
     }
 
-    // Add async queries API routes - available in all modes but handlers check for cluster mode
-    // The job_executor is initialized asynchronously in scheduler mode, so handlers fetch it dynamically from Runtime
+    // Add async queries API routes - registered unconditionally for discoverability and consistency.
+    // Handlers check at runtime if cluster mode with scheduler role is enabled.
+    // This design ensures:
+    // 1. API endpoints are discoverable via OpenAPI/health checks regardless of cluster mode
+    // 2. Helpful 503 errors guide users on how to enable the feature
+    // 3. job_executor can be initialized asynchronously after routes are registered
     let queries_router = Router::new()
         .route("/v1/queries", post(v1::queries::submit))
         .route("/v1/queries", get(v1::queries::list))
