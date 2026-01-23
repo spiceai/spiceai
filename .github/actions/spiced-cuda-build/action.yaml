@@ -4,7 +4,7 @@ inputs:
   cuda-version:
     description: 'The CUDA version to install'
     required: true
-    default: '12.4.1'
+    default: '12.6.0'
   cuda-compute-capability:
     description: 'The CUDA compute capability to target'
     required: true
