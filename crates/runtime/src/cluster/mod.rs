@@ -336,11 +336,13 @@ fn update_scheduler_pollers(
     *known_schedulers = next_schedulers;
 }
 
+mod control_stream_client;
 pub mod datafusion;
 mod scheduler_registry;
 mod servers;
 mod service;
 
+pub use control_stream_client::ControlStreamManager;
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -872,14 +874,36 @@ pub async fn initialize_cluster_executor(
     let codec_for_manager = codec;
     let initial_scheduler_addresses_for_manager = initial_scheduler_addresses.clone();
 
+    // Compute the executor's advertise address for control stream identification.
+    let executor_advertise_id =
+        if let Some(advertise_host) = rt.df.cluster_config.node_advertise_address() {
+            let bind_port = rt.df.cluster_config.node_bind_address().port();
+            format!("{advertise_host}:{bind_port}")
+        } else {
+            rt.df.cluster_config.node_bind_address().to_string()
+        };
+    let control_stream_executor_id = executor_advertise_id;
+    let control_stream_tls_config = client_tls_config.clone();
+    let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
+
     let poll_manager = tokio::spawn(async move {
         let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
         let mut known_schedulers: HashSet<String> = HashSet::new();
+
+        let mut control_stream_manager =
+            ControlStreamManager::new(control_stream_executor_id, control_stream_tls_config);
 
         let mut current_addresses = initial_scheduler_addresses_for_manager;
         if current_addresses.is_empty() {
             current_addresses.push(scheduler_url_for_manager.to_string());
         }
+
+        let control_stream_addresses = if control_stream_initial_schedulers.is_empty() {
+            vec![scheduler_url_for_manager.to_string()]
+        } else {
+            control_stream_initial_schedulers
+        };
+        control_stream_manager.update_schedulers(control_stream_addresses);
 
         update_scheduler_pollers(
             &mut pollers,
@@ -906,6 +930,7 @@ pub async fn initialize_cluster_executor(
                     );
                     continue;
                 }
+                control_stream_manager.update_schedulers(addresses.clone());
                 update_scheduler_pollers(
                     &mut pollers,
                     &mut known_schedulers,
