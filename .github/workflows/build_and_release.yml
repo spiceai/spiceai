@@ -69,24 +69,25 @@ jobs:
         id: setup-matrix
         with:
           script: |
-            // Check if this is a release build (tagged release or release branch)
-            const isReleaseBuild = context.ref.startsWith('refs/tags/v') ||
-                                   context.ref.startsWith('refs/heads/release-') ||
-                                   context.ref.startsWith('refs/heads/release/');
+            // Check if this is a tagged release (uses GitHub hosted runners, no minio)
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+
+            // Check if this is a release branch (uses spiceai runners with minio)
+            const isReleaseBranch = context.ref.startsWith('refs/heads/release-') ||
+                                    context.ref.startsWith('refs/heads/release/');
 
             // Check if this is a manual workflow dispatch
             const isManualDispatch = context.eventName === 'workflow_dispatch';
 
-            // Include Windows and Linux ARM only for release builds or manual dispatch (exclude trunk pushes)
-            const includeWindowsAndLinuxArm = isReleaseBuild || isManualDispatch;
+            // Include Windows and Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
+            const includeWindowsAndLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
 
-            // Use hosted macOS runners only for tagged releases, otherwise use self-hosted
-            const macosRunner = isReleaseBuild ? "macos-15" : "spiceai-macos";
+            // Tagged releases use GitHub hosted runners, others use spiceai runners
+            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
+            const linuxRunner = isTaggedRelease ? "ubuntu-22.04" : "spiceai-dev-runners";
 
-            // For release builds, use ubuntu-22.04 with Actions cache
-            // For trunk/PR builds, use spiceai-dev-runners with minio
-            const linuxRunner = isReleaseBuild ? "ubuntu-22.04" : "spiceai-dev-runners";
-            const useMinio = !isReleaseBuild;
+            // Use minio for spiceai runners (trunk, release branches, manual dispatch on non-tagged)
+            const useMinio = !isTaggedRelease;
 
             const matrix = [
               {
@@ -112,7 +113,7 @@ jobs:
             if (includeWindowsAndLinuxArm) {
               matrix.push({
                 name: "Linux aarch64",
-                runner: "hosted-linux-arm-runner",
+                runner: isTaggedRelease ? "hosted-linux-arm-runner" : "hosted-linux-arm-runner",
                 target_os: "linux",
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
