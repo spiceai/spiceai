@@ -280,7 +280,18 @@ install-cli-dev: build-cli-dev
 modtidy:
 	go mod tidy
 
+################################################################################
+# Target: distributed                                                          #
+################################################################################
+.PHONY: distributed
+distributed:
+	make install SPICED_NON_DEFAULT_FEATURES="vortex"
+	./scripts/distributed.sh
 
+.PHONY: distributed-dev
+distributed-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="vortex"
+	./scripts/distributed.sh
 
 
 ################################################################################
