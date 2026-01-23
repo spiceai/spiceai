@@ -171,7 +171,7 @@ jobs:
       - name: Run Spiced CUDA Build
         uses: ./.github/actions/spiced-cuda-build
         with:
-          cuda-version: '12.4.1'
+          cuda-version: '12.6.0'
           cuda-compute-capability: ${{ matrix.target.compute_cap }}
           artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           target_os: ${{ matrix.target.target_os }}

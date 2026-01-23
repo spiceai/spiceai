@@ -558,7 +558,7 @@ pub async fn get_client_for_flight_endpoint(
     if ep.location.is_empty() {
         Ok(client.clone())
     } else {
-        let channel = new_tls_flight_channel(&ep.location[0].uri).await?;
+        let channel = new_tls_flight_channel(&ep.location[0].uri, None).await?;
         Ok(FlightSqlServiceClient::new(channel))
     }
 }
