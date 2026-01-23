@@ -1523,14 +1523,13 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
 
             // Manually set the snapshot_last_updated_at_ms in metadata
             let mut metadata = updated_metadata;
-            if let Some(dataset_entry) = metadata.get_mut(TAXI_TRIPS_DATASET_NAME) {
-                if let Some(snapshots_arr) = dataset_entry.get_mut("snapshots").and_then(Value::as_array_mut) {
-                    if let Some(last_snapshot) = snapshots_arr.last_mut() {
-                        last_snapshot.as_object_mut().map(|obj| {
-                            obj.insert("snapshot-last-updated-at-ms".to_string(), json!(12345u64));
-                        });
-                    }
-                }
+            if let Some(dataset_entry) = metadata.get_mut(TAXI_TRIPS_DATASET_NAME)
+                && let Some(snapshots_arr) =
+                    dataset_entry.get_mut("snapshots").and_then(Value::as_array_mut)
+                && let Some(last_snapshot) = snapshots_arr.last_mut()
+                && let Some(obj) = last_snapshot.as_object_mut()
+            {
+                obj.insert("snapshot-last-updated-at-ms".to_string(), json!(12345u64));
             }
             fixture.context.write_metadata(&metadata).await?;
 
