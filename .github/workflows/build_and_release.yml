@@ -59,7 +59,7 @@ env:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-dev-runners
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -69,30 +69,34 @@ jobs:
         id: setup-matrix
         with:
           script: |
-            // Check if this is a tagged release
-            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
-
-            // Check if this is a release branch
-            const isReleaseBranch = context.ref.startsWith('refs/heads/release-') ||
-                                     context.ref.startsWith('refs/heads/release/');
+            // Check if this is a release build (tagged release or release branch)
+            const isReleaseBuild = context.ref.startsWith('refs/tags/v') ||
+                                   context.ref.startsWith('refs/heads/release-') ||
+                                   context.ref.startsWith('refs/heads/release/');
 
             // Check if this is a manual workflow dispatch
             const isManualDispatch = context.eventName === 'workflow_dispatch';
 
-            // Include Windows and Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
-            const includeWindowsAndLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
+            // Include Windows and Linux ARM only for release builds or manual dispatch (exclude trunk pushes)
+            const includeWindowsAndLinuxArm = isReleaseBuild || isManualDispatch;
 
             // Use hosted macOS runners only for tagged releases, otherwise use self-hosted
-            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
+            const macosRunner = isReleaseBuild ? "macos-15" : "spiceai-macos";
+
+            // For release builds, use ubuntu-22.04 with Actions cache
+            // For trunk/PR builds, use spiceai-dev-runners with minio
+            const linuxRunner = isReleaseBuild ? "ubuntu-22.04" : "spiceai-dev-runners";
+            const useMinio = !isReleaseBuild;
 
             const matrix = [
               {
                 name: "Linux x64",
-                runner: "spiceai-dev-runners",
+                runner: linuxRunner,
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
                 tags: ["default", "models", "odbc"],
+                use_minio: useMinio,
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 runner: macosRunner,
@@ -100,6 +104,7 @@ jobs:
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
                 tags: ["default", "models", "metal"],
+                use_minio: false,
               }
             ];
 
@@ -112,6 +117,7 @@ jobs:
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
                 tags: ["default", "models"],
+                use_minio: false,
               });
               matrix.push({
                 name: "Windows x64",
@@ -120,6 +126,7 @@ jobs:
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
                 tags: ["default", "models"],
+                use_minio: false,
               });
             }
 
@@ -250,7 +257,7 @@ jobs:
           path: spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       - name: Upload spiced to Minio
-        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
         uses: ./.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -300,7 +307,7 @@ jobs:
           path: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       - name: Upload spiced_models to Minio
-        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'models')
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'models')
         uses: ./.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -333,7 +340,7 @@ jobs:
           path: spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       - name: Upload spiced_odbc_models to Minio
-        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
         uses: ./.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -404,7 +411,7 @@ jobs:
           path: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
       - name: Upload spice CLI to Minio
-        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
+        if: matrix.target.use_minio && matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
         uses: ./.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
