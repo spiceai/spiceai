@@ -62,7 +62,7 @@ on:
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -228,7 +228,7 @@ jobs:
       ARTIFACT_DIR: ./release
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
