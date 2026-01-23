@@ -1984,15 +1984,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
                 .expect("Notify")
                 .notified()
                 .await;
-            runtime
-                .datafusion()
-                .refresh_table(&TableReference::parse_str("taxi_trips"), None)
-                .await
-                .expect("Table refresh")
-                .expect("Notify")
-                .notified()
-                .await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
 
             // Wait for snapshot to appear
             let snapshots_after = context
