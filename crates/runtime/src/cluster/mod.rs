@@ -768,28 +768,48 @@ pub async fn initialize_cluster_executor(
 
     // Get shuffle_location from app params; if set to a path (not "memory"), use it as work_dir
     // Otherwise fall back to temp_directory from query config or system temp dir
-    // Note: shuffle_memory_mode is configured via the scheduler's override_session_builder
+    // Note: shuffle_memory_mode and object store config is set via the scheduler's override_session_builder
     let shuffle_location = app_def.runtime.params.get("shuffle_location");
 
-    let work_dir = if shuffle_location.map(|s| s.as_str()) == Some("memory") {
-        // Memory mode: still need a work_dir for executor, use temp_directory as fallback
-        app_def
-            .runtime
-            .query
-            .as_ref()
-            .and_then(|q| q.temp_directory.clone())
-            .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
-    } else if let Some(location) = shuffle_location {
-        // Disk mode with explicit path
-        location.clone()
-    } else {
-        // Disk mode with default temp_directory
-        app_def
-            .runtime
-            .query
-            .as_ref()
-            .and_then(|q| q.temp_directory.clone())
-            .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
+    // Determine work_dir for executor:
+    // - For "memory" mode or object store paths (s3://, abfs://), use temp_directory as fallback
+    // - For local disk paths, use the specified path
+    let work_dir = match shuffle_location.map(String::as_str) {
+        Some("memory") => {
+            // Memory mode: use temp_directory as fallback for any local work
+            app_def
+                .runtime
+                .query
+                .as_ref()
+                .and_then(|q| q.temp_directory.clone())
+                .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
+        }
+        Some(loc)
+            if loc.starts_with("s3://")
+                || loc.starts_with("abfs://")
+                || loc.starts_with("az://") =>
+        {
+            // Object store mode: shuffle data goes to object store, but executor still needs local work_dir
+            app_def
+                .runtime
+                .query
+                .as_ref()
+                .and_then(|q| q.temp_directory.clone())
+                .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
+        }
+        Some(loc) => {
+            // Local disk mode with explicit path
+            loc.to_string()
+        }
+        None => {
+            // Default: use temp_directory
+            app_def
+                .runtime
+                .query
+                .as_ref()
+                .and_then(|q| q.temp_directory.clone())
+                .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
+        }
     };
 
     // Log shuffle configuration
@@ -1007,6 +1027,24 @@ async fn create_scheduler_server(
     };
     let shuffle_memory_mode = shuffle_location.as_deref() == Some("memory");
 
+    // Determine shuffle storage type and URL from shuffle_location
+    // - "memory" -> in-memory shuffle (no storage_type/storage_url needed)
+    // - "s3://..." -> S3 object store
+    // - "abfs://..." or "az://..." -> Azure object store
+    // - other path or None -> local disk storage
+    let (shuffle_storage_type, shuffle_storage_url): (Option<String>, Option<String>) =
+        match shuffle_location.as_deref() {
+            Some("memory") => (None, None), // Memory mode handled separately
+            Some(loc) if loc.starts_with("s3://") => {
+                (Some("s3".to_string()), Some(loc.to_string()))
+            }
+            Some(loc) if loc.starts_with("abfs://") || loc.starts_with("az://") => {
+                (Some("azure".to_string()), Some(loc.to_string()))
+            }
+            Some(loc) => (Some("local".to_string()), Some(loc.to_string())), // Explicit local path
+            None => (None, None), // Default to local temp_directory
+        };
+
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
     let override_create_grpc_client_endpoint: Option<SchedulerEndpointOverride> = client_tls_config
         .clone()
@@ -1044,11 +1082,19 @@ async fn create_scheduler_server(
         grpc_server_max_encoding_message_size: u32::MAX,
 
         override_session_builder: Some(Arc::new(move |_cfg| {
-            let cfg = current_context
+            let mut cfg = current_context
                 .copied_config()
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_ballista_shuffle_format(ballista_shuffle_format)
                 .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
+
+            // Apply object store shuffle configuration if specified
+            if let Some(ref storage_type) = shuffle_storage_type {
+                cfg = cfg.with_ballista_shuffle_storage_type(storage_type);
+            }
+            if let Some(ref storage_url) = shuffle_storage_url {
+                cfg = cfg.with_ballista_shuffle_storage_url(storage_url);
+            }
 
             Ok(
                 SessionStateBuilder::new_from_existing(current_context.as_ref().state())
