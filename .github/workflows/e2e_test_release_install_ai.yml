@@ -121,7 +121,7 @@ jobs:
         with:
           method: network
           sub-packages: '[]'
-          cuda: '12.4.1'
+          cuda: '12.6.0'
           use-github-cache: false
           use-local-cache: false
 
