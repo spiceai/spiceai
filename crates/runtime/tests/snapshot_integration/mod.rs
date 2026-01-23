@@ -1481,7 +1481,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
-                runtime_acceleration::snapshot::SnapshotAdapter::file(fixture.local_db_path.clone()),
+                runtime_acceleration::snapshot::AccelerationLayout::file(fixture.local_db_path.clone()),
                 AccelerationEngine::DuckDB,
             )
                 .await
