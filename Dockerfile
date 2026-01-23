@@ -34,7 +34,7 @@ RUN \
       *) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
     esac && \
     if [ "${CARGO_NO_DEFAULT_FEATURES}" = "true" ]; then \
-      cargo build --profile ${RUST_PROFILE} --no-default-features --features ${CARGO_FEATURES:-default}; \
+      cargo build --profile "${RUST_PROFILE}" --no-default-features ${CARGO_FEATURES:+--features ${CARGO_FEATURES}}; \
     else \
       cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default}; \
     fi && \

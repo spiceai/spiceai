@@ -20,7 +20,7 @@ limitations under the License.
     feature = "duckdb",
     feature = "sqlite",
     feature = "turso",
-    feature = "postgres"
+    feature = "postgres-accel"
 ))]
 use std::path::Path;
 #[cfg(any(feature = "duckdb", feature = "turso"))]
@@ -67,7 +67,7 @@ use crate::component::dataset::acceleration::Engine;
     feature = "duckdb",
     feature = "sqlite",
     feature = "turso",
-    feature = "postgres"
+    feature = "postgres-accel"
 ))]
 use crate::dataaccelerator::get_registered_accelerator;
 
@@ -145,7 +145,7 @@ pub enum Error {
     SqliteFeatureNotEnabled,
 
     #[cfg(not(feature = "postgres-accel"))]
-    #[snafu(display("Spice wasn't built with PostgreSQL support enabled"))]
+    #[snafu(display("Spice wasn't built with PostgreSQL acceleration support enabled"))]
     PostgresFeatureNotEnabled,
 
     #[cfg(feature = "turso")]
