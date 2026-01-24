@@ -4,7 +4,7 @@
 
 Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and agents. Provides federated SQL querying, data acceleration/materialization, search (vector, keyword, full-text), and AI inference via industry-standard APIs.
 
-**Architecture**: Go CLI (`bin/spice`) + Rust runtime daemon (`bin/spiced`). Built on Apache DataFusion, Arrow, and DuckDB.
+**Architecture**: Rust CLI (`bin/spice`) + Rust runtime daemon (`bin/spiced`). Built on Apache DataFusion, Arrow, and DuckDB.
 
 **Core Principle**: Developer Experience First — Bring data and AI/ML to your application, not the other way around.
 
@@ -347,7 +347,7 @@ fn process_data(data: &Arc<RecordBatch>) { ... }
 ### Binary Targets
 
 - `bin/spiced/` - Runtime daemon (Rust)
-- `bin/spice/` - CLI (Go)
+- `bin/spice/` - CLI (Rust)
 
 ### Core Crates
 
