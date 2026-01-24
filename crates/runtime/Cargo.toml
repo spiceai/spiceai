@@ -75,7 +75,7 @@ http-body-util = "0.1.3"
 humantime = { workspace = true, optional = true }
 hyper = "1.7.0"
 hyper-util = { version = "0.1.19", features = ["service"] }
-iceberg.workspace = true
+iceberg = { workspace = true, features = ["storage-gcs", "storage-s3"] }
 iceberg-catalog-glue.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
@@ -91,7 +91,7 @@ mongodb = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
 ns_lookup = { path = "../ns_lookup" }
-object_store = { workspace = true, features = ["aws", "http", "azure"] }
+object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
