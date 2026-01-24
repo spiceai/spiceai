@@ -127,8 +127,9 @@ jobs:
 
       - name: default
         run: |
-          echo "IMAGE_TAG=models" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+          echo "IMAGE_TAG=default" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - &build-arm64-image
         name: Build ARM64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
@@ -142,21 +143,31 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            CARGO_NO_DEFAULT_FEATURES=${{ env.CARGO_NO_DEFAULT_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
-      - name: models-jemalloc
+      - name: data
         run: |
-          echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
+          echo "IMAGE_TAG=data" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=true" >> $GITHUB_ENV
       - *build-arm64-image
-      - name: models-mimalloc
+      - name: jemalloc
         run: |
-          echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
+          echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-jemalloc" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-arm64-image
-      - name: models-sysalloc
+      - name: mimalloc
         run: |
-          echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
+          echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-mimalloc" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
+      - *build-arm64-image
+      - name: sysalloc
+        run: |
+          echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-system" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-arm64-image
       - name: Upload ARM64 artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
@@ -197,8 +208,9 @@ jobs:
 
       - name: default
         run: |
-          echo "IMAGE_TAG=models" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+          echo "IMAGE_TAG=default" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - &build-amd64-image
         name: Build AMD64 ${{ env.IMAGE_TAG }} image
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
@@ -212,21 +224,31 @@ jobs:
           build-args: |
             REL_VERSION=${{ needs.setup.outputs.rel_version }}
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
+            CARGO_NO_DEFAULT_FEATURES=${{ env.CARGO_NO_DEFAULT_FEATURES }}
             RUST_PROFILE=${{ env.RUST_PROFILE }}
-      - name: models-jemalloc
+      - name: data
         run: |
-          echo "IMAGE_TAG=models-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-jemalloc" >> $GITHUB_ENV
+          echo "IMAGE_TAG=data" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=true" >> $GITHUB_ENV
       - *build-amd64-image
-      - name: models-mimalloc
+      - name: jemalloc
         run: |
-          echo "IMAGE_TAG=models-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-mimalloc" >> $GITHUB_ENV
+          echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-jemalloc" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-amd64-image
-      - name: models-sysalloc
+      - name: mimalloc
         run: |
-          echo "IMAGE_TAG=models-sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,alloc-system" >> $GITHUB_ENV
+          echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-mimalloc" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
+      - *build-amd64-image
+      - name: sysalloc
+        run: |
+          echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-system" >> $GITHUB_ENV
+          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
       - *build-amd64-image
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
@@ -273,7 +295,9 @@ jobs:
         run: |
           echo "REL_VERSION=${REL_VERSION}"
           echo "PUBLISH=${PUBLISH}"
-          variants=("models" "models-jemalloc" "models-mimalloc" "models-sysalloc")
+
+          # Variants: default (models), data (no models), and allocator variants
+          variants=("default" "data" "jemalloc" "mimalloc" "sysalloc")
           for variant in "${variants[@]}"; do
             suffix=""
             if [ "$variant" != "default" ]; then
@@ -281,9 +305,9 @@ jobs:
             fi
 
             # Load both architecture images
-            echo "Loading AMD64 image"
+            echo "Loading AMD64 image for ${variant}"
             docker load -i /tmp/image-amd64-${variant}.tar
-            echo "Loading ARM64 image"
+            echo "Loading ARM64 image for ${variant}"
             docker load -i /tmp/image-arm64-${variant}.tar
 
             # Push images to local registry
@@ -293,7 +317,7 @@ jobs:
 
             if [[ "${PUBLISH}" == "true" ]]; then
               # Push to GitHub Container Registry
-              echo "Pushing to GHCR"
+              echo "Pushing ${variant} to GHCR"
               docker buildx imagetools create \
                 -t ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}${suffix} \
                 -t ghcr.io/spiceai/spiceai-nightly:latest${suffix} \

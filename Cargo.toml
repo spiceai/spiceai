@@ -1,6 +1,7 @@
 [workspace]
 default-members = ["bin/spiced"]
 members = [
+    "bin/spice/",
     "bin/spiced/",
     "crates/app",
     "crates/arrow_sql_gen",

@@ -67,55 +67,7 @@ jobs:
         id: check
         uses: ./.github/actions/check-code-changes
 
-  # Run Go linting in parallel with Rust linting
-  lint-go:
-    name: Go Lint
-    runs-on: spiceai-dev-runners
-    needs: check_changes
-    env:
-      GOVER: 1.25.5
-
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          fetch-depth: 1
-
-      - name: Cache Go modules
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Set up Go
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
-
-      - name: Install golangci-lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          # Install golangci-lint v2.8.0+ which supports Go 1.25
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.8.0
-
-      - name: Install make
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y make
-
-      - name: Run Go lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make lint-go
-
-  # Run Rust linting in parallel with Go linting
+  # Run Rust linting
   lint-rust:
     name: Rust Lint
     runs-on: spiceai-dev-runners
@@ -186,7 +138,7 @@ jobs:
   build-test:
     name: Build and Test
     runs-on: spiceai-dev-runners
-    needs: [check_changes, lint-go, lint-rust]
+    needs: [check_changes, lint-rust]
     env:
       GOVER: 1.25.5
 

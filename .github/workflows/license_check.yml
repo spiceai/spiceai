@@ -54,26 +54,3 @@ jobs:
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
-
-  license-check-go:
-    name: Check Golang Licenses
-    runs-on: self-hosted
-    env:
-      GOVER: 1.25.3
-
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
-      - name: Set up Go
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
-
-      - name: Install go-licences
-        run: go get github.com/google/go-licenses
-
-      - name: Check spice licenses
-        working-directory: bin/spice
-        run: |
-          go-licenses csv . 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}
