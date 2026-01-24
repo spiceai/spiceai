@@ -174,6 +174,8 @@ impl IcebergDataConnector {
         if source.starts_with("file://")
             || source.starts_with("s3://")
             || source.starts_with("s3a://")
+            || source.starts_with("gs://")
+            || source.starts_with("gcs://")
         {
             let metadata_mode = self
                 .params
@@ -258,7 +260,7 @@ impl IcebergDataConnector {
                 Error::InvalidConfiguration {
                     dataconnector: "iceberg".into(),
                     message: format!(
-                        "A Dataset Path is required for Iceberg in the format of: file:///tmp/hadoop_warehouse/<namespace>/<table_name> or s3://<bucket>/<namespace>/<table_name>.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/iceberg#from\n{e}"
+                        "A Dataset Path is required for Iceberg in the format of: file:///tmp/hadoop_warehouse/<namespace>/<table_name>, s3://<bucket>/<namespace>/<table_name>, or gs://<bucket>/<namespace>/<table_name>.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/iceberg#from\n{e}"
                     ),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
