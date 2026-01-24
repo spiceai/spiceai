@@ -157,25 +157,37 @@ impl TableProviderFactory for ArrowFactory {
         let primary_key_columns = extract_primary_key_columns(&cmd.constraints, &schema);
 
         // Hash index is disabled by default. Must be explicitly enabled with hash_index=enabled.
-        // When enabled, a primary_key must be specified.
+        // When enabled, either a primary_key or secondary indexes (via `indexes`) must be specified.
         let enable_hash_index = cmd
             .options
             .get("hash_index")
             .is_some_and(|v| v.eq_ignore_ascii_case("enabled"));
 
-        // If hash index is enabled, use IndexedMemTable (requires primary key)
+        // If hash index is enabled, use IndexedMemTable
         if enable_hash_index {
-            if primary_key_columns.is_empty() {
+            // Parse secondary indexes to check if any are unique
+            let indexes_config = if let Some(indexes_str) = cmd.options.get("indexes") {
+                parse_indexes_option(indexes_str, &schema)?
+            } else {
+                Vec::new()
+            };
+            let has_unique_secondary_indexes = indexes_config
+                .iter()
+                .any(|(_, index_type)| *index_type == IndexType::Unique);
+
+            // At least one of primary_key or unique indexes must be specified
+            if primary_key_columns.is_empty() && !has_unique_secondary_indexes {
                 return Err(DataFusionError::Configuration(
-                    "hash_index requires a primary_key to be specified".to_string(),
+                    "hash_index requires a primary_key or unique indexes to be specified"
+                        .to_string(),
                 ));
             }
+
             let mut indexed_table =
                 IndexedMemTable::try_new(Arc::clone(&schema), vec![], primary_key_columns)?;
 
-            // Parse and create secondary indexes if specified
-            if let Some(indexes_str) = cmd.options.get("indexes") {
-                let indexes_config = parse_indexes_option(indexes_str, &schema)?;
+            // Create secondary indexes from parsed config
+            if !indexes_config.is_empty() {
                 let mut secondary_indexes = Vec::new();
 
                 for (columns, index_type) in indexes_config {
@@ -287,6 +299,7 @@ impl TableProviderFactory for ArrowFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::RecordBatch;
     use arrow::datatypes::{Field, Schema};
     use datafusion::common::{Constraint, Constraints};
     use datafusion::execution::SessionStateBuilder;
@@ -374,11 +387,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_factory_hash_index_enabled_requires_primary_key() {
+    async fn test_factory_hash_index_enabled_requires_primary_key_or_indexes() {
         let factory = ArrowFactory::new();
         let schema = create_test_schema();
 
-        // Create command with hash_index=enabled but NO primary key
+        // Create command with hash_index=enabled but NO primary key and NO indexes
         let constraints = Constraints::new_unverified(vec![]);
         let mut options = HashMap::new();
         options.insert("hash_index".to_string(), "enabled".to_string());
@@ -405,12 +418,12 @@ mod tests {
         let state = SessionStateBuilder::new().build();
         let result = factory.create(&state, &cmd).await;
 
-        // Should fail because hash_index=enabled requires a primary_key
+        // Should fail because hash_index=enabled requires primary_key or unique indexes
         assert!(result.is_err());
         let err = result.expect_err("expected error");
         assert!(
-            err.to_string().contains("primary_key"),
-            "Error should mention primary_key requirement: {err}"
+            err.to_string().contains("primary_key or unique indexes"),
+            "Error should mention primary_key or unique indexes requirement: {err}"
         );
     }
 
@@ -610,5 +623,284 @@ mod tests {
 
         let result3 = parse_indexes_option("col1:ENABLED", &schema).expect("parse failed");
         assert_eq!(result3[0].1, IndexType::Enabled);
+    }
+
+    /// Test that querying on non-indexed column (neither PK nor secondary index) with
+    /// `hash_index` enabled returns correct data. This is a critical data correctness test:
+    /// the index should NOT be used for non-indexed columns, and queries should still
+    /// return correct results via full scan.
+    #[tokio::test]
+    async fn test_factory_query_non_indexed_column_returns_correct_data() {
+        use arrow::array::Int64Array;
+        use datafusion::prelude::*;
+
+        let factory = ArrowFactory::new();
+
+        // Create schema with id as PK and name as non-indexed column
+        let arrow_schema = Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Int64, false),
+            Field::new("name", arrow::datatypes::DataType::Utf8, false),
+        ]);
+
+        // Create command with hash_index enabled on "id" PK
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let mut options = HashMap::new();
+        options.insert("hash_index".to_string(), "enabled".to_string());
+
+        let cmd = CreateExternalTable {
+            schema: Arc::new(
+                datafusion::common::DFSchema::try_from(arrow_schema.clone())
+                    .expect("schema conversion"),
+            ),
+            name: "test_table".into(),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            or_replace: false,
+            temporary: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints,
+            column_defaults: HashMap::new(),
+        };
+
+        let state = SessionStateBuilder::new().build();
+        let table = factory
+            .create(&state, &cmd)
+            .await
+            .expect("failed to create table");
+
+        // Register and insert test data
+        let ctx = SessionContext::new();
+        ctx.register_table("test_table", table)
+            .expect("failed to register");
+
+        // Insert data using SQL
+        let insert_sql = "INSERT INTO test_table VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie'), (42, 'target_name')";
+        ctx.sql(insert_sql)
+            .await
+            .expect("insert failed")
+            .collect()
+            .await
+            .expect("insert failed");
+
+        // Query on NON-indexed column "name"
+        let df = ctx
+            .sql("SELECT id, name FROM test_table WHERE name = 'target_name'")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        // Should return exactly 1 row with id=42
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 1,
+            "Query on non-PK column 'name' should return 1 row, but got {total_rows}"
+        );
+
+        if total_rows > 0 {
+            let id_col = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("expected int64");
+            assert_eq!(
+                id_col.value(0),
+                42,
+                "Query WHERE name='target_name' should return row with id=42"
+            );
+        }
+    }
+
+    /// Test that EXPLAIN for non-indexed column (neither PK nor secondary index) query
+    /// does NOT show `IndexedLookupExec`.
+    #[tokio::test]
+    async fn test_factory_explain_non_indexed_column_no_indexed_scan() {
+        use datafusion::prelude::*;
+
+        let factory = ArrowFactory::new();
+
+        let arrow_schema = Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Int64, false),
+            Field::new("name", arrow::datatypes::DataType::Utf8, false),
+        ]);
+
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let mut options = HashMap::new();
+        options.insert("hash_index".to_string(), "enabled".to_string());
+
+        let cmd = CreateExternalTable {
+            schema: Arc::new(
+                datafusion::common::DFSchema::try_from(arrow_schema.clone())
+                    .expect("schema conversion"),
+            ),
+            name: "test_table".into(),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            or_replace: false,
+            temporary: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints,
+            column_defaults: HashMap::new(),
+        };
+
+        let state = SessionStateBuilder::new().build();
+        let table = factory
+            .create(&state, &cmd)
+            .await
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test_table", table)
+            .expect("failed to register");
+
+        // Insert data to trigger index creation
+        ctx.sql("INSERT INTO test_table VALUES (1, 'alice'), (42, 'bob')")
+            .await
+            .expect("insert failed")
+            .collect()
+            .await
+            .expect("insert failed");
+
+        // Get explain plan for query on non-PK column
+        let df = ctx
+            .sql("SELECT * FROM test_table WHERE name = 'alice'")
+            .await
+            .expect("query failed");
+        let plan = df
+            .create_physical_plan()
+            .await
+            .expect("failed to create physical plan");
+        let plan_str =
+            datafusion::physical_plan::display::DisplayableExecutionPlan::new(plan.as_ref())
+                .indent(true)
+                .to_string();
+
+        // MUST NOT show IndexedLookupExec for non-PK column
+        assert!(
+            !plan_str.contains("IndexedLookupExec"),
+            "EXPLAIN should NOT show IndexedLookupExec when filtering on non-PK column 'name'. Got:\n{plan_str}"
+        );
+        assert!(
+            !plan_str.contains("indexed_scan"),
+            "EXPLAIN should NOT show indexed_scan when filtering on non-PK column. Got:\n{plan_str}"
+        );
+    }
+
+    /// Test SQL query on STRING primary key through `ArrowFactory`.
+    ///
+    /// This test replicates a production bug where:
+    /// - Table has string column as primary key (e.g., `c_name`)
+    /// - `hash_index` is enabled
+    /// - Data is inserted via INSERT statements
+    /// - SQL query: SELECT * FROM customer WHERE `c_name` = 'Customer#000000000000042'
+    /// - Bug: Returns 0 rows when it should return 1
+    ///
+    /// CRITICAL DATA CORRECTNESS TEST.
+    #[tokio::test]
+    async fn test_factory_string_primary_key_query() {
+        use arrow::array::{Int64Array, StringArray};
+        use datafusion::prelude::*;
+
+        let factory = ArrowFactory::new();
+
+        // Schema with STRING as primary key (column index 0)
+        let arrow_schema = Schema::new(vec![
+            Field::new("c_name", arrow::datatypes::DataType::Utf8, false),
+            Field::new("c_custkey", arrow::datatypes::DataType::Int64, false),
+        ]);
+
+        // Primary key is c_name (string column, index 0)
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let mut options = HashMap::new();
+        options.insert("hash_index".to_string(), "enabled".to_string());
+
+        let cmd = CreateExternalTable {
+            schema: Arc::new(
+                datafusion::common::DFSchema::try_from(arrow_schema.clone())
+                    .expect("schema conversion"),
+            ),
+            name: "customer".into(),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            or_replace: false,
+            temporary: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints,
+            column_defaults: HashMap::new(),
+        };
+
+        let state = SessionStateBuilder::new().build();
+        let table = factory
+            .create(&state, &cmd)
+            .await
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("customer", Arc::clone(&table))
+            .expect("failed to register");
+
+        // Insert multiple rows with TPC-H style customer names
+        ctx.sql(
+            "INSERT INTO customer VALUES \
+             ('Customer#000000000000001', 1), \
+             ('Customer#000000000000042', 42), \
+             ('Customer#000000000000100', 100)",
+        )
+        .await
+        .expect("insert failed")
+        .collect()
+        .await
+        .expect("insert failed");
+
+        // Trigger index maintenance (this is what the runtime does after inserts)
+        crate::index_maintenance::perform_index_maintenance(table.as_ref())
+            .await
+            .expect("index maintenance failed");
+
+        // Query on STRING primary key - this is the exact pattern that was failing
+        let target_name = "Customer#000000000000042";
+        let df = ctx
+            .sql(&format!(
+                "SELECT c_name, c_custkey FROM customer WHERE c_name = '{target_name}'"
+            ))
+            .await
+            .expect("query failed");
+
+        let batches = df.collect().await.expect("collect failed");
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        assert_eq!(
+            total_rows, 1,
+            "Query on STRING primary key should return 1 row, got {total_rows}"
+        );
+
+        // Verify correct data returned
+        let name_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("expected string");
+        assert_eq!(name_col.value(0), target_name);
+
+        let custkey_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected int64");
+        assert_eq!(custkey_col.value(0), 42);
     }
 }

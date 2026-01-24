@@ -109,6 +109,14 @@ impl Telemetry {
     #[must_use]
     pub fn with_otlp(config: OtlpExporterConfig) -> Self {
         let resource = Resource::builder_empty().build();
+        Self::with_otlp_resource(config, resource)
+    }
+
+    /// Create telemetry with OTLP backend and a resource provided upfront.
+    ///
+    /// Use this when the resource attributes are already available at creation time.
+    #[must_use]
+    pub fn with_otlp_resource(config: OtlpExporterConfig, resource: Resource) -> Self {
         let reader = InitialReader::default();
 
         let provider = SdkMeterProvider::builder()

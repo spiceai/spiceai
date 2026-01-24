@@ -309,27 +309,25 @@ impl<R: Read + Send> BufRead for ArrayToNdjson<R> {
 /// Filter out newlines and carriage returns from JSON element bytes,
 /// also skip leading and trailing whitespace. Used by both pull and push implementations.
 fn filter_element_bytes(element_bytes: &[u8], output: &mut VecDeque<u8>) {
-    // First, filter out newlines and carriage returns
-    let filtered: Vec<u8> = element_bytes
-        .iter()
-        .filter(|&&b| b != b'\n' && b != b'\r')
-        .copied()
-        .collect();
+    // Predicate: keep bytes that are not newlines or carriage returns
+    let is_content = |&b: &u8| b != b'\n' && b != b'\r';
 
-    // Find the first and last non-whitespace characters
-    let start = filtered
+    // Find the first non-whitespace content byte
+    let start = element_bytes
         .iter()
-        .position(|&b| !b.is_ascii_whitespace())
-        .unwrap_or(0);
-    let end = filtered
-        .iter()
-        .rposition(|&b| !b.is_ascii_whitespace())
-        .unwrap_or(filtered.len());
+        .position(|b| is_content(b) && !b.is_ascii_whitespace());
 
-    // Add the trimmed content
-    if start <= end && end < filtered.len() {
-        for &byte in &filtered[start..=end] {
-            output.push_back(byte);
+    // Find the last non-whitespace content byte
+    let end = element_bytes
+        .iter()
+        .rposition(|b| is_content(b) && !b.is_ascii_whitespace());
+
+    // Add the trimmed content, filtering out newlines/carriage returns in a single pass
+    if let (Some(start), Some(end)) = (start, end) {
+        for &byte in &element_bytes[start..=end] {
+            if is_content(&byte) {
+                output.push_back(byte);
+            }
         }
     }
     output.push_back(b'\n');
@@ -629,6 +627,165 @@ mod tests {
             line.clear();
         }
         Ok(lines)
+    }
+
+    // Direct unit tests for filter_element_bytes function
+    mod filter_element_bytes_tests {
+        use super::*;
+
+        fn filter_to_string(input: &[u8]) -> String {
+            let mut output = VecDeque::new();
+            filter_element_bytes(input, &mut output);
+            // Remove trailing newline for easier comparison
+            let bytes: Vec<u8> = output.into_iter().collect();
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\n')
+                .to_string()
+        }
+
+        #[test]
+        fn test_filter_basic_json() {
+            let input = b"{\"name\": \"John\"}";
+            assert_eq!(filter_to_string(input), r#"{"name": "John"}"#);
+        }
+
+        #[test]
+        fn test_filter_removes_newlines() {
+            let input = b"{\n\"name\":\n\"John\"\n}";
+            assert_eq!(filter_to_string(input), r#"{"name":"John"}"#);
+        }
+
+        #[test]
+        fn test_filter_removes_carriage_returns() {
+            let input = b"{\r\"name\":\r\"John\"\r}";
+            assert_eq!(filter_to_string(input), r#"{"name":"John"}"#);
+        }
+
+        #[test]
+        fn test_filter_removes_mixed_line_endings() {
+            let input = b"{\r\n\"name\":\n\r\"John\"\r\n}";
+            assert_eq!(filter_to_string(input), r#"{"name":"John"}"#);
+        }
+
+        #[test]
+        fn test_filter_trims_leading_whitespace() {
+            let input = b"   \t{\"name\": \"John\"}";
+            assert_eq!(filter_to_string(input), r#"{"name": "John"}"#);
+        }
+
+        #[test]
+        fn test_filter_trims_trailing_whitespace() {
+            let input = b"{\"name\": \"John\"}   \t";
+            assert_eq!(filter_to_string(input), r#"{"name": "John"}"#);
+        }
+
+        #[test]
+        fn test_filter_trims_both_ends() {
+            let input = b"  \t {\"name\": \"John\"}  \t ";
+            assert_eq!(filter_to_string(input), r#"{"name": "John"}"#);
+        }
+
+        #[test]
+        fn test_filter_handles_leading_newlines_as_whitespace() {
+            // Leading newlines should be treated as whitespace and trimmed
+            let input = b"\n\n{\"x\": 1}\n\n";
+            assert_eq!(filter_to_string(input), r#"{"x": 1}"#);
+        }
+
+        #[test]
+        fn test_filter_empty_input() {
+            // Empty input should just produce a newline
+            let input = b"";
+            let mut output = VecDeque::new();
+            filter_element_bytes(input, &mut output);
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0], b'\n');
+        }
+
+        #[test]
+        fn test_filter_only_whitespace() {
+            // Whitespace-only input should just produce a newline
+            let input = b"   \t\n  ";
+            let mut output = VecDeque::new();
+            filter_element_bytes(input, &mut output);
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0], b'\n');
+        }
+
+        #[test]
+        fn test_filter_only_newlines_and_carriage_returns() {
+            // Input with only newlines/carriage returns should produce just a newline
+            let input = b"\n\r\n\r";
+            let mut output = VecDeque::new();
+            filter_element_bytes(input, &mut output);
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0], b'\n');
+        }
+
+        #[test]
+        fn test_filter_preserves_internal_spaces() {
+            // Spaces inside the JSON content should be preserved
+            let input = b"{\"name\":  \"John  Doe\"}";
+            assert_eq!(filter_to_string(input), r#"{"name":  "John  Doe"}"#);
+        }
+
+        #[test]
+        fn test_filter_preserves_internal_tabs() {
+            let input = b"{\"name\":\t\"John\"}";
+            assert_eq!(filter_to_string(input), "{\"name\":\t\"John\"}");
+        }
+
+        #[test]
+        fn test_filter_complex_json() {
+            let input = b"  \n{\n  \"users\": [\n    {\"name\": \"Alice\"},\n    {\"name\": \"Bob\"}\n  ]\n}\n  ";
+            let result = filter_to_string(input);
+            // Should have all newlines removed and be trimmed
+            assert!(!result.contains('\n'));
+            assert!(!result.contains('\r'));
+            assert!(result.starts_with('{'));
+            assert!(result.ends_with('}'));
+        }
+
+        #[test]
+        fn test_filter_appends_newline() {
+            // The function should always append a newline at the end
+            let input = b"{}";
+            let mut output = VecDeque::new();
+            filter_element_bytes(input, &mut output);
+            let bytes: Vec<u8> = output.into_iter().collect();
+            assert_eq!(bytes.last(), Some(&b'\n'));
+        }
+
+        #[test]
+        fn test_filter_single_character() {
+            let input = b"1";
+            assert_eq!(filter_to_string(input), "1");
+        }
+
+        #[test]
+        fn test_filter_number() {
+            let input = b"  42  ";
+            assert_eq!(filter_to_string(input), "42");
+        }
+
+        #[test]
+        fn test_filter_null() {
+            let input = b"  null  ";
+            assert_eq!(filter_to_string(input), "null");
+        }
+
+        #[test]
+        fn test_filter_boolean() {
+            let input = b"  true  ";
+            assert_eq!(filter_to_string(input), "true");
+        }
+
+        #[test]
+        fn test_filter_string_with_escaped_newline() {
+            // Escaped newlines in strings (\\n) should be preserved as literal characters
+            let input = br#"{"text": "line1\nline2"}"#;
+            assert_eq!(filter_to_string(input), r#"{"text": "line1\nline2"}"#);
+        }
     }
 
     #[test]

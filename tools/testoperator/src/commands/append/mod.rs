@@ -179,17 +179,13 @@ struct AppendTestMetrics {
     branch_name: Option<String>,
     max_memory: Option<f64>,
     median_memory: Option<f64>,
-    telemetry: Telemetry,
 }
 
 impl AppendTestMetrics {
     fn new(app_name: impl Into<String>, query_set: impl Into<String>) -> Self {
-        let telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
-
         Self {
             app_name: app_name.into(),
             query_set: query_set.into(),
-            telemetry,
             spiced_version: None,
             testoperator_commit_sha: None,
             spiced_commit_sha: None,
@@ -226,7 +222,7 @@ impl AppendTestMetrics {
     }
 
     /// Emit metrics and telemetry for the test result.
-    async fn emit(mut self, test_status: TestStatus) -> anyhow::Result<()> {
+    async fn emit(self, test_status: TestStatus) -> anyhow::Result<()> {
         let resource = Resource::builder_empty()
             .with_attributes(vec![
                 KeyValue::new("service.name", "testoperator"),
@@ -254,7 +250,8 @@ impl AppendTestMetrics {
             ])
             .build();
 
-        self.telemetry.set_resource(resource);
+        // Create telemetry with resource upfront, before recording any metrics
+        let telemetry = Telemetry::new_with_resource(&resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
         crate::metrics::STATUS.record(test_status.to_u64(), &[]);
 
@@ -265,7 +262,7 @@ impl AppendTestMetrics {
             crate::metrics::MEDIAN_MEMORY_USAGE.record(median_mem * 1024.0, &[]);
         }
 
-        self.telemetry.emit().await
+        telemetry.emit().await
     }
 }
 

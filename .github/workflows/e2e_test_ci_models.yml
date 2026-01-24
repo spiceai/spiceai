@@ -29,7 +29,7 @@ env:
 jobs:
   resolve-run:
     name: Resolve parent workflow run
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       run_id: ${{ steps.resolve.outputs.run_id }}
       head_sha: ${{ steps.resolve.outputs.head_sha }}
@@ -80,7 +80,7 @@ jobs:
 
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs:
       - resolve-run
     if: ${{ needs.resolve-run.outputs.conclusion == 'success' }}

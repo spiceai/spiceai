@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -9,40 +8,40 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "How is microsporidia infection typically acquired?"
+        "question": "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
       },
       "primary_key": {
-        "id": 446
+        "id": 938
       },
       "score": 0.01
     },
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
+        "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
       },
       "primary_key": {
-        "id": 1193
+        "id": 1015
       },
       "score": 0.01
     },
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+        "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
       },
       "primary_key": {
-        "id": 449
+        "id": 821
       },
       "score": 0.01
     },
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "Which of the following is an intensive property of a system?"
+        "question": "Which compound is not an intermediate of the TCA cycle?"
       },
       "primary_key": {
-        "id": 1289
+        "id": 1279
       },
       "score": 0.01
     }

@@ -35,7 +35,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, Result};
+use datafusion::common::{Constraint, Constraints, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -44,9 +44,10 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_table_providers::util::on_conflict::OnConflict;
-use hash_index::{HashIndex, HashIndexBuilder, RowLocation, index_threshold};
+use hash_index::{HashIndex, HashIndexBuilder, RowLocation};
 
 use super::write::MemTable;
+use crate::index_maintenance::IndexMaintenanceProvider;
 
 /// Configuration for a secondary hash index.
 #[derive(Debug, Clone)]
@@ -140,7 +141,7 @@ impl IndexedMemTable {
         schema: SchemaRef,
         partitions: Vec<Vec<RecordBatch>>,
         primary_key_columns: Vec<String>,
-        parallelism: Option<usize>,
+        _parallelism: Option<usize>,
     ) -> Result<Self> {
         let inner = MemTable::try_new(Arc::clone(&schema), partitions.clone())?;
 
@@ -162,20 +163,19 @@ impl IndexedMemTable {
                 .map(RecordBatch::num_rows)
                 .sum();
 
-            // Use provided parallelism or fall back to CPU count
-            let parallelism = parallelism.unwrap_or_else(num_cpus::get);
-            let threshold = index_threshold(parallelism);
-
-            // Build the hash index only if row count exceeds threshold
-            HashIndexBuilder::new(primary_key_columns.clone())
-                .with_expected_rows(total_rows)
-                .with_min_rows_threshold(threshold)
-                .allow_duplicates(false)
-                .try_build(&partitions)
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to build hash index: {e}"))
-                })?
-                .map(Arc::new)
+            // Always build the hash index when primary key is specified.
+            // IndexedMemTable is only created when hash_index is explicitly enabled,
+            // so we should always create the index even if empty (it will be rebuilt
+            // after data is inserted).
+            Some(Arc::new(
+                HashIndexBuilder::new(primary_key_columns.clone())
+                    .with_expected_rows(total_rows)
+                    .allow_duplicates(false)
+                    .build(&partitions)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to build hash index: {e}"))
+                    })?,
+            ))
         };
 
         Ok(Self {
@@ -453,8 +453,26 @@ impl IndexedMemTable {
     }
 
     /// Adds constraints to the table.
+    ///
+    /// Note: `Unique` constraints are filtered out because `IndexedMemTable` handles
+    /// uniqueness through secondary indexes. The underlying `MemTable` doesn't support
+    /// `Unique` constraints, so we only pass through `PrimaryKey` constraints.
     pub async fn try_with_constraints(mut self, constraints: Constraints) -> Result<Self> {
-        self.inner = self.inner.try_with_constraints(constraints).await?;
+        // Filter out Unique constraints - IndexedMemTable handles uniqueness via secondary indexes.
+        // The underlying MemTable doesn't support Unique constraints.
+        let filtered_constraints: Vec<Constraint> = constraints
+            .iter()
+            .filter(|c| matches!(c, Constraint::PrimaryKey(_)))
+            .cloned()
+            .collect();
+
+        if filtered_constraints.is_empty() {
+            // No primary key constraints to apply
+            return Ok(self);
+        }
+
+        let new_constraints = Constraints::new_unverified(filtered_constraints);
+        self.inner = self.inner.try_with_constraints(new_constraints).await?;
         Ok(self)
     }
 
@@ -599,6 +617,15 @@ impl TableProvider for IndexedMemTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Debug: Log what filters we received and our index configuration
+        tracing::debug!(
+            primary_key_columns = ?self.primary_key_columns,
+            secondary_indexes_count = self.secondary_indexes.len(),
+            filters_count = filters.len(),
+            filters = ?filters,
+            "IndexedMemTable::scan called"
+        );
+
         // Check if we can use the primary key index for a point lookup
         if let (Some(index), Some(pk_value)) =
             (&self.index, self.extract_pk_equality_value(filters))
@@ -664,6 +691,12 @@ impl TableProvider for IndexedMemTable {
         // Note: Secondary indexes with unique=true work like primary key lookups (single result)
         // Non-unique secondary indexes still provide fast lookup but may have collisions
         if let Some((secondary, key_value)) = self.find_secondary_index_match(filters) {
+            tracing::debug!(
+                secondary_index_name = %secondary.name,
+                secondary_columns = ?secondary.columns,
+                secondary_unique = secondary.unique,
+                "Found secondary index match"
+            );
             // Only use indexed lookup for unique secondary indexes
             // Non-unique indexes would need multi-value support which hash-index doesn't provide yet
             // Also verify this is a single-column index since verification below only checks first column
@@ -748,6 +781,13 @@ impl TableProvider for IndexedMemTable {
     }
 }
 
+#[async_trait]
+impl IndexMaintenanceProvider for IndexedMemTable {
+    async fn perform_maintenance(&self) -> Result<()> {
+        self.rebuild_index().await
+    }
+}
+
 /// Execution plan for indexed lookups.
 ///
 /// This is a simple wrapper that returns pre-computed results from index lookups.
@@ -761,6 +801,10 @@ pub struct IndexedLookupExec {
     pk_columns: Vec<String>,
     /// Whether the lookup found a result.
     found_result: bool,
+    /// Metrics for this execution plan.
+    metrics: datafusion::physical_plan::metrics::ExecutionPlanMetricsSet,
+    /// Number of rows that will be output (0 or 1 for point lookups).
+    output_rows: usize,
 }
 
 impl IndexedLookupExec {
@@ -781,12 +825,17 @@ impl IndexedLookupExec {
             Boundedness::Bounded,
         );
 
+        // For indexed point lookups, output_rows is 0 or 1
+        let output_rows = usize::from(found_result);
+
         Self {
             schema,
             result: std::sync::Mutex::new(Some(stream)),
             properties,
             pk_columns,
             found_result,
+            metrics: datafusion::physical_plan::metrics::ExecutionPlanMetricsSet::new(),
+            output_rows,
         }
     }
 
@@ -860,9 +909,28 @@ impl ExecutionPlan for IndexedLookupExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        use datafusion::physical_plan::metrics::MetricBuilder;
+
+        // Record output rows metric
+        MetricBuilder::new(&self.metrics)
+            .output_rows(partition)
+            .add(self.output_rows);
+
+        // Record OTel metrics for hash index lookups
+        {
+            let mut dimensions: Vec<telemetry::KeyValue> = Vec::new();
+
+            // Attach dataset name from schema metadata when available for better attribution
+            if let Some(dataset_name) = self.schema.metadata().get("dataset") {
+                dimensions.push(telemetry::KeyValue::new("dataset", dataset_name.clone()));
+            }
+            telemetry::track_hash_index_lookups(1, &dimensions);
+            telemetry::track_hash_index_lookup_rows(self.output_rows as u64, &dimensions);
+        }
+
         // Take the pre-computed result
         let mut guard = self.result.lock().map_err(|_| {
             DataFusionError::Execution("Failed to acquire lock on result".to_string())
@@ -871,6 +939,10 @@ impl ExecutionPlan for IndexedLookupExec {
         guard.take().ok_or_else(|| {
             DataFusionError::Execution("IndexedLookupExec can only be executed once".to_string())
         })
+    }
+
+    fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 
@@ -1053,9 +1125,12 @@ mod tests {
         let _ = result.expect_err("expected error for table without index");
     }
 
+    /// Test that an index is always created when primary key is specified,
+    /// regardless of row count. This is by design since `IndexedMemTable` is only
+    /// used when `hash_index=enabled` is explicitly specified by the user.
     #[tokio::test]
-    async fn test_below_threshold_no_index() {
-        // With parallelism=1, threshold is 256. Create only 100 rows.
+    async fn test_always_creates_index_with_primary_key() {
+        // Create a small table (only 100 rows)
         let batch = create_large_test_batch(100);
         let schema = batch.schema();
 
@@ -1066,16 +1141,17 @@ mod tests {
         )
         .expect("failed to create table");
 
-        // Below threshold, no index should be created
+        // Index should always be created when primary key is specified
         assert!(
-            !table.has_index(),
-            "Index should NOT be created when row count (100) is below threshold (256)"
+            table.has_index(),
+            "Index SHOULD be created regardless of row count when hash_index is enabled"
         );
+        assert_eq!(table.index().map(|i| i.len()), Some(100));
     }
 
     #[tokio::test]
-    async fn test_at_threshold_has_index() {
-        // With parallelism=1, threshold is 256. Create exactly 256 rows.
+    async fn test_larger_table_has_index() {
+        // Create a larger table (256 rows)
         let batch = create_large_test_batch(256);
         let schema = batch.schema();
 
@@ -1086,10 +1162,10 @@ mod tests {
         )
         .expect("failed to create table");
 
-        // At threshold, index should be created
+        // Index should be created
         assert!(
             table.has_index(),
-            "Index SHOULD be created when row count (256) equals threshold (256)"
+            "Index SHOULD be created for larger tables"
         );
     }
 
@@ -1121,6 +1197,112 @@ mod tests {
         assert_eq!(pushdown, vec![TableProviderFilterPushDown::Unsupported]);
     }
 
+    /// Test that filtering on a non-indexed column returns Unsupported pushdown.
+    /// A "non-indexed column" is one that is neither the primary key nor has a secondary index.
+    /// This is a critical data correctness test: queries on non-indexed columns
+    /// must NOT use the index (which would return wrong results).
+    #[tokio::test]
+    async fn test_filter_pushdown_non_indexed_column_returns_unsupported() {
+        // Table has PK index on "id" but NO secondary index on "name"
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch]],
+            vec!["id".to_string()], // PK is "id", "name" is NOT indexed
+        )
+        .expect("failed to create table");
+
+        // Equality on non-indexed column should get Unsupported
+        let filter_name = col("name").eq(lit("name_42"));
+        let pushdown = table
+            .supports_filters_pushdown(&[&filter_name])
+            .expect("pushdown check failed");
+        assert_eq!(
+            pushdown,
+            vec![TableProviderFilterPushDown::Unsupported],
+            "Filter on non-indexed column 'name' should return Unsupported"
+        );
+    }
+
+    /// Test that querying on a non-indexed column returns correct data via full scan.
+    /// A "non-indexed column" is one that has neither a primary key nor a secondary index.
+    /// This test verifies data correctness when an index exists but shouldn't be used.
+    #[tokio::test]
+    async fn test_query_non_indexed_column_returns_correct_data() {
+        // Table has PK index on "id" but NO secondary index on "name"
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch]],
+            vec!["id".to_string()], // PK is "id", "name" is NOT indexed
+        )
+        .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // Query on non-indexed column "name" should still return correct data via full scan
+        let df = ctx
+            .sql("SELECT id, name FROM test WHERE name = 'name_42'")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        // Should return exactly 1 row with id=42 and name='name_42'
+        let total_rows: usize = batches.iter().map(arrow_array::RecordBatch::num_rows).sum();
+        assert_eq!(
+            total_rows, 1,
+            "Query on non-indexed column 'name' should return 1 row, not {total_rows}"
+        );
+
+        let id_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected int64");
+        assert_eq!(
+            id_col.value(0),
+            42,
+            "Query WHERE name='name_42' should return row with id=42"
+        );
+    }
+
+    /// Test EXPLAIN output when filtering on non-indexed column.
+    /// The plan should NOT show `IndexedLookupExec` for columns without any index.
+    #[tokio::test]
+    async fn test_explain_non_indexed_column_no_indexed_scan() {
+        let batch = create_test_indexed_table_force_index(
+            create_test_batch(vec![1, 2, 3], vec!["alice", "bob", "charlie"]).schema(),
+            vec![vec![create_test_batch(
+                vec![1, 2, 3],
+                vec!["alice", "bob", "charlie"],
+            )]],
+            vec!["id".to_string()], // PK is "id", "name" has NO secondary index
+        )
+        .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test_table", Arc::new(batch))
+            .expect("failed to register");
+
+        // Query on non-indexed column "name" should NOT use indexed scan
+        let plan = explain_plan(&ctx, "SELECT * FROM test_table WHERE name = 'alice'").await;
+
+        assert!(
+            !plan.contains("IndexedLookupExec"),
+            "EXPLAIN should NOT show IndexedLookupExec when filtering on non-indexed column 'name'. Got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("indexed_scan"),
+            "EXPLAIN should NOT show indexed_scan when filtering on non-indexed column. Got:\n{plan}"
+        );
+    }
+
     #[tokio::test]
     async fn test_with_constraints() {
         use datafusion::common::{Constraint, Constraints};
@@ -1143,6 +1325,66 @@ mod tests {
             .await
             .expect("failed to add constraints");
 
+        assert!(table.constraints().is_some());
+    }
+
+    /// Test that `Unique` constraints are filtered out and don't cause errors.
+    /// `IndexedMemTable` handles uniqueness via secondary indexes, so the underlying
+    /// `MemTable` shouldn't receive `Unique` constraints (which it doesn't support).
+    #[tokio::test]
+    async fn test_unique_constraints_are_filtered() {
+        use datafusion::common::{Constraint, Constraints};
+
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+
+        // Add ONLY a Unique constraint (no primary key) - this should NOT error
+        let constraints = Constraints::new_unverified(vec![Constraint::Unique(vec![1])]);
+        let table = table
+            .try_with_constraints(constraints)
+            .await
+            .expect("IndexedMemTable should filter out Unique constraints");
+
+        // The inner MemTable should have no constraints since Unique was filtered out
+        // and no PrimaryKey was provided
+        // The table should still work correctly
+        assert!(table.has_index());
+    }
+
+    /// Test that mixed constraints (`PrimaryKey` + `Unique`) work correctly.
+    /// Only `PrimaryKey` should be passed to the underlying `MemTable`.
+    #[tokio::test]
+    async fn test_mixed_constraints_primary_key_preserved() {
+        use datafusion::common::{Constraint, Constraints};
+
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+
+        // Add both PrimaryKey and Unique constraints
+        let constraints = Constraints::new_unverified(vec![
+            Constraint::PrimaryKey(vec![0]),
+            Constraint::Unique(vec![1]),
+        ]);
+        let table = table
+            .try_with_constraints(constraints)
+            .await
+            .expect("failed to add constraints");
+
+        // The table should have constraints (the PrimaryKey was preserved)
         assert!(table.constraints().is_some());
     }
 
@@ -1179,6 +1421,116 @@ mod tests {
         assert!(result.is_some());
         let batch = result.expect("expected result");
         assert_eq!(batch.num_rows(), 1);
+    }
+
+    /// Test SQL query on string primary key returns correct results.
+    ///
+    /// This test replicates a production bug where:
+    /// - Table has string column as primary key (e.g., `c_name`)
+    /// - `hash_index` is enabled
+    /// - SQL query: SELECT * FROM table WHERE `c_name` = 'Customer#000071684'
+    /// - Bug: Returns 0 rows when it should return 1
+    ///
+    /// CRITICAL DATA CORRECTNESS TEST.
+    #[tokio::test]
+    async fn test_sql_query_string_primary_key() {
+        // Create table with string primary key (like c_name in TPC-H customer)
+        let size = 300;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("c_name", DataType::Utf8, false),
+            Field::new("c_custkey", DataType::Int64, false),
+            Field::new("c_address", DataType::Utf8, false),
+        ]));
+
+        // Create data similar to TPC-H customer table
+        let names: Vec<String> = (0..size).map(|i| format!("Customer#{i:015}")).collect();
+        let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+        let custkeys: Vec<i64> = (0..i64::from(size)).collect();
+        let addresses: Vec<String> = (0..size).map(|i| format!("Address_{i}")).collect();
+        let addresses_ref: Vec<&str> = addresses.iter().map(String::as_str).collect();
+
+        let name_array = StringArray::from(names_ref);
+        let custkey_array = Int64Array::from(custkeys);
+        let address_array = StringArray::from(addresses_ref);
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(name_array),
+                Arc::new(custkey_array),
+                Arc::new(address_array),
+            ],
+        )
+        .expect("failed to create batch");
+
+        // Create table with c_name as primary key (STRING PK)
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch]],
+            vec!["c_name".to_string()],
+        )
+        .expect("failed to create table");
+
+        assert!(table.has_index(), "Index should be created");
+
+        // The target row: format!("Customer#{42:015}") = "Customer#000000000000042"
+        let target_name = "Customer#000000000000042";
+
+        // Verify the target row exists via direct get_by_key
+        let direct_result = table
+            .get_by_key(&target_name)
+            .await
+            .expect("direct lookup failed");
+        assert!(
+            direct_result.is_some(),
+            "Direct get_by_key should find the row"
+        );
+
+        // Register with DataFusion and query via SQL
+        let ctx = SessionContext::new();
+        ctx.register_table("customer", Arc::new(table))
+            .expect("failed to register");
+
+        // Test the exact query pattern from the bug report
+        let df = ctx
+            .sql(&format!(
+                "SELECT c_name, c_custkey FROM customer WHERE c_name = '{target_name}'"
+            ))
+            .await
+            .expect("query failed");
+
+        let batches = df.collect().await.expect("collect failed");
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        assert_eq!(
+            total_rows, 1,
+            "Query on string primary key should return 1 row, but got {total_rows}"
+        );
+
+        // Verify the correct row was returned
+        if total_rows > 0 {
+            let name_col = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("expected string");
+            assert_eq!(
+                name_col.value(0),
+                target_name,
+                "Should return the exact row we queried for"
+            );
+
+            let custkey_col = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("expected int64");
+            assert_eq!(
+                custkey_col.value(0),
+                42,
+                "Customer#000000000042 should have c_custkey=42"
+            );
+        }
     }
 
     #[tokio::test]

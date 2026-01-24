@@ -25,7 +25,7 @@ on:
 jobs:
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -124,7 +124,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           CHART_VERSION="${{ inputs.chart_version }}"
-          
+
           if [ "$CHART_VERSION" = "latest" ] || [ -z "$CHART_VERSION" ]; then
             # Get latest release tag from GitHub
             RELEASE_VERSION=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | jq -r '.tag_name')
@@ -176,7 +176,7 @@ jobs:
           helm package .
           CHART_FILE=$(ls spiceai-*.tgz)
           cd ../..
-          
+
           helm install spice-test ./deploy/chart/$CHART_FILE \
             --namespace spice-system \
             --create-namespace \
@@ -194,7 +194,7 @@ jobs:
           kubectl get deployments -n spice-system
           kubectl get pods -n spice-system
           kubectl get services -n spice-system
-          
+
           # Wait for pod to be ready
           kubectl wait --for=condition=Ready pod -l app=spice-test -n spice-system --timeout=300s
 
@@ -210,14 +210,14 @@ jobs:
         run: |
           POD_NAME=$(kubectl get pods -n spice-system -l app=spice-test -o jsonpath='{.items[0].metadata.name}')
           echo "Testing health endpoint on pod: $POD_NAME"
-          
+
           # Port forward in background
           kubectl port-forward -n spice-system $POD_NAME 8090:8090 &
           PF_PID=$!
-          
+
           # Wait for port forward to be ready
           sleep 5
-          
+
           # Test health endpoint
           for i in {1..30}; do
             if curl -s http://localhost:8090/health | grep -q "ok"; then
@@ -228,7 +228,7 @@ jobs:
             echo "Attempt $i: Health check not ready yet..."
             sleep 2
           done
-          
+
           kill $PF_PID || true
           echo "Health check failed after 30 attempts"
           exit 1
@@ -238,14 +238,14 @@ jobs:
         run: |
           POD_NAME=$(kubectl get pods -n spice-system -l app=spice-test -o jsonpath='{.items[0].metadata.name}')
           echo "Testing ready endpoint on pod: $POD_NAME"
-          
+
           # Port forward in background
           kubectl port-forward -n spice-system $POD_NAME 8090:8090 &
           PF_PID=$!
-          
+
           # Wait for port forward to be ready
           sleep 5
-          
+
           # Test ready endpoint
           for i in {1..30}; do
             if curl -s http://localhost:8090/v1/ready | grep -q "ready"; then
@@ -256,7 +256,7 @@ jobs:
             echo "Attempt $i: Ready check not ready yet..."
             sleep 2
           done
-          
+
           kill $PF_PID || true
           echo "Ready check failed after 30 attempts"
           exit 1
@@ -266,21 +266,21 @@ jobs:
         run: |
           POD_NAME=$(kubectl get pods -n spice-system -l app=spice-test -o jsonpath='{.items[0].metadata.name}')
           echo "Testing SQL query endpoint on pod: $POD_NAME"
-          
+
           # Port forward in background
           kubectl port-forward -n spice-system $POD_NAME 8090:8090 &
           PF_PID=$!
-          
+
           # Wait for port forward to be ready
           sleep 5
-          
+
           # Test simple SQL query
           RESPONSE=$(curl -s -X POST http://localhost:8090/v1/sql \
             -H "Content-Type: application/json" \
             -d '{"sql": "SELECT 1 as test", "parameters": {}}')
-          
+
           echo "Query response: $RESPONSE"
-          
+
           if echo "$RESPONSE" | jq -e '.[] | select(.test == 1)' > /dev/null; then
             echo "SQL query test passed!"
             kill $PF_PID || true
@@ -296,7 +296,7 @@ jobs:
         run: |
           helm list -n spice-system
           helm status spice-test -n spice-system
-          
+
           # Check if release is deployed
           if helm status spice-test -n spice-system | grep -q "STATUS: deployed"; then
             echo "Helm release is deployed successfully!"
@@ -309,7 +309,7 @@ jobs:
       - name: Test Helm upgrade
         run: |
           echo "Testing Helm upgrade..."
-          
+
           # Upgrade with same values (should be idempotent)
           helm upgrade spice-test ./deploy/chart \
             --namespace spice-system \
@@ -319,7 +319,7 @@ jobs:
             --set service.type=ClusterIP \
             --wait \
             --timeout 5m
-          
+
           # Verify upgrade succeeded
           if helm status spice-test -n spice-system | grep -q "STATUS: deployed"; then
             echo "Helm upgrade test passed!"

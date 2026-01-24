@@ -75,3 +75,6 @@ pr_body.md
 *.db
 *.db-wal
 *.db-shm
+
+# Cluster logs
+cluster_logs/

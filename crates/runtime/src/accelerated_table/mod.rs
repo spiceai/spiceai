@@ -323,6 +323,9 @@ pub struct Builder {
     caching_stale_if_error: bool,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     bootstrap_status: BootstrapStatus,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
+    acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
 }
 
 impl Builder {
@@ -364,7 +367,17 @@ impl Builder {
             caching_stale_if_error: false,
             resource_monitor: None,
             bootstrap_status: BootstrapStatus::none(),
+            acceleration_layout: None,
+            is_s3_express_acceleration: false,
         }
+    }
+
+    pub fn acceleration_layout(
+        &mut self,
+        layout: runtime_acceleration::snapshot::AccelerationLayout,
+    ) -> &mut Self {
+        self.acceleration_layout = Some(layout);
+        self
     }
 
     pub fn retention(&mut self, retention: Option<Retention>) -> &mut Self {
@@ -534,6 +547,12 @@ impl Builder {
         self
     }
 
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    pub fn s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
+        self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
     /// Build the accelerated table
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
@@ -675,6 +694,8 @@ impl Builder {
             refresher.with_resource_monitor(resource_monitor.clone());
         }
 
+        refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
         let refresh_handle = refresher.start(acceleration_refresh_mode).await?;
         let refresher = Arc::new(refresher);
 
@@ -710,6 +731,17 @@ impl Builder {
                 self.io_runtime.clone(),
             ));
             handlers.push(retention_check_handle);
+        }
+
+        // Spawn size metrics task for file-based accelerators
+        if let Some(ref layout) = self.acceleration_layout
+            && layout.is_enabled()
+        {
+            let size_metrics_handle = tokio::spawn(AcceleratedTable::start_size_metrics_task(
+                self.dataset_name.clone(),
+                layout.clone(),
+            ));
+            handlers.push(size_metrics_handle);
         }
 
         // If the table should be ready immediately, mark it as ready.
@@ -814,6 +846,21 @@ impl AcceleratedTable {
             refresh,
             io_runtime,
         )
+    }
+
+    /// Periodically emits the `dataset_acceleration_size_bytes` metric for file-based accelerators.
+    pub(crate) async fn start_size_metrics_task(
+        dataset_name: TableReference,
+        layout: runtime_acceleration::snapshot::AccelerationLayout,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            interval.tick().await;
+
+            let size = layout.total_size();
+            metrics::SIZE_BYTES.record(size, &[KeyValue::new("dataset", dataset_name.to_string())]);
+        }
     }
 
     #[must_use]

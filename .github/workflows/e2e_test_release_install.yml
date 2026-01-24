@@ -41,15 +41,10 @@ jobs:
             runner: macos-15
             target_os: darwin
             target_arch: aarch64
-          - name: Windows x64
-            runner: windows-latest
-            target_os: windows
-            target_arch: x86_64
-            target_arch_go: amd64
+          # Windows runtime is not supported - use WSL
 
     steps:
       - name: system info
-        if: matrix.target_os != 'windows'
         run: uname -m
 
       - name: checkout code
@@ -63,61 +58,29 @@ jobs:
           sudo apt install jq -y
 
       - name: install Spice (https://install.spiceai.org)
-        if: matrix.target_os != 'windows' && github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
+        if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           curl https://install.spiceai.org | /bin/bash
 
       - name: install Spice (from branch)
-        if: matrix.target_os != 'windows' && (github.event_name != 'workflow_dispatch' || inputs.install_script_branch != '')
+        if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
           curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
 
-      - name: install Spice (Windows)
-        if: matrix.target_os == 'windows' && github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1"))
-
-      - name: install Spice (Windows from branch)
-        if: matrix.target_os == 'windows' && (github.event_name != 'workflow_dispatch' || inputs.install_script_branch != '')
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $branch = "${{ inputs.install_script_branch }}"
-          if ([string]::IsNullOrEmpty($branch)) {
-            $branch = "${{ github.head_ref }}"
-            if ([string]::IsNullOrEmpty($branch)) {
-              $branch = "${{ github.ref_name }}"
-            }
-          }
-          $url = "https://raw.githubusercontent.com/spiceai/spiceai/$branch/install/Install.ps1"
-          iex ((New-Object System.Net.WebClient).DownloadString($url))
-
       - name: add Spice bin to PATH
-        if: matrix.target_os != 'windows'
         run: |
           echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      - name: add Spice bin to PATH (Windows)
-        if: matrix.target_os == 'windows'
-        run: |
-          Add-Content $env:GITHUB_PATH (Join-Path $HOME ".spice\bin")
-        shell: pwsh
 
       - name: check installation
         run: |
           spice version
 
       - name: start Spice runtime
-        if: matrix.target_os != 'windows'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -125,42 +88,12 @@ jobs:
           cd app
           spice run &
 
-      - name: start Spice runtime (Windows)
-        if: matrix.target_os == 'windows'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          spice init app
-          cd app
-          Start-Process -FilePath spice run
-        shell: pwsh
-
       - name: wait for Spice runtime healthy
-        if: matrix.target_os != 'windows'
         run: |
           bash -c 'while [[ "$(curl -s http://localhost:8090/health)" != "ok" ]]; do sleep 1; done' || false
         timeout-minutes: 1
 
-      - name: wait for Spice runtime healthy
-        if: matrix.target_os == 'windows'
-        run: |
-          do {
-            try {
-              Start-Sleep -Seconds 1
-              $response = Invoke-WebRequest -Uri "http://127.0.0.1:8090/health" -UseBasicParsing
-              $res = $response.Content.Trim()
-
-              Write-Host "Status: $($response.StatusCode)"
-              Write-Host "Reponse: $res"
-            } catch {
-              Write-Host "Failed to reach /health endpoint. Error: $($_.Exception.Message)"
-            }
-          } while ($res -ne "ok")
-        timeout-minutes: 1
-        shell: pwsh
-
       - name: check Spice cli and runtime version
-        if: matrix.target_os != 'windows'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -185,39 +118,92 @@ jobs:
             exit 1
           fi
 
-      - name: check Spice cli and runtime version (Windows)
-        if: matrix.target_os == 'windows'
+  # Test Windows with WSL - runtime runs in WSL, not native Windows
+  test-install-windows-wsl:
+    name: install on Windows x64 (WSL)
+    runs-on: windows-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Setup WSL
+        uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: curl jq
+
+      - name: install Spice (https://install.spiceai.org)
+        if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
+        shell: wsl-bash {0}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $version = spice version 2>&1
-          Write-Host "Raw version string: $version"
+          curl https://install.spiceai.org | /bin/bash
 
-          $cliVersion = ($version -split "`n")[0].Trim()
-          $cliVersion = ($cliVersion -split "\s+")[-1].Trim()
-          Write-Host "CLI Version: $cliVersion"
+      - name: install Spice (from branch)
+        if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
+        shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
+          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
 
-          $runtimeVersion = ($version -split "`n")[1].Trim()
-          $runtimeVersion = ($runtimeVersion -split "\s+")[-1].Trim()
-          Write-Host "Runtime Version: $runtimeVersion"
+      - name: check installation
+        shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          spice version
 
-          $headers = @{}
-          $headers["Authorization"] = "token $env:GITHUB_TOKEN"
+      - name: start Spice runtime and wait for healthy
+        shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          spice init app
+          cd app
+          spice run &
+          # Wait for the runtime to be healthy
+          for i in $(seq 1 60); do
+            if [ "$(curl -s http://localhost:8090/health)" = "ok" ]; then
+              echo "Spice runtime is healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Spice runtime failed to start"
+          exit 1
+        timeout-minutes: 2
 
-          $response = Invoke-WebRequest -Uri "https://api.github.com/repos/spiceai/spiceai/releases/latest" -UseBasicParsing -Headers $headers
-          $releaseVersion = ($response.Content | ConvertFrom-Json).tag_name
-          # Append "+models" to the release version to match default runtime
-          $releaseVersion = "$releaseVersion+models"
-          Write-Host "Release Version: $releaseVersion"
+      - name: check Spice cli and runtime version
+        shell: wsl-bash {0}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          version=$(spice version 2>&1)
+          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
+          runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
 
-          # Release version contains '+models' suffix, so we need to add it to the cliVersion for comparison
-          if ("$cliVersion+models" -ne $releaseVersion) {
-            Write-Host "CLI version $cliVersion does not match the latest release version $releaseVersion."
+          # Use bash array for optional curl args to avoid quoting issues
+          auth_args=()
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            auth_args=(-H "Authorization: token $GITHUB_TOKEN")
+          fi
+          release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" "${auth_args[@]}" | jq -r '.tag_name')+models"
+
+          echo "Release Version: $release_version"
+          echo "CLI Version: $cli_version"
+          echo "Runtime Version: $runtime_version"
+
+          # Release version contains '+models' suffix, so we need to add it to the cli_version for comparison
+          if [ "$cli_version+models" != "$release_version" ]; then
+            echo "CLI version $cli_version does not match the latest release version $release_version."
             exit 1
-          }
+          fi
 
-          if ($runtimeVersion -ne $releaseVersion) {
-            Write-Host "Runtime version $runtimeVersion does not match the latest release version $releaseVersion."
+          if [ "$runtime_version" != "$release_version" ]; then
+            echo "Runtime version $runtime_version does not match the latest release version $release_version."
             exit 1
-          }
-        shell: pwsh
+          fi
