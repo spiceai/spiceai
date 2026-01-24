@@ -25,9 +25,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use runtime_acceleration::snapshot::{
-    AccelerationEngine, SnapshotAdapter, SnapshotApiError, SnapshotBehavior, SnapshotManager, api,
-};
+use runtime_acceleration::snapshot::{SnapshotApiError, SnapshotBehavior, SnapshotManager, api};
 use serde::{Deserialize, Serialize};
 use spicepod::component::snapshot::Snapshots;
 use tokio::sync::RwLock;
@@ -41,7 +39,7 @@ pub struct MessageResponse {
 
 /// List all snapshots for a dataset.
 ///
-/// GET /v1/datasets/{name}/acceleration/snapshots
+/// `GET /v1/datasets/{name}/acceleration/snapshots`
 pub async fn list_snapshots(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
@@ -93,7 +91,7 @@ pub async fn list_snapshots(
     }
 
     // Create a snapshot manager to query the metadata
-    let snapshot_manager = match create_snapshot_manager_for_query(
+    let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
         readable_app.snapshots.clone(),
         acceleration,
@@ -101,19 +99,14 @@ pub async fn list_snapshots(
         rt.tokio_io_runtime(),
     )
     .await
-    {
-        Some(manager) => manager,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(MessageResponse {
-                    message: format!(
-                        "Dataset {dataset_name} does not have snapshots configured"
-                    ),
-                }),
-            )
-                .into_response();
-        }
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("Dataset {dataset_name} does not have snapshots configured"),
+            }),
+        )
+            .into_response();
     };
 
     // Need to drop the app lock before the async call
@@ -121,13 +114,13 @@ pub async fn list_snapshots(
 
     match snapshot_manager.get_snapshot_summary().await {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
-        Err(e) => snapshot_api_error_to_response(e),
+        Err(e) => snapshot_api_error_to_response(&e),
     }
 }
 
 /// Get details of a specific snapshot.
 ///
-/// GET /v1/datasets/{name}/acceleration/snapshots/{snapshot_id}
+/// `GET /v1/datasets/{name}/acceleration/snapshots/{snapshot_id}`
 pub async fn get_snapshot(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
@@ -178,7 +171,7 @@ pub async fn get_snapshot(
             .into_response();
     }
 
-    let snapshot_manager = match create_snapshot_manager_for_query(
+    let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
         readable_app.snapshots.clone(),
         acceleration,
@@ -186,19 +179,14 @@ pub async fn get_snapshot(
         rt.tokio_io_runtime(),
     )
     .await
-    {
-        Some(manager) => manager,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(MessageResponse {
-                    message: format!(
-                        "Dataset {dataset_name} does not have snapshots configured"
-                    ),
-                }),
-            )
-                .into_response();
-        }
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("Dataset {dataset_name} does not have snapshots configured"),
+            }),
+        )
+            .into_response();
     };
 
     // Need to drop the app lock before the async call
@@ -206,13 +194,13 @@ pub async fn get_snapshot(
 
     match snapshot_manager.get_snapshot(snapshot_id).await {
         Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
-        Err(e) => snapshot_api_error_to_response(e),
+        Err(e) => snapshot_api_error_to_response(&e),
     }
 }
 
 /// Set the current snapshot for a dataset.
 ///
-/// POST /v1/datasets/{name}/acceleration/snapshots/current
+/// `POST /v1/datasets/{name}/acceleration/snapshots/current`
 pub async fn set_current_snapshot(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
@@ -264,7 +252,7 @@ pub async fn set_current_snapshot(
             .into_response();
     }
 
-    let snapshot_manager = match create_snapshot_manager_for_query(
+    let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
         readable_app.snapshots.clone(),
         acceleration,
@@ -272,19 +260,14 @@ pub async fn set_current_snapshot(
         rt.tokio_io_runtime(),
     )
     .await
-    {
-        Some(manager) => manager,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(MessageResponse {
-                    message: format!(
-                        "Dataset {dataset_name} does not have snapshots configured"
-                    ),
-                }),
-            )
-                .into_response();
-        }
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!("Dataset {dataset_name} does not have snapshots configured"),
+            }),
+        )
+            .into_response();
     };
 
     // Need to drop the app lock before the async call
@@ -301,7 +284,7 @@ pub async fn set_current_snapshot(
             }),
         )
             .into_response(),
-        Err(e) => snapshot_api_error_to_response(e),
+        Err(e) => snapshot_api_error_to_response(&e),
     }
 }
 
@@ -331,23 +314,14 @@ async fn create_snapshot_manager_for_query(
         return None;
     }
 
-    // Use a dummy adapter since we're only reading metadata, not actual snapshot files
-    let adapter = SnapshotAdapter::None;
-
-    // Use a default engine - doesn't matter for metadata queries
-    let engine = AccelerationEngine::Cayenne;
-
-    SnapshotManager::try_new(
-        dataset_name.to_string(),
-        snapshot_behavior,
-        adapter,
-        engine,
-    )
-    .await
+    // Use the metadata-only constructor that doesn't require an enabled adapter.
+    // This avoids the issue where SnapshotAdapter::None would cause try_new()
+    // to always return None due to the adapter.is_enabled() check.
+    SnapshotManager::try_new_for_metadata_queries(dataset_name.to_string(), snapshot_behavior).await
 }
 
-fn snapshot_api_error_to_response(error: SnapshotApiError) -> Response {
-    match &error {
+fn snapshot_api_error_to_response(error: &SnapshotApiError) -> Response {
+    match error {
         SnapshotApiError::SnapshotNotFound { .. } => (
             StatusCode::NOT_FOUND,
             Json(MessageResponse {
