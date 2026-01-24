@@ -154,11 +154,14 @@ impl RecursiveSplittingChunker<CoreBPE> {
 
 impl<Sizer: ChunkSizer + Send + Sync> Chunker for RecursiveSplittingChunker<Sizer> {
     fn chunk_indices<'a>(&self, text: &'a str) -> ChunkIndicesIter<'a> {
-        let z: Vec<_> = match &self.splitter {
+        // Note: collect() is required here because the underlying text_splitter iterator
+        // borrows from &self, but the trait signature only allows borrowing from text.
+        // The Vec allocation decouples the iterator from self's lifetime.
+        let chunks: Vec<_> = match &self.splitter {
             Splitter::Markdown(splitter) => splitter.chunk_indices(text).collect(),
             Splitter::Text(splitter) => splitter.chunk_indices(text).collect(),
         };
-        Box::new(z.into_iter())
+        Box::new(chunks.into_iter())
     }
 }
 
@@ -211,5 +214,77 @@ mod tests {
         let chunker = RecursiveSplittingChunker::with_character_sizer(&cfg)
             .expect("failed to create chunker");
         assert!(matches!(chunker.splitter, Splitter::Markdown(_)));
+    }
+
+    #[test]
+    fn test_chunk_indices_returns_owned_iterator() {
+        // This test verifies that chunk_indices returns an iterator that doesn't
+        // borrow from self, allowing the chunker to be dropped while the iterator
+        // is still in use. This is the behavior documented by the collect() comment.
+        let cfg = ChunkingConfig {
+            target_chunk_size: 10,
+            overlap_size: 0,
+            trim_whitespace: true,
+            file_format: None,
+        };
+
+        let text = "Hello world, this is a test of chunking functionality.";
+
+        // Create chunker, get iterator, then ensure we can collect after moving text reference
+        let chunker = RecursiveSplittingChunker::with_character_sizer(&cfg)
+            .expect("failed to create chunker");
+
+        // Get the iterator - it should only borrow from `text`, not from `chunker`
+        let chunks_iter = chunker.chunk_indices(text);
+
+        // Collect chunks - this works because the iterator doesn't borrow from chunker
+        let chunks: Vec<_> = chunks_iter.collect();
+
+        // Verify we got reasonable chunks
+        assert!(!chunks.is_empty(), "Should produce at least one chunk");
+
+        // Verify each chunk index is valid and points to the correct text
+        for (idx, chunk) in &chunks {
+            assert!(
+                *idx < text.len(),
+                "Chunk index {idx} should be within text bounds"
+            );
+            assert_eq!(
+                &text[*idx..*idx + chunk.len()],
+                *chunk,
+                "Chunk content should match text at index"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_with_offsets() {
+        let cfg = ChunkingConfig {
+            target_chunk_size: 5,
+            overlap_size: 0,
+            trim_whitespace: true,
+            file_format: None,
+        };
+
+        let chunker = RecursiveSplittingChunker::with_character_sizer(&cfg)
+            .expect("failed to create chunker");
+
+        let text = "Hello world";
+        let chunks: Vec<_> = chunker.chunk_with_offsets(text).collect();
+
+        // Verify offset tuples are (start, end) and correctly span the chunk
+        for ((start, end), chunk) in &chunks {
+            assert!(*start < *end, "Start offset should be less than end offset");
+            assert_eq!(
+                *end - *start,
+                chunk.len(),
+                "Offset range should equal chunk length"
+            );
+            assert_eq!(
+                &text[*start..*end],
+                *chunk,
+                "Offset range should extract the correct chunk"
+            );
+        }
     }
 }

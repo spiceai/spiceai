@@ -15,7 +15,6 @@ version.workspace = true
 anyhow.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
-dirs = "6.0.0"
 ndarray = "0.15.6"
 regex.workspace = true
 reqwest.workspace = true

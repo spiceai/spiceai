@@ -193,7 +193,7 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .ok_or_else(|p| MissingRequiredParameterSnafu { parameter: p.0 }.build())?;
             let credentials = Credentials::new("", api_key.clone());
 
-            let mut flight_client = FlightClient::try_new(url, credentials, None)
+            let mut flight_client = FlightClient::try_new(url, credentials, None, None)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
 

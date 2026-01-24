@@ -269,6 +269,19 @@ install-cli-dev: build-cli-dev
 	install -m 755 target/debug/spice ~/.spice/bin/spice
 
 ################################################################################
+# Target: distributed                                                          #
+################################################################################
+.PHONY: distributed
+distributed:
+	make install SPICED_NON_DEFAULT_FEATURES="vortex"
+	./scripts/distributed.sh
+
+.PHONY: distributed-dev
+distributed-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="vortex"
+	./scripts/distributed.sh
+
+################################################################################
 # Target: generate-acknowledgements                                            #
 ################################################################################
 ACKNOWLEDGEMENTS_PATH := acknowledgements.md
