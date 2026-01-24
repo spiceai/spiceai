@@ -13,11 +13,13 @@ COPY . /build
 WORKDIR /build
 
 ARG CARGO_FEATURES=default
+ARG CARGO_NO_DEFAULT_FEATURES=false
 ARG RUST_PROFILE=release
 ARG CARGO_INCREMENTAL=yes
 ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
 ARG TARGETARCH
 ENV CARGO_FEATURES=$CARGO_FEATURES \
+    CARGO_NO_DEFAULT_FEATURES=$CARGO_NO_DEFAULT_FEATURES \
     CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
     CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI \
     RUST_PROFILE=$RUST_PROFILE
@@ -31,7 +33,11 @@ RUN \
       amd64) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC -march=x86-64" ;; \
       *) export CFLAGS="-O3 -ffunction-sections -fdata-sections -fPIC" ;; \
     esac && \
-    cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default} && \
+    if [ "${CARGO_NO_DEFAULT_FEATURES}" = "true" ]; then \
+      cargo build --profile "${RUST_PROFILE}" --no-default-features ${CARGO_FEATURES:+--features ${CARGO_FEATURES}}; \
+    else \
+      cargo build --profile ${RUST_PROFILE} --features ${CARGO_FEATURES:-default}; \
+    fi && \
     cp /build/target/${RUST_PROFILE}/spiced /root/spiced
 
 FROM debian:bookworm-slim as sandbox-setup
