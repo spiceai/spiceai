@@ -208,14 +208,14 @@ async fn test_acceleration_refresh_sqlite_full_variant() -> Result<(), anyhow::E
 }
 
 // Postgres (feature-gated)
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 #[tokio::test]
 async fn test_acceleration_refresh_postgres_append_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_refresh_append_for_engine("postgres").await
 }
 
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 #[tokio::test]
 async fn test_acceleration_refresh_postgres_full_variant() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

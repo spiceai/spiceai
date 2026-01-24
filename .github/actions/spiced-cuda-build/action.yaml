@@ -1,5 +1,5 @@
 name: 'Spiced CUDA Build Action'
-description: 'Set up CUDA, verify prerequisites, build and package spiced with models and CUDA support.'
+description: 'Set up CUDA, verify prerequisites, build and package spiced with CUDA support.'
 inputs:
   cuda-version:
     description: 'The CUDA version to install'
@@ -22,7 +22,7 @@ inputs:
 outputs:
   artifact-name:
     description: 'The name of the uploaded artifact'
-    value: 'spiced_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz'
+    value: 'spiced_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz'
 
 runs:
   using: 'composite'
@@ -39,14 +39,14 @@ runs:
       if: ${{ inputs.target_os == 'windows'}}
       run: |
         echo "SHELL=pwsh" >> $env:GITHUB_ENV
-        echo "BUILD_CMD=cd bin\\spiced && cargo build --profile ${{ inputs.rust-profile }} --features models,cuda --target-dir ../../target" >> $env:GITHUB_ENV
+        echo "BUILD_CMD=cd bin\\spiced && cargo build --profile ${{ inputs.rust-profile }} --no-default-features --features release,models,cuda --target-dir ../../target" >> $env:GITHUB_ENV
         @(
             "PACKAGE_CMD=move target\${{ inputs.rust-profile }}\spiced.exe spiced.exe -Force; ",
             "copy 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_MM }}\bin\cudart64_*.dll' .; ",
             "copy 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_MM }}\bin\cublas64_*.dll' .; ",
             "copy 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_MM }}\bin\cublasLt64_*.dll' .; ",
             "copy 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_MM }}\bin\curand64_*.dll' .; ",
-            "tar -czf spiced.exe_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced.exe *.dll"
+            "tar -czf spiced.exe_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced.exe *.dll"
         ) -join '' | echo >> $env:GITHUB_ENV
       shell: pwsh
 
@@ -54,8 +54,8 @@ runs:
       if: ${{ inputs.target_os != 'windows'}}
       run: |
         echo "SHELL=bash" >> $GITHUB_ENV
-        echo "BUILD_CMD=make -C bin/spiced SPICED_NON_DEFAULT_FEATURES='models,cuda' RUST_PROFILE=${{ inputs.rust-profile }}" >> $GITHUB_ENV
-        echo "PACKAGE_CMD=mv target/${{ inputs.rust-profile }}/spiced spiced && chmod +x spiced && tar czf spiced_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced" >> $GITHUB_ENV
+        echo "BUILD_CMD=make -C bin/spiced SPICED_NON_DEFAULT_FEATURES='cuda' RUST_PROFILE=${{ inputs.rust-profile }}" >> $GITHUB_ENV
+        echo "PACKAGE_CMD=mv target/${{ inputs.rust-profile }}/spiced spiced && chmod +x spiced && tar czf spiced_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz spiced" >> $GITHUB_ENV
       shell: bash
 
     - name: Install CUDA Toolkit (Linux)
@@ -96,12 +96,12 @@ runs:
       if: inputs.target_os != 'windows'
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
       with:
-        name: spiced_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}
-        path: spiced_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz
+        name: spiced_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}
+        path: spiced_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz
 
     - name: Upload artifact
       if: inputs.target_os == 'windows'
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
       with:
-        name: spiced.exe_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}
-        path: spiced.exe_models_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz
+        name: spiced.exe_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}
+        path: spiced.exe_cuda_${{ inputs.cuda-compute-capability }}_${{ inputs.artifact-tag }}.tar.gz

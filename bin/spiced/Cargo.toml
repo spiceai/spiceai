@@ -83,6 +83,7 @@ default = [
     "smb",
     "pingora",
     "scylladb",
+    "models",
 ]
 delta_lake = ["runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -106,6 +107,7 @@ odbc = ["runtime/odbc"]
 oracle = ["runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["runtime/postgres"]
+postgres-accel = ["runtime/postgres-accel"]
 postgres-write = ["runtime/postgres-write"]
 release = []
 scylladb = ["runtime/scylladb"]

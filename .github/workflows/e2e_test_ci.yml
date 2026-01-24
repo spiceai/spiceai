@@ -155,7 +155,7 @@ jobs:
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
         run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models"
+          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,postgres-accel"
           cargo build --release -p spice
 
       - name: Build spiced and spice CLI (macOS)
@@ -163,7 +163,7 @@ jobs:
         env:
           MISTRALRS_METAL_PRECOMPILE: 0
         run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,metal"
+          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,postgres-accel,metal"
           cargo build --release -p spice
 
       - name: make spiced executable
