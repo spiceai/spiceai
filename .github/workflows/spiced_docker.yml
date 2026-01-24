@@ -15,6 +15,15 @@ on:
         required: false
         type: boolean
         default: false
+      tag_latest:
+        description: Tag as 'latest' (auto = detect from version, skips rc/beta/alpha)
+        required: false
+        type: choice
+        options:
+          - auto
+          - 'true'
+          - 'false'
+        default: auto
       target:
         description: Build docker images for specific target(s)
         required: false
@@ -34,6 +43,7 @@ jobs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       publish: ${{ steps.resolve.outputs.publish }}
+      should_tag_latest: ${{ steps.resolve.outputs.should_tag_latest }}
       target: ${{ steps.resolve.outputs.target }}
       run_amd64: ${{ steps.resolve.outputs.run_amd64 }}
       run_arm64: ${{ steps.resolve.outputs.run_arm64 }}
@@ -111,9 +121,35 @@ jobs:
               ;;
           esac
 
+          # Determine if this release should be tagged as 'latest'
+          if [ "$event_name" = "workflow_dispatch" ]; then
+            tag_latest_input="${{ github.event.inputs.tag_latest }}"
+          else
+            # For release events, use 'auto' detection
+            tag_latest_input="auto"
+          fi
+
+          if [ "$tag_latest_input" = "auto" ]; then
+            # Auto-detect: stable versions get 'latest', pre-releases don't
+            if [[ "${rel_version}" == *-rc* || "${rel_version}" == *-beta* || "${rel_version}" == *-alpha* ]]; then
+              should_tag_latest="false"
+              echo "Auto-detected pre-release version (${rel_version}), skipping 'latest' tag"
+            else
+              should_tag_latest="true"
+              echo "Auto-detected stable version (${rel_version}), will tag as 'latest'"
+            fi
+          elif [ "$tag_latest_input" = "true" ]; then
+            should_tag_latest="true"
+            echo "Explicitly requested 'latest' tag"
+          else
+            should_tag_latest="false"
+            echo "Explicitly skipping 'latest' tag"
+          fi
+
           echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
           echo "rel_version=${rel_version}" >> "$GITHUB_OUTPUT"
           echo "publish=${publish_flag}" >> "$GITHUB_OUTPUT"
+          echo "should_tag_latest=${should_tag_latest}" >> "$GITHUB_OUTPUT"
           echo "target=${target_input}" >> "$GITHUB_OUTPUT"
           echo "run_amd64=${run_amd64}" >> "$GITHUB_OUTPUT"
           echo "run_arm64=${run_arm64}" >> "$GITHUB_OUTPUT"
@@ -293,6 +329,7 @@ jobs:
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
+      SHOULD_TAG_LATEST: ${{ needs.setup.outputs.should_tag_latest }}
       RUN_AMD64: ${{ needs.setup.outputs.run_amd64 }}
       RUN_ARM64: ${{ needs.setup.outputs.run_arm64 }}
     steps:
@@ -340,6 +377,7 @@ jobs:
         run: |
           echo "REL_VERSION=${REL_VERSION}"
           echo "PUBLISH=${PUBLISH}"
+          echo "SHOULD_TAG_LATEST=${SHOULD_TAG_LATEST}"
           echo "RUN_AMD64=${RUN_AMD64}"
           echo "RUN_ARM64=${RUN_ARM64}"
 
@@ -369,15 +407,22 @@ jobs:
 
           if [[ "${PUBLISH}" == "true" ]]; then
             echo "Publishing to GHCR and DockerHub"
-            docker buildx imagetools create \
-              -t ghcr.io/spiceai/spiceai:${REL_VERSION} \
-              -t ghcr.io/spiceai/spiceai:latest \
-              "${sources[@]}"
 
-            docker buildx imagetools create \
-              -t spiceai/spiceai:${REL_VERSION} \
-              -t spiceai/spiceai:latest \
-              "${sources[@]}"
+            # Build tag arguments - always include version tag
+            ghcr_tags="-t ghcr.io/spiceai/spiceai:${REL_VERSION}"
+            dockerhub_tags="-t spiceai/spiceai:${REL_VERSION}"
+
+            # Add optionally 'latest' tags
+            if [[ "${SHOULD_TAG_LATEST}" == "true" ]]; then
+              echo "Adding 'latest' tag"
+              ghcr_tags="${ghcr_tags} -t ghcr.io/spiceai/spiceai:latest"
+              dockerhub_tags="${dockerhub_tags} -t spiceai/spiceai:latest"
+            else
+              echo "Skipping 'latest' tag (pre-release or explicitly disabled)"
+            fi
+
+            docker buildx imagetools create ${ghcr_tags} "${sources[@]}"
+            docker buildx imagetools create ${dockerhub_tags} "${sources[@]}"
 
             echo "Verifying GHCR image:"
             docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}
@@ -400,6 +445,7 @@ jobs:
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
+      SHOULD_TAG_LATEST: ${{ needs.setup.outputs.should_tag_latest }}
     steps:
       - name: Download CUDA artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
@@ -446,12 +492,21 @@ jobs:
 
           if [[ "${PUBLISH}" == "true" ]]; then
             echo "Pushing CUDA to GHCR and DockerHub"
-            docker buildx imagetools create \
-              -t spiceai/spiceai:${REL_VERSION}-cuda \
-              -t spiceai/spiceai:latest-cuda \
-              -t ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda \
-              -t ghcr.io/spiceai/spiceai:latest-cuda \
-              localhost:5000/spiceai:cuda-amd64
+
+            # Build tag arguments - always include version tag
+            ghcr_tags="-t ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda"
+            dockerhub_tags="-t spiceai/spiceai:${REL_VERSION}-cuda"
+
+            # Add optionally 'latest-cuda' tags
+            if [[ "${SHOULD_TAG_LATEST}" == "true" ]]; then
+              echo "Adding 'latest-cuda' tag"
+              ghcr_tags="${ghcr_tags} -t ghcr.io/spiceai/spiceai:latest-cuda"
+              dockerhub_tags="${dockerhub_tags} -t spiceai/spiceai:latest-cuda"
+            else
+              echo "Skipping 'latest-cuda' tag (pre-release or explicitly disabled)"
+            fi
+
+            docker buildx imagetools create ${ghcr_tags} ${dockerhub_tags} localhost:5000/spiceai:cuda-amd64
 
             echo "Verifying CUDA GHCR image:"
             docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda
