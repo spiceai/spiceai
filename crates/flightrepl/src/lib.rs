@@ -260,6 +260,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             .tls_config(client_tls_config)?
             .connect()
             .await
+    } else if repl_flight_endpoint.starts_with("https://") {
+        // For HTTPS endpoints without a custom certificate, use system certificates
+        let client_tls_config = ClientTlsConfig::new().with_native_roots();
+        Channel::from_shared(repl_flight_endpoint.clone())?
+            .user_agent(user_agent.clone())?
+            .tls_config(client_tls_config)?
+            .connect()
+            .await
     } else {
         Channel::from_shared(repl_flight_endpoint.clone())?
             .user_agent(user_agent.clone())?

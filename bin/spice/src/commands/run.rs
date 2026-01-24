@@ -44,13 +44,13 @@ Examples:
 See more at: https://spiceai.org/docs/"#
 )]
 pub struct RunArgs {
+    /// Specifies the runtime HTTP endpoint (overrides global --http-endpoint for binding)
+    #[arg(long)]
+    http_endpoint: Option<String>,
+
     /// Specifies the runtime Flight endpoint
     #[arg(long)]
     flight_endpoint: Option<String>,
-
-    /// Specifies the runtime HTTP endpoint
-    #[arg(long)]
-    http_endpoint: Option<String>,
 
     /// Specifies the runtime Prometheus metrics endpoint
     #[arg(long)]
@@ -86,17 +86,12 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
         spiced_args.push(flight.clone());
     }
 
-    if let Some(http) = &args.http_endpoint {
-        spiced_args.push("--http".to_string());
-        spiced_args.push(http.clone());
-    }
-
     if let Some(metrics) = &args.metrics_endpoint {
         spiced_args.push("--metrics".to_string());
         spiced_args.push(metrics.clone());
     }
 
-    let mut cmd = ctx.get_run_cmd(&spiced_args)?;
+    let mut cmd = ctx.get_run_cmd(&spiced_args, args.http_endpoint.as_deref())?;
 
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

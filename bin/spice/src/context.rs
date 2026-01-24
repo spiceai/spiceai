@@ -63,6 +63,9 @@ pub struct RuntimeContext {
 
     /// HTTP client with default timeout
     http_client: reqwest::Client,
+
+    /// TLS root certificate file path
+    tls_root_certificate_file: Option<String>,
 }
 
 impl RuntimeContext {
@@ -95,6 +98,7 @@ impl RuntimeContext {
             user_agent: Self::default_user_agent(),
             extra_headers: HashMap::new(),
             http_client,
+            tls_root_certificate_file: None,
         })
     }
 
@@ -103,6 +107,7 @@ impl RuntimeContext {
         http_endpoint: Option<String>,
         api_key: Option<String>,
         is_cloud: bool,
+        tls_root_certificate_file: Option<String>,
     ) -> Result<Self> {
         let mut ctx = Self::new()?;
 
@@ -116,6 +121,7 @@ impl RuntimeContext {
         }
 
         ctx.api_key = api_key;
+        ctx.tls_root_certificate_file = tls_root_certificate_file;
 
         // Load API key from .env if not provided
         if ctx.api_key.is_none() {
@@ -257,10 +263,18 @@ impl RuntimeContext {
 
     /// Create a command to run spiced with the given arguments.
     ///
+    /// # Arguments
+    /// * `args` - Additional arguments to pass to spiced
+    /// * `http_endpoint_override` - Optional HTTP endpoint override for binding (from run command)
+    ///
     /// # Errors
     ///
     /// Returns an error if the runtime is not installed.
-    pub fn get_run_cmd(&self, args: &[String]) -> Result<Command> {
+    pub fn get_run_cmd(
+        &self,
+        args: &[String],
+        http_endpoint_override: Option<&str>,
+    ) -> Result<Command> {
         if !self.is_runtime_installed() {
             return Err(RuntimeNotInstalledSnafu.build());
         }
@@ -269,9 +283,16 @@ impl RuntimeContext {
         cmd.arg("--pods-watcher-enabled");
         cmd.args(args);
 
-        // Add HTTP endpoint
+        // Add HTTP endpoint (use override if provided, otherwise use context default)
         cmd.arg("--http");
-        cmd.arg(self.http_socket_address());
+        let http_addr = http_endpoint_override
+            .map(|ep| {
+                ep.trim_start_matches("http://")
+                    .trim_start_matches("https://")
+                    .to_string()
+            })
+            .unwrap_or_else(|| self.http_socket_address());
+        cmd.arg(http_addr);
 
         // Add API key if present
         if let Some(api_key) = &self.api_key {
@@ -279,9 +300,19 @@ impl RuntimeContext {
             cmd.arg(api_key);
         }
 
+        // Add TLS root certificate file if present
+        if let Some(tls_cert) = &self.tls_root_certificate_file {
+            cmd.arg("--tls-root-certificate-file");
+            cmd.arg(tls_cert);
+        }
+
         // Add user agent
         cmd.arg("--user-agent");
         cmd.arg(&self.user_agent);
+
+        // Set default captured output for task history (for spice trace)
+        cmd.arg("--set-runtime");
+        cmd.arg("task_history.captured_output=truncated");
 
         Ok(cmd)
     }
@@ -405,5 +436,571 @@ impl RuntimeContext {
             .send()
             .await
             .context(crate::error::ConnectionFailedSnafu { endpoint: url })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Helper to create a RuntimeContext with a mocked spiced binary for testing.
+    fn create_test_context() -> RuntimeContext {
+        RuntimeContext {
+            spice_runtime_dir: PathBuf::from("/test/.spice"),
+            spice_bin_dir: PathBuf::from("/test/.spice/bin"),
+            app_dir: PathBuf::from("/test/app"),
+            pods_dir: PathBuf::from("/test/app/spicepods"),
+            http_endpoint: "http://127.0.0.1:8090".to_string(),
+            api_key: None,
+            is_cloud: false,
+            user_agent: "spice/test (test; test)".to_string(),
+            extra_headers: HashMap::new(),
+            http_client: reqwest::Client::new(),
+            tls_root_certificate_file: None,
+        }
+    }
+
+    /// Create a test context with a mocked spiced binary in an isolated temp directory.
+    /// Returns the context and the TempDir (which must be kept alive for the test).
+    fn create_test_context_with_runtime() -> (RuntimeContext, TempDir) {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let bin_dir = temp_dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let spiced_path = bin_dir.join(SPICED_FILENAME);
+        std::fs::write(&spiced_path, "mock").expect("create mock spiced");
+
+        let ctx = RuntimeContext {
+            spice_runtime_dir: temp_dir.path().to_path_buf(),
+            spice_bin_dir: bin_dir,
+            app_dir: PathBuf::from("/test/app"),
+            pods_dir: PathBuf::from("/test/app/spicepods"),
+            http_endpoint: "http://127.0.0.1:8090".to_string(),
+            api_key: None,
+            is_cloud: false,
+            user_agent: "spice/test (test; test)".to_string(),
+            extra_headers: HashMap::new(),
+            http_client: reqwest::Client::new(),
+            tls_root_certificate_file: None,
+        };
+
+        (ctx, temp_dir)
+    }
+
+    /// Convert Command args to a Vec<String> for testing.
+    /// This extracts the arguments that would be passed to spiced.
+    fn get_cmd_args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_get_run_cmd_includes_pods_watcher_enabled() {
+        let (ctx, _temp_dir) = create_test_context_with_runtime();
+
+        let cmd = ctx
+            .get_run_cmd(&[], None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            args.contains(&"--pods-watcher-enabled".to_string()),
+            "Should include --pods-watcher-enabled, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_includes_http_endpoint() {
+        let (ctx, _temp_dir) = create_test_context_with_runtime();
+
+        let cmd = ctx
+            .get_run_cmd(&[], None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            args.contains(&"--http".to_string()),
+            "Should include --http flag, got: {args:?}"
+        );
+        assert!(
+            args.contains(&"127.0.0.1:8090".to_string()),
+            "Should include HTTP socket address, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_uses_http_endpoint_override() {
+        let (ctx, _temp_dir) = create_test_context_with_runtime();
+
+        let cmd = ctx
+            .get_run_cmd(&[], Some("http://0.0.0.0:9999"))
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            args.contains(&"--http".to_string()),
+            "Should include --http flag, got: {args:?}"
+        );
+        assert!(
+            args.contains(&"0.0.0.0:9999".to_string()),
+            "Should use override endpoint, got: {args:?}"
+        );
+        assert!(
+            !args.contains(&"127.0.0.1:8090".to_string()),
+            "Should NOT include default endpoint when override is set, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_http_override_strips_prefix() {
+        let (ctx, _temp_dir) = create_test_context_with_runtime();
+
+        // Test with http:// prefix
+        let cmd = ctx
+            .get_run_cmd(&[], Some("http://192.168.1.1:8080"))
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+        assert!(
+            args.contains(&"192.168.1.1:8080".to_string()),
+            "Should strip http:// prefix, got: {args:?}"
+        );
+
+        // Test with https:// prefix
+        let cmd = ctx
+            .get_run_cmd(&[], Some("https://secure.example.com:443"))
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+        assert!(
+            args.contains(&"secure.example.com:443".to_string()),
+            "Should strip https:// prefix, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_includes_api_key_when_set() {
+        let (mut ctx, _temp_dir) = create_test_context_with_runtime();
+        ctx.api_key = Some("test-api-key-12345".to_string());
+
+        let cmd = ctx
+            .get_run_cmd(&[], None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            args.contains(&"--api-key".to_string()),
+            "Should include --api-key flag, got: {args:?}"
+        );
+        assert!(
+            args.contains(&"test-api-key-12345".to_string()),
+            "Should include the API key value, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_excludes_api_key_when_not_set() {
+        let (ctx, _temp_dir) = create_test_context_with_runtime();
+
+        let cmd = ctx
+            .get_run_cmd(&[], None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            !args.contains(&"--api-key".to_string()),
+            "Should NOT include --api-key flag when not set, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_includes_tls_certificate_when_set() {
+        let (mut ctx, _temp_dir) = create_test_context_with_runtime();
+        ctx.tls_root_certificate_file = Some("/path/to/cert.pem".to_string());
+
+        let cmd = ctx
+            .get_run_cmd(&[], None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            args.contains(&"--tls-root-certificate-file".to_string()),
+            "Should include --tls-root-certificate-file flag, got: {args:?}"
+        );
+        assert!(
+            args.contains(&"/path/to/cert.pem".to_string()),
+            "Should include the TLS certificate path, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_excludes_tls_certificate_when_not_set() {
+        let (ctx, _temp_dir) = create_test_context_with_runtime();
+
+        let cmd = ctx
+            .get_run_cmd(&[], None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            !args.contains(&"--tls-root-certificate-file".to_string()),
+            "Should NOT include --tls-root-certificate-file flag when not set, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_includes_user_agent() {
+        let (mut ctx, _temp_dir) = create_test_context_with_runtime();
+        ctx.user_agent = "spice/1.0.0 (macos; arm64)".to_string();
+
+        let cmd = ctx
+            .get_run_cmd(&[], None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            args.contains(&"--user-agent".to_string()),
+            "Should include --user-agent flag, got: {args:?}"
+        );
+        assert!(
+            args.contains(&"spice/1.0.0 (macos; arm64)".to_string()),
+            "Should include the user agent value, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_includes_captured_output_setting() {
+        let (ctx, _temp_dir) = create_test_context_with_runtime();
+
+        let cmd = ctx
+            .get_run_cmd(&[], None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            args.contains(&"--set-runtime".to_string()),
+            "Should include --set-runtime flag, got: {args:?}"
+        );
+        assert!(
+            args.contains(&"task_history.captured_output=truncated".to_string()),
+            "Should include task_history.captured_output=truncated, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_passes_through_extra_args() {
+        let (ctx, _temp_dir) = create_test_context_with_runtime();
+
+        let extra_args = vec![
+            "-v".to_string(),
+            "--flight".to_string(),
+            "0.0.0.0:50051".to_string(),
+        ];
+        let cmd = ctx
+            .get_run_cmd(&extra_args, None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        assert!(
+            args.contains(&"-v".to_string()),
+            "Should include -v flag from extra args, got: {args:?}"
+        );
+        assert!(
+            args.contains(&"--flight".to_string()),
+            "Should include --flight from extra args, got: {args:?}"
+        );
+        assert!(
+            args.contains(&"0.0.0.0:50051".to_string()),
+            "Should include flight endpoint from extra args, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_run_cmd_full_argument_order() {
+        let (mut ctx, _temp_dir) = create_test_context_with_runtime();
+        ctx.api_key = Some("my-api-key".to_string());
+        ctx.tls_root_certificate_file = Some("/cert.pem".to_string());
+        ctx.user_agent = "test-agent".to_string();
+        ctx.http_endpoint = "http://localhost:9090".to_string();
+
+        let extra_args = vec!["-vv".to_string()];
+        let cmd = ctx
+            .get_run_cmd(&extra_args, None)
+            .expect("get_run_cmd should succeed");
+        let args = get_cmd_args(&cmd);
+
+        // Verify all expected arguments are present
+        let expected = [
+            "--pods-watcher-enabled",
+            "-vv",
+            "--http",
+            "localhost:9090",
+            "--api-key",
+            "my-api-key",
+            "--tls-root-certificate-file",
+            "/cert.pem",
+            "--user-agent",
+            "test-agent",
+            "--set-runtime",
+            "task_history.captured_output=truncated",
+        ];
+
+        for expected_arg in expected {
+            assert!(
+                args.contains(&expected_arg.to_string()),
+                "Should include '{expected_arg}', got: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_run_cmd_fails_when_runtime_not_installed() {
+        let ctx = create_test_context();
+        // spice_bin_dir points to /test/.spice/bin which doesn't exist
+        let result = ctx.get_run_cmd(&[], None);
+
+        assert!(result.is_err(), "Should fail when runtime not installed");
+    }
+
+    #[test]
+    fn test_http_socket_address_strips_http_prefix() {
+        let mut ctx = create_test_context();
+        ctx.http_endpoint = "http://127.0.0.1:8090".to_string();
+        assert_eq!(ctx.http_socket_address(), "127.0.0.1:8090");
+    }
+
+    #[test]
+    fn test_http_socket_address_strips_https_prefix() {
+        let mut ctx = create_test_context();
+        ctx.http_endpoint = "https://secure.example.com:443".to_string();
+        assert_eq!(ctx.http_socket_address(), "secure.example.com:443");
+    }
+
+    #[test]
+    fn test_http_socket_address_no_prefix() {
+        let mut ctx = create_test_context();
+        ctx.http_endpoint = "127.0.0.1:8090".to_string();
+        assert_eq!(ctx.http_socket_address(), "127.0.0.1:8090");
+    }
+
+    #[test]
+    fn test_with_args_sets_http_endpoint() {
+        let ctx =
+            RuntimeContext::with_args(Some("http://custom:9999".to_string()), None, false, None)
+                .expect("with_args should succeed");
+
+        assert_eq!(ctx.http_endpoint(), "http://custom:9999");
+    }
+
+    #[test]
+    fn test_with_args_sets_api_key() {
+        let ctx = RuntimeContext::with_args(None, Some("test-key".to_string()), false, None)
+            .expect("with_args should succeed");
+
+        assert_eq!(ctx.api_key(), Some("test-key"));
+    }
+
+    #[test]
+    fn test_with_args_sets_cloud_mode() {
+        let ctx =
+            RuntimeContext::with_args(None, None, true, None).expect("with_args should succeed");
+
+        assert!(ctx.is_cloud());
+        assert_eq!(ctx.http_endpoint(), "https://data.spiceai.io");
+    }
+
+    #[test]
+    fn test_with_args_sets_tls_certificate() {
+        let ctx =
+            RuntimeContext::with_args(None, None, false, Some("/path/to/cert.pem".to_string()))
+                .expect("with_args should succeed");
+
+        assert_eq!(
+            ctx.tls_root_certificate_file,
+            Some("/path/to/cert.pem".to_string())
+        );
+    }
+
+    #[test]
+    fn test_default_user_agent_format() {
+        let user_agent = RuntimeContext::default_user_agent();
+        assert!(
+            user_agent.starts_with("spice/"),
+            "User agent should start with spice/, got: {user_agent}"
+        );
+        assert!(
+            user_agent.contains("("),
+            "User agent should contain OS/arch info, got: {user_agent}"
+        );
+    }
+
+    #[test]
+    fn test_get_headers_includes_user_agent() {
+        let ctx = create_test_context();
+        let headers = ctx.get_headers();
+
+        assert!(
+            headers.contains_key("User-Agent"),
+            "Headers should include User-Agent"
+        );
+    }
+
+    #[test]
+    fn test_get_headers_includes_api_key_when_set() {
+        let mut ctx = create_test_context();
+        ctx.api_key = Some("my-api-key".to_string());
+        let headers = ctx.get_headers();
+
+        assert_eq!(
+            headers.get("X-API-Key"),
+            Some(&"my-api-key".to_string()),
+            "Headers should include X-API-Key"
+        );
+    }
+
+    #[test]
+    fn test_get_headers_excludes_api_key_when_not_set() {
+        let ctx = create_test_context();
+        let headers = ctx.get_headers();
+
+        assert!(
+            !headers.contains_key("X-API-Key"),
+            "Headers should NOT include X-API-Key when not set"
+        );
+    }
+
+    #[test]
+    fn test_add_headers() {
+        let mut ctx = create_test_context();
+        let mut extra = HashMap::new();
+        extra.insert("X-Custom-Header".to_string(), "custom-value".to_string());
+        ctx.add_headers(extra);
+
+        let headers = ctx.get_headers();
+        assert_eq!(
+            headers.get("X-Custom-Header"),
+            Some(&"custom-value".to_string())
+        );
+    }
+
+    // ========================================================================
+    // Local vs Remote (Cloud) Mode Tests
+    // ========================================================================
+
+    #[test]
+    fn test_local_mode_default_endpoint() {
+        // Local mode should use default localhost endpoint
+        let ctx = RuntimeContext::new().expect("new should succeed");
+
+        assert!(!ctx.is_cloud());
+        assert_eq!(ctx.http_endpoint(), "http://127.0.0.1:8090");
+    }
+
+    #[test]
+    fn test_local_mode_custom_endpoint() {
+        // Local mode with custom endpoint
+        let ctx = RuntimeContext::with_args(
+            Some("http://192.168.1.100:8090".to_string()),
+            None,
+            false,
+            None,
+        )
+        .expect("with_args should succeed");
+
+        assert!(!ctx.is_cloud());
+        assert_eq!(ctx.http_endpoint(), "http://192.168.1.100:8090");
+    }
+
+    #[test]
+    fn test_cloud_mode_overrides_endpoint() {
+        // Cloud mode should override any custom endpoint with cloud URL
+        let ctx = RuntimeContext::with_args(
+            Some("http://custom:9999".to_string()), // This should be ignored
+            None,
+            true, // Cloud mode enabled
+            None,
+        )
+        .expect("with_args should succeed");
+
+        assert!(ctx.is_cloud());
+        assert_eq!(ctx.http_endpoint(), "https://data.spiceai.io");
+    }
+
+    #[test]
+    fn test_cloud_mode_with_api_key() {
+        // Cloud mode with API key
+        let ctx =
+            RuntimeContext::with_args(None, Some("cloud-api-key-12345".to_string()), true, None)
+                .expect("with_args should succeed");
+
+        assert!(ctx.is_cloud());
+        assert_eq!(ctx.http_endpoint(), "https://data.spiceai.io");
+        assert_eq!(ctx.api_key(), Some("cloud-api-key-12345"));
+    }
+
+    #[test]
+    fn test_local_mode_with_api_key() {
+        // Local mode can also have an API key (for local runtime auth)
+        let ctx = RuntimeContext::with_args(
+            Some("http://localhost:8090".to_string()),
+            Some("local-api-key".to_string()),
+            false,
+            None,
+        )
+        .expect("with_args should succeed");
+
+        assert!(!ctx.is_cloud());
+        assert_eq!(ctx.http_endpoint(), "http://localhost:8090");
+        assert_eq!(ctx.api_key(), Some("local-api-key"));
+    }
+
+    #[test]
+    fn test_cloud_mode_uses_https() {
+        let ctx =
+            RuntimeContext::with_args(None, None, true, None).expect("with_args should succeed");
+
+        assert!(
+            ctx.http_endpoint().starts_with("https://"),
+            "Cloud mode should use HTTPS, got: {}",
+            ctx.http_endpoint()
+        );
+    }
+
+    #[test]
+    fn test_local_mode_socket_address() {
+        let ctx =
+            RuntimeContext::with_args(None, None, false, None).expect("with_args should succeed");
+
+        // Local mode socket address should not have scheme prefix
+        assert_eq!(ctx.http_socket_address(), "127.0.0.1:8090");
+    }
+
+    #[test]
+    fn test_cloud_mode_socket_address() {
+        let ctx =
+            RuntimeContext::with_args(None, None, true, None).expect("with_args should succeed");
+
+        // Cloud mode socket address should strip https://
+        assert_eq!(ctx.http_socket_address(), "data.spiceai.io");
+    }
+
+    #[test]
+    fn test_mode_reflected_in_headers() {
+        // Both local and cloud modes should include user agent
+        let local_ctx =
+            RuntimeContext::with_args(None, None, false, None).expect("with_args should succeed");
+        let cloud_ctx =
+            RuntimeContext::with_args(None, None, true, None).expect("with_args should succeed");
+
+        let local_headers = local_ctx.get_headers();
+        let cloud_headers = cloud_ctx.get_headers();
+
+        assert!(
+            local_headers.contains_key("User-Agent"),
+            "Local mode should include User-Agent"
+        );
+        assert!(
+            cloud_headers.contains_key("User-Agent"),
+            "Cloud mode should include User-Agent"
+        );
     }
 }

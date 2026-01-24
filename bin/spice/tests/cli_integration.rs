@@ -744,14 +744,139 @@ mod run {
     }
 
     #[test]
-    fn test_run_flags() {
+    fn test_run_help_shows_flight_endpoint() {
         let mut cmd = spice_cmd();
         cmd.arg("run")
             .arg("--help")
             .assert()
             .success()
-            .stdout(predicate::str::contains("--http-endpoint"))
             .stdout(predicate::str::contains("--flight-endpoint"));
+    }
+
+    #[test]
+    fn test_run_help_shows_metrics_endpoint() {
+        let mut cmd = spice_cmd();
+        cmd.arg("run")
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--metrics-endpoint"));
+    }
+
+    #[test]
+    fn test_run_accepts_flight_endpoint_flag() {
+        // Verify the flag is parsed correctly (will fail later due to no runtime, but parsing should work)
+        let mut cmd = spice_cmd();
+        cmd.arg("run")
+            .arg("--flight-endpoint")
+            .arg("0.0.0.0:50051")
+            .arg("--help") // Add --help to avoid actually running
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_run_accepts_metrics_endpoint_flag() {
+        let mut cmd = spice_cmd();
+        cmd.arg("run")
+            .arg("--metrics-endpoint")
+            .arg("0.0.0.0:9090")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_run_accepts_trailing_args() {
+        // Verify trailing args are accepted (passed through to spiced)
+        let mut cmd = spice_cmd();
+        cmd.arg("run")
+            .arg("--help")
+            .arg("--")
+            .arg("--custom-arg")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_run_with_global_http_endpoint_flag() {
+        // Verify global --http-endpoint flag works with run command
+        let mut cmd = spice_cmd();
+        cmd.arg("--http-endpoint")
+            .arg("http://127.0.0.1:9999")
+            .arg("run")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_run_with_local_http_endpoint_flag() {
+        // Verify run-specific --http-endpoint flag is accepted (overrides binding address)
+        let mut cmd = spice_cmd();
+        cmd.arg("run")
+            .arg("--http-endpoint")
+            .arg("0.0.0.0:8080")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_run_help_shows_http_endpoint() {
+        // Verify --http-endpoint appears in run help
+        let mut cmd = spice_cmd();
+        cmd.arg("run")
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--http-endpoint"));
+    }
+
+    #[test]
+    fn test_run_with_global_tls_certificate_flag() {
+        // Verify global --tls-root-certificate-file flag is accepted
+        let mut cmd = spice_cmd();
+        cmd.arg("--tls-root-certificate-file")
+            .arg("/path/to/cert.pem")
+            .arg("run")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_run_with_global_api_key_flag() {
+        // Verify global --api-key flag is accepted
+        let mut cmd = spice_cmd();
+        cmd.arg("--api-key")
+            .arg("test-api-key")
+            .arg("run")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_run_with_combined_global_and_local_flags() {
+        // Verify global and local flags can be combined
+        let mut cmd = spice_cmd();
+        cmd.arg("--http-endpoint")
+            .arg("http://127.0.0.1:9999")
+            .arg("--api-key")
+            .arg("my-key")
+            .arg("--tls-root-certificate-file")
+            .arg("/cert.pem")
+            .arg("run")
+            .arg("--http-endpoint") // Local override for binding
+            .arg("0.0.0.0:8080")
+            .arg("--flight-endpoint")
+            .arg("0.0.0.0:50051")
+            .arg("--metrics-endpoint")
+            .arg("0.0.0.0:9090")
+            .arg("--help")
+            .assert()
+            .success();
     }
 }
 
@@ -783,6 +908,16 @@ mod global_flags {
     }
 
     #[test]
+    fn test_max_verbose_flag() {
+        let mut cmd = spice_cmd();
+        cmd.arg("-vvv")
+            .arg("version")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("CLI version:"));
+    }
+
+    #[test]
     fn test_cloud_flag_attempts_cloud_connection() {
         // When --cloud is used without API key, it attempts to connect to cloud
         // which will fail with a connection error (not an API key error)
@@ -798,6 +933,242 @@ mod global_flags {
             .arg("--help")
             .assert()
             .success();
+    }
+
+    #[test]
+    fn test_http_endpoint_flag_with_ip() {
+        let mut cmd = spice_cmd();
+        cmd.arg("--http-endpoint")
+            .arg("http://127.0.0.1:9999")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_api_key_flag() {
+        let mut cmd = spice_cmd();
+        cmd.arg("--api-key")
+            .arg("test-api-key-12345")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_tls_root_certificate_file_flag() {
+        let mut cmd = spice_cmd();
+        cmd.arg("--tls-root-certificate-file")
+            .arg("/path/to/certificate.pem")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_all_global_flags_combined() {
+        let mut cmd = spice_cmd();
+        cmd.arg("-vv")
+            .arg("--http-endpoint")
+            .arg("http://127.0.0.1:9999")
+            .arg("--api-key")
+            .arg("my-api-key")
+            .arg("--tls-root-certificate-file")
+            .arg("/cert.pem")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_global_flags_work_with_status_command() {
+        let mut cmd = spice_cmd();
+        cmd.arg("--http-endpoint")
+            .arg("http://127.0.0.1:9999")
+            .arg("--api-key")
+            .arg("test-key")
+            .arg("status")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_global_flags_work_with_sql_command() {
+        let mut cmd = spice_cmd();
+        cmd.arg("--http-endpoint")
+            .arg("http://127.0.0.1:9999")
+            .arg("sql")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+}
+
+// ============================================================================
+// Local vs Remote (Cloud) Mode Tests
+// ============================================================================
+
+mod mode_tests {
+    use super::*;
+
+    #[test]
+    fn test_default_local_mode() {
+        // Default mode should be local (no --cloud flag)
+        let mut cmd = spice_cmd();
+        cmd.arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--cloud"));
+    }
+
+    #[test]
+    fn test_cloud_flag_available() {
+        // --cloud flag should be available as global option
+        let mut cmd = spice_cmd();
+        cmd.arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--cloud"))
+            .stdout(predicate::str::contains("Use cloud instance"));
+    }
+
+    #[test]
+    fn test_cloud_mode_with_status() {
+        // Cloud mode status should fail without proper connection (no API key)
+        let mut cmd = spice_cmd();
+        cmd.arg("--cloud").arg("status").assert().failure();
+    }
+
+    #[test]
+    fn test_cloud_mode_with_api_key_status() {
+        // Cloud mode with API key should still fail (invalid key)
+        // but the command structure should be valid
+        let mut cmd = spice_cmd();
+        cmd.arg("--cloud")
+            .arg("--api-key")
+            .arg("invalid-api-key")
+            .arg("status")
+            .assert()
+            .failure();
+    }
+
+    #[test]
+    fn test_local_mode_explicit_endpoint() {
+        // Local mode with explicit endpoint
+        let mut cmd = spice_cmd();
+        cmd.arg("--http-endpoint")
+            .arg("http://localhost:8090")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_cloud_mode_with_datasets() {
+        // Cloud mode with datasets command
+        let mut cmd = spice_cmd();
+        cmd.arg("--cloud")
+            .arg("datasets")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_cloud_mode_with_models() {
+        // Cloud mode with models command
+        let mut cmd = spice_cmd();
+        cmd.arg("--cloud")
+            .arg("models")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_cloud_mode_with_search() {
+        // Cloud mode with search command
+        let mut cmd = spice_cmd();
+        cmd.arg("--cloud")
+            .arg("search")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_cloud_mode_with_sql() {
+        // Cloud mode with sql command
+        let mut cmd = spice_cmd();
+        cmd.arg("--cloud")
+            .arg("sql")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_local_mode_with_run_command() {
+        // Local mode run command (default)
+        let mut cmd = spice_cmd();
+        cmd.arg("run").arg("--help").assert().success();
+    }
+
+    #[test]
+    fn test_cloud_mode_not_supported_by_datasets() {
+        // Some commands don't support cloud mode and should indicate this
+        let mut cmd = spice_cmd();
+        cmd.arg("--cloud")
+            .arg("datasets")
+            .assert()
+            .success() // Currently exits 0 but prints error message
+            .stdout(predicate::str::contains("does not support"));
+    }
+
+    #[test]
+    fn test_api_key_env_var_documented() {
+        // API key env var should be documented in help
+        let mut cmd = spice_cmd();
+        cmd.arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("SPICE_API_KEY"));
+    }
+
+    #[test]
+    fn test_cloud_and_http_endpoint_mutually_exclusive_behavior() {
+        // When --cloud is used, it should override --http-endpoint
+        // (The context.rs tests verify this behavior, here we just verify flags parse)
+        let mut cmd = spice_cmd();
+        cmd.arg("--http-endpoint")
+            .arg("http://custom:8080")
+            .arg("--cloud")
+            .arg("--help")
+            .assert()
+            .success();
+    }
+
+    #[test]
+    fn test_local_mode_all_query_commands_available() {
+        // All query commands should work in local mode
+        for command in &["status", "datasets", "models", "sql", "search"] {
+            let mut cmd = spice_cmd();
+            cmd.arg(command).arg("--help").assert().success();
+        }
+    }
+
+    #[test]
+    fn test_cloud_mode_all_query_commands_available() {
+        // All query commands should work in cloud mode
+        for command in &["status", "datasets", "models", "sql", "search"] {
+            let mut cmd = spice_cmd();
+            cmd.arg("--cloud")
+                .arg(command)
+                .arg("--help")
+                .assert()
+                .success();
+        }
     }
 }
 
