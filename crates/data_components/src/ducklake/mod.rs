@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,17 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "schemars")]
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+//! `DuckLake` catalog provider implementation.
+//!
+//! `DuckLake` is an open Lakehouse format that stores metadata in SQL tables and data in Parquet files.
+//! This module provides a catalog provider that connects to a `DuckLake` catalog using `DuckDB`
+//! with the `ducklake` extension.
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum AccessMode {
-    #[default]
-    Read,
-    ReadWrite,
-    /// Full read-write access including DDL operations (CREATE TABLE, DROP TABLE, etc.)
-    ReadWriteCreate,
-}
+pub mod provider;

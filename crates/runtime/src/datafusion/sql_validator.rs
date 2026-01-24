@@ -19,7 +19,7 @@ use std::sync::Arc;
 use datafusion::{
     common::{plan_err, tree_node::TreeNodeRecursion},
     error::DataFusionError,
-    logical_expr::{LogicalPlan, Statement},
+    logical_expr::{DdlStatement, LogicalPlan, Statement},
 };
 
 use crate::datafusion::DataFusion;
@@ -42,7 +42,7 @@ pub fn validate_sql_query_operations(
     plan.apply_with_subqueries(|node| match node {
         // Data Definition Language (DDL): CREATE / DROP TABLES / VIEWS / SCHEMAS
         LogicalPlan::Ddl(ddl) => {
-            plan_err!("Operation is not allowed: {}", ddl.name())
+            validate_ddl_operation(ddl, df)
         }
         // Data Manipulation Language (DML): Insert / Update / Delete
         LogicalPlan::Dml(dml) => {
@@ -94,6 +94,53 @@ pub fn validate_sql_query_operations(
         _ => Ok(TreeNodeRecursion::Continue),
     })?;
     Ok(())
+}
+
+/// Validates DDL operations. DDL is only allowed on catalogs with `access: read_write_create`.
+fn validate_ddl_operation(
+    ddl: &DdlStatement,
+    df: &Arc<DataFusion>,
+) -> Result<TreeNodeRecursion, DataFusionError> {
+    // Extract the catalog name from the DDL statement's table reference
+    let catalog_name = match ddl {
+        DdlStatement::CreateExternalTable(create) => create.name.catalog().map(String::from),
+        DdlStatement::CreateMemoryTable(create) => create.name.catalog().map(String::from),
+        DdlStatement::DropTable(drop) => drop.name.catalog().map(String::from),
+        DdlStatement::CreateView(create) => create.name.catalog().map(String::from),
+        DdlStatement::DropView(drop) => drop.name.catalog().map(String::from),
+        // Schema-level operations - schema_name is a string that may contain catalog.schema format
+        DdlStatement::CreateCatalogSchema(create) => {
+            // schema_name may be in format "catalog.schema" or just "schema"
+            create.schema_name.split('.').next().filter(|_| create.schema_name.contains('.')).map(String::from)
+        }
+        DdlStatement::DropCatalogSchema(drop) => {
+            // Extract catalog from SchemaReference if it's a full reference
+            match &drop.name {
+                datafusion::common::SchemaReference::Full { catalog, .. } => Some(catalog.to_string()),
+                datafusion::common::SchemaReference::Bare { .. } => None,
+            }
+        }
+        // Catalog-level operations - use the catalog name directly
+        DdlStatement::CreateCatalog(_) | DdlStatement::CreateIndex(_) | DdlStatement::CreateFunction(_) | DdlStatement::DropFunction(_) => None,
+    };
+
+    // Check if the operation is targeting a DDL-enabled catalog
+    if let Some(catalog) = catalog_name {
+        if catalog != super::SPICE_DEFAULT_CATALOG && df.is_catalog_ddl_enabled(&catalog) {
+            return Ok(TreeNodeRecursion::Continue);
+        }
+        return plan_err!(
+            "DDL operation '{}' is not allowed on catalog '{}'. Verify the catalog is configured with 'access: read_write_create' and try again.",
+            ddl.name(),
+            catalog
+        );
+    }
+
+    // DDL on the default catalog or without a catalog is not allowed
+    plan_err!(
+        "DDL operation '{}' is not allowed. DDL operations are only supported on catalogs configured with 'access: read_write_create'.",
+        ddl.name()
+    )
 }
 
 #[cfg(test)]
