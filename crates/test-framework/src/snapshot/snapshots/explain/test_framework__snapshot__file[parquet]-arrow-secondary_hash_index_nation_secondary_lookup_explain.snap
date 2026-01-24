@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: nation_secondary_lookup"
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                 |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: nation.n_name = LargeUtf8("ALGERIA")                                                                                         |
+|               |   TableScan: nation projection=[n_nationkey, n_name, n_regionkey, n_comment], partial_filters=[nation.n_name = LargeUtf8("ALGERIA")] |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                                          |
+|               |   FilterExec: n_name@1 = ALGERIA                                                                                                     |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                            |
+|               |       SchemaCastScanExec                                                                                                             |
+|               |         CooperativeExec                                                                                                              |
+|               |           BytesProcessedExec                                                                                                         |
+|               |             IndexedLookupExec: indexed_scan on [n_name]                                                                              |
+|               |                                                                                                                                      |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------+

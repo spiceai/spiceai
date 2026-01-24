@@ -19,6 +19,10 @@ service ClusterService {
     // Get the scheduler membership list.
     // Called by executors during initialization.
     rpc GetSchedulers(GetSchedulersRequest) returns (GetSchedulersResponse);
+
+    // Bidirectional control stream for executor-scheduler communication.
+    // Initiated by executors, used for liveness tracking.
+    rpc ControlStream(stream ExecutorControlMessage) returns (stream SchedulerControlMessage);
 }
 
 // Request message for GetAppDefinition RPC.
@@ -56,6 +60,23 @@ message SchedulerInstance {
 // Response message for GetSchedulers RPC.
 message GetSchedulersResponse {
     repeated SchedulerInstance schedulers = 1;
+}
+
+// Message sent from executor to scheduler on the control stream.
+message ExecutorControlMessage {
+    // Executor's advertise address (used as identifier).
+    string executor_id = 1;
+    oneof message {
+        ExecutorHeartbeat heartbeat = 2;
+    }
+}
+
+// Message sent from scheduler to executor on the control stream.
+message SchedulerControlMessage {}
+
+// Heartbeat message sent by executor to scheduler.
+message ExecutorHeartbeat {
+    int64 timestamp_ms = 1;
 }
 
 // Physical plan

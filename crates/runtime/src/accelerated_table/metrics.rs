@@ -103,3 +103,11 @@ pub(crate) static INGESTION_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
         .with_description("Lag between the current wall-clock time and the maximum time_column value after the refresh operation, in milliseconds.")
         .build()
 });
+
+pub(crate) static SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("dataset_acceleration_size_bytes")
+        .with_description("Size of the accelerated table storage in bytes.")
+        .with_unit("By")
+        .build()
+});

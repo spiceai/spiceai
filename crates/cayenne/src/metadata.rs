@@ -188,6 +188,15 @@ pub struct VortexConfig {
     /// Compression strategy to use for Vortex files
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
+    /// Maximum number of concurrent file uploads when writing multiple Vortex files.
+    /// Each file uses multipart uploads internally via `object_store`.
+    /// Defaults to 4 for balanced I/O throughput vs resource usage.
+    #[serde(default = "default_upload_concurrency")]
+    pub upload_concurrency: usize,
+}
+
+const fn default_upload_concurrency() -> usize {
+    4
 }
 
 impl Default for VortexConfig {
@@ -201,6 +210,8 @@ impl Default for VortexConfig {
             // No sort columns by default
             sort_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
+            // 4 concurrent uploads balances throughput vs resource usage
+            upload_concurrency: 4,
         }
     }
 }

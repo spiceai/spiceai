@@ -23,12 +23,11 @@ use data_components::oracle::connection::{
     OracleConnectionParams, OracleConnectionPool, OracleDirectConnectionParamsBuilder,
 };
 use datafusion::datasource::TableProvider;
-use once_cell::sync::OnceCell;
 use snafu::{ResultExt, Snafu};
 use std::fs;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::{any::Any, future::Future};
 
 use super::{
@@ -41,7 +40,9 @@ const DEFAULT_WALLET_PATH: &str = ".oracle";
 // Ensures that the wallet certificate is only saved once, even if multiple datasets
 // attempt to initialize concurrently. This avoids race conditions when writing the
 // cwallet.sso file and ensures the Oracle OCI client is initialized with a valid wallet.
-static WALLET_INIT: OnceCell<()> = OnceCell::new();
+// Stores the result of the first initialization attempt (success or error message) to
+// prevent repeated retries on failure.
+static WALLET_INIT: OnceLock<Mutex<Option<Result<(), String>>>> = OnceLock::new();
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -49,6 +50,16 @@ pub enum Error {
         "Missing required parameter: '{parameter}'. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/oracle"
     ))]
     MissingParameter { parameter: String },
+
+    #[snafu(display(
+        "Failed to initialize Oracle wallet: A previous initialization failed and the lock is poisoned. Restart the application."
+    ))]
+    WalletInitializationLockPoisoned,
+
+    #[snafu(display(
+        "Failed to initialize Oracle wallet: A previous initialization attempt failed: {message}"
+    ))]
+    WalletInitializationPreviouslyFailed { message: String },
 
     #[snafu(display(
         "Failed to connect to the Oracle Server. Verify your connection configuration, and try again. {source}"
@@ -173,13 +184,27 @@ impl Oracle {
     /// Ensures safe, single initialization across concurrent dataset connections by guarding
     /// against race conditions using `WALLET_INIT`. If multiple datasets attempt to initialize
     /// the wallet concurrently, only the first call will perform the write and initialization;
-    /// subsequent calls will no-op.
+    /// subsequent calls will return the cached result (success or error).
     pub fn save_wallet_cert_once(cert_base64_str: &str, wallet_path: &str) -> Result<()> {
-        WALLET_INIT.get_or_try_init(|| {
-            Self::save_wallet_cert(cert_base64_str, wallet_path)?;
-            Ok(())
-        })?;
-        Ok(())
+        let mutex = WALLET_INIT.get_or_init(|| Mutex::new(None));
+        let mut guard = mutex
+            .lock()
+            .map_err(|_| Error::WalletInitializationLockPoisoned)?;
+
+        match &*guard {
+            Some(Ok(())) => Ok(()),
+            Some(Err(cached_error)) => Err(Error::WalletInitializationPreviouslyFailed {
+                message: cached_error.clone(),
+            }),
+            None => {
+                let result = Self::save_wallet_cert(cert_base64_str, wallet_path);
+                match &result {
+                    Ok(()) => *guard = Some(Ok(())),
+                    Err(e) => *guard = Some(Err(e.to_string())),
+                }
+                result
+            }
+        }
     }
 
     /// Save base64-encoded wallet certificate as cwallet.sso file

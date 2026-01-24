@@ -1,0 +1,8 @@
+tests:
+  bench:
+    spicepod_path: accelerated/indexes/file[parquet]-arrow-compound_hash_index.yaml
+    query_set: scenario
+    scenario_query_file: scenario/hash_index/compound_index_lookup.yaml
+    runner_type: spiceai-dev-runners
+    ready_wait: 300
+    validate_results: true

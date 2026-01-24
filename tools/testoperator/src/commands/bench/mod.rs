@@ -27,6 +27,7 @@ use test_framework::{
     TestType, anyhow,
     app::App,
     arrow::util::pretty::print_batches,
+    git,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
@@ -80,9 +81,31 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
     let ready_wait_duration = ready_wait_start.elapsed();
 
-    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
-    // Resource will be set later with set_resource() before emit()
-    let mut telemetry = super::create_telemetry(&args.common);
+    // Build resource with attributes known upfront, before creating telemetry.
+    // This ensures the SdkMeterProvider is created with the correct resource,
+    // so all metrics (including HealthMonitor) have proper resource attributes.
+    let spiced_version = spiced_instance.version().to_string();
+    let spiced_commit_sha =
+        std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let testoperator_commit_sha = git::get_commit_sha();
+    let branch_name = git::get_branch_name();
+
+    let benchmark_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "benchmark_query"),
+            KeyValue::new("name", app.name.clone()),
+            KeyValue::new("spiced_version", spiced_version),
+            KeyValue::new("query_set", format!("{:?}", args.query_set)),
+            KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("branch_name", branch_name),
+            KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
+        ])
+        .build();
+
+    // Create telemetry with resource upfront, before any metrics calls
+    let telemetry = super::create_telemetry_with_resource(&args.common, benchmark_resource);
 
     let health_monitor = HealthMonitor::spawn()?;
 
@@ -96,7 +119,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     // baseline run
     println!("Running benchmark test");
 
-    let (query_set, test_builder) = super::build_test_with_validation(
+    let (_query_set, test_builder) = super::build_test_with_validation(
         args,
         NotStarted::new()
             .with_parallel_count(1)
@@ -123,26 +146,6 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
     let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
-
-    let commit_sha = metrics.commit_sha.clone();
-    let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
-    let spiced_version = metrics.spiced_version.clone();
-    let app_name = app.name.clone();
-    let benchmark_resource = Resource::builder_empty()
-        .with_attributes(vec![
-            KeyValue::new("service.name", "testoperator"),
-            KeyValue::new("type", "benchmark_query"),
-            KeyValue::new("name", app_name.clone()),
-            KeyValue::new("spiced_version", spiced_version.clone()),
-            KeyValue::new("query_set", query_set.to_string()),
-            KeyValue::new("testoperator_commit_sha", commit_sha.clone()),
-            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-            KeyValue::new("branch_name", metrics.branch_name.clone()),
-            KeyValue::new("scale_factor", args.scale_factor.unwrap_or(1.0).to_string()),
-        ])
-        .build();
-
-    telemetry.set_resource(benchmark_resource);
 
     let mut failures = Vec::new();
     for query in &metrics.metrics {

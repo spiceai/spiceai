@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{pin::Pin, sync::Arc};
 
+use data_components::index_maintenance::perform_index_maintenance;
 use datafusion::{
     catalog::TableProvider, execution::RecordBatchStream, logical_expr::dml::InsertOp,
     physical_plan::collect, prelude::SessionContext,
@@ -91,6 +92,22 @@ impl TableSink {
                 collect_start.elapsed().as_secs_f64()
             );
             return Err(retry_from_df_error(e));
+        }
+
+        // Perform post-write index maintenance (e.g., rebuild hash indexes) if the table supports it
+        match perform_index_maintenance(self.table_provider.as_ref()).await {
+            Ok(true) => {
+                tracing::debug!("TableSink: index maintenance completed successfully");
+            }
+            Ok(false) => {
+                // Table doesn't support index maintenance - this is expected for most tables
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "TableSink: index maintenance failed after write: {e}. Index may be stale until next refresh."
+                );
+                // Don't fail the write - data was successfully written, index rebuild is best-effort
+            }
         }
 
         tracing::debug!(

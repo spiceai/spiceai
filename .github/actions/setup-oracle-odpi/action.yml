@@ -7,7 +7,7 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        # Ubuntu 24.04+ renamed libaio1 to libaio1t64 for 64-bit time_t transition
+        # Ubuntu 22.04+ renamed libaio1 to libaio1t64 for 64-bit time_t transition
         sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
 
         # Download and extract Oracle Instant Client
@@ -17,7 +17,7 @@ runs:
         IC_DIR=$PWD/$(ls -d linux/instantclient*)
 
         # Handle both old and new libaio naming conventions for maximum compatibility
-        # Ubuntu 24.04+ renamed libaio.so.1 to libaio.so.1t64
+        # Ubuntu 22.04+ renamed libaio.so.1 to libaio.so.1t64
         if [ -f /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ] && [ ! -f $IC_DIR/libaio.so.1 ]; then
           ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 $IC_DIR/libaio.so.1
         fi

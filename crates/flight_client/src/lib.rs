@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -258,8 +258,11 @@ impl FlightClient {
     ///
     /// # Arguments
     ///
-    /// * `username` - The username to use.
-    /// * `password` - The password to use.
+    /// * `url` - The URL to connect to.
+    /// * `credentials` - The credentials to use for authentication.
+    /// * `metadata` - Optional metadata to include with requests.
+    /// * `ca_certificate_path` - Optional path to a CA certificate file (PEM format)
+    ///   for TLS verification. If not provided, system certificates will be used.
     ///
     /// # Errors
     ///
@@ -268,8 +271,9 @@ impl FlightClient {
         url: Arc<str>,
         credentials: Credentials,
         metadata: Option<tonic::metadata::MetadataMap>,
+        ca_certificate_path: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let flight_channel = tls::new_tls_flight_channel(&url)
+        let flight_channel = tls::new_tls_flight_channel(&url, ca_certificate_path)
             .await
             .context(UnableToConnectToServerSnafu)?;
 

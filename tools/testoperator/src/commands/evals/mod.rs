@@ -112,9 +112,22 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
-    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
-    // Resource will be set later with set_resource() before emit()
-    let mut telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
+    // Build resource with attributes known upfront, before creating telemetry.
+    // This ensures the SdkMeterProvider is created with the correct resource.
+    let benchmark_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "model_benchmark"),
+            KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+            KeyValue::new("spiced_commit_sha", git::get_commit_sha()),
+            KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+            KeyValue::new("branch_name", git::get_branch_name()),
+        ])
+        .build();
+
+    // Create telemetry with resource upfront, before any metrics calls
+    let telemetry =
+        Telemetry::new_with_resource(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
     let health_monitor = HealthMonitor::spawn()?;
 
@@ -180,19 +193,6 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     println!("Top errors:\n{}\n", arrow_to_json(&top_errors)?);
 
     // Record benchmark results
-    let benchmark_resource = Resource::builder_empty()
-        .with_attributes(vec![
-            KeyValue::new("service.name", "testoperator"),
-            KeyValue::new("type", "model_benchmark"),
-            KeyValue::new("spiced_version", spiced_instance.version().to_string()),
-            KeyValue::new("spiced_commit_sha", git::get_commit_sha()),
-            KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
-            KeyValue::new("branch_name", git::get_branch_name()),
-        ])
-        .build();
-
-    telemetry.set_resource(benchmark_resource);
-
     let attributes = vec![
         KeyValue::new("model_name", model.clone()),
         KeyValue::new("benchmark_name", eval.clone()),

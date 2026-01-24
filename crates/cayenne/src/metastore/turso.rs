@@ -276,6 +276,31 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
     }
 }
 
+/// Convert Turso errors to `CatalogError`, distinguishing constraint violations.
+fn convert_turso_error(e: turso::Error) -> CatalogError {
+    match e {
+        turso::Error::SqlExecutionFailure(ref msg) if is_constraint_violation(msg) => {
+            CatalogError::ConstraintViolation {
+                message: msg.clone(),
+            }
+        }
+        other => CatalogError::Database {
+            message: format!("Failed to execute statement: {other}"),
+        },
+    }
+}
+
+/// Check if an error message indicates a constraint violation.
+/// Turso/libSQL returns constraint violations as `SqlExecutionFailure` with a message
+/// containing keywords like "UNIQUE constraint".
+fn is_constraint_violation(msg: &str) -> bool {
+    let msg_lower = msg.to_lowercase();
+    msg_lower.contains("unique constraint")
+        || msg_lower.contains("constraint failed")
+        || msg_lower.contains("primary key constraint")
+        || msg_lower.contains("foreign key constraint")
+}
+
 #[async_trait]
 impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
@@ -332,9 +357,7 @@ impl MetastoreBackend for TursoMetastore {
 
         conn.execute(params.sql, turso_params)
             .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to execute statement: {e}"),
-            })?;
+            .map_err(convert_turso_error)?;
 
         Ok(())
     }

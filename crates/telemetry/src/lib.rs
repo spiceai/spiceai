@@ -273,3 +273,27 @@ static HASH_INDEX_MEMORY_BYTES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
 pub fn track_hash_index_memory_bytes(bytes: u64, dimensions: &[KeyValue]) {
     HASH_INDEX_MEMORY_BYTES.record(bytes, dimensions);
 }
+
+static HASH_INDEX_LOOKUPS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("hash_index_lookups")
+        .with_description("Number of hash index point lookups performed.")
+        .with_unit("lookups")
+        .build()
+});
+
+pub fn track_hash_index_lookups(count: u64, dimensions: &[KeyValue]) {
+    HASH_INDEX_LOOKUPS.add(count, dimensions);
+}
+
+static HASH_INDEX_LOOKUP_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("hash_index_lookup_rows")
+        .with_description("Number of rows returned from hash index lookups.")
+        .with_unit("rows")
+        .build()
+});
+
+pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
+    HASH_INDEX_LOOKUP_ROWS.add(rows, dimensions);
+}

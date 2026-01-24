@@ -154,13 +154,13 @@ jobs:
 
       - name: Build spiced
         if: matrix.target.target_os != 'darwin'
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models"
+        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,postgres-accel"
 
       - name: Build spiced (macOS)
         if: matrix.target.target_os == 'darwin'
         env:
           MISTRALRS_METAL_PRECOMPILE: 0
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,metal"
+        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,postgres-accel,metal"
 
       - name: Build spice
         run: make -C bin/spice

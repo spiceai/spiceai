@@ -4,6 +4,7 @@ The project docs for contributors and community. For user documentation of the S
 
 - [Principles](PRINCIPLES.md)
 - [Roadmap](ROADMAP.md)
+- [Distributions](DISTRIBUTIONS.md)
 
 ## Contributing
 
