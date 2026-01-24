@@ -29,7 +29,8 @@ use crate::datafusion::DataFusion;
 /// Reads (SELECT queries) are allowed on all tables.
 /// INSERT operations are only allowed on datasets that are configured as writable,
 /// and are not allowed on internal Spice tables.
-/// DDL, DML (other than allowed INSERT), COPY, and Statement operations are not permitted.
+/// DDL operations are only allowed on catalogs configured with `access: read_write_create`.
+/// DML (other than allowed INSERT), COPY, and Statement operations are not permitted.
 ///
 /// # Returns
 /// * `Ok(())` if the plan is valid
@@ -111,17 +112,27 @@ fn validate_ddl_operation(
         // Schema-level operations - schema_name is a string that may contain catalog.schema format
         DdlStatement::CreateCatalogSchema(create) => {
             // schema_name may be in format "catalog.schema" or just "schema"
-            create.schema_name.split('.').next().filter(|_| create.schema_name.contains('.')).map(String::from)
+            create
+                .schema_name
+                .split('.')
+                .next()
+                .filter(|_| create.schema_name.contains('.'))
+                .map(String::from)
         }
         DdlStatement::DropCatalogSchema(drop) => {
             // Extract catalog from SchemaReference if it's a full reference
             match &drop.name {
-                datafusion::common::SchemaReference::Full { catalog, .. } => Some(catalog.to_string()),
+                datafusion::common::SchemaReference::Full { catalog, .. } => {
+                    Some(catalog.to_string())
+                }
                 datafusion::common::SchemaReference::Bare { .. } => None,
             }
         }
         // Catalog-level operations - use the catalog name directly
-        DdlStatement::CreateCatalog(_) | DdlStatement::CreateIndex(_) | DdlStatement::CreateFunction(_) | DdlStatement::DropFunction(_) => None,
+        DdlStatement::CreateCatalog(_)
+        | DdlStatement::CreateIndex(_)
+        | DdlStatement::CreateFunction(_)
+        | DdlStatement::DropFunction(_) => None,
     };
 
     // Check if the operation is targeting a DDL-enabled catalog
@@ -252,6 +263,22 @@ mod tests {
         // Mark writable_catalog as writable
         df.mark_catalog_writable("writable_catalog")
             .expect("catalog should be marked as writable");
+
+        // Add a DDL-enabled catalog for testing DDL operations
+        df.ctx.register_catalog(
+            "ddl_enabled_catalog".to_string(),
+            Arc::new(MemoryCatalogProvider::new()),
+        );
+
+        df.ctx
+            .catalog("ddl_enabled_catalog")
+            .expect("catalog should be found")
+            .register_schema("public", Arc::new(SpiceSchemaProvider::new()))
+            .expect("schema should be registered");
+
+        // Mark ddl_enabled_catalog as DDL-enabled (which also makes it writable)
+        df.mark_catalog_ddl_enabled("ddl_enabled_catalog")
+            .expect("catalog should be marked as DDL-enabled");
 
         df
     }
@@ -396,6 +423,76 @@ mod tests {
 
         let result = validate_sql_query_operations(&plan, &df);
         assert!(result.is_err(), "CREATE TABLE should be blocked");
+    }
+
+    #[tokio::test]
+    async fn test_validate_ddl_operations_allowed_on_ddl_enabled_catalog() {
+        let df = create_test_datafusion();
+
+        // Test CREATE TABLE on DDL-enabled catalog
+        let sql = "CREATE TABLE ddl_enabled_catalog.public.new_table (id INT, name VARCHAR(50))";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "CREATE TABLE should be allowed on DDL-enabled catalog"
+        );
+
+        // Test DROP TABLE on DDL-enabled catalog
+        let sql = "DROP TABLE IF EXISTS ddl_enabled_catalog.public.some_table";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "DROP TABLE should be allowed on DDL-enabled catalog"
+        );
+
+        // Test CREATE SCHEMA on DDL-enabled catalog
+        let sql = "CREATE SCHEMA ddl_enabled_catalog.new_schema";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_ok(),
+            "CREATE SCHEMA should be allowed on DDL-enabled catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_ddl_blocked_on_writable_but_not_ddl_enabled_catalog() {
+        let df = create_test_datafusion();
+
+        // Test CREATE TABLE on writable_catalog (which is only read_write, not read_write_create)
+        let sql = "CREATE TABLE writable_catalog.public.new_table (id INT, name VARCHAR(50))";
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("plan should be created");
+
+        let result = validate_sql_query_operations(&plan, &df);
+        assert!(
+            result.is_err(),
+            "CREATE TABLE should be blocked on writable (but not DDL-enabled) catalog"
+        );
     }
 
     #[tokio::test]

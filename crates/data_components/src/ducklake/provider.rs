@@ -48,10 +48,14 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Write operations are not allowed on this catalog (access mode is read-only)"))]
+    #[snafu(display(
+        "Write operations are not allowed on this catalog (access mode is read-only)"
+    ))]
     WriteNotAllowed,
 
-    #[snafu(display("DDL operations are not allowed on this catalog (access mode does not include create)"))]
+    #[snafu(display(
+        "DDL operations are not allowed on this catalog (access mode does not include create)"
+    ))]
     DdlNotAllowed,
 
     #[snafu(display("Schema '{schema_name}' not found in catalog '{catalog_name}'"))]
@@ -215,7 +219,6 @@ impl DuckLakeCatalogProvider {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 impl CatalogProvider for DuckLakeCatalogProvider {
     fn as_any(&self) -> &dyn Any {
         self
@@ -347,7 +350,8 @@ impl CatalogProvider for DuckLakeCatalogProvider {
         let duckdb_conn = conn.as_any().downcast_ref::<duckdb::Connection>();
         if let Some(duckdb_conn) = duckdb_conn {
             let cascade_str = if cascade { " CASCADE" } else { "" };
-            let sql = format!(r#"DROP SCHEMA IF EXISTS "{catalog_name}"."{schema_name}"{cascade_str}"#);
+            let sql =
+                format!(r#"DROP SCHEMA IF EXISTS "{catalog_name}"."{schema_name}"{cascade_str}"#);
             duckdb_conn
                 .execute(&sql, [])
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -590,9 +594,8 @@ impl SchemaProvider for DuckLakeSchemaProvider {
 
         let duckdb_conn = conn.as_any().downcast_ref::<duckdb::Connection>();
         if let Some(duckdb_conn) = duckdb_conn {
-            let sql = format!(
-                r#"DROP TABLE IF EXISTS "{catalog_name}"."{schema_name}"."{table_name}""#
-            );
+            let sql =
+                format!(r#"DROP TABLE IF EXISTS "{catalog_name}"."{schema_name}"."{table_name}""#);
             duckdb_conn
                 .execute(&sql, [])
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
