@@ -52,10 +52,13 @@ jobs:
             target_input="${{ github.event.inputs.target }}"
             publish_flag="${{ github.event.inputs.publish || 'false' }}"
             release_tag_input="${{ github.event.inputs.release_tag }}"
+            allow_cuda=true
           else
+            # For release events, CUDA is not built (nightly-only)
             target_input="all"
             publish_flag="true"
             release_tag_input="${{ github.event.release.tag_name }}"
+            allow_cuda=false
           fi
 
           target_input="${target_input:-all}"
@@ -84,7 +87,9 @@ jobs:
             all|"")
               run_amd64=true
               run_arm64=true
-              run_cuda=true
+              if [ "$allow_cuda" = "true" ]; then
+                run_cuda=true
+              fi
               ;;
             amd64)
               run_amd64=true
@@ -93,7 +98,12 @@ jobs:
               run_arm64=true
               ;;
             cuda)
-              run_cuda=true
+              if [ "$allow_cuda" = "true" ]; then
+                run_cuda=true
+              else
+                echo "CUDA builds are only available via workflow_dispatch (nightly builds)" >&2
+                exit 1
+              fi
               ;;
             *)
               echo "Unknown target selection: $target_input" >&2
@@ -131,7 +141,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
@@ -149,14 +159,6 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-
-      - name: models
-        run: |
-          echo "IMAGE_TAG=models" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-      - *build-amd64-image
 
       - name: Upload AMD64 artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
@@ -208,7 +210,7 @@ jobs:
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
@@ -226,14 +228,6 @@ jobs:
             CARGO_FEATURES=${{ env.CARGO_FEATURES }}
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-
-      - name: models
-        run: |
-          echo "IMAGE_TAG=models" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
-        if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-      - *build-arm64-image
 
       - name: Upload ARM64 artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
@@ -262,14 +256,14 @@ jobs:
             image=moby/buildkit:latest
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
-      - name: Configure CUDA models build
+      - name: Configure CUDA build
         run: |
-          echo "IMAGE_TAG=models-cuda" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models-cuda" >> $GITHUB_ENV
+          echo "IMAGE_TAG=cuda" >> $GITHUB_ENV
+          echo "BINARY_VARIANT=cuda" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,cuda" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
-      - name: Package CUDA models image
+      - name: Package CUDA image
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
@@ -349,60 +343,55 @@ jobs:
           echo "RUN_AMD64=${RUN_AMD64}"
           echo "RUN_ARM64=${RUN_ARM64}"
 
-          variants=("default" "models")
-          for variant in "${variants[@]}"; do
-            suffix=""
-            if [ "$variant" != "default" ]; then
-              suffix="-${variant}"
-            fi
+          # Single default variant
+          variant="default"
 
-            sources=()
+          sources=()
 
-            if [ "${RUN_AMD64}" = "true" ] && [ -f "/tmp/image-amd64-${variant}.tar" ]; then
-              echo "Loading AMD64 image for ${variant}"
-              docker load -i /tmp/image-amd64-${variant}.tar
-              docker push localhost:5000/spiceai:${variant}-amd64
-              sources+=("localhost:5000/spiceai:${variant}-amd64")
-            fi
+          if [ "${RUN_AMD64}" = "true" ] && [ -f "/tmp/image-amd64-${variant}.tar" ]; then
+            echo "Loading AMD64 image for ${variant}"
+            docker load -i /tmp/image-amd64-${variant}.tar
+            docker push localhost:5000/spiceai:${variant}-amd64
+            sources+=("localhost:5000/spiceai:${variant}-amd64")
+          fi
 
-            if [ "${RUN_ARM64}" = "true" ] && [ -f "/tmp/image-arm64-${variant}.tar" ]; then
-              echo "Loading ARM64 image for ${variant}"
-              docker load -i /tmp/image-arm64-${variant}.tar
-              docker push localhost:5000/spiceai:${variant}-arm64
-              sources+=("localhost:5000/spiceai:${variant}-arm64")
-            fi
+          if [ "${RUN_ARM64}" = "true" ] && [ -f "/tmp/image-arm64-${variant}.tar" ]; then
+            echo "Loading ARM64 image for ${variant}"
+            docker load -i /tmp/image-arm64-${variant}.tar
+            docker push localhost:5000/spiceai:${variant}-arm64
+            sources+=("localhost:5000/spiceai:${variant}-arm64")
+          fi
 
-            if [ ${#sources[@]} -eq 0 ]; then
-              echo "No images built for variant ${variant}; skipping manifest creation."
-              continue
-            fi
+          if [ ${#sources[@]} -eq 0 ]; then
+            echo "No images built; skipping manifest creation."
+            exit 0
+          fi
 
-            if [[ "${PUBLISH}" == "true" ]]; then
-              echo "Publishing ${variant} to GHCR and DockerHub"
-              docker buildx imagetools create \
-                -t ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix} \
-                -t ghcr.io/spiceai/spiceai:latest${suffix} \
-                "${sources[@]}"
+          if [[ "${PUBLISH}" == "true" ]]; then
+            echo "Publishing to GHCR and DockerHub"
+            docker buildx imagetools create \
+              -t ghcr.io/spiceai/spiceai:${REL_VERSION} \
+              -t ghcr.io/spiceai/spiceai:latest \
+              "${sources[@]}"
 
-              docker buildx imagetools create \
-                -t spiceai/spiceai:${REL_VERSION}${suffix} \
-                -t spiceai/spiceai:latest${suffix} \
-                "${sources[@]}"
+            docker buildx imagetools create \
+              -t spiceai/spiceai:${REL_VERSION} \
+              -t spiceai/spiceai:latest \
+              "${sources[@]}"
 
-              echo "Verifying GHCR image:"
-              docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix}
+            echo "Verifying GHCR image:"
+            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}
 
-              echo "Verifying DockerHub image:"
-              docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}${suffix}
-            else
-              echo "Skipping registry publish for ${variant}"
-              docker buildx imagetools create \
-                -t localhost:5000/spiceai:latest${suffix} \
-                "${sources[@]}"
+            echo "Verifying DockerHub image:"
+            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}
+          else
+            echo "Skipping registry publish"
+            docker buildx imagetools create \
+              -t localhost:5000/spiceai:latest \
+              "${sources[@]}"
 
-              docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
-            fi
-          done
+            docker buildx imagetools inspect localhost:5000/spiceai:latest
+          fi
 
   publish-cuda:
     needs: [setup, build-cuda]
@@ -451,29 +440,29 @@ jobs:
             exit 0
           fi
 
-          echo "Handling CUDA models..."
+          echo "Handling CUDA..."
           docker load -i /tmp/images-amd64-cuda.tar
-          docker push localhost:5000/spiceai:models-cuda-amd64
+          docker push localhost:5000/spiceai:cuda-amd64
 
           if [[ "${PUBLISH}" == "true" ]]; then
-            echo "Pushing CUDA models to GHCR and DockerHub"
+            echo "Pushing CUDA to GHCR and DockerHub"
             docker buildx imagetools create \
-              -t spiceai/spiceai:${REL_VERSION}-models-cuda \
-              -t spiceai/spiceai:latest-models-cuda \
-              -t ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda \
-              -t ghcr.io/spiceai/spiceai:latest-models-cuda \
-              localhost:5000/spiceai:models-cuda-amd64
+              -t spiceai/spiceai:${REL_VERSION}-cuda \
+              -t spiceai/spiceai:latest-cuda \
+              -t ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda \
+              -t ghcr.io/spiceai/spiceai:latest-cuda \
+              localhost:5000/spiceai:cuda-amd64
 
             echo "Verifying CUDA GHCR image:"
-            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda
+            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda
 
             echo "Verifying CUDA DockerHub image:"
-            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}-models-cuda
+            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}-cuda
           else
             echo "Skipping push for non-publish CUDA build"
             docker buildx imagetools create \
-              -t localhost:5000/spiceai:latest-models-cuda \
-              localhost:5000/spiceai:models-cuda-amd64
+              -t localhost:5000/spiceai:latest-cuda \
+              localhost:5000/spiceai:cuda-amd64
 
-            docker buildx imagetools inspect localhost:5000/spiceai:latest-models-cuda
+            docker buildx imagetools inspect localhost:5000/spiceai:latest-cuda
           fi

@@ -559,9 +559,8 @@ export PATH="$PATH:$HOME/.spice/bin"
 4. Integration tests need credentials (`spice login` or `.env`)
 5. testoperator is the test harness
 6. Workspace uses Rust edition 2024
-7. Allocator customizable (default: snmalloc, can use jemalloc/mimalloc)
-8. New files should include copyright header. The current year is 2026. Required file types: `.rs`, `.go`
-9. **Spice runtime (Rust) is 64-bit minimum**: The runtime requires at least 64-bit pointer size. Do not add 32-bit compatibility code. Code should assume `usize` is at least 64 bits but not assume it's exactly 64 bits (future 128-bit support).
+7. New files should include copyright header. The current year is 2026. Required file types: `.rs`, `.go`
+8. **Spice runtime (Rust) is 64-bit minimum**: The runtime requires at least 64-bit pointer size. Do not add 32-bit compatibility code. Code should assume `usize` is at least 64 bits but not assume it's exactly 64 bits (future 128-bit support).
 
 ## Adding Features Checklist
 

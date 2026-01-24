@@ -285,6 +285,7 @@ postgres = [
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
+postgres-accel = ["postgres"]
 postgres-write = []
 s3_vectors = [
     "data_components/s3_vectors",

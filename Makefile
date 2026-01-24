@@ -214,6 +214,11 @@ display-deps:
 ################################################################################
 # Target: install                                                              #
 ################################################################################
+# Default install includes models. Use -data suffix variants to build without models.
+# Data-only features (default features minus models)
+# Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb
+
 .PHONY: install
 install: build
 	mkdir -p ~/.spice/bin
@@ -226,27 +231,50 @@ install-dev: build-dev
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
-.PHONY: install-with-models
-install-with-models:
-	make install SPICED_NON_DEFAULT_FEATURES="models"
+# Data-only variants (without models)
+.PHONY: install-data-only
+install-data-only:
+	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES)"
 
-.PHONY: install-with-models-dev
-install-with-models-dev:
-	make install-dev SPICED_NON_DEFAULT_FEATURES="models"
+.PHONY: install-data-only-dev
+install-data-only-dev:
+	make install-dev SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES)"
 
-.PHONY: install-with-models-metal-dev
-install-with-models-metal-dev:
-	make install-dev SPICED_NON_DEFAULT_FEATURES="models,metal"
+# Metal variants (with GPU acceleration)
+.PHONY: install-metal
+install-metal:
+	make install SPICED_NON_DEFAULT_FEATURES="metal"
 
-install-with-models-metal:
-	make install SPICED_NON_DEFAULT_FEATURES="models,metal"
+.PHONY: install-metal-dev
+install-metal-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="metal"
 
-install-with-models-cuda:
-	make install SPICED_NON_DEFAULT_FEATURES="models,cuda"
+.PHONY: install-data-only-metal
+install-data-only-metal:
+	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),metal"
 
-.PHONY: install-with-odbc
-install-with-odbc:
+.PHONY: install-data-only-metal-dev
+install-data-only-metal-dev:
+	make install-dev SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),metal"
+
+# CUDA variants
+.PHONY: install-cuda
+install-cuda:
+	make install SPICED_NON_DEFAULT_FEATURES="cuda"
+
+.PHONY: install-data-only-cuda
+install-data-only-cuda:
+	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),cuda"
+
+# ODBC variants
+.PHONY: install-odbc
+install-odbc:
 	make install SPICED_NON_DEFAULT_FEATURES="odbc"
+
+# NFS variants
+.PHONY: install-nfs
+install-nfs:
+	make install SPICED_NON_DEFAULT_FEATURES="nfs"
 
 .PHONY: install-testoperator-dev
 install-testoperator-dev: build-testoperator-dev
