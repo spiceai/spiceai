@@ -112,12 +112,15 @@
       "preLaunchTask": "rust: cargo build testoperator"
     },
     {
-      "name": "spice version",
-      "type": "go",
+      "name": "[Rust] spice version",
+      "type": "lldb",
       "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/bin/spice/main.go",
-      "args": ["version"]
+      "cargo": {
+        "args": ["build", "--package", "spice"],
+        "problemMatcher": "$rustc"
+      },
+      "args": ["version"],
+      "cwd": "${workspaceFolder}"
     },
     {
       "type": "lldb",

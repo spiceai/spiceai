@@ -35,7 +35,48 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::Runtime;
+use crate::config::ClusterRole;
 use crate::jobs::{JobExecutor, JobState, JobStatus};
+
+/// Check if cluster mode with scheduler role is enabled.
+/// Returns 503 error response if not in scheduler cluster mode.
+#[expect(
+    clippy::result_large_err,
+    reason = "Response type is needed for HTTP error responses"
+)]
+fn require_cluster_mode(rt: &Arc<Runtime>) -> Result<(), Response> {
+    if rt.df.cluster_config.effective_role() != Some(ClusterRole::Scheduler) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Async queries API is only available when running as scheduler. Start with: spiced --role scheduler"
+            })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// Helper to get job executor from runtime.
+/// Requires cluster mode to be enabled. Returns 503 if executor is not available yet.
+#[expect(
+    clippy::result_large_err,
+    reason = "Response type is needed for HTTP error responses"
+)]
+fn get_executor(rt: &Arc<Runtime>) -> Result<Arc<JobExecutor>, Response> {
+    require_cluster_mode(rt)?;
+
+    rt.job_executor().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Queries API is initializing. Please retry shortly."
+            })),
+        )
+            .into_response()
+    })
+}
 
 /// Request body for submitting a new query.
 #[derive(Debug, Deserialize)]
@@ -241,9 +282,13 @@ pub struct QuerySummary {
     )
 ))]
 pub(crate) async fn submit(
-    Extension(executor): Extension<Arc<JobExecutor>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Json(request): Json<SubmitQueryRequest>,
 ) -> Response {
+    let executor = match get_executor(&rt) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
     let result = executor.submit(request.sql, request.parameters).await;
 
     match result {
@@ -280,9 +325,13 @@ pub(crate) async fn submit(
     )
 ))]
 pub(crate) async fn get_query(
-    Extension(executor): Extension<Arc<JobExecutor>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Path(query_id): Path<String>,
 ) -> Response {
+    let executor = match get_executor(&rt) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
     let result = executor.get_status(&query_id).await;
 
     match result {
@@ -327,9 +376,13 @@ pub(crate) async fn get_query(
     )
 ))]
 pub(crate) async fn get_status(
-    Extension(executor): Extension<Arc<JobExecutor>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Path(query_id): Path<String>,
 ) -> Response {
+    let executor = match get_executor(&rt) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
     let result = executor.get_status(&query_id).await;
 
     match result {
@@ -371,10 +424,14 @@ pub(crate) async fn get_status(
     )
 ))]
 pub(crate) async fn get_results(
-    Extension(executor): Extension<Arc<JobExecutor>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Path(query_id): Path<String>,
     Query(params): Query<ResultsQueryParams>,
 ) -> Response {
+    let executor = match get_executor(&rt) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
     let partition = params.partition.unwrap_or(0);
 
     // First check the job state
@@ -469,9 +526,13 @@ pub struct ResultsQueryParams {
     )
 ))]
 pub(crate) async fn get_chunk(
-    Extension(executor): Extension<Arc<JobExecutor>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Path((query_id, chunk_index)): Path<(String, usize)>,
 ) -> Response {
+    let executor = match get_executor(&rt) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
     // First check the job state to get manifest
     let state = match executor.get_status(&query_id).await {
         Ok(s) => s,
@@ -536,9 +597,13 @@ pub(crate) async fn get_chunk(
     )
 ))]
 pub(crate) async fn cancel(
-    Extension(executor): Extension<Arc<JobExecutor>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Path(query_id): Path<String>,
 ) -> Response {
+    let executor = match get_executor(&rt) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
     let result = executor.cancel(&query_id).await;
 
     match result {
@@ -566,9 +631,13 @@ pub(crate) async fn cancel(
     )
 ))]
 pub(crate) async fn list(
-    Extension(executor): Extension<Arc<JobExecutor>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Query(query): Query<ListQueriesQuery>,
 ) -> Response {
+    let executor = match get_executor(&rt) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
     // Parse status filter
     let status_filter = query.status.and_then(|s| match s.to_lowercase().as_str() {
         "queued" | "pending" => Some(JobStatus::Pending),

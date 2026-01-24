@@ -24,8 +24,9 @@ GITHUB_REPO=spiceai
 # Spice Runtime filename
 SPICED_FILENAME=spiced
 
-# Variant options: "" (no variant), "models", "cuda", "metal"
-: ${VARIANT:="models"}
+# Variant options: "" (default, includes models), "cuda", "metal"
+# The default distribution now includes models, so no separate variant suffix needed
+: ${VARIANT:=""}
 
 # CUDA version: "80", "86", "87", "89", "90"
 # Only used when VARIANT is "cuda"
@@ -59,7 +60,26 @@ getSystemInfo() {
 }
 
 verifySupported() {
-    local supported=(linux-x86_64 linux-aarch64 darwin-aarch64 windows-x86_64)
+    # Check for Windows first and provide helpful error message
+    if [ "$OS" == "windows" ]; then
+        echo ""
+        echo "Error: Native Windows is not supported for the Spice runtime (spiced) in the open source version."
+        echo ""
+        echo "Options:"
+        echo ""
+        echo "  1. Run the Spice runtime inside Windows Subsystem for Linux (WSL):"
+        echo "     - Install WSL: wsl --install"
+        echo "     - Open a WSL terminal (e.g., Ubuntu)"
+        echo "     - Run this install script again from within WSL"
+        echo "     - For more information: https://docs.microsoft.com/en-us/windows/wsl/install"
+        echo ""
+        echo "  2. Native Windows support is available with Spice.ai Enterprise."
+        echo "     - Learn more: https://spice.ai/pricing"
+        echo ""
+        exit 1
+    fi
+
+    local supported=(linux-x86_64 linux-aarch64 darwin-aarch64)
     local current_osarch="${OS}-${ARCH}"
 
     for osarch in "${supported[@]}"; do
@@ -174,23 +194,17 @@ downloadFile() {
 
     # Build artifact name based on variant and OS
     # Asset naming convention:
-    #   No variant (VARIANT=""): spiced_{os}_{arch}.tar.gz  or  spiced.exe_{os}_{arch}.tar.gz (Windows)
-    #   Models (VARIANT="models", the default): spiced_models_{os}_{arch}.tar.gz  or  spiced.exe_models_{os}_{arch}.tar.gz (Windows)
-    #   Metal (VARIANT="metal"): spiced_models_metal_{os}_{arch}.tar.gz
-    #   CUDA (VARIANT="cuda"): spiced_models_cuda_{version}_{os}_{arch}.tar.gz
+    #   Default (VARIANT=""): spiced_{os}_{arch}.tar.gz (includes models)
+    #   Metal (VARIANT="metal"): spiced_metal_{os}_{arch}.tar.gz
+    #   CUDA (VARIANT="cuda"): spiced_cuda_{version}_{os}_{arch}.tar.gz
     local artifact_name="${SPICED_FILENAME}"
     
-    # For Windows, .exe comes right after spiced
-    if [ "$OS" == "windows" ]; then
-        artifact_name="${artifact_name}.exe"
-    fi
-    
-    # Add variant suffix
+    # Add variant suffix (only for non-default variants)
     if [ -n "$VARIANT" ]; then
         if [ "$VARIANT" == "cuda" ]; then
-            artifact_name="${artifact_name}_models_cuda_${CUDA_VERSION}"
+            artifact_name="${artifact_name}_cuda_${CUDA_VERSION}"
         elif [ "$VARIANT" == "metal" ]; then
-            artifact_name="${artifact_name}_models_metal"
+            artifact_name="${artifact_name}_metal"
         else
             artifact_name="${artifact_name}_${VARIANT}"
         fi

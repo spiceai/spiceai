@@ -50,12 +50,11 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
 
 use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
-mod adapter;
 mod behavior;
 pub mod directory_archive;
 mod engine;
 pub mod metrics;
-pub use adapter::SnapshotAdapter;
+pub use crate::layout::AccelerationLayout;
 pub use behavior::SnapshotBehavior;
 use engine::{SnapshotEngine, create_snapshot_engine};
 
@@ -485,8 +484,8 @@ pub struct SnapshotManager {
     dataset_name: String,
     snapshots_location: object_store::path::Path,
     snapshot_location_uri: String,
-    /// The snapshot adapter defining how this accelerator's data should be snapshotted.
-    adapter: SnapshotAdapter,
+    /// The acceleration layout defining the storage paths for this accelerator.
+    layout: AccelerationLayout,
     snapshot_engine: Arc<dyn SnapshotEngine>,
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
@@ -500,7 +499,7 @@ impl std::fmt::Debug for SnapshotManager {
             .field("dataset_name", &self.dataset_name)
             .field("snapshots_location", &self.snapshots_location)
             .field("snapshot_location_uri", &self.snapshot_location_uri)
-            .field("adapter", &self.adapter)
+            .field("layout", &self.layout)
             .field(
                 "bootstrap_failure_behavior",
                 &self.bootstrap_failure_behavior,
@@ -591,11 +590,11 @@ impl SnapshotManager {
     pub async fn try_new(
         dataset_name: String,
         snapshots: SnapshotBehavior,
-        adapter: SnapshotAdapter,
+        layout: AccelerationLayout,
         engine: AccelerationEngine,
     ) -> Option<Self> {
-        if !adapter.is_enabled() {
-            tracing::debug!("Snapshot adapter is not enabled for {dataset_name}");
+        if !layout.is_enabled() {
+            tracing::debug!("Acceleration layout is not enabled for {dataset_name}");
             return None;
         }
 
@@ -673,7 +672,7 @@ impl SnapshotManager {
             dataset_name,
             snapshots_location: path,
             snapshot_location_uri,
-            adapter,
+            layout,
             snapshot_engine,
             object_store: store,
             checkpointer_factory: None,
@@ -856,17 +855,17 @@ impl SnapshotManager {
             self.dataset_name
         );
 
-        let (total_bytes, checksum) = match &self.adapter {
-            SnapshotAdapter::None => {
+        let (total_bytes, checksum) = match &self.layout {
+            AccelerationLayout::None => {
                 return Err(SnapshotUploadError::AdapterDisabled {
                     dataset: self.dataset_name.clone(),
                 });
             }
-            SnapshotAdapter::File { path } => {
+            AccelerationLayout::File { path } => {
                 self.create_file_snapshot(path, &destination_location, lock_guard)
                     .await?
             }
-            SnapshotAdapter::Directories { dirs } => {
+            AccelerationLayout::Directories { dirs } => {
                 self.create_directory_snapshot(dirs, &destination_location, lock_guard)
                     .await?
             }
@@ -1393,17 +1392,17 @@ impl SnapshotManager {
             sha = entry.snapshot_checksum.as_str(),
         );
 
-        let (actual_size, actual_checksum) = match &self.adapter {
-            SnapshotAdapter::None => {
+        let (actual_size, actual_checksum) = match &self.layout {
+            AccelerationLayout::None => {
                 return Err(SnapshotDownloadError::SnapshotDisabled {
                     dataset: self.dataset_name.clone(),
                 });
             }
-            SnapshotAdapter::File { path } => {
+            AccelerationLayout::File { path } => {
                 self.download_to_file(path, get_result, entry, &path_display)
                     .await?
             }
-            SnapshotAdapter::Directories { dirs } => {
+            AccelerationLayout::Directories { dirs } => {
                 self.download_to_directories(dirs, get_result, entry, &path_display)
                     .await?
             }
@@ -1436,7 +1435,7 @@ impl SnapshotManager {
             }
 
             let local_path_display = self
-                .adapter
+                .layout
                 .primary_path()
                 .map_or_else(|| "<directories>".to_string(), |p| p.display().to_string());
             tracing::info!(
@@ -2256,7 +2255,7 @@ mod tests {
             dataset_name: DATASET_NAME.to_string(),
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
-            adapter: SnapshotAdapter::File { path: local_path },
+            layout: AccelerationLayout::File { path: local_path },
             snapshot_engine,
             object_store,
             bootstrap_failure_behavior: behavior,
