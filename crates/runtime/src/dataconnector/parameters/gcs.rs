@@ -22,7 +22,7 @@ use super::{ConnectorParams, Validator};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Multiple authentication methods were provided. Specify only one of the following: service_account_path, service_account_key, application_default_credentials, or skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth"
+        "Multiple authentication methods were provided. Specify only one of the following: gcs_service_account_path, gcs_service_account_key, gcs_application_default_credentials, or gcs_skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth"
     ))]
     MultipleAuthMethods,
 }

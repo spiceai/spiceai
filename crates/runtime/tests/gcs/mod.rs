@@ -129,6 +129,55 @@ async fn gcs_public_dataset_federation() -> Result<(), anyhow::Error> {
         .await
 }
 
+/// Test GCS using the `gs://` URL scheme.
+#[tokio::test]
+async fn gs_url_scheme() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            // Using gs:// prefix (standard Google Cloud Storage scheme)
+            let app = AppBuilder::new("gs_url_scheme")
+                .with_dataset(get_public_gcs_dataset(
+                    "gs://cloud-samples-data/bigquery/us-states/us-states.parquet",
+                    "us_states_gs",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT * FROM us_states_gs LIMIT 5")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            let batches: Vec<_> = query_result.data.try_collect().await?;
+
+            assert!(!batches.is_empty(), "Expected at least one batch");
+            let total_rows: usize = batches
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
+            assert_eq!(total_rows, 5, "Expected 5 rows across all batches");
+
+            Ok(())
+        })
+        .await
+}
+
 /// Test GCS using the `gcs://` URL scheme (alternative to `gs://`).
 #[tokio::test]
 async fn gcs_url_scheme() -> Result<(), anyhow::Error> {
@@ -136,7 +185,7 @@ async fn gcs_url_scheme() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            // Same dataset but using gcs:// prefix
+            // Using gcs:// prefix (alternative scheme)
             let app = AppBuilder::new("gcs_url_scheme")
                 .with_dataset(get_public_gcs_dataset(
                     "gcs://cloud-samples-data/bigquery/us-states/us-states.parquet",
@@ -167,7 +216,10 @@ async fn gcs_url_scheme() -> Result<(), anyhow::Error> {
             let batches: Vec<_> = query_result.data.try_collect().await?;
 
             assert!(!batches.is_empty(), "Expected at least one batch");
-            let total_rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+            let total_rows: usize = batches
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
             assert_eq!(total_rows, 5, "Expected 5 rows across all batches");
 
             Ok(())

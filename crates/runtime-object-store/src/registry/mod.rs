@@ -577,7 +577,14 @@ impl SpiceObjectStoreRegistry {
 
         // Service account authentication (only if not skip_signature)
         if !skip_signature {
-            if let Some(service_account_path) = params.get("service_account_path") {
+            // Prefer explicit service_account_path, but also accept legacy aliases:
+            // - service_account (canonicalized from google_service_account by Parameters::canonicalize_gcs_fragments)
+            // - google_service_account (for direct compatibility if not canonicalized)
+            if let Some(service_account_path) = params
+                .get("service_account_path")
+                .or_else(|| params.get("service_account"))
+                .or_else(|| params.get("google_service_account"))
+            {
                 builder = builder.with_service_account_path(service_account_path);
             }
             if let Some(service_account_key) = params.get("service_account_key") {
