@@ -87,13 +87,13 @@ impl DuckLakeFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("connection_string")
+    ParameterSpec::component("ducklake_connection_string")
         .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake').")
         .required(),
-    ParameterSpec::component("name").description(
+    ParameterSpec::component("ducklake_name").description(
         "The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'.",
     ),
-    ParameterSpec::component("open").description(
+    ParameterSpec::component("ducklake_open").description(
         "Optional path to an existing DuckDB file. If not provided, an in-memory DuckDB is used.",
     ),
 ];
@@ -201,7 +201,7 @@ impl DataConnectorFactory for DuckLakeFactory {
             let connection_string: String = params
                 .parameters
                 .clone()
-                .get("connection_string")
+                .get("ducklake_connection_string")
                 .expose()
                 .ok_or_else(|_| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "ducklake".to_string(),
@@ -212,12 +212,12 @@ impl DataConnectorFactory for DuckLakeFactory {
 
             let catalog_name = params
                 .parameters
-                .get("name")
+                .get("ducklake_name")
                 .expose()
                 .ok()
                 .map_or_else(|| "ducklake".to_string(), ToString::to_string);
 
-            let open_path = params.parameters.get("open").expose().ok();
+            let open_path = params.parameters.get("ducklake_open").expose().ok();
 
             let (duckdb_factory, catalog_name) =
                 create_ducklake_factory(&connection_string, &catalog_name, open_path, &params)?;

@@ -61,12 +61,12 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("connection_string")
+    ParameterSpec::component("ducklake_connection_string")
         .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake').")
         .required(),
-    ParameterSpec::component("name")
+    ParameterSpec::component("ducklake_name")
         .description("The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'."),
-    ParameterSpec::component("open")
+    ParameterSpec::component("ducklake_open")
         .description("Optional path to an existing `DuckDB` file. If not provided, an in-memory `DuckDB` is used."),
 ];
 
@@ -97,7 +97,7 @@ impl CatalogConnector for DuckLakeCatalog {
         let connection_string: String = self
             .params
             .parameters
-            .get("connection_string")
+            .get("ducklake_connection_string")
             .expose()
             .ok_or_else(|p| Error::MissingParameter {
                 parameter: p.to_string(),
@@ -112,12 +112,12 @@ impl CatalogConnector for DuckLakeCatalog {
         let catalog_name = self
             .params
             .parameters
-            .get("name")
+            .get("ducklake_name")
             .expose()
             .ok()
             .map_or_else(|| "ducklake".to_string(), ToString::to_string);
 
-        let open_path = self.params.parameters.get("open").expose().ok();
+        let open_path = self.params.parameters.get("ducklake_open").expose().ok();
 
         // Get the catalog's access mode to determine writable/ddl_enabled flags
         let writable = catalog.access.allows_write();

@@ -99,11 +99,11 @@ DROP SCHEMA my_catalog.new_schema CASCADE;
 
 ### Catalog Connector Parameters
 
-| Parameter           | Type   | Required | Default     | Description                                                                      |
-| ------------------- | ------ | -------- | ----------- | -------------------------------------------------------------------------------- |
-| `connection_string` | string | Yes      | -           | The DuckLake metadata file location (e.g., `s3://bucket/path/metadata.ducklake`) |
-| `name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB                                 |
-| `open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage                                     |
+| Parameter                    | Type   | Required | Default     | Description                                                                      |
+| ---------------------------- | ------ | -------- | ----------- | -------------------------------------------------------------------------------- |
+| `ducklake_connection_string` | string | Yes      | -           | The DuckLake metadata file location (e.g., `s3://bucket/path/metadata.ducklake`) |
+| `ducklake_name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB                                 |
+| `ducklake_open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage                                     |
 
 ## Data Connector
 
@@ -115,14 +115,14 @@ The data connector allows connecting to specific tables in a DuckLake catalog. U
 
 ### Dataset Configuration
 
-The `from` URI specifies the table path (format: `ducklake:[schema.]table`), while the `connection_string` parameter specifies the DuckLake metadata file location.
+The `from` URI specifies the table path (format: `ducklake:[schema.]table`), while the `ducklake_connection_string` parameter specifies the DuckLake metadata file location.
 
 ```yaml
 datasets:
   - from: ducklake:orders
     name: orders
     params:
-      connection_string: s3://my-bucket/warehouse/metadata.ducklake
+      ducklake_connection_string: s3://my-bucket/warehouse/metadata.ducklake
 ```
 
 By default, tables are looked up in the `main` schema.
@@ -134,7 +134,7 @@ datasets:
   - from: ducklake:sales.orders
     name: sales_orders
     params:
-      connection_string: s3://my-bucket/warehouse/metadata.ducklake
+      ducklake_connection_string: s3://my-bucket/warehouse/metadata.ducklake
 ```
 
 ### With Acceleration
@@ -144,8 +144,7 @@ datasets:
   - from: ducklake:sales.orders
     name: orders
     params:
-      connection_string: s3://my-bucket/warehouse/metadata.ducklake
-    acceleration:
+      ducklake_connection_string: s3://my-bucket/warehouse/metadata.ducklake
       enabled: true
       engine: duckdb
       mode: file
@@ -154,11 +153,11 @@ datasets:
 
 ### Data Connector Parameters
 
-| Parameter           | Type   | Required | Default     | Description                                      |
-| ------------------- | ------ | -------- | ----------- | ------------------------------------------------ |
-| `connection_string` | string | Yes      | -           | The DuckLake metadata file location              |
-| `name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB |
-| `open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage     |
+| Parameter                    | Type   | Required | Default     | Description                                      |
+| ---------------------------- | ------ | -------- | ----------- | ------------------------------------------------ |
+| `ducklake_connection_string` | string | Yes      | -           | The DuckLake metadata file location              |
+| `ducklake_name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB |
+| `ducklake_open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage     |
 
 ## Connection String Formats
 
