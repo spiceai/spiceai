@@ -90,22 +90,22 @@ datasets:
 
 ## Parameters
 
-| Parameter                         | Type    | Default | Description                                                                       |
-| --------------------------------- | ------- | ------- | --------------------------------------------------------------------------------- |
-| `bucket`                          | string  | none    | GCS bucket name (alternative to specifying in URL)                                |
-| `service_account_path`            | string  | none    | Path to a GCS service account JSON key file                                       |
-| `service_account_key`             | string  | none    | GCS service account JSON key as a string                                          |
-| `application_default_credentials` | boolean | `false` | Use Google ADC. Uses `GOOGLE_APPLICATION_CREDENTIALS` env var if set              |
-| `skip_signature`                  | boolean | `false` | Skip signing requests. Used for public buckets                                    |
-| `allow_http`                      | boolean | `false` | Allow insecure HTTP connections                                                   |
-| `max_retries`                     | integer | `3`     | Maximum number of retries for failed requests                                     |
-| `retry_timeout`                   | string  | none    | Retry timeout duration                                                            |
-| `backoff_initial_duration`        | string  | none    | Initial backoff duration                                                          |
-| `backoff_max_duration`            | string  | none    | Maximum backoff duration                                                          |
-| `backoff_base`                    | float   | none    | Base of the exponential backoff                                                   |
-| `client_timeout`                  | string  | none    | Timeout for GCS client operations                                                 |
-| `file_format`                     | string  | none    | File format: `parquet`, `csv`, `json`, `ndjson`                                   |
-| `hive_partitioning_enabled`       | boolean | `false` | Enable Hive-style partitioning                                                    |
+| Parameter                         | Type    | Default | Description                                                          |
+| --------------------------------- | ------- | ------- | -------------------------------------------------------------------- |
+| `bucket`                          | string  | none    | GCS bucket name (alternative to specifying in URL)                   |
+| `service_account_path`            | string  | none    | Path to a GCS service account JSON key file                          |
+| `service_account_key`             | string  | none    | GCS service account JSON key as a string                             |
+| `application_default_credentials` | boolean | `false` | Use Google ADC. Uses `GOOGLE_APPLICATION_CREDENTIALS` env var if set |
+| `skip_signature`                  | boolean | `false` | Skip signing requests. Used for public buckets                       |
+| `allow_http`                      | boolean | `false` | Allow insecure HTTP connections                                      |
+| `max_retries`                     | integer | `3`     | Maximum number of retries for failed requests                        |
+| `retry_timeout`                   | string  | none    | Retry timeout duration                                               |
+| `backoff_initial_duration`        | string  | none    | Initial backoff duration                                             |
+| `backoff_max_duration`            | string  | none    | Maximum backoff duration                                             |
+| `backoff_base`                    | float   | none    | Base of the exponential backoff                                      |
+| `client_timeout`                  | string  | none    | Timeout for GCS client operations                                    |
+| `file_format`                     | string  | none    | File format: `parquet`, `csv`, `json`, `ndjson`                      |
+| `hive_partitioning_enabled`       | boolean | `false` | Enable Hive-style partitioning                                       |
 
 ## File Format Parameters
 
