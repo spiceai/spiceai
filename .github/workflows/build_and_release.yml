@@ -149,9 +149,6 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
-      GOVER: 1.25.3
-      GOOS: ${{ matrix.target.target_os }}
-      GOARCH: ${{ matrix.target.target_arch_go }}
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
@@ -170,14 +167,6 @@ jobs:
       - name: Install Visual Studio Build Tools
         if: matrix.target.target_os == 'windows'
         uses: ./.github/actions/install-vs-buildtools
-
-      - name: Set up Go
-        # CLI is only built on the same runners as the default spiced binary
-        if: contains(matrix.target.tags, 'default')
-        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -218,11 +207,11 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      ## Default flavor (runtime not built on Windows - use WSL)
-      - name: Build spiced
+      ## Default flavor - build both spiced and spice CLI together (runtime not built on Windows - use WSL)
+      - name: Build spiced and spice CLI
         if: contains(matrix.target.tags, 'default') && matrix.target.target_os != 'windows'
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models  --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
 
       - name: tar binary
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
@@ -307,29 +296,25 @@ jobs:
           name: spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      ## CLI build
-      - name: Build spice
-        if: contains(matrix.target.tags, 'default')
-        run: make -C bin/spice
-
-      - name: tar binary
+      ## CLI - package the CLI binary that was built above
+      - name: tar CLI binary
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         run: |
           mv target/release/spice spice
           chmod +x spice
           tar czf spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spice
 
-      - name: tar binary (Windows)
+      - name: tar CLI binary (Windows)
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: |
           mv target/release/spice.exe spice.exe
           tar czf spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spice.exe
 
-      - name: Print version
+      - name: Print CLI version
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         run: ./spice version
 
-      - name: Print version (Windows)
+      - name: Print CLI version (Windows)
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spice.exe version
 

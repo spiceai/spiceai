@@ -152,18 +152,19 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build spiced
+      - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,postgres-accel"
+        run: |
+          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,postgres-accel"
+          cargo build --release -p spice
 
-      - name: Build spiced (macOS)
+      - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
         env:
           MISTRALRS_METAL_PRECOMPILE: 0
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,postgres-accel,metal"
-
-      - name: Build spice
-        run: make -C bin/spice
+        run: |
+          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,postgres-accel,metal"
+          cargo build --release -p spice
 
       - name: make spiced executable
         if: matrix.target.target_os != 'windows'
