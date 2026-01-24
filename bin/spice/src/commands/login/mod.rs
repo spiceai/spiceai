@@ -96,7 +96,9 @@ pub async fn execute(ctx: &RuntimeContext, args: LoginArgs) -> Result<()> {
         Some(LoginCommands::Sharepoint(provider_args)) => {
             providers::login_sharepoint(ctx, provider_args).await
         }
-        Some(LoginCommands::Abfs(provider_args)) => providers::login_abfs(ctx, provider_args).await,
+        Some(LoginCommands::Abfs(provider_args)) => {
+            providers::login_abfs(ctx, provider_args).await
+        }
         None => {
             // Main Spice.ai login with OAuth flow
             login_spiceai(ctx, args.key).await
@@ -177,13 +179,7 @@ async fn login_spiceai(_ctx: &RuntimeContext, api_key: Option<String>) -> Result
     let (org_name, app_name) = read_spicepod_metadata();
 
     // Get auth context
-    let auth_context = get_spice_auth_context(
-        &base_url,
-        &access_token,
-        org_name.as_deref(),
-        app_name.as_deref(),
-    )
-    .await?;
+    let auth_context = get_spice_auth_context(&base_url, &access_token, org_name.as_deref(), app_name.as_deref()).await?;
 
     // Save credentials
     merge_auth_config(
@@ -251,7 +247,10 @@ fn read_spicepod_metadata() -> (Option<String>, Option<String>) {
         .and_then(|o| o.as_str())
         .map(String::from);
 
-    let app_name = yaml.get("name").and_then(|n| n.as_str()).map(String::from);
+    let app_name = yaml
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(String::from);
 
     (org_name, app_name)
 }
@@ -304,13 +303,11 @@ async fn get_spice_auth_context(
     }
 
     // Parse the response - API returns nested org/app objects
-    let body: serde_json::Value =
-        response
-            .json()
-            .await
-            .map_err(|e| crate::error::Error::InvalidResponse {
-                message: format!("Failed to parse auth context: {e}"),
-            })?;
+    let body: serde_json::Value = response.json().await.map_err(|e| {
+        crate::error::Error::InvalidResponse {
+            message: format!("Failed to parse auth context: {e}"),
+        }
+    })?;
 
     Ok(SpiceAuthContext {
         username: body["username"].as_str().unwrap_or_default().to_string(),

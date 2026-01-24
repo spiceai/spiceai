@@ -50,8 +50,10 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build spiced
-        run: make -C bin/spiced
+      - name: Build spiced and spice CLI
+        run: |
+          make -C bin/spiced
+          cargo build --release -p spice
 
       - name: Update build cache (macOS)
         if: matrix.target_os == 'darwin'
@@ -73,9 +75,6 @@ jobs:
           if (Test-Path C:/spiceai/build/target) {
             Copy-Item -Recurse -Force target/* C:/spiceai/build/target
           }
-
-      - name: Build spice
-        run: make -C bin/spice
 
       - name: make spiced executable
         if: matrix.target_os != 'windows'

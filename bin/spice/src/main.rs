@@ -17,12 +17,12 @@ limitations under the License.
 //! Spice.ai CLI - Main entry point.
 
 use clap::{Parser, Subcommand};
-use spice_cli::commands::{
+use spice::commands::{
     acceleration, add, catalogs, chat, cloud, cluster, connect, dataset, datasets, eval, init,
     install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace, upgrade,
     version, workers,
 };
-use spice_cli::{Result, RuntimeContext};
+use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;
 
 /// Spice.ai CLI - Interact with the Spice.ai runtime
@@ -175,17 +175,17 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Commands::Status(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(status::execute(&ctx, &args))?;
         }
         Commands::Run(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(run::execute(&ctx, &args, cli.verbose))?;
         }
         Commands::Sql(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(sql::execute(&ctx, &args))?;
         }
         Commands::Init(args) => {
@@ -193,62 +193,62 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Commands::Install(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(install::execute(&ctx, &args))?;
         }
         Commands::Add(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(add::execute(&ctx, args))?;
         }
         Commands::Connect(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(connect::execute(&ctx, args))?;
         }
         Commands::Login(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(login::execute(&ctx, args))?;
         }
         Commands::Datasets(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(datasets::execute(&ctx, &args))?;
         }
         Commands::Catalogs(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(catalogs::execute(&ctx, &args))?;
         }
         Commands::Models(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(models::execute(&ctx, &args))?;
         }
         Commands::Pods(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(pods::execute(&ctx, &args))?;
         }
         Commands::Refresh(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(refresh::execute(&ctx, &args))?;
         }
         Commands::Upgrade(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(upgrade::execute(&ctx, &args))?;
         }
         Commands::Workers(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(workers::execute(&ctx, &args))?;
         }
         Commands::Acceleration(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(acceleration::execute(&ctx, &args))?;
         }
         Commands::Dataset(args) => {
@@ -256,17 +256,17 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Commands::Cloud(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(cloud::execute(&ctx, &args))?;
         }
         Commands::Eval(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(eval::execute(&ctx, &args))?;
         }
         Commands::Trace(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(trace::execute(&ctx, &args))?;
         }
         Commands::Cluster(args) => {
@@ -274,22 +274,22 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Commands::Nsql(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(nsql::execute(&ctx, &args))?;
         }
         Commands::Query(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(query::execute(&ctx, &args))?;
         }
         Commands::Search(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(search::execute(&ctx, &args))?;
         }
         Commands::Chat(args) => {
             let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice_cli::error::Error::RuntimeExecution { source: e })?;
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(chat::execute(&ctx, &args))?;
         }
     }
