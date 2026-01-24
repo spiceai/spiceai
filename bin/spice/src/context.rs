@@ -285,13 +285,14 @@ impl RuntimeContext {
 
         // Add HTTP endpoint (use override if provided, otherwise use context default)
         cmd.arg("--http");
-        let http_addr = http_endpoint_override
-            .map(|ep| {
+        let http_addr = http_endpoint_override.map_or_else(
+            || self.http_socket_address(),
+            |ep| {
                 ep.trim_start_matches("http://")
                     .trim_start_matches("https://")
                     .to_string()
-            })
-            .unwrap_or_else(|| self.http_socket_address());
+            },
+        );
         cmd.arg(http_addr);
 
         // Add API key if present
@@ -444,7 +445,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Helper to create a RuntimeContext with a mocked spiced binary for testing.
+    /// Helper to create a `RuntimeContext` with a mocked spiced binary for testing.
     fn create_test_context() -> RuntimeContext {
         RuntimeContext {
             spice_runtime_dir: PathBuf::from("/test/.spice"),
@@ -462,7 +463,7 @@ mod tests {
     }
 
     /// Create a test context with a mocked spiced binary in an isolated temp directory.
-    /// Returns the context and the TempDir (which must be kept alive for the test).
+    /// Returns the context and the `TempDir` (which must be kept alive for the test).
     fn create_test_context_with_runtime() -> (RuntimeContext, TempDir) {
         let temp_dir = TempDir::new().expect("create temp dir");
         let bin_dir = temp_dir.path().join("bin");
@@ -828,7 +829,7 @@ mod tests {
             "User agent should start with spice/, got: {user_agent}"
         );
         assert!(
-            user_agent.contains("("),
+            user_agent.contains('('),
             "User agent should contain OS/arch info, got: {user_agent}"
         );
     }
