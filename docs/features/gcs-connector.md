@@ -45,7 +45,7 @@ datasets:
   - from: gcs://my-bucket/data/
     name: my_data
     params:
-      service_account_path: /path/to/service-account.json
+      gcs_service_account_path: /path/to/service-account.json
       file_format: parquet
 ```
 
@@ -58,7 +58,7 @@ datasets:
   - from: gcs://my-bucket/data/
     name: my_data
     params:
-      service_account_key: '{"type": "service_account", "project_id": "...", ...}'
+      gcs_service_account_key: '{"type": "service_account", "project_id": "...", ...}'
       file_format: parquet
 ```
 
@@ -71,7 +71,7 @@ datasets:
   - from: gcs://my-bucket/data/
     name: my_data
     params:
-      application_default_credentials: 'true'
+      gcs_application_default_credentials: 'true'
       file_format: parquet
 ```
 
@@ -84,28 +84,27 @@ datasets:
   - from: gcs://public-bucket/data/
     name: public_data
     params:
-      skip_signature: 'true'
+      gcs_skip_signature: 'true'
       file_format: parquet
 ```
 
 ## Parameters
 
-| Parameter                         | Type    | Default | Description                                                          |
-| --------------------------------- | ------- | ------- | -------------------------------------------------------------------- |
-| `bucket`                          | string  | none    | GCS bucket name (alternative to specifying in URL)                   |
-| `service_account_path`            | string  | none    | Path to a GCS service account JSON key file                          |
-| `service_account_key`             | string  | none    | GCS service account JSON key as a string                             |
-| `application_default_credentials` | boolean | `false` | Use Google ADC. Uses `GOOGLE_APPLICATION_CREDENTIALS` env var if set |
-| `skip_signature`                  | boolean | `false` | Skip signing requests. Used for public buckets                       |
-| `allow_http`                      | boolean | `false` | Allow insecure HTTP connections                                      |
-| `max_retries`                     | integer | `3`     | Maximum number of retries for failed requests                        |
-| `retry_timeout`                   | string  | none    | Retry timeout duration                                               |
-| `backoff_initial_duration`        | string  | none    | Initial backoff duration                                             |
-| `backoff_max_duration`            | string  | none    | Maximum backoff duration                                             |
-| `backoff_base`                    | float   | none    | Base of the exponential backoff                                      |
-| `client_timeout`                  | string  | none    | Timeout for GCS client operations                                    |
-| `file_format`                     | string  | none    | File format: `parquet`, `csv`, `json`, `ndjson`                      |
-| `hive_partitioning_enabled`       | boolean | `false` | Enable Hive-style partitioning                                       |
+| Parameter                             | Type    | Default | Description                                                          |
+| ------------------------------------- | ------- | ------- | -------------------------------------------------------------------- |
+| `gcs_service_account_path`            | string  | none    | Path to a GCS service account JSON key file                          |
+| `gcs_service_account_key`             | string  | none    | GCS service account JSON key as a string                             |
+| `gcs_application_default_credentials` | boolean | `false` | Use Google ADC. Uses `GOOGLE_APPLICATION_CREDENTIALS` env var if set |
+| `gcs_skip_signature`                  | boolean | `false` | Skip signing requests. Used for public buckets                       |
+| `allow_http`                          | boolean | `false` | Allow insecure HTTP connections                                      |
+| `gcs_max_retries`                     | integer | `3`     | Maximum number of retries for failed requests                        |
+| `gcs_retry_timeout`                   | string  | none    | Retry timeout duration                                               |
+| `gcs_backoff_initial_duration`        | string  | none    | Initial backoff duration                                             |
+| `gcs_backoff_max_duration`            | string  | none    | Maximum backoff duration                                             |
+| `gcs_backoff_base`                    | float   | none    | Base of the exponential backoff                                      |
+| `client_timeout`                      | string  | none    | Timeout for GCS client operations                                    |
+| `file_format`                         | string  | none    | File format: `parquet`, `csv`, `json`, `ndjson`                      |
+| `hive_partitioning_enabled`           | boolean | `false` | Enable Hive-style partitioning                                       |
 
 ## File Format Parameters
 
@@ -173,7 +172,7 @@ datasets:
     name: accelerated_data
     params:
       file_format: parquet
-      service_account_path: /path/to/service-account.json
+      gcs_service_account_path: /path/to/service-account.json
     acceleration:
       enabled: true
       engine: duckdb

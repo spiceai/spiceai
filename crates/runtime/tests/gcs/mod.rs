@@ -167,7 +167,8 @@ async fn gcs_url_scheme() -> Result<(), anyhow::Error> {
             let batches: Vec<_> = query_result.data.try_collect().await?;
 
             assert!(!batches.is_empty(), "Expected at least one batch");
-            assert_eq!(batches[0].num_rows(), 5, "Expected 5 rows");
+            let total_rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+            assert_eq!(total_rows, 5, "Expected 5 rows across all batches");
 
             Ok(())
         })

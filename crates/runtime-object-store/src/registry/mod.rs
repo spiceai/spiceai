@@ -553,10 +553,14 @@ impl SpiceObjectStoreRegistry {
 
         // Check skip_signature first - if true, use new() instead of from_env() to avoid
         // automatic credential loading attempts
-        let skip_signature = params
-            .get("skip_signature")
-            .and_then(|s| s.parse::<bool>().ok())
-            .unwrap_or(false);
+        let skip_signature = match params.get("skip_signature") {
+            Some(value) => value.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{value} is not a valid boolean for skip_signature"
+                ))
+            })?,
+            None => false,
+        };
 
         let mut builder = if skip_signature {
             GoogleCloudStorageBuilder::new()

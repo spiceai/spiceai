@@ -97,9 +97,6 @@ impl GoogleCloudStorageFactory {
 static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[
-        ParameterSpec::component("bucket")
-            .description("GCS bucket name.")
-            .secret(),
         ParameterSpec::component("service_account_path")
             .description("Path to a GCS service account JSON key file.")
             .secret(),
@@ -211,7 +208,6 @@ impl ListingTableConnector for GoogleCloudStorage {
         let params = build_fragments(
             &self.params,
             vec![
-                "bucket",
                 "service_account_path",
                 "service_account_key",
                 "application_default_credentials",
