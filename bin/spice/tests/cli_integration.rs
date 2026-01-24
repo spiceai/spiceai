@@ -19,14 +19,14 @@ limitations under the License.
 //! These tests verify CLI commands work correctly without requiring
 //! a running Spice runtime (unless specifically testing runtime interaction).
 
-use assert_cmd::Command;
+use assert_cmd::{Command, cargo::cargo_bin_cmd};
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
 /// Get a Command for the spice binary
 fn spice_cmd() -> Command {
-    Command::cargo_bin("spice").expect("Failed to find spice binary")
+    cargo_bin_cmd!("spice")
 }
 
 // ============================================================================

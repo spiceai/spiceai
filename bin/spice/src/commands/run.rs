@@ -66,11 +66,8 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
     // Auto-install runtime if not present
     if !ctx.is_runtime_installed() {
         tracing::info!("Spice.ai runtime is not installed. Installing now...");
-        crate::commands::install::execute(
-            ctx,
-            &crate::commands::install::InstallArgs::default(),
-        )
-        .await?;
+        crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
+            .await?;
     }
 
     tracing::info!("Spice.ai runtime starting...");

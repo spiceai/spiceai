@@ -40,7 +40,7 @@ pub struct SearchArgs {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Remote Spice instance HTTP endpoint (e.g., http://localhost:8090)
+    /// Remote Spice instance HTTP endpoint (e.g., `http://localhost:8090`)
     #[arg(long)]
     pub endpoint: Option<String>,
 
@@ -174,7 +174,10 @@ async fn send_search_request(
     args: &SearchArgs,
 ) -> Result<SearchResponse> {
     // Use endpoint override if provided, otherwise use context's endpoint
-    let base_url = args.endpoint.as_deref().unwrap_or_else(|| ctx.http_endpoint());
+    let base_url = args
+        .endpoint
+        .as_deref()
+        .unwrap_or_else(|| ctx.http_endpoint());
     let url = format!("{base_url}/v1/search");
 
     let body = SearchRequest {

@@ -80,8 +80,8 @@ test-integration-models-without-openai:
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
-.PHONY: lint lint-go lint-rust
-lint: lint-go lint-rust
+.PHONY: lint lint-rust
+lint: lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
@@ -152,11 +152,6 @@ lint-rust-fix:
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes \
 		-Aunfulfilled_lint_expectations
-
-
-lint-go:
-	go vet ./...
-	golangci-lint run
 
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features

@@ -348,7 +348,7 @@ pub async fn login_spark(_ctx: &RuntimeContext, args: SparkArgs) -> Result<()> {
     Ok(())
 }
 
-/// Arguments for SharePoint login.
+/// Arguments for `SharePoint` login.
 #[derive(Args, Debug)]
 pub struct SharePointArgs {
     /// Microsoft organization tenant ID
@@ -360,13 +360,18 @@ pub struct SharePointArgs {
     pub client_id: String,
 }
 
-/// Login to Microsoft 365 SharePoint.
+/// Login to Microsoft 365 `SharePoint`.
 ///
-/// This performs an interactive OAuth2 device code flow to authenticate with
-/// Microsoft Azure AD and obtain an access token for SharePoint access.
+/// This performs an interactive `OAuth2` device code flow to authenticate with
+/// Microsoft Azure AD and obtain an access token for `SharePoint` access.
 pub async fn login_sharepoint(_ctx: &RuntimeContext, args: SharePointArgs) -> Result<()> {
     // Microsoft Graph scopes for SharePoint access
-    let scopes = ["User.Read", "Files.Read.All", "Sites.Read.All", "GroupMember.Read.All"];
+    let scopes = [
+        "User.Read",
+        "Files.Read.All",
+        "Sites.Read.All",
+        "GroupMember.Read.All",
+    ];
 
     let access_token = msal_device_code_flow(&args.tenant_id, &args.client_id, &scopes).await?;
 
@@ -400,7 +405,7 @@ pub struct AbfsArgs {
 
 /// Login to Azure Blob Storage (ABFS).
 ///
-/// This performs an interactive OAuth2 device code flow to authenticate with
+/// This performs an interactive `OAuth2` device code flow to authenticate with
 /// Microsoft Azure AD and obtain an access token for Azure Storage access.
 pub async fn login_abfs(_ctx: &RuntimeContext, args: AbfsArgs) -> Result<()> {
     // Azure Storage scope
@@ -424,7 +429,7 @@ pub async fn login_abfs(_ctx: &RuntimeContext, args: AbfsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Perform Microsoft OAuth2 device code flow authentication.
+/// Perform Microsoft `OAuth2` device code flow authentication.
 ///
 /// This is the CLI-friendly alternative to browser-based interactive auth.
 /// The user is given a device code and URL to visit to complete authentication.
@@ -443,10 +448,7 @@ async fn msal_device_code_flow(
     let client = reqwest::Client::new();
     let device_response = client
         .post(&device_code_url)
-        .form(&[
-            ("client_id", client_id),
-            ("scope", &scope_string),
-        ])
+        .form(&[("client_id", client_id), ("scope", &scope_string)])
         .send()
         .await
         .map_err(|e| crate::error::Error::InvalidResponse {
@@ -460,23 +462,25 @@ async fn msal_device_code_flow(
         });
     }
 
-    let device_code_data: serde_json::Value = device_response.json().await.map_err(|e| {
+    let device_code_data: serde_json::Value =
+        device_response
+            .json()
+            .await
+            .map_err(|e| crate::error::Error::InvalidResponse {
+                message: format!("Failed to parse device code response: {e}"),
+            })?;
+
+    let device_code = device_code_data["device_code"].as_str().ok_or_else(|| {
         crate::error::Error::InvalidResponse {
-            message: format!("Failed to parse device code response: {e}"),
+            message: "No device_code in response".to_string(),
         }
     })?;
 
-    let device_code = device_code_data["device_code"]
-        .as_str()
-        .ok_or_else(|| crate::error::Error::InvalidResponse {
-            message: "No device_code in response".to_string(),
-        })?;
-
-    let user_code = device_code_data["user_code"]
-        .as_str()
-        .ok_or_else(|| crate::error::Error::InvalidResponse {
+    let user_code = device_code_data["user_code"].as_str().ok_or_else(|| {
+        crate::error::Error::InvalidResponse {
             message: "No user_code in response".to_string(),
-        })?;
+        }
+    })?;
 
     let verification_uri = device_code_data["verification_uri"]
         .as_str()
@@ -524,11 +528,13 @@ async fn msal_device_code_flow(
                 message: format!("Token request failed: {e}"),
             })?;
 
-        let token_data: serde_json::Value = token_response.json().await.map_err(|e| {
-            crate::error::Error::InvalidResponse {
-                message: format!("Failed to parse token response: {e}"),
-            }
-        })?;
+        let token_data: serde_json::Value =
+            token_response
+                .json()
+                .await
+                .map_err(|e| crate::error::Error::InvalidResponse {
+                    message: format!("Failed to parse token response: {e}"),
+                })?;
 
         // Check for errors
         if let Some(error) = token_data["error"].as_str() {
@@ -553,9 +559,7 @@ async fn msal_device_code_flow(
                     });
                 }
                 _ => {
-                    let description = token_data["error_description"]
-                        .as_str()
-                        .unwrap_or(error);
+                    let description = token_data["error_description"].as_str().unwrap_or(error);
                     return Err(crate::error::Error::InvalidResponse {
                         message: format!("Authentication error: {description}"),
                     });
