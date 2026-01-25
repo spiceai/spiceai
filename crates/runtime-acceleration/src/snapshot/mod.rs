@@ -752,15 +752,14 @@ impl SnapshotManager {
             (store.into(), path)
         };
 
-        // Use a no-op adapter and engine for metadata-only queries
-        let adapter = SnapshotAdapter::None;
+        // Use a no-op layout and engine for metadata-only queries
         let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
 
         Some(Self {
             dataset_name,
             snapshots_location: path,
             snapshot_location_uri,
-            adapter,
+            layout: AccelerationLayout::None,
             snapshot_engine,
             object_store: store,
             checkpointer_factory: None,
@@ -3587,7 +3586,7 @@ mod tests {
     // ========== Tests for Snapshot Metadata API ==========
 
     /// Builds a `SnapshotManager` for metadata-only API tests.
-    /// Uses `SnapshotAdapter::None` since API tests only read/write metadata.
+    /// Uses `AccelerationLayout::None` since API tests only read/write metadata.
     fn build_manager_for_api_tests(store: Arc<InMemory>) -> SnapshotManager {
         let object_store: Arc<dyn ObjectStore> = store;
         let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
@@ -3596,7 +3595,7 @@ mod tests {
             dataset_name: DATASET_NAME.to_string(),
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
-            adapter: SnapshotAdapter::None,
+            layout: AccelerationLayout::None,
             snapshot_engine,
             object_store,
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
