@@ -147,7 +147,7 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
 }
 
 /// Initialize postgres with a test table that includes a `value` column for testing upsert behavior.
-/// The table has: id (PK), created_at (timestamp), value (text)
+/// The table has: id (PK), `created_at` (timestamp), value (text)
 pub(crate) async fn initialize_postgres_with_value_column(
     port: usize,
 ) -> Result<PostgresConnection, anyhow::Error> {

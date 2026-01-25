@@ -151,10 +151,10 @@ async fn test_acceleration_refresh_cayenne_full() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test that Cayenne append mode works with both primary_key and time_column specified.
+/// Test that Cayenne append mode works with both `primary_key` and `time_column` specified.
 /// This validates that:
-/// 1. time_column is used for incremental queries (fetch only new data)
-/// 2. primary_key is used for deduplication at insert time (upsert behavior)
+/// 1. `time_column` is used for incremental queries (fetch only new data)
+/// 2. `primary_key` is used for deduplication at insert time (upsert behavior)
 #[tokio::test]
 async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -207,7 +207,7 @@ async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow
                         .as_any()
                         .downcast_ref::<arrow::array::StringArray>()
                 })
-                .and_then(|arr| if !arr.is_empty() { Some(arr.value(0).to_string()) } else { None })
+                .and_then(|arr| if arr.is_empty() { None } else { Some(arr.value(0).to_string()) })
                 .expect("Should have initial value");
             assert_eq!(initial_value, "initial_value", "Initial value should be 'initial_value'");
 
@@ -220,7 +220,7 @@ async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow
                         .as_any()
                         .downcast_ref::<arrow::array::Int32Array>()
                 })
-                .and_then(|arr| if !arr.is_empty() { Some(arr.value(0)) } else { None })
+                .and_then(|arr| if arr.is_empty() { None } else { Some(arr.value(0)) })
                 .expect("Should have at least one row");
 
             // Insert a new row with a new timestamp and different value
@@ -278,7 +278,7 @@ async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow
                         .as_any()
                         .downcast_ref::<arrow::array::StringArray>()
                 })
-                .and_then(|arr| if !arr.is_empty() { Some(arr.value(0).to_string()) } else { None })
+                .and_then(|arr| if arr.is_empty() { None } else { Some(arr.value(0).to_string()) })
                 .expect("Should have updated value");
             assert_eq!(
                 updated_value, "updated_value",
