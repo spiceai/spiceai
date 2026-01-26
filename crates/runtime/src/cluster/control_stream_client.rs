@@ -18,8 +18,7 @@ limitations under the License.
 //!
 //! This module provides functionality for executors to establish and maintain
 //! bidirectional control streams with schedulers. These streams allow schedulers
-//! to request metrics from executors on-demand and receive `PollNow` commands
-//! to trigger immediate work polling.
+//! to request metrics from executors on-demand.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -30,10 +29,10 @@ use futures::StreamExt;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
-    ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown, MetricsResponse,
+    ExecutorControlMessage, ExecutorHeartbeat, MetricsResponse,
     executor_control_message::Message as ExecutorMessage,
 };
-use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::ClientTlsConfig;
@@ -42,13 +41,12 @@ use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 use crate::metrics_reader::MetricsReader;
 
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Handle for a single control stream connection to a scheduler.
 struct ControlStreamHandle {
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
-    outbound_tx: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
 }
 
 /// Spawns a control stream connection to a single scheduler.
@@ -57,19 +55,15 @@ struct ControlStreamHandle {
 /// 1. Connect to the scheduler
 /// 2. Send periodic heartbeats
 /// 3. Respond to metrics requests from the scheduler
-/// 4. Receive control messages (e.g., `PollNow`) and signal the notify
-/// 5. Reconnect on failure with exponential backoff
+/// 4. Reconnect on failure with exponential backoff
 fn spawn_control_stream(
     scheduler_address: String,
     executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
-    poll_now_notify: Arc<Notify>,
-    outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
-    let outbound_tx_state_for_task = Arc::clone(&outbound_tx_state);
 
     let task = tokio::spawn(async move {
         let tls_enabled = client_tls_config.is_some();
@@ -142,10 +136,6 @@ fn spawn_control_stream(
 
             // Create channels for outbound messages
             let (outbound_tx, outbound_rx) = mpsc::channel::<ExecutorControlMessage>(32);
-            {
-                let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                *outbound_guard = Some(outbound_tx.clone());
-            }
 
             // Spawn heartbeat sender
             let heartbeat_executor_id = executor_id.clone();
@@ -189,8 +179,6 @@ fn spawn_control_stream(
             };
             if outbound_tx.send(init_msg).await.is_err() {
                 heartbeat_task.abort();
-                let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                *outbound_guard = None;
                 continue;
             }
 
@@ -205,8 +193,6 @@ fn spawn_control_stream(
                         "Failed to establish control stream to {scheduler_address}: {e}"
                     );
                     heartbeat_task.abort();
-                    let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                    *outbound_guard = None;
                     if let Some(delay) = backoff.next_duration() {
                         tokio::select! {
                             () = token.cancelled() => break,
@@ -225,10 +211,6 @@ fn spawn_control_stream(
                 tokio::select! {
                     () = token.cancelled() => {
                         heartbeat_task.abort();
-                        {
-                            let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                            *outbound_guard = None;
-                        }
                         tracing::debug!(
                             "Control stream to {scheduler_address} cancelled"
                         );
@@ -244,7 +226,6 @@ fn spawn_control_stream(
                                         message,
                                         &outbound_tx,
                                         metrics_reader.as_deref(),
-                                        &poll_now_notify,
                                     )
                                     .await;
                                 }
@@ -267,10 +248,6 @@ fn spawn_control_stream(
             }
 
             heartbeat_task.abort();
-            {
-                let mut outbound_guard = outbound_tx_state_for_task.write().await;
-                *outbound_guard = None;
-            }
             tracing::debug!("Control stream to {scheduler_address} disconnected, will reconnect");
 
             if let Some(delay) = backoff.next_duration() {
@@ -282,11 +259,7 @@ fn spawn_control_stream(
         }
     });
 
-    ControlStreamHandle {
-        cancel,
-        task,
-        outbound_tx: outbound_tx_state,
-    }
+    ControlStreamHandle { cancel, task }
 }
 
 /// Handles a message from the scheduler on the control stream.
@@ -296,7 +269,6 @@ async fn handle_scheduler_message(
     message: SchedulerMessage,
     outbound_tx: &mpsc::Sender<ExecutorControlMessage>,
     metrics_reader: Option<&MetricsReader>,
-    poll_now_notify: &Notify,
 ) {
     match message {
         SchedulerMessage::RequestMetrics(request) => {
@@ -325,13 +297,6 @@ async fn handle_scheduler_message(
                 tracing::warn!("Failed to send metrics response to {scheduler_address}: {e}");
             }
         }
-        SchedulerMessage::PollNow(cmd) => {
-            tracing::debug!(
-                reason = %cmd.reason,
-                "Received PollNow from scheduler {scheduler_address}"
-            );
-            poll_now_notify.notify_one();
-        }
     }
 }
 
@@ -348,17 +313,13 @@ fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
 /// Manages control stream connections to all schedulers.
 ///
 /// This struct tracks scheduler membership and ensures control streams
-/// are established to all known schedulers. It also provides a shared `Notify`
-/// handle that is signaled when any scheduler sends a [`PollNow`] command.
+/// are established to all known schedulers.
 pub struct ControlStreamManager {
     executor_id: String,
-    ballista_executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
     streams: HashMap<String, ControlStreamHandle>,
     known_schedulers: HashSet<String>,
-    /// Shared notify handle signaled when any scheduler sends `PollNow`.
-    poll_now_notify: Arc<Notify>,
 }
 
 impl ControlStreamManager {
@@ -366,64 +327,16 @@ impl ControlStreamManager {
     #[must_use]
     pub fn new(
         executor_id: String,
-        ballista_executor_id: String,
         client_tls_config: Option<ClientTlsConfig>,
         metrics_reader: Option<MetricsReader>,
     ) -> Self {
         Self {
             executor_id,
-            ballista_executor_id,
             client_tls_config,
             metrics_reader: metrics_reader.map(Arc::new),
             streams: HashMap::new(),
             known_schedulers: HashSet::new(),
-            poll_now_notify: Arc::new(Notify::new()),
         }
-    }
-
-    /// Returns a clone of the shared `Notify` handle.
-    ///
-    /// This handle is signaled when any connected scheduler sends a `PollNow` command.
-    /// Pass this to the poll loop to enable immediate wake-up on new work.
-    #[must_use]
-    pub fn poll_now_notify(&self) -> Arc<Notify> {
-        Arc::clone(&self.poll_now_notify)
-    }
-
-    /// Sends a shutdown notification to all connected schedulers.
-    pub async fn notify_shutdown(&self, reason: &str) {
-        if self.streams.is_empty() {
-            return;
-        }
-
-        let message = ExecutorControlMessage {
-            executor_id: self.executor_id.clone(),
-            message: Some(ExecutorMessage::Shutdown(ExecutorShutdown {
-                ballista_executor_id: self.ballista_executor_id.clone(),
-                reason: reason.to_string(),
-            })),
-        };
-
-        let mut sent = 0usize;
-        for (scheduler_address, handle) in &self.streams {
-            let outbound_tx = { handle.outbound_tx.read().await.clone() };
-            if let Some(outbound_tx) = outbound_tx {
-                match outbound_tx.try_send(message.clone()) {
-                    Ok(()) => {
-                        sent += 1;
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            "Failed to send shutdown to scheduler {scheduler_address}: {err}"
-                        );
-                    }
-                }
-            }
-        }
-
-        tracing::debug!(
-            "Sent executor shutdown notification to {sent} scheduler streams: {reason}"
-        );
     }
 
     /// Updates the set of schedulers and spawns/removes control streams as needed.
@@ -450,14 +363,11 @@ impl ControlStreamManager {
 
         // Spawn new control streams
         for address in added {
-            let outbound_tx_state = Arc::new(RwLock::new(None));
             let handle = spawn_control_stream(
                 address.clone(),
                 self.executor_id.clone(),
                 self.client_tls_config.clone(),
                 self.metrics_reader.clone(),
-                Arc::clone(&self.poll_now_notify),
-                Arc::clone(&outbound_tx_state),
             );
             self.streams.insert(address, handle);
         }
@@ -535,7 +445,6 @@ mod tests {
     fn test_control_stream_manager_new() {
         let manager = ControlStreamManager::new(
             "executor-1".to_string(),
-            "executor-1".to_string(),
             None, // no TLS
             None, // no metrics reader
         );
@@ -547,23 +456,13 @@ mod tests {
     #[test]
     fn test_control_stream_manager_new_with_metrics_reader() {
         let reader = MetricsReader::new();
-        let manager = ControlStreamManager::new(
-            "executor-2".to_string(),
-            "executor-2".to_string(),
-            None,
-            Some(reader),
-        );
+        let manager = ControlStreamManager::new("executor-2".to_string(), None, Some(reader));
         assert!(manager.metrics_reader.is_some());
     }
 
     #[test]
     fn test_control_stream_manager_update_schedulers_empty() {
-        let mut manager = ControlStreamManager::new(
-            "executor-1".to_string(),
-            "executor-1".to_string(),
-            None,
-            None,
-        );
+        let mut manager = ControlStreamManager::new("executor-1".to_string(), None, None);
         manager.update_schedulers(vec![]);
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -571,12 +470,7 @@ mod tests {
 
     #[test]
     fn test_control_stream_manager_shutdown_empty() {
-        let mut manager = ControlStreamManager::new(
-            "executor-1".to_string(),
-            "executor-1".to_string(),
-            None,
-            None,
-        );
+        let mut manager = ControlStreamManager::new("executor-1".to_string(), None, None);
         // Should not panic on empty manager
         manager.shutdown();
         assert!(manager.known_schedulers.is_empty());

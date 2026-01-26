@@ -17,8 +17,7 @@ limitations under the License.
 //! Internal cluster gRPC service implementation.
 //!
 //! This service handles scheduler-executor communication for cluster mode,
-//! including app definition retrieval, secret expansion, and control stream
-//! management for sending `PollNow` commands to executors.
+//! including app definition retrieval and secret expansion.
 
 use std::ops::ControlFlow;
 use std::pin::Pin;
@@ -26,45 +25,26 @@ use std::sync::Arc;
 
 use app::App;
 use arrow::array::RecordBatch;
-use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
-use data_components::flightsql::FlightSqlClient;
-
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        ast::{Ident, ObjectNamePart, visit_relations_mut},
-        dialect::PostgreSqlDialect,
-        parser::Parser,
-    },
-};
-
-use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
-
-use flight_client::cookie::{CookieService, CookieStore};
-use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
+use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::sqlparser::parser::Parser;
 use futures::{Stream, StreamExt, TryStreamExt};
-use parking_lot::RwLock;
+use runtime_proto::cluster_service_server::ClusterService;
+use runtime_proto::executor_control_message::Message as ExecutorMessage;
 use runtime_proto::{
-    AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, ExecutorControlMessage,
-    ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
-    GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest, GetSchedulersResponse,
-    GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand, SchedulerControlMessage,
-    SchedulerInstance, StringArray, cluster_service_server::ClusterService,
-    executor_control_message::Message as ExecutorMessage,
-    scheduler_control_message::Message as SchedulerMessage,
+    ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
+    GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
+    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, SchedulerControlMessage,
+    SchedulerInstance,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use std::collections::HashMap;
 use std::task::{Context, Poll};
-use tokio::sync::RwLock as TokioRwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-
-use tonic::{Request, Response, Status, Streaming, transport::Endpoint};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::cluster::SchedulerPeers;
 use crate::cluster::executor_registry::ExecutorRegistry;
@@ -72,101 +52,26 @@ use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 
-/// Handle for sending messages to a connected executor.
-struct ExecutorStreamHandle {
-    tx: mpsc::Sender<SchedulerControlMessage>,
-}
-
-/// Shared registry of connected executor control streams.
-///
-/// This is extracted from `ClusterServiceImpl` to allow sharing with the
-/// scheduler callback for broadcasting `PollNow` notifications.
-#[derive(Clone, Default)]
-pub struct ExecutorControlStreamRegistry {
-    streams: Arc<RwLock<HashMap<String, ExecutorStreamHandle>>>,
-}
-
-impl ExecutorControlStreamRegistry {
-    /// Creates a new empty executor stream registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            streams: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    /// Broadcasts a `PollNow` command to all connected executors.
-    ///
-    /// This notifies executors that new work may be available, causing them
-    /// to immediately poll for tasks rather than waiting for the next poll interval.
-    pub fn broadcast_poll_now(&self, reason: &str) {
-        let streams = self.streams.read();
-        if streams.is_empty() {
-            return;
-        }
-
-        let message = SchedulerControlMessage {
-            message: Some(SchedulerMessage::PollNow(PollNowCommand {
-                reason: reason.to_string(),
-            })),
-        };
-
-        let count = streams.len();
-        for (executor_id, handle) in streams.iter() {
-            // Use try_send to avoid blocking. If the channel is full, the executor
-            // will poll on its next interval anyway.
-            if let Err(e) = handle.tx.try_send(message.clone()) {
-                tracing::debug!("Failed to send PollNow to executor {executor_id}: {e}");
-            }
-        }
-
-        tracing::debug!("Broadcast PollNow to {count} executors: {reason}");
-    }
-
-    /// Registers an executor stream for receiving control messages.
-    pub(crate) fn register(&self, executor_id: &str, tx: mpsc::Sender<SchedulerControlMessage>) {
-        let mut streams = self.streams.write();
-        streams.insert(executor_id.to_string(), ExecutorStreamHandle { tx });
-        tracing::debug!(
-            "Registered executor stream: {executor_id} (total: {})",
-            streams.len()
-        );
-    }
-
-    /// Unregisters an executor stream.
-    pub(crate) fn unregister(&self, executor_id: &str) {
-        let mut streams = self.streams.write();
-        if streams.remove(executor_id).is_some() {
-            tracing::debug!(
-                "Unregistered executor stream: {executor_id} (remaining: {})",
-                streams.len()
-            );
-        }
-    }
-}
-
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
-    app: Arc<TokioRwLock<Option<Arc<App>>>>,
-    secrets: Arc<TokioRwLock<Secrets>>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
+    secrets: Arc<RwLock<Secrets>>,
     advertise_address: String,
-    scheduler_peers: Arc<TokioRwLock<SchedulerPeers>>,
+    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
     datafusion: Arc<DataFusion>,
     executor_registry: Arc<ExecutorRegistry>,
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
-    /// Registry of connected executor streams for [`PollNow`] broadcasts.
-    executor_streams: ExecutorControlStreamRegistry,
 }
 
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
     pub fn new(
-        app: Arc<TokioRwLock<Option<Arc<App>>>>,
-        secrets: Arc<TokioRwLock<Secrets>>,
+        app: Arc<RwLock<Option<Arc<App>>>>,
+        secrets: Arc<RwLock<Secrets>>,
         advertise_address: String,
-        scheduler_peers: Arc<TokioRwLock<SchedulerPeers>>,
+        scheduler_peers: Arc<RwLock<SchedulerPeers>>,
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
@@ -179,52 +84,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-            executor_streams: ExecutorControlStreamRegistry::new(),
         }
-    }
-
-    /// Creates a new cluster service with a pre-existing executor stream registry.
-    ///
-    /// This allows sharing the registry with the scheduler callback for
-    /// broadcasting `PollNow` notifications.
-    #[must_use]
-    #[expect(clippy::too_many_arguments)]
-    pub fn with_executor_streams(
-        app: Arc<TokioRwLock<Option<Arc<App>>>>,
-        secrets: Arc<TokioRwLock<Secrets>>,
-        advertise_address: String,
-        scheduler_peers: Arc<TokioRwLock<SchedulerPeers>>,
-        datafusion: Arc<DataFusion>,
-        executor_registry: Arc<ExecutorRegistry>,
-        metrics_reader: Option<MetricsReader>,
-        executor_streams: ExecutorControlStreamRegistry,
-    ) -> Self {
-        Self {
-            app,
-            secrets,
-            advertise_address,
-            scheduler_peers,
-            datafusion,
-            executor_registry,
-            metrics_reader,
-            executor_streams,
-        }
-    }
-
-    /// Returns a clone of the executor stream registry.
-    ///
-    /// This can be used to share the registry with the scheduler callback.
-    #[must_use]
-    pub fn executor_streams(&self) -> ExecutorControlStreamRegistry {
-        self.executor_streams.clone()
-    }
-
-    /// Broadcasts a `PollNow` command to all connected executors.
-    ///
-    /// This notifies executors that new work may be available, causing them
-    /// to immediately poll for tasks rather than waiting for the next poll interval.
-    pub fn broadcast_poll_now(&self, reason: &str) {
-        self.executor_streams.broadcast_poll_now(reason);
     }
 
     /// Returns the executor registry for use by other components.
@@ -432,19 +292,12 @@ impl ClusterService for ClusterServiceImpl {
         let cancel = CancellationToken::new();
         let inbound_cancel = cancel.clone();
 
-        // Create a channel for outbound messages to the executor.
+        // Create a channel for outbound messages to the executor
         let (outbound_tx, outbound_rx) = mpsc::channel::<SchedulerControlMessage>(32);
-
-        // Clone the executor_streams registry for use in the spawned task.
-        let executor_streams = self.executor_streams.clone();
-
-        // Clone outbound_tx for registration after we identify the executor.
-        let registration_tx = outbound_tx.clone();
 
         // We need to identify the executor from its first message.
         // Spawn a task to handle the bidirectional stream.
         let executor_registry = Arc::clone(&self.executor_registry);
-        let datafusion = Arc::clone(&self.datafusion);
         let outbound_tx_for_registry = outbound_tx.clone();
         let inbound_task = tokio::spawn(async move {
             let executor_id = match inbound.next().await {
@@ -458,7 +311,7 @@ impl ClusterService for ClusterServiceImpl {
 
                     // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, &message, &datafusion).await;
+                        handle_executor_message(&executor_id, &message, &executor_registry);
                     }
                     executor_id
                 }
@@ -476,9 +329,6 @@ impl ClusterService for ClusterServiceImpl {
             let pending_requests = executor_registry
                 .register(executor_id.clone(), outbound_tx_for_registry)
                 .await;
-
-            // Register the executor stream for PollNow broadcasts.
-            executor_streams.register(&executor_id, registration_tx);
 
             loop {
                 tokio::select! {
@@ -505,9 +355,8 @@ impl ClusterService for ClusterServiceImpl {
                                         handle_executor_message(
                                             &executor_id,
                                             &message,
-                                            &datafusion,
-                                        )
-                                        .await;
+                                            &executor_registry,
+                                        );
                                     }
                                 }
                             }
@@ -526,10 +375,6 @@ impl ClusterService for ClusterServiceImpl {
 
             // Unregister the executor when the stream ends.
             executor_registry.unregister(&executor_id).await;
-
-            // Unregister the executor stream.
-            executor_streams.unregister(&executor_id);
-
             tracing::debug!("Executor control stream ended: {executor_id}");
         });
 
@@ -542,85 +387,13 @@ impl ClusterService for ClusterServiceImpl {
 
         Ok(Response::new(Box::pin(stream)))
     }
-
-    async fn allocate_initial_partitions(
-        &self,
-        request: Request<AllocateInitialPartitionsRequest>,
-    ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
-        let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
-
-        match create_executor_flight_client(&executor_id) {
-            Ok(client) => {
-                let mut flight_client_registry =
-                    self.executor_registry.flight_sql_clients.write().await;
-                flight_client_registry.insert(executor_id.clone(), client);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to create Flight SQL client for executor {executor_id}: {e}"
-                );
-            }
-        }
-
-        let table_partitions: HashMap<TableReference, StringArray> = (*self.app.read().await)
-            .as_ref()
-            .map(|app| {
-                app.datasets
-                    .iter()
-                    .map(|ds| {
-                        (
-                            TableReference::parse_str(&ds.name),
-                            StringArray { items: vec![] },
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut executor_partitions = self.executor_registry.partitions.write().await;
-        executor_partitions.insert(
-            executor_id.clone(),
-            table_partitions
-                .keys()
-                .map(|tbl| (tbl.clone(), vec![]))
-                .collect(),
-        );
-
-        Ok(Response::new(AllocateInitialPartitionsResponse {
-            table_partitions: table_partitions
-                .into_iter()
-                .map(|(tbl, x)| (tbl.to_string(), x))
-                .collect(),
-        }))
-    }
 }
 
-fn create_executor_flight_client(
-    endpoint: &str,
-) -> Result<FlightSqlClient, tonic::transport::Error> {
-    let executor_address = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    };
-
-    // TODO support for mTLS certificates per executor.
-    let flight_channel = Endpoint::from_shared(executor_address)?.connect_lazy();
-
-    Ok(FlightSqlServiceClient::new_from_inner(
-        FlightServiceClient::new(CookieService::new(
-            flight_channel,
-            Arc::new(CookieStore::new()),
-        ))
-        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
-        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
-    ))
-}
-
-/// Handles an executor control message (heartbeat, shutdown, etc.)
-async fn handle_executor_message(
+/// Handles an executor control message (heartbeat, etc.)
+fn handle_executor_message(
     executor_id: &str,
     message: &ExecutorMessage,
-    datafusion: &DataFusion,
+    _registry: &ExecutorRegistry,
 ) {
     match message {
         ExecutorMessage::Heartbeat(heartbeat) => {
@@ -636,55 +409,7 @@ async fn handle_executor_message(
                 "Unexpected metrics response in handle_executor_message for {executor_id}"
             );
         }
-        ExecutorMessage::Shutdown(shutdown) => {
-            let reason = if shutdown.reason.is_empty() {
-                "executor shutdown".to_string()
-            } else {
-                shutdown.reason.clone()
-            };
-            let ballista_executor_id = if shutdown.ballista_executor_id.is_empty() {
-                executor_id
-            } else {
-                shutdown.ballista_executor_id.as_str()
-            };
-            tracing::info!(
-                executor_id = %executor_id,
-                ballista_executor_id = %ballista_executor_id,
-                reason = %reason,
-                "Executor shutdown requested"
-            );
-            if let Err(err) =
-                notify_scheduler_executor_shutdown(datafusion, ballista_executor_id, &reason).await
-            {
-                tracing::warn!(
-                    "Failed to notify scheduler about executor shutdown for {ballista_executor_id}: {err}"
-                );
-            }
-        }
     }
-}
-
-async fn notify_scheduler_executor_shutdown(
-    datafusion: &DataFusion,
-    executor_id: &str,
-    reason: &str,
-) -> Result<(), String> {
-    let scheduler = datafusion
-        .scheduler_server
-        .read()
-        .map_err(|_| "Failed to lock scheduler server".to_string())?
-        .clone()
-        .ok_or_else(|| "Scheduler server not initialized".to_string())?;
-
-    scheduler
-        .executor_stopped(Request::new(ExecutorStoppedParams {
-            executor_id: executor_id.to_string(),
-            reason: reason.to_string(),
-        }))
-        .await
-        .map_err(|e| format!("Failed to notify scheduler about executor shutdown: {e}"))?;
-
-    Ok(())
 }
 /// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
 ///

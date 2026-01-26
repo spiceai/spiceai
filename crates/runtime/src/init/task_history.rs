@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::cluster::DistributedNode;
 use crate::{
-    Error, Result, Runtime, UnableToCreateBackendSnafu, datafusion::SPICE_RUNTIME_SCHEMA,
-    task_history,
+    Error, Result, Runtime, UnableToCreateBackendSnafu, config::ClusterRole,
+    datafusion::SPICE_RUNTIME_SCHEMA, task_history,
 };
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
@@ -99,8 +98,8 @@ impl Runtime {
         // In cluster scheduler mode, wrap the local table with FederatedTaskHistoryTable
         // to enable cluster-wide task history queries, and also register the local table
         // separately for use by the GetTaskHistory RPC handler
-        let table_to_register: Arc<dyn TableProvider> = match &self.distributed {
-            Some(DistributedNode::Scheduler { peers, .. }) => {
+        let table_to_register: Arc<dyn TableProvider> =
+            if matches!(effective_role, Some(ClusterRole::Scheduler)) {
                 let schema = local_table.schema();
 
                 // Compute scheduler_id: {advertise_host}:{bind_port}
@@ -134,14 +133,14 @@ impl Runtime {
                 let federated = task_history::federated::FederatedTaskHistoryTable::new(
                     schema,
                     local_table_provider,
-                    Arc::clone(peers),
+                    self.scheduler_peers(),
                     self.df.cluster_config.client_tls_config().cloned(),
                     scheduler_id,
                 );
                 Arc::new(federated)
-            }
-            _ => local_table,
-        };
+            } else {
+                local_table
+            };
 
         self.df
             .register_table_as_writable_and_with_schema(
