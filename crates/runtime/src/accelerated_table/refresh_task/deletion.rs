@@ -126,13 +126,9 @@ fn balanced_and(conditions: Vec<Expr>) -> Option<Expr> {
         ),
         _ => {
             let mid = conditions.len() / 2;
-            let (left, right): (Vec<_>, Vec<_>) = conditions
-                .into_iter()
-                .enumerate()
-                .partition(|(i, _)| *i < mid);
-
-            let left_exprs: Vec<Expr> = left.into_iter().map(|(_, e)| e).collect();
-            let right_exprs: Vec<Expr> = right.into_iter().map(|(_, e)| e).collect();
+            let (left_exprs, right_exprs) = conditions.split_at(mid);
+            let left_exprs = left_exprs.to_vec();
+            let right_exprs = right_exprs.to_vec();
 
             match (balanced_and(left_exprs), balanced_and(right_exprs)) {
                 (Some(l), Some(r)) => Some(l.and(r)),
