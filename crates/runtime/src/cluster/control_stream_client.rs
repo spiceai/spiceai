@@ -18,7 +18,8 @@ limitations under the License.
 //!
 //! This module provides functionality for executors to establish and maintain
 //! bidirectional control streams with schedulers. These streams allow schedulers
-//! to request metrics from executors on-demand.
+//! to request metrics from executors on-demand and receive `PollNow` commands
+//! to trigger immediate work polling.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use runtime_proto::{
     ExecutorControlMessage, ExecutorHeartbeat, MetricsResponse,
     executor_control_message::Message as ExecutorMessage,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::ClientTlsConfig;
@@ -55,12 +56,14 @@ struct ControlStreamHandle {
 /// 1. Connect to the scheduler
 /// 2. Send periodic heartbeats
 /// 3. Respond to metrics requests from the scheduler
-/// 4. Reconnect on failure with exponential backoff
+/// 4. Receive control messages (e.g., `PollNow`) and signal the notify
+/// 5. Reconnect on failure with exponential backoff
 fn spawn_control_stream(
     scheduler_address: String,
     executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
+    poll_now_notify: Arc<Notify>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -226,6 +229,7 @@ fn spawn_control_stream(
                                         message,
                                         &outbound_tx,
                                         metrics_reader.as_deref(),
+                                        &poll_now_notify,
                                     )
                                     .await;
                                 }
@@ -269,6 +273,7 @@ async fn handle_scheduler_message(
     message: SchedulerMessage,
     outbound_tx: &mpsc::Sender<ExecutorControlMessage>,
     metrics_reader: Option<&MetricsReader>,
+    poll_now_notify: &Notify,
 ) {
     match message {
         SchedulerMessage::RequestMetrics(request) => {
@@ -297,6 +302,13 @@ async fn handle_scheduler_message(
                 tracing::warn!("Failed to send metrics response to {scheduler_address}: {e}");
             }
         }
+        SchedulerMessage::PollNow(cmd) => {
+            tracing::debug!(
+                reason = %cmd.reason,
+                "Received PollNow from scheduler {scheduler_address}"
+            );
+            poll_now_notify.notify_one();
+        }
     }
 }
 
@@ -313,13 +325,16 @@ fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
 /// Manages control stream connections to all schedulers.
 ///
 /// This struct tracks scheduler membership and ensures control streams
-/// are established to all known schedulers.
+/// are established to all known schedulers. It also provides a shared `Notify`
+/// handle that is signaled when any scheduler sends a [`PollNow`] command.
 pub struct ControlStreamManager {
     executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
     streams: HashMap<String, ControlStreamHandle>,
     known_schedulers: HashSet<String>,
+    /// Shared notify handle signaled when any scheduler sends `PollNow`.
+    poll_now_notify: Arc<Notify>,
 }
 
 impl ControlStreamManager {
@@ -336,7 +351,17 @@ impl ControlStreamManager {
             metrics_reader: metrics_reader.map(Arc::new),
             streams: HashMap::new(),
             known_schedulers: HashSet::new(),
+            poll_now_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Returns a clone of the shared `Notify` handle.
+    ///
+    /// This handle is signaled when any connected scheduler sends a `PollNow` command.
+    /// Pass this to the poll loop to enable immediate wake-up on new work.
+    #[must_use]
+    pub fn poll_now_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.poll_now_notify)
     }
 
     /// Updates the set of schedulers and spawns/removes control streams as needed.
@@ -368,6 +393,7 @@ impl ControlStreamManager {
                 self.executor_id.clone(),
                 self.client_tls_config.clone(),
                 self.metrics_reader.clone(),
+                Arc::clone(&self.poll_now_notify),
             );
             self.streams.insert(address, handle);
         }
