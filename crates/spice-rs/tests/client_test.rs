@@ -15,7 +15,7 @@ mod tests {
     use std::sync::Arc;
 
     async fn new_cloud_client() -> Client {
-        dotenv::from_path(Path::new(".env.local")).ok();
+        dotenvy::from_path(Path::new(".env.local")).ok();
         let api_key =
             env::var("SCP_SPICEAI_TPCH_API_KEY").expect("SCP_SPICEAI_TPCH_API_KEY not found");
         ClientBuilder::new()
