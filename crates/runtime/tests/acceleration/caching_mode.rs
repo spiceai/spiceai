@@ -2345,6 +2345,157 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
         .await
 }
 
+/// Test that query parameters in different orders are correctly supported.
+///
+/// Workflow:
+/// 1. Query with `q=michael&page=1` → cache miss → fetch → stored as `page=1&q=michael`
+/// 2. Query with `page=1&q=michael` → cache hit (normalized order matches)
+/// 3. Query with `q=michael&page=1` → cache hit (original order also matches after normalization)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_query_param_order_normalization() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::cache=trace",
+    ));
+
+    test_request_context()
+        .scope(async {
+            // Create HTTP dataset with caching mode using DuckDB for proper upsert support
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("duckdb".to_string()),
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_param_order")
+                .with_dataset(dataset)
+                .build();
+
+            // Disable SQL results caching
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // STEP 1: Cache miss - query with params in one order (q first, page second)
+            eprintln!("TEST: Step 1 - querying with q=michael&page=1...");
+            let df1 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=michael&page=1")))?
+                .select(vec![col("request_path"), col("request_query")])?
+                .limit(0, Some(1))?;
+
+            let batches1 = df1.collect().await?;
+            assert!(
+                !batches1.is_empty() && batches1[0].num_rows() > 0,
+                "Should have results from HTTP API"
+            );
+
+            let batch1 = &batches1[0];
+            let request_query_array1 = batch1
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("request_query should be StringArray");
+
+            // Data is stored with normalized (sorted) params
+            assert_eq!(
+                request_query_array1.value(0),
+                "page=1&q=michael",
+                "Stored data should have normalized (alphabetically sorted) params"
+            );
+            eprintln!("TEST: Step 1 complete - data fetched and cached with normalized params");
+
+            // STEP 2: Cache hit with reversed param order (page first, q second)
+            // This tests that the fix normalizes the query filter before lookup
+            eprintln!("TEST: Step 2 - querying with page=1&q=michael (reversed order)...");
+            let df2 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("page=1&q=michael")))?
+                .select(vec![col("request_path"), col("request_query")])?
+                .limit(0, Some(1))?;
+
+            let batches2 = df2.collect().await?;
+            assert!(
+                !batches2.is_empty() && batches2[0].num_rows() > 0,
+                "Should have cached results with reversed param order (issue #9056 fix)"
+            );
+
+            let batch2 = &batches2[0];
+            let request_query_array2 = batch2
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("request_query should be StringArray");
+            assert_eq!(
+                request_query_array2.value(0),
+                "page=1&q=michael",
+                "Should return cached data"
+            );
+            eprintln!("TEST: Step 2 complete - reversed param order matched cached data");
+
+            // STEP 3: Cache hit with original param order (q first, page second)
+            // Verify the original order still works after normalization
+            eprintln!("TEST: Step 3 - querying with q=michael&page=1 (original order)...");
+            let df3 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=michael&page=1")))?
+                .select(vec![col("request_path"), col("request_query")])?
+                .limit(0, Some(1))?;
+
+            let batches3 = df3.collect().await?;
+            assert!(
+                !batches3.is_empty() && batches3[0].num_rows() > 0,
+                "Should have cached results with original param order"
+            );
+            eprintln!("TEST: Step 3 complete - original param order still works");
+
+            Ok(())
+        })
+        .await
+}
+
 /// Asserts that the specified column in the given record batches contains non-empty string data.
 fn assert_column_has_data(batches: &[arrow::array::RecordBatch], column_name: &str) {
     assert!(!batches.is_empty(), "expected at least one batch");

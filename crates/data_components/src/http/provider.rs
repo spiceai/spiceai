@@ -118,6 +118,27 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024; // 16 KiB
 const MAX_REQUEST_PATH_LENGTH: usize = 1024;
 type PartitionSpec = (Option<String>, Option<String>, Option<String>);
 
+/// Sort query parameters alphabetically for consistent cache key handling.
+///
+/// This ensures that `param1=a&param2=b` and `param2=b&param1=a` are treated as equivalent
+/// when used as cache keys or for matching against stored data.
+///
+/// # Examples
+/// ```ignore
+/// assert_eq!(sort_query_params("b=2&a=1"), "a=1&b=2");
+/// assert_eq!(sort_query_params(""), "");
+/// ```
+#[must_use]
+pub fn sort_query_params(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+
+    let mut params: Vec<&str> = query.split('&').collect();
+    params.sort_unstable();
+    params.join("&")
+}
+
 #[derive(Clone)]
 struct CachedResponse {
     content: Arc<String>,
@@ -1465,18 +1486,7 @@ impl HttpTableProvider {
         }
 
         let query = raw.strip_prefix('?').unwrap_or(raw);
-        Ok(Self::sort_query_params(query))
-    }
-
-    /// Sort query parameters alphabetically by key for consistent primary key handling
-    fn sort_query_params(query: &str) -> String {
-        if query.is_empty() {
-            return String::new();
-        }
-
-        let mut params: Vec<&str> = query.split('&').collect();
-        params.sort_unstable();
-        params.join("&")
+        Ok(sort_query_params(query))
     }
 
     fn ensure_allowed_body(&self, raw: &str) -> Result<String> {
@@ -2100,35 +2110,26 @@ mod tests {
     #[test]
     fn test_sort_query_params() {
         // Test empty query
-        assert_eq!(HttpTableProvider::sort_query_params(""), "");
+        assert_eq!(sort_query_params(""), "");
 
         // Test single parameter
-        assert_eq!(
-            HttpTableProvider::sort_query_params("key=value"),
-            "key=value"
-        );
+        assert_eq!(sort_query_params("key=value"), "key=value");
 
         // Test already sorted parameters
-        assert_eq!(
-            HttpTableProvider::sort_query_params("a=1&b=2&c=3"),
-            "a=1&b=2&c=3"
-        );
+        assert_eq!(sort_query_params("a=1&b=2&c=3"), "a=1&b=2&c=3");
 
         // Test unsorted parameters - should be sorted alphabetically
-        assert_eq!(
-            HttpTableProvider::sort_query_params("c=3&a=1&b=2"),
-            "a=1&b=2&c=3"
-        );
+        assert_eq!(sort_query_params("c=3&a=1&b=2"), "a=1&b=2&c=3");
 
         // Test with URL encoding
         assert_eq!(
-            HttpTableProvider::sort_query_params("z=last&a=first&m=middle"),
+            sort_query_params("z=last&a=first&m=middle"),
             "a=first&m=middle&z=last"
         );
 
         // Test complex query string
         assert_eq!(
-            HttpTableProvider::sort_query_params("userId=1&title=foo&body=bar"),
+            sort_query_params("userId=1&title=foo&body=bar"),
             "body=bar&title=foo&userId=1"
         );
     }

@@ -1054,10 +1054,34 @@ impl TableProvider for AcceleratedTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        // In caching mode, we handle filters ourselves (not pushed to accelerator)
-        // Return Inexact to indicate we'll use the filters but they shouldn't be optimized away
+        // The HTTP connector returns data with normalized `request_query` values
+        // (e.g., `param2=b&param1=a` → `param1=a&param2=b`), which is then stored in the
+        // caching accelerator.
+        //
+        // Returning Inexact would cause DataFusion to add FilterExec with the original
+        // (non-normalized) filter value, which would reject correct results since stored
+        // data has normalized values.
+        //
+        // It is safe to return Exact for `request_query` filters because:
+        // 1. This mirrors how the HTTP connector returns Exact for the same reason
+        // 2. Both write path (HttpTableProvider::ensure_allowed_query) and read path
+        //    (normalize_request_query_filters) use the same sort_query_params normalization
+        // 3. `request_query` has special meaning and supports predefined format / expressions
+        //
+        // Other filters (request_path, request_body, etc.) remain Inexact as a conservative
+        // default. While the accelerator can fully handle equality correctly, Inexact ensures
+        // DataFusion verifies results for complex expressions (LIKE, functions, etc.).
         if self.refresh_mode == RefreshMode::Caching {
-            return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
+            return Ok(filters
+                .iter()
+                .map(|f| {
+                    if caching::is_request_query_filter(f) {
+                        TableProviderFilterPushDown::Exact
+                    } else {
+                        TableProviderFilterPushDown::Inexact
+                    }
+                })
+                .collect());
         }
 
         match self.zero_results_action {
@@ -1101,10 +1125,20 @@ impl TableProvider for AcceleratedTable {
             }
         }
 
+        // For caching mode, normalize request_query filter values by sorting query parameters.
+        // This ensures that `param2=b&param1=a` matches stored data with `param1=a&param2=b`.
+        let normalized_filters: Vec<Expr>;
+        let effective_filters = if is_caching_mode {
+            normalized_filters = caching::normalize_request_query_filters(filters);
+            &normalized_filters[..]
+        } else {
+            filters
+        };
+
         // For caching mode with filters, extend projection to include fetched_at for freshness checking if needed.
         // Added columns will be automatically stripped by `SchemaCastScanExec`, similar to
         // fallback-to-source on cache miss where results return all columns.
-        let extended_projection = if is_caching_mode && !filters.is_empty() {
+        let extended_projection = if is_caching_mode && !effective_filters.is_empty() {
             extend_projection_for_caching(projection, &self.accelerator.schema())
         } else {
             None
@@ -1112,7 +1146,7 @@ impl TableProvider for AcceleratedTable {
         let scan_projection = extended_projection.as_ref().or(projection);
         let input = self
             .accelerator
-            .scan(state, scan_projection, filters, limit)
+            .scan(state, scan_projection, effective_filters, limit)
             .await?;
         let federated = Arc::clone(&self.federated);
         let fallback_fn: FallbackAsyncTableProvider = Arc::new(move || {
@@ -1126,7 +1160,7 @@ impl TableProvider for AcceleratedTable {
 
                 // Check which filters the accelerator doesn't fully support and need to be re-applied.
                 // This ensures correct results when the accelerator returns Inexact or Unsupported for some filters.
-                let filters_to_reapply = self.get_filters_to_reapply(filters)?;
+                let filters_to_reapply = self.get_filters_to_reapply(effective_filters)?;
                 let input = if filters_to_reapply.is_empty() {
                     input
                 } else {
@@ -1147,7 +1181,7 @@ impl TableProvider for AcceleratedTable {
                     Arc::clone(&self.accelerator),
                     self.dataset_name.to_string(),
                     self.io_runtime.clone(),
-                    filters.to_vec(),
+                    effective_filters.to_vec(),
                     projection.cloned(),
                     limit,
                     Arc::clone(&self.accelerator_write_mutex),

@@ -24,9 +24,12 @@ use arrow::array::StringArray;
 use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
 use arrow::datatypes::SchemaRef;
 use arrow_tools::format::SchemaDisplay;
+use data_components::http::sort_query_params;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::Operator;
+use datafusion::logical_expr::expr::{BinaryExpr, InList};
 use datafusion::logical_expr::{Expr, dml::InsertOp, not};
 use datafusion::logical_expr::{col, lit};
 use datafusion::physical_plan::execution_plan::EmissionType;
@@ -1695,6 +1698,120 @@ impl ExecutionPlan for CachingAccelerationScanExec {
     }
 }
 
+/// Check if an expression is a `request_query` filter that we normalize.
+/// Used to determine if we should return Exact filter support.
+///
+/// Returns true for:
+/// - Simple equality: `request_query = 'value'`
+/// - IN lists: `request_query IN ('value1', 'value2')`
+/// - OR of `request_query` filters: `request_query = 'a' OR request_query = 'b'`
+#[must_use]
+pub fn is_request_query_filter(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
+            if let Expr::Column(col) = left.as_ref() {
+                col.name == "request_query"
+            } else if let Expr::Column(col) = right.as_ref() {
+                col.name == "request_query"
+            } else {
+                false
+            }
+        }
+        Expr::InList(in_list) => {
+            if let Expr::Column(col) = in_list.expr.as_ref() {
+                col.name == "request_query"
+            } else {
+                false
+            }
+        }
+        // OR of request_query filters: both sides must be request_query filters.
+        // Example: request_query = 'a' OR request_query = 'b'
+        // Note: AND expressions are passed as separate filters by DataFusion.
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Or => {
+            is_request_query_filter(left) && is_request_query_filter(right)
+        }
+        _ => false,
+    }
+}
+
+/// Normalize `request_query` filter values by sorting query parameters alphabetically.
+///
+/// This ensures that queries with parameters in different orders match correctly against
+/// cached data. For example, `request_query='param2=b&param1=a'` will be normalized to
+/// `request_query='param1=a&param2=b'` to match how data is stored in the cache.
+///
+/// Handles:
+/// - Simple equality: `request_query = 'param2=b&param1=a'`
+/// - IN lists: `request_query IN ('param2=b&param1=a', 'param3=c&param1=a')`
+/// - AND/OR expressions (recursive)
+pub fn normalize_request_query_filters(filters: &[Expr]) -> Vec<Expr> {
+    filters.iter().map(normalize_expr).collect()
+}
+
+fn normalize_expr(expr: &Expr) -> Expr {
+    match expr {
+        // Handle: request_query = 'value'
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
+            if let Expr::Column(col) = left.as_ref()
+                && col.name == "request_query"
+                && let Expr::Literal(ScalarValue::Utf8(Some(value)), sort) = right.as_ref()
+            {
+                let normalized = sort_query_params(value);
+                Expr::BinaryExpr(BinaryExpr {
+                    left: left.clone(),
+                    op: *op,
+                    right: Box::new(Expr::Literal(
+                        ScalarValue::Utf8(Some(normalized)),
+                        sort.clone(),
+                    )),
+                })
+            } else {
+                expr.clone()
+            }
+        }
+        // Handle: request_query IN ('value1', 'value2', ...)
+        Expr::InList(in_list) => {
+            if let Expr::Column(col) = in_list.expr.as_ref()
+                && col.name == "request_query"
+            {
+                let normalized_list: Vec<Expr> = in_list
+                    .list
+                    .iter()
+                    .map(|item| {
+                        if let Expr::Literal(ScalarValue::Utf8(Some(value)), sort) = item {
+                            Expr::Literal(
+                                ScalarValue::Utf8(Some(sort_query_params(value))),
+                                sort.clone(),
+                            )
+                        } else {
+                            item.clone()
+                        }
+                    })
+                    .collect();
+                Expr::InList(InList {
+                    expr: in_list.expr.clone(),
+                    list: normalized_list,
+                    negated: in_list.negated,
+                })
+            } else {
+                expr.clone()
+            }
+        }
+        // Handle: expr1 AND expr2, expr1 OR expr2 (recursive)
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if *op == Operator::And || *op == Operator::Or =>
+        {
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(normalize_expr(left)),
+                op: *op,
+                right: Box::new(normalize_expr(right)),
+            })
+        }
+        // All other expressions: return as-is
+        _ => expr.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2766,5 +2883,110 @@ mod tests {
 
         let total_rows: usize = data.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "Should have 3 rows from 3 requests");
+    }
+
+    #[test]
+    fn test_normalize_request_query_filters_equality() {
+        // Test simple equality filter: request_query = 'param2=b&param1=a'
+        let filters = vec![col("request_query").eq(lit("param2=b&param1=a"))];
+        let normalized = normalize_request_query_filters(&filters);
+
+        assert_eq!(normalized.len(), 1);
+        // Should be normalized to param1=a&param2=b (sorted)
+        let expected = col("request_query").eq(lit("param1=a&param2=b"));
+        assert_eq!(
+            format!("{}", normalized[0].human_display()),
+            format!("{}", expected.human_display())
+        );
+    }
+
+    #[test]
+    fn test_normalize_request_query_filters_already_sorted() {
+        // Test already sorted: request_query = 'a=1&b=2'
+        let filters = vec![col("request_query").eq(lit("a=1&b=2"))];
+        let normalized = normalize_request_query_filters(&filters);
+
+        assert_eq!(normalized.len(), 1);
+        let expected = col("request_query").eq(lit("a=1&b=2"));
+        assert_eq!(
+            format!("{}", normalized[0].human_display()),
+            format!("{}", expected.human_display())
+        );
+    }
+
+    #[test]
+    fn test_normalize_request_query_filters_in_list() {
+        // Test IN list: request_query IN ('z=3&a=1', 'b=2&a=1')
+        let filters = vec![Expr::InList(InList {
+            expr: Box::new(col("request_query")),
+            list: vec![lit("z=3&a=1"), lit("b=2&a=1")],
+            negated: false,
+        })];
+        let normalized = normalize_request_query_filters(&filters);
+
+        assert_eq!(normalized.len(), 1);
+        // Should normalize each value in the list
+        if let Expr::InList(in_list) = &normalized[0] {
+            assert_eq!(in_list.list.len(), 2);
+            // Values should be sorted: a=1&z=3 and a=1&b=2
+            assert_eq!(
+                format!("{}", in_list.list[0].human_display()),
+                format!("{}", lit("a=1&z=3").human_display())
+            );
+            assert_eq!(
+                format!("{}", in_list.list[1].human_display()),
+                format!("{}", lit("a=1&b=2").human_display())
+            );
+        } else {
+            panic!("Expected InList expression");
+        }
+    }
+
+    #[test]
+    fn test_normalize_request_query_filters_and_expression() {
+        // Test AND: request_path = '/api' AND request_query = 'b=2&a=1'
+        let filters = vec![
+            col("request_path")
+                .eq(lit("/api"))
+                .and(col("request_query").eq(lit("b=2&a=1"))),
+        ];
+        let normalized = normalize_request_query_filters(&filters);
+
+        assert_eq!(normalized.len(), 1);
+        // The request_query part should be normalized, request_path unchanged
+        let expected = col("request_path")
+            .eq(lit("/api"))
+            .and(col("request_query").eq(lit("a=1&b=2")));
+        assert_eq!(
+            format!("{}", normalized[0].human_display()),
+            format!("{}", expected.human_display())
+        );
+    }
+
+    #[test]
+    fn test_normalize_request_query_filters_non_query_unchanged() {
+        // Test that non-request_query columns are unchanged
+        let filters = vec![col("request_path").eq(lit("/api/users"))];
+        let normalized = normalize_request_query_filters(&filters);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(
+            format!("{}", normalized[0].human_display()),
+            format!("{}", filters[0].human_display())
+        );
+    }
+
+    #[test]
+    fn test_normalize_request_query_filters_empty() {
+        // Test empty query string
+        let filters = vec![col("request_query").eq(lit(""))];
+        let normalized = normalize_request_query_filters(&filters);
+
+        assert_eq!(normalized.len(), 1);
+        let expected = col("request_query").eq(lit(""));
+        assert_eq!(
+            format!("{}", normalized[0].human_display()),
+            format!("{}", expected.human_display())
+        );
     }
 }

@@ -15,3 +15,5 @@ limitations under the License.
 */
 
 pub mod provider;
+
+pub use provider::sort_query_params;
