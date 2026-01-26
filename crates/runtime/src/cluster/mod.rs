@@ -1178,9 +1178,6 @@ async fn create_scheduler_server(
     let on_work_available: Arc<dyn Fn(&str) + Send + Sync> =
         Arc::new(move |reason: &str| registry_for_callback.broadcast_poll_now(reason));
 
-    let scheduler_config = SchedulerConfig {
-        bind_host: bind_addr.ip().to_string(),
-        bind_port: bind_addr.port(),
     // Create InMemoryClusterState first so we can reference it in the config_producer
     let cluster_state: Arc<dyn ClusterState> = Arc::new(InMemoryClusterState::default());
 
