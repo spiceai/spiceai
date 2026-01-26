@@ -1,0 +1,97 @@
+[package]
+name = "spice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[[bin]]
+name = "spice"
+path = "src/main.rs"
+
+[dependencies]
+# CLI framework
+clap.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Async utilities
+futures.workspace = true
+
+# Error handling
+snafu.workspace = true
+
+# Logging/tracing
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# HTTP client
+reqwest.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Environment files
+dotenvy.workspace = true
+
+# Cross-platform directories
+dirs = "6"
+
+# Semver comparison
+semver = "1"
+
+# Date/time formatting
+chrono.workspace = true
+
+# Duration parsing
+humantime = "2"
+
+# Terminal colors
+ansi_term = "0.12"
+
+# Archive extraction
+flate2 = "1"
+tar = "0.4"
+zip = "2"
+
+# YAML parsing for spicepod
+serde_yaml = "0.9"
+
+# Temp file handling
+tempfile.workspace = true
+
+# Table formatting
+comfy-table = "7"
+
+# Line editor for REPL
+rustyline = "15"
+
+# Random number generation (for auth codes)
+rand = "0.9"
+
+# Open URLs in browser
+open = "5"
+
+# URL encoding
+urlencoding = "2"
+
+# Certificate generation for cluster TLS
+rcgen = { version = "0.13", features = ["x509-parser"] }
+pem = "3"
+time = "0.3"
+
+# Internal crates
+flightrepl = { path = "../../crates/flightrepl" }
+
+[build-dependencies]
+# None needed - we use include_str! for version
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile.workspace = true

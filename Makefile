@@ -6,11 +6,11 @@ all: build
 
 .PHONY: build-cli
 build-cli:
-	make -C bin/spice
+	cargo build --release -p spice
 
 .PHONY: build-cli-dev
 build-cli-dev:
-	export DEV=true; make -C bin/spice
+	cargo build -p spice
 
 .PHONY: build-runtime
 build-runtime:
@@ -25,7 +25,7 @@ build: build-cli build-runtime
 
 .PHONY: build-dev
 build-dev:
-	export DEV=true; make -C bin/spice
+	cargo build -p spice
 	export DEV=true; make -C bin/spiced
 
 .PHONY: build-testoperator-dev
@@ -80,8 +80,8 @@ test-integration-models-without-openai:
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
-.PHONY: lint lint-go lint-rust
-lint: lint-go lint-rust
+.PHONY: lint lint-rust
+lint: lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
@@ -152,11 +152,6 @@ lint-rust-fix:
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes \
 		-Aunfulfilled_lint_expectations
-
-
-lint-go:
-	go vet ./...
-	golangci-lint run
 
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
@@ -299,14 +294,7 @@ install-runtime: build-runtime
 .PHONY: install-cli-dev
 install-cli-dev: build-cli-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
-
-################################################################################
-# Target: modtidy                                                              #
-################################################################################
-.PHONY: modtidy
-modtidy:
-	go mod tidy
+	install -m 755 target/debug/spice ~/.spice/bin/spice
 
 ################################################################################
 # Target: distributed                                                          #
@@ -321,7 +309,6 @@ distributed-dev:
 	make install-dev SPICED_NON_DEFAULT_FEATURES="vortex"
 	./scripts/distributed.sh
 
-
 ################################################################################
 # Target: generate-acknowledgements                                            #
 ################################################################################
@@ -330,16 +317,8 @@ ACKNOWLEDGEMENTS_PATH := acknowledgements.md
 .PHONY: generate-acknowledgements
 generate-acknowledgements:
 	echo "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n" > $(ACKNOWLEDGEMENTS_PATH)
-	make generate-acknowledgements-go
 	make generate-acknowledgements-rust
 	make generate-acknowledgements-formatting
-
-.PHONY: generate-acknowledgements-go
-generate-acknowledgements-go:
-	echo "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)
-	go get github.com/google/go-licenses
-	go install github.com/google/go-licenses
-	cd bin/spice && go-licenses report --ignore github.com/spiceai/spiceai . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && cd ../../
 
 .PHONY: generate-acknowledgements-rust
 generate-acknowledgements-rust:

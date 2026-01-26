@@ -49,7 +49,7 @@ use tokio::sync::OnceCell;
 use url::Url;
 
 use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
-use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
+use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
@@ -1927,59 +1927,6 @@ impl DataAccelerator for CayenneAccelerator {
         let dir_path = self.resolve_storage_config(source).boxed()?;
         let arrow_schema = Self::transformed_arrow_schema(&cmd, source).boxed()?;
         let _ = Self::ensure_directory(&dir_path).boxed()?;
-
-        // Validate append mode configuration: requires either none, primary_key or time_column, but not both
-        if let Some(acceleration) = source.acceleration()
-            && let Some(refresh_mode) = acceleration.refresh_mode
-            && refresh_mode == RefreshMode::Append
-        {
-            // Get primary keys from constraints
-            let arrow_schema_for_pk = Arc::new(cmd.schema.as_arrow().clone());
-            let primary_keys = if cmd.constraints.is_empty() {
-                Vec::new()
-            } else {
-                super::get_primary_keys_from_constraints(&cmd.constraints, &arrow_schema_for_pk)
-            };
-            let has_primary_key = !primary_keys.is_empty();
-
-            // Get time_column from the source via the trait method
-            let has_time_column = source.time_column().is_some();
-
-            // Validate: must have exactly one (not both, not neither)
-            match (has_primary_key, has_time_column) {
-                (false, false) => {
-                    return Err(Box::new(Error::InvalidConfiguration {
-                        detail: Arc::from(
-                            "Append mode requires either primary_key or time_column to be specified. \
-                            Please add one of these to your dataset configuration.",
-                        ),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-                (true, true) => {
-                    return Err(Box::new(Error::InvalidConfiguration {
-                        detail: Arc::from(
-                            "Append mode currently cannot have both primary_key and time_column specified. \
-                            Please specify only one of these in your dataset configuration.",
-                        ),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-                (true, false) => {
-                    tracing::info!(
-                        "Append mode for dataset '{}': using primary_key {:?} for deduplication",
-                        source.name(),
-                        primary_keys
-                    );
-                }
-                (false, true) => {
-                    tracing::info!(
-                        "Append mode for dataset '{}': using time_column for append operations",
-                        source.name()
-                    );
-                }
-            }
-        }
 
         // Get the table name from the source
         let table_name = source.name().to_string();

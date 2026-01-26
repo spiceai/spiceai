@@ -233,7 +233,7 @@ impl Highlighter for EditorHelper {
     }
 }
 
-#[expect(clippy::missing_errors_doc)]
+#[expect(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
     let mut user_agent = get_user_agent();
@@ -255,6 +255,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         if repl_flight_endpoint == "http://localhost:50051" {
             repl_flight_endpoint = "https://localhost:50051".to_string();
         }
+        Channel::from_shared(repl_flight_endpoint.clone())?
+            .user_agent(user_agent.clone())?
+            .tls_config(client_tls_config)?
+            .connect()
+            .await
+    } else if repl_flight_endpoint.starts_with("https://") {
+        // For HTTPS endpoints without a custom certificate, use system certificates
+        let client_tls_config = ClientTlsConfig::new().with_native_roots();
         Channel::from_shared(repl_flight_endpoint.clone())?
             .user_agent(user_agent.clone())?
             .tls_config(client_tls_config)?
