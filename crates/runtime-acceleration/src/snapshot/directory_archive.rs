@@ -140,6 +140,26 @@ where
     Ok(total_bytes)
 }
 
+/// Options for controlling archive extraction behavior.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtractOptions {
+    /// If true, skip files that already exist on disk instead of overwriting them.
+    /// This is useful for Cayenne snapshots where multiple datasets share a metadata
+    /// directory - the first dataset's snapshot extracts the metadata, and subsequent
+    /// datasets skip the metadata files because they already exist.
+    pub skip_if_exists: bool,
+}
+
+impl ExtractOptions {
+    /// Creates options with skip_if_exists enabled.
+    #[must_use]
+    pub fn skip_existing() -> Self {
+        Self {
+            skip_if_exists: true,
+        }
+    }
+}
+
 /// Extract a tar archive to a target directory.
 ///
 /// # Arguments
@@ -154,6 +174,31 @@ where
 /// - Files cannot be extracted
 /// - The target directory cannot be created
 pub async fn extract_archive<R>(reader: R, target_dir: &Path) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    extract_archive_with_options(reader, target_dir, ExtractOptions::default()).await
+}
+
+/// Extract a tar archive to a target directory with options.
+///
+/// # Arguments
+///
+/// * `reader` - An async reader containing the tar archive data
+/// * `target_dir` - The directory to extract the archive into
+/// * `options` - Options controlling extraction behavior
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The archive cannot be read
+/// - Files cannot be extracted
+/// - The target directory cannot be created
+pub async fn extract_archive_with_options<R>(
+    reader: R,
+    target_dir: &Path,
+    options: ExtractOptions,
+) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -182,13 +227,18 @@ where
             source,
         })?;
 
-        // Extract all files
-        archive
-            .unpack(&target_dir)
-            .map_err(|source| ArchiveError::ExtractArchive {
-                path: target_dir.clone(),
-                source,
-            })?;
+        if options.skip_if_exists {
+            // Custom extraction that skips existing files
+            extract_with_skip_existing(&mut archive, &target_dir)?;
+        } else {
+            // Standard extraction that overwrites existing files
+            archive
+                .unpack(&target_dir)
+                .map_err(|source| ArchiveError::ExtractArchive {
+                    path: target_dir.clone(),
+                    source,
+                })?;
+        }
 
         Ok::<(), ArchiveError>(())
     })
@@ -197,6 +247,80 @@ where
         path: target_dir_for_error,
         source: std::io::Error::other(e),
     })??;
+
+    Ok(())
+}
+
+/// Extract archive entries, skipping files that already exist.
+fn extract_with_skip_existing<R: std::io::Read>(
+    archive: &mut tar::Archive<R>,
+    target_dir: &Path,
+) -> Result<()> {
+    use std::fs;
+    use std::io::{Read, Write};
+
+    for entry_result in archive.entries().map_err(|source| ArchiveError::ReadArchive { source })? {
+        let mut entry = entry_result.map_err(|source| ArchiveError::ReadArchive { source })?;
+        let entry_path = entry
+            .path()
+            .map_err(|source| ArchiveError::ReadArchive { source })?;
+        let dest_path = target_dir.join(&entry_path);
+
+        // Skip if the file already exists
+        if dest_path.exists() {
+            tracing::debug!(
+                "Skipping existing file during archive extraction: {}",
+                dest_path.display()
+            );
+            continue;
+        }
+
+        // Create parent directories if needed
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| ArchiveError::ExtractArchive {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        // Check if entry is a directory or file
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            fs::create_dir_all(&dest_path).map_err(|source| ArchiveError::ExtractArchive {
+                path: dest_path.clone(),
+                source,
+            })?;
+        } else if entry_type.is_file() {
+            // Extract file contents
+            let mut file =
+                fs::File::create(&dest_path).map_err(|source| ArchiveError::ExtractArchive {
+                    path: dest_path.clone(),
+                    source,
+                })?;
+
+            let mut contents = Vec::new();
+            entry
+                .read_to_end(&mut contents)
+                .map_err(|source| ArchiveError::ReadArchive { source })?;
+
+            file.write_all(&contents)
+                .map_err(|source| ArchiveError::ExtractArchive {
+                    path: dest_path.clone(),
+                    source,
+                })?;
+
+            // Preserve file permissions if available
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(mode) = entry.header().mode() {
+                    let permissions = fs::Permissions::from_mode(mode);
+                    let _ = fs::set_permissions(&dest_path, permissions);
+                }
+            }
+        }
+        // Skip other entry types (symlinks, etc.) for now
+    }
 
     Ok(())
 }
@@ -595,6 +719,129 @@ mod tests {
         extract_archive(Cursor::new(archive_buffer), extract_dir.path()).await?;
 
         assert!(extract_dir.path().join("file.txt").exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extract_skip_if_exists() -> Result<()> {
+        // Create test directories and files for two "datasets" sharing metadata
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Dataset 1: metadata + data1
+        let metadata_dir = test_dir.path().join("ds1_metadata");
+        let data1_dir = test_dir.path().join("ds1_data");
+        std::fs::create_dir_all(&metadata_dir).expect("Failed to create metadata dir");
+        std::fs::create_dir_all(&data1_dir).expect("Failed to create data1 dir");
+        std::fs::write(metadata_dir.join("catalog.db"), b"shared_metadata")
+            .expect("Failed to write catalog");
+        std::fs::write(data1_dir.join("data1.vortex"), b"data1_content")
+            .expect("Failed to write data1");
+
+        // Archive dataset 1
+        let mut archive1_buffer = Vec::new();
+        let dirs1 = vec![
+            (metadata_dir.clone(), "metadata/".to_string()),
+            (data1_dir.clone(), "data/".to_string()),
+        ];
+        archive_directories(&dirs1, Cursor::new(&mut archive1_buffer)).await?;
+
+        // Dataset 2: metadata + data2
+        let metadata_dir2 = test_dir.path().join("ds2_metadata");
+        let data2_dir = test_dir.path().join("ds2_data");
+        std::fs::create_dir_all(&metadata_dir2).expect("Failed to create metadata2 dir");
+        std::fs::create_dir_all(&data2_dir).expect("Failed to create data2 dir");
+        std::fs::write(metadata_dir2.join("catalog.db"), b"metadata_from_ds2")
+            .expect("Failed to write catalog2");
+        std::fs::write(data2_dir.join("data2.vortex"), b"data2_content")
+            .expect("Failed to write data2");
+
+        // Archive dataset 2
+        let mut archive2_buffer = Vec::new();
+        let dirs2 = vec![
+            (metadata_dir2.clone(), "metadata/".to_string()),
+            (data2_dir.clone(), "data/".to_string()),
+        ];
+        archive_directories(&dirs2, Cursor::new(&mut archive2_buffer)).await?;
+
+        // Extract both archives to the same target directory, using skip_if_exists
+        let extract_dir = TempDir::new().expect("Failed to create extract dir");
+
+        // Extract dataset 1 first (normal extraction)
+        extract_archive_with_options(
+            Cursor::new(archive1_buffer.clone()),
+            extract_dir.path(),
+            ExtractOptions::skip_existing(),
+        )
+        .await?;
+
+        // Verify dataset 1 content
+        let catalog = std::fs::read_to_string(extract_dir.path().join("metadata/catalog.db"))
+            .expect("read catalog");
+        assert_eq!(catalog, "shared_metadata");
+        let data1 = std::fs::read_to_string(extract_dir.path().join("data/data1.vortex"))
+            .expect("read data1");
+        assert_eq!(data1, "data1_content");
+
+        // Extract dataset 2 with skip_if_exists - metadata should be skipped
+        extract_archive_with_options(
+            Cursor::new(archive2_buffer),
+            extract_dir.path(),
+            ExtractOptions::skip_existing(),
+        )
+        .await?;
+
+        // Verify metadata was NOT overwritten (still from dataset 1)
+        let catalog_after =
+            std::fs::read_to_string(extract_dir.path().join("metadata/catalog.db"))
+                .expect("read catalog after");
+        assert_eq!(
+            catalog_after, "shared_metadata",
+            "Metadata should not be overwritten when skip_if_exists is true"
+        );
+
+        // Verify dataset 2's data was extracted (to its own data path)
+        let data2 = std::fs::read_to_string(extract_dir.path().join("data/data2.vortex"))
+            .expect("read data2");
+        assert_eq!(data2, "data2_content");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extract_without_skip_overwrites() -> Result<()> {
+        // Test that default extraction DOES overwrite existing files
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let data_dir = test_dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+        std::fs::write(data_dir.join("file.txt"), b"original_content")
+            .expect("Failed to write file");
+
+        // Archive with new content
+        std::fs::write(data_dir.join("file.txt"), b"new_content").expect("Failed to update file");
+
+        let mut archive_buffer = Vec::new();
+        let dirs = vec![(data_dir.clone(), "data/".to_string())];
+        archive_directories(&dirs, Cursor::new(&mut archive_buffer)).await?;
+
+        // Pre-create the file in extract dir with different content
+        let extract_dir = TempDir::new().expect("Failed to create extract dir");
+        std::fs::create_dir_all(extract_dir.path().join("data")).expect("create data dir");
+        std::fs::write(
+            extract_dir.path().join("data/file.txt"),
+            b"pre_existing_content",
+        )
+        .expect("write pre-existing file");
+
+        // Extract WITHOUT skip_if_exists (default) - should overwrite
+        extract_archive(Cursor::new(archive_buffer), extract_dir.path()).await?;
+
+        let content = std::fs::read_to_string(extract_dir.path().join("data/file.txt"))
+            .expect("read extracted file");
+        assert_eq!(
+            content, "new_content",
+            "File should be overwritten without skip_if_exists"
+        );
 
         Ok(())
     }
