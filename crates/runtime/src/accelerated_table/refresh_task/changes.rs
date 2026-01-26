@@ -30,10 +30,9 @@ use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
-use datafusion::common::ScalarValue;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
-use datafusion::logical_expr::{Expr, col};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
