@@ -133,3 +133,5 @@ message SchemaCastScanExecNode {
 }
 
 message BytesProcessedExecNode {}
+
+message CayenneAccelerationExecNode {}
