@@ -58,7 +58,7 @@ jobs:
   build-docker:
     name: Build Docker image
     needs: build-binary
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6

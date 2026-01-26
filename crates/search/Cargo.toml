@@ -23,7 +23,7 @@ datafusion-functions-json = { workspace = true }
 datafusion-optimizer-rules = {path = "../datafusion-optimizer-rules"}
 futures.workspace = true
 itertools.workspace = true
-llms = { path = "../llms", optional = true }
+llms = { path = "../llms", default-features = false, optional = true }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 serde_json.workspace = true

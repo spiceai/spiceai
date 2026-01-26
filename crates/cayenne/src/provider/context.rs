@@ -19,13 +19,12 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion_execution::config::SessionConfig;
-use vortex::compressor::CompactCompressor;
-use vortex::file::WriteStrategyBuilder;
+use tokio::sync::Semaphore;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexFormat, VortexOptions};
 use vortex_session::VortexSession;
 
-use crate::metadata::{CompressionStrategy, VortexConfig};
+use crate::metadata::VortexConfig;
 
 /// Shared context for Cayenne table operations.
 ///
@@ -46,6 +45,8 @@ pub struct CayenneContext {
     config: VortexConfig,
     /// Session configuration for `DataFusion` listing options.
     session_config: SessionConfig,
+    /// Shared semaphore for limiting concurrent file writes / uploads across all partitions.
+    upload_semaphore: Arc<Semaphore>,
 }
 
 impl CayenneContext {
@@ -61,6 +62,7 @@ impl CayenneContext {
             vortex_format,
             config: config.clone(),
             session_config: SessionConfig::default(),
+            upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency)),
         })
     }
 
@@ -102,25 +104,33 @@ impl CayenneContext {
         !self.config.sort_columns.is_empty()
     }
 
+    /// Get the maximum number of concurrent file uploads.
+    #[must_use]
+    pub fn upload_concurrency(&self) -> usize {
+        self.config.upload_concurrency.max(1)
+    }
+
+    /// Get the shared semaphore for limiting concurrent file writes / uploads.
+    #[must_use]
+    pub fn upload_semaphore(&self) -> &Arc<Semaphore> {
+        &self.upload_semaphore
+    }
+
     /// Create a `VortexFormat` from configuration.
     ///
     /// The format contains a `VortexFileCache` that can be accessed via `file_cache()`
     /// and shared with other `VortexFormat` instances using `new_with_cache()`.
     fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
-        // Create a configured Vortex session with selected encodings
+        // Create a Vortex session with default encodings
+        // Note: Write strategy configuration (e.g., compression) is applied at write time via
+        // `session.write_options().with_strategy(...)`, not at the VortexFormat level
         let vortex_session = VortexSession::default();
-
-        let vortex_session = if matches!(config.compression_strategy, CompressionStrategy::Zstd) {
-            vortex_session
-                .set(WriteStrategyBuilder::new().with_compressor(CompactCompressor::default()))
-        } else {
-            vortex_session
-        };
 
         // Configure VortexFormat - it creates its own VortexFileCache internally
         let vortex_opts = VortexOptions {
             footer_cache_size_mb: config.footer_cache_mb,
             segment_cache_size_mb: config.segment_cache_mb,
+            ..VortexOptions::default()
         };
 
         Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))

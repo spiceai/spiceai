@@ -78,7 +78,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// the same behavior version consistently across the codebase.
 #[must_use]
 pub fn default_aws_config() -> aws_config::ConfigLoader {
-    aws_config::defaults(BehaviorVersion::v2025_08_07())
+    aws_config::defaults(BehaviorVersion::v2026_01_12())
 }
 
 static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();

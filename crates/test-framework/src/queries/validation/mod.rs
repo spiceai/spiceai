@@ -229,7 +229,8 @@ macro_rules! downcast_and_stringify_ts {
 /// - `Err(anyhow::Error)`: If there is an error (e.g., invalid index, failed downcast).
 ///
 /// # Example:
-/// ```
+/// ```rust,ignore
+/// use arrow::array::Int64Array;
 /// let array = Int64Array::from(vec![12345]);
 /// let result = array_value_to_string(&array, 0);
 /// assert_eq!(result.unwrap(), Some("12345".to_string()));

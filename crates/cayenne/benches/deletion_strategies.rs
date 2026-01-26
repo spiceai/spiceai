@@ -17,9 +17,9 @@ limitations under the License.
 //! Benchmarks for deletion vector strategies in Cayenne.
 //!
 //! This benchmarks the three deletion strategies:
-//! 1. Int64Pk - Single Int64 primary key using HashSet<i64>
-//! 2. RowConverterBased - Composite/non-integer PKs using RowConverter
-//! 3. PositionBased - No PK, uses RoaringBitmap
+//! 1. `Int64Pk` - Single Int64 primary key using `HashSet<i64>`
+//! 2. `RowConverterBased` - Composite/non-integer PKs using `RowConverter`
+//! 3. `PositionBased` - No PK, uses `RoaringBitmap`
 //!
 //! Each strategy is tested for:
 //! - Single row deletion
@@ -28,6 +28,7 @@ limitations under the License.
 //! - Insert after deletion
 
 #![allow(clippy::expect_used)]
+#![allow(clippy::cast_possible_wrap)]
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -161,11 +162,25 @@ fn generate_no_pk_batch(schema: Arc<Schema>, size: usize) -> RecordBatch {
 }
 
 async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
+    let ctx = SessionContext::new();
     let schema = batch.schema();
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
-    table.insert(boxed_stream).await.expect("insert");
+    let input_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![batch]],
+        schema,
+        None,
+    )
+    .expect("memory exec");
+    let insert_plan = table
+        .insert_into(
+            &ctx.state(),
+            input_exec,
+            datafusion_expr::dml::InsertOp::Append,
+        )
+        .await
+        .expect("insert_into");
+    datafusion_physical_plan::collect(insert_plan, ctx.task_ctx())
+        .await
+        .expect("collect");
 }
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> u64 {

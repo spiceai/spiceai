@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
+use crate::dataaccelerator::BootstrapStatus;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
@@ -24,28 +25,36 @@ use crate::{
     },
 };
 use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::{
     dataset_checkpoint::make_checkpointer_factory,
-    snapshot::{SnapshotBehavior, SnapshotDownloadInfo, SnapshotManager, metrics},
+    snapshot::{SnapshotBehavior, SnapshotManager, metrics},
 };
 use snafu::ResultExt;
 
+/// Downloads a snapshot if needed for bootstrapping.
+/// Returns `BootstrapStatus`::`Bootstrapped` if a snapshot was successfully downloaded.
 pub(super) async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
-    path: PathBuf,
+    layout: AccelerationLayout,
     engine: AccelerationEngine,
-) {
+) -> BootstrapStatus {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
-        return;
+        return BootstrapStatus::none();
     }
 
-    if path.exists() {
+    let Some(primary_path) = layout.primary_path().cloned() else {
+        tracing::debug!("No primary path for acceleration layout, skipping download");
+        return BootstrapStatus::none();
+    };
+
+    if primary_path.exists() {
         tracing::info!(
             "Acceleration already exists at {}, skipping snapshot download",
-            path.display()
+            primary_path.display()
         );
-        return;
+        return BootstrapStatus::none();
     }
 
     let dataset_name = source.name().to_string();
@@ -68,7 +77,7 @@ pub(super) async fn download_snapshot_if_needed(
     if let Some(manager) = SnapshotManager::try_new(
         dataset_name.clone(),
         acceleration.snapshot_behavior.clone(),
-        path,
+        layout,
         engine,
     )
     .await
@@ -76,24 +85,24 @@ pub(super) async fn download_snapshot_if_needed(
         let manager = manager.with_checkpointer_factory(checkpoint_factory);
         let start_time = Instant::now();
         match manager.download_latest_snapshot().await {
-            Ok(Some(SnapshotDownloadInfo {
-                schema: _,
-                bytes_downloaded,
-                checksum,
-            })) => {
+            Ok(Some(info)) => {
                 let duration_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 metrics::record_bootstrap_metrics(
                     &dataset_name,
                     duration_ms,
-                    bytes_downloaded,
-                    &checksum,
+                    info.bytes_downloaded,
+                    &info.checksum,
                 );
+                BootstrapStatus::bootstrapped(info)
             }
-            Ok(None) => {}
+            Ok(None) => BootstrapStatus::none(),
             Err(e) => {
                 tracing::error!("Failed to download snapshot: {}", e);
+                BootstrapStatus::none()
             }
         }
+    } else {
+        BootstrapStatus::none()
     }
 }
 

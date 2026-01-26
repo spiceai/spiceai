@@ -1,0 +1,16 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: nation_pk_24"
+---
++---------------+------------------------------------------------------------------------------+
+| plan_type     | plan                                                                         |
++---------------+------------------------------------------------------------------------------+
+| logical_plan  | Filter: nation.n_nationkey = Int32(24)                                       |
+|               |   TableScan: nation projection=[n_nationkey, n_name, n_regionkey, n_comment] |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                  |
+|               |   FilterExec: n_nationkey@0 = 24                                             |
+|               |     SchemaCastScanExec                                                       |
+|               |       BytesProcessedExec                                                     |
+|               |         DataSourceExec: partitions=1, partition_sizes=[1]                    |
+|               |                                                                              |
++---------------+------------------------------------------------------------------------------+

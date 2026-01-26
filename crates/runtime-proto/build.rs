@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::io::Result;
+use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let proto_files = std::fs::read_dir("proto")?
@@ -24,10 +25,10 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>();
 
     if !proto_files.is_empty() {
-        tonic_build::configure()
+        tonic_prost_build::configure()
             .build_server(true)
             .build_client(true)
-            .compile_protos(&proto_files, &["proto"])?;
+            .compile_protos(&proto_files, &[PathBuf::from("proto")])?;
     }
 
     Ok(())

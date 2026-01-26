@@ -4,9 +4,22 @@
 
 Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and agents. Provides federated SQL querying, data acceleration/materialization, search (vector, keyword, full-text), and AI inference via industry-standard APIs.
 
-**Architecture**: Go CLI (`bin/spice`) + Rust runtime daemon (`bin/spiced`). Built on Apache DataFusion, Arrow, and DuckDB.
+**Architecture**: Rust CLI (`bin/spice`) + Rust runtime daemon (`bin/spiced`). Built on Apache DataFusion, Arrow, and DuckDB.
 
 **Core Principle**: Developer Experience First — Bring data and AI/ML to your application, not the other way around.
+
+### ⚠️ DATA CORRECTNESS — ABSOLUTE TOP PRIORITY ⚠️
+
+**As an AI-native database and search engine, data correctness is non-negotiable and the highest priority of this project.**
+
+- **Data can NEVER be wrong**: Every query must return correct results. Incorrect data is unacceptable under any circumstances.
+- **Correctness over performance**: Never sacrifice data accuracy for speed or convenience. A slow correct answer is infinitely better than a fast wrong one.
+- **Verify transformations**: Any data transformation, aggregation, or computation must preserve data integrity.
+- **Test edge cases rigorously**: NULL handling, boundary conditions, type coercions, and overflow scenarios must all produce correct results.
+- **When in doubt, fail safely**: If there's any uncertainty about data correctness, return an error rather than potentially incorrect data.
+- **No silent data corruption**: Always surface errors visibly rather than returning subtly wrong results.
+
+**This principle supersedes all other considerations including performance, developer experience, and feature velocity.**
 
 ### Runtime Architecture - Separate Tokio Runtimes
 
@@ -66,26 +79,7 @@ fn test() { let value = option.expect("descriptive message"); }
 ### Logging & Streams (CRITICAL)
 
 - **Use `tracing::`** not `log::` (tracing::info!, tracing::error!, etc.)
-- **AVOID `stream!` macro**: Breaks rust-analyzer, hard to debug
-
-### Async/Blocking (CRITICAL)
-
-**Rule**: Async code must reach `.await` within 10-100 microseconds.
-
-**Never block async runtime**:
-
-- ❌ `std::thread::sleep`/`std::fs`/blocking DB → ✅ `tokio::time::sleep`/`tokio::fs`/async pools
-
-**Handling blocking operations**:
-
-1. **Blocking I/O**: `tokio::task::spawn_blocking(move || { /* sync code */ }).await?`
-2. **CPU-bound**: Use `rayon::spawn()` with `oneshot::channel()` for result
-3. **Background tasks**: `std::thread::spawn()`
-
-### Clippy (Enforced in CI)
-
-**Errors**: `clippy::pedantic`, `clippy::unwrap_used`, `clippy::expect_used`, `clippy::clone_on_ref_ptr`  
-**Allowed**: `clippy::module_name_repetitions`, `clippy::large_futures`
+- **AVOID `stream!` macro**: Breaks rust-analyzer, hard to debug. Use manual Stream implementations or `async_stream::stream` sparingly; when unavoidable, document why.
 
 ## Performance & Memory (CRITICAL)
 
@@ -150,6 +144,35 @@ while let Some(batch) = stream.next().await { process_batch(batch?)?; }
 let all_batches: Vec<RecordBatch> = stream.try_collect().await?;
 ```
 
+### SQL & Query Safety (CRITICAL for Data Correctness)
+
+- **Favor DataFrame APIs over raw SQL for internal queries**: Use DataFusion's `DataFrame` API for runtime-internal queries—it's type-safe, composable, and avoids SQL parsing overhead
+- **Never trust user input in SQL**: Always use parameterized queries or proper escaping
+- **Validate query results**: When transforming data, verify row counts and key values are preserved
+- **Handle NULL correctly**: Use `Option<T>` appropriately; NULL propagation must match SQL semantics
+- **Be explicit about type coercions**: Arrow/DataFusion type casting must preserve data fidelity
+- **Test aggregations**: SUM, COUNT, AVG must handle empty sets, NULLs, and overflows correctly
+- **Verify JOIN semantics**: Ensure correct handling of NULL keys and duplicate rows
+- **ORDER BY stability**: Document whether sort is stable when values are equal
+
+```rust
+// GOOD - explicit NULL handling
+let value: Option<i64> = row.get("amount");
+let total = value.unwrap_or(0); // Only if business logic allows
+
+// GOOD - validate transformations with runtime error handling
+ensure!(
+    input_batch.num_rows() == output_batch.num_rows(),
+    RowCountMismatchSnafu {
+        expected: input_batch.num_rows(),
+        actual: output_batch.num_rows(),
+    }
+);
+
+// GOOD - propagate error instead of panicking on NULL
+let value: i64 = row.get("amount").context(AmountNullSnafu)?; // Returns a structured error if NULL
+```
+
 ### Allocation Minimization
 
 - **Reuse buffers**: `String::clear()`, `Vec::clear()` to keep capacity
@@ -210,13 +233,6 @@ async fn bad(&self) {
     some_async_op().await;  // Still holding lock!
 }
 ```
-
-### Connection Pooling & Arc Cloning
-
-### Stream Handling (CRITICAL)
-
-- **AVOID `stream!` macro**: Breaks rust-analyzer IDE hints and makes debugging harder
-- **Use manual Stream implementations or `async_stream::stream` sparingly**: When unavoidable, document why
 
 ### Logging (CRITICAL)
 
@@ -282,38 +298,7 @@ tracing::error!(
 
 **Why this matters**: Blocking an async runtime thread prevents other tasks from running, causing cascading delays and poor throughput under load.
 
-### Clippy Rules (Enforced in CI)
-
-The following clippy rules are **errors** in CI (`-Dwarnings`):
-
-- `clippy::pedantic` - All pedantic lints enabled
-- `clippy::unwrap_used` - No `.unwrap()` calls
-- `clippy::expect_used` - No `.expect()` calls (use proper error handling)
-- `clippy::clone_on_ref_ptr` - Don't clone `Arc`/`Rc` unnecessarily
-
-Allowed exceptions:
-
-- `clippy::module_name_repetitions` - OK to have `module_name::ModuleName`
-- `clippy::large_futures` - Allowed due to async complexity
-
-### Performance and Memory Management
-
-#### Zero-Copy Operations
-
-- **Prefer zero-copy** when working with Arrow arrays
-- Use `Arc<dyn Array>` for type-erased arrays (cheap to clone)
-- Avoid unnecessary data copies between Arrow, DataFusion, and connectors
-
-```rust
-// GOOD - zero-copy sharing
-let array: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 2, 3]));
-let shared = Arc::clone(&array); // Cheap reference count increment
-
-// BAD - unnecessary copy
-let copied = array.to_data().clone(); // Avoid unless necessary
-```
-
-#### Connection Pooling
+### Connection Pooling
 
 - **Always use connection pools** for database connectors
 - Pool creation should never fail - errors only on `.get()`
@@ -362,7 +347,7 @@ fn process_data(data: &Arc<RecordBatch>) { ... }
 ### Binary Targets
 
 - `bin/spiced/` - Runtime daemon (Rust)
-- `bin/spice/` - CLI (Go)
+- `bin/spice/` - CLI (Rust)
 
 ### Core Crates
 
@@ -400,7 +385,11 @@ testoperator run bench -p test.yaml -s spiced --query-set tpch --validate
 testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrency 25
 ```
 
-Use `INSTA_UPDATE=1` to regenerate snapshots.
+### Snapshot Testing with Insta
+
+- **NEVER manually edit snapshot files** (`.snap` files): Always use Insta to generate them
+- Run tests with `INSTA_UPDATE=1` to regenerate snapshots: `INSTA_UPDATE=1 cargo test`
+- Review generated snapshots carefully before accepting
 
 ## Feature Flags
 
@@ -410,6 +399,26 @@ Use `INSTA_UPDATE=1` to regenerate snapshots.
 2. Add feature: `newdb = ["runtime/newdb", "data_components/newdb"]`
 3. Gate code: `#[cfg(feature = "newdb")]`
 4. Update Makefile lint targets
+
+### Git Dependencies in Cargo.toml
+
+- **Always use full 40-character SHA hashes** for git dependencies, never abbreviated SHAs
+- Full SHAs ensure reproducible builds and avoid ambiguity
+- **For spiceai forks**: Add a comment with the branch name to track the source
+
+```toml
+# GOOD - full SHA
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" }
+
+# GOOD - spiceai fork with branch comment
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" } # branch: spice
+
+# BAD - abbreviated SHA
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a1b2c3d" }
+
+# BAD - spiceai fork without branch comment
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" }
+```
 
 ## Development Workflow
 
@@ -471,19 +480,20 @@ export PATH="$PATH:$HOME/.spice/bin"
 4. Integration tests need credentials (`spice login` or `.env`)
 5. testoperator is the test harness
 6. Workspace uses Rust edition 2024
-7. Allocator customizable (default: snmalloc, can use jemalloc/mimalloc)
-8. New files should include copyright header. The current year is 2025. Required file types: `.rs`, `.go`
+7. New files should include copyright header. The current year is 2026. Required file types: `.rs`, `.go`
+8. **Spice runtime (Rust) is 64-bit minimum**: The runtime requires at least 64-bit pointer size. Do not add 32-bit compatibility code. Code should assume `usize` is at least 64 bits but not assume it's exactly 64 bits (future 128-bit support).
 
 ## Adding Features Checklist
 
 1. Check if needs new extension point
 2. Make heavy dependencies optional via features
 3. Add integration tests (testoperator or test-framework)
-4. Update user docs (README.md, docs/)
-5. Follow error message guidelines
-6. Ensure clippy passes
-7. Add to Makefile lint targets
-8. Ensure no blocking ops in async context (`spawn_blocking` or `rayon`)
+4. **Test data correctness edge cases**: NULLs, empty sets, boundary values, type coercions, large datasets
+5. Update user docs (README.md, docs/)
+6. Follow error message guidelines
+7. Ensure clippy passes
+8. Add to Makefile lint targets
+9. Ensure no blocking ops in async context (`spawn_blocking` or `rayon`)
 
 ## References
 

@@ -160,6 +160,14 @@ pub enum CatalogError {
         "Turso backend requested but 'turso' feature is not enabled. Enable with --features turso"
     ))]
     TursoNotEnabled,
+
+    /// Constraint violation (e.g., unique constraint, foreign key constraint)
+    /// Used for handling concurrent insert conflicts.
+    #[snafu(display("Constraint violation: {message}"))]
+    ConstraintViolation {
+        /// Details about the constraint that was violated
+        message: String,
+    },
 }
 
 /// Result type for catalog operations.

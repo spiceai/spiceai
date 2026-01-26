@@ -20,7 +20,10 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 
+pub mod ansi_colors;
 pub mod fibonacci_backoff;
+pub mod home_dir;
+pub mod levenshtein;
 pub mod retry_strategy;
 pub mod security;
 pub use backoff::Error as RetryError;
@@ -30,6 +33,7 @@ mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
 pub use tracing_util::in_tracing_context;
 pub mod arrow;
+pub mod expr;
 pub mod stream_utils;
 pub mod time_format;
 

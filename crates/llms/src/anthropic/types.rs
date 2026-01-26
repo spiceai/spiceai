@@ -45,6 +45,188 @@ pub struct MessageCreateParams {
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<RequestServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagementConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<McpServerDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormat>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ThinkingConfig {
+    #[serde(rename = "enabled")]
+    Enabled { budget_tokens: u32 },
+    #[serde(rename = "disabled")]
+    Disabled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestServiceTier {
+    Auto,
+    StandardOnly,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContainerParam {
+    Id(String),
+    Config(ContainerConfig),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContainerConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<SkillParams>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkillParams {
+    pub skill_id: String,
+    #[serde(rename = "type")]
+    pub skill_type: SkillType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillType {
+    Anthropic,
+    Custom,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContextManagementConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edits: Option<Vec<ContextManagementEdit>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContextManagementEdit {
+    #[serde(rename = "clear_tool_uses_20250919")]
+    ClearToolUses {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger: Option<ContextTrigger>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        keep: Option<ToolUsesKeep>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clear_at_least: Option<InputTokensClearAtLeast>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clear_tool_inputs: Option<ClearToolInputs>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exclude_tools: Option<Vec<String>>,
+    },
+    #[serde(rename = "clear_thinking_20251015")]
+    ClearThinking {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        keep: Option<ThinkingKeep>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContextTrigger {
+    #[serde(rename = "input_tokens")]
+    InputTokens { value: u32 },
+    #[serde(rename = "tool_uses")]
+    ToolUses { value: u32 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolUsesKeep {
+    #[serde(rename = "type")]
+    pub keep_type: String, // Always "tool_uses"
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InputTokensClearAtLeast {
+    #[serde(rename = "type")]
+    pub clear_type: String, // Always "input_tokens"
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClearToolInputs {
+    All(bool),
+    Specific(Vec<String>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ThinkingKeep {
+    All(ThinkingKeepAll),
+    Turns(ThinkingTurns),
+    Literal(String), // "all"
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThinkingKeepAll {
+    #[serde(rename = "type")]
+    pub keep_type: String, // Always "all"
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThinkingTurns {
+    #[serde(rename = "type")]
+    pub keep_type: String, // Always "thinking_turns"
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpServerDefinition {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub server_type: String, // Always "url"
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_configuration: Option<McpToolConfiguration>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpToolConfiguration {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutputConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<EffortLevel>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutputFormat {
+    #[serde(rename = "type")]
+    pub format_type: String, // Always "json_schema"
+    pub schema: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -95,17 +277,98 @@ impl MessageRole {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
+    #[serde(rename = "text")]
     Text(TextBlockParam),
+    #[serde(rename = "image")]
     Image(ImageBlockParam),
+    #[serde(rename = "tool_use")]
     ToolUse(ToolUseBlockParam),
+    #[serde(rename = "tool_result")]
     ToolResult(ToolResultBlockParam),
+    #[serde(rename = "thinking")]
+    Thinking(ThinkingBlockParam),
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking(RedactedThinkingBlockParam),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ThinkingBlockParam {
+    pub thinking: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RedactedThinkingBlockParam {
+    pub data: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "type")]
 pub enum ResponseContentBlock {
-    Text(TextBlockParam),
-    ToolUse(ToolUseBlockParam),
+    #[serde(rename = "text")]
+    Text(ResponseTextBlock),
+    #[serde(rename = "tool_use")]
+    ToolUse(ResponseToolUseBlock),
+    #[serde(rename = "thinking")]
+    Thinking(ThinkingBlock),
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking(RedactedThinkingBlock),
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse(ServerToolUseBlock),
+}
+
+/// Text block for responses - unlike `TextBlockParam`, this doesn't include the `type` field
+/// since it's consumed by the `#[serde(tag = "type")]` attribute on `ResponseContentBlock`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResponseTextBlock {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+}
+
+/// Tool use block for responses - unlike `ToolUseBlockParam`, this doesn't include the `type` field
+/// since it's consumed by the `#[serde(tag = "type")]` attribute on `ResponseContentBlock`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResponseToolUseBlock {
+    pub id: String,
+    pub input: serde_json::Value,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolCaller>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ThinkingBlock {
+    pub thinking: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RedactedThinkingBlock {
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ServerToolUseBlock {
+    pub id: String,
+    pub name: ServerToolName,
+    pub input: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolCaller>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerToolName {
+    WebSearch,
+    WebFetch,
+    CodeExecution,
+    BashCodeExecution,
+    TextEditorCodeExecution,
+    ToolSearchToolRegex,
+    ToolSearchToolBm25,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -113,51 +376,69 @@ pub struct TextBlockParam {
     pub text: String,
     #[serde(rename = "type")]
     pub block_type: String, // Always "text"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
 }
+
 impl TextBlockParam {
     pub fn new(text: String) -> Self {
         Self {
             text,
             block_type: "text".to_string(),
+            cache_control: None,
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Source {
-    pub data: String, // Base64 encoded string
-    pub media_type: MediaType,
+pub struct CacheControlEphemeral {
     #[serde(rename = "type")]
-    pub r#type: SourceType,
+    pub control_type: String, // Always "ephemeral"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<CacheTtl>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
+pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum MediaType {
-    #[serde(rename = "image_jpeg")]
+    #[serde(rename = "image/jpeg")]
     Jpeg,
 
-    #[serde(rename = "image_png")]
+    #[serde(rename = "image/png")]
     Png,
 
-    #[serde(rename = "image_gif")]
+    #[serde(rename = "image/gif")]
     Gif,
 
-    #[serde(rename = "image_webp")]
+    #[serde(rename = "image/webp")]
     Webp,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum SourceType {
-    Base64,
+pub struct ImageBlockParam {
+    pub source: ImageSource,
+    #[serde(rename = "type")]
+    pub block_type: String, // Always "image"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ImageBlockParam {
-    pub source: Source,
-    #[serde(rename = "type")]
-    pub block_type: String, // Always "image"
+#[serde(tag = "type")]
+pub enum ImageSource {
+    #[serde(rename = "base64")]
+    Base64 { data: String, media_type: MediaType },
+    #[serde(rename = "url")]
+    Url { url: String },
+    #[serde(rename = "file")]
+    File { file_id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -167,6 +448,10 @@ pub struct ToolUseBlockParam {
     pub name: String,
     #[serde(rename = "type")]
     pub block_type: String, // Always "tool_use"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ToolCaller>,
 }
 
 impl ToolUseBlockParam {
@@ -176,8 +461,19 @@ impl ToolUseBlockParam {
             input,
             name,
             block_type: "tool_use".to_string(),
+            cache_control: None,
+            caller: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum ToolCaller {
+    #[serde(rename = "direct")]
+    Direct,
+    #[serde(rename = "code_execution_20250825")]
+    ServerToolCaller { tool_id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -350,6 +646,9 @@ pub enum StopReason {
     MaxTokens,
     StopSequence,
     ToolUse,
+    PauseTurn,
+    Refusal,
+    ModelContextWindowExceeded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,6 +663,40 @@ pub struct Usage {
     pub input_tokens: u32,
     #[serde(default)]
     pub output_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_use: Option<ServerToolUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CacheCreation {
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u32,
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ServerToolUsage {
+    #[serde(default)]
+    pub web_search_requests: u32,
+    #[serde(default)]
+    pub web_fetch_requests: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    Standard,
+    Priority,
+    Batch,
 }
 
 #[cfg(test)]

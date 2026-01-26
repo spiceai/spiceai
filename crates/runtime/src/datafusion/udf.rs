@@ -28,14 +28,15 @@ use datafusion_table_providers::util::supported_functions::{FunctionRestriction,
 #[cfg(feature = "models")]
 use runtime_datafusion_udfs::{
     ai::{AI_UDF_NAME, Ai},
-    embed,
+    embed::{self, EMBED_UDF_NAME},
 };
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
 use runtime_datafusion_udfs::{
     alias::ScalarUDFAlias,
     bucket::{BUCKET_SCALAR_UDF_NAME, Bucket},
     cosine_distance::{COSINE_DISTANCE_UDF_NAME, CosineDistance},
     digest_many::{DIGEST_UDF_NAME, INSTANCE},
-    embed::EMBED_UDF_NAME,
     truncate::{TRUNCATE_SCALAR_UDF_NAME, Truncate},
 };
 

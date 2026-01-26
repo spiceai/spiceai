@@ -26,8 +26,10 @@ use arrow::record_batch::RecordBatch;
 use arrow_buffer::{BufferBuilder, NullBufferBuilder, OffsetBuffer};
 use opentelemetry::InstrumentationScope;
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::metrics::MetricError;
-use opentelemetry_sdk::metrics::data::{Gauge, Histogram, Metric, ResourceMetrics, Sum};
+use opentelemetry_sdk::metrics::data::{
+    AggregatedMetrics, Gauge, Histogram, Metric, MetricData, ResourceMetrics, Sum,
+};
+use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,6 +37,18 @@ use crate::{
     attribute_list_field, attribute_struct_fields, histogram_data_fields, number_fields,
     resource_fields, scope_fields, temporality_to_i32,
 };
+
+/// Errors that can occur during `OTel` to Arrow conversion.
+#[derive(Debug)]
+pub struct ConversionError(String);
+
+impl fmt::Display for ConversionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ConversionError {}
 
 pub struct OtelToArrowConverter {
     time_unix_nano_builder: TimestampNanosecondBuilder,
@@ -392,29 +406,27 @@ impl OtelToArrowConverter {
     pub fn convert(
         &mut self,
         resource_metrics: &ResourceMetrics,
-    ) -> Result<RecordBatch, MetricError> {
-        for scope_metrics in &resource_metrics.scope_metrics {
-            for metric in &scope_metrics.metrics {
-                self.process_metric(metric, &resource_metrics.resource, &scope_metrics.scope)?;
+    ) -> Result<RecordBatch, ConversionError> {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                self.process_metric(metric, resource_metrics.resource(), scope_metrics.scope())?;
             }
         }
 
         let Some(resource) = self.resource_builder.finish() else {
-            return Err(MetricError::Other("Could not convert resource".into()));
+            return Err(ConversionError("Could not convert resource".into()));
         };
         let Some(scope) = self.scope_builder.finish() else {
-            return Err(MetricError::Other("Could not convert scope".into()));
+            return Err(ConversionError("Could not convert scope".into()));
         };
         let Some(attributes) = self.attributes_builder.finish() else {
-            return Err(MetricError::Other("Could not convert attributes".into()));
+            return Err(ConversionError("Could not convert attributes".into()));
         };
         let Some(data_number) = self.data_number_builder.finish() else {
-            return Err(MetricError::Other("Could not convert data number".into()));
+            return Err(ConversionError("Could not convert data number".into()));
         };
         let Some(data_histogram) = self.data_histogram_builder.finish() else {
-            return Err(MetricError::Other(
-                "Could not convert data histogram".into(),
-            ));
+            return Err(ConversionError("Could not convert data histogram".into()));
         };
 
         let arrays: Vec<Arc<dyn Array>> = vec![
@@ -436,7 +448,7 @@ impl OtelToArrowConverter {
         ];
 
         RecordBatch::try_new(crate::schema::schema(), arrays)
-            .map_err(|e| MetricError::Other(e.to_string()))
+            .map_err(|e| ConversionError(e.to_string()))
     }
 
     fn process_metric(
@@ -444,47 +456,73 @@ impl OtelToArrowConverter {
         metric: &Metric,
         resource: &Resource,
         instrument_scope: &InstrumentationScope,
-    ) -> Result<(), MetricError> {
-        let data = metric.data.as_any();
-
-        // This is unfortunately the only way to downcast a generic trait object
-        if let Some(hist) = data.downcast_ref::<Histogram<i64>>() {
-            self.process_histogram(hist, metric, resource, instrument_scope);
-        } else if let Some(hist) = data.downcast_ref::<Histogram<u64>>() {
-            self.process_histogram(hist, metric, resource, instrument_scope);
-        } else if let Some(hist) = data.downcast_ref::<Histogram<f64>>() {
-            self.process_histogram(hist, metric, resource, instrument_scope);
-        } else if let Some(sum) = data.downcast_ref::<Sum<u64>>() {
-            self.process_sum(sum, metric, resource, instrument_scope);
-        } else if let Some(sum) = data.downcast_ref::<Sum<i64>>() {
-            self.process_sum(sum, metric, resource, instrument_scope);
-        } else if let Some(sum) = data.downcast_ref::<Sum<f64>>() {
-            self.process_sum(sum, metric, resource, instrument_scope);
-        } else if let Some(gauge) = data.downcast_ref::<Gauge<u64>>() {
-            self.process_gauge(gauge, metric, resource, instrument_scope);
-        } else if let Some(gauge) = data.downcast_ref::<Gauge<i64>>() {
-            self.process_gauge(gauge, metric, resource, instrument_scope);
-        } else if let Some(gauge) = data.downcast_ref::<Gauge<f64>>() {
-            self.process_gauge(gauge, metric, resource, instrument_scope);
-        } else {
-            return Err(MetricError::Other("Unsupported metric type".into()));
+    ) -> Result<(), ConversionError> {
+        match metric.data() {
+            AggregatedMetrics::F64(data) => match data {
+                MetricData::Histogram(hist) => {
+                    self.process_histogram(hist, metric, resource, instrument_scope);
+                }
+                MetricData::Sum(sum) => {
+                    self.process_sum(sum, metric, resource, instrument_scope);
+                }
+                MetricData::Gauge(gauge) => {
+                    self.process_gauge(gauge, metric, resource, instrument_scope);
+                }
+                MetricData::ExponentialHistogram(_) => {
+                    return Err(ConversionError(
+                        "ExponentialHistogram not yet supported".into(),
+                    ));
+                }
+            },
+            AggregatedMetrics::U64(data) => match data {
+                MetricData::Histogram(hist) => {
+                    self.process_histogram(hist, metric, resource, instrument_scope);
+                }
+                MetricData::Sum(sum) => {
+                    self.process_sum(sum, metric, resource, instrument_scope);
+                }
+                MetricData::Gauge(gauge) => {
+                    self.process_gauge(gauge, metric, resource, instrument_scope);
+                }
+                MetricData::ExponentialHistogram(_) => {
+                    return Err(ConversionError(
+                        "ExponentialHistogram not yet supported".into(),
+                    ));
+                }
+            },
+            AggregatedMetrics::I64(data) => match data {
+                MetricData::Histogram(hist) => {
+                    self.process_histogram(hist, metric, resource, instrument_scope);
+                }
+                MetricData::Sum(sum) => {
+                    self.process_sum(sum, metric, resource, instrument_scope);
+                }
+                MetricData::Gauge(gauge) => {
+                    self.process_gauge(gauge, metric, resource, instrument_scope);
+                }
+                MetricData::ExponentialHistogram(_) => {
+                    return Err(ConversionError(
+                        "ExponentialHistogram not yet supported".into(),
+                    ));
+                }
+            },
         }
 
         Ok(())
     }
 
-    fn process_sum<T: AppendDataNumber>(
+    fn process_sum<T: AppendDataNumber + Copy>(
         &mut self,
         sum: &Sum<T>,
         metric: &Metric,
         resource: &Resource,
         instrument_scope: &InstrumentationScope,
     ) {
-        for data_point in &sum.data_points {
+        for data_point in sum.data_points() {
             self.time_unix_nano_builder
-                .append_value(system_time_to_nanos(sum.time));
+                .append_value(system_time_to_nanos(sum.time()));
             self.start_time_unix_nano_builder
-                .append_option(Some(system_time_to_nanos(sum.start_time)));
+                .append_option(Some(system_time_to_nanos(sum.start_time())));
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
@@ -492,35 +530,37 @@ impl OtelToArrowConverter {
             self.metric_type_builder
                 .append_value(crate::schema::MetricType::Sum.to_u8());
 
-            self.name_builder.append_value(&metric.name);
-            self.description_builder.append_value(&metric.description);
-            self.unit_builder.append_value(&metric.unit);
+            self.name_builder.append_value(metric.name());
+            self.description_builder.append_value(metric.description());
+            self.unit_builder.append_value(metric.unit());
 
             self.aggregation_temporality_builder
-                .append_value(temporality_to_i32(sum.temporality));
-            self.is_monotonic_builder.append_value(sum.is_monotonic);
+                .append_value(temporality_to_i32(sum.temporality()));
+            self.is_monotonic_builder.append_value(sum.is_monotonic());
 
             self.flags_builder.append_null();
 
-            Self::add_attributes_to_builder(&mut self.attributes_builder, &data_point.attributes);
+            let attributes: Vec<opentelemetry::KeyValue> =
+                data_point.attributes().cloned().collect();
+            Self::add_attributes_to_builder(&mut self.attributes_builder, &attributes);
 
-            data_point.value.append(&mut self.data_number_builder);
+            data_point.value().append(&mut self.data_number_builder);
             self.data_histogram_builder.append(false);
         }
     }
 
-    fn process_gauge<T: AppendDataNumber>(
+    fn process_gauge<T: AppendDataNumber + Copy>(
         &mut self,
         gauge: &Gauge<T>,
         metric: &Metric,
         resource: &Resource,
         instrument_scope: &InstrumentationScope,
     ) {
-        for data_point in &gauge.data_points {
+        for data_point in gauge.data_points() {
             self.time_unix_nano_builder
-                .append_value(system_time_to_nanos(gauge.time));
+                .append_value(system_time_to_nanos(gauge.time()));
             self.start_time_unix_nano_builder
-                .append_option(gauge.start_time.map(system_time_to_nanos));
+                .append_option(gauge.start_time().map(system_time_to_nanos));
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
@@ -528,34 +568,36 @@ impl OtelToArrowConverter {
             self.metric_type_builder
                 .append_value(crate::schema::MetricType::Gauge.to_u8());
 
-            self.name_builder.append_value(&metric.name);
-            self.description_builder.append_value(&metric.description);
-            self.unit_builder.append_value(&metric.unit);
+            self.name_builder.append_value(metric.name());
+            self.description_builder.append_value(metric.description());
+            self.unit_builder.append_value(metric.unit());
 
             self.aggregation_temporality_builder.append_null();
             self.is_monotonic_builder.append_null();
 
             self.flags_builder.append_null();
 
-            Self::add_attributes_to_builder(&mut self.attributes_builder, &data_point.attributes);
+            let attributes: Vec<opentelemetry::KeyValue> =
+                data_point.attributes().cloned().collect();
+            Self::add_attributes_to_builder(&mut self.attributes_builder, &attributes);
 
-            data_point.value.append(&mut self.data_number_builder);
+            data_point.value().append(&mut self.data_number_builder);
             self.data_histogram_builder.append(false);
         }
     }
 
-    fn process_histogram<T: AppendFloat64 + Clone>(
+    fn process_histogram<T: AppendFloat64 + Copy>(
         &mut self,
         histogram: &Histogram<T>,
         metric: &Metric,
         resource: &Resource,
         instrument_scope: &InstrumentationScope,
     ) {
-        for data_point in &histogram.data_points {
+        for data_point in histogram.data_points() {
             self.time_unix_nano_builder
-                .append_value(system_time_to_nanos(histogram.time));
+                .append_value(system_time_to_nanos(histogram.time()));
             self.start_time_unix_nano_builder
-                .append_option(Some(system_time_to_nanos(histogram.start_time)));
+                .append_option(Some(system_time_to_nanos(histogram.start_time())));
 
             self.add_resource(resource);
             self.add_scope(instrument_scope);
@@ -563,42 +605,44 @@ impl OtelToArrowConverter {
             self.metric_type_builder
                 .append_value(crate::schema::MetricType::Histogram.to_u8());
 
-            self.name_builder.append_value(&metric.name);
-            self.description_builder.append_value(&metric.description);
-            self.unit_builder.append_value(&metric.unit);
+            self.name_builder.append_value(metric.name());
+            self.description_builder.append_value(metric.description());
+            self.unit_builder.append_value(metric.unit());
 
             self.aggregation_temporality_builder
-                .append_value(temporality_to_i32(histogram.temporality));
+                .append_value(temporality_to_i32(histogram.temporality()));
             self.is_monotonic_builder.append_null();
 
             self.flags_builder.append_null();
 
-            Self::add_attributes_to_builder(&mut self.attributes_builder, &data_point.attributes);
+            let attributes: Vec<opentelemetry::KeyValue> =
+                data_point.attributes().cloned().collect();
+            Self::add_attributes_to_builder(&mut self.attributes_builder, &attributes);
 
             self.data_number_builder.append(false);
 
             self.data_histogram_builder
                 .count_builder
-                .append_value(data_point.count);
+                .append_value(data_point.count());
             data_point
-                .sum
+                .sum()
                 .append(&mut self.data_histogram_builder.sum_builder);
             AppendFloat64::append_option(
-                data_point.min.clone(),
+                data_point.min(),
                 &mut self.data_histogram_builder.min_builder,
             );
             AppendFloat64::append_option(
-                data_point.max.clone(),
+                data_point.max(),
                 &mut self.data_histogram_builder.max_builder,
             );
 
             self.data_histogram_builder
                 .bucket_counts_builder
-                .append_value(data_point.bucket_counts.iter().map(|bc| Some(*bc)));
+                .append_value(data_point.bucket_counts().map(Some));
 
             self.data_histogram_builder
                 .explicit_bounds_builder
-                .append_value(data_point.bounds.iter().map(|b| Some(*b)));
+                .append_value(data_point.bounds().map(Some));
 
             self.data_histogram_builder.append(true);
         }

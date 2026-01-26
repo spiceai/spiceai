@@ -58,8 +58,30 @@ use crate::{
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
-pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> =
-    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
+
+/// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
+/// to pass through for RRF (Reciprocal Rank Fusion) operations.
+///
+/// This is required because `DataFusion` v51+ rejects named arguments for functions that use
+/// `VariadicAny` signature. The `UserDefined` signature type allows us to:
+/// 1. Accept any types (like `VariadicAny`)
+/// 2. Support named parameters via `with_parameter_names()`
+pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    // Parameter names that can be passed as named arguments.
+    // These are passthrough parameters used by RRF and other table functions.
+    let param_names = vec![
+        "tbl".to_string(),
+        "query".to_string(),
+        "column".to_string(),
+        "limit".to_string(),
+        "include_score".to_string(),
+        "rank_weight".to_string(),
+    ];
+    // SAFETY: These are valid ASCII parameter names
+    Signature::user_defined(Volatility::Stable)
+        .with_parameter_names(param_names)
+        .unwrap_or_else(|_| unreachable!("valid parameter names for text_search"))
+});
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct TextSearchTableFuncArgs {
@@ -333,5 +355,10 @@ impl ScalarUDFImpl for TextSearchTableFunc {
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
         Self::scalar_invocation_error()
+    }
+
+    /// Required for `UserDefined` signature - accepts any types like `VariadicAny` would.
+    fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
+        Ok(arg_types.to_vec())
     }
 }

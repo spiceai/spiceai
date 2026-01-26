@@ -90,6 +90,13 @@ static SNAPSHOT_WRITE_CHECKSUM: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .build()
 });
 
+static SNAPSHOT_SKIPPED_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_snapshot_skipped_count")
+        .with_description("Number of snapshot creations skipped due to no data updates.")
+        .build()
+});
+
 fn dataset_label(dataset: &str) -> KeyValue {
     KeyValue::new("dataset", dataset.to_string())
 }
@@ -137,4 +144,9 @@ pub fn record_write_metrics(
         KeyValue::new("checksum", checksum.to_string()),
     ];
     SNAPSHOT_WRITE_CHECKSUM.record(1.0, &checksum_labels);
+}
+
+pub fn record_snapshot_skipped(dataset: &str) {
+    let labels = [dataset_label(dataset)];
+    SNAPSHOT_SKIPPED_COUNT.add(1, &labels);
 }

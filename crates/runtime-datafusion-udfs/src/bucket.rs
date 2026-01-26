@@ -34,8 +34,6 @@ use snafu::{ResultExt as _, Snafu};
 const MAX_NUM_BUCKETS: i64 = 1_000_000;
 
 /// Compile-time assertion that `MAX_NUM_BUCKETS` does not exceed `i32::MAX`
-#[expect(clippy::disallowed_macros, clippy::allow_attributes)]
-#[allow(unfulfilled_lint_expectations)]
 const _: () = assert!(
     MAX_NUM_BUCKETS <= i32::MAX as i64,
     "MAX_NUM_BUCKETS exceeds i32::MAX"

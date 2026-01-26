@@ -3,7 +3,7 @@ additionalLabels: {}
 
 image:
   repository: ghcr.io/spiceai/spiceai-nightly
-  tag: latest-models # 1.10.0-unstable
+  tag: latest-models # 1.11.0-unstable
 replicaCount: 1
 
 service:

@@ -218,6 +218,18 @@ pub(crate) fn routes(
             "/v1/datasets/{name}/acceleration",
             patch(v1::datasets::acceleration),
         )
+        .route(
+            "/v1/datasets/{name}/acceleration/snapshots",
+            get(v1::snapshots::list_snapshots),
+        )
+        .route(
+            "/v1/datasets/{name}/acceleration/snapshots/{snapshot_id}",
+            get(v1::snapshots::get_snapshot),
+        )
+        .route(
+            "/v1/datasets/{name}/acceleration/snapshots/current",
+            post(v1::snapshots::set_current_snapshot),
+        )
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route("/v1/packages/generate", post(v1::packages::generate));
 
@@ -280,6 +292,32 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.workers)))
             .layer(Extension(Arc::clone(&rt.responses_llms)));
     }
+
+    // Add async queries API routes - registered unconditionally for discoverability and consistency.
+    // Handlers check at runtime if cluster mode with scheduler role is enabled.
+    // This design ensures:
+    // 1. API endpoints are discoverable via OpenAPI/health checks regardless of cluster mode
+    // 2. Helpful 503 errors guide users on how to enable the feature
+    // 3. job_executor can be initialized asynchronously after routes are registered
+    let queries_router = Router::new()
+        .route("/v1/queries", post(v1::queries::submit))
+        .route("/v1/queries", get(v1::queries::list))
+        .route("/v1/queries/{query_id}", get(v1::queries::get_query))
+        .route(
+            "/v1/queries/{query_id}/status",
+            get(v1::queries::get_status),
+        )
+        .route(
+            "/v1/queries/{query_id}/results",
+            get(v1::queries::get_results),
+        )
+        .route(
+            "/v1/queries/{query_id}/results/chunks/{chunk_index}",
+            get(v1::queries::get_chunk),
+        )
+        .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel));
+
+    authenticated_router = authenticated_router.merge(queries_router);
 
     #[cfg(feature = "mcp")]
     {

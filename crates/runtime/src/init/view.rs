@@ -30,6 +30,7 @@ use crate::{
 };
 use app::App;
 use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
+#[cfg(feature = "duckdb")]
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use snafu::prelude::*;
@@ -273,7 +274,7 @@ impl Runtime {
                     name: acceleration_settings.engine.to_string(),
                 },
             ) {
-                Ok(()) => {
+                Ok(_) => {
                     // Initialization successful, continue to next view
                 }
                 Err(err) => {
@@ -287,6 +288,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(feature = "duckdb")]
     pub(crate) async fn get_initialized_views(
         self: Arc<Self>,
         app: &Arc<App>,

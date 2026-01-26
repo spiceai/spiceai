@@ -84,7 +84,10 @@ pub struct S3ObjectStoreBuilder {
     secret_access_key: Option<String>,
     session_token: Option<String>,
     client_timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
     allow_http: Option<bool>,
+    pool_max_idle_per_host: Option<usize>,
+    pool_idle_timeout: Option<Duration>,
 }
 
 impl S3ObjectStoreBuilder {
@@ -109,7 +112,10 @@ impl S3ObjectStoreBuilder {
             secret_access_key: None,
             session_token: None,
             client_timeout: None,
+            connect_timeout: None,
             allow_http: None,
+            pool_max_idle_per_host: None,
+            pool_idle_timeout: None,
         })
     }
 
@@ -269,10 +275,36 @@ impl S3ObjectStoreBuilder {
         self
     }
 
+    /// Sets the connection phase timeout.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
     /// Sets whether to allow HTTP connections (vs HTTPS only).
     #[must_use]
     pub fn with_allow_http(mut self, allow: bool) -> Self {
         self.allow_http = Some(allow);
+        self
+    }
+
+    /// Sets the maximum number of idle connections per host.
+    ///
+    /// Higher values can improve throughput for repeated requests to the same endpoint.
+    /// Default is typically 32.
+    #[must_use]
+    pub fn with_pool_max_idle_per_host(mut self, max: usize) -> Self {
+        self.pool_max_idle_per_host = Some(max);
+        self
+    }
+
+    /// Sets how long idle connections should be kept alive.
+    ///
+    /// Longer timeouts can reduce connection establishment overhead for repeated requests.
+    #[must_use]
+    pub fn with_pool_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.pool_idle_timeout = Some(timeout);
         self
     }
 
@@ -310,6 +342,19 @@ impl S3ObjectStoreBuilder {
         // Apply client timeout
         if let Some(timeout) = self.client_timeout {
             client_options = client_options.with_timeout(timeout);
+        }
+
+        // Apply connect timeout
+        if let Some(timeout) = self.connect_timeout {
+            client_options = client_options.with_connect_timeout(timeout);
+        }
+
+        // Apply connection pool settings for better throughput
+        if let Some(max_idle) = self.pool_max_idle_per_host {
+            client_options = client_options.with_pool_max_idle_per_host(max_idle);
+        }
+        if let Some(idle_timeout) = self.pool_idle_timeout {
+            client_options = client_options.with_pool_idle_timeout(idle_timeout);
         }
 
         // Apply allow_http setting (explicit setting overrides endpoint-based detection)

@@ -7,7 +7,7 @@ description: "Query: tpch_simple_q4"
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: lineitem.L_QUANTITY DESC NULLS FIRST, fetch=10                                                                                     |
 |               |   Projection: avg(lineitem.L_TAX), lineitem.L_LINENUMBER, lineitem.L_QUANTITY                                                            |
-|               |     Aggregate: groupBy=[[lineitem.L_LINENUMBER, lineitem.L_QUANTITY]], aggr=[[avg(lineitem.L_TAX)]]                                      |
+|               |     Aggregate: groupBy=[[lineitem.L_LINENUMBER, lineitem.L_QUANTITY]], aggr=[[avg(CAST(lineitem.L_TAX AS Float64))]]                     |
 |               |       TableScan: lineitem projection=[L_LINENUMBER, L_QUANTITY, L_TAX]                                                                   |
 | physical_plan | SortPreservingMergeExec: [L_QUANTITY@2 DESC], fetch=10                                                                                   |
 |               |   SortExec: TopK(fetch=10), expr=[L_QUANTITY@2 DESC], preserve_partitioning=[true]                                                       |

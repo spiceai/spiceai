@@ -55,6 +55,11 @@ impl IcebergCatalogProvider {
     /// This method retrieves the list of namespace names
     /// attempts to create a schema provider for each namespace, and
     /// collects these providers into a `HashMap`.
+    ///
+    /// # Arguments
+    /// * `client` - The Iceberg catalog client
+    /// * `root_namespace` - Optional root namespace to start from
+    /// * `includes` - Optional glob patterns for filtering tables
     pub async fn try_new(
         client: Arc<dyn Catalog>,
         root_namespace: Option<NamespaceIdent>,
@@ -152,6 +157,12 @@ impl IcebergSchemaProvider {
     /// This method retrieves a list of table names
     /// attempts to create a table provider for each table name, and
     /// collects these providers into a `HashMap`.
+    ///
+    /// # Arguments
+    /// * `client` - The Iceberg catalog client
+    /// * `namespace` - The namespace containing the tables
+    /// * `load_semaphore` - Semaphore to limit concurrent table loads
+    /// * `include` - Optional glob patterns for filtering tables
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
@@ -205,7 +216,7 @@ impl IcebergSchemaProvider {
     }
 
     async fn load_table(
-        client: Arc<dyn Catalog>,
+        catalog: Arc<dyn Catalog>,
         table_name: Arc<TableIdent>,
         semaphore: Arc<Semaphore>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
@@ -215,16 +226,16 @@ impl IcebergSchemaProvider {
             .await
             .map_err(|e| Error::SemaphoreError { source: e })?;
 
-        match client.load_table(&table_name).await {
-            Ok(_table) => {
-                match IcebergTableProvider::try_new(client, Arc::unwrap_or_clone(table_name)).await
-                {
-                    Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
-                    Err(e) => Err(handle_iceberg_error(e)),
-                }
-            }
+        // Use IcebergTableProvider - it keeps a reference to the catalog for read/write support
+        match IcebergTableProvider::try_new(
+            Arc::clone(&catalog),
+            table_name.namespace().clone(),
+            table_name.name().to_string(),
+        )
+        .await
+        {
+            Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
             Err(e) => {
-                // If the table doesn't exist, return None instead of an error
                 let err_msg = e.to_string();
                 if err_msg.contains("NoSuchIcebergTableException") || err_msg.contains("code: 404")
                 {

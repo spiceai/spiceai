@@ -78,6 +78,7 @@ use snafu::{OptionExt, ResultExt};
 use spicepod::metric::Metrics;
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::atomic::AtomicI64;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use tokio::{
@@ -119,6 +120,9 @@ pub struct RefreshTaskBuilder {
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
+    last_updated_at: Arc<AtomicI64>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
 }
 
 impl RefreshTaskBuilder {
@@ -146,6 +150,8 @@ impl RefreshTaskBuilder {
             resource_monitor: None,
             accelerator_write_mutex,
             on_stream_batch_process_callback: None,
+            last_updated_at: Arc::new(AtomicI64::new(0)),
+            is_s3_express_acceleration: false,
         }
     }
 
@@ -189,6 +195,19 @@ impl RefreshTaskBuilder {
         callback: Option<StreamBatchProcessCallback>,
     ) -> RefreshTaskBuilder {
         self.on_stream_batch_process_callback = callback;
+        self
+    }
+
+    #[must_use]
+    pub fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> RefreshTaskBuilder {
+        self.last_updated_at = last_updated_at;
+        self
+    }
+
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    #[must_use]
+    pub fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> RefreshTaskBuilder {
+        self.is_s3_express_acceleration = is_s3_express;
         self
     }
 
@@ -240,6 +259,8 @@ impl RefreshTaskBuilder {
             resource_monitor: self.resource_monitor,
             accelerator_write_mutex: self.accelerator_write_mutex,
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
+            last_updated_at: self.last_updated_at,
+            is_s3_express_acceleration: self.is_s3_express_acceleration,
         }
     }
 }
@@ -261,6 +282,9 @@ pub struct RefreshTask {
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
+    last_updated_at: Arc<AtomicI64>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -713,15 +737,20 @@ impl RefreshTask {
             return Err(e);
         }
 
-        if let (Some(start_time), Ok(refresh_stat)) =
-            (start_time, on_written_data_stat_available.try_recv())
-        {
-            self.trace_load_completed(start_time, refresh_stat.num_rows, refresh_stat.memory_size)
+        let refresh_stat = on_written_data_stat_available.try_recv().ok();
+
+        if let (Some(start_time), Some(stat)) = (start_time, &refresh_stat) {
+            self.trace_load_completed(start_time, stat.num_rows, stat.memory_size)
                 .await;
         }
 
         self.set_refresh_status(sql, status::ComponentStatus::Ready)
             .await;
+
+        self.maybe_update_last_updated_at(
+            &data_update.update_type,
+            refresh_stat.map_or(0, |s| s.num_rows),
+        );
 
         Ok(())
     }
@@ -818,9 +847,9 @@ impl RefreshTask {
             self.dataset_name,
         );
 
-        // Use the CacheRefreshHelper to identify and refresh stale rows
+        // Use the CacheRefreshHelper to identify and refresh all stale rows
         let federated_provider = self.federated.table_provider().await;
-        let refreshed_count = CacheRefreshHelper::refresh_stale_rows(
+        let refreshed_count = CacheRefreshHelper::refresh_all_stale_rows(
             federated_provider,
             Arc::clone(&self.accelerator),
             self.dataset_name.to_string().as_str(),
@@ -1325,6 +1354,21 @@ impl RefreshTask {
             return;
         }
 
+        // Check for S3 Express One Zone upload speed error and provide user-friendly message.
+        // ClientUploadSpeedTooSlow is specific to S3 Express One Zone (directory buckets).
+        if self.is_s3_express_acceleration && is_s3_express_upload_speed_error(&error.to_string()) {
+            let table_name =
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref());
+            tracing::warn!(
+                error = %error,
+                "Failed to load data for {} {table_name}: S3 upload speed too slow. This typically occurs when uploading to S3 Express One Zone from outside AWS or over a slow network connection. Consider: (1) Running Spice closer to your S3 bucket (same region/AZ), (2) Reducing dataset size or using incremental refresh, (3) Increasing 'cayenne_target_file_size_mb' to reduce the number of files uploaded.",
+                self.component_type(),
+            );
+            self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
+                .await;
+            return;
+        }
+
         // For all errors that result from calling DataFusion, check if they are due to the task being cancelled and ignore them
         match error {
             super::Error::UnableToGetDataFromConnector { source }
@@ -1353,6 +1397,25 @@ impl RefreshTask {
         );
         self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
             .await;
+    }
+
+    /// Updates `last_updated_at` timestamp based on refresh type and row count.
+    ///
+    /// - For `Overwrite` and `Changes`: Always updates (data is replaced/modified)
+    /// - For `Append`: Only updates if rows were actually written (`num_rows > 0`)
+    fn maybe_update_last_updated_at(&self, update_type: &UpdateType, num_rows: usize) {
+        let should_update = match update_type {
+            UpdateType::Overwrite | UpdateType::Changes => true,
+            UpdateType::Append => num_rows > 0,
+        };
+
+        if should_update {
+            self.update_last_updated_at();
+        }
+    }
+
+    fn update_last_updated_at(&self) {
+        super::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
     }
 }
 
@@ -1408,14 +1471,17 @@ impl DataLoadTracing {
             let size = util::human_readable_bytes(self.bytes_received);
             let elapsed_str = format!("{}s", elapsed.as_secs());
 
+            // Note: size and throughput are based on uncompressed in-memory Arrow data size,
+            // not actual network transfer. Actual network bytes may be significantly smaller
+            // due to compression.
             if is_spice_internal_dataset(&self.dataset) {
                 tracing::debug!(
-                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    "Dataset {} received {pretty_records} records ({size} uncompressed) in {elapsed_str}, {throughput}",
                     self.dataset
                 );
             } else {
                 tracing::info!(
-                    "Dataset {} received {pretty_records} records ({size}) in {elapsed_str}, {throughput}",
+                    "Dataset {} received {pretty_records} records ({size} uncompressed) in {elapsed_str}, {throughput}",
                     self.dataset
                 );
             }
@@ -1582,6 +1648,17 @@ fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
     }
 }
 
+/// Check if an error message indicates an S3 Express One Zone upload speed error.
+///
+/// S3 Express One Zone (directory buckets) returns `ClientUploadSpeedTooSlow` when
+/// the client's upload speed is below the minimum threshold. This typically occurs
+/// when uploading from outside AWS or over slow network connections.
+///
+/// This function is extracted to enable unit testing of the detection logic.
+fn is_s3_express_upload_speed_error(error_message: &str) -> bool {
+    error_message.contains("ClientUploadSpeedTooSlow")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1614,5 +1691,27 @@ mod tests {
         assert_eq!(tracing.num_records_received, num_rows);
         assert_eq!(tracing.bytes_received, batch_size);
         assert!(tracing.bytes_received > 0);
+    }
+
+    #[test]
+    fn test_is_s3_express_upload_speed_error() {
+        // Should detect ClientUploadSpeedTooSlow error
+        assert!(is_s3_express_upload_speed_error(
+            "Error: ClientUploadSpeedTooSlow: Upload speed is below minimum threshold"
+        ));
+
+        // Should detect when error is part of a larger message
+        assert!(is_s3_express_upload_speed_error(
+            "Failed to upload: S3 returned ClientUploadSpeedTooSlow for bucket mybucket--usw2-az1--x-s3"
+        ));
+
+        // Should not match unrelated errors
+        assert!(!is_s3_express_upload_speed_error("Connection timeout"));
+        assert!(!is_s3_express_upload_speed_error("Access denied"));
+        assert!(!is_s3_express_upload_speed_error("NoSuchBucket"));
+
+        // Should not match partial error names
+        assert!(!is_s3_express_upload_speed_error("ClientUpload"));
+        assert!(!is_s3_express_upload_speed_error("SpeedTooSlow"));
     }
 }

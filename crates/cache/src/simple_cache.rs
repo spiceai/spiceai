@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -132,6 +132,7 @@ impl<
 
     async fn invalidate_all(&self) {
         self.cache.invalidate_all();
+        self.cache.run_pending_tasks().await;
     }
 
     async fn size_bytes(&self) -> u64 {

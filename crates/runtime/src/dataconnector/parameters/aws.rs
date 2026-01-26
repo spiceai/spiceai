@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::parameters::{ParamLookup, Parameters};
 use aws_config::ConfigLoader;
+#[cfg(feature = "dynamodb")]
 use aws_sdk_credential_bridge::{
     initiate_config_auth_iam_env, initiate_config_auth_iam_metadata, initiate_config_auth_key,
     initiate_config_default_auth,
@@ -251,6 +252,7 @@ pub async fn initiate_config_with_credentials(
 /// - `key`: Explicit access key credentials
 ///
 /// Return [`ConfigLoader`] to allow further customisation.
+#[cfg(feature = "dynamodb")]
 #[expect(clippy::too_many_arguments)]
 pub async fn initiate_config_with_auth_method(
     provider_name: &'static str,

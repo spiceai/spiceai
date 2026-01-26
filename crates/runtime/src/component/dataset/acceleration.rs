@@ -21,7 +21,7 @@ use datafusion_table_providers::util::{
 };
 use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
-use spicepod::acceleration::{SnapshotsCompaction, SnapshotsTrigger};
+use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy, SnapshotsTrigger};
 use spicepod::{
     acceleration::{self as spicepod_acceleration},
     param::Params,
@@ -312,6 +312,10 @@ pub struct Acceleration {
     pub snapshots_trigger_threshold: Option<String>,
 
     pub snapshots_compaction: SnapshotsCompaction,
+
+    pub snapshots_reset_expiry_on_load_enabled: bool,
+
+    pub snapshots_creation_policy: SnapshotsCreationPolicy,
 }
 
 impl Acceleration {
@@ -328,6 +332,16 @@ impl Acceleration {
     ) -> Self {
         self.on_conflict = on_conflict;
         self
+    }
+
+    /// Returns whether `hash_index` is explicitly enabled in the acceleration params.
+    #[must_use]
+    pub fn is_hash_index_enabled(&self) -> bool {
+        self.engine == Engine::Arrow
+            && self
+                .params
+                .get("hash_index")
+                .is_some_and(|v| v.eq_ignore_ascii_case("enabled"))
     }
 }
 
@@ -396,19 +410,43 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             engine => engine,
         };
 
-        if engine == Engine::Arrow && !indexes.is_empty() {
+        // Only warn about primary_key if hash_index is not enabled
+        let hash_index_enabled = params
+            .as_ref()
+            .and_then(|p| p.data.get("hash_index"))
+            .is_some_and(|v| v.as_string().eq_ignore_ascii_case("enabled"));
+
+        // Indexes require hash_index to be enabled for Arrow engine
+        if engine == Engine::Arrow && !indexes.is_empty() && !hash_index_enabled {
             tracing::warn!(
-                "Indexes are not supported for Arrow engine acceleration. Ignoring indexes."
+                "Indexes specified but hash_index is not enabled for Arrow engine. Add 'hash_index: enabled' to use indexes for fast lookups."
             );
         }
-        if engine == Engine::Arrow && primary_key.is_some() {
+        if engine == Engine::Arrow && primary_key.is_some() && !hash_index_enabled {
             tracing::warn!(
-                "Primary key is not supported for Arrow engine acceleration. Ignoring primary_key."
+                "Primary key specified but hash_index is not enabled for Arrow engine. \
+                 Add 'hash_index: enabled' to use primary_key for fast lookups. Note, hash_index is experimental in Arrow acceleration."
             );
         }
+        // Note: The warning for hash_index being experimental is logged once
+        // at dataset registration time in init/dataset.rs, not during parsing.
         if engine == Engine::Arrow && !on_conflict.is_empty() {
             tracing::warn!(
                 "Conflict resolution is not supported for Arrow engine acceleration. Ignoring on_conflict."
+            );
+        }
+
+        if matches!(
+            acceleration.snapshots_reset_expiry_on_load,
+            spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
+        ) && (engine != Engine::DuckDB
+            || !matches!(
+                acceleration.refresh_mode,
+                Some(spicepod_acceleration::RefreshMode::Caching)
+            ))
+        {
+            tracing::warn!(
+                "Resetting expiry on load is only supported for DuckDB engine acceleration with caching refresh mode. Ignoring snapshots_reset_expiry_on_load."
             );
         }
 
@@ -475,6 +513,11 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             snapshots_trigger: acceleration.snapshots_trigger,
             snapshots_trigger_threshold: acceleration.snapshots_trigger_threshold,
             snapshots_compaction: acceleration.snapshots_compaction,
+            snapshots_reset_expiry_on_load_enabled: matches!(
+                acceleration.snapshots_reset_expiry_on_load,
+                spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
+            ),
+            snapshots_creation_policy: acceleration.snapshots_creation_policy,
         })
     }
 }
@@ -514,6 +557,8 @@ impl Default for Acceleration {
             snapshots_trigger: None,
             snapshots_trigger_threshold: None,
             snapshots_compaction: SnapshotsCompaction::Disabled,
+            snapshots_reset_expiry_on_load_enabled: false,
+            snapshots_creation_policy: SnapshotsCreationPolicy::default(),
         }
     }
 }

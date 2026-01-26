@@ -257,6 +257,8 @@ impl RefreshTask {
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
+        self.update_last_updated_at();
+
         Ok(())
     }
 
@@ -294,6 +296,8 @@ impl RefreshTask {
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
         }
+
+        self.update_last_updated_at();
 
         Ok(())
     }

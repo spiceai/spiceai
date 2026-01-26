@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ limitations under the License.
 use async_trait::async_trait;
 
 use crate::model::eval::scorer::mean;
-use strsim::levenshtein;
 
 use super::{DatasetInput, DatasetOutput, Scorer, extract_text};
 
@@ -30,7 +29,7 @@ pub struct Levenshtein {}
 
 #[async_trait]
 impl Scorer for Levenshtein {
-    #[expect(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_possible_truncation)]
     async fn score(
         &self,
         _input: &DatasetInput,
@@ -40,17 +39,10 @@ impl Scorer for Levenshtein {
         let actual_text = extract_text(actual);
         let ideal_text = extract_text(ideal);
 
-        // Calculate the Levenshtein distance between the two texts.
-        let distance = levenshtein(&actual_text, &ideal_text);
-        let max_len = actual_text.len().max(ideal_text.len());
+        // Use the common util::levenshtein implementation
+        let similarity = util::levenshtein::similarity(&actual_text, &ideal_text);
 
-        // If both strings are empty, treat it as an exact match.
-        if max_len == 0 {
-            return Ok(1.0);
-        }
-
-        // Normalize
-        Ok(1.0 - (distance as f32 / max_len as f32))
+        Ok(similarity as f32)
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {

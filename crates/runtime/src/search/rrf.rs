@@ -133,6 +133,30 @@ struct ReciprocalRankFusionSubqueryArgs {
     pub rank_weight: Option<f64>,
 }
 
+/// Checks if an expression is a scalar function, possibly wrapped in an `Alias`.
+/// In `DataFusion` v51+, function calls with named arguments may be wrapped in `Alias`.
+fn is_scalar_function_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::ScalarFunction(_) => true,
+        Expr::Alias(alias) => matches!(alias.expr.as_ref(), Expr::ScalarFunction(_)),
+        _ => false,
+    }
+}
+
+/// Unwraps an expression that may be wrapped in an `Alias` to get the inner `ScalarFunction`.
+fn unwrap_scalar_function(expr: Expr) -> Expr {
+    match expr {
+        Expr::Alias(alias) => {
+            if matches!(alias.expr.as_ref(), Expr::ScalarFunction(_)) {
+                (*alias.expr).clone()
+            } else {
+                Expr::Alias(alias)
+            }
+        }
+        other => other,
+    }
+}
+
 impl ReciprocalRankFusionSubqueryArgs {
     pub fn from_scalar_function_expr(
         expr: &Expr,
@@ -197,9 +221,14 @@ impl ReciprocalRankFusionArgs {
     pub fn from_udtf_exprs(args: &[Expr]) -> Result<ReciprocalRankFusionArgs> {
         let mut rrf_args = args.to_vec();
 
+        // In DataFusion v51+, function calls with named arguments may be wrapped in Alias.
+        // Use is_scalar_function_expr to handle both wrapped and unwrapped cases.
         let (search_udtfs, subquery_args): (Vec<_>, Vec<_>) = rrf_args
-            .extract_if(.., |arg| matches!(arg, Expr::ScalarFunction(_)))
-            .map(|e| ReciprocalRankFusionSubqueryArgs::from_scalar_function_expr(&e))
+            .extract_if(.., |arg| is_scalar_function_expr(arg))
+            .map(|e| {
+                let unwrapped = unwrap_scalar_function(e);
+                ReciprocalRankFusionSubqueryArgs::from_scalar_function_expr(&unwrapped)
+            })
             .collect::<Result<Vec<(Expr, ReciprocalRankFusionSubqueryArgs)>>>()?
             .into_iter()
             .unzip();
@@ -703,6 +732,7 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{ExprFunctionExt, lit};
+    #[cfg(feature = "models")]
     use llms::model2vec::Model2Vec;
     use runtime_request_context::{Protocol, RequestContext};
     use std::collections::BTreeMap;
@@ -712,6 +742,25 @@ mod tests {
 
     pub static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
+
+    /// Shared embedding model for tests to avoid concurrent file lock contention.
+    /// Model loading from `HuggingFace` uses file locks; creating multiple models in parallel
+    /// can fail with lock acquisition errors.
+    #[cfg(feature = "models")]
+    static TEST_EMBEDDING_MODEL: LazyLock<Arc<Model2Vec>> = LazyLock::new(|| {
+        Arc::new(
+            Model2Vec::from_params(
+                "minishlab/potion-base-2M",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("Must make embedding model"),
+        )
+    });
 
     macro_rules! spice_named_lit {
         ($name:literal, $value:expr) => {{
@@ -752,6 +801,7 @@ mod tests {
     }
 
     // Assumes column "content" is embedded
+    #[cfg(feature = "models")]
     fn df_as_embedding_table(runtime: &Runtime, df: DataFrame) -> Arc<dyn TableProvider> {
         let mut embedded_columns = HashMap::new();
         embedded_columns.insert(
@@ -771,6 +821,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "models")]
     async fn make_test_runtime() -> Result<Runtime> {
         let rt = RuntimeBuilder::new().build().await;
         rt.df
@@ -779,18 +830,9 @@ mod tests {
             .config_mut()
             .set_extension(Arc::clone(&TEST_REQUEST_CONTEXT));
 
-        let embedding_model = Arc::new(
-            Model2Vec::from_params(
-                "minishlab/potion-base-2M",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("Must make embedding model"),
-        );
+        // Use shared embedding model to avoid file lock contention in parallel tests
+        let embedding_model: Arc<dyn llms::embeddings::Embed> =
+            Arc::clone(&TEST_EMBEDDING_MODEL) as Arc<dyn llms::embeddings::Embed>;
         rt.embeds
             .write()
             .await
@@ -800,6 +842,7 @@ mod tests {
         Ok(rt)
     }
 
+    #[cfg(feature = "models")]
     async fn make_fruit_dataframe(runtime: &Runtime) -> Result<DataFrame> {
         let rowid_expr = row_number()
             .order_by(vec![col("content").sort(false, false)])
@@ -841,6 +884,7 @@ mod tests {
         Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(stub_udf), vec![]))
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     // #[ignore = "https://github.com/spiceai/spiceai/issues/7861"] // For some reason, BytesProcessedExec is failing to acquire a RequestContext even though the other RRF tests do fine
     // https://github.com/spiceai/spiceai/issues/7861
@@ -886,6 +930,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_recency_unboosting_disjoint() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -951,6 +996,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_rank_weighting() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -976,6 +1022,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fuse_queries() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -1001,6 +1048,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fuse_queries_auto_hash_and_special_idents() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -1029,6 +1077,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fuse_with_case_sensitive_columns() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -1060,6 +1109,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fuse_with_dupes() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;
@@ -1084,6 +1134,7 @@ mod tests {
         Ok(ExitCode::SUCCESS)
     }
 
+    #[cfg(feature = "models")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_score_computation() -> Result<ExitCode> {
         let runtime = make_test_runtime().await?;

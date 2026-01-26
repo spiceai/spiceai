@@ -40,7 +40,7 @@ use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -116,8 +116,8 @@ impl SqliteAccelerator {
         }
         Self {
             sqlite_factory: SqliteTableProviderFactory::new()
-                .with_decimal_between(true)
                 .with_batch_insert_use_prepared_statements(true)
+                .with_decimal_between(true)
                 .with_function_support(deny_spice_specific_functions()),
         }
     }
@@ -230,9 +230,9 @@ impl DataAccelerator for SqliteAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         let path = self.file_path(source)?;
@@ -272,18 +272,20 @@ impl DataAccelerator for SqliteAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(
+            let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                PathBuf::from(path),
+                runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Sqlite,
             )
             .await;
 
             self.get_shared_pool(source).await?;
+
+            return Ok(bootstrap_status);
         }
 
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
@@ -355,8 +357,11 @@ impl DataAccelerator for SqliteAccelerator {
         let sqlite_writer = Arc::new(sqlite_writer.clone());
 
         // Wrap with upsert deduplication if needed
-        let (write_provider, delete_provider) =
-            upsert_dedup::wrap_with_upsert_dedup_if_needed(sqlite_writer, &cmd.options);
+        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            sqlite_writer,
+            &cmd.options,
+            cmd.constraints.clone(),
+        );
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,
@@ -417,6 +422,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,

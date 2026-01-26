@@ -9,14 +9,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ansi_term = "0.12.1"
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-json.workspace = true
 clap.workspace = true
 datafusion.workspace = true
 flight_client = { path = "../flight_client" }
 futures.workspace = true
-llms = { path = "../llms" }
+llms = { path = "../llms", default-features = false }
 prost.workspace = true
 reqwest.workspace = true
 rustyline = { version = "17.0.1", features = [
@@ -33,6 +32,7 @@ tonic = { workspace = true, features = [
   "tls-native-roots",
 ] }
 tracing.workspace = true
+util = { path = "../util" }
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

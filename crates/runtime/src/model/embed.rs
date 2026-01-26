@@ -31,10 +31,10 @@ use llms::bedrock::{
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
-use llms::embeddings::{
-    Embed, Error as EmbedError,
-    candle::{download_hf_file, tei::TeiEmbed},
-};
+#[cfg(feature = "models")]
+use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
+use llms::embeddings::{Embed, Error as EmbedError};
+#[cfg(feature = "models")]
 use llms::model2vec::Model2Vec;
 use llms::openai::embed::OpenaiEmbed;
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
@@ -104,6 +104,7 @@ pub async fn try_to_embedding(
             )
             .await
         }
+        #[cfg(feature = "models")]
         EmbeddingPrefix::File => {
             file(
                 model_id.as_deref(),
@@ -113,9 +114,18 @@ pub async fn try_to_embedding(
             )
             .await
         }
+        #[cfg(not(feature = "models"))]
+        EmbeddingPrefix::File => Err(EmbedError::UnknownModelSource {
+            from: "file".to_string(),
+        }),
+        #[cfg(feature = "models")]
         EmbeddingPrefix::HuggingFace => {
             huggingface(&component.name, model_id, &params, embeddings_cache.clone()).await
         }
+        #[cfg(not(feature = "models"))]
+        EmbeddingPrefix::HuggingFace => Err(EmbedError::UnknownModelSource {
+            from: "huggingface".to_string(),
+        }),
         EmbeddingPrefix::Google => google(model_id, &params, embeddings_cache.clone()),
         EmbeddingPrefix::Databricks => {
             databricks(
@@ -132,10 +142,16 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
             from: "bedrock".to_string(),
         }),
+        #[cfg(feature = "models")]
         EmbeddingPrefix::Model2Vec => model2vec(model_id, &params, embeddings_cache.clone()),
+        #[cfg(not(feature = "models"))]
+        EmbeddingPrefix::Model2Vec => Err(EmbedError::UnknownModelSource {
+            from: "model2vec".to_string(),
+        }),
     }
 }
 
+#[cfg(feature = "models")]
 fn model2vec(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
@@ -379,6 +395,7 @@ async fn bedrock(
     }
 }
 
+#[cfg(feature = "models")]
 async fn huggingface(
     name: &String,
     model_id: Option<String>,
@@ -504,6 +521,7 @@ async fn databricks(
     }
 }
 
+#[cfg(feature = "models")]
 async fn file(
     model_id: Option<&str>,
     component: &spicepod::component::embeddings::Embeddings,
@@ -668,92 +686,97 @@ async fn get_bytes_for_file(
     url: &str,
     params: &HashMap<String, SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    match url.split('/').collect_vec().as_slice() {
-        [
-            "https:",
-            "",
-            "huggingface.co",
-            org_id,
-            model_id,
-            "blob",
-            branch,
-            file @ ..,
-        ] => {
-            get_file_from_hf(
-                None,
+    #[cfg(feature = "models")]
+    {
+        match url.split('/').collect_vec().as_slice() {
+            [
+                "https:",
+                "",
+                "huggingface.co",
                 org_id,
                 model_id,
-                Some(branch),
-                file.join("/").as_str(),
-                params
-                    .get("hf_token")
-                    .map(secrecy::ExposeSecret::expose_secret),
-            )
-            .await
-        }
-        ["hf:", "", "datasets", org_id, model_id_revision, file @ ..] => {
-            let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
+                "blob",
+                branch,
+                file @ ..,
+            ] => {
+                return get_file_from_hf(
+                    None,
+                    org_id,
+                    model_id,
+                    Some(branch),
+                    file.join("/").as_str(),
+                    params
+                        .get("hf_token")
+                        .map(secrecy::ExposeSecret::expose_secret),
+                )
+                .await;
+            }
+            ["hf:", "", "datasets", org_id, model_id_revision, file @ ..] => {
+                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
 
-            get_file_from_hf(
-                Some("datasets"),
-                org_id,
-                model_id,
-                branch,
-                file.join("/").as_str(),
-                params
-                    .get("hf_token")
-                    .map(secrecy::ExposeSecret::expose_secret),
-            )
-            .await
-        }
-        ["hf:", "", "spaces", org_id, model_id_revision, file @ ..] => {
-            let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-            get_file_from_hf(
-                Some("spaces"),
-                org_id,
-                model_id,
-                branch,
-                file.join("/").as_str(),
-                params
-                    .get("hf_token")
-                    .map(secrecy::ExposeSecret::expose_secret),
-            )
-            .await
-        }
-        ["hf:", "", "models", org_id, model_id_revision, file @ ..]
-        | ["hf:", "", org_id, model_id_revision, file @ ..] => {
-            let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
-            get_file_from_hf(
-                Some("models"),
-                org_id,
-                model_id,
-                branch,
-                file.join("/").as_str(),
-                params
-                    .get("hf_token")
-                    .map(secrecy::ExposeSecret::expose_secret),
-            )
-            .await
-        }
-        _ => {
-            // Need to add `file://` for file paths
-            let final_url = match PathBuf::from_str(url).map(|p| p.canonicalize()) {
-                Ok(Ok(ref p)) if p.exists() => {
-                    format!("file://{}", p.to_string_lossy())
-                }
-                _ => url.to_string(),
-            };
-            let url = Url::parse(final_url.as_str()).boxed()?;
-            let (store, path) = object_store::parse_url(&url).boxed()?;
-            store.get(&path).await.boxed()?.bytes().await.boxed()
+                return get_file_from_hf(
+                    Some("datasets"),
+                    org_id,
+                    model_id,
+                    branch,
+                    file.join("/").as_str(),
+                    params
+                        .get("hf_token")
+                        .map(secrecy::ExposeSecret::expose_secret),
+                )
+                .await;
+            }
+            ["hf:", "", "spaces", org_id, model_id_revision, file @ ..] => {
+                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
+                return get_file_from_hf(
+                    Some("spaces"),
+                    org_id,
+                    model_id,
+                    branch,
+                    file.join("/").as_str(),
+                    params
+                        .get("hf_token")
+                        .map(secrecy::ExposeSecret::expose_secret),
+                )
+                .await;
+            }
+            ["hf:", "", "models", org_id, model_id_revision, file @ ..]
+            | ["hf:", "", org_id, model_id_revision, file @ ..] => {
+                let (model_id, branch) = parse_model_id_w_revision(model_id_revision);
+                return get_file_from_hf(
+                    Some("models"),
+                    org_id,
+                    model_id,
+                    branch,
+                    file.join("/").as_str(),
+                    params
+                        .get("hf_token")
+                        .map(secrecy::ExposeSecret::expose_secret),
+                )
+                .await;
+            }
+            _ => {}
         }
     }
+
+    // Fallback: non-HuggingFace URLs or when models feature is disabled
+    // Need to add `file://` for file paths
+    let final_url = match PathBuf::from_str(url).map(|p| p.canonicalize()) {
+        Ok(Ok(ref p)) if p.exists() => {
+            format!("file://{}", p.to_string_lossy())
+        }
+        _ => url.to_string(),
+    };
+    let url = Url::parse(final_url.as_str()).boxed()?;
+    let (store, path) = object_store::parse_url(&url).boxed()?;
+    store.get(&path).await.boxed()?.bytes().await.boxed()
 }
 
 /// From `hf://` spec, parse the `model_id` that may have a revision attached `all-MiniLM-L6-v2@main`.
 ///
 /// `all-MiniLM-L6-v2` -> (`all-MiniLM-L6-v2`, None)
 /// `all-MiniLM-L6-v2@main` -> (`all-MiniLM-L6-v2`, Some(`main`))
+#[cfg(feature = "models")]
 fn parse_model_id_w_revision(model_w_revision: &str) -> (&str, Option<&str>) {
     match model_w_revision.split_once('@') {
         Some((model_id, revision)) => (model_id, Some(revision)),
@@ -761,6 +784,7 @@ fn parse_model_id_w_revision(model_w_revision: &str) -> (&str, Option<&str>) {
     }
 }
 
+#[cfg(feature = "models")]
 async fn get_file_from_hf(
     repo_type: Option<&str>,
     org_id: &str,

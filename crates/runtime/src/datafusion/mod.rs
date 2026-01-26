@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -31,8 +30,8 @@ use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::{self};
-use crate::dataaccelerator::{AcceleratorEngineRegistry, acceleration_file_path};
+use crate::dataaccelerator::{self, BootstrapStatus};
+use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
@@ -49,7 +48,7 @@ use crate::view::prepare_view;
 use crate::{status, view};
 
 use {
-    crate::cluster::ResolvedClusterConfig,
+    crate::cluster::{ExecutorControlStreamRegistry, ResolvedClusterConfig},
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -79,7 +78,21 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
 use query::QueryBuilder;
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotManager};
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres",
+    not(windows)
+))]
+use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_acceleration::snapshot::AccelerationLayout;
+#[cfg(any(
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "postgres",
+    not(windows)
+))]
+use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
 use schema::ensure_schema_exists;
@@ -103,6 +116,7 @@ pub mod dialect;
 pub mod error;
 pub mod filter_converter;
 pub mod flight_session_extension;
+pub mod job_executor_context_extension;
 pub mod managed_runtime;
 pub mod param_utils;
 pub mod refresh_sql;
@@ -110,6 +124,7 @@ pub mod request_context_extension;
 pub mod retention_sql;
 pub mod schema;
 pub mod secrets_context_extension;
+pub mod sort_columns;
 pub(crate) mod sql_validator;
 pub mod udf;
 
@@ -251,8 +266,11 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
-    #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
+    #[snafu(display("Unable to acquire lock for cluster executor state"))]
     UnableToLockWritableExecutorHandle {},
+
+    #[snafu(display("Unable to acquire lock for executor stream registry"))]
+    UnableToLockWritableExecutorStreamRegistry {},
 
     #[snafu(display(
         "The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"
@@ -335,6 +353,9 @@ pub enum Error {
     ))]
     UnsupportedRefreshCompleteForStream,
 
+    #[snafu(display("Caching refresh mode only supports 'time_interval' for snapshots_trigger"))]
+    UnsupportedSnapshotTriggerForCaching,
+
     #[snafu(display(
         "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
     ))]
@@ -350,6 +371,7 @@ pub enum Table {
         federated_read_table: FederatedTable,
         accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
+        bootstrap_status: BootstrapStatus,
     },
     Federated {
         data_connector: Arc<dyn DataConnector>,
@@ -394,6 +416,9 @@ pub struct DataFusion {
     pub cluster_config: Arc<ResolvedClusterConfig>,
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     pub executor: RwLock<Option<Arc<Executor>>>,
+    /// Registry of connected executor control streams for `PollNow` broadcasts.
+    /// Only used in scheduler mode.
+    pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -542,6 +567,7 @@ impl DataFusion {
                 federated_read_table,
                 accelerated_table,
                 secrets,
+                bootstrap_status,
             } => {
                 if let Some(accelerated_table) = accelerated_table {
                     tracing::debug!(
@@ -569,8 +595,14 @@ impl DataFusion {
                         });
                     None
                 } else {
-                    self.register_accelerated_table(dataset, source, federated_read_table, secrets)
-                        .await?
+                    self.register_accelerated_table(
+                        dataset,
+                        source,
+                        federated_read_table,
+                        secrets,
+                        bootstrap_status,
+                    )
+                    .await?
                 }
             }
             Table::Federated {
@@ -806,6 +838,7 @@ impl DataFusion {
             sink_connector,
             federated_table,
             Arc::clone(&pending_registration.secrets),
+            BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
         )
         .await?;
 
@@ -943,7 +976,7 @@ impl DataFusion {
             .await
             .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
-        Ok(Schema::from(data_frame.schema()))
+        Ok(data_frame.schema().as_arrow().clone())
     }
 
     #[must_use]
@@ -1007,6 +1040,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
+        bootstrap_status: BootstrapStatus,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
@@ -1243,17 +1277,27 @@ impl DataFusion {
                 .caching_stale_if_error(acceleration_settings.caching_stale_if_error.is_enabled());
         }
 
+        // Get the acceleration layout (used for snapshots and size metrics)
+        let acceleration_layout = get_acceleration_layout(dataset).await.ok();
+
         if acceleration_settings.snapshot_behavior.create_enabled() {
-            if let Ok(snapshot_path) = acceleration_file_path(dataset).await {
-                if let Some(snapshot_config) = build_snapshot_creation_config(
-                    dataset,
-                    &acceleration_settings,
-                    refresh_mode,
-                    snapshot_path,
-                )
-                .await?
-                {
-                    accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
+            if let Some(ref layout) = acceleration_layout {
+                if layout.is_enabled() {
+                    if let Some(snapshot_config) = build_snapshot_creation_config(
+                        dataset,
+                        &acceleration_settings,
+                        refresh_mode,
+                        layout.clone(),
+                    )
+                    .await?
+                    {
+                        accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
+                    }
+                } else {
+                    tracing::warn!(
+                        "Dataset {} accelerator does not support snapshots.",
+                        dataset.name
+                    );
                 }
             } else {
                 tracing::warn!(
@@ -1261,6 +1305,11 @@ impl DataFusion {
                     dataset.name
                 );
             }
+        }
+
+        // Pass the acceleration layout for size metrics
+        if let Some(layout) = acceleration_layout {
+            accelerated_table_builder.acceleration_layout(layout);
         }
 
         accelerated_table_builder.checkpointer_opt(
@@ -1329,6 +1378,22 @@ impl DataFusion {
         if has_on_conflict {
             accelerated_table_builder.write_to_accelerator_only();
         }
+
+        accelerated_table_builder.bootstrap_status(bootstrap_status);
+
+        // Check if this is an S3 Express One Zone acceleration (Cayenne with S3 Express config)
+        // This is used for better error messages when S3 Express upload fails
+        let is_s3_express_acceleration = acceleration_settings.engine == Engine::Cayenne
+            && (acceleration_settings
+                .params
+                .get("cayenne_file_path")
+                .is_some_and(|path| {
+                    crate::dataaccelerator::cayenne::CayenneAccelerator::is_s3_express_path(path)
+                })
+                || acceleration_settings
+                    .params
+                    .contains_key("cayenne_s3_zone_ids"));
+        accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
 
         accelerated_table_builder
             .build()
@@ -1422,9 +1487,16 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
+        bootstrap_status: BootstrapStatus,
     ) -> Result<Option<Arc<Notify>>> {
         let mut accelerated_table = self
-            .create_accelerated_table(&dataset, Arc::clone(&source), federated_read_table, secrets)
+            .create_accelerated_table(
+                &dataset,
+                Arc::clone(&source),
+                federated_read_table,
+                secrets,
+                bootstrap_status,
+            )
             .await?;
         let notifier = accelerated_table.refresher().on_complete_notification();
 
@@ -2008,6 +2080,26 @@ impl DataFusion {
         Ok(())
     }
 
+    pub fn bind_executor_stream_registry(
+        &self,
+        registry: ExecutorControlStreamRegistry,
+    ) -> Result<()> {
+        let mut executor_stream_registry = self
+            .executor_stream_registry
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableExecutorStreamRegistry {})?;
+        *executor_stream_registry = Some(registry);
+        Ok(())
+    }
+
+    /// Returns the executor stream registry if one is bound.
+    ///
+    /// Returns `None` if no registry is bound or if the read lock cannot be acquired.
+    #[must_use]
+    pub fn executor_stream_registry(&self) -> Option<ExecutorControlStreamRegistry> {
+        self.executor_stream_registry.read().ok()?.clone()
+    }
+
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
         let mut executor_handle = self
             .executor
@@ -2099,10 +2191,10 @@ async fn build_snapshot_creation_config(
     dataset: &Dataset,
     acceleration_settings: &Acceleration,
     refresh_mode: RefreshMode,
-    snapshot_path: PathBuf,
+    acceleration_layout: AccelerationLayout,
 ) -> Result<Option<SnapshotCreationConfig>> {
-    let is_batch_refresh = matches!(refresh_mode, RefreshMode::Full)
-        || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_some());
+    let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
+        || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
     let snapshot_threshold: Option<String> =
         acceleration_settings.snapshots_trigger_threshold.clone();
@@ -2140,20 +2232,20 @@ async fn build_snapshot_creation_config(
         }
     };
 
-    let snapshot_creation_trigger = if is_batch_refresh {
+    // Caching mode only supports time_interval - no "refresh complete" or "stream_batches" events.
+    let is_caching = matches!(refresh_mode, RefreshMode::Caching);
+
+    let snapshot_creation_trigger = if is_caching {
         match snapshot_trigger {
-            None | Some(SnapshotsTrigger::RefreshComplete) => {
-                SnapshotCreateTrigger::RefreshComplete
-            }
-            Some(SnapshotsTrigger::TimeInterval) => {
+            None | Some(SnapshotsTrigger::TimeInterval) => {
                 let interval = parse_interval(&snapshot_threshold)?;
                 SnapshotCreateTrigger::Interval(interval)
             }
-            Some(SnapshotsTrigger::StreamBatches) => {
-                return Err(Error::UnsupportedStreamBatchesForBatchRefresh);
+            Some(SnapshotsTrigger::RefreshComplete | SnapshotsTrigger::StreamBatches) => {
+                return Err(Error::UnsupportedSnapshotTriggerForCaching);
             }
         }
-    } else {
+    } else if is_streaming_refresh {
         match snapshot_trigger {
             None | Some(SnapshotsTrigger::TimeInterval) => {
                 let interval = parse_interval(&snapshot_threshold)?;
@@ -2167,8 +2259,27 @@ async fn build_snapshot_creation_config(
                 SnapshotCreateTrigger::Batches(batches)
             }
         }
+    } else {
+        match snapshot_trigger {
+            None | Some(SnapshotsTrigger::RefreshComplete) => {
+                SnapshotCreateTrigger::RefreshComplete
+            }
+            Some(SnapshotsTrigger::TimeInterval) => {
+                let interval = parse_interval(&snapshot_threshold)?;
+                SnapshotCreateTrigger::Interval(interval)
+            }
+            Some(SnapshotsTrigger::StreamBatches) => {
+                return Err(Error::UnsupportedStreamBatchesForBatchRefresh);
+            }
+        }
     };
 
+    #[cfg(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    ))]
     let acceleration_engine = match acceleration_settings.engine {
         #[cfg(feature = "duckdb")]
         Engine::DuckDB => AccelerationEngine::DuckDB,
@@ -2178,6 +2289,8 @@ async fn build_snapshot_creation_config(
         Engine::Sqlite => AccelerationEngine::Sqlite,
         #[cfg(feature = "turso")]
         Engine::Turso => AccelerationEngine::Turso,
+        #[cfg(not(windows))]
+        Engine::Cayenne => AccelerationEngine::Cayenne,
         _ => {
             // This code is unreachable since build_snapshot_creation_config is
             // only called iff acceleration_file_path returned Some(<file_path>)
@@ -2185,14 +2298,35 @@ async fn build_snapshot_creation_config(
         }
     };
 
+    #[cfg(not(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    )))]
+    {
+        let _ = acceleration_layout;
+        let _ = snapshot_creation_trigger;
+        return Err(Error::UnsupportedAccelerationEngineForSnapshots);
+    }
+
+    #[cfg(any(
+        feature = "duckdb",
+        feature = "sqlite",
+        feature = "postgres",
+        not(windows)
+    ))]
     Ok(SnapshotManager::try_new(
         dataset.name.to_string(),
         acceleration_settings.snapshot_behavior.clone(),
-        snapshot_path.clone(),
+        acceleration_layout,
         acceleration_engine,
     )
     .await
-    .map(|sm| SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)))
+    .map(|sm| {
+        let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
+        SnapshotCreationConfig::new(Arc::new(sm), snapshot_creation_trigger)
+    }))
 }
 
 #[cfg(test)]
@@ -2254,6 +2388,7 @@ mod tests {
         assert_eq!(cache_provider.item_count().await, 1);
     }
 
+    #[cfg(all(feature = "duckdb", feature = "snapshots",))]
     mod build_snapshot_creation_config_tests {
         use super::*;
         use crate::component::dataset::Dataset;
@@ -2340,7 +2475,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Full,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2364,7 +2499,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2401,7 +2536,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Changes,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2438,7 +2573,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Full,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2470,7 +2605,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2502,7 +2637,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2534,7 +2669,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2562,7 +2697,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Append,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2590,7 +2725,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Full,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 
@@ -2621,7 +2756,7 @@ mod tests {
                 &dataset,
                 &acceleration,
                 RefreshMode::Changes,
-                snapshot_path,
+                AccelerationLayout::file(snapshot_path),
             )
             .await;
 

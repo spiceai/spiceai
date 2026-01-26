@@ -35,6 +35,7 @@ use url::Url;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::Runtime;
+use crate::metrics::cluster as cluster_metrics;
 
 const CLUSTER_SCHEMA_VERSION: u32 = 1;
 const SCHEDULER_SCHEMA_VERSION: u32 = 1;
@@ -143,6 +144,19 @@ pub async fn start_scheduler_registry(
     let scheduler_id = format!(
         "{advertise_host}:{}",
         rt.datafusion().cluster_config.node_bind_address().port()
+    );
+
+    // Initialize job executor for async SQL queries
+    let job_store = crate::jobs::JobStore::new(
+        Arc::clone(&store),
+        base_prefix.clone(),
+        scheduler_id.clone(),
+    );
+    let job_executor = crate::jobs::JobExecutor::new(Arc::new(job_store), rt.datafusion());
+    rt.set_job_executor(Arc::new(job_executor)).await;
+    tracing::info!(
+        "Initialized async SQL jobs API with state location: {}",
+        config.state_location
     );
 
     let record = SchedulerRecord {
@@ -374,6 +388,10 @@ impl SchedulerRegistryRunner {
         }
 
         *peers = records;
+
+        // Record cluster scheduler count metric
+        cluster_metrics::set_scheduler_count(&self.scheduler_id, peers.len() as u64);
+
         Ok(())
     }
 

@@ -23,7 +23,7 @@ use spicepod::{acceleration::Mode, param::Params};
 mod caching_mode;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
@@ -33,7 +33,8 @@ mod checkpoint_turso;
 mod cron;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
-#[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
+mod hash_index;
+#[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
 #[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;

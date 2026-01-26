@@ -20,7 +20,7 @@ arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { workspace = true, optional = true }
+aws-config.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
@@ -75,7 +75,7 @@ http-body-util = "0.1.3"
 humantime = { workspace = true, optional = true }
 hyper = "1.7.0"
 hyper-util = { version = "0.1.19", features = ["service"] }
-iceberg.workspace = true
+iceberg = { workspace = true, features = ["storage-gcs", "storage-s3"] }
 iceberg-catalog-glue.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
@@ -83,7 +83,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-llms = { path = "../llms" }
+llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
 model_components = { path = "../model_components" }
 moka.workspace = true
@@ -91,12 +91,11 @@ mongodb = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 notify = "8.2.0"
 ns_lookup = { path = "../ns_lookup" }
-object_store = { workspace = true, features = ["aws", "http", "azure"] }
-once_cell = "1.21.3"
+object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.30", features = [
+opentelemetry-proto = { version = "0.31", features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",
@@ -156,7 +155,6 @@ serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
-strsim = { version = "0.11.1", optional = true }
 sysinfo.workspace = true
 telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
@@ -205,7 +203,6 @@ bollard = "0.18.1"
 bytes.workspace = true
 chrono.workspace = true
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-dirs = "6.0.0"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
@@ -225,14 +222,14 @@ test-framework = { path = "../test-framework" }
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+tar = "0.4"
 
 [features]
 aws-secrets-manager = [
-    "dep:aws-config",
     "dep:aws-sdk-sts",
     "runtime-secrets/aws-secrets-manager",
 ]
-bedrock = ["dep:aws-config"]
+bedrock = []
 clickhouse = [
     "dep:clickhouse-rs",
     "db_connection_pool/clickhouse",
@@ -270,9 +267,10 @@ metal = ["llms/metal"]
 models = [
     "model_components/full",
     "mcp",
-    "dep:strsim",
     "runtime-datafusion-udfs/models",
     "search/llms",
+    "llms/local_llm",
+    "llms/local_embed",
 ]
 mongodb = ["dep:mongodb", "data_components/mongodb"]
 mssql = ["dep:tiberius", "data_components/mssql"]
@@ -281,11 +279,13 @@ nfs = ["runtime-object-store/nfs"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
 openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 oracle = ["data_components/oracle"]
+pingora = ["cache/pingora"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
+postgres-accel = ["postgres"]
 postgres-write = []
 s3_vectors = [
     "data_components/s3_vectors",
@@ -323,6 +323,7 @@ turso = [
     "dep:rusqlite",
     "runtime-acceleration/turso"
 ]
+vortex = ["ballista-core/vortex", "ballista-executor/vortex"]
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso"] }
 vortex.workspace = true

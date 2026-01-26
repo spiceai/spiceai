@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, clippy::needless_raw_string_hashes)]
+    #[expect(clippy::needless_raw_string_hashes)]
     fn test_pagination_parse() {
         let test_cases = vec![
             TestPaginationParseCase {

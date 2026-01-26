@@ -166,6 +166,7 @@ async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
         format!("http://{flight_addr}").into(),
         Credentials::anonymous(),
         None,
+        None,
     )
     .await
     {

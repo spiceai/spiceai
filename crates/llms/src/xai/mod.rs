@@ -36,7 +36,10 @@ use async_openai::{
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::chat::{Chat, Error, nsql::SqlGeneration};
+use crate::chat::{
+    Chat, Error,
+    nsql::{SqlGeneration, json::JsonSchemaSqlGeneration},
+};
 
 static DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
 static DEFAULT_MODEL: &str = "grok-3";
@@ -133,7 +136,7 @@ impl Chat for Xai {
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
-        None
+        Some(&JsonSchemaSqlGeneration {})
     }
 
     async fn chat_stream(

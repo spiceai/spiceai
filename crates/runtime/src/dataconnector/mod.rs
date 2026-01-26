@@ -44,7 +44,7 @@ use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
 use linkme::distributed_slice;
-use parameters::ConnectorParams;
+pub use parameters::ConnectorParams;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -169,6 +169,7 @@ pub mod odbc;
 pub mod oracle;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
+pub mod gcs;
 pub mod glue;
 pub mod iceberg;
 #[cfg(feature = "imap")]

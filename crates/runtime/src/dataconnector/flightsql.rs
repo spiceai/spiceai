@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ use flight_client::tls::new_tls_flight_channel;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use snafu::prelude::*;
 use std::any::Any;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::{future::Future, sync::Arc};
 
@@ -79,6 +80,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("username").secret(),
     ParameterSpec::component("password").secret(),
     ParameterSpec::component("endpoint"),
+    ParameterSpec::component("tls_ca_certificate_file")
+        .description("Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates."),
 ];
 
 impl DataConnectorFactory for FlightSQLFactory {
@@ -99,7 +102,15 @@ impl DataConnectorFactory for FlightSQLFactory {
                     parameter: p.to_string(),
                 })?
                 .to_string();
-            let flight_channel = new_tls_flight_channel(&endpoint)
+
+            let ca_certificate_path: Option<PathBuf> = params
+                .parameters
+                .get("tls_ca_certificate_file")
+                .expose()
+                .ok()
+                .map(PathBuf::from);
+
+            let flight_channel = new_tls_flight_channel(&endpoint, ca_certificate_path.as_deref())
                 .await
                 .context(UnableToConstructTlsChannelSnafu)?;
 

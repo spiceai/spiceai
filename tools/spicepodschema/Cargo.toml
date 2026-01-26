@@ -36,6 +36,7 @@ runtime = { path = "../../crates/runtime", features = [
     # "odbc",
     "oracle",
     "postgres",
+    "postgres-accel",
     "sharepoint",
     "snowflake",
     "spark",

@@ -91,7 +91,6 @@ runs:
         path: |
           target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
         key: spicepod-validator-${{ steps.detect-os.outputs.os }}-${{ steps.commit-sha.outputs.sha }}
-        lookup-only: true
 
     - name: Setup Rust
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')

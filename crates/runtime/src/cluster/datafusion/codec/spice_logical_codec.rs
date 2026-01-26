@@ -19,7 +19,7 @@ use arrow_schema::SchemaRef;
 use ballista_core::serde::BallistaLogicalExtensionCodec;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
-use datafusion::prelude::SessionContext;
+use datafusion::execution::TaskContext;
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_expr::{Extension, LogicalPlan, ScalarUDF};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
@@ -67,7 +67,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         &self,
         buf: &[u8],
         inputs: &[LogicalPlan],
-        ctx: &SessionContext,
+        ctx: &TaskContext,
     ) -> Result<Extension> {
         if let Ok(ext) = self.inner.try_decode(buf, inputs, ctx) {
             return Ok(ext);
@@ -99,7 +99,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         _buf: &[u8],
         table_ref: &TableReference,
         _schema: SchemaRef,
-        _ctx: &SessionContext,
+        _ctx: &TaskContext,
     ) -> Result<Arc<dyn TableProvider>> {
         if let Some(table_provider) = self.runtime()?.df.get_table_sync(table_ref) {
             Ok(table_provider)

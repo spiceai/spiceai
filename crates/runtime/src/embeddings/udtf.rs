@@ -48,6 +48,7 @@ use datafusion::{
 use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
 };
+#[cfg(feature = "s3_vectors")]
 use futures::FutureExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
@@ -89,8 +90,29 @@ use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
 
-pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> =
-    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
+/// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
+/// to pass through for RRF (Reciprocal Rank Fusion) operations.
+///
+/// This is required because `DataFusion` v51+ rejects named arguments for functions that use
+/// `VariadicAny` signature. The `UserDefined` signature type allows us to:
+/// 1. Accept any types (like `VariadicAny`)
+/// 2. Support named parameters via `with_parameter_names()`
+pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    // Parameter names that can be passed as named arguments.
+    // These are passthrough parameters used by RRF and other table functions.
+    let param_names = vec![
+        "tbl".to_string(),
+        "query".to_string(),
+        "column".to_string(),
+        "limit".to_string(),
+        "include_score".to_string(),
+        "rank_weight".to_string(),
+    ];
+    match Signature::user_defined(Volatility::Stable).with_parameter_names(param_names) {
+        Ok(sig) => sig,
+        Err(_) => Signature::variadic_any(Volatility::Stable),
+    }
+});
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct VectorSearchTableFuncArgs {
@@ -232,7 +254,11 @@ impl VectorSearchTableFunc {
     }
 
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {
-        let mut args = args.iter();
+        // Filter out passthrough parameters (those with spice.parameter_name metadata)
+        // These are meant for table functions like RRF, not for vector_search itself
+        let mut args = args.iter().filter(|arg| {
+            !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
+        });
 
         let tbl = args.next();
         let Some(Expr::Column(c)) = tbl else {
@@ -480,6 +506,11 @@ impl ScalarUDFImpl for VectorSearchTableFunc {
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
         Self::scalar_invocation_error()
+    }
+
+    /// Required for `UserDefined` signature - accepts any types like `VariadicAny` would.
+    fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
+        Ok(arg_types.to_vec())
     }
 }
 

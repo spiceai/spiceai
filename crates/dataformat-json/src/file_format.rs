@@ -279,7 +279,7 @@ impl FileFormat for SpiceJsonFormat {
     async fn create_physical_plan(
         &self,
         _state: &dyn Session,
-        mut conf: FileScanConfig,
+        conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let source = Arc::new(
             SpiceJsonSource::new()
@@ -297,18 +297,16 @@ impl FileFormat for SpiceJsonFormat {
             // In order to still allow parallel read for individual files, we wrap them into separate files groups
             let individual_file_groups: Vec<_> = conf
                 .file_groups
-                .into_iter()
+                .iter()
                 .flat_map(|group| {
                     group
-                        .into_inner()
-                        .into_iter()
-                        .map(|file_meta| FileGroup::new(vec![file_meta]))
+                        .iter()
+                        .map(|file_meta| FileGroup::new(vec![file_meta.clone()]))
                 })
                 .collect();
 
-            conf.file_groups = individual_file_groups;
-
             let conf = FileScanConfigBuilder::from(conf)
+                .with_file_groups(individual_file_groups)
                 .with_file_compression_type(FileCompressionType::from(self.options.compression))
                 .with_source(source)
                 .build();
@@ -469,8 +467,8 @@ impl DataSource for NonRepartitionedFileScanConfig {
     fn eq_properties(&self) -> EquivalenceProperties {
         self.inner.eq_properties()
     }
-    fn statistics(&self) -> Result<Statistics> {
-        self.inner.statistics()
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        self.inner.partition_statistics(partition)
     }
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
         self.inner.with_fetch(limit)

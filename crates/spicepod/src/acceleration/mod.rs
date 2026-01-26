@@ -144,14 +144,42 @@ pub enum SnapshotBehavior {
     CreateOnly,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsResetExpiryOnLoad {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotsCreationPolicy {
+    Always,
+    #[default]
+    OnChange,
+}
+
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
-    *b == SnapshotBehavior::Disabled
+    *b == SnapshotBehavior::default()
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_compaction(c: &SnapshotsCompaction) -> bool {
-    *c == SnapshotsCompaction::Disabled
+    *c == SnapshotsCompaction::default()
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshots_reset_expiry_on_load(c: &SnapshotsResetExpiryOnLoad) -> bool {
+    *c == SnapshotsResetExpiryOnLoad::default()
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshots_creation_policy(c: &SnapshotsCreationPolicy) -> bool {
+    *c == SnapshotsCreationPolicy::default()
 }
 
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -304,6 +332,15 @@ pub struct Acceleration {
 
     #[serde(default, skip_serializing_if = "is_default_snapshot_compaction")]
     pub snapshots_compaction: SnapshotsCompaction,
+
+    #[serde(
+        default,
+        skip_serializing_if = "is_default_snapshots_reset_expiry_on_load"
+    )]
+    pub snapshots_reset_expiry_on_load: SnapshotsResetExpiryOnLoad,
+
+    #[serde(default, skip_serializing_if = "is_default_snapshots_creation_policy")]
+    pub snapshots_creation_policy: SnapshotsCreationPolicy,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -349,6 +386,8 @@ impl Default for Acceleration {
             snapshots_trigger: None,
             snapshots_trigger_threshold: None,
             snapshots_compaction: SnapshotsCompaction::Disabled,
+            snapshots_reset_expiry_on_load: SnapshotsResetExpiryOnLoad::Disabled,
+            snapshots_creation_policy: SnapshotsCreationPolicy::default(),
         }
     }
 }

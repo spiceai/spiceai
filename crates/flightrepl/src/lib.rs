@@ -25,12 +25,12 @@ use std::time::Instant;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use ansi_term::Colour;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
 use arrow_flight::{
     FlightDescriptor, decode::FlightRecordBatchStream, error::FlightError,
     flight_service_client::FlightServiceClient,
 };
+use util::ansi_colors::Color;
 
 use crate::completer::SchemaCache;
 use clap::Parser;
@@ -138,7 +138,7 @@ const SPECIAL_COMMANDS: [&str; 8] = [
     ".clear",
     ".clear history",
 ];
-const PROMPT_COLOR: Colour = Colour::Fixed(8);
+const PROMPT_COLOR: Color = Color::Fixed(8);
 
 /// Set secure permissions (0600) on a file to ensure only the user can read/write it
 #[cfg(unix)]
@@ -233,7 +233,7 @@ impl Highlighter for EditorHelper {
     }
 }
 
-#[expect(clippy::missing_errors_doc)]
+#[expect(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
     let mut user_agent = get_user_agent();
@@ -260,6 +260,14 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             .tls_config(client_tls_config)?
             .connect()
             .await
+    } else if repl_flight_endpoint.starts_with("https://") {
+        // For HTTPS endpoints without a custom certificate, use system certificates
+        let client_tls_config = ClientTlsConfig::new().with_native_roots();
+        Channel::from_shared(repl_flight_endpoint.clone())?
+            .user_agent(user_agent.clone())?
+            .tls_config(client_tls_config)?
+            .connect()
+            .await
     } else {
         Channel::from_shared(repl_flight_endpoint.clone())?
             .user_agent(user_agent.clone())?
@@ -281,7 +289,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
     #[cfg(target_os = "windows")]
     // Ensure ANSI support on Windows is enabled for proper color display.
-    let _ = ansi_term::enable_ansi_support();
+    let _ = util::ansi_colors::enable_ansi_support();
 
     let config = Config::builder()
         .completion_type(CompletionType::List)
@@ -374,7 +382,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     continue 'outer;
                 }
                 Err(err) => {
-                    println!("{} Input read error: {err}", Colour::Red.paint("Error:"));
+                    println!("{} Input read error: {err}", Color::Red.paint("Error:"));
                     continue 'outer;
                 }
             };
@@ -468,7 +476,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 {
                     println!(
                         "{} NQL processing failed: {e}. Use '.error' if applicable.",
-                        Colour::Red.paint("Error:")
+                        Color::Red.paint("Error:")
                     );
                 }
                 continue;
@@ -498,7 +506,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             Err(e) => {
                 println!(
                     "{} Unexpected Flight error: {e}. Check connection or query syntax.",
-                    Colour::Red.paint("Error:")
+                    Color::Red.paint("Error:")
                 );
                 let _ = std::io::stdout().flush();
             }
@@ -647,7 +655,7 @@ fn display_records(
         Err(e) => {
             println!(
                 "{} Failed to format results: {e}",
-                Colour::Red.paint("Display Error:")
+                Color::Red.paint("Display Error:")
             );
             return Err(Box::new(e));
         }
@@ -818,7 +826,7 @@ fn display_grpc_error(err: &Status) {
 
     println!(
         "{} {user_err_msg}",
-        Colour::Red.paint(format!("{error_type}:"))
+        Color::Red.paint(format!("{error_type}:"))
     );
     let _ = std::io::stdout().flush();
 }

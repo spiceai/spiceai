@@ -18,20 +18,28 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use nsql::SqlGeneration;
+#[cfg(feature = "local_llm")]
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, Snafu};
+#[cfg(feature = "local_llm")]
+use snafu::ResultExt;
+use snafu::Snafu;
 use spicepod::component::model::ModelSource;
+#[cfg(feature = "local_llm")]
+use std::path::Path;
+#[cfg(feature = "local_llm")]
 use std::path::PathBuf;
+use std::pin::Pin;
+#[cfg(feature = "local_llm")]
 use std::str::FromStr;
+#[cfg(feature = "local_llm")]
 use std::sync::Arc;
-use std::{path::Path, pin::Pin};
 use tracing_futures::Instrument;
 
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::chat::{
-        ChatChoice, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+        ChatChoice, ChatCompletionRequestAssistantMessage,
         ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestDeveloperMessage,
         ChatCompletionRequestDeveloperMessageContent,
         ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestFunctionMessage,
@@ -43,10 +51,13 @@ use async_openai::{
     },
 };
 
+#[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
 use crate::streaming_utils::generate_stream_id;
+#[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
+#[cfg(feature = "local_llm")]
 use mistralrs::MessageContent;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
@@ -332,12 +343,14 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 }
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
+#[cfg(feature = "local_llm")]
 #[must_use]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
     use async_openai::types::chat::{
-        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
+        ChatCompletionMessageToolCalls, ChatCompletionRequestSystemMessageContent,
+        ChatCompletionRequestToolMessageContent,
     };
     use either::Either;
     use serde_json::{Value, json};
@@ -710,6 +723,7 @@ pub trait Chat: Sync + Send {
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
+#[cfg(feature = "local_llm")]
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
@@ -721,6 +735,7 @@ pub async fn create_hf_model(
         .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
+#[cfg(feature = "local_llm")]
 pub async fn create_local_model(
     model_weights: &[String],
     config: Option<&str>,

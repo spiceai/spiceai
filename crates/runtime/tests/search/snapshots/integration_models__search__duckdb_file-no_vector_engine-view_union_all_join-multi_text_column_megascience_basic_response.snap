@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -9,10 +8,10 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
+        "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
       },
       "primary_key": {
-        "id": 772
+        "id": 525
       },
       "score": 0.01
     },
@@ -29,10 +28,10 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
+        "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
       },
       "primary_key": {
-        "id": 525
+        "id": 772
       },
       "score": 0.01
     }

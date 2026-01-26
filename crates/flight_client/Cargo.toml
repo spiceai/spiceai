@@ -19,8 +19,13 @@ futures.workspace = true
 rustls-native-certs = "0.8.2"
 secrecy.workspace = true
 snafu.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tonic = { workspace = true, features = [
     "transport",
     "tls-ring",
     "tls-native-roots",
 ] }
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

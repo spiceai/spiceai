@@ -75,6 +75,7 @@ pub mod unity_catalog;
 
 pub mod git;
 pub mod github;
+pub mod key_filter;
 pub mod rate_limit;
 
 pub mod cdc;
@@ -83,6 +84,7 @@ pub mod graphql;
 pub mod http;
 #[cfg(feature = "imap")]
 pub mod imap;
+pub mod index_maintenance;
 pub mod object;
 pub mod poly;
 

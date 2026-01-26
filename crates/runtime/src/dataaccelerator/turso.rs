@@ -62,7 +62,7 @@ use crate::{
     register_data_accelerator, spice_data_base_path,
 };
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -410,7 +410,7 @@ impl DataAccelerator for TursoAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         // Reject remote database configurations (not supported as accelerators)
         // Note: This is an accelerator-specific limitation. Remote databases will be
         // supported when Turso is used as a data connector.
@@ -428,7 +428,7 @@ impl DataAccelerator for TursoAccelerator {
             // Initialize the shared pool to verify connectivity
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         // Handle file mode: validate path and setup file-based database
@@ -467,10 +467,10 @@ impl DataAccelerator for TursoAccelerator {
                 }
             }
 
-            download_snapshot_if_needed(
+            let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                PathBuf::from(path),
+                runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Turso,
             )
             .await;
@@ -478,9 +478,11 @@ impl DataAccelerator for TursoAccelerator {
             // Initialize the database file using the shared pool
             let pool = self.get_shared_pool(source).await?;
             pool.connect().await?;
+
+            return Ok(bootstrap_status);
         }
 
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
@@ -656,8 +658,11 @@ impl DataAccelerator for TursoAccelerator {
         ) as Arc<dyn TableProvider>;
 
         // Wrap with upsert deduplication if needed
-        let (write_provider, delete_provider) =
-            upsert_dedup::wrap_with_upsert_dedup_if_needed(turso_provider, &cmd.options);
+        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            turso_provider,
+            &cmd.options,
+            cmd.constraints.clone(),
+        );
 
         let table_provider = Arc::new(PolyTableProvider::new(
             write_provider,
@@ -821,6 +826,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -921,6 +927,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -1050,6 +1057,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -1205,6 +1213,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -1294,6 +1303,7 @@ mod tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -1359,6 +1369,7 @@ mod tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -1424,6 +1435,7 @@ mod tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -1489,6 +1501,7 @@ mod tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,

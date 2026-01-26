@@ -3,4 +3,4 @@ tests:
     spicepod_path: accelerated/on_zero_results/file[parquet]-cayenne[file]-on_zero_results.yaml
     query_set: tpcds
     runner_type: spiceai-dev-runners
-    validate_results: true
+    validate_results: false

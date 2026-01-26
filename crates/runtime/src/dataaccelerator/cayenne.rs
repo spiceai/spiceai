@@ -48,13 +48,13 @@ use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
-use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
+use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
 use crate::spice_data_base_path;
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotBehavior};
+use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -437,7 +437,8 @@ impl CayenneAccelerator {
     ///
     /// S3 Express One Zone buckets have the naming convention: `{base-name}--{zone-id}--x-s3`
     /// Example: `s3://mybucket--usw2-az1--x-s3/prefix/`
-    fn is_s3_express_path(path: &str) -> bool {
+    #[must_use]
+    pub fn is_s3_express_path(path: &str) -> bool {
         path.starts_with("s3://") && path.contains("--x-s3")
     }
 
@@ -650,10 +651,6 @@ impl CayenneAccelerator {
     ///
     /// Returns `Ok(true)` if a new bucket was created, `Ok(false)` if the bucket already existed.
     /// Returns `Err` if the bucket creation or verification fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "S3 Express bucket creation requires extensive setup, creation, and verification steps"
-    )]
     async fn create_s3_express_bucket_if_needed(
         bucket_name: &str,
         zone_id: &str,
@@ -781,6 +778,9 @@ impl CayenneAccelerator {
             bucket_name
         );
 
+        // Note: Validation uses default timeout/unsigned_payload settings because this runs
+        // during bucket creation/verification, before user parameters are parsed. The defaults
+        // (120s timeout, unsigned payload enabled) are appropriate for validation requests.
         let object_store = Self::build_s3_object_store_for_validation(
             bucket_name,
             zone_id,
@@ -788,6 +788,8 @@ impl CayenneAccelerator {
             access_key_id.clone(),
             secret_access_key.clone(),
             session_token.clone(),
+            None,
+            None,
         )
         .await?;
 
@@ -858,6 +860,11 @@ impl CayenneAccelerator {
     ///
     /// This ensures validation uses the exact same client configuration (credentials, endpoint, S3 Express mode)
     /// that will be used for actual data uploads, preventing configuration mismatches.
+    ///
+    /// Optional parameters allow callers to match the main client configuration:
+    /// - `timeout`: Client timeout (defaults to 120s if None)
+    /// - `unsigned_payload`: Whether to skip payload signing (defaults to true if None)
+    #[expect(clippy::too_many_arguments)]
     async fn build_s3_object_store_for_validation(
         bucket_name: &str,
         zone_id: &str,
@@ -865,6 +872,8 @@ impl CayenneAccelerator {
         access_key_id: Option<String>,
         secret_access_key: Option<String>,
         session_token: Option<String>,
+        timeout: Option<std::time::Duration>,
+        unsigned_payload: Option<bool>,
     ) -> Result<Arc<dyn object_store::ObjectStore>> {
         let io_runtime = tokio::runtime::Handle::current();
         let mut s3_builder = AmazonS3Builder::from_env()
@@ -872,14 +881,20 @@ impl CayenneAccelerator {
             .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
             .with_region(region);
 
+        // Use provided settings or defaults
+        let effective_unsigned_payload = unsigned_payload.unwrap_or(true);
+        let effective_timeout = timeout.unwrap_or(std::time::Duration::from_secs(120));
+
         // Configure S3 Express One Zone mode
         tracing::debug!(
-            "Building validation object store for S3 Express bucket (zone: {})",
-            zone_id
+            "Building validation object store for S3 Express bucket (zone: {}, unsigned_payload: {})",
+            zone_id,
+            effective_unsigned_payload
         );
         s3_builder = s3_builder
             .with_s3_express(true)
-            .with_virtual_hosted_style_request(true);
+            .with_virtual_hosted_style_request(true)
+            .with_unsigned_payload(effective_unsigned_payload);
 
         // Build the S3 Express endpoint with virtual-hosted-style format
         let express_endpoint =
@@ -887,9 +902,8 @@ impl CayenneAccelerator {
         tracing::debug!("Validation using S3 Express endpoint: {express_endpoint}");
         s3_builder = s3_builder.with_endpoint(&express_endpoint);
 
-        // Set default timeout consistent with data upload configuration
-        let client_options =
-            ClientOptions::default().with_timeout(std::time::Duration::from_secs(300)); // 5 minutes per request
+        // Set timeout for S3 Express validation requests
+        let client_options = ClientOptions::default().with_timeout(effective_timeout);
         s3_builder = s3_builder.with_client_options(client_options);
 
         // Handle credentials
@@ -1089,10 +1103,6 @@ impl CayenneAccelerator {
     /// Build an S3 object store for S3 Express One Zone storage.
     ///
     /// Returns `None` if the path is not an S3 path, or an error if S3 configuration is invalid.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "S3 object store setup requires extensive configuration"
-    )]
     async fn build_s3_object_store(
         source: &dyn AccelerationSource,
     ) -> Result<Option<cayenne::metadata::ObjectStoreConfig>> {
@@ -1148,6 +1158,9 @@ impl CayenneAccelerator {
         let s3_client_timeout = get_param("cayenne_s3_client_timeout");
         let s3_allow_http =
             get_param("cayenne_s3_allow_http").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        // Default to unsigned payload (true) for better performance; can be disabled if needed
+        let s3_unsigned_payload = get_param("cayenne_s3_unsigned_payload")
+            .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
 
         // Extract zone ID from bucket name for S3 Express One Zone endpoint
         let zone_id = Self::extract_zone_id_from_bucket(bucket_name);
@@ -1184,24 +1197,27 @@ impl CayenneAccelerator {
 
         let mut client_options = ClientOptions::default();
 
-        // Set a generous default timeout for S3 Express One Zone uploads from outside AWS.
-        // The default object_store timeout (~90s) is too short for large file uploads over the internet.
-        // S3 Express One Zone is optimized for same-AZ access; external uploads need more time.
-        let default_timeout = std::time::Duration::from_secs(300); // 5 minutes per request
+        // Set default timeout for S3 Express One Zone requests.
+        // Can be overridden via cayenne_s3_client_timeout parameter.
+        let default_timeout = std::time::Duration::from_secs(120); // 2 minutes per request
         client_options = client_options.with_timeout(default_timeout);
 
         // For S3 Express One Zone buckets, enable special handling:
         // - with_s3_express(true) enables CreateSession API for session tokens
         // - with_virtual_hosted_style_request(true) uses {bucket}.endpoint format
+        // - with_unsigned_payload(s3_unsigned_payload) optionally skips SHA-256 computation for request body
+        //   (S3 Express One Zone uses session-based auth, making payload signing unnecessary)
         // - Endpoint format with virtual-hosted-style: https://{bucket}.s3express-{zone-id}.{region}.amazonaws.com
         if let Some(zid) = zone_id {
             tracing::debug!(
-                "Detected S3 Express One Zone bucket (zone: {}), enabling S3 Express mode",
-                zid
+                "Detected S3 Express One Zone bucket (zone: {}), enabling S3 Express mode (unsigned_payload: {})",
+                zid,
+                s3_unsigned_payload
             );
             s3_builder = s3_builder
                 .with_s3_express(true)
-                .with_virtual_hosted_style_request(true);
+                .with_virtual_hosted_style_request(true)
+                .with_unsigned_payload(s3_unsigned_payload);
 
             // For S3 Express with virtual-hosted-style, the endpoint should include the bucket name
             // Format: https://{bucket}.s3express-{zone-id}.{region}.amazonaws.com
@@ -1384,11 +1400,27 @@ impl CayenneAccelerator {
                     .collect();
             }
 
+            // Parse upload concurrency for parallel file writes
+            let parsed_upload_concurrency = parse_usize(
+                acceleration,
+                "cayenne_upload_concurrency",
+                config.upload_concurrency,
+            );
+            if parsed_upload_concurrency == 0 {
+                tracing::warn!(
+                    "Invalid cayenne_upload_concurrency value of 0. Using minimum value of 1."
+                );
+                config.upload_concurrency = 1;
+            } else {
+                config.upload_concurrency = parsed_upload_concurrency;
+            }
+
             tracing::debug!(
-                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, sort_columns={:?}, compression_strategy={:?}",
+                "Cayenne Vortex config: footer_cache={}MB, segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, sort_columns={:?}, compression_strategy={:?}",
                 config.footer_cache_mb,
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
+                config.upload_concurrency,
                 config.sort_columns,
                 config.compression_strategy
             );
@@ -1401,7 +1433,7 @@ impl CayenneAccelerator {
         cmd: &CreateExternalTable,
         source: &dyn AccelerationSource,
     ) -> Result<SchemaRef> {
-        let full_schema: arrow::datatypes::Schema = cmd.schema.as_ref().clone().into();
+        let full_schema: arrow::datatypes::Schema = cmd.schema.as_arrow().clone();
         let unsupported_type_action = Self::get_unsupported_type_action(source);
         let transformed_schema =
             transform_schema_for_vortex(&full_schema, unsupported_type_action)?;
@@ -1561,7 +1593,7 @@ impl CayenneAccelerator {
             CayenneTableProviderBuilder::new(catalog).with_retention_filters(retention_filters);
         if let Some(object_store) = object_store {
             tracing::info!(
-                "Attaching S3 Express One Zone object store to CayenneTableProvider for {}: {}",
+                "Using S3 Express One Zone storage for {} acceleration: {}",
                 table_name,
                 object_store.url.as_str()
             );
@@ -1590,6 +1622,8 @@ impl CayenneAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("file_path")
         .description("Path for storing Cayenne data files (Vortex files). Can be a local path or an S3 Express One Zone path. For S3 Express One Zone, use format: 's3://{bucket-name}--{zone-id}--x-s3/{prefix}/'. When S3 Express One Zone is specified, data files are stored exclusively in S3 while metadata (SQLite) remains on local disk."),
+    ParameterSpec::component("metadata_dir")
+        .description("Path for storing Cayenne metadata (SQLite catalog). If not specified, defaults to '{cayenne_file_path}/metadata'."),
     ParameterSpec::component("metastore")
         .description("Metastore backend for Cayenne catalog. Options: 'sqlite' (default), 'turso' (requires 'turso' feature enabled at build time)")
         .default("sqlite"),
@@ -1616,10 +1650,14 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("iam_role")
         .one_of(&["iam_role", "key"]),
     ParameterSpec::component("cayenne_s3_client_timeout")
-        .description("Timeout for S3 client operations (e.g., '30s', '5m')."),
+        .description("Timeout for S3 client operations (e.g., '30s', '5m'). Default: 120s.")
+        .default("120s"),
     ParameterSpec::component("cayenne_s3_allow_http")
         .description("Allow HTTP (non-TLS) connections to S3. Default: false.")
         .default("false"),
+    ParameterSpec::component("cayenne_s3_unsigned_payload")
+        .description("Use unsigned payload for S3 Express One Zone requests. Only applies when S3 Express mode is enabled (via cayenne_s3_zone_ids or directory bucket path). Skips SHA-256 computation for request body, improving upload performance. S3 Express One Zone uses session-based auth, making payload signing unnecessary. Default: true.")
+        .default("true"),
     // S3 Express One Zone auto-generation parameter
     ParameterSpec::component("cayenne_s3_zone_ids")
         .description("Comma-separated list of Availability Zone IDs for S3 Express One Zone storage (e.g., 'usw2-az1' or 'usw2-az1,usw2-az2'). When specified without 'cayenne_file_path', auto-generates bucket name from app and dataset name, and creates the bucket if needed. For multi-zone redundancy, specify multiple zones. Data is written to all zones with ACID guarantees - writes succeed only if all zones succeed. Reads are served from the primary (first) zone with fallback to replicas."),
@@ -1637,6 +1675,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("compression_strategy")
         .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
         .default("btrblocks"),
+    ParameterSpec::component("cayenne_upload_concurrency")
+        .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Default: 4.")
+        .default("4"),
 ];
 
 #[async_trait]
@@ -1659,6 +1700,16 @@ impl DataAccelerator for CayenneAccelerator {
                 engine: Engine::Cayenne,
                 source: err.into(),
             })
+    }
+
+    fn acceleration_layout(&self, source: &dyn AccelerationSource) -> AccelerationLayout {
+        let Ok(data_dir) = self.cayenne_data_dir(source) else {
+            return AccelerationLayout::default();
+        };
+
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+
+        AccelerationLayout::cayenne(PathBuf::from(metadata_dir), PathBuf::from(data_dir))
     }
 
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
@@ -1694,16 +1745,12 @@ impl DataAccelerator for CayenneAccelerator {
     /// Initializes a `Cayenne` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Initialization requires extensive validation, S3 bucket setup, and directory management"
-    )]
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         tracing::warn!(
-            "Cayenne data accelerator (Alpha) is in preview and should not be used in production."
+            "Cayenne data accelerator (Alpha) is in preview and is not recommended for production."
         );
 
         if !source.is_file_accelerated() {
@@ -1730,18 +1777,6 @@ impl DataAccelerator for CayenneAccelerator {
                 }));
             }
 
-            // Validate refresh_mode - append and full are supported
-            if let Some(refresh_mode) = acceleration.refresh_mode
-                && refresh_mode != RefreshMode::Append
-                && refresh_mode != RefreshMode::Full
-            {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(format!(
-                        "Cayenne data accelerator supports append and full refresh modes, but {refresh_mode:?} was specified. Please set refresh_mode to either append or full"
-                    )),
-                }));
-            }
-
             // Validate that refresh_append_overlap is not specified
             if acceleration.refresh_append_overlap.is_some() {
                 return Err(Box::new(Error::InvalidConfiguration {
@@ -1749,14 +1784,6 @@ impl DataAccelerator for CayenneAccelerator {
                         "Cayenne data accelerator does not yet support refresh_append_overlap. Please remove this configuration",
                     ),
                 }));
-            }
-
-            // Validate that snapshots are not enabled
-            if !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled) {
-                tracing::warn!(
-                    "Dataset {}: Cayenne data accelerator does not support acceleration snapshots. Please set 'acceleration.snapshots: disabled' or remove the snapshots configuration",
-                    source.name()
-                );
             }
         }
 
@@ -1806,7 +1833,7 @@ impl DataAccelerator for CayenneAccelerator {
                 }
             }
 
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         // If mode is FileCreate, delete the existing directory and metadata to start fresh
@@ -1867,16 +1894,19 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if let Some(acceleration) = source.acceleration() {
-            download_snapshot_if_needed(
+            let metadata_dir = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+            let snapshot_adapter =
+                runtime_acceleration::snapshot::AccelerationLayout::cayenne(metadata_dir, path_buf);
+            Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
-                path_buf,
+                snapshot_adapter,
                 AccelerationEngine::Cayenne,
             )
-            .await;
+            .await)
+        } else {
+            Ok(BootstrapStatus::none())
         }
-
-        Ok(())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
@@ -1897,59 +1927,6 @@ impl DataAccelerator for CayenneAccelerator {
         let dir_path = self.resolve_storage_config(source).boxed()?;
         let arrow_schema = Self::transformed_arrow_schema(&cmd, source).boxed()?;
         let _ = Self::ensure_directory(&dir_path).boxed()?;
-
-        // Validate append mode configuration: requires either none, primary_key or time_column, but not both
-        if let Some(acceleration) = source.acceleration()
-            && let Some(refresh_mode) = acceleration.refresh_mode
-            && refresh_mode == RefreshMode::Append
-        {
-            // Get primary keys from constraints
-            let arrow_schema_for_pk = Arc::new(cmd.schema.as_arrow().clone());
-            let primary_keys = if cmd.constraints.is_empty() {
-                Vec::new()
-            } else {
-                super::get_primary_keys_from_constraints(&cmd.constraints, &arrow_schema_for_pk)
-            };
-            let has_primary_key = !primary_keys.is_empty();
-
-            // Get time_column from the source via the trait method
-            let has_time_column = source.time_column().is_some();
-
-            // Validate: must have exactly one (not both, not neither)
-            match (has_primary_key, has_time_column) {
-                (false, false) => {
-                    return Err(Box::new(Error::InvalidConfiguration {
-                        detail: Arc::from(
-                            "Append mode requires either primary_key or time_column to be specified. \
-                            Please add one of these to your dataset configuration.",
-                        ),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-                (true, true) => {
-                    return Err(Box::new(Error::InvalidConfiguration {
-                        detail: Arc::from(
-                            "Append mode currently cannot have both primary_key and time_column specified. \
-                            Please specify only one of these in your dataset configuration.",
-                        ),
-                    })
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-                (true, false) => {
-                    tracing::info!(
-                        "Append mode for dataset '{}': using primary_key {:?} for deduplication",
-                        source.name(),
-                        primary_keys
-                    );
-                }
-                (false, true) => {
-                    tracing::info!(
-                        "Append mode for dataset '{}': using time_column for append operations",
-                        source.name()
-                    );
-                }
-            }
-        }
 
         // Get the table name from the source
         let table_name = source.name().to_string();
@@ -1998,8 +1975,11 @@ impl DataAccelerator for CayenneAccelerator {
         if partition_by.is_empty() {
             // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let (write_provider, delete_provider) =
-                upsert_dedup::wrap_with_upsert_dedup_if_needed(cayenne_table, &cmd.options);
+            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+                cayenne_table,
+                &cmd.options,
+                cmd.constraints.clone(),
+            );
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(
@@ -2132,8 +2112,11 @@ impl DataAccelerator for CayenneAccelerator {
             );
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let (write_provider, delete_provider) =
-                upsert_dedup::wrap_with_upsert_dedup_if_needed(partition_provider, &cmd.options);
+            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+                partition_provider,
+                &cmd.options,
+                cmd.constraints.clone(),
+            );
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(

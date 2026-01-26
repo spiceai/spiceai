@@ -13,6 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+#![allow(clippy::expect_used)]
+
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 use crate::utils::{runtime_ready_check, test_request_context};
 use crate::{configure_test_datafusion, init_tracing};

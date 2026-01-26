@@ -106,10 +106,6 @@ impl LocationPruningListingTable {
         &self.inner.options().table_partition_cols
     }
 
-    fn metadata_columns(&self) -> &Vec<MetadataColumn> {
-        &self.inner.options().metadata_cols
-    }
-
     fn object_store_url(&self) -> ObjectStoreUrl {
         // Safe: Listing tables share object store across paths. Should always have at least one path.
         self.inner.table_paths().first().map_or_else(
@@ -272,13 +268,18 @@ impl TableProvider for LocationPruningListingTable {
 
         let file_source = self.inner.options().format.file_source();
 
+        // Note: We intentionally do NOT pass projection indices to the FileScanConfigBuilder.
+        // The projection indices from the table scan are relative to the full table schema
+        // (file columns + partition columns + metadata columns), but FileScanConfigBuilder
+        // expects indices relative to only the file schema. Passing table-level indices would
+        // cause index-out-of-bounds errors. By omitting projection, DataFusion will read all
+        // columns and apply projections at a higher level.
         let mut builder =
             FileScanConfigBuilder::new(self.object_store_url(), self.file_schema(), file_source)
                 .with_file_groups(file_groups)
                 .with_table_partition_cols(partition_fields)
-                .with_projection(projection.cloned())
                 .with_limit(limit)
-                .with_metadata_cols(self.metadata_columns().clone())
+                .with_metadata_cols(self.inner.options().metadata_cols.clone())
                 .with_object_versioning_type(self.inner.options().object_versioning_type.clone());
 
         if let Some(constraints) = self.inner.constraints() {
@@ -760,18 +761,8 @@ pub trait ListingTableConnector: DataConnector {
                     },
                 )?;
 
-            table_parquet_options
-                .set(
-                    "tolerate_missing_page_index",
-                    &page_index_options.tolerate_missing_page_index.to_string(),
-                )
-                .map_err(
-                    |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                        dataconnector: format!("{self}"),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: Box::new(e),
-                    },
-                )?;
+            // Note: tolerate_missing_page_index was removed in DataFusion v51.
+            // Page index reading now handles missing indexes gracefully by default.
         }
 
         Ok(table_parquet_options)
@@ -1164,7 +1155,7 @@ fn refresh_skip_enabled(dataset: &Dataset) -> bool {
 }
 
 fn add_metadata_columns_if_required(
-    mut options: ListingOptions,
+    options: ListingOptions,
     table_url: &Url,
     schema: &Schema,
     dataset: &Dataset,
@@ -1176,7 +1167,7 @@ fn add_metadata_columns_if_required(
             dataset.name,
             columns
         );
-        options = options.with_metadata_cols(columns);
+        return options.with_metadata_cols(columns);
     }
 
     options
@@ -1401,14 +1392,12 @@ impl SensitiveListingTableUrl {
 
 struct ParquetPageIndexOptions {
     enable_page_index: bool,
-    tolerate_missing_page_index: bool,
 }
 
 impl Default for ParquetPageIndexOptions {
     fn default() -> Self {
         Self {
             enable_page_index: true,
-            tolerate_missing_page_index: false,
         }
     }
 }
@@ -1429,15 +1418,13 @@ async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOption
         app::App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
 
     match parquet_page_index_param.as_str() {
-        "auto" => ParquetPageIndexOptions {
-            enable_page_index: true,
-            tolerate_missing_page_index: true,
-        },
+        // Note: "auto" and "required" both enable page index now. The difference was that "auto"
+        // set tolerate_missing_page_index=true, but that option was removed in DataFusion v51.
+        // Page index reading now handles missing indexes gracefully by default.
+        "auto" | "required" => ParquetPageIndexOptions::default(),
         "skip" => ParquetPageIndexOptions {
             enable_page_index: false,
-            tolerate_missing_page_index: false,
         },
-        "required" => ParquetPageIndexOptions::default(),
         _ => {
             tracing::warn!(
                 "Invalid value '{}' for runtime.params.parquet_page_index, valid options are: 'auto', 'skip', 'required'. Using 'required'.",
@@ -2336,7 +2323,6 @@ mod tests {
 
         let options = parquet_page_index_options(&runtime).await;
         assert!(options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 
     #[tokio::test]
@@ -2351,9 +2337,10 @@ mod tests {
             .build()
             .await;
 
+        // "auto" and "required" now behave the same since tolerate_missing_page_index
+        // was removed in DataFusion v51. Page index reading handles missing indexes gracefully.
         let options = parquet_page_index_options(&runtime).await;
         assert!(options.enable_page_index);
-        assert!(options.tolerate_missing_page_index);
     }
 
     #[test]
@@ -2472,7 +2459,6 @@ mod tests {
 
         let options = parquet_page_index_options(&runtime).await;
         assert!(!options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 
     #[tokio::test]
@@ -2489,7 +2475,6 @@ mod tests {
 
         let options = parquet_page_index_options(&runtime).await;
         assert!(options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 
     #[tokio::test]
@@ -2507,6 +2492,5 @@ mod tests {
         let options = parquet_page_index_options(&runtime).await;
         // Should fall back to default
         assert!(options.enable_page_index);
-        assert!(!options.tolerate_missing_page_index);
     }
 }

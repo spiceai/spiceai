@@ -17,10 +17,15 @@ limitations under the License.
 //! Test INSERT OVERWRITE functionality for Cayenne
 
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
+
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
+
 use tempfile::TempDir;
 
 #[tokio::test]

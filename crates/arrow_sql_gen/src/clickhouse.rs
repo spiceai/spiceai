@@ -534,6 +534,7 @@ fn to_decimal_128(decimal: &BigDecimal, scale: i8) -> Option<i128> {
     (decimal * 10i128.pow(scale.try_into().unwrap_or_default())).to_i128()
 }
 
+#[cfg(test)]
 mod tests {
     #[test]
     fn test_block_to_arrow() {

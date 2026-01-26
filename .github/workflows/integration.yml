@@ -38,6 +38,12 @@ concurrency:
 
 env:
   CONTAINER_REGISTRY: spiceaitestimages.azurecr.io/
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
@@ -50,7 +56,8 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
-          fetch-depth: 0
+          # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
 
       - name: Check for code changes
         id: check
@@ -63,11 +70,13 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        with:
+          fetch-depth: 1
 
       # Cache Cargo dependencies
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        uses: actions/cache@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
         with:
           path: |
             ~/.cargo/registry/index/
@@ -88,6 +97,11 @@ jobs:
       - name: Set up cc
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -110,7 +124,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark,dynamodb,oracle,kafka,mongodb,iceberg-write,snapshots"
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -246,6 +260,10 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
           GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # MinIO/S3-compatible storage for TPC-DS and other S3 tests
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           # old dbc instance
           TEST_DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}

@@ -13,32 +13,56 @@
 # limitations under the License.
 
 name: 'Setup Nextest'
-description: 'Installs cargo-nextest for running Rust tests'
+description: 'Installs cargo-nextest for running Rust tests with caching'
 
 runs:
   using: 'composite'
   steps:
-    - name: Install Nextest (Linux)
+    - name: Cache Nextest binary (Linux)
       if: runner.os == 'Linux'
+      id: cache-nextest-linux
+      uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      with:
+        path: ~/.cargo/bin/cargo-nextest
+        key: nextest-linux-x86_64-0.9.89
+
+    - name: Install Nextest (Linux)
+      if: runner.os == 'Linux' && steps.cache-nextest-linux.outputs.cache-hit != 'true'
       shell: bash
       run: |
         mkdir -p ${CARGO_HOME:-~/.cargo}/bin
-        curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        curl -LsSf https://get.nexte.st/0.9.89/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+    - name: Cache Nextest binary (macOS)
+      if: runner.os == 'macOS'
+      id: cache-nextest-macos
+      uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      with:
+        path: ~/.cargo/bin/cargo-nextest
+        key: nextest-macos-${{ runner.arch }}-0.9.89
 
     - name: Install Nextest (macOS)
-      if: runner.os == 'macOS'
+      if: runner.os == 'macOS' && steps.cache-nextest-macos.outputs.cache-hit != 'true'
       shell: bash
       run: |
         mkdir -p ${CARGO_HOME:-~/.cargo}/bin
-        curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        curl -LsSf https://get.nexte.st/0.9.89/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+    - name: Cache Nextest binary (Windows)
+      if: runner.os == 'Windows'
+      id: cache-nextest-windows
+      uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      with:
+        path: ~/.cargo/bin/cargo-nextest.exe
+        key: nextest-windows-x86_64-0.9.89
 
     - name: Install Nextest (Windows)
-      if: runner.os == 'Windows'
+      if: runner.os == 'Windows' && steps.cache-nextest-windows.outputs.cache-hit != 'true'
       shell: pwsh
       run: |
         $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
         $cargoBin = Join-Path $cargoHome "bin"
         New-Item -ItemType Directory -Force -Path $cargoBin | Out-Null
-        Invoke-WebRequest -Uri "https://get.nexte.st/latest/windows" -OutFile "$cargoBin\nextest.zip"
+        Invoke-WebRequest -Uri "https://get.nexte.st/0.9.89/windows" -OutFile "$cargoBin\nextest.zip"
         Expand-Archive -Path "$cargoBin\nextest.zip" -DestinationPath $cargoBin -Force
         Remove-Item "$cargoBin\nextest.zip"
