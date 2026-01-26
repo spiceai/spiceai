@@ -25,6 +25,8 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
+mod common;
+
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -53,13 +55,7 @@ async fn insert_batch(
     table_provider: &Arc<CayenneTableProvider>,
     batch: RecordBatch,
 ) -> TestResult<u64> {
-    let schema = batch.schema();
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
-
-    table_provider
-        .insert(boxed_stream)
+    common::insert_batch(table_provider.as_ref(), batch)
         .await
         .map_err(Into::into)
 }

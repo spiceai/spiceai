@@ -34,8 +34,6 @@ use datafusion::datasource::TableProvider;
 
 use datafusion::prelude::*;
 
-use datafusion_execution::SendableRecordBatchStream;
-
 use std::sync::Arc;
 
 test_with_backends!(test_retention_filters_apply_on_insert_impl);
@@ -82,14 +80,7 @@ async fn test_retention_filters_apply_on_insert_impl(
         ],
     )?;
 
-    let stream = futures::stream::iter(vec![Ok(batch.clone())]);
-    let adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        stream,
-    );
-    let sendable: SendableRecordBatchStream = Box::pin(adapter);
-
-    let inserted = table_provider.insert(sendable).await?;
+    let inserted = common::insert_batch(table_provider.as_ref(), batch).await?;
     assert_eq!(inserted, 5, "Should insert all rows");
 
     // Retention should have created a delete file containing row IDs 0 and 1.
@@ -194,14 +185,7 @@ async fn test_retention_filters_skip_when_no_matches_impl(
         ],
     )?;
 
-    let stream = futures::stream::iter(vec![Ok(batch)]);
-    let adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        stream,
-    );
-    let sendable: SendableRecordBatchStream = Box::pin(adapter);
-
-    table_provider.insert(sendable).await?;
+    common::insert_batch(&table_provider, batch).await?;
 
     // No delete files should have been created.
     let delete_files = table_provider

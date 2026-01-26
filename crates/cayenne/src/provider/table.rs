@@ -31,6 +31,7 @@ use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use crate::deletion::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::metadata::{CreateTableOptions, TableMetadata};
 use crate::provider::scan::CayenneAccelerationExec;
+use crate::provider::sink::CayenneDataSink;
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
@@ -41,6 +42,7 @@ use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::datasource::sink::DataSinkExec;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -358,6 +360,95 @@ impl std::fmt::Debug for CayenneTableProvider {
 }
 
 impl CayenneTableProvider {
+    /// Returns the name of this table.
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        &self.table_metadata.table_name
+    }
+
+    /// Returns the base path for this table's data.
+    #[must_use]
+    pub(crate) fn table_path(&self) -> &str {
+        &self.table_metadata.path
+    }
+
+    /// Returns the path to a snapshot directory for this table.
+    #[must_use]
+    pub(crate) fn snapshot_dir_path_for(&self, snapshot_id: &str) -> std::path::PathBuf {
+        Self::snapshot_dir_path(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            snapshot_id,
+        )
+    }
+
+    /// Atomically commit an overwrite operation to the catalog.
+    ///
+    /// This clears any existing delete files since overwrite replaces all data.
+    pub(crate) async fn commit_overwrite(&self, new_snapshot_id: &str) -> CatalogResult<()> {
+        self.catalog
+            .commit_compaction(self.table_metadata.table_id, new_snapshot_id)
+            .await
+    }
+
+    /// Update the listing table to point to a new snapshot directory.
+    ///
+    /// This ensures subsequent queries in the same context will read from the new data.
+    pub(crate) fn update_listing_table_for_snapshot(
+        &self,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            self.table_metadata.table_id,
+            new_snapshot_id,
+        );
+
+        let new_listing_table = Self::create_listing_table(
+            &snapshot_dir_url,
+            Arc::clone(&self.table_metadata.schema),
+            self.context.file_format(),
+        )?;
+
+        let mut listing_table_guard =
+            self.listing_table
+                .write()
+                .map_err(|_| CatalogError::LockPoisoned {
+                    operation: "update listing table for snapshot".to_string(),
+                })?;
+        *listing_table_guard = new_listing_table;
+        Ok(())
+    }
+
+    /// Trigger cleanup of old snapshot directories in the background.
+    ///
+    /// This is a non-blocking operation that logs warnings on failure but doesn't
+    /// propagate errors, as cleanup failures shouldn't fail the write operation.
+    pub(crate) async fn trigger_old_snapshot_cleanup(&self, current_snapshot: &str) {
+        if self.table_metadata.path.starts_with("s3://") {
+            if let Err(err) = self.cleanup_old_snapshots_s3(current_snapshot).await {
+                tracing::warn!(
+                    "Failed to cleanup old S3 snapshots for table {}: {err}",
+                    self.table_metadata.table_id
+                );
+            }
+        } else {
+            let table_path = self.table_metadata.path.clone();
+            let table_id = self.table_metadata.table_id;
+            let current_snapshot = current_snapshot.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) =
+                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
+                {
+                    tracing::warn!(
+                        "Failed to cleanup old snapshots for table {}: {e}",
+                        table_id
+                    );
+                }
+            });
+        }
+    }
+
     /// Construct the path to a snapshot directory.
     ///
     /// Directory structure: `[table_path]/[table_id]/[snapshot_id]/`
@@ -587,7 +678,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created.
-    async fn ensure_snapshot_dir_exists(
+    pub(crate) async fn ensure_snapshot_dir_exists(
         snapshot_dir: &std::path::Path,
     ) -> datafusion_common::Result<()> {
         if !snapshot_dir.exists() {
@@ -615,7 +706,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the directory cannot be synced.
-    async fn sync_snapshot_dir(snapshot_dir: &std::path::Path) -> CatalogResult<()> {
+    pub(crate) async fn sync_snapshot_dir(snapshot_dir: &std::path::Path) -> CatalogResult<()> {
         let snapshot_dir = snapshot_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
             // Open the directory and call sync_all to flush metadata
@@ -975,7 +1066,7 @@ impl CayenneTableProvider {
     /// - Each file maintains proper statistics for `DataFusion` pushdown and pruning
     ///
     /// The target file size is configurable via `VortexConfig.target_vortex_file_size_mb`
-    /// and defaults to 256 MB.
+    /// and defaults to 128 MB.
     ///
     /// # Performance Optimizations
     ///
@@ -1003,7 +1094,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the data cannot be inserted.
-    pub async fn insert(&self, stream: SendableRecordBatchStream) -> CatalogResult<u64> {
+    pub(crate) async fn insert(&self, stream: SendableRecordBatchStream) -> CatalogResult<u64> {
         // Acquire write lock to serialize inserts and prevent concurrent write races.
         // This ensures listing table refresh happens after all parallel chunk writes complete
         // and retention filters are applied atomically.
@@ -1012,33 +1103,7 @@ impl CayenneTableProvider {
         // Check for pending deletions based on the deletion strategy.
         // Position-based: Requires compaction - row IDs would conflict when new files are added
         // PK-based (Int64Pk, RowConverterBased): Use anti-deletions to avoid compaction
-        let has_pending_deletions =
-            match self.pk_deletion_strategy {
-                PkDeletionStrategy::PositionBased => {
-                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
-                        CatalogError::LockPoisoned {
-                            operation: "check position-based deletion cache".to_string(),
-                        }
-                    })?;
-                    !guard.is_empty()
-                }
-                PkDeletionStrategy::Int64Pk => {
-                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
-                        CatalogError::LockPoisoned {
-                            operation: "check Int64 PK deletion cache".to_string(),
-                        }
-                    })?;
-                    !guard.is_empty()
-                }
-                PkDeletionStrategy::RowConverterBased => {
-                    let guard = self.cached_deleted_row_keys.read().map_err(|_| {
-                        CatalogError::LockPoisoned {
-                            operation: "check key-based deletion cache".to_string(),
-                        }
-                    })?;
-                    !guard.is_empty()
-                }
-            };
+        let has_pending_deletions = self.has_pending_deletions()?;
 
         // For position-based strategy, we still need compaction because row IDs change
         // when new files are added.
@@ -1529,7 +1594,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the write operation fails.
-    async fn chunk_and_write_parallel_to_snapshot(
+    pub(crate) async fn chunk_and_write_parallel_to_snapshot(
         &self,
         mut stream: SendableRecordBatchStream,
         target_size_bytes: usize,
@@ -1787,26 +1852,22 @@ impl CayenneTableProvider {
     ///
     /// # Note on Retention Filters
     ///
-    /// The cloned instance has empty `retention_filters` because retention is applied
-    /// atomically at the end of the main `insert()` method (after all parallel chunk
-    /// writes complete but before the write lock is released).
+    /// Retention filters are preserved in the clone because they need to be applied
+    /// by `insert()` at the end of each write operation. The `insert()` method holds
+    /// the write lock and applies retention atomically after all parallel chunk writes
+    /// complete.
     ///
     /// This design provides ACID semantics:
     /// - Retention filters are table-wide predicates (e.g., "delete rows older than 30 days")
     /// - They must scan all table data, not just the newly written chunks
-    /// - Applying them per-chunk would cause write amplification (write, scan, delete, repeat)
     /// - The write lock ensures atomicity: all writes + retention happen as one operation
-    ///
-    /// There is a brief moment (milliseconds) where newly written data exists on disk before
-    /// deletion vectors are created, but the write lock prevents this from being observable
-    /// to other operations - either the entire insert+retention succeeds atomically, or it fails.
     fn clone_for_write(&self) -> Self {
         Self {
             table_metadata: self.table_metadata.clone(),
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
             context: Arc::clone(&self.context),
-            retention_filters: Vec::new(), // Applied once after all chunks complete, not per-chunk
+            retention_filters: self.retention_filters.clone(),
             cached_deleted_row_ids: Arc::clone(&self.cached_deleted_row_ids),
             cached_deleted_pk_i64: Arc::clone(&self.cached_deleted_pk_i64),
             cached_deleted_row_keys: Arc::clone(&self.cached_deleted_row_keys),
@@ -3124,6 +3185,46 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Check if there are pending deletions based on the current deletion strategy.
+    ///
+    /// This is used to determine if inserts need special handling:
+    /// - Position-based deletions require compaction (row IDs conflict with new files)
+    /// - PK-based deletions use anti-deletions (write to new snapshot with higher sequence)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deletion cache lock is poisoned.
+    fn has_pending_deletions(&self) -> CatalogResult<bool> {
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::PositionBased => {
+                let guard =
+                    self.cached_deleted_row_ids
+                        .read()
+                        .map_err(|_| CatalogError::LockPoisoned {
+                            operation: "check position-based deletion cache".to_string(),
+                        })?;
+                Ok(!guard.is_empty())
+            }
+            PkDeletionStrategy::Int64Pk => {
+                let guard =
+                    self.cached_deleted_pk_i64
+                        .read()
+                        .map_err(|_| CatalogError::LockPoisoned {
+                            operation: "check Int64 PK deletion cache".to_string(),
+                        })?;
+                Ok(!guard.is_empty())
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                    CatalogError::LockPoisoned {
+                        operation: "check key-based deletion cache".to_string(),
+                    }
+                })?;
+                Ok(!guard.is_empty())
+            }
+        }
+    }
+
     /// Clear all cached deletion vectors and insert records.
     ///
     /// This should be called after compaction operations that have applied all deletions
@@ -3132,7 +3233,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if any cache lock is poisoned.
-    fn clear_all_deletion_caches(&self) -> CatalogResult<()> {
+    pub(crate) fn clear_all_deletion_caches(&self) -> CatalogResult<()> {
         // Clear position-based cache
         {
             let mut guard =
@@ -3220,7 +3321,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the lock is poisoned.
-    fn update_current_snapshot_id(&self, new_snapshot_id: &str) -> CatalogResult<()> {
+    pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) -> CatalogResult<()> {
         let mut guard =
             self.current_snapshot_id
                 .write()
@@ -3251,253 +3352,6 @@ impl CayenneTableProvider {
         Err(CatalogError::NotImplemented {
             function: "delete_by_primary_key".to_string(),
         })
-    }
-
-    /// Perform a merge-insert: read existing data with deletion filter, combine with new data,
-    /// and write to a new snapshot. This is used when there are pending deletions to ensure
-    /// deletions are applied before new data is added.
-    ///
-    /// Supports all deletion strategies:
-    /// - Position-based: Prevents row ID conflicts when new files are added
-    /// - Key-based (Int64 PK and RowConverter): Prevents new rows from being incorrectly filtered
-    ///
-    /// # Arguments
-    ///
-    /// * `state` - The session state for query execution
-    /// * `new_input` - The execution plan for new data to insert
-    ///
-    /// # Returns
-    ///
-    /// An execution plan that writes the merged data to a new snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the merge-insert operation fails.
-    async fn merge_insert_with_compaction(
-        &self,
-        state: &dyn Session,
-        new_input: Arc<dyn ExecutionPlan>,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        use super::delete::{
-            DeletionFilterExec, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
-        };
-        use datafusion_physical_plan::union::UnionExec;
-
-        // Get the existing listing table
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    LISTING_TABLE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            Arc::clone(&guard)
-        };
-
-        // Create a new session context for the scan
-        let ctx = SessionContext::new();
-
-        // Scan existing data with deletion filter applied
-        let existing_scan = listing_table.scan(&ctx.state(), None, &[], None).await?;
-
-        // Apply the appropriate deletion filter based on strategy
-        let filtered_existing: Arc<dyn ExecutionPlan> = match self.pk_deletion_strategy {
-            PkDeletionStrategy::PositionBased => {
-                let deleted_row_ids = {
-                    let guard = self.cached_deleted_row_ids.read().map_err(|_| {
-                        datafusion_common::DataFusionError::Execution(
-                            DELETION_CACHE_LOCK_POISONED.to_string(),
-                        )
-                    })?;
-                    Arc::clone(&guard)
-                };
-                Arc::new(DeletionFilterExec::new(existing_scan, deleted_row_ids))
-            }
-            PkDeletionStrategy::Int64Pk => {
-                let deleted_pk_values = {
-                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
-                        datafusion_common::DataFusionError::Execution(
-                            DELETION_CACHE_LOCK_POISONED.to_string(),
-                        )
-                    })?;
-                    Arc::clone(&guard)
-                };
-                let insert_records_pk_values = {
-                    let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
-                        datafusion_common::DataFusionError::Execution(
-                            DELETION_CACHE_LOCK_POISONED.to_string(),
-                        )
-                    })?;
-                    Arc::clone(&guard)
-                };
-                let pk_column_index = self.pk_column_indices.first().copied().ok_or_else(|| {
-                    datafusion_common::DataFusionError::Internal(
-                        "Int64 PK strategy requires exactly one PK column index".to_string(),
-                    )
-                })?;
-                Arc::new(Int64PkDeletionFilterExec::new(
-                    existing_scan,
-                    deleted_pk_values,
-                    insert_records_pk_values,
-                    pk_column_index,
-                ))
-            }
-            PkDeletionStrategy::RowConverterBased => {
-                let deleted_row_keys = {
-                    let guard = self.cached_deleted_row_keys.read().map_err(|_| {
-                        datafusion_common::DataFusionError::Execution(
-                            DELETION_CACHE_LOCK_POISONED.to_string(),
-                        )
-                    })?;
-                    Arc::clone(&guard)
-                };
-                let insert_records_row_keys = {
-                    let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
-                        datafusion_common::DataFusionError::Execution(
-                            DELETION_CACHE_LOCK_POISONED.to_string(),
-                        )
-                    })?;
-                    Arc::clone(&guard)
-                };
-                let row_converter = self.pk_row_converter.as_ref().ok_or_else(|| {
-                    datafusion_common::DataFusionError::Internal(
-                        "RowConverter not available for RowConverterBased strategy".to_string(),
-                    )
-                })?;
-                Arc::new(KeyBasedDeletionFilterExec::new(
-                    existing_scan,
-                    deleted_row_keys,
-                    insert_records_row_keys,
-                    self.pk_column_indices.clone(),
-                    Arc::clone(row_converter),
-                ))
-            }
-        };
-
-        // Union the filtered existing data with new input
-        let union_plan: Arc<dyn ExecutionPlan> =
-            UnionExec::try_new(vec![filtered_existing, new_input])?;
-
-        // Generate a new snapshot ID
-        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-
-        // Construct snapshot directory URL
-        let snapshot_dir_url = Self::snapshot_dir_url(
-            &self.table_metadata.path,
-            self.table_metadata.table_id,
-            &new_snapshot_id,
-        );
-
-        // For local paths, ensure the directory exists
-        if !self.table_metadata.path.starts_with("s3://") {
-            let snapshot_dir = Self::snapshot_dir_path(
-                &self.table_metadata.path,
-                self.table_metadata.table_id,
-                &new_snapshot_id,
-            );
-            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
-        }
-
-        // Create a new ListingTable pointing to the snapshot directory
-        let new_listing_table = Self::create_listing_table(
-            &snapshot_dir_url,
-            Arc::clone(&self.table_metadata.schema),
-            self.context.file_format(),
-        )
-        .map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to create listing table for compaction snapshot: {e}"
-            ))
-        })?;
-
-        // Perform the insert using the new listing table with append mode
-        let result = new_listing_table
-            .insert_into(state, union_plan, InsertOp::Append)
-            .await?;
-
-        // Sync the snapshot directory to ensure all data is durably written.
-        // This is critical for ACID durability - we must ensure data files are
-        // on disk before updating the catalog metadata.
-        if !self.table_metadata.path.starts_with("s3://") {
-            let snapshot_dir = Self::snapshot_dir_path(
-                &self.table_metadata.path,
-                self.table_metadata.table_id,
-                &new_snapshot_id,
-            );
-            Self::sync_snapshot_dir(&snapshot_dir).await.map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to sync snapshot directory for durability: {e}"
-                ))
-            })?;
-        }
-
-        // Atomically update the catalog snapshot and clear delete files.
-        // This is the commit point for the compaction operation - both changes
-        // happen together or not at all, ensuring ACID compliance.
-        self.catalog
-            .commit_compaction(self.table_metadata.table_id, &new_snapshot_id)
-            .await
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to commit compaction: {e}"
-                ))
-            })?;
-
-        // Update the in-memory snapshot ID to match the new catalog state
-        self.update_current_snapshot_id(&new_snapshot_id)
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to update current snapshot ID: {e}"
-                ))
-            })?;
-
-        // Clear the in-memory cached deletion vectors since they've been applied
-        self.clear_all_deletion_caches().map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to clear deletion caches after compaction: {e}"
-            ))
-        })?;
-
-        // Update the provider's listing table to point to the new snapshot
-        {
-            let mut listing_table_guard = self.listing_table.write().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    LISTING_TABLE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            *listing_table_guard = new_listing_table;
-        }
-
-        // Cleanup old snapshots
-        if self.table_metadata.path.starts_with("s3://") {
-            let current_snapshot = new_snapshot_id.clone();
-            if let Err(err) = self.cleanup_old_snapshots_s3(&current_snapshot).await {
-                tracing::warn!(
-                    "Failed to cleanup old S3 snapshots for table {}: {err}",
-                    self.table_metadata.table_id
-                );
-            }
-        } else {
-            let table_path = self.table_metadata.path.clone();
-            let table_id = self.table_metadata.table_id;
-            let current_snapshot = new_snapshot_id.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) =
-                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
-                {
-                    tracing::warn!(
-                        "Failed to cleanup old snapshots for table {}: {e}",
-                        table_id
-                    );
-                }
-            });
-        }
-
-        tracing::info!(
-            "Completed merge-insert with compaction for table {}",
-            self.table_metadata.table_name
-        );
-
-        Ok(result)
     }
 
     /// Perform a merge-insert with compaction using a stream of new data.
@@ -4767,132 +4621,19 @@ impl TableProvider for CayenneTableProvider {
             );
         }
 
-        // Handle overwrite by creating a new snapshot
-        // Directory structure: [data_dir]/[table_id]/[snapshot_id]/
+        // For overwrite mode, delegate directly to CayenneDataSink which handles:
+        // - Creating a new snapshot
+        // - Memory-bounded writes via chunk_and_write_parallel_to_snapshot
+        // - Catalog commit and state updates AFTER the data is written
+        // - Old snapshot cleanup
         if overwrite == InsertOp::Overwrite {
-            // Generate a new UUIDv7 for the snapshot
-            let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-
-            // Construct snapshot directory URL
-            let snapshot_dir_url = Self::snapshot_dir_url(
-                &self.table_metadata.path,
-                self.table_metadata.table_id,
-                &new_snapshot_id,
-            );
-
-            // For local paths, ensure the directory exists
-            // S3 doesn't require directory creation (object storage creates paths on write)
-            if !self.table_metadata.path.starts_with("s3://") {
-                let snapshot_dir = Self::snapshot_dir_path(
-                    &self.table_metadata.path,
-                    self.table_metadata.table_id,
-                    &new_snapshot_id,
-                );
-                Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
-            }
-
-            // Create a new ListingTable pointing to the snapshot directory
-            let new_listing_table = Self::create_listing_table(
-                &snapshot_dir_url,
+            let sink = Arc::new(CayenneDataSink::new(
+                self.clone_for_write(),
+                InsertOp::Overwrite,
                 Arc::clone(&self.table_metadata.schema),
-                self.context.file_format(),
-            )
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to create listing table for new snapshot: {e}"
-                ))
-            })?;
-
-            // Perform the insert using the new listing table with append mode
-            // (Vortex only supports append at the file level)
-            let result = new_listing_table
-                .insert_into(state, input, InsertOp::Append)
-                .await?;
-
-            // Sync the snapshot directory to ensure all data is durably written.
-            // This is critical for ACID durability - we must ensure data files are
-            // on disk before updating the catalog metadata.
-            if !self.table_metadata.path.starts_with("s3://") {
-                let snapshot_dir = Self::snapshot_dir_path(
-                    &self.table_metadata.path,
-                    self.table_metadata.table_id,
-                    &new_snapshot_id,
-                );
-                Self::sync_snapshot_dir(&snapshot_dir).await.map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to sync snapshot directory for durability: {e}"
-                    ))
-                })?;
-            }
-
-            // Atomically update the catalog snapshot and clear any delete files.
-            // For overwrite operations, any existing delete files are stale since
-            // we're replacing all data. Using commit_compaction ensures atomicity.
-            self.catalog
-                .commit_compaction(self.table_metadata.table_id, &new_snapshot_id)
-                .await
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to commit overwrite: {e}"
-                    ))
-                })?;
-
-            // Update the in-memory snapshot ID to match the new catalog state
-            self.update_current_snapshot_id(&new_snapshot_id)
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to update current snapshot ID: {e}"
-                    ))
-                })?;
-
-            // Clear any in-memory deletion caches since all data was replaced
-            if let Err(e) = self.clear_all_deletion_caches() {
-                tracing::warn!(
-                    "Failed to clear deletion caches after overwrite for table {}: {e}",
-                    self.table_metadata.table_name
-                );
-            }
-
-            // Update the provider's listing table to point to the new snapshot
-            // This ensures subsequent queries in the same context will read from the new data
-            {
-                let mut listing_table_guard = self.listing_table.write().map_err(|_| {
-                    datafusion_common::DataFusionError::Execution(
-                        LISTING_TABLE_LOCK_POISONED.to_string(),
-                    )
-                })?;
-                *listing_table_guard = new_listing_table;
-            }
-
-            // Trigger cleanup of old snapshot directories after successful full refresh
-            // Local paths use blocking cleanup; S3 paths use object store deletion
-            if self.table_metadata.path.starts_with("s3://") {
-                let current_snapshot = new_snapshot_id.clone();
-                if let Err(err) = self.cleanup_old_snapshots_s3(&current_snapshot).await {
-                    tracing::warn!(
-                        "Failed to cleanup old S3 snapshots for table {}: {err}",
-                        self.table_metadata.table_id
-                    );
-                }
-            } else {
-                let table_path = self.table_metadata.path.clone();
-                let table_id = self.table_metadata.table_id;
-                let current_snapshot = new_snapshot_id.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = Self::cleanup_old_snapshots_blocking(
-                        &table_path,
-                        table_id,
-                        &current_snapshot,
-                    ) {
-                        tracing::warn!(
-                            "Failed to cleanup old snapshots for table {}: {e}",
-                            table_id
-                        );
-                    }
-                });
-            }
-
-            return Ok(result);
+                Arc::clone(&self.context),
+            ));
+            return Ok(Arc::new(DataSinkExec::new(input, sink, None)));
         }
 
         // For regular appends, use the existing snapshot and listing table
@@ -4914,38 +4655,34 @@ impl TableProvider for CayenneTableProvider {
         // For position-based deletion tables with pending deletions, we must compact
         // before appending to prevent row ID conflicts. Position-based row IDs are global
         // and become invalid when new files are added.
+        //
+        // Route through CayenneDataSink which calls insert() -> merge_insert_stream_with_compaction().
+        // This ensures correct execution order: data is written BEFORE catalog/cache updates.
         if self.pk_deletion_strategy == PkDeletionStrategy::PositionBased {
-            let has_pending_deletions = {
-                let guard = self.cached_deleted_row_ids.read().map_err(|_| {
-                    datafusion_common::DataFusionError::Execution(
-                        DELETION_CACHE_LOCK_POISONED.to_string(),
-                    )
-                })?;
-                !guard.is_empty()
-            };
+            let has_pending_deletions = self.has_pending_deletions().map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to check pending deletions: {e}"
+                ))
+            })?;
 
             if has_pending_deletions {
                 tracing::info!(
                     "Table {} has pending position-based deletions, converting append to merge-insert",
                     self.table_metadata.table_name
                 );
-                return self.merge_insert_with_compaction(state, input).await;
+                let sink = Arc::new(CayenneDataSink::new(
+                    self.clone_for_write(),
+                    InsertOp::Append,
+                    Arc::clone(&self.table_metadata.schema),
+                    Arc::clone(&self.context),
+                ));
+                return Ok(Arc::new(DataSinkExec::new(input, sink, None)));
             }
         }
 
-        // Clone the Arc and drop the lock before awaiting
-        let listing_table = {
-            let guard = self.listing_table.read().map_err(|_| {
-                datafusion_common::DataFusionError::Execution(
-                    LISTING_TABLE_LOCK_POISONED.to_string(),
-                )
-            })?;
-            Arc::clone(&guard)
-        };
-
         if is_s3 {
             tracing::info!(
-                "Delegating S3 write to ListingTable for {}",
+                "Preparing CayenneDataSink for S3 write to {}",
                 self.table_metadata.table_name
             );
         }
@@ -5104,24 +4841,24 @@ impl TableProvider for CayenneTableProvider {
             input
         };
 
-        let result = listing_table
-            .insert_into(state, final_input, InsertOp::Append)
-            .await?;
+        // Use CayenneDataSink with DataSinkExec for memory-bounded writes:
+        // - Chunked writes via chunk_and_write_parallel
+        // - Retention filter application
+        // - Automatic listing table refresh
+        let sink = Arc::new(CayenneDataSink::new(
+            self.clone_for_write(),
+            InsertOp::Append,
+            Arc::clone(&self.table_metadata.schema),
+            Arc::clone(&self.context),
+        ));
+        let result = Arc::new(DataSinkExec::new(final_input, sink, None));
 
         if is_s3 {
             tracing::info!(
-                "ListingTable insert_into returned for {} (S3 write plan created)",
+                "CayenneDataSink created for {} (S3 write plan)",
                 self.table_metadata.table_name
             );
         }
-
-        // Refresh the listing table to pick up new files and update statistics
-        // This ensures query plans have access to up-to-date statistics after the insert
-        self.refresh_listing_table().map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to refresh listing table after insert: {e}"
-            ))
-        })?;
 
         Ok(result)
     }
