@@ -1188,7 +1188,7 @@ async fn create_scheduler_server(
             let total_slots = slots_for_session.load(Ordering::Relaxed);
             let target_partitions = if total_slots > 0 { total_slots } else { 16 };
 
-            tracing::info!(
+            tracing::debug!(
                 total_slots,
                 target_partitions,
                 "Cluster session_builder: setting target_partitions based on cluster capacity"
