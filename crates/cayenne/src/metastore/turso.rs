@@ -81,7 +81,6 @@ impl TursoMetastore {
         }
 
         let db = Builder::new_local(db_path)
-            .with_mvcc(false) // Enable MVCC when Turso supports it with indexes: https://github.com/spiceai/spiceai/issues/8526
             .build()
             .await
             .map_err(|e| CatalogError::Database {
@@ -95,9 +94,18 @@ impl TursoMetastore {
     /// Get a connection from the database.
     async fn get_conn(&self) -> CatalogResult<Connection> {
         let db = self.get_db().await?;
-        db.connect().map_err(|e| CatalogError::Database {
+        let conn = db.connect().map_err(|e| CatalogError::Database {
             message: format!("Failed to connect to Turso database: {e}"),
-        })
+        })?;
+
+        // Set busy timeout to wait for locks instead of immediately returning SQLITE_BUSY.
+        // This fixes issue #8826 where concurrent transactions to the same database fail.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set busy timeout: {e}"),
+            })?;
+
+        Ok(conn)
     }
 
     /// Schema for the `cayenne_table` table.

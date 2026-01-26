@@ -2324,6 +2324,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.69.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "271383c67ccabffb7381723dea0672a673f292304fcb45c01cc648c7a8d58088"
+dependencies = [
+ "bitflags 2.10.0",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.12.1",
+ "lazy_static",
+ "lazycell",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 1.1.0",
+ "shlex",
+ "syn 2.0.111",
+ "which",
+]
+
+[[package]]
 name = "bindgen_cuda"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2385,6 +2408,12 @@ checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
 dependencies = [
  "bit-vec 0.8.0",
 ]
+
+[[package]]
+name = "bit-vec"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02b4ff8b16e6076c3e14220b39fbc1fabb6737522281a388998046859400895f"
 
 [[package]]
 name = "bit-vec"
@@ -2533,6 +2562,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d00ac8e5056d6d65376a3c1aa5c7c34850d6949ace17f0266953a254eb3d6fe8"
+dependencies = [
+ "bit-vec 0.4.4",
+]
+
+[[package]]
 name = "bm25"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2636,6 +2674,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.111",
+]
+
+[[package]]
+name = "branches"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e426eb5cc1900033930ec955317b302e68f19f326cc7bb0c8a86865a826cdf0c"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]
@@ -6965,6 +7012,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "genawaiter"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c86bd0361bcbde39b13475e6e36cb24c329964aa2611be285289d1e4b751c1a0"
+dependencies = [
+ "genawaiter-macro",
+]
+
+[[package]]
+name = "genawaiter-macro"
+version = "0.99.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b32dfe1fdfc0bbde1f22a5da25355514b5e450c33a6af6770884c8750aedfbc"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9102,7 +9164,7 @@ version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a9e8e3abb006dbbf5b1427a22db7cebe0d7c0e71378e2c4f52c3b310a673dee"
 dependencies = [
- "bindgen",
+ "bindgen 0.60.1",
 ]
 
 [[package]]
@@ -13344,6 +13406,15 @@ name = "rangemap"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "acbbbbea733ec66275512d0b9694f34102e7d5406fdbe2ad8d21b28dce92887c"
+
+[[package]]
+name = "rapidhash"
+version = "4.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d8b5b858a440a0bc02625b62dd95131b9201aa9f69f411195dd4a7cfb1de3d7"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "raw-cpuid"
@@ -18265,32 +18336,37 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.3.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c670345a51c5df2ebb0a582c9af67dea98192c8fd82ca2c50aca34b342bf0c10"
+checksum = "6906d37d281135404586b3cdf91be43259aff280e4cc7cccc3a6b3571f7fa359"
 dependencies = [
  "thiserror 2.0.17",
  "tracing",
  "tracing-subscriber",
- "turso_core",
+ "turso_sdk_kit",
+ "turso_sync_sdk_kit",
 ]
 
 [[package]]
 name = "turso_core"
-version = "0.3.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd5a3044961c822886d08cbc94f5519524213b877f65fb66ab70133ed3c0a36d"
+checksum = "2f840b90d96418a1235109177906c246c30db4efa88a53e669f490bb602c11b2"
 dependencies = [
  "aegis",
  "aes 0.8.4",
  "aes-gcm 0.10.3",
  "arc-swap",
  "bitflags 2.10.0",
+ "bloom",
+ "branches",
  "built",
+ "bumpalo",
  "bytemuck",
  "cfg_block",
  "chrono",
  "crossbeam-skiplist",
+ "either",
  "fallible-iterator 0.3.0",
  "hex",
  "intrusive-collections",
@@ -18304,6 +18380,7 @@ dependencies = [
  "paste",
  "polling",
  "rand 0.9.2",
+ "rapidhash",
  "regex",
  "regex-syntax",
  "roaring",
@@ -18316,6 +18393,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "tracing",
+ "tracing-subscriber",
  "turso_ext",
  "turso_macros",
  "turso_parser",
@@ -18326,9 +18404,9 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.3.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c744b2d657542911d6b1708f8aa2f047601cc0d452af8cd2d7f8fb1c05d40730"
+checksum = "e6a9dc344da6735187fa763c9772765927369f7972f597c805641387a49849ab"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -18337,9 +18415,9 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.3.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4631f270381e6153833ab491b42fca3a1dbaad0f657a12ea1d676dec8f71e7b1"
+checksum = "7a60b69b4d367d0020320eccee5693818f34a6dfb2f5430ab37103f08de3333a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -18348,16 +18426,84 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.3.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b64ae3d49b989ed156abe143ae0244d0f239f67fc42da72806369a567f295750"
+checksum = "809b13b7c1df2ce91ed6ae656e37c69052b3baaac2bd6a5f6c65924cbe6c356b"
 dependencies = [
  "bitflags 2.10.0",
+ "memchr",
  "miette",
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "thiserror 2.0.17",
  "turso_macros",
+]
+
+[[package]]
+name = "turso_sdk_kit"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "870a42c14b7af1a7224614d1ebee20e21076a0c16062d1a74ddc95a260ef93aa"
+dependencies = [
+ "bindgen 0.69.5",
+ "env_logger 0.11.8",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "turso_core",
+ "turso_sdk_kit_macros",
+]
+
+[[package]]
+name = "turso_sdk_kit_macros"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3c926b4dd58d6d220aeb6d49b9a645adeea344cd9777cff9ca5908e40abd7d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
+name = "turso_sync_engine"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6bd56754dc38e2bc5bcb25c21185093d91ef0cdb11cb55bc50a52491e220323"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "genawaiter",
+ "http 1.4.0",
+ "libc",
+ "prost 0.14.1",
+ "roaring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tracing",
+ "turso_core",
+ "turso_parser",
+ "uuid 1.18.1",
+]
+
+[[package]]
+name = "turso_sync_sdk_kit"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0138b311cfce756c10b86273c8cbf58be0804b0791495e855519362078012aaa"
+dependencies = [
+ "bindgen 0.69.5",
+ "env_logger 0.11.8",
+ "genawaiter",
+ "parking_lot 0.12.5",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "turso_core",
+ "turso_sdk_kit",
+ "turso_sdk_kit_macros",
+ "turso_sync_engine",
 ]
 
 [[package]]

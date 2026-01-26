@@ -290,7 +290,7 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.30"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = { version = "0.3.2", default-features = false, features = ["experimental_indexes"] }
+turso = { version = "0.4.3", default-features = false }
 twox-hash = "2.1.2"
 url = "2.5"
 util = { path = "crates/util" }
