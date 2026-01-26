@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2025-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,16 +20,23 @@ limitations under the License.
 //! including app definition retrieval and secret expansion.
 
 use app::App;
+use futures::{Stream, StreamExt};
 use runtime_proto::cluster_service_server::ClusterService;
+use runtime_proto::executor_control_message::Message as ExecutorMessage;
 use runtime_proto::{
-    ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
-    GetSchedulersRequest, GetSchedulersResponse, SchedulerInstance,
+    ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
+    GetAppDefinitionResponse, GetSchedulersRequest, GetSchedulersResponse, SchedulerControlMessage,
+    SchedulerInstance,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tonic::{Request, Response, Status};
+use std::task::{Context, Poll};
+use tokio::sync::{RwLock, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::cluster::SchedulerPeers;
 
@@ -56,6 +63,33 @@ impl ClusterServiceImpl {
             advertise_address,
             scheduler_peers,
         }
+    }
+}
+
+struct ControlStreamOutbound {
+    inner: ReceiverStream<SchedulerControlMessage>,
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+    _outbound_tx: mpsc::Sender<SchedulerControlMessage>,
+}
+
+impl Stream for ControlStreamOutbound {
+    type Item = Result<SchedulerControlMessage, Status>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(message)) => Poll::Ready(Some(Ok(message))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ControlStreamOutbound {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
     }
 }
 
@@ -164,5 +198,98 @@ impl ClusterService for ClusterServiceImpl {
         );
 
         Ok(Response::new(GetSchedulersResponse { schedulers }))
+    }
+
+    type ControlStreamStream =
+        Pin<Box<dyn Stream<Item = Result<SchedulerControlMessage, Status>> + Send>>;
+
+    async fn control_stream(
+        &self,
+        request: Request<Streaming<ExecutorControlMessage>>,
+    ) -> Result<Response<Self::ControlStreamStream>, Status> {
+        let mut inbound = request.into_inner();
+        let cancel = CancellationToken::new();
+        let inbound_cancel = cancel.clone();
+
+        // Create a channel for outbound messages to the executor (unused for now).
+        let (outbound_tx, outbound_rx) = mpsc::channel::<SchedulerControlMessage>(32);
+
+        // We need to identify the executor from its first message.
+        let inbound_task = tokio::spawn(async move {
+            let executor_id = match inbound.next().await {
+                Some(Ok(msg)) => {
+                    let executor_id = msg.executor_id.clone();
+                    if executor_id.is_empty() {
+                        tracing::warn!("Executor connected with empty executor_id, closing stream");
+                        return;
+                    }
+                    tracing::debug!("Executor control stream connected: {executor_id}");
+
+                    if let Some(message) = msg.message {
+                        handle_executor_message(&executor_id, message);
+                    }
+                    executor_id
+                }
+                Some(Err(e)) => {
+                    tracing::warn!("Error receiving first executor control message: {e}");
+                    return;
+                }
+                None => {
+                    tracing::debug!("Executor control stream closed before sending any messages");
+                    return;
+                }
+            };
+
+            loop {
+                tokio::select! {
+                    () = inbound_cancel.cancelled() => {
+                        tracing::debug!("Executor control stream cancelled: {executor_id}");
+                        break;
+                    }
+                    result = inbound.next() => {
+                        match result {
+                            Some(Ok(msg)) => {
+                                if let Some(message) = msg.message {
+                                    handle_executor_message(&executor_id, message);
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::debug!(
+                                    "Executor control stream error for {executor_id}: {e}"
+                                );
+                                break;
+                            }
+                            None => {
+                                tracing::debug!(
+                                    "Executor control stream closed by executor {executor_id}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            tracing::debug!("Executor control stream ended: {executor_id}");
+        });
+
+        let stream = ControlStreamOutbound {
+            inner: ReceiverStream::new(outbound_rx),
+            cancel,
+            task: inbound_task,
+            _outbound_tx: outbound_tx,
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+fn handle_executor_message(executor_id: &str, message: ExecutorMessage) {
+    match message {
+        ExecutorMessage::Heartbeat(heartbeat) => {
+            tracing::trace!(
+                "Received heartbeat from executor {executor_id}: timestamp_ms={}",
+                heartbeat.timestamp_ms
+            );
+        }
     }
 }

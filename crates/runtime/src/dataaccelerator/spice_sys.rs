@@ -20,7 +20,7 @@ limitations under the License.
     feature = "duckdb",
     feature = "sqlite",
     feature = "turso",
-    feature = "postgres"
+    feature = "postgres-accel"
 ))]
 use std::path::Path;
 #[cfg(any(feature = "duckdb", feature = "turso"))]
@@ -31,12 +31,12 @@ use super::AccelerationSource;
     feature = "duckdb",
     feature = "sqlite",
     feature = "turso",
-    feature = "postgres"
+    feature = "postgres-accel"
 ))]
 use snafu::ResultExt;
 use snafu::{OptionExt, Snafu};
 
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 use {
     datafusion_table_providers::sql::db_connection_pool::postgrespool::{
         self, PostgresConnectionPool,
@@ -67,7 +67,7 @@ use crate::component::dataset::acceleration::Engine;
     feature = "duckdb",
     feature = "sqlite",
     feature = "turso",
-    feature = "postgres"
+    feature = "postgres-accel"
 ))]
 use crate::dataaccelerator::get_registered_accelerator;
 
@@ -86,7 +86,7 @@ pub mod caching_engine;
 enum AccelerationConnection {
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<DuckDbConnectionPool>),
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "postgres-accel")]
     Postgres(PostgresConnectionPool),
     #[cfg(feature = "sqlite")]
     SQLite(SqliteConnectionPool),
@@ -132,7 +132,7 @@ pub enum Error {
     #[snafu(display("Unable to create SQLite connection pool: {source}"))]
     SqlitePool { source: SqliteError },
 
-    #[cfg(feature = "postgres")]
+    #[cfg(feature = "postgres-accel")]
     #[snafu(display("Unable to create PostgreSQL connection pool: {source}"))]
     PostgresPool { source: postgrespool::Error },
 
@@ -144,8 +144,8 @@ pub enum Error {
     #[snafu(display("Spice wasn't built with SQLite support enabled"))]
     SqliteFeatureNotEnabled,
 
-    #[cfg(not(feature = "postgres"))]
-    #[snafu(display("Spice wasn't built with PostgreSQL support enabled"))]
+    #[cfg(not(feature = "postgres-accel"))]
+    #[snafu(display("Spice wasn't built with PostgreSQL acceleration support enabled"))]
     PostgresFeatureNotEnabled,
 
     #[cfg(feature = "turso")]
@@ -327,7 +327,7 @@ async fn acceleration_connection(
         }
         #[cfg(not(feature = "sqlite"))]
         Engine::Sqlite => SqliteFeatureNotEnabledSnafu.fail(),
-        #[cfg(feature = "postgres")]
+        #[cfg(feature = "postgres-accel")]
         Engine::PostgreSQL => {
             let secret_map = to_secret_map(acceleration_settings.params.clone());
 
@@ -337,7 +337,7 @@ async fn acceleration_connection(
 
             Ok(AccelerationConnection::Postgres(pool))
         }
-        #[cfg(not(feature = "postgres"))]
+        #[cfg(not(feature = "postgres-accel"))]
         Engine::PostgreSQL => PostgresFeatureNotEnabledSnafu.fail(),
 
         #[cfg(feature = "turso")]

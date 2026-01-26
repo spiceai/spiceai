@@ -34,7 +34,7 @@ on:
 jobs:
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -121,7 +121,7 @@ jobs:
         with:
           method: network
           sub-packages: '[]'
-          cuda: '12.4.1'
+          cuda: '12.6.0'
           use-github-cache: false
           use-local-cache: false
 

@@ -1322,11 +1322,9 @@ impl CayenneTableProvider {
     ) -> CatalogResult<(u64, usize)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
-        use tokio::sync::Semaphore;
 
         // Bounded parallelism: configurable concurrent writes to optimize I/O
-        let upload_concurrency = self.context.upload_concurrency();
-        let semaphore = Arc::new(Semaphore::new(upload_concurrency));
+        let semaphore = Arc::clone(self.context.upload_semaphore());
 
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");
@@ -1539,7 +1537,6 @@ impl CayenneTableProvider {
     ) -> CatalogResult<(u64, usize)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
-        use tokio::sync::Semaphore;
 
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
@@ -1556,8 +1553,7 @@ impl CayenneTableProvider {
         )?;
 
         // Bounded parallelism: configurable concurrent writes to optimize I/O
-        let upload_concurrency = self.context.upload_concurrency();
-        let semaphore = Arc::new(Semaphore::new(upload_concurrency));
+        let semaphore = Arc::clone(self.context.upload_semaphore());
 
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");

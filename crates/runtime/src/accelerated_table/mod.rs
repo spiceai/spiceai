@@ -325,6 +325,7 @@ pub struct Builder {
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
 }
 
 impl Builder {
@@ -366,8 +367,17 @@ impl Builder {
             caching_stale_if_error: false,
             resource_monitor: None,
             bootstrap_status: BootstrapStatus::none(),
+            acceleration_layout: None,
             is_s3_express_acceleration: false,
         }
+    }
+
+    pub fn acceleration_layout(
+        &mut self,
+        layout: runtime_acceleration::snapshot::AccelerationLayout,
+    ) -> &mut Self {
+        self.acceleration_layout = Some(layout);
+        self
     }
 
     pub fn retention(&mut self, retention: Option<Retention>) -> &mut Self {
@@ -579,14 +589,51 @@ impl Builder {
                 }
 
                 let schema = self.accelerator.schema();
-                let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
-                    !get_primary_keys_from_constraints(constraints, &schema).is_empty()
-                });
+                let primary_keys = self
+                    .accelerator
+                    .constraints()
+                    .map_or_else(Vec::new, |constraints| {
+                        get_primary_keys_from_constraints(constraints, &schema)
+                    });
+                let has_primary_key = !primary_keys.is_empty();
                 let has_time_column = self.refresh.time_column.is_some();
                 let has_append_stream = self.append_stream.is_some();
 
                 let append_mode =
                     AppendMode::try_new(has_time_column, has_primary_key, has_append_stream)?;
+
+                // Log append mode configuration for debugging
+                match (has_primary_key, has_time_column, has_append_stream) {
+                    (_, _, true) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            "Append mode: using changes stream"
+                        );
+                    }
+                    (true, true, false) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            ?primary_keys,
+                            "Append mode: using time_column for incremental queries and primary_key for deduplication"
+                        );
+                    }
+                    (true, false, false) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            ?primary_keys,
+                            "Append mode: using primary_key for deduplication (full fetch each refresh)"
+                        );
+                    }
+                    (false, true, false) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            "Append mode: using time_column for incremental queries"
+                        );
+                    }
+                    (false, false, false) => {
+                        // This case is handled by AppendMode::try_new returning an error
+                    }
+                }
 
                 match append_mode {
                     AppendMode::ChangesStream => {
@@ -723,6 +770,17 @@ impl Builder {
             handlers.push(retention_check_handle);
         }
 
+        // Spawn size metrics task for file-based accelerators
+        if let Some(ref layout) = self.acceleration_layout
+            && layout.is_enabled()
+        {
+            let size_metrics_handle = tokio::spawn(AcceleratedTable::start_size_metrics_task(
+                self.dataset_name.clone(),
+                layout.clone(),
+            ));
+            handlers.push(size_metrics_handle);
+        }
+
         // If the table should be ready immediately, mark it as ready.
         if self.ready_state == ReadyState::OnRegistration {
             self.runtime_status
@@ -825,6 +883,21 @@ impl AcceleratedTable {
             refresh,
             io_runtime,
         )
+    }
+
+    /// Periodically emits the `dataset_acceleration_size_bytes` metric for file-based accelerators.
+    pub(crate) async fn start_size_metrics_task(
+        dataset_name: TableReference,
+        layout: runtime_acceleration::snapshot::AccelerationLayout,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            interval.tick().await;
+
+            let size = layout.total_size();
+            metrics::SIZE_BYTES.record(size, &[KeyValue::new("dataset", dataset_name.to_string())]);
+        }
     }
 
     #[must_use]

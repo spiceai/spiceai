@@ -167,7 +167,7 @@ impl DataConnectorFactory for DremioFactory {
                     .cloned()
                     .unwrap_or("".into()),
             );
-            let flight_client = FlightClient::try_new(endpoint, credentials, None)
+            let flight_client = FlightClient::try_new(endpoint, credentials, None, None)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
