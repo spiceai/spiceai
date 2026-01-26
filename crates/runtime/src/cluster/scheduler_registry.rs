@@ -35,6 +35,7 @@ use url::Url;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::Runtime;
+use crate::metrics::cluster as cluster_metrics;
 
 const CLUSTER_SCHEMA_VERSION: u32 = 1;
 const SCHEDULER_SCHEMA_VERSION: u32 = 1;
@@ -387,6 +388,10 @@ impl SchedulerRegistryRunner {
         }
 
         *peers = records;
+
+        // Record cluster scheduler count metric
+        cluster_metrics::set_scheduler_count(&self.scheduler_id, peers.len() as u64);
+
         Ok(())
     }
 

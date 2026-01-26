@@ -39,7 +39,6 @@ use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
-use ballista_executor::metrics::LoggingMetricsCollector;
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process;
@@ -339,11 +338,14 @@ fn update_scheduler_pollers(
 
 mod control_stream_client;
 pub mod datafusion;
+mod executor_registry;
+pub mod metrics_collector;
 mod scheduler_registry;
 mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
+pub use executor_registry::ExecutorRegistry;
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -705,26 +707,6 @@ pub async fn initialize_cluster_executor(
 
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
     let tls_enabled = client_tls_config.is_some();
-    let config_producer_tls = client_tls_config.clone();
-
-    // Configure executor session config - shuffle_memory_mode will be set after we fetch the app definition
-    let config_producer: ConfigProducer = Arc::new(move || {
-        let mut config = SessionConfig::new_with_ballista()
-            .with_option_extension(SpiceClusterConfig::default())
-            .with_ballista_use_tls(tls_enabled)
-            // Use 100MB max message size to match other gRPC configurations in the codebase.
-            // The default Ballista config is 16MB which is too small for shuffle operations
-            // with large batches.
-            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024);
-
-        if let Some(tls_config) = config_producer_tls.clone() {
-            config = config.with_ballista_override_create_grpc_client_endpoint({
-                Arc::new(move |ep| ep.tls_config(tls_config.clone()).boxed())
-            });
-        }
-
-        config
-    });
 
     // Generate executor_id early so we can use it for both the app definition request and executor registration
     let executor_id = Uuid::new_v4().to_string();
@@ -908,7 +890,7 @@ pub async fn initialize_cluster_executor(
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
         // flight service - use advertise address for scheduler to contact this executor
-        host: Some(advertise_host),
+        host: Some(advertise_host.clone()),
         port: u32::from(advertise_port),
         // grpc_port is used only for push mode, and not initialized for pull mode (default)
         grpc_port: 0,
@@ -919,13 +901,49 @@ pub async fn initialize_cluster_executor(
         }),
     };
 
+    // Use advertise address as node_id for metrics
+    let metrics_node_id = format!("{advertise_host}:{advertise_port}");
+
+    // Configure executor session config with shuffle locality metrics callback
+    let config_producer_tls = client_tls_config.clone();
+    let config_producer_node_id = metrics_node_id.clone();
+    let config_producer: ConfigProducer = Arc::new(move || {
+        let mut config = SessionConfig::new_with_ballista()
+            .with_option_extension(SpiceClusterConfig::default())
+            .with_ballista_use_tls(tls_enabled)
+            // Use 100MB max message size to match other gRPC configurations in the codebase.
+            // The default Ballista config is 16MB which is too small for shuffle operations
+            // with large batches.
+            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024)
+            // Enable shuffle locality metrics callback to track local vs remote shuffle reads
+            .with_ballista_shuffle_read_metrics_callback(
+                metrics_collector::OtelShuffleReadMetricsCallback::new_arc(
+                    config_producer_node_id.clone(),
+                ),
+            );
+
+        if let Some(tls_config) = config_producer_tls.clone() {
+            config = config.with_ballista_override_create_grpc_client_endpoint({
+                Arc::new(move |ep| ep.tls_config(tls_config.clone()).boxed())
+            });
+        }
+
+        config
+    });
+
+    let metrics_collector =
+        metrics_collector::OtelExecutorMetricsCollector::new(metrics_node_id.clone());
+
+    // Record task slots capacity for utilization metrics
+    crate::metrics::cluster::set_executor_task_slots(&metrics_node_id, u64::from(concurrent_tasks));
+
     let executor = Arc::new(Executor::new(
         executor_meta,
         &work_dir,
         runtime_producer,
         config_producer,
         Arc::new(BallistaFunctionRegistry::default()),
-        Arc::new(LoggingMetricsCollector::default()),
+        Arc::new(metrics_collector),
         concurrent_tasks as usize,
         None,
     ));
@@ -962,13 +980,18 @@ pub async fn initialize_cluster_executor(
     let control_stream_executor_id = executor_advertise_id;
     let control_stream_tls_config = client_tls_config.clone();
     let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
+    let control_stream_metrics_reader = rt.metrics_reader().cloned();
 
     let poll_manager = tokio::spawn(async move {
         let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
         let mut known_schedulers: HashSet<String> = HashSet::new();
 
-        let mut control_stream_manager =
-            ControlStreamManager::new(control_stream_executor_id, control_stream_tls_config);
+        // Initialize control stream manager for metrics collection
+        let mut control_stream_manager = ControlStreamManager::new(
+            control_stream_executor_id,
+            control_stream_tls_config,
+            control_stream_metrics_reader,
+        );
 
         let mut current_addresses = initial_scheduler_addresses_for_manager;
         if current_addresses.is_empty() {
@@ -1007,7 +1030,9 @@ pub async fn initialize_cluster_executor(
                     );
                     continue;
                 }
+                // Update control streams with new scheduler membership
                 control_stream_manager.update_schedulers(addresses.clone());
+
                 update_scheduler_pollers(
                     &mut pollers,
                     &mut known_schedulers,
@@ -1112,6 +1137,16 @@ async fn create_scheduler_server(
         BallistaShuffleFormat::ArrowIpc
     };
 
+    // Create metrics collector with the scheduler's advertise address as node_id
+    let metrics_node_id = rt
+        .df
+        .cluster_config
+        .scheduler_url_string()
+        .map_or_else(|| bind_addr.to_string(), ToString::to_string);
+    let scheduler_metrics_collector = Arc::new(
+        metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id),
+    );
+
     let scheduler_config = SchedulerConfig {
         bind_host: bind_addr.ip().to_string(),
         bind_port: bind_addr.port(),
@@ -1150,6 +1185,7 @@ async fn create_scheduler_server(
             )
         })),
         override_create_grpc_client_endpoint,
+        override_metrics_collector: Some(scheduler_metrics_collector),
         ..Default::default()
     };
 

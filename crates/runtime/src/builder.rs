@@ -17,6 +17,7 @@ limitations under the License.
 use crate::cluster::ResolvedClusterConfig;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
+use crate::metrics_reader::MetricsReader;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -49,6 +50,7 @@ pub struct RuntimeBuilder {
     datasets_health_monitor_enabled: bool,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    metrics_reader: Option<MetricsReader>,
     runtime_status: Arc<status::RuntimeStatus>,
     rate_limits: Option<Arc<RateLimits>>,
     io_runtime: Option<Handle>,
@@ -68,6 +70,7 @@ impl RuntimeBuilder {
             datasets_health_monitor_enabled: false,
             metrics_endpoint: None,
             prometheus_registry: None,
+            metrics_reader: None,
             autoload_extensions: HashMap::new(),
             runtime_status: status::RuntimeStatus::new(),
             rate_limits: None,
@@ -154,6 +157,16 @@ impl RuntimeBuilder {
         resolved_cluster_config: ResolvedClusterConfig,
     ) -> Self {
         self.resolved_cluster_config = Some(resolved_cluster_config);
+        self
+    }
+
+    /// Sets the metrics reader for on-demand OTLP metrics collection in cluster mode.
+    ///
+    /// This reader is used by:
+    /// - `GetMetrics` RPC to return local metrics to peer schedulers
+    /// - Executors responding to metrics requests from schedulers via control stream
+    pub fn with_metrics_reader(mut self, metrics_reader: MetricsReader) -> Self {
+        self.metrics_reader = Some(metrics_reader);
         self
     }
 
@@ -292,6 +305,7 @@ impl RuntimeBuilder {
             datasets_health_monitor,
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
+            metrics_reader: self.metrics_reader,
             rate_limits: self.rate_limits.unwrap_or_default(),
             io_runtime,
             status: self.runtime_status,

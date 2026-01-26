@@ -20,8 +20,16 @@ service ClusterService {
     // Called by executors during initialization.
     rpc GetSchedulers(GetSchedulersRequest) returns (GetSchedulersResponse);
 
+    // Query task history from this scheduler.
+    // Used for federated task history queries across the cluster.
+    rpc GetTaskHistory(GetTaskHistoryRequest) returns (GetTaskHistoryResponse);
+
+    // Get OTLP metrics from this scheduler.
+    // Used for cluster-wide metrics collection.
+    rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+
     // Bidirectional control stream for executor-scheduler communication.
-    // Initiated by executors, used for liveness tracking.
+    // Initiated by executors, allows schedulers to request metrics on-demand.
     rpc ControlStream(stream ExecutorControlMessage) returns (stream SchedulerControlMessage);
 }
 
@@ -62,21 +70,61 @@ message GetSchedulersResponse {
     repeated SchedulerInstance schedulers = 1;
 }
 
+// Request message for GetTaskHistory RPC.
+message GetTaskHistoryRequest {
+    // SQL query to execute against the local task_history table.
+    string sql = 1;
+}
+
+// Response message for GetTaskHistory RPC.
+message GetTaskHistoryResponse {
+    // Arrow IPC-encoded RecordBatch containing the query results.
+    bytes arrow_ipc = 1;
+}
+
+// Request message for GetMetrics RPC.
+message GetMetricsRequest {}
+
+// Response message for GetMetrics RPC.
+message GetMetricsResponse {
+    // OTLP ExportMetricsServiceRequest protobuf-encoded metrics.
+    bytes otlp_metrics = 1;
+}
+
 // Message sent from executor to scheduler on the control stream.
 message ExecutorControlMessage {
     // Executor's advertise address (used as identifier).
     string executor_id = 1;
     oneof message {
         ExecutorHeartbeat heartbeat = 2;
+        MetricsResponse metrics = 3;
     }
 }
 
 // Message sent from scheduler to executor on the control stream.
-message SchedulerControlMessage {}
+message SchedulerControlMessage {
+    oneof message {
+        MetricsRequest request_metrics = 1;
+    }
+}
 
 // Heartbeat message sent by executor to scheduler.
 message ExecutorHeartbeat {
     int64 timestamp_ms = 1;
+}
+
+// Request for metrics from an executor.
+message MetricsRequest {
+    // Unique identifier for this request, used to correlate responses.
+    string request_id = 1;
+}
+
+// Metrics response from an executor.
+message MetricsResponse {
+    // Request ID this response corresponds to.
+    string request_id = 1;
+    // OTLP ExportMetricsServiceRequest protobuf-encoded metrics.
+    bytes otlp_metrics = 2;
 }
 
 // Physical plan
