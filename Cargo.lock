@@ -3747,7 +3747,7 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
 name = "connector-clickhouse"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "clickhouse-rs",
@@ -3766,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "connector-databricks"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -3786,7 +3786,7 @@ dependencies = [
 
 [[package]]
 name = "connector-delta-lake"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -3802,7 +3802,7 @@ dependencies = [
 
 [[package]]
 name = "connector-dremio"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3820,7 +3820,7 @@ dependencies = [
 
 [[package]]
 name = "connector-duckdb"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -3835,7 +3835,7 @@ dependencies = [
 
 [[package]]
 name = "connector-flightsql"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3851,7 +3851,7 @@ dependencies = [
 
 [[package]]
 name = "connector-ftp"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "linkme",
  "paste",
@@ -3863,7 +3863,7 @@ dependencies = [
 
 [[package]]
 name = "connector-graphql"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -3878,7 +3878,7 @@ dependencies = [
 
 [[package]]
 name = "connector-imap"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -3894,7 +3894,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mongodb"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -3910,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mssql"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -3924,7 +3924,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mysql"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3954,7 +3954,7 @@ dependencies = [
 
 [[package]]
 name = "connector-odbc"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -3969,7 +3969,7 @@ dependencies = [
 
 [[package]]
 name = "connector-oracle"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3985,7 +3985,7 @@ dependencies = [
 
 [[package]]
 name = "connector-postgres"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -3999,7 +3999,7 @@ dependencies = [
 
 [[package]]
 name = "connector-scylladb"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4017,7 +4017,7 @@ dependencies = [
 
 [[package]]
 name = "connector-sftp"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "linkme",
  "paste",
@@ -4029,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "connector-sharepoint"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "connector-smb"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "linkme",
  "paste",
@@ -4057,7 +4057,7 @@ dependencies = [
 
 [[package]]
 name = "connector-snowflake"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4074,7 +4074,7 @@ dependencies = [
 
 [[package]]
 name = "connector-spark"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "data_components",
@@ -14952,7 +14952,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-api-types"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "serde",
  "serde_json",

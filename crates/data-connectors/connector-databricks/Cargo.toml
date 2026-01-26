@@ -40,3 +40,4 @@ tracing.workspace = true
 
 [features]
 default = []
+spark = []

@@ -49,7 +49,9 @@ use runtime::token_providers::databricks::{
     AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
 use runtime_secrets::get_params_with_secrets;
-use secrecy::{ExposeSecret, SecretString};
+#[cfg(feature = "spark")]
+use secrecy::ExposeSecret;
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -873,6 +875,7 @@ fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReferen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     #[test]
     fn test_build_auth_credentials_token_only() {
