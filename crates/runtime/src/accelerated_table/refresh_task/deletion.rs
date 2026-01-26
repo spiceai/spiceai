@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -100,13 +100,9 @@ fn balanced_or(conditions: Vec<Expr>) -> Option<Expr> {
         ),
         _ => {
             let mid = conditions.len() / 2;
-            let (left, right): (Vec<_>, Vec<_>) = conditions
-                .into_iter()
-                .enumerate()
-                .partition(|(i, _)| *i < mid);
-
-            let left_exprs: Vec<Expr> = left.into_iter().map(|(_, e)| e).collect();
-            let right_exprs: Vec<Expr> = right.into_iter().map(|(_, e)| e).collect();
+            let (left_exprs, right_exprs) = conditions.split_at(mid);
+            let left_exprs = left_exprs.to_vec();
+            let right_exprs = right_exprs.to_vec();
 
             match (balanced_or(left_exprs), balanced_or(right_exprs)) {
                 (Some(l), Some(r)) => Some(l.or(r)),
