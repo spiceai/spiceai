@@ -94,32 +94,32 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 
 ### Data Query and Analytics
 
-| Feature                          | **Spice**                              | Trino / Presto       | Dremio                | ClickHouse          | Materialize          |
-| -------------------------------- | -------------------------------------- | -------------------- | --------------------- | ------------------- | -------------------- |
-| **Primary Use-Case**             | Data & AI apps/agents                  | Big data analytics   | Interactive analytics | Real-time analytics | Real-time analytics  |
-| **Primary deployment model**     | Sidecar                                | Cluster              | Cluster               | Cluster             | Cluster              |
-| **Federated Query Support**      | ✅                                     | ✅                   | ✅                    | ―                   | ―                    |
+| Feature                          | **Spice**                             | Trino / Presto       | Dremio                | ClickHouse          | Materialize         |
+| -------------------------------- | ------------------------------------- | -------------------- | --------------------- | ------------------- | ------------------- |
+| **Primary Use-Case**             | Data & AI apps/agents                 | Big data analytics   | Interactive analytics | Real-time analytics | Real-time analytics |
+| **Primary deployment model**     | Sidecar                               | Cluster              | Cluster               | Cluster             | Cluster             |
+| **Federated Query Support**      | ✅                                     | ✅                    | ✅                     | ―                   | ―                   |
 | **Acceleration/Materialization** | ✅ (Arrow, SQLite, DuckDB, PostgreSQL) | Intermediate storage | Reflections (Iceberg) | Materialized views  | ✅ (Real-time views) |
-| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue)  | ✅                   | ✅                    | ―                   | ―                    |
-| **Query Result Caching**         | ✅                                     | ✅                   | ✅                    | ✅                  | Limited              |
-| **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP)                       | ―                    | ―                     | ―                   | ―                    |
+| **Catalog Support**              | ✅ (Iceberg, Unity Catalog, AWS Glue)  | ✅                    | ✅                     | ―                   | ―                   |
+| **Query Result Caching**         | ✅                                     | ✅                    | ✅                     | ✅                   | Limited             |
+| **Multi-Modal Acceleration**     | ✅ (OLAP + OLTP)                       | ―                    | ―                     | ―                   | ―                   |
 | **Change Data Capture (CDC)**    | ✅ (Debezium)                          | ―                    | ―                     | ―                   | ✅ (Debezium)        |
 
 ### AI Apps and Agents
 
-| Feature                       | **Spice**                                | LangChain          | LlamaIndex | AgentOps.ai      | Ollama                        |
-| ----------------------------- | ---------------------------------------- | ------------------ | ---------- | ---------------- | ----------------------------- |
-| **Primary Use-Case**          | Data & AI apps                           | Agentic workflows  | RAG apps   | Agent operations | LLM apps                      |
-| **Programming Language**      | Any language (HTTP interface)            | JavaScript, Python | Python     | Python           | Any language (HTTP interface) |
+| Feature                       | **Spice**                               | LangChain          | LlamaIndex | AgentOps.ai      | Ollama                        |
+| ----------------------------- | --------------------------------------- | ------------------ | ---------- | ---------------- | ----------------------------- |
+| **Primary Use-Case**          | Data & AI apps                          | Agentic workflows  | RAG apps   | Agent operations | LLM apps                      |
+| **Programming Language**      | Any language (HTTP interface)           | JavaScript, Python | Python     | Python           | Any language (HTTP interface) |
 | **Unified Data + AI Runtime** | ✅                                       | ―                  | ―          | ―                | ―                             |
 | **Federated Data Query**      | ✅                                       | ―                  | ―          | ―                | ―                             |
 | **Accelerated Data Access**   | ✅                                       | ―                  | ―          | ―                | ―                             |
-| **Tools/Functions**           | ✅ (MCP HTTP+SSE)                        | ✅                 | ✅         | Limited          | Limited                       |
-| **LLM Memory**                | ✅                                       | ✅                 | ―          | ✅               | ―                             |
+| **Tools/Functions**           | ✅ (MCP HTTP+SSE)                        | ✅                  | ✅          | Limited          | Limited                       |
+| **LLM Memory**                | ✅                                       | ✅                  | ―          | ✅                | ―                             |
 | **Evaluations (Evals)**       | ✅                                       | Limited            | ―          | Limited          | ―                             |
-| **Hybrid Search**             | ✅ (Keyword, Vector, & Full-Text-Search) | ✅                 | ✅         | Limited          | Limited                       |
+| **Hybrid Search**             | ✅ (Keyword, Vector, & Full-Text-Search) | ✅                  | ✅          | Limited          | Limited                       |
 | **Caching**                   | ✅ (Query and results caching)           | Limited            | ―          | ―                | ―                             |
-| **Embeddings**                | ✅ (Built-in & pluggable models/DBs)     | ✅                 | ✅         | Limited          | ―                             |
+| **Embeddings**                | ✅ (Built-in & pluggable models/DBs)     | ✅                  | ✅          | Limited          | ―                             |
 
 ✅ = Fully supported
 ❌ = Not supported
@@ -189,6 +189,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `abfs`                             | Azure BlobFS                          | Alpha             | Parquet, CSV                 |
 | `clickhouse`                       | Clickhouse                            | Alpha             |                              |
 | `debezium`                         | Debezium CDC                          | Alpha             | Kafka + JSON                 |
+| `gcs`, `gs`                        | [Google Cloud Storage][gcs]           | Alpha             | Parquet, CSV, JSON           |
 | `kafka`                            | Kafka                                 | Alpha             | Kafka + JSON                 |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `glue`                             | [AWS Glue][glue]                      | Alpha             | Iceberg, Parquet, CSV        |
@@ -203,6 +204,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 [databricks]: https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md
 [spark]: https://spark.apache.org/docs/latest/spark-connect-overview.html
+[gcs]: docs/features/gcs-connector.md
 [s3]: https://github.com/spiceai/cookbook/tree/trunk/s3#readme
 [spiceai]: https://github.com/spiceai/cookbook/tree/trunk/spiceai#readme
 [dremio]: https://github.com/spiceai/cookbook/tree/trunk/dremio#readme

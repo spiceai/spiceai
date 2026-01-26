@@ -4,7 +4,7 @@
 
 Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and agents. Provides federated SQL querying, data acceleration/materialization, search (vector, keyword, full-text), and AI inference via industry-standard APIs.
 
-**Architecture**: Go CLI (`bin/spice`) + Rust runtime daemon (`bin/spiced`). Built on Apache DataFusion, Arrow, and DuckDB.
+**Architecture**: Rust CLI (`bin/spice`) + Rust runtime daemon (`bin/spiced`). Built on Apache DataFusion, Arrow, and DuckDB.
 
 **Core Principle**: Developer Experience First — Bring data and AI/ML to your application, not the other way around.
 
@@ -347,7 +347,7 @@ fn process_data(data: &Arc<RecordBatch>) { ... }
 ### Binary Targets
 
 - `bin/spiced/` - Runtime daemon (Rust)
-- `bin/spice/` - CLI (Go)
+- `bin/spice/` - CLI (Rust)
 
 ### Core Crates
 
@@ -390,85 +390,6 @@ testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrenc
 - **NEVER manually edit snapshot files** (`.snap` files): Always use Insta to generate them
 - Run tests with `INSTA_UPDATE=1` to regenerate snapshots: `INSTA_UPDATE=1 cargo test`
 - Review generated snapshots carefully before accepting
-
-## Dependency Management
-
-### Minimize External Dependencies
-
-**Principle**: Prefer fewer, well-maintained dependencies over convenience. External crates add supply chain risk, maintenance burden, and potential security vulnerabilities.
-
-**Exception - Test Dependencies**: External crates for testing (e.g., `insta`, `proptest`, `criterion`, `test-case`) are fine and preferred. Use `[dev-dependencies]` freely to improve test quality and coverage.
-
-**Core/Allowed Dependencies** (actively maintained, widely used, foundational):
-
-- **Arrow ecosystem**: `arrow`, `parquet`, `arrow-flight`, `arrow-schema`, `arrow-array`
-- **DataFusion ecosystem**: `datafusion`, `datafusion-*` crates
-- **Ballista**: Distributed compute
-- **Delta Lake**: `delta_kernel`, `deltalake`
-- **Async runtime**: `tokio`, `futures`, `async-trait`
-- **Serialization**: `serde`, `serde_json`
-- **Error handling**: `snafu`, `thiserror`
-- **Logging/Tracing**: `tracing`, `tracing-subscriber`
-- **Database drivers**: Official/well-maintained drivers (e.g., `tokio-postgres`, `mysql_async`, `duckdb`)
-- **Cloud SDKs**: Official AWS/GCP/Azure SDKs
-- **HTTP**: `reqwest`, `hyper`, `axum`, `tonic`
-- **Search**: `tantivy`
-- **LLM inference**: `mistralrs`, `llama-cpp-2` (llama.cpp bindings)
-
-### When to Implement vs. Depend
-
-**Implement yourself when the external crate has**:
-
-- Less than 100K total downloads on crates.io
-- No updates in the last 12 months
-- Fewer than 3 maintainers or unclear maintenance status
-- Excessive transitive dependencies for simple functionality
-- Only partial functionality needed (use 10% of a large crate)
-
-**Before adding a new dependency, ask**:
-
-1. Can this be implemented in <150 lines of code? → Implement it
-2. Is this a one-time or rarely-used feature? → Implement it
-3. Does the crate pull in >5 transitive dependencies for simple functionality? → Implement it
-4. Is there an existing dependency that already provides this? → Use existing
-5. Is this a core, complex domain (crypto, compression, parsing)? → Use well-vetted crate
-
-**When implementing replacements**:
-
-- **Prefer OS-level APIs**: Use platform APIs consistent across Linux and macOS (e.g., environment variables, POSIX APIs) over external crates
-- **Place in common location**: Add implementations to the `util` crate (`crates/util/src/`) so they can be reused across the project
-- **Comprehensive unit tests**: Include tests for all edge cases (empty inputs, Unicode, boundary values, special characters, error conditions)
-- **No replacement comments**: Don't document which external crate is being replaced in module docs
-
-```rust
-// GOOD - simple functionality, implement yourself
-fn truncate_string(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len { s } else { &s[..max_len] }
-}
-
-// GOOD - use existing dependency (serde already in deps)
-use serde::Deserialize;
-
-// BAD - adding a crate for trivial functionality
-// Cargo.toml: string-utils = "0.1"  // Don't do this
-```
-
-### Dependency Hygiene
-
-- **Audit dependencies regularly**: Use `cargo deny` and `cargo audit`
-- **Pin versions carefully**: Use exact versions or tight ranges for stability
-- **Prefer `optional` dependencies**: Gate heavy dependencies behind feature flags
-- **Check before adding**: Review crates.io download stats, GitHub activity, issue responsiveness, and [blessed.rs](https://blessed.rs) for crate recommendations
-- **Document why**: Add a comment in Cargo.toml for non-obvious dependencies
-
-```toml
-# GOOD - documented non-obvious dependency
-# Used for X.509 certificate parsing in TLS connector
-x509-parser = "0.15"
-
-# GOOD - optional heavy dependency
-duckdb = { version = "1.0", optional = true }
-```
 
 ## Feature Flags
 
@@ -573,7 +494,6 @@ export PATH="$PATH:$HOME/.spice/bin"
 7. Ensure clippy passes
 8. Add to Makefile lint targets
 9. Ensure no blocking ops in async context (`spawn_blocking` or `rayon`)
-10. New files use the current year only (e.g., `Copyright 2026`); updated files use a range ending in the current year (e.g., `Copyright 2024-2026`)
 
 ## References
 
