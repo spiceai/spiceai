@@ -176,15 +176,15 @@ pub fn create_periodic_snapshot_callback(
                 let last_updated_at = Arc::clone(&last_updated_at);
 
                 Box::pin(async move {
-                    // Only count batches after the dataset is ready
-                    if !dataset_ready.load(Ordering::Acquire) {
-                        return;
-                    }
-
                     let mut batches_processed_value = batches_processed.write().await;
 
                     *batches_processed_value += 1;
                     if *batches_processed_value >= batches {
+                        // Only create snapshot if runtime is ready
+                        if !dataset_ready.load(Ordering::Acquire) {
+                            return;
+                        }
+
                         *batches_processed_value = 0;
 
                         create_checkpoint_and_snapshot(
