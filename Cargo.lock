@@ -2450,7 +2450,7 @@ dependencies = [
  "regex",
  "rustc-hash 1.1.0",
  "shlex",
- "syn 2.0.111",
+ "syn 2.0.114",
  "which",
 ]
 
@@ -18933,7 +18933,7 @@ checksum = "db3c926b4dd58d6d220aeb6d49b9a645adeea344cd9777cff9ca5908e40abd7d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.111",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -18947,15 +18947,15 @@ dependencies = [
  "genawaiter",
  "http 1.4.0",
  "libc",
- "prost 0.14.1",
+ "prost 0.14.3",
  "roaring",
  "serde",
  "serde_json",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
  "tracing",
  "turso_core",
  "turso_parser",
- "uuid 1.18.1",
+ "uuid 1.20.0",
 ]
 
 [[package]]
