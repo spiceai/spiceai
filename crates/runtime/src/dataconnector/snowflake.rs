@@ -69,6 +69,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("username").secret(),
     ParameterSpec::component("password").secret(),
     ParameterSpec::component("private_key_path").secret(),
+    ParameterSpec::component("private_key").secret(),
     ParameterSpec::component("private_key_passphrase").secret(),
     ParameterSpec::component("account").secret(),
     ParameterSpec::component("warehouse").secret(),

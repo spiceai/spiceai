@@ -19,6 +19,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion_execution::config::SessionConfig;
+use tokio::sync::Semaphore;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexFormat, VortexOptions};
 use vortex_session::VortexSession;
@@ -44,6 +45,8 @@ pub struct CayenneContext {
     config: VortexConfig,
     /// Session configuration for `DataFusion` listing options.
     session_config: SessionConfig,
+    /// Shared semaphore for limiting concurrent file writes / uploads across all partitions.
+    upload_semaphore: Arc<Semaphore>,
 }
 
 impl CayenneContext {
@@ -59,6 +62,7 @@ impl CayenneContext {
             vortex_format,
             config: config.clone(),
             session_config: SessionConfig::default(),
+            upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency)),
         })
     }
 
@@ -104,6 +108,12 @@ impl CayenneContext {
     #[must_use]
     pub fn upload_concurrency(&self) -> usize {
         self.config.upload_concurrency.max(1)
+    }
+
+    /// Get the shared semaphore for limiting concurrent file writes / uploads.
+    #[must_use]
+    pub fn upload_semaphore(&self) -> &Arc<Semaphore> {
+        &self.upload_semaphore
     }
 
     /// Create a `VortexFormat` from configuration.

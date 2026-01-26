@@ -153,7 +153,7 @@ impl IcebergCatalog {
     }
 }
 
-pub const ICEBERG_PARAM_LEN: usize = 17;
+pub const ICEBERG_PARAM_LEN: usize = 22;
 pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
@@ -211,7 +211,21 @@ pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
         .description("The Amazon Resource Name (ARN) of the role to assume. If provided instead of s3_access_key_id and s3_secret_access_key, temporary credentials will be fetched by assuming this role")
         .secret(),
     ParameterSpec::component("s3_connect_timeout")
-        .description("Configure socket connection timeout, in seconds (default: 60).")
+        .description("Configure socket connection timeout, in seconds (default: 60)."),
+
+    // GCS storage options
+    ParameterSpec::component("gcs_project_id")
+        .description("The Google Cloud project ID for GCS storage."),
+    ParameterSpec::component("gcs_credentials")
+        .description("Base64-encoded Google Cloud service account credentials JSON for GCS storage.")
+        .secret(),
+    ParameterSpec::component("gcs_token")
+        .description("OAuth2 token to use for GCS authentication.")
+        .secret(),
+    ParameterSpec::component("gcs_service_path")
+        .description("Custom endpoint URL for GCS (for emulators or custom endpoints)."),
+    ParameterSpec::component("gcs_no_auth")
+        .description("Set to 'true' to allow anonymous access to GCS (for public buckets)."),
 ];
 
 /// Maps a Spice parameter name to an Iceberg property name.
@@ -247,6 +261,12 @@ pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<Str
         "sigv4_enabled" => Some(vec!["rest.sigv4-enabled".to_string()]),
         "signing_region" => Some(vec!["rest.signing-region".to_string()]),
         "signing_name" => Some(vec!["rest.signing-name".to_string()]),
+        // GCS storage options
+        "gcs_project_id" => Some(vec!["gcs.project-id".to_string()]),
+        "gcs_credentials" => Some(vec!["gcs.credentials-json".to_string()]),
+        "gcs_token" => Some(vec!["gcs.oauth2.token".to_string()]),
+        "gcs_service_path" => Some(vec!["gcs.service.path".to_string()]),
+        "gcs_no_auth" => Some(vec!["gcs.no-auth".to_string()]),
         _ => None,
     }
 }
@@ -326,6 +346,8 @@ impl CatalogConnector for IcebergCatalog {
         if catalog_id.starts_with("file://")
             || catalog_id.starts_with("s3://")
             || catalog_id.starts_with("s3a://")
+            || catalog_id.starts_with("gs://")
+            || catalog_id.starts_with("gcs://")
         {
             return IcebergCatalog::load_hadoop_catalog(
                 props,
