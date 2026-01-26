@@ -2345,6 +2345,94 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
         .await
 }
 
+/// Test that query parameters in different orders both work correctly.
+///
+/// This test verifies that both `q=michael&page=1` and `page=1&q=michael` return data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::cache=trace",
+    ));
+
+    test_request_context()
+        .scope(async {
+            // Create HTTP dataset with caching mode
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/people".to_string(),
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_param_order")
+                .with_dataset(dataset)
+                .build();
+
+            // Disable SQL results caching
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // Query with params in one order
+            let df1 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("q=michael&page=1")))?
+                .select(vec![col("content")])?;
+
+            let batches1 = df1.collect().await?;
+            assert_column_has_data(&batches1, "content");
+
+            // Query with params in different order
+            let df2 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/people")))?
+                .filter(col("request_query").eq(lit("page=1&q=michael")))?
+                .select(vec![col("content")])?;
+
+            let batches2 = df2.collect().await?;
+            assert_column_has_data(&batches2, "content");
+
+            Ok(())
+        })
+        .await
+}
+
 /// Asserts that the specified column in the given record batches contains non-empty string data.
 fn assert_column_has_data(batches: &[arrow::array::RecordBatch], column_name: &str) {
     assert!(!batches.is_empty(), "expected at least one batch");
