@@ -105,7 +105,16 @@ message ExecutorControlMessage {
 message SchedulerControlMessage {
     oneof message {
         MetricsRequest request_metrics = 1;
+        PollNowCommand poll_now = 2;
     }
+}
+
+// Command sent from scheduler to executor to immediately poll for new work.
+// This allows the scheduler to notify executors when new tasks are available,
+// reducing latency compared to waiting for the next poll interval.
+message PollNowCommand {
+    // Optional reason for the immediate poll (for debugging/logging).
+    string reason = 1;
 }
 
 // Heartbeat message sent by executor to scheduler.
