@@ -39,9 +39,13 @@ use tokio::sync::RwLock;
 
 use crate::accelerated_table::{AcceleratedTable, Retention};
 
+pub mod federated;
 pub mod otel_exporter;
 
 pub const DEFAULT_TASK_HISTORY_TABLE: &str = "task_history";
+/// Internal table name for the local (non-federated) task history table.
+/// Used by cluster RPC handlers to query local data without triggering federated fan-out.
+pub const LOCAL_TASK_HISTORY_TABLE: &str = "local_task_history";
 pub const DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS: u64 = 8 * 60 * 60; // 8 hours
 pub const DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS: u64 = 15 * 60; // 15 minutes
 
@@ -75,6 +79,10 @@ pub(crate) struct TaskSpan {
     pub(crate) execution_duration_ms: f64,
     pub(crate) error_message: Option<Arc<str>>,
     pub(crate) labels: HashMap<Arc<str>, Arc<str>>,
+
+    /// The scheduler ID (advertise address) that executed this task.
+    /// Only populated in cluster mode.
+    pub(crate) scheduler_id: Option<Arc<str>>,
     // For top-level HTTP tasks, have a label:
     // - "http_status" (200, 400)
 }
@@ -85,6 +93,7 @@ impl TaskSpan {
         retention_period_secs: u64,
         retention_check_interval_secs: u64,
         runtime: Arc<Runtime>,
+        is_cluster_mode: bool,
     ) -> Result<Arc<AcceleratedTable>, Error> {
         let time_column = Some("start_time".to_string());
         let time_format = Some(TimeFormat::UnixSeconds);
@@ -116,7 +125,7 @@ impl TaskSpan {
         create_internal_accelerated_table(
             status,
             tbl_reference,
-            Arc::new(TaskSpan::table_schema()),
+            Arc::new(TaskSpan::table_schema(is_cluster_mode)),
             Some(vec!["span_id".to_string()]),
             acceleration_settings,
             Refresh::default(),
@@ -129,8 +138,8 @@ impl TaskSpan {
         .context(UnableToRegisterTableSnafu)
     }
 
-    fn table_schema() -> Schema {
-        Schema::new(vec![
+    fn table_schema(is_cluster_mode: bool) -> Schema {
+        let mut fields = vec![
             Field::new("trace_id", DataType::Utf8, false),
             Field::new("span_id", DataType::Utf8, false),
             Field::new("parent_span_id", DataType::Utf8, true),
@@ -164,7 +173,14 @@ impl TaskSpan {
                 ),
                 false,
             ),
-        ])
+        ];
+
+        // Add scheduler_id column only in cluster mode
+        if is_cluster_mode {
+            fields.push(Field::new("scheduler_id", DataType::Utf8, false));
+        }
+
+        Schema::new(fields)
     }
 
     pub async fn write(df: Arc<DataFusion>, spans: Vec<TaskSpan>) -> Result<(), Error> {
@@ -177,23 +193,26 @@ impl TaskSpan {
             })
             .collect();
 
-        let data = Self::to_record_batch(spans)
+        // Get the schema from the registered table to ensure we use the correct schema
+        // (with or without scheduler_id depending on cluster mode)
+        let table_ref = TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
+        let table_provider = df.get_table(&table_ref).await.context(TableNotFoundSnafu)?;
+        let schema = table_provider.schema();
+
+        let data = Self::to_record_batch(spans, schema.as_ref())
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
         let data_update = DataUpdate {
-            schema: Arc::new(Self::table_schema()),
+            schema,
             data: vec![data],
             update_type: crate::dataupdate::UpdateType::Append,
         };
 
-        df.write_data(
-            &TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
-            data_update,
-        )
-        .await
-        .boxed()
-        .context(UnableToWriteToTableSnafu)?;
+        df.write_data(&table_ref, data_update)
+            .await
+            .boxed()
+            .context(UnableToWriteToTableSnafu)?;
 
         // Override trace_ids if necessary. Must be after above write so that it also handles override this batch of spans.
         for (from, to) in overrides {
@@ -211,12 +230,13 @@ impl TaskSpan {
         from: Arc<str>,
         to: Arc<str>,
     ) -> Result<(), Error> {
+        let table_ref = TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
+
         let overriden: Vec<_> = df
             .query_builder(
                 format!(
                     "SELECT * FROM {} where trace_id = '{from}'",
-                    TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE)
-                        .to_quoted_string()
+                    table_ref.to_quoted_string()
                 )
                 .as_str(),
             )
@@ -243,10 +263,14 @@ impl TaskSpan {
             .boxed()
             .context(UnableToUpdateTracesSnafu)?;
 
+        // Get the schema from the registered table
+        let table_provider = df.get_table(&table_ref).await.context(TableNotFoundSnafu)?;
+        let schema = table_provider.schema();
+
         df.write_data(
-            &TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE),
+            &table_ref,
             DataUpdate {
-                schema: Arc::new(Self::table_schema()),
+                schema,
                 data: overriden,
                 update_type: UpdateType::Changes,
             },
@@ -259,8 +283,7 @@ impl TaskSpan {
     }
 
     #[expect(clippy::cast_possible_truncation)]
-    fn to_record_batch(spans: Vec<TaskSpan>) -> Result<RecordBatch, Error> {
-        let schema = Self::table_schema();
+    fn to_record_batch(spans: Vec<TaskSpan>, schema: &Schema) -> Result<RecordBatch, Error> {
         let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), spans.len());
 
         for span in spans {
@@ -350,6 +373,17 @@ impl TaskSpan {
                             .boxed()
                             .context(UnableToCreateRowSnafu)?;
                     }
+                    "scheduler_id" => {
+                        let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
+                        match &span.scheduler_id {
+                            Some(scheduler_id) => str_builder.append_value(scheduler_id),
+                            None => {
+                                // This should not happen in cluster mode - scheduler_id should always be set
+                                // But handle gracefully by using empty string
+                                str_builder.append_value("");
+                            }
+                        }
+                    }
                     name => unreachable!("unexpected field name: {name}"),
                 }
             }
@@ -400,6 +434,9 @@ pub enum Error {
     UnableToGetTableProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("The `task_history` table was not found"))]
+    TableNotFound,
 
     #[snafu(display("Unable to downcast ArrayBuilder"))]
     DowncastBuilder,

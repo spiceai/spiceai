@@ -180,6 +180,16 @@ impl RuntimeStatus {
     pub fn update_cluster(&self, node_name: &str, status: ComponentStatus) {
         let cluster_node_name = node_name.to_string();
         self.update_component_status(&format!("cluster:{cluster_node_name}"), status);
+
+        // Record cluster node status metric
+        // Map ComponentStatus to cluster status values: 0=Unknown, 1=Healthy, 2=Unhealthy, 3=Draining
+        let status_value = match status {
+            ComponentStatus::Initializing => 0,
+            ComponentStatus::Ready | ComponentStatus::Refreshing => 1, // Refreshing is still healthy
+            ComponentStatus::Disabled | ComponentStatus::Error => 2,
+            ComponentStatus::ShuttingDown => 3, // Draining
+        };
+        metrics::cluster::set_node_status(&cluster_node_name, node_name, status_value);
     }
 
     /// Get the status of a worker

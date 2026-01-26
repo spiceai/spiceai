@@ -19,19 +19,27 @@ limitations under the License.
 //! This service handles scheduler-executor communication for cluster mode,
 //! including app definition retrieval and secret expansion.
 
+use std::ops::ControlFlow;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use app::App;
-use futures::{Stream, StreamExt};
+use arrow::array::RecordBatch;
+use arrow_ipc::writer::StreamWriter;
+use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::sqlparser::parser::Parser;
+use futures::{Stream, StreamExt, TryStreamExt};
 use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::executor_control_message::Message as ExecutorMessage;
 use runtime_proto::{
     ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
-    GetAppDefinitionResponse, GetSchedulersRequest, GetSchedulersResponse, SchedulerControlMessage,
+    GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
+    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, SchedulerControlMessage,
     SchedulerInstance,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -39,6 +47,10 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::cluster::SchedulerPeers;
+use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
+use crate::metrics_reader::MetricsReader;
+use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
@@ -46,6 +58,10 @@ pub struct ClusterServiceImpl {
     secrets: Arc<RwLock<Secrets>>,
     advertise_address: String,
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+    datafusion: Arc<DataFusion>,
+    executor_registry: Arc<ExecutorRegistry>,
+    /// Metrics reader for collecting local OTLP metrics on demand.
+    metrics_reader: Option<MetricsReader>,
 }
 
 impl ClusterServiceImpl {
@@ -56,13 +72,25 @@ impl ClusterServiceImpl {
         secrets: Arc<RwLock<Secrets>>,
         advertise_address: String,
         scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+        datafusion: Arc<DataFusion>,
+        executor_registry: Arc<ExecutorRegistry>,
+        metrics_reader: Option<MetricsReader>,
     ) -> Self {
         Self {
             app,
             secrets,
             advertise_address,
             scheduler_peers,
+            datafusion,
+            executor_registry,
+            metrics_reader,
         }
+    }
+
+    /// Returns the executor registry for use by other components.
+    #[must_use]
+    pub fn executor_registry(&self) -> Arc<ExecutorRegistry> {
+        Arc::clone(&self.executor_registry)
     }
 }
 
@@ -199,6 +227,59 @@ impl ClusterService for ClusterServiceImpl {
 
         Ok(Response::new(GetSchedulersResponse { schedulers }))
     }
+    async fn get_task_history(
+        &self,
+        request: Request<GetTaskHistoryRequest>,
+    ) -> Result<Response<GetTaskHistoryResponse>, Status> {
+        let request = request.into_inner();
+
+        tracing::debug!(
+            "ClusterService::get_task_history executing query: {}",
+            request.sql
+        );
+
+        // Parse and rewrite the SQL to query local_task_history instead of task_history.
+        // This avoids infinite recursion: the federated task_history table would fan out
+        // to peers, but peers need to query their local data only.
+        let local_sql = rewrite_task_history_sql(&request.sql)
+            .map_err(|e| Status::invalid_argument(format!("Invalid task history query: {e}")))?;
+
+        // Execute the query against local_task_history
+        let query_result = self
+            .datafusion
+            .query_builder(&local_sql)
+            .build()
+            .run()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+
+        // Collect all record batches
+        let batches: Vec<RecordBatch> = query_result
+            .data
+            .try_collect()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to collect query results: {e}")))?;
+
+        // Encode as Arrow IPC
+        let arrow_ipc = encode_batches_to_ipc(&batches)
+            .map_err(|e| Status::internal(format!("Failed to encode results as Arrow IPC: {e}")))?;
+
+        Ok(Response::new(GetTaskHistoryResponse { arrow_ipc }))
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<GetMetricsRequest>,
+    ) -> Result<Response<GetMetricsResponse>, Status> {
+        // Collect local OTLP metrics and return as protobuf bytes
+        let otlp_metrics = self
+            .metrics_reader
+            .as_ref()
+            .map(MetricsReader::collect_otlp)
+            .unwrap_or_default();
+
+        Ok(Response::new(GetMetricsResponse { otlp_metrics }))
+    }
 
     type ControlStreamStream =
         Pin<Box<dyn Stream<Item = Result<SchedulerControlMessage, Status>> + Send>>;
@@ -211,10 +292,13 @@ impl ClusterService for ClusterServiceImpl {
         let cancel = CancellationToken::new();
         let inbound_cancel = cancel.clone();
 
-        // Create a channel for outbound messages to the executor (unused for now).
+        // Create a channel for outbound messages to the executor
         let (outbound_tx, outbound_rx) = mpsc::channel::<SchedulerControlMessage>(32);
 
         // We need to identify the executor from its first message.
+        // Spawn a task to handle the bidirectional stream.
+        let executor_registry = Arc::clone(&self.executor_registry);
+        let outbound_tx_for_registry = outbound_tx.clone();
         let inbound_task = tokio::spawn(async move {
             let executor_id = match inbound.next().await {
                 Some(Ok(msg)) => {
@@ -225,8 +309,9 @@ impl ClusterService for ClusterServiceImpl {
                     }
                     tracing::debug!("Executor control stream connected: {executor_id}");
 
+                    // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, message);
+                        handle_executor_message(&executor_id, &message, &executor_registry);
                     }
                     executor_id
                 }
@@ -240,6 +325,11 @@ impl ClusterService for ClusterServiceImpl {
                 }
             };
 
+            // Register the executor with the registry.
+            let pending_requests = executor_registry
+                .register(executor_id.clone(), outbound_tx_for_registry)
+                .await;
+
             loop {
                 tokio::select! {
                     () = inbound_cancel.cancelled() => {
@@ -250,19 +340,32 @@ impl ClusterService for ClusterServiceImpl {
                         match result {
                             Some(Ok(msg)) => {
                                 if let Some(message) = msg.message {
-                                    handle_executor_message(&executor_id, message);
+                                    // Handle metrics responses by completing pending requests.
+                                    if let ExecutorMessage::Metrics(response) = &message {
+                                        let mut pending = pending_requests.write().await;
+                                        if let Some(sender) = pending.remove(&response.request_id) {
+                                            let _ = sender.send(response.clone());
+                                        } else {
+                                            tracing::warn!(
+                                                "Received metrics response for unknown request_id: {}",
+                                                response.request_id
+                                            );
+                                        }
+                                    } else {
+                                        handle_executor_message(
+                                            &executor_id,
+                                            &message,
+                                            &executor_registry,
+                                        );
+                                    }
                                 }
                             }
                             Some(Err(e)) => {
-                                tracing::debug!(
-                                    "Executor control stream error for {executor_id}: {e}"
-                                );
+                                tracing::debug!("Executor control stream error for {executor_id}: {e}");
                                 break;
                             }
                             None => {
-                                tracing::debug!(
-                                    "Executor control stream closed by executor {executor_id}"
-                                );
+                                tracing::debug!("Executor control stream closed by executor {executor_id}");
                                 break;
                             }
                         }
@@ -270,6 +373,8 @@ impl ClusterService for ClusterServiceImpl {
                 }
             }
 
+            // Unregister the executor when the stream ends.
+            executor_registry.unregister(&executor_id).await;
             tracing::debug!("Executor control stream ended: {executor_id}");
         });
 
@@ -279,11 +384,17 @@ impl ClusterService for ClusterServiceImpl {
             task: inbound_task,
             _outbound_tx: outbound_tx,
         };
+
         Ok(Response::new(Box::pin(stream)))
     }
 }
 
-fn handle_executor_message(executor_id: &str, message: ExecutorMessage) {
+/// Handles an executor control message (heartbeat, etc.)
+fn handle_executor_message(
+    executor_id: &str,
+    message: &ExecutorMessage,
+    _registry: &ExecutorRegistry,
+) {
     match message {
         ExecutorMessage::Heartbeat(heartbeat) => {
             tracing::trace!(
@@ -291,5 +402,181 @@ fn handle_executor_message(executor_id: &str, message: ExecutorMessage) {
                 heartbeat.timestamp_ms
             );
         }
+        ExecutorMessage::Metrics(_) => {
+            // Metrics responses are handled separately in the stream handler
+            // This shouldn't be reached, but log if it is
+            tracing::warn!(
+                "Unexpected metrics response in handle_executor_message for {executor_id}"
+            );
+        }
+    }
+}
+/// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
+///
+/// Returns an empty vec if no batches are provided.
+fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::error::ArrowError> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let schema = batches[0].schema();
+    let mut buffer = Vec::new();
+
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &schema)?;
+        for batch in batches {
+            writer.write(batch)?;
+        }
+        writer.finish()?;
+    }
+
+    Ok(buffer)
+}
+
+/// Rewrites a task history SQL query to use `local_task_history` instead of `task_history`.
+///
+/// This function parses the SQL, validates it references the expected table, and rewrites
+/// all table references from `runtime.task_history` to `runtime.local_task_history`.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The SQL cannot be parsed
+/// - The query contains multiple statements
+/// - The query doesn't reference the `runtime.task_history` table
+fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
+    let dialect = PostgreSqlDialect {};
+    let mut statements =
+        Parser::parse_sql(&dialect, sql).map_err(|e| format!("Failed to parse SQL: {e}"))?;
+
+    if statements.len() != 1 {
+        return Err(format!(
+            "Expected single SQL statement, got {}",
+            statements.len()
+        ));
+    }
+
+    let statement = &mut statements[0];
+
+    // Track whether we found and rewrote the task_history table
+    let mut found_task_history = false;
+
+    // Visit all table references and rewrite task_history -> local_task_history
+    let _ = visit_relations_mut(statement, |table_name| {
+        // Check if this is runtime.task_history (2 parts) or just task_history (1 part)
+        let parts: Vec<&str> = table_name
+            .0
+            .iter()
+            .filter_map(|part| match part {
+                ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
+                ObjectNamePart::Function(_) => None,
+            })
+            .collect();
+
+        let is_task_history_table = match parts.as_slice() {
+            [schema, table] => {
+                *schema == SPICE_RUNTIME_SCHEMA && *table == DEFAULT_TASK_HISTORY_TABLE
+            }
+            [table] => *table == DEFAULT_TASK_HISTORY_TABLE,
+            _ => false,
+        };
+
+        if is_task_history_table {
+            found_task_history = true;
+
+            // Rewrite the table name: find and replace the task_history identifier
+            for part in &mut table_name.0 {
+                if let ObjectNamePart::Identifier(ident) = part
+                    && ident.value == DEFAULT_TASK_HISTORY_TABLE
+                {
+                    *ident = Ident::new(LOCAL_TASK_HISTORY_TABLE);
+                }
+            }
+        }
+
+        ControlFlow::<()>::Continue(())
+    });
+
+    if !found_task_history {
+        return Err(format!(
+            "Query must reference the \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\" table"
+        ));
+    }
+
+    Ok(statement.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rewrite_task_history_sql_simple() {
+        let sql = r#"SELECT * FROM "runtime"."task_history""#;
+        let result = rewrite_task_history_sql(sql).expect("should rewrite");
+        assert!(
+            result.contains("local_task_history"),
+            "Expected local_task_history in: {result}"
+        );
+        assert!(
+            !result.contains(r#""task_history""#),
+            "Should not contain task_history: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_with_where() {
+        let sql = r#"SELECT * FROM "runtime"."task_history" WHERE task = 'sql'"#;
+        let result = rewrite_task_history_sql(sql).expect("should rewrite");
+        assert!(
+            result.contains("local_task_history"),
+            "Expected local_task_history in: {result}"
+        );
+        assert!(
+            result.contains("task = 'sql'"),
+            "Should preserve WHERE clause: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_with_limit() {
+        let sql = r#"SELECT * FROM "runtime"."task_history" LIMIT 100"#;
+        let result = rewrite_task_history_sql(sql).expect("should rewrite");
+        assert!(
+            result.contains("local_task_history"),
+            "Expected local_task_history in: {result}"
+        );
+        assert!(
+            result.contains("LIMIT 100"),
+            "Should preserve LIMIT: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_rejects_other_tables() {
+        let sql = r#"SELECT * FROM "runtime"."other_table""#;
+        let result = rewrite_task_history_sql(sql);
+        assert!(result.is_err(), "Should reject queries to other tables");
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_rejects_multiple_statements() {
+        let sql = r#"SELECT * FROM "runtime"."task_history"; DROP TABLE foo"#;
+        let result = rewrite_task_history_sql(sql);
+        assert!(
+            result.is_err(),
+            "Should reject multiple statements: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_task_history_sql_with_filter_and_limit() {
+        let sql =
+            r#"SELECT * FROM "runtime"."task_history" WHERE status = Utf8("completed") LIMIT 50"#;
+        let result = rewrite_task_history_sql(sql).expect("should rewrite");
+        assert!(
+            result.contains("local_task_history"),
+            "Expected local_task_history in: {result}"
+        );
     }
 }

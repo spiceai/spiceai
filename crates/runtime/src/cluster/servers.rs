@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::ClusterTlsConfig;
 use crate::cluster::ClusterServiceImpl;
+use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::flight::{Error, is_address_in_use_error};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
@@ -53,6 +54,7 @@ fn server_with_cluster_mtls(
 pub async fn start_internal_cluster_server(
     rt: Arc<Runtime>,
     shutdown_signal: Option<CancellationToken>,
+    executor_registry: Arc<ExecutorRegistry>,
 ) -> ClusterServerResult<()> {
     let bind_address = rt.df.cluster_config.node_bind_address();
 
@@ -100,11 +102,15 @@ pub async fn start_internal_cluster_server(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| bind_address.to_string());
+
     let cluster_service = ClusterServiceImpl::new(
         Arc::clone(&rt.app),
         Arc::clone(&rt.secrets),
         advertise_address,
         rt.scheduler_peers(),
+        Arc::clone(&rt.df),
+        Arc::clone(&executor_registry),
+        rt.metrics_reader().cloned(),
     );
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 
