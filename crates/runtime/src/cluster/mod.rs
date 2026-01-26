@@ -39,7 +39,8 @@ use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
-use ballista_scheduler::cluster::BallistaCluster;
+use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
+use ballista_scheduler::cluster::{BallistaCluster, ClusterState};
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
@@ -57,6 +58,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -1144,26 +1146,57 @@ async fn create_scheduler_server(
         .scheduler_url_string()
         .map_or_else(|| bind_addr.to_string(), ToString::to_string);
     let scheduler_metrics_collector = Arc::new(
-        metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id),
+        metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id.clone()),
     );
 
-    let scheduler_config = SchedulerConfig {
-        bind_host: bind_addr.ip().to_string(),
-        bind_port: bind_addr.port(),
+    // Create InMemoryClusterState first so we can reference it in the config_producer
+    let cluster_state: Arc<dyn ClusterState> = Arc::new(InMemoryClusterState::default());
 
-        override_logical_codec: Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt))),
-        override_physical_codec: Some(
-            SpicePhysicalCodec::new(Arc::clone(rt))
-                .boxed()
-                .context(FailedToStartClusterSchedulerSnafu)?,
-        ),
+    // Create an atomic counter for total executor slots, updated by a background task
+    // This allows session_builder to read the value synchronously without blocking
+    let total_executor_slots = Arc::new(AtomicUsize::new(0));
 
-        grpc_server_max_decoding_message_size: u32::MAX,
-        grpc_server_max_encoding_message_size: u32::MAX,
+    // Spawn background task to periodically update total executor slots from cluster state
+    let cluster_state_for_slots = Arc::clone(&cluster_state);
+    let slots_counter = Arc::clone(&total_executor_slots);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let metadata = cluster_state_for_slots.registered_executor_metadata().await;
+            let total: usize = metadata
+                .iter()
+                .map(|m| m.specification.task_slots as usize)
+                .sum();
+            let prev = slots_counter.swap(total, Ordering::Relaxed);
+            if total != prev {
+                tracing::info!(
+                    executor_count = metadata.len(),
+                    total_slots = total,
+                    "Cluster executor slots updated"
+                );
+            }
+        }
+    });
 
-        override_session_builder: Some(Arc::new(move |_cfg| {
+    // Create the session builder that will build SessionState from SessionConfig
+    // Uses the dynamic total_executor_slots to set target_partitions
+    let slots_for_session = Arc::clone(&total_executor_slots);
+    let session_builder: ballista_scheduler::scheduler_server::SessionBuilder =
+        Arc::new(move |_cfg| {
+            // Get dynamic target_partitions based on cluster capacity
+            let total_slots = slots_for_session.load(Ordering::Relaxed);
+            let target_partitions = if total_slots > 0 { total_slots } else { 16 };
+
+            tracing::debug!(
+                total_slots,
+                target_partitions,
+                "Cluster session_builder: setting target_partitions based on cluster capacity"
+            );
+
             let mut cfg = current_context
                 .copied_config()
+                .with_target_partitions(target_partitions)
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_ballista_shuffle_format(ballista_shuffle_format)
                 .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
@@ -1183,16 +1216,56 @@ async fn create_scheduler_server(
                     .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
                     .build(),
             )
-        })),
+        });
+
+    // Create config_producer that dynamically sets target_partitions based on cluster capacity
+    // Reads from the atomic counter updated by the background task above
+    let slots_for_config = Arc::clone(&total_executor_slots);
+    let config_producer: ConfigProducer = Arc::new(move || {
+        let total_slots = slots_for_config.load(Ordering::Relaxed);
+
+        // Use total slots if executors have registered, otherwise fall back to default
+        let target_partitions = if total_slots > 0 { total_slots } else { 16 };
+
+        tracing::debug!(
+            total_slots,
+            target_partitions,
+            "Cluster config_producer: setting target_partitions based on cluster capacity"
+        );
+
+        SessionConfig::new_with_ballista()
+            .with_target_partitions(target_partitions)
+            .with_option_extension(SpiceClusterConfig::default())
+            .with_ballista_shuffle_format(ballista_shuffle_format)
+            .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
+    });
+
+    // Manually create the BallistaCluster with our custom config_producer
+    let job_state = Arc::new(InMemoryJobState::new(
+        metrics_node_id,
+        session_builder,
+        config_producer,
+    ));
+    let cluster = BallistaCluster::new(cluster_state, job_state);
+
+    let scheduler_config = SchedulerConfig {
+        bind_host: bind_addr.ip().to_string(),
+        bind_port: bind_addr.port(),
+
+        override_logical_codec: Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt))),
+        override_physical_codec: Some(
+            SpicePhysicalCodec::new(Arc::clone(rt))
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?,
+        ),
+
+        grpc_server_max_decoding_message_size: u32::MAX,
+        grpc_server_max_encoding_message_size: u32::MAX,
+
         override_create_grpc_client_endpoint,
         override_metrics_collector: Some(scheduler_metrics_collector),
         ..Default::default()
     };
-
-    let cluster = BallistaCluster::new_from_config(&scheduler_config)
-        .await
-        .boxed()
-        .context(FailedToStartClusterSchedulerSnafu)?;
 
     rt.status
         .update_cluster("scheduler", ComponentStatus::Ready);
