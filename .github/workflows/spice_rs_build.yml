@@ -1,10 +1,16 @@
-name: build
+name: spice-rs build
 
 on:
   push:
     branches: ['trunk']
+    paths:
+      - 'crates/spice-rs/**'
+      - '.github/workflows/spice_rs_build.yml'
   pull_request:
     branches: ['trunk']
+    paths:
+      - 'crates/spice-rs/**'
+      - '.github/workflows/spice_rs_build.yml'
 
   workflow_dispatch:
 
@@ -40,6 +46,7 @@ jobs:
 
       - name: Run rust-clippy
         run: cargo clippy
+          -p spiceai
           --all-features
           --message-format=json | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
         continue-on-error: true
@@ -83,7 +90,7 @@ jobs:
           override: true
 
       - name: Cargo clippy
-        run: cargo clippy --all-features
+        run: cargo clippy -p spiceai --all-features
 
       - name: Install Spice (https://install.spiceai.org) (Linux)
         if: startsWith(matrix.os, 'ubuntu')
@@ -135,7 +142,7 @@ jobs:
         shell: pwsh
 
       - name: Run tests
-        run: cargo test
+        run: cargo test -p spiceai
         env:
           SCP_SPICEAI_TPCH_API_KEY: ${{ secrets.SCP_SPICEAI_TPCH_API_KEY }}
 
