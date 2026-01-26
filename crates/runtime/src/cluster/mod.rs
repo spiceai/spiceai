@@ -354,7 +354,7 @@ pub use executor_registry::ExecutorRegistry;
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-pub use service::{ClusterServiceImpl, ExecutorStreamRegistry};
+pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
 /// mTLS configuration for cluster communications.
 ///
@@ -1087,7 +1087,7 @@ async fn create_scheduler_server(
     rt: &Arc<Runtime>,
 ) -> crate::Result<(
     SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
-    ExecutorStreamRegistry,
+    ExecutorControlStreamRegistry,
 )> {
     let bind_addr = rt.df.cluster_config.node_bind_address();
 
@@ -1169,7 +1169,7 @@ async fn create_scheduler_server(
 
     // Create the executor stream registry for PollNow broadcasts.
     // This registry will be shared with the ClusterServiceImpl.
-    let executor_stream_registry = ExecutorStreamRegistry::new();
+    let executor_stream_registry = ExecutorControlStreamRegistry::new();
 
     // Create callback that broadcasts PollNow to all connected executors when work is available.
     let registry_for_callback = executor_stream_registry.clone();

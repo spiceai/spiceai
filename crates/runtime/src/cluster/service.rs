@@ -67,11 +67,11 @@ struct ExecutorStreamHandle {
 /// This is extracted from `ClusterServiceImpl` to allow sharing with the
 /// scheduler callback for broadcasting `PollNow` notifications.
 #[derive(Clone, Default)]
-pub struct ExecutorStreamRegistry {
+pub struct ExecutorControlStreamRegistry {
     streams: Arc<RwLock<HashMap<String, ExecutorStreamHandle>>>,
 }
 
-impl ExecutorStreamRegistry {
+impl ExecutorControlStreamRegistry {
     /// Creates a new empty executor stream registry.
     #[must_use]
     pub fn new() -> Self {
@@ -141,7 +141,7 @@ pub struct ClusterServiceImpl {
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
-    executor_streams: ExecutorStreamRegistry,
+    executor_streams: ExecutorControlStreamRegistry,
 }
 
 impl ClusterServiceImpl {
@@ -164,7 +164,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-            executor_streams: ExecutorStreamRegistry::new(),
+            executor_streams: ExecutorControlStreamRegistry::new(),
         }
     }
 
@@ -182,7 +182,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
-        executor_streams: ExecutorStreamRegistry,
+        executor_streams: ExecutorControlStreamRegistry,
     ) -> Self {
         Self {
             app,
@@ -200,7 +200,7 @@ impl ClusterServiceImpl {
     ///
     /// This can be used to share the registry with the scheduler callback.
     #[must_use]
-    pub fn executor_streams(&self) -> ExecutorStreamRegistry {
+    pub fn executor_streams(&self) -> ExecutorControlStreamRegistry {
         self.executor_streams.clone()
     }
 

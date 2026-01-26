@@ -48,7 +48,7 @@ use crate::view::prepare_view;
 use crate::{status, view};
 
 use {
-    crate::cluster::{ExecutorStreamRegistry, ResolvedClusterConfig},
+    crate::cluster::{ExecutorControlStreamRegistry, ResolvedClusterConfig},
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -266,8 +266,11 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
-    #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
+    #[snafu(display("Unable to acquire lock for cluster executor state"))]
     UnableToLockWritableExecutorHandle {},
+
+    #[snafu(display("Unable to acquire lock for executor stream registry"))]
+    UnableToLockWritableExecutorStreamRegistry {},
 
     #[snafu(display(
         "The schema returned by the data connector for 'refresh_mode: changes' does not contain a data field"
@@ -415,7 +418,7 @@ pub struct DataFusion {
     pub executor: RwLock<Option<Arc<Executor>>>,
     /// Registry of connected executor control streams for `PollNow` broadcasts.
     /// Only used in scheduler mode.
-    pub executor_stream_registry: RwLock<Option<ExecutorStreamRegistry>>,
+    pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -2077,18 +2080,23 @@ impl DataFusion {
         Ok(())
     }
 
-    pub fn bind_executor_stream_registry(&self, registry: ExecutorStreamRegistry) -> Result<()> {
+    pub fn bind_executor_stream_registry(
+        &self,
+        registry: ExecutorControlStreamRegistry,
+    ) -> Result<()> {
         let mut executor_stream_registry = self
             .executor_stream_registry
             .try_write()
-            .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
+            .map_err(|_| Error::UnableToLockWritableExecutorStreamRegistry {})?;
         *executor_stream_registry = Some(registry);
         Ok(())
     }
 
     /// Returns the executor stream registry if one is bound.
+    ///
+    /// Returns `None` if no registry is bound or if the read lock cannot be acquired.
     #[must_use]
-    pub fn executor_stream_registry(&self) -> Option<ExecutorStreamRegistry> {
+    pub fn executor_stream_registry(&self) -> Option<ExecutorControlStreamRegistry> {
         self.executor_stream_registry.read().ok()?.clone()
     }
 
