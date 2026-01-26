@@ -790,6 +790,8 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
 
+        let runtime_status = Arc::clone(&self.runtime_status);
+
         let (snapshot_interval_task, create_checkpoint_snapshot_after_refresh) =
             match snapshot_trigger {
                 // This will only create checkpoint - default behavior when snapshots are not configured
@@ -879,7 +881,7 @@ impl Refresher {
                                     }
                             }
 
-                            if create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
+                            if runtime_status.is_ready() && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
                                 create_checkpoint_and_snapshot(
                                     checkpointer,
                                     snapshot_manager.as_ref(),
