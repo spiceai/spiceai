@@ -554,14 +554,17 @@ mod tests {
         let result = balanced_or(vec![expr.clone()]);
         assert!(result.is_some());
         // Single element should be returned as-is
-        assert_eq!(format!("{}", result.unwrap()), format!("{}", expr));
+        assert_eq!(
+            format!("{}", result.expect("expected Some")),
+            format!("{}", expr)
+        );
     }
 
     #[test]
     fn test_balanced_or_two_elements() {
         let expr1 = col("a").eq(datafusion::logical_expr::lit(1));
         let expr2 = col("b").eq(datafusion::logical_expr::lit(2));
-        let result = balanced_or(vec![expr1, expr2]).unwrap();
+        let result = balanced_or(vec![expr1, expr2]).expect("expected Some for two elements");
 
         // Should be a single OR
         if let Expr::BinaryExpr(binary) = &result {
@@ -577,7 +580,7 @@ mod tests {
             .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_or(exprs).unwrap();
+        let result = balanced_or(exprs).expect("expected Some for three elements");
 
         // Collect all OR conditions - should get 3 leaf nodes
         let conditions = collect_or_conditions(&result);
@@ -590,7 +593,7 @@ mod tests {
             .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_or(exprs).unwrap();
+        let result = balanced_or(exprs).expect("expected Some for four elements");
 
         // For 4 elements, should be perfectly balanced: OR(OR(a,b), OR(c,d))
         // Depth should be 2 (log2(4) = 2)
@@ -609,11 +612,14 @@ mod tests {
             .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_or(exprs).unwrap();
+        let result = balanced_or(exprs).expect("expected Some for multiple elements");
 
         // All original expressions should be in the tree
         let conditions = collect_or_conditions(&result);
-        assert_eq!(conditions.len(), count as usize);
+        assert_eq!(
+            conditions.len(),
+            usize::try_from(count).expect("count fits in usize")
+        );
 
         // Verify the values are 0..count
         let mut values: Vec<i32> = conditions
@@ -628,7 +634,7 @@ mod tests {
                 }
             })
             .collect();
-        values.sort();
+        values.sort_unstable();
         assert_eq!(values, (0..count).collect::<Vec<_>>());
     }
 
@@ -647,14 +653,17 @@ mod tests {
         let expr = col("a").eq(datafusion::logical_expr::lit(1));
         let result = balanced_and(vec![expr.clone()]);
         assert!(result.is_some());
-        assert_eq!(format!("{}", result.unwrap()), format!("{}", expr));
+        assert_eq!(
+            format!("{}", result.expect("expected Some")),
+            format!("{}", expr)
+        );
     }
 
     #[test]
     fn test_balanced_and_two_elements() {
         let expr1 = col("a").eq(datafusion::logical_expr::lit(1));
         let expr2 = col("b").eq(datafusion::logical_expr::lit(2));
-        let result = balanced_and(vec![expr1, expr2]).unwrap();
+        let result = balanced_and(vec![expr1, expr2]).expect("expected Some for two elements");
 
         if let Expr::BinaryExpr(binary) = &result {
             assert_eq!(binary.op, Operator::And);
@@ -669,7 +678,7 @@ mod tests {
             .map(|i| col(format!("col_{i}")).eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_and(exprs).unwrap();
+        let result = balanced_and(exprs).expect("expected Some for four elements");
 
         // For 4 elements, should be perfectly balanced: AND(AND(a,b), AND(c,d))
         let depth = measure_and_depth(&result);
@@ -687,10 +696,13 @@ mod tests {
             .map(|i| col(format!("col_{i}")).eq(datafusion::logical_expr::lit(i)))
             .collect();
 
-        let result = balanced_and(exprs).unwrap();
+        let result = balanced_and(exprs).expect("expected Some for multiple elements");
 
         let conditions = collect_and_conditions(&result);
-        assert_eq!(conditions.len(), count as usize);
+        assert_eq!(
+            conditions.len(),
+            usize::try_from(count).expect("count fits in usize")
+        );
     }
 
     // ============================================================
@@ -700,8 +712,8 @@ mod tests {
     #[test]
     fn test_build_in_list_expr_single_value() {
         let row_indices = vec![0];
-        let result =
-            build_in_list_expr(&row_indices, "id", &|_| make_single_key_batch("val1")).unwrap();
+        let result = build_in_list_expr(&row_indices, "id", &|_| make_single_key_batch("val1"))
+            .expect("build_in_list_expr should succeed");
 
         if let Expr::InList(in_list) = &result {
             assert_eq!(in_list.list.len(), 1);
@@ -723,7 +735,7 @@ mod tests {
         let result = build_in_list_expr(&row_indices, "id", &|row| {
             make_single_key_batch(values[row])
         })
-        .unwrap();
+        .expect("build_in_list_expr should succeed");
 
         if let Expr::InList(in_list) = &result {
             assert_eq!(in_list.list.len(), 5);
@@ -743,7 +755,10 @@ mod tests {
                 .collect();
 
             for val in &values {
-                assert!(extracted.contains(&val.to_string()), "Missing value: {val}");
+                assert!(
+                    extracted.contains(&(*val).to_string()),
+                    "Missing value: {val}"
+                );
             }
         } else {
             panic!("Expected InList, got: {result:?}");
@@ -759,8 +774,10 @@ mod tests {
         }
 
         let row_indices: Vec<usize> = (0..5).collect();
-        let result =
-            build_in_list_expr(&row_indices, "id", &|row| make_int_batch(row as i64)).unwrap();
+        let result = build_in_list_expr(&row_indices, "id", &|row| {
+            make_int_batch(i64::try_from(row).expect("row fits in i64"))
+        })
+        .expect("build_in_list_expr should succeed");
 
         if let Expr::InList(in_list) = &result {
             assert_eq!(in_list.list.len(), 5);
@@ -848,7 +865,12 @@ mod tests {
         let result = build_batch_delete_expr(
             &row_indices,
             |_| vec!["PK".to_string(), "SK".to_string()],
-            |row| make_single_row_batch(row as i64, &format!("sk-{row}")),
+            |row| {
+                make_single_row_batch(
+                    i64::try_from(row).expect("row fits in i64"),
+                    &format!("sk-{row}"),
+                )
+            },
             "test_dataset",
         )
         .expect("should not error")
@@ -876,7 +898,7 @@ mod tests {
 
         // Check that we got valid pairs (pk values should be 0-9 for first 10)
         for (pk, sk) in &pairs {
-            assert!(*pk >= 0 && *pk < count as i64);
+            assert!(*pk >= 0 && *pk < i64::try_from(count).expect("count fits in i64"));
             assert!(sk.starts_with("sk-"));
         }
     }
@@ -891,7 +913,12 @@ mod tests {
         let result = build_batch_delete_expr(
             &row_indices,
             |_| vec!["PK".to_string(), "SK".to_string()],
-            |row| make_single_row_batch(row as i64, &format!("sk-{row}")),
+            |row| {
+                make_single_row_batch(
+                    i64::try_from(row).expect("row fits in i64"),
+                    &format!("sk-{row}"),
+                )
+            },
             "test_dataset",
         )
         .expect("should not error")
@@ -949,7 +976,7 @@ mod tests {
                 .map(|i| col("x").eq(datafusion::logical_expr::lit(i)))
                 .collect();
 
-            let result = balanced_or(exprs).unwrap();
+            let result = balanced_or(exprs).expect("expected Some for multiple elements");
             let actual_depth = measure_expr_depth(&result);
 
             assert!(
@@ -968,7 +995,7 @@ mod tests {
                 .map(|i| col(format!("col_{i}")).eq(datafusion::logical_expr::lit(i)))
                 .collect();
 
-            let result = balanced_and(exprs).unwrap();
+            let result = balanced_and(exprs).expect("expected Some for multiple elements");
             let actual_depth = measure_and_depth(&result);
 
             assert!(
