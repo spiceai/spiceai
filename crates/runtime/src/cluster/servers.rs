@@ -103,15 +103,30 @@ pub async fn start_internal_cluster_server(
         })
         .unwrap_or_else(|| bind_address.to_string());
 
-    let cluster_service = ClusterServiceImpl::new(
-        Arc::clone(&rt.app),
-        Arc::clone(&rt.secrets),
-        advertise_address,
-        rt.scheduler_peers(),
-        Arc::clone(&rt.df),
-        Arc::clone(&executor_registry),
-        rt.metrics_reader().cloned(),
-    );
+    // Use the shared executor stream registry if available (created during scheduler init).
+    // This allows the scheduler callback to broadcast PollNow to connected executors.
+    let cluster_service = if let Some(executor_streams) = rt.df.executor_stream_registry() {
+        ClusterServiceImpl::with_executor_streams(
+            Arc::clone(&rt.app),
+            Arc::clone(&rt.secrets),
+            advertise_address,
+            rt.scheduler_peers(),
+            Arc::clone(&rt.df),
+            Arc::clone(&executor_registry),
+            rt.metrics_reader().cloned(),
+            executor_streams,
+        )
+    } else {
+        ClusterServiceImpl::new(
+            Arc::clone(&rt.app),
+            Arc::clone(&rt.secrets),
+            advertise_address,
+            rt.scheduler_peers(),
+            Arc::clone(&rt.df),
+            Arc::clone(&executor_registry),
+            rt.metrics_reader().cloned(),
+        )
+    };
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 
     let server = server
