@@ -92,7 +92,12 @@ pub fn build_batch_delete_expr_from_change_batch(
 fn balanced_or(conditions: Vec<Expr>) -> Option<Expr> {
     match conditions.len() {
         0 => None,
-        1 => Some(conditions.into_iter().next().expect("len checked")),
+        1 => Some(
+            conditions
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| unreachable!("len checked")),
+        ),
         _ => {
             let mid = conditions.len() / 2;
             let (left, right): (Vec<_>, Vec<_>) = conditions
@@ -117,7 +122,12 @@ fn balanced_or(conditions: Vec<Expr>) -> Option<Expr> {
 fn balanced_and(conditions: Vec<Expr>) -> Option<Expr> {
     match conditions.len() {
         0 => None,
-        1 => Some(conditions.into_iter().next().expect("len checked")),
+        1 => Some(
+            conditions
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| unreachable!("len checked")),
+        ),
         _ => {
             let mid = conditions.len() / 2;
             let (left, right): (Vec<_>, Vec<_>) = conditions
