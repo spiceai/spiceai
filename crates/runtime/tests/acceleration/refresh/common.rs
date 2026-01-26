@@ -146,6 +146,40 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
     Ok(db_conn)
 }
 
+/// Initialize postgres with a test table that includes a `value` column for testing upsert behavior.
+/// The table has: id (PK), `created_at` (timestamp), value (text)
+pub(crate) async fn initialize_postgres_with_value_column(
+    port: usize,
+) -> Result<PostgresConnection, anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("Error connecting: {e}"))?;
+
+    execute_ps_sql(
+        &db_conn,
+        "
+                CREATE TABLE test_table (
+                    id SERIAL PRIMARY KEY,
+                    created_at TIMESTAMP(3) WITH TIME ZONE,
+                    value TEXT
+                )",
+    )
+    .await?;
+
+    execute_ps_sql(
+        &db_conn,
+        "INSERT INTO test_table (created_at, value) VALUES (date_trunc('milliseconds', now()), 'initial_value')",
+    )
+    .await?;
+
+    execute_ps_sql(&db_conn, "CREATE DATABASE acceleration").await?;
+
+    Ok(db_conn)
+}
+
 pub(crate) async fn start_test_runtime(
     port: usize,
     acceleration: Acceleration,

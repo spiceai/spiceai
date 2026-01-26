@@ -589,14 +589,51 @@ impl Builder {
                 }
 
                 let schema = self.accelerator.schema();
-                let has_primary_key = self.accelerator.constraints().is_some_and(|constraints| {
-                    !get_primary_keys_from_constraints(constraints, &schema).is_empty()
-                });
+                let primary_keys = self
+                    .accelerator
+                    .constraints()
+                    .map_or_else(Vec::new, |constraints| {
+                        get_primary_keys_from_constraints(constraints, &schema)
+                    });
+                let has_primary_key = !primary_keys.is_empty();
                 let has_time_column = self.refresh.time_column.is_some();
                 let has_append_stream = self.append_stream.is_some();
 
                 let append_mode =
                     AppendMode::try_new(has_time_column, has_primary_key, has_append_stream)?;
+
+                // Log append mode configuration for debugging
+                match (has_primary_key, has_time_column, has_append_stream) {
+                    (_, _, true) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            "Append mode: using changes stream"
+                        );
+                    }
+                    (true, true, false) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            ?primary_keys,
+                            "Append mode: using time_column for incremental queries and primary_key for deduplication"
+                        );
+                    }
+                    (true, false, false) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            ?primary_keys,
+                            "Append mode: using primary_key for deduplication (full fetch each refresh)"
+                        );
+                    }
+                    (false, true, false) => {
+                        tracing::debug!(
+                            dataset = %self.dataset_name,
+                            "Append mode: using time_column for incremental queries"
+                        );
+                    }
+                    (false, false, false) => {
+                        // This case is handled by AppendMode::try_new returning an error
+                    }
+                }
 
                 match append_mode {
                     AppendMode::ChangesStream => {
