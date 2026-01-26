@@ -57,7 +57,7 @@ ansi_term = "0.12"
 # Archive extraction
 flate2 = "1"
 tar = "0.4"
-zip = "2"
+zip = "6"
 
 # YAML parsing for spicepod
 serde_yaml = "0.9"
