@@ -16414,7 +16414,7 @@ dependencies = [
 
 [[package]]
 name = "spice"
-version = "1.11.0-unstable"
+version = "1.11.0-enterprise-beta"
 dependencies = [
  "ansi_term",
  "assert_cmd",
