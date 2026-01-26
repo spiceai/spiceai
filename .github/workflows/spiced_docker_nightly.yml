@@ -383,4 +383,4 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             /repos/spicehq/ai-platform/dispatches \
             -f 'event_type=publish-spiceai-enterprise-nightly' \
-            -F "client_payload[tag]=${{ env.REL_VERSION }}-models"
+            -F "client_payload[tag]=${{ env.REL_VERSION }}"
