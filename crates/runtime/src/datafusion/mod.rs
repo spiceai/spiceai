@@ -48,7 +48,7 @@ use crate::view::prepare_view;
 use crate::{status, view};
 
 use {
-    crate::cluster::ResolvedClusterConfig,
+    crate::cluster::{ExecutorStreamRegistry, ResolvedClusterConfig},
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -413,6 +413,9 @@ pub struct DataFusion {
     pub cluster_config: Arc<ResolvedClusterConfig>,
     pub scheduler_server: RwLock<Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>>>,
     pub executor: RwLock<Option<Arc<Executor>>>,
+    /// Registry of connected executor control streams for `PollNow` broadcasts.
+    /// Only used in scheduler mode.
+    pub executor_stream_registry: RwLock<Option<ExecutorStreamRegistry>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -2072,6 +2075,21 @@ impl DataFusion {
             .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
         *scheduler_server = Some(server);
         Ok(())
+    }
+
+    pub fn bind_executor_stream_registry(&self, registry: ExecutorStreamRegistry) -> Result<()> {
+        let mut executor_stream_registry = self
+            .executor_stream_registry
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableSchedulerHandle {})?;
+        *executor_stream_registry = Some(registry);
+        Ok(())
+    }
+
+    /// Returns the executor stream registry if one is bound.
+    #[must_use]
+    pub fn executor_stream_registry(&self) -> Option<ExecutorStreamRegistry> {
+        self.executor_stream_registry.read().ok()?.clone()
     }
 
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
