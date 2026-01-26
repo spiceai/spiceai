@@ -720,9 +720,10 @@ mod tests {
     fn test_build_in_list_expr_multiple_values() {
         let values = ["a", "b", "c", "d", "e"];
         let row_indices: Vec<usize> = (0..values.len()).collect();
-        let result =
-            build_in_list_expr(&row_indices, "id", &|row| make_single_key_batch(values[row]))
-                .unwrap();
+        let result = build_in_list_expr(&row_indices, "id", &|row| {
+            make_single_key_batch(values[row])
+        })
+        .unwrap();
 
         if let Expr::InList(in_list) = &result {
             assert_eq!(in_list.list.len(), 5);
@@ -742,10 +743,7 @@ mod tests {
                 .collect();
 
             for val in &values {
-                assert!(
-                    extracted.contains(&val.to_string()),
-                    "Missing value: {val}"
-                );
+                assert!(extracted.contains(&val.to_string()), "Missing value: {val}");
             }
         } else {
             panic!("Expected InList, got: {result:?}");
@@ -808,7 +806,11 @@ mod tests {
 
         // Should be an IN list with 2000 values
         if let Expr::InList(in_list) = &result {
-            assert_eq!(in_list.list.len(), count, "Expected {count} values in IN list");
+            assert_eq!(
+                in_list.list.len(),
+                count,
+                "Expected {count} values in IN list"
+            );
             assert!(!in_list.negated);
 
             if let Expr::Column(col) = in_list.expr.as_ref() {
@@ -818,15 +820,16 @@ mod tests {
             }
 
             // Spot check some values
-            let has_first = in_list.list.iter().any(|e| {
-                matches!(e, Expr::Literal(ScalarValue::Utf8(Some(v)), _) if v == "id-0")
-            });
-            let has_last = in_list.list.iter().any(|e| {
-                matches!(e, Expr::Literal(ScalarValue::Utf8(Some(v)), _) if v == "id-1999")
-            });
-            let has_middle = in_list.list.iter().any(|e| {
-                matches!(e, Expr::Literal(ScalarValue::Utf8(Some(v)), _) if v == "id-1000")
-            });
+            let has_first = in_list
+                .list
+                .iter()
+                .any(|e| matches!(e, Expr::Literal(ScalarValue::Utf8(Some(v)), _) if v == "id-0"));
+            let has_last = in_list.list.iter().any(
+                |e| matches!(e, Expr::Literal(ScalarValue::Utf8(Some(v)), _) if v == "id-1999"),
+            );
+            let has_middle = in_list.list.iter().any(
+                |e| matches!(e, Expr::Literal(ScalarValue::Utf8(Some(v)), _) if v == "id-1000"),
+            );
 
             assert!(has_first, "Missing first value id-0");
             assert!(has_last, "Missing last value id-1999");
@@ -853,11 +856,7 @@ mod tests {
 
         // Should be a balanced OR tree
         let or_conditions = collect_or_conditions(&result);
-        assert_eq!(
-            or_conditions.len(),
-            count,
-            "Expected {count} OR conditions"
-        );
+        assert_eq!(or_conditions.len(), count, "Expected {count} OR conditions");
 
         // Verify the depth is O(log n), not O(n)
         // For 2000 elements, log2(2000) ≈ 11, so depth should be around 11
@@ -936,12 +935,12 @@ mod tests {
     fn test_balanced_or_depth_is_logarithmic() {
         // Test various sizes to verify O(log n) depth
         let test_cases = [
-            (1, 0),    // Single element has depth 0
-            (2, 1),    // 2 elements: depth 1
-            (4, 2),    // 4 elements: depth 2
-            (8, 3),    // 8 elements: depth 3
-            (16, 4),   // 16 elements: depth 4
-            (100, 7),  // 100 elements: ceil(log2(100)) = 7
+            (1, 0),     // Single element has depth 0
+            (2, 1),     // 2 elements: depth 1
+            (4, 2),     // 4 elements: depth 2
+            (8, 3),     // 8 elements: depth 3
+            (16, 4),    // 16 elements: depth 4
+            (100, 7),   // 100 elements: ceil(log2(100)) = 7
             (1000, 10), // 1000 elements: ceil(log2(1000)) = 10
         ];
 
@@ -962,13 +961,7 @@ mod tests {
 
     #[test]
     fn test_balanced_and_depth_is_logarithmic() {
-        let test_cases = [
-            (1, 0),
-            (2, 1),
-            (4, 2),
-            (8, 3),
-            (16, 4),
-        ];
+        let test_cases = [(1, 0), (2, 1), (4, 2), (8, 3), (16, 4)];
 
         for (count, expected_depth) in test_cases {
             let exprs: Vec<Expr> = (0..count)
