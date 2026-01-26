@@ -1,0 +1,147 @@
+name: build
+
+on:
+  push:
+    branches: ['trunk']
+  pull_request:
+    branches: ['trunk']
+
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_toolchains:
+    name: Clippy on ${{ matrix.toolchain }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - stable
+          - beta
+          - nightly
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Rust toolchain
+        # actions-rs/toolchain v1.0.7
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+          override: true
+
+      - name: Install required cargo
+        run: cargo install clippy-sarif sarif-fmt
+
+      - name: Run rust-clippy
+        run: cargo clippy
+          --all-features
+          --message-format=json | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
+        continue-on-error: true
+
+      - name: Upload analysis results to GitHub
+        # github/codeql-action v3.28.1
+        uses: github/codeql-action/upload-sarif@48ab28a6f5dbc2a99bf1e0131198dd8f1df78169
+        with:
+          sarif_file: rust-clippy-results.sarif
+          wait-for-processing: true
+
+  build_and_test:
+    name: Build and test ${{matrix.os}} on ${{ matrix.toolchain }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          [
+            ubuntu-latest,
+            ubuntu-22.04,
+            macos-latest,
+            macos-14,
+            windows-latest,
+            windows-2022,
+          ]
+        toolchain:
+          - stable
+          - beta
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Rust toolchain
+        # actions-rs/toolchain v1.0.7
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+          override: true
+
+      - name: Cargo clippy
+        run: cargo clippy --all-features
+
+      - name: Install Spice (https://install.spiceai.org) (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl https://install.spiceai.org | /bin/bash
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
+          $HOME/.spice/bin/spice install
+
+      - name: Install Spice (https://install.spiceai.org) (MacOS)
+        if: startsWith(matrix.os, 'macos')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          brew install spiceai/spiceai/spice
+          spice install
+
+      - name: install Spice (Windows)
+        if: startsWith(matrix.os, 'windows')
+        run: |
+          curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+
+      - name: add Spice bin to PATH (Windows)
+        if: startsWith(matrix.os, 'windows')
+        run: |
+          Add-Content $env:GITHUB_PATH (Join-Path $HOME ".spice\bin")
+        shell: pwsh
+
+      - name: Init and start spice app
+        if: "!startsWith(matrix.os, 'windows')"
+        run: |
+          spice init spice_qs
+          cd spice_qs
+          spice add spiceai/quickstart
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
+
+      - name: Init and start spice app (Windows)
+        if: startsWith(matrix.os, 'windows')
+        run: |
+          spice init spice_qs
+          cd spice_qs
+          spice add spiceai/quickstart
+          Start-Process -FilePath spice run
+          # time to initialize added dataset
+          Start-Sleep -Seconds 10
+        shell: pwsh
+
+      - name: Run tests
+        run: cargo test
+        env:
+          SCP_SPICEAI_TPCH_API_KEY: ${{ secrets.SCP_SPICEAI_TPCH_API_KEY }}
+
+      - name: Stop spice and check logs
+        working-directory: spice_qs
+        if: "!startsWith(matrix.os, 'windows') && always()"
+        run: |
+          killall spice || true
+          cat spice.log
