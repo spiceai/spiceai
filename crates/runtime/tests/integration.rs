@@ -60,7 +60,6 @@ pub mod dynamodb;
 mod endpoint_auth;
 mod file;
 mod flight;
-mod gcs;
 mod github;
 mod glue;
 mod graphql;
