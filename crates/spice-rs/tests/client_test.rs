@@ -27,6 +27,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_new_client_builder() {
         new_cloud_client().await;
     }
@@ -59,6 +60,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires running Spice runtime with taxi_trips dataset"]
     async fn test_local_query() {
         let _ = rustls::crypto::CryptoProvider::install_default(
             rustls::crypto::aws_lc_rs::default_provider(),
@@ -94,6 +96,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires running Spice runtime with taxi_trips dataset"]
     async fn test_local_query_with_params() {
         let _ = rustls::crypto::CryptoProvider::install_default(
             rustls::crypto::aws_lc_rs::default_provider(),
@@ -133,6 +136,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_query() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -164,6 +168,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_query_streaming() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -196,6 +201,7 @@ mod tests {
 
     /// Test querying integer and string types from the nation table
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_nation_types() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -222,6 +228,7 @@ mod tests {
 
     /// Test querying decimal types from the orders table
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_orders_decimal_types() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -248,6 +255,7 @@ mod tests {
 
     /// Test querying date types from the orders table
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_orders_date_types() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -274,6 +282,7 @@ mod tests {
 
     /// Test querying multiple decimal columns from the lineitem table
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_lineitem_decimal_types() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -300,6 +309,7 @@ mod tests {
 
     /// Test querying multiple date columns from the lineitem table
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_lineitem_date_types() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -328,6 +338,7 @@ mod tests {
 
     /// Test aggregation query with GROUP BY
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_aggregation() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -354,6 +365,7 @@ mod tests {
 
     /// Test query with SUM aggregation on decimal columns
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_sum_aggregation() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -380,6 +392,7 @@ mod tests {
 
     /// Test query with JOIN between tables
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_join_query() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -405,6 +418,7 @@ mod tests {
 
     /// Test querying the region table (small reference table)
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_region_table() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -431,6 +445,7 @@ mod tests {
 
     /// Test querying the supplier table with decimal (acctbal) type
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_supplier_types() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -457,6 +472,7 @@ mod tests {
 
     /// Test querying the part table with various types
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_part_types() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -483,6 +499,7 @@ mod tests {
 
     /// Test querying the partsupp table
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_partsupp_types() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -511,6 +528,7 @@ mod tests {
 
     /// Test query with calculated/derived columns
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_calculated_columns() {
         let spice_client = new_cloud_client().await;
         match spice_client
@@ -536,6 +554,7 @@ mod tests {
 
     /// Test query with WHERE clause filtering
     #[tokio::test]
+    #[ignore = "requires SCP_SPICEAI_TPCH_API_KEY environment variable"]
     async fn test_tpch_filtered_query() {
         let spice_client = new_cloud_client().await;
         match spice_client

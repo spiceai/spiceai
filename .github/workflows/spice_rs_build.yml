@@ -142,7 +142,7 @@ jobs:
         shell: pwsh
 
       - name: Run tests
-        run: cargo test -p spiceai
+        run: cargo test -p spiceai -- --include-ignored
         env:
           SCP_SPICEAI_TPCH_API_KEY: ${{ secrets.SCP_SPICEAI_TPCH_API_KEY }}
 
