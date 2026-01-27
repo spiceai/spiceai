@@ -18,7 +18,11 @@ use std::sync::Arc;
 
 use app::AppBuilder;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
-use runtime::Runtime;
+use runtime::{
+    Runtime,
+    component::dataset::Dataset as RuntimeDataset,
+    dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
+};
 use spicepod::{
     acceleration::{Acceleration, Mode},
     component::dataset::Dataset,
@@ -185,14 +189,16 @@ async fn initialize_runtime(port: usize) -> Result<Runtime, anyhow::Error> {
         ..Acceleration::default()
     });
 
+    let ds_clone = ds.clone();
+
     let app = AppBuilder::new("test_schema_evolution")
         .with_dataset(ds)
         .build();
 
     configure_test_datafusion();
-    let rt = Runtime::builder().with_app(app).build().await;
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-    let cloned_rt = Arc::new(rt.clone());
+    let cloned_rt = Arc::clone(&rt);
 
     // Set a timeout for the test
     tokio::select! {
@@ -204,5 +210,45 @@ async fn initialize_runtime(port: usize) -> Result<Runtime, anyhow::Error> {
 
     runtime_ready_check(&rt).await;
 
-    Ok(rt)
+    // Wait for checkpoint to be created (checkpoint creation is async after runtime is ready)
+    let app_ref = rt.app();
+    let app_lock = app_ref.read().await;
+    let Some(app) = app_lock.as_ref() else {
+        return Err(anyhow::anyhow!("Failed to obtain app from runtime"));
+    };
+
+    let runtime_dataset = runtime::component::dataset::builder::DatasetBuilder::try_from(ds_clone)
+        .map_err(|e| anyhow::anyhow!("Failed to create dataset builder: {e}"))?
+        .with_app(Arc::clone(app))
+        .with_runtime(Arc::clone(&rt))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build dataset: {e}"))?;
+    wait_for_checkpoint(&runtime_dataset, 30).await?;
+
+    // Drop the app lock before returning
+    drop(app_lock);
+
+    // Unwrap the Arc to get ownership of the Runtime
+    Ok(Arc::try_unwrap(rt).unwrap_or_else(|arc| (*arc).clone()))
+}
+
+async fn wait_for_checkpoint(
+    dataset: &RuntimeDataset,
+    timeout_secs: u64,
+) -> Result<(), anyhow::Error> {
+    let checkpoint = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create checkpoint: {e}"))?;
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    while !checkpoint.exists().await {
+        if start.elapsed() > timeout {
+            return Err(anyhow::anyhow!("Timed out waiting for checkpoint to exist"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    Ok(())
 }
