@@ -17,7 +17,7 @@ limitations under the License.
 //! `spice chat` command - Chat with an LLM.
 
 use crate::context::RuntimeContext;
-use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
+use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, Result};
 use clap::Args;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -116,7 +116,11 @@ struct ModelsResponse {
 pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
     // Get or select the model
     let model = match &args.model {
-        Some(m) => m.clone(),
+        Some(m) => {
+            // Validate that the specified model exists
+            validate_model(ctx, m).await?;
+            m.clone()
+        }
         None => select_model(ctx).await?,
     };
 
@@ -141,6 +145,77 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
 
 /// Select a model from available models.
 async fn select_model(ctx: &RuntimeContext) -> Result<String> {
+    let models = get_available_models(ctx).await?;
+
+    if models.is_empty() {
+        return Err(InvalidResponseSnafu {
+            message: "No models found. Please configure a model in your Spicepod.".to_string(),
+        }
+        .build());
+    }
+
+    // If only one model, use it
+    if models.len() == 1 {
+        return Ok(models[0].clone());
+    }
+
+    // Let user select
+    println!("\nAvailable models:");
+    for (i, model) in models.iter().enumerate() {
+        println!("  {}: {model}", i + 1);
+    }
+
+    print!("Select model (1-{}): ", models.len());
+    let _ = io::stdout().flush();
+
+    let stdin = io::stdin();
+    let mut input = String::new();
+    stdin.lock().read_line(&mut input).map_err(|e| {
+        InvalidResponseSnafu {
+            message: format!("Failed to read input: {e}"),
+        }
+        .build()
+    })?;
+
+    let selection: usize = input.trim().parse().map_err(|_| {
+        InvalidResponseSnafu {
+            message: "Invalid selection".to_string(),
+        }
+        .build()
+    })?;
+
+    if selection == 0 || selection > models.len() {
+        return Err(InvalidResponseSnafu {
+            message: format!("Selection must be between 1 and {}", models.len()),
+        }
+        .build());
+    }
+
+    Ok(models[selection - 1].clone())
+}
+
+/// Validate that a model exists.
+async fn validate_model(ctx: &RuntimeContext, model: &str) -> Result<()> {
+    let models = get_available_models(ctx).await?;
+
+    if !models.iter().any(|m| m == model) {
+        let available = if models.is_empty() {
+            "none".to_string()
+        } else {
+            models.join(", ")
+        };
+        return Err(ModelNotFoundSnafu {
+            model: model.to_string(),
+            available,
+        }
+        .build());
+    }
+
+    Ok(())
+}
+
+/// Get the list of available models from the runtime.
+async fn get_available_models(ctx: &RuntimeContext) -> Result<Vec<String>> {
     let url = format!("{}/v1/models?status=true", ctx.http_endpoint());
 
     let mut request = ctx.http_client().get(&url);
@@ -169,51 +244,7 @@ async fn select_model(ctx: &RuntimeContext) -> Result<String> {
         .build()
     })?;
 
-    if models.data.is_empty() {
-        return Err(InvalidResponseSnafu {
-            message: "No models found. Please configure a model in your Spicepod.".to_string(),
-        }
-        .build());
-    }
-
-    // If only one model, use it
-    if models.data.len() == 1 {
-        return Ok(models.data[0].id.clone());
-    }
-
-    // Let user select
-    println!("\nAvailable models:");
-    for (i, model) in models.data.iter().enumerate() {
-        println!("  {}: {}", i + 1, model.id);
-    }
-
-    print!("Select model (1-{}): ", models.data.len());
-    let _ = io::stdout().flush();
-
-    let stdin = io::stdin();
-    let mut input = String::new();
-    stdin.lock().read_line(&mut input).map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to read input: {e}"),
-        }
-        .build()
-    })?;
-
-    let selection: usize = input.trim().parse().map_err(|_| {
-        InvalidResponseSnafu {
-            message: "Invalid selection".to_string(),
-        }
-        .build()
-    })?;
-
-    if selection == 0 || selection > models.data.len() {
-        return Err(InvalidResponseSnafu {
-            message: format!("Selection must be between 1 and {}", models.data.len()),
-        }
-        .build());
-    }
-
-    Ok(models.data[selection - 1].id.clone())
+    Ok(models.data.into_iter().map(|m| m.id).collect())
 }
 
 /// Run the REPL loop.

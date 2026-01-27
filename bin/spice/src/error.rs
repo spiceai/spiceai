@@ -101,4 +101,8 @@ pub enum Error {
     /// Failed to register signal handler
     #[snafu(display("Failed to register signal handler: {source}"))]
     SignalHandler { source: std::io::Error },
+
+    /// Model not found
+    #[snafu(display("Model '{model}' not found. Available models: {available}"))]
+    ModelNotFound { model: String, available: String },
 }
