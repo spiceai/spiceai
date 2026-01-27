@@ -180,7 +180,6 @@ Testing focus DRIs are responsible for:
 - [ ] Merge any pending Merge pending [Cookbook PRs](https://github.com/spiceai/cookbook/pulls)
 
 - [ ] Prepare and finalize release notes:
-  - [ ] If the previous release was an RC release, copy the previous RC release notes as a starting points. RC release notes are additive until the final stable release.
   - [ ] Acknowledge external and new contributors.
   - [ ] List notable dependency updates (e.g. `datafusion`, `datafusion-table-providers`) under `## Dependencies`.
   - [ ] Summarize any cookbook changes under `## Cookbook`.
