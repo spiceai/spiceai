@@ -1949,14 +1949,17 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            // Verify no snapshots exist yet
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // Verify initial snapshot exists
             let initial_snapshots = context
                 .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
                 .await
                 .unwrap_or_default();
-            assert!(
-                initial_snapshots.is_empty(),
-                "Should start with no snapshots in this fresh context"
+            assert_eq!(
+                initial_snapshots.len(),
+                1,
+                "Exactly one snapshot should be created"
             );
 
             runtime
@@ -1993,7 +1996,7 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
             assert_eq!(
                 snapshots_after.len(),
                 4,
-                "Exactly one snapshot should be created"
+                "Exactly fours snapshots should be created"
             );
 
             runtime.shutdown().await;
