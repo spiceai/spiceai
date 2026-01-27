@@ -88,6 +88,9 @@ pem = "3"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 
+# Internal crates
+flightrepl = { path = "../../crates/flightrepl" }
+
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
@@ -102,7 +105,6 @@ test-framework = { path = "../../crates/test-framework" }
 
 # Tracing/opentelemetry for trace ID handling
 opentelemetry.workspace = true
-
 [build-dependencies]
 # None needed - we use include_str! for version
 
