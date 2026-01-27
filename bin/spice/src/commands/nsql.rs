@@ -52,12 +52,10 @@ async fn get_or_select_model(ctx: &RuntimeContext, model: Option<&str>) -> Resul
                 ModelNotFoundSnafu { model, available }.build()
             }
             repl::util::UtilError::NoModelsConfigured => NoModelsConfiguredSnafu.build(),
-            repl::util::UtilError::ConnectionFailed { endpoint, source } => {
-                InvalidResponseSnafu {
-                    message: format!("Failed to connect to {endpoint}: {source}"),
-                }
-                .build()
+            repl::util::UtilError::ConnectionFailed { endpoint, source } => InvalidResponseSnafu {
+                message: format!("Failed to connect to {endpoint}: {source}"),
             }
+            .build(),
             repl::util::UtilError::InvalidResponse { message } => {
                 InvalidResponseSnafu { message }.build()
             }
@@ -84,13 +82,12 @@ pub async fn execute(ctx: &RuntimeContext, args: &NsqlArgs) -> Result<()> {
 
 /// Run the REPL loop.
 async fn run_repl(ctx: &RuntimeContext, model: &str) -> Result<()> {
-    let (mut rl, history_path) =
-        create_editor_with_history("nsql_history.txt").map_err(|e| {
-            InvalidResponseSnafu {
-                message: e.to_string(),
-            }
-            .build()
-        })?;
+    let (mut rl, history_path) = create_editor_with_history("nsql_history.txt").map_err(|e| {
+        InvalidResponseSnafu {
+            message: e.to_string(),
+        }
+        .build()
+    })?;
 
     loop {
         let readline = rl.readline("nsql> ");

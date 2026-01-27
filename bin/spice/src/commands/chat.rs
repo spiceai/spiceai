@@ -110,12 +110,10 @@ async fn get_or_select_model(ctx: &RuntimeContext, model: Option<&str>) -> Resul
                 ModelNotFoundSnafu { model, available }.build()
             }
             repl::util::UtilError::NoModelsConfigured => NoModelsConfiguredSnafu.build(),
-            repl::util::UtilError::ConnectionFailed { endpoint, source } => {
-                InvalidResponseSnafu {
-                    message: format!("Failed to connect to {endpoint}: {source}"),
-                }
-                .build()
+            repl::util::UtilError::ConnectionFailed { endpoint, source } => InvalidResponseSnafu {
+                message: format!("Failed to connect to {endpoint}: {source}"),
             }
+            .build(),
             repl::util::UtilError::InvalidResponse { message } => {
                 InvalidResponseSnafu { message }.build()
             }
