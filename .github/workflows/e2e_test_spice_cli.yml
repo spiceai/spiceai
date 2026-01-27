@@ -69,6 +69,10 @@ jobs:
         if: matrix.target.target_os == 'linux' && github.event.inputs.build_cli == 'true'
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        if: matrix.target.target_os == 'linux' && github.event.inputs.build_cli == 'true'
+        uses: ./.github/actions/setup-cc
+
       - name: Build spice
         if: github.event.inputs.build_cli == 'true'
         run: cargo build --release -p spice
