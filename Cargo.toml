@@ -238,7 +238,7 @@ prost = { version = "0.14.1", default-features = false, features = [
 ] }
 r2d2 = "0.8.10"
 rand = "0.9.2"
-rdkafka = { version = "0.38.0" }
+rdkafka = { version = "0.39.0" }
 regex = "1.12.2"
 # Pinned to 0.12.24 due to hf-hub content-range header issue with 0.12.25+ (tower-http decompression change)
 # See: https://github.com/seanmonstar/reqwest/pull/2840

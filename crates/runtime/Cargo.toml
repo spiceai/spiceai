@@ -189,9 +189,7 @@ yaml = { path = "../yaml" }
 anyhow.workspace = true
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
-aws-credential-types = { workspace = true, features = [
-    "hardcoded-credentials",
-] }
+aws-credential-types = { workspace = true, features = ["hardcoded-credentials"] }
 azure_core = "0.31.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
