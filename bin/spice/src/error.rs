@@ -90,7 +90,7 @@ pub enum Error {
     ))]
     HomeDirectoryNotFound,
 
-    /// Flightrepl error
+    /// REPL error
     #[snafu(display("SQL REPL error: {message}"))]
     Repl { message: String },
 

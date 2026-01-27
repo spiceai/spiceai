@@ -57,7 +57,7 @@ pub struct SqlArgs {
 /// Execute the sql command.
 pub async fn execute(ctx: &RuntimeContext, args: &SqlArgs) -> Result<()> {
     let repl_config = build_repl_config(ctx, args);
-    flightrepl::run(repl_config)
+    repl::run(repl_config)
         .await
         .map_err(|e| crate::error::Error::Repl {
             message: e.to_string(),
@@ -66,8 +66,8 @@ pub async fn execute(ctx: &RuntimeContext, args: &SqlArgs) -> Result<()> {
     Ok(())
 }
 
-/// Build the flightrepl configuration from CLI args.
-fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> flightrepl::ReplConfig {
+/// Build the REPL configuration from CLI args.
+fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
     let flight_endpoint = args
         .endpoint
         .clone()
@@ -95,11 +95,11 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> flightrepl::ReplCo
     let http_endpoint = ctx.http_endpoint().to_string();
 
     let cache_control = match args.cache_control.as_str() {
-        "no-cache" => flightrepl::cache_control::CacheControl::NoCache,
-        _ => flightrepl::cache_control::CacheControl::Cache,
+        "no-cache" => repl::cache_control::CacheControl::NoCache,
+        _ => repl::cache_control::CacheControl::Cache,
     };
 
-    flightrepl::ReplConfig {
+    repl::ReplConfig {
         repl_flight_endpoint: flight_endpoint,
         http_endpoint,
         tls_root_certificate_file: args.tls_root_certificate_file.clone(),

@@ -30,7 +30,6 @@ pub mod error;
 pub mod github;
 pub mod output;
 pub mod registry;
-pub mod repl;
 
 pub use context::RuntimeContext;
 pub use error::{Error, Result};

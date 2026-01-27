@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,15 +16,9 @@ limitations under the License.
 
 //! Shared REPL utilities for CLI commands.
 
-use crate::context::RuntimeContext;
-use crate::error::{
-    ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
-    Result,
-};
 use dialoguer::{Select, theme::ColorfulTheme};
 use rustyline::DefaultEditor;
 use serde::Deserialize;
-use snafu::ResultExt;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Spinner animation frames.
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Model information from the models endpoint.
 #[derive(Deserialize)]
@@ -45,6 +39,41 @@ struct Model {
 struct ModelsResponse {
     data: Vec<Model>,
 }
+
+/// Error type for REPL utilities.
+#[derive(Debug)]
+pub enum UtilError {
+    /// Connection failed
+    ConnectionFailed { endpoint: String, source: String },
+    /// Invalid response
+    InvalidResponse { message: String },
+    /// Model not found
+    ModelNotFound { model: String, available: String },
+    /// No models configured
+    NoModelsConfigured,
+}
+
+impl std::fmt::Display for UtilError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionFailed { endpoint, source } => {
+                write!(f, "Failed to connect to {endpoint}: {source}")
+            }
+            Self::InvalidResponse { message } => write!(f, "{message}"),
+            Self::ModelNotFound { model, available } => {
+                write!(
+                    f,
+                    "Model '{model}' not found. Available models: {available}"
+                )
+            }
+            Self::NoModelsConfigured => {
+                write!(f, "No models are configured in the runtime")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UtilError {}
 
 /// A spinner that shows activity while waiting for an async operation.
 pub struct Spinner {
@@ -100,41 +129,46 @@ impl Drop for Spinner {
 }
 
 /// Get the list of available models from the runtime.
-pub async fn get_available_models(ctx: &RuntimeContext) -> Result<Vec<String>> {
-    let url = format!("{}/v1/models?status=true", ctx.http_endpoint());
+pub async fn get_available_models(
+    client: &reqwest::Client,
+    http_endpoint: &str,
+    headers: &[(String, String)],
+) -> Result<Vec<String>, UtilError> {
+    let url = format!("{http_endpoint}/v1/models?status=true");
 
-    let mut request = ctx.http_client().get(&url);
-    for (key, value) in ctx.get_headers() {
-        request = request.header(&key, &value);
+    let mut request = client.get(&url);
+    for (key, value) in headers {
+        request = request.header(key, value);
     }
 
-    let response = request
-        .send()
-        .await
-        .context(ConnectionFailedSnafu { endpoint: &url })?;
+    let response = request.send().await.map_err(|e| UtilError::ConnectionFailed {
+        endpoint: url.clone(),
+        source: e.to_string(),
+    })?;
 
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(InvalidResponseSnafu {
+        return Err(UtilError::InvalidResponse {
             message: format!("Failed to get models: {status} - {text}"),
-        }
-        .build());
+        });
     }
 
-    let models: ModelsResponse = response.json().await.map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to parse models response: {e}"),
-        }
-        .build()
+    let models: ModelsResponse = response.json().await.map_err(|e| UtilError::InvalidResponse {
+        message: format!("Failed to parse models response: {e}"),
     })?;
 
     Ok(models.data.into_iter().map(|m| m.id).collect())
 }
 
 /// Validate that a model exists in the runtime.
-pub async fn validate_model(ctx: &RuntimeContext, model: &str) -> Result<()> {
-    let models = get_available_models(ctx).await?;
+pub async fn validate_model(
+    client: &reqwest::Client,
+    http_endpoint: &str,
+    headers: &[(String, String)],
+    model: &str,
+) -> Result<(), UtilError> {
+    let models = get_available_models(client, http_endpoint, headers).await?;
 
     if !models.iter().any(|m| m == model) {
         let available = if models.is_empty() {
@@ -142,21 +176,26 @@ pub async fn validate_model(ctx: &RuntimeContext, model: &str) -> Result<()> {
         } else {
             models.join(", ")
         };
-        return Err(ModelNotFoundSnafu {
+        return Err(UtilError::ModelNotFound {
             model: model.to_string(),
             available,
-        }
-        .build());
+        });
     }
 
     Ok(())
 }
 
 /// Select a model from available models using an interactive picker.
-pub async fn select_model(ctx: &RuntimeContext) -> Result<String> {
-    let models = get_available_models(ctx).await?;
+pub async fn select_model(
+    client: &reqwest::Client,
+    http_endpoint: &str,
+    headers: &[(String, String)],
+) -> Result<String, UtilError> {
+    let models = get_available_models(client, http_endpoint, headers).await?;
 
-    snafu::ensure!(!models.is_empty(), NoModelsConfiguredSnafu);
+    if models.is_empty() {
+        return Err(UtilError::NoModelsConfigured);
+    }
 
     // If only one model, use it
     if models.len() == 1 {
@@ -169,34 +208,39 @@ pub async fn select_model(ctx: &RuntimeContext) -> Result<String> {
         .items(&models)
         .default(0)
         .interact()
-        .map_err(|e| {
-            InvalidResponseSnafu {
-                message: format!("Failed to read selection: {e}"),
-            }
-            .build()
+        .map_err(|e| UtilError::InvalidResponse {
+            message: format!("Failed to read selection: {e}"),
         })?;
 
     Ok(models[selection].clone())
 }
 
 /// Get or validate a model - validates if specified, selects interactively if not.
-pub async fn get_or_select_model(ctx: &RuntimeContext, model: Option<&str>) -> Result<String> {
+pub async fn get_or_select_model(
+    client: &reqwest::Client,
+    http_endpoint: &str,
+    headers: &[(String, String)],
+    model: Option<&str>,
+) -> Result<String, UtilError> {
     match model {
         Some(m) => {
-            validate_model(ctx, m).await?;
+            validate_model(client, http_endpoint, headers, m).await?;
             Ok(m.to_string())
         }
-        None => select_model(ctx).await,
+        None => select_model(client, http_endpoint, headers).await,
     }
 }
 
 /// Create a new rustyline editor with history loaded from the specified file.
-pub fn create_editor_with_history(history_file: &str) -> Result<(DefaultEditor, Option<PathBuf>)> {
-    let mut rl = DefaultEditor::new().map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to initialize line editor: {e}"),
-        }
-        .build()
+///
+/// # Errors
+///
+/// Returns an error if the editor fails to initialize.
+pub fn create_editor_with_history(
+    history_file: &str,
+) -> Result<(DefaultEditor, Option<PathBuf>), UtilError> {
+    let mut rl = DefaultEditor::new().map_err(|e| UtilError::InvalidResponse {
+        message: format!("Failed to initialize line editor: {e}"),
     })?;
 
     let history_path = dirs::home_dir().map(|h| h.join(".spice").join(history_file));

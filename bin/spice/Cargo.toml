@@ -89,7 +89,7 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 
 # Internal crates
-flightrepl = { path = "../../crates/flightrepl" }
+repl = { path = "../../crates/repl" }
 
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]

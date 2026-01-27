@@ -6763,30 +6763,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flightrepl"
-version = "1.11.0-unstable"
-dependencies = [
- "ansi_colors",
- "arrow",
- "arrow-flight",
- "arrow-json",
- "clap 4.5.54",
- "flight_client",
- "futures",
- "insta",
- "prost 0.14.3",
- "regex",
- "reqwest",
- "rustyline",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
- "tracing",
- "winver",
-]
-
-[[package]]
 name = "flightsubscriber"
 version = "1.11.0-unstable"
 dependencies = [
@@ -13990,6 +13966,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "repl"
+version = "1.11.0-unstable"
+dependencies = [
+ "ansi_colors",
+ "arrow",
+ "arrow-flight",
+ "arrow-json",
+ "clap 4.5.54",
+ "dialoguer",
+ "dirs",
+ "flight_client",
+ "futures",
+ "insta",
+ "prost 0.14.3",
+ "regex",
+ "reqwest",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "winver",
+]
+
+[[package]]
 name = "reqsign"
 version = "0.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14432,7 +14434,6 @@ dependencies = [
  "dynamodb-streams",
  "event_stream",
  "flight_client",
- "flightrepl",
  "fundu",
  "futures",
  "gethostname",
@@ -14486,6 +14487,7 @@ dependencies = [
  "rayon",
  "rdkafka",
  "regex",
+ "repl",
  "reqwest",
  "rmcp",
  "rstest 0.26.1",
@@ -16418,7 +16420,6 @@ dependencies = [
  "dirs",
  "dotenvy",
  "flate2",
- "flightrepl",
  "futures",
  "humantime",
  "nix 0.29.0",
@@ -16427,6 +16428,7 @@ dependencies = [
  "predicates",
  "rand 0.9.2",
  "rcgen",
+ "repl",
  "reqwest",
  "rstest 0.26.1",
  "rustyline",
@@ -16496,7 +16498,6 @@ dependencies = [
  "app",
  "clap 4.5.54",
  "event_stream",
- "flightrepl",
  "futures",
  "mimalloc",
  "opentelemetry",
@@ -16506,6 +16507,7 @@ dependencies = [
  "opentelemetry_sdk",
  "otel-arrow",
  "prometheus",
+ "repl",
  "reqwest",
  "runtime",
  "runtime-async",

@@ -19,8 +19,8 @@ limitations under the License.
 use crate::context::RuntimeContext;
 use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
 use crate::output::TableOutput;
-use crate::repl::{Spinner, create_editor_with_history, save_history};
 use clap::Args;
+use repl::util::{Spinner, create_editor_with_history, save_history};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::HashMap;
@@ -113,7 +113,12 @@ pub async fn execute(ctx: &RuntimeContext, args: &SearchArgs) -> Result<()> {
 
 /// Run the REPL loop.
 async fn run_repl(ctx: &RuntimeContext, args: &SearchArgs) -> Result<()> {
-    let (mut rl, history_path) = create_editor_with_history("search_history.txt")?;
+    let (mut rl, history_path) = create_editor_with_history("search_history.txt").map_err(|e| {
+        InvalidResponseSnafu {
+            message: e.to_string(),
+        }
+        .build()
+    })?;
 
     loop {
         let readline = rl.readline("search> ");

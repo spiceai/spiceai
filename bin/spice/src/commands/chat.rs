@@ -17,10 +17,13 @@ limitations under the License.
 //! `spice chat` command - Chat with an LLM.
 
 use crate::context::RuntimeContext;
-use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
-use crate::repl::{Spinner, create_editor_with_history, get_or_select_model, save_history};
+use crate::error::{
+    ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
+    Result,
+};
 use clap::Args;
 use futures::StreamExt;
+use repl::util::{Spinner, create_editor_with_history, save_history};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::io::{self, Write};
@@ -97,6 +100,28 @@ struct Usage {
     total_tokens: u32,
 }
 
+/// Get or validate a model using the runtime context.
+async fn get_or_select_model(ctx: &RuntimeContext, model: Option<&str>) -> Result<String> {
+    let headers: Vec<(String, String)> = ctx.get_headers().into_iter().collect();
+    repl::util::get_or_select_model(ctx.http_client(), ctx.http_endpoint(), &headers, model)
+        .await
+        .map_err(|e| match e {
+            repl::util::UtilError::ModelNotFound { model, available } => {
+                ModelNotFoundSnafu { model, available }.build()
+            }
+            repl::util::UtilError::NoModelsConfigured => NoModelsConfiguredSnafu.build(),
+            repl::util::UtilError::ConnectionFailed { endpoint, source } => {
+                InvalidResponseSnafu {
+                    message: format!("Failed to connect to {endpoint}: {source}"),
+                }
+                .build()
+            }
+            repl::util::UtilError::InvalidResponse { message } => {
+                InvalidResponseSnafu { message }.build()
+            }
+        })
+}
+
 /// Execute the `chat` command.
 ///
 /// # Errors
@@ -127,7 +152,12 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
 
 /// Run the REPL loop.
 async fn run_repl(ctx: &RuntimeContext, model: &str, temperature: Option<f32>) -> Result<()> {
-    let (mut rl, history_path) = create_editor_with_history("chat_history.txt")?;
+    let (mut rl, history_path) = create_editor_with_history("chat_history.txt").map_err(|e| {
+        InvalidResponseSnafu {
+            message: e.to_string(),
+        }
+        .build()
+    })?;
 
     let mut messages: Vec<Message> = Vec::new();
 

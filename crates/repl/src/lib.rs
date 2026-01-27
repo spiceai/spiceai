@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,6 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+//! Spice.ai REPL utilities and Flight SQL REPL.
+//!
+//! This crate provides:
+//! - Shared REPL utilities (spinner, model selection, history management) via the `util` module
+//! - Flight SQL REPL implementation via the `run` function
 
 use std::borrow::Cow;
 use std::error::Error;
@@ -58,6 +64,7 @@ use tonic::{Code, IntoRequest, Status};
 
 pub mod cache_control;
 mod completer;
+pub mod util;
 mod config;
 
 #[derive(Parser, Debug)]

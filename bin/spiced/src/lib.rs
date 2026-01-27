@@ -26,7 +26,7 @@ use std::time::Duration;
 use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryConfig};
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
-use flightrepl::ReplConfig;
+use repl::ReplConfig;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
