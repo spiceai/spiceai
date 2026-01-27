@@ -23,8 +23,8 @@ use super::constants::{
     DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
 };
 use super::delete::{
-    read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec, Int64PkDeletionFilterExec,
-    KeyBasedDeletionFilterExec,
+    is_pk_visible_i64, is_pk_visible_row_key, read_deletion_vectors, CayenneDeletionSink,
+    DeletionFilterExec, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
@@ -1119,6 +1119,10 @@ impl CayenneTableProvider {
         // with a higher sequence number. This ensures proper Iceberg-style ordering:
         // - Deletions apply to snapshots with sequence <= delete_sequence
         // - New data in snapshots with sequence > delete_sequence is visible
+        //
+        // We still need to run validate_on_conflict() on the incoming stream
+        // to handle upserts for PKs that already exist in the table. Without this,
+        // duplicate PKs would appear in query results.
         if has_pending_deletions {
             let new_sequence = self
                 .catalog
@@ -1129,9 +1133,26 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name,
                 new_sequence
             );
-            return self
-                .insert_to_new_snapshot_with_sequence(stream, new_sequence)
-                .await;
+
+            let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
+                self.prepare_stream_for_insert(stream).await?;
+
+            tracing::debug!(
+                "insert() with pending deletions: delete_specs={} files, deleted_pk_i64={} keys",
+                delete_specs.len(),
+                deleted_pk_i64.len()
+            );
+
+            // Write to new snapshot with the prepared (deduplicated) stream
+            let total_rows = self
+                .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
+                .await?;
+
+            // Update deletion caches for the upserted PKs
+            self.apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
+                .await?;
+
+            return Ok(total_rows);
         }
 
         let target_size_bytes = self.context.target_file_size_bytes();
@@ -1139,32 +1160,13 @@ impl CayenneTableProvider {
         // If a primary key is configured, enforce on_conflict behavior by materializing
         // the incoming stream, validating keys, and preparing deletion vectors.
         let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
-            if let Some(pk_indices) = self.primary_key_indices()? {
-                let converter = self.build_pk_converter(&pk_indices)?;
-                let mut existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
-                let validation_result = self
-                    .validate_on_conflict(stream, &pk_indices, &converter, &mut existing_keys)
-                    .await?;
+            self.prepare_stream_for_insert(stream).await?;
 
-                // Build a new stream from the validated batches.
-                let schema = validation_result.filtered_batches.first().map_or_else(
-                    || Arc::clone(&self.table_metadata.schema),
-                    RecordBatch::schema,
-                );
-                let validated_stream = RecordBatchStreamAdapter::new(
-                    Arc::clone(&schema),
-                    futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok)),
-                );
-
-                (
-                    Box::pin(validated_stream) as SendableRecordBatchStream,
-                    validation_result.delete_specs,
-                    validation_result.deleted_pk_i64,
-                    validation_result.deleted_row_keys,
-                )
-            } else {
-                (stream, HashMap::new(), Vec::new(), Vec::new())
-            };
+        tracing::debug!(
+            "insert(): delete_specs={} files, deleted_pk_i64={} keys",
+            delete_specs.len(),
+            deleted_pk_i64.len()
+        );
 
         // Process stream in chunks and write them in parallel with bounded concurrency
         let (total_rows, chunk_count) = self
@@ -1924,9 +1926,12 @@ impl CayenneTableProvider {
     /// Build the existing keyset (primary key bytes -> row location) for append-mode inserts.
     ///
     /// This method respects ALL deletion caches based on `pk_deletion_strategy`:
-    /// - `Int64Pk`: Uses `cached_deleted_pk_i64` (single Int64 primary key)
-    /// - `RowConverterBased`: Uses `cached_deleted_row_keys` (composite/non-integer PK)
+    /// - `Int64Pk`: Uses `cached_deleted_pk_i64` and `cached_insert_records_pk_i64`
+    /// - `RowConverterBased`: Uses `cached_deleted_row_keys` and `cached_insert_records_row_keys`
     /// - `PositionBased`: Uses `cached_deleted_row_ids` (no primary key)
+    ///
+    /// Rows marked as deleted are excluded unless they were re-inserted with a higher
+    /// sequence number (upsert semantics).
     async fn load_existing_keyset(
         &self,
         pk_indices: &[usize],
@@ -1979,6 +1984,18 @@ impl CayenneTableProvider {
             None
         };
 
+        // Load insert records cache for Int64Pk strategy to check re-insertions
+        let insert_records_pk_i64 = if self.pk_deletion_strategy == PkDeletionStrategy::Int64Pk {
+            let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
+                CatalogError::InvalidOperationNoSource {
+                    message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                }
+            })?;
+            Some(Arc::clone(&guard))
+        } else {
+            None
+        };
+
         let deleted_row_keys = if self.pk_deletion_strategy == PkDeletionStrategy::RowConverterBased
         {
             let guard = self.cached_deleted_row_keys.read().map_err(|_| {
@@ -1990,6 +2007,19 @@ impl CayenneTableProvider {
         } else {
             None
         };
+
+        // Load insert records cache for RowConverterBased strategy to check re-insertions
+        let insert_records_row_keys =
+            if self.pk_deletion_strategy == PkDeletionStrategy::RowConverterBased {
+                let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
+                    CatalogError::InvalidOperationNoSource {
+                        message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                    }
+                })?;
+                Some(Arc::clone(&guard))
+            } else {
+                None
+            };
 
         let mut keyset = HashMap::with_capacity(1024);
         let mut row_id_base: i64 = 0;
@@ -2032,7 +2062,11 @@ impl CayenneTableProvider {
                             (int64_pk_array, &deleted_pk_i64)
                         {
                             let pk_value = pk_array.value(row_idx);
-                            deleted_pks.contains_key(&pk_value)
+                            !is_pk_visible_i64(
+                                pk_value,
+                                deleted_pks,
+                                insert_records_pk_i64.as_deref(),
+                            )
                         } else {
                             false
                         }
@@ -2040,7 +2074,11 @@ impl CayenneTableProvider {
                     PkDeletionStrategy::RowConverterBased => {
                         if let Some(deleted_keys) = &deleted_row_keys {
                             let key = rows.row(row_idx);
-                            deleted_keys.contains_key(key.as_ref())
+                            !is_pk_visible_row_key(
+                                key.as_ref(),
+                                deleted_keys,
+                                insert_records_row_keys.as_deref(),
+                            )
                         } else {
                             false
                         }
@@ -2099,6 +2137,57 @@ impl CayenneTableProvider {
         }
 
         Ok(keyset)
+    }
+
+    /// Prepare an incoming stream for insert by validating `on_conflict` constraints.
+    ///
+    /// If a primary key is configured, this method:
+    /// 1. Loads existing keys from the table (respecting deletion visibility)
+    /// 2. Validates incoming rows against `on_conflict` behavior (drop/upsert)
+    /// 3. Returns a prepared stream with conflicts resolved and deletion specs
+    ///
+    /// If no primary key is configured, returns the stream unchanged with empty deletion specs.
+    async fn prepare_stream_for_insert(
+        &self,
+        stream: SendableRecordBatchStream,
+    ) -> CatalogResult<(
+        SendableRecordBatchStream,
+        HashMap<i64, Vec<i64>>,
+        Vec<i64>,
+        Vec<Box<[u8]>>,
+    )> {
+        let Some(pk_indices) = self.primary_key_indices()? else {
+            return Ok((stream, HashMap::new(), Vec::new(), Vec::new()));
+        };
+
+        let converter = self.build_pk_converter(&pk_indices)?;
+        let mut existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
+        tracing::debug!(
+            "prepare_stream_for_insert: loaded {} existing keys for table {}",
+            existing_keys.len(),
+            self.table_metadata.table_name
+        );
+
+        let validation_result = self
+            .validate_on_conflict(stream, &pk_indices, &converter, &mut existing_keys)
+            .await?;
+
+        // Build a new stream from the validated batches.
+        let schema = validation_result.filtered_batches.first().map_or_else(
+            || Arc::clone(&self.table_metadata.schema),
+            RecordBatch::schema,
+        );
+        let validated_stream = RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(validation_result.filtered_batches.into_iter().map(Ok)),
+        );
+
+        Ok((
+            Box::pin(validated_stream) as SendableRecordBatchStream,
+            validation_result.delete_specs,
+            validation_result.deleted_pk_i64,
+            validation_result.deleted_row_keys,
+        ))
     }
 
     /// Validate incoming batches against primary key uniqueness and configured on-conflict behavior.
