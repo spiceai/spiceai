@@ -1529,6 +1529,10 @@ impl SnapshotManager {
     }
 
     /// Downloads a snapshot archive and extracts it to multiple directories (for Cayenne).
+    ///
+    /// Uses skip-if-exists extraction to handle multiple Cayenne datasets that share a
+    /// metadata directory. The first dataset's snapshot extracts the metadata files,
+    /// and subsequent datasets skip those files since they already exist.
     async fn download_to_directories(
         &self,
         dirs: &[(PathBuf, String)],
@@ -1536,7 +1540,7 @@ impl SnapshotManager {
         entry: &SnapshotEntry,
         path_display: &str,
     ) -> Result<(u64, String), SnapshotDownloadError> {
-        use crate::snapshot::directory_archive::extract_archive;
+        use crate::snapshot::directory_archive::{ExtractOptions, extract_archive_with_options};
 
         // Download to a temporary file first
         let temp_archive_path = std::env::temp_dir().join(format!(
@@ -1621,7 +1625,10 @@ impl SnapshotManager {
                 }
             })?;
 
-        // Extract the tar archive to the target directory
+        // Extract the tar archive to the target directory.
+        // Use skip_if_exists to handle shared metadata directories across multiple
+        // Cayenne datasets. The first dataset's snapshot extracts the metadata,
+        // and subsequent datasets skip those files since they already exist.
         let archive_file = fs::File::open(&temp_archive_path).await.map_err(|source| {
             SnapshotDownloadError::WriteLocal {
                 path: temp_archive_path.clone(),
@@ -1629,12 +1636,16 @@ impl SnapshotManager {
             }
         })?;
 
-        extract_archive(archive_file, extract_target)
-            .await
-            .map_err(|source| SnapshotDownloadError::ArchiveExtract {
-                path: temp_archive_path.clone(),
-                source: std::io::Error::other(source.to_string()),
-            })?;
+        extract_archive_with_options(
+            archive_file,
+            extract_target,
+            ExtractOptions::skip_existing(),
+        )
+        .await
+        .map_err(|source| SnapshotDownloadError::ArchiveExtract {
+            path: temp_archive_path.clone(),
+            source: std::io::Error::other(source.to_string()),
+        })?;
 
         // Cleanup temp archive
         let _ = fs::remove_file(&temp_archive_path).await;

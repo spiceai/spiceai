@@ -69,7 +69,7 @@ tempfile.workspace = true
 comfy-table = "7"
 
 # Line editor for REPL
-rustyline = "15"
+rustyline = "17"
 
 # Random number generation (for auth codes)
 rand = "0.9"

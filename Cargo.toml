@@ -238,7 +238,7 @@ prost = { version = "0.14.1", default-features = false, features = [
 ] }
 r2d2 = "0.8.10"
 rand = "0.9.2"
-rdkafka = { version = "0.38.0" }
+rdkafka = { version = "0.39.0" }
 regex = "1.12.2"
 # Pinned to 0.12.24 due to hf-hub content-range header issue with 0.12.25+ (tower-http decompression change)
 # See: https://github.com/seanmonstar/reqwest/pull/2840
@@ -351,10 +351,9 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "1de
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "8cff5241923989720f86687bdf7d0b3c9c7dad2f" } # spiceai-51
 
-# Spiceai fork of datafusion-ballista with Vortex shuffle format support and PollNow interrupt
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" }      # branch: spiceai-51
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" }  # branch: spiceai-51
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" } # branch: spiceai-51
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "2abc199e4b23f0881a4520e2749412dd35514050" } # branch: spiceai-51
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "2abc199e4b23f0881a4520e2749412dd35514050" } # branch: spiceai-51
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "2abc199e4b23f0881a4520e2749412dd35514050" } # branch: spiceai-51
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
