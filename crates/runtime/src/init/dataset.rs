@@ -87,10 +87,8 @@ impl Runtime {
         // Validate Cayenne snapshot consistency before initializing accelerators.
         // All Cayenne datasets sharing the same metadata directory must have the same
         // snapshot configuration (either all enabled or all disabled).
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> = valid_datasets
-            .iter()
-            .map(|ds| ds.clone_arc())
-            .collect();
+        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
+            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
         if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
@@ -818,10 +816,8 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
 
         // Validate Cayenne snapshot consistency before initializing accelerators.
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> = valid_datasets
-            .iter()
-            .map(|ds| ds.clone_arc())
-            .collect();
+        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
+            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
         if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;

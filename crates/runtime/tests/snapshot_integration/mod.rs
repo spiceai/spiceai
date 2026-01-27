@@ -2010,7 +2010,9 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
 /// with inconsistent settings will not be loaded.
 #[tokio::test]
 async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<()> {
-    let _guard = init_tracing(Some("integration=debug,runtime::dataaccelerator=trace,info"));
+    let _guard = init_tracing(Some(
+        "integration=debug,runtime::dataaccelerator=trace,info",
+    ));
 
     test_request_context()
         .scope(async {
@@ -2151,7 +2153,9 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
 /// without conflicting on shared metadata files.
 #[tokio::test]
 async fn snapshot_int_test11_cayenne_multiple_datasets_bootstrap() -> Result<()> {
-    let _guard = init_tracing(Some("integration=debug,runtime_acceleration::snapshot=debug,info"));
+    let _guard = init_tracing(Some(
+        "integration=debug,runtime_acceleration::snapshot=debug,info",
+    ));
     let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
     test_request_context()
         .scope(async {

@@ -184,19 +184,19 @@ pub struct ExtractOptions {
     /// datasets skip the metadata files because they already exist.
     pub skip_if_exists: bool,
 
-    /// If true, verify checksums of existing files when skip_if_exists is enabled.
+    /// If true, verify checksums of existing files when `skip_if_exists` is enabled.
     /// If a file exists but its checksum doesn't match the expected value in the archive,
     /// an error is returned to indicate data corruption.
     pub verify_existing_checksums: bool,
 
     /// Expected checksums for files, keyed by their archive path.
-    /// If provided and verify_existing_checksums is true, existing files are verified
+    /// If provided and `verify_existing_checksums` is true, existing files are verified
     /// against these checksums.
     pub expected_checksums: Option<HashMap<String, String>>,
 }
 
 impl ExtractOptions {
-    /// Creates options with skip_if_exists enabled and checksum verification enabled.
+    /// Creates options with `skip_if_exists` enabled and checksum verification enabled.
     /// This is the recommended option for Cayenne snapshot extraction where data
     /// integrity is critical.
     #[must_use]
@@ -208,7 +208,7 @@ impl ExtractOptions {
         }
     }
 
-    /// Creates options with skip_if_exists enabled but checksum verification disabled.
+    /// Creates options with `skip_if_exists` enabled but checksum verification disabled.
     /// Use with caution - this trades off safety for performance.
     #[must_use]
     pub fn skip_existing_no_verify() -> Self {
@@ -338,13 +338,15 @@ fn compute_file_checksum(path: &Path) -> Result<String> {
     })?;
 
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024]; // 64KB buffer
+    let mut buffer = vec![0u8; 64 * 1024]; // 64KB heap-allocated buffer
 
     loop {
-        let bytes_read = file.read(&mut buffer).map_err(|source| ArchiveError::ExtractArchive {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|source| ArchiveError::ExtractArchive {
+                path: path.to_path_buf(),
+                source,
+            })?;
 
         if bytes_read == 0 {
             break;
@@ -380,7 +382,10 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
     use std::fs;
     use std::io::{Read, Write};
 
-    for entry_result in archive.entries().map_err(|source| ArchiveError::ReadArchive { source })? {
+    for entry_result in archive
+        .entries()
+        .map_err(|source| ArchiveError::ReadArchive { source })?
+    {
         let mut entry = entry_result.map_err(|source| ArchiveError::ReadArchive { source })?;
         let entry_path = entry
             .path()
@@ -454,11 +459,12 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
             let temp_path = dest_path.with_extension("tmp");
 
             {
-                let mut file =
-                    fs::File::create(&temp_path).map_err(|source| ArchiveError::ExtractArchive {
+                let mut file = fs::File::create(&temp_path).map_err(|source| {
+                    ArchiveError::ExtractArchive {
                         path: temp_path.clone(),
                         source,
-                    })?;
+                    }
+                })?;
 
                 file.write_all(&contents)
                     .map_err(|source| ArchiveError::ExtractArchive {
@@ -466,10 +472,11 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                         source,
                     })?;
 
-                file.sync_all().map_err(|source| ArchiveError::ExtractArchive {
-                    path: temp_path.clone(),
-                    source,
-                })?;
+                file.sync_all()
+                    .map_err(|source| ArchiveError::ExtractArchive {
+                        path: temp_path.clone(),
+                        source,
+                    })?;
             }
 
             // Atomic rename
@@ -960,8 +967,8 @@ mod tests {
         .await?;
 
         // Verify dataset 1 content
-        let catalog = std::fs::read(extract_dir.path().join("metadata/catalog.db"))
-            .expect("read catalog");
+        let catalog =
+            std::fs::read(extract_dir.path().join("metadata/catalog.db")).expect("read catalog");
         assert_eq!(catalog, shared_metadata);
         let data1 = std::fs::read_to_string(extract_dir.path().join("data/data1.vortex"))
             .expect("read data1");
@@ -976,9 +983,8 @@ mod tests {
         .await?;
 
         // Verify metadata was NOT overwritten (still from dataset 1, verified via checksum)
-        let catalog_after =
-            std::fs::read(extract_dir.path().join("metadata/catalog.db"))
-                .expect("read catalog after");
+        let catalog_after = std::fs::read(extract_dir.path().join("metadata/catalog.db"))
+            .expect("read catalog after");
         assert_eq!(
             catalog_after, shared_metadata,
             "Metadata should not be overwritten when skip_if_exists is true"
@@ -1080,8 +1086,8 @@ mod tests {
         );
 
         // Verify original file was NOT overwritten (skipped)
-        let content = std::fs::read_to_string(extract_dir.path().join("data/file.txt"))
-            .expect("read file");
+        let content =
+            std::fs::read_to_string(extract_dir.path().join("data/file.txt")).expect("read file");
         assert_eq!(
             content, "different_pre_existing_content",
             "File should be skipped, not overwritten"

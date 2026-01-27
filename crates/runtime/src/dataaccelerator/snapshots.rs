@@ -18,6 +18,8 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use crate::component::dataset::acceleration::Engine;
 use crate::dataaccelerator::BootstrapStatus;
+#[cfg(not(windows))]
+use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
@@ -25,8 +27,6 @@ use crate::{
         spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     },
 };
-#[cfg(not(windows))]
-use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::{
@@ -169,7 +169,7 @@ pub enum CayenneSnapshotValidationError {
 /// Validates that all Cayenne datasets sharing the same metadata directory have consistent
 /// snapshot settings (either all enabled or all disabled).
 ///
-/// This validation is necessary because Cayenne uses a shared SQLite metadata catalog for
+/// This validation is necessary because Cayenne uses a shared `SQLite` metadata catalog for
 /// all datasets in the same metadata directory. When snapshots are enabled, the metadata
 /// database must be included in the snapshot archive. To ensure consistency and avoid
 /// conflicts during snapshot restoration, all datasets sharing the metadata directory
@@ -195,7 +195,8 @@ pub fn validate_cayenne_snapshot_consistency(
         }
 
         let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
-        let snapshots_enabled = !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled);
+        let snapshots_enabled =
+            !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled);
         let dataset_name = source.name().to_string();
 
         metadata_dir_groups
@@ -216,16 +217,18 @@ pub fn validate_cayenne_snapshot_consistency(
             .collect();
         let disabled: Vec<&str> = datasets
             .iter()
-            .filter_map(|(name, enabled)| if !*enabled { Some(name.as_str()) } else { None })
+            .filter_map(|(name, enabled)| if *enabled { None } else { Some(name.as_str()) })
             .collect();
 
         // If we have both enabled and disabled datasets, that's an error
         if !enabled.is_empty() && !disabled.is_empty() {
-            return Err(CayenneSnapshotValidationError::InconsistentSnapshotSettings {
-                metadata_dir,
-                enabled_datasets: enabled.join(", "),
-                disabled_datasets: disabled.join(", "),
-            });
+            return Err(
+                CayenneSnapshotValidationError::InconsistentSnapshotSettings {
+                    metadata_dir,
+                    enabled_datasets: enabled.join(", "),
+                    disabled_datasets: disabled.join(", "),
+                },
+            );
         }
     }
 
