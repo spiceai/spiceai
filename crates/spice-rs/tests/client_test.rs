@@ -82,7 +82,7 @@ mod tests {
                     }
                 }
                 let batch_concat = concat_batches(&batches[0].schema(), &batches).expect("Failed to concat batches");
-                let formatted = format!("{}", pretty_format_batches(&[batch_concat.clone()]).expect("Failed to format batches"));
+                let formatted = format!("{}", pretty_format_batches(std::slice::from_ref(&batch_concat)).expect("Failed to format batches"));
                 assert_eq!(batch_concat.num_columns(), 3);
                 assert_eq!(batch_concat.num_rows(), 5);
                 assert_eq!(formatted, get_expected_result());
@@ -90,7 +90,7 @@ mod tests {
             Err(e) => {
                 panic!("Error: {e}");
             }
-        };
+        }
     }
 
     #[tokio::test]
@@ -121,7 +121,7 @@ mod tests {
                     }
                 }
                 let batch_concat = concat_batches(&batches[0].schema(), &batches).expect("Failed to concat batches");
-                let formatted = format!("{}", pretty_format_batches(&[batch_concat.clone()]).expect("Failed to format batches"));
+                let formatted = format!("{}", pretty_format_batches(std::slice::from_ref(&batch_concat)).expect("Failed to format batches"));
                 assert_eq!(batch_concat.num_columns(), 3);
                 assert_eq!(batch_concat.num_rows(), 5);
                 assert_eq!(formatted, get_expected_result());
@@ -129,7 +129,7 @@ mod tests {
             Err(e) => {
                 panic!("Error: {e}");
             }
-        };
+        }
     }
 
     #[tokio::test]
@@ -150,7 +150,7 @@ mod tests {
                         Err(e) => {
                             panic!("Error: {e}")
                         }
-                    };
+                    }
                 }
                 let batch_concat = concat_batches(&batches[0].schema(), &batches)
                     .expect("Failed to concat batches");
@@ -160,7 +160,7 @@ mod tests {
             Err(e) => {
                 panic!("Error: {e}");
             }
-        };
+        }
     }
 
     #[tokio::test]
@@ -183,7 +183,7 @@ mod tests {
                         Err(e) => {
                             panic!("Error: {e}")
                         }
-                    };
+                    }
                 }
                 assert_eq!(total_rows, 10000);
                 assert_ne!(num_batches, 1);
@@ -191,7 +191,7 @@ mod tests {
             Err(e) => {
                 panic!("Error: {e}");
             }
-        };
+        }
     }
 
     /// Test querying integer and string types from the nation table
@@ -217,7 +217,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 5);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test querying decimal types from the orders table
@@ -243,7 +243,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 10);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test querying date types from the orders table
@@ -269,7 +269,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 10);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test querying multiple decimal columns from the lineitem table
@@ -295,7 +295,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 20);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test querying multiple date columns from the lineitem table
@@ -323,7 +323,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 15);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test aggregation query with GROUP BY
@@ -349,7 +349,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 5);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test query with SUM aggregation on decimal columns
@@ -375,7 +375,7 @@ mod tests {
                 assert!(batch_concat.num_rows() >= 1);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test query with JOIN between tables
@@ -400,7 +400,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 10);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test querying the region table (small reference table)
@@ -426,7 +426,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 5);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test querying the supplier table with decimal (acctbal) type
@@ -452,7 +452,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 10);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test querying the part table with various types
@@ -478,7 +478,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 10);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test querying the partsupp table
@@ -506,7 +506,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 10);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test query with calculated/derived columns
@@ -531,7 +531,7 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 10);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 
     /// Test query with WHERE clause filtering
@@ -557,6 +557,6 @@ mod tests {
                 assert_eq!(batch_concat.num_rows(), 10);
             }
             Err(e) => panic!("Error: {e}"),
-        };
+        }
     }
 }

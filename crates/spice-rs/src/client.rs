@@ -46,7 +46,6 @@ impl SpiceClientConfig {
 
 /// The `SpiceClient` is the main entry point for interacting with the Spice API.
 /// It provides methods for querying the Spice Flight endpoint.
-#[allow(clippy::module_name_repetitions)]
 #[derive(Clone)]
 pub struct SpiceClient {
     flight: Arc<SqlFlightClient>,

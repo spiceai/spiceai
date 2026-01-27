@@ -73,14 +73,14 @@ mod tests {
         // HTTP endpoint should work without TLS
         let result = new_tls_flight_channel("http://localhost:12345").await;
         // Will fail to connect, but should not panic on TLS config
-        assert!(result.is_err()); // Connection refused is expected
+        result.expect_err("connection should be refused");
     }
 
     #[tokio::test]
     async fn test_new_tls_flight_channel_https_invalid_host() {
         // HTTPS with invalid host should fail gracefully
         let result = new_tls_flight_channel("https://invalid.nonexistent.host:443").await;
-        assert!(result.is_err());
+        result.expect_err("invalid host should fail");
     }
 
     #[test]
@@ -88,8 +88,7 @@ mod tests {
         use std::str::FromStr;
         use tonic::transport::channel::Endpoint;
 
-        let endpoint = Endpoint::from_str("https://flight.spiceai.io");
-        assert!(endpoint.is_ok());
+        Endpoint::from_str("https://flight.spiceai.io").expect("valid https endpoint");
     }
 
     #[test]
@@ -97,8 +96,7 @@ mod tests {
         use std::str::FromStr;
         use tonic::transport::channel::Endpoint;
 
-        let endpoint = Endpoint::from_str("http://localhost:50051");
-        assert!(endpoint.is_ok());
+        Endpoint::from_str("http://localhost:50051").expect("valid http endpoint");
     }
 
     // Edge case tests
@@ -107,7 +105,7 @@ mod tests {
     async fn test_new_tls_flight_channel_empty_url() {
         // Empty URL should fail
         let result = new_tls_flight_channel("").await;
-        assert!(result.is_err());
+        result.expect_err("empty URL should fail");
     }
 
     #[tokio::test]
@@ -115,14 +113,14 @@ mod tests {
         // Connection to an unreachable port should fail
         let result = new_tls_flight_channel("http://127.0.0.1:1").await;
         // Port 1 is typically not open, so connection should fail
-        assert!(result.is_err());
+        result.expect_err("unreachable port should fail");
     }
 
     #[tokio::test]
     async fn test_new_tls_flight_channel_missing_scheme() {
         // Missing scheme should fail
         let result = new_tls_flight_channel("example.com:443").await;
-        assert!(result.is_err());
+        result.expect_err("missing scheme should fail");
     }
 
     #[test]
@@ -130,8 +128,7 @@ mod tests {
         use std::str::FromStr;
         use tonic::transport::channel::Endpoint;
 
-        let endpoint = Endpoint::from_str("https://flight.spiceai.io/path");
-        assert!(endpoint.is_ok());
+        Endpoint::from_str("https://flight.spiceai.io/path").expect("valid endpoint with path");
     }
 
     #[test]
@@ -139,8 +136,7 @@ mod tests {
         use std::str::FromStr;
         use tonic::transport::channel::Endpoint;
 
-        let endpoint = Endpoint::from_str("https://flight.spiceai.io:443");
-        assert!(endpoint.is_ok());
+        Endpoint::from_str("https://flight.spiceai.io:443").expect("valid endpoint with port");
     }
 
     #[test]
@@ -148,8 +144,7 @@ mod tests {
         use std::str::FromStr;
         use tonic::transport::channel::Endpoint;
 
-        let endpoint = Endpoint::from_str("http://127.0.0.1:50051");
-        assert!(endpoint.is_ok());
+        Endpoint::from_str("http://127.0.0.1:50051").expect("valid ipv4 localhost endpoint");
     }
 
     #[test]
@@ -157,18 +152,13 @@ mod tests {
         use std::str::FromStr;
         use tonic::transport::channel::Endpoint;
 
-        let endpoint = Endpoint::from_str("http://[::1]:50051");
-        assert!(endpoint.is_ok());
+        Endpoint::from_str("http://[::1]:50051").expect("valid ipv6 localhost endpoint");
     }
 
     #[test]
     fn test_system_tls_certificate_pem_format() {
         // Verify the certificate loads and is in valid PEM format
-        let result = system_tls_certificate();
-        assert!(
-            result.is_ok(),
-            "should load system TLS certificates in PEM format"
-        );
+        system_tls_certificate().expect("should load system TLS certificates in PEM format");
     }
 
     #[test]
