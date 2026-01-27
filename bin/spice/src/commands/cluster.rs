@@ -19,7 +19,7 @@ limitations under the License.
 use crate::error::{
     ConfigIoSnafu, CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, InvalidArgumentSnafu, Result,
 };
-use ansi_term::Colour;
+use ansi_colors::Colour;
 use clap::{Args, Subcommand};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,

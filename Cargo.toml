@@ -3,6 +3,7 @@ default-members = ["bin/spiced"]
 members = [
     "bin/spice/",
     "bin/spiced/",
+    "crates/ansi_colors",
     "crates/app",
     "crates/arrow_sql_gen",
     "crates/arrow_tools",

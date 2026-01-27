@@ -52,7 +52,7 @@ chrono = { workspace = true, features = ["serde"] }
 humantime = "2"
 
 # Terminal colors
-ansi_term = "0.12"
+ansi_colors = { path = "../../crates/ansi_colors" }
 
 # Archive extraction
 flate2 = "1"

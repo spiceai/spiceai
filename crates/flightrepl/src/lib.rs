@@ -32,7 +32,7 @@ use arrow_flight::{
 };
 
 use crate::completer::SchemaCache;
-use ansi_term::Color;
+use ansi_colors::Color;
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
