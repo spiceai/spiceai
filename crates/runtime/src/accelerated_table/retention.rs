@@ -16,6 +16,14 @@ limitations under the License.
 
 use std::{sync::Arc, time::SystemTime};
 
+use crate::{
+    accelerated_table::{DataRetentionFilter, Retention, refresh},
+    component::dataset::TimeFormat,
+    datafusion::{
+        builder::get_df_default_config, filter_converter::TimestampFilterConvert,
+        is_spice_internal_dataset,
+    },
+};
 use arrow::array::UInt64Array;
 use cache::Caching;
 use data_components::delete::get_deletion_provider;
@@ -26,17 +34,9 @@ use datafusion::{
     prelude::{Expr, SessionContext},
     sql::TableReference,
 };
+use runtime_object_store::registry::default_runtime_env;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
-use crate::{
-    accelerated_table::{DataRetentionFilter, Retention, refresh},
-    component::dataset::TimeFormat,
-    datafusion::{
-        builder::get_df_default_config, filter_converter::TimestampFilterConvert,
-        is_spice_internal_dataset,
-    },
-};
-use runtime_object_store::registry::default_runtime_env;
 
 impl super::AcceleratedTable {
     #[expect(clippy::cast_possible_truncation)]
@@ -329,6 +329,7 @@ mod tests {
             retention,
             caching,
             Handle::current(),
+            Arc::new(Mutex::new(())),
         ));
 
         // Wait for retention to run
