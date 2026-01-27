@@ -27,7 +27,7 @@ use datafusion::{
     sql::TableReference,
 };
 use tokio::runtime::Handle;
-
+use tokio::sync::Mutex;
 use crate::{
     accelerated_table::{DataRetentionFilter, Retention, refresh},
     component::dataset::TimeFormat,
@@ -46,11 +46,15 @@ impl super::AcceleratedTable {
         retention: Retention,
         caching: Option<Arc<Caching>>,
         io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) {
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
         loop {
             interval_timer.tick().await;
+
+            // Lock the accelerator to protect concurrent access to the accelerator during cache/snapshot operations
+            let _lock_guard = accelerator_write_mutex.lock().await;
 
             if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
                 let mut exprs = Vec::new();
