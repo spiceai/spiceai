@@ -384,7 +384,7 @@ async fn test_multiple_concurrent_inserts(backend: BackendType) -> TestResult<()
 
 test_with_backends_multithreaded!(test_separate_sessions);
 
-/// Test with separate DataFusion sessions simulating separate accelerations in a spicepod.
+/// Test with separate `DataFusion` sessions simulating separate accelerations in a spicepod.
 async fn test_separate_sessions(backend: BackendType) -> TestResult<()> {
     let (_temp_dir, catalog, data_path) = create_shared_fixture(backend).await?;
     let schema = create_test_schema();
@@ -859,11 +859,11 @@ async fn test_highly_concurrent_inserts(backend: BackendType) -> TestResult<()> 
 
 test_with_backends_multithreaded!(test_concurrent_overwrite_operations, workers = 8);
 
-/// Test concurrent OVERWRITE operations which trigger the commit_compaction transaction.
+/// Test concurrent OVERWRITE operations which trigger the `commit_compaction` transaction.
 /// This directly exercises the transaction path that causes "Database is busy" in issue #8826.
 ///
 /// The bug occurred because:
-/// 1. Each table's overwrite calls commit_compaction which runs:
+/// 1. Each table's overwrite calls `commit_compaction` which runs:
 ///    `BEGIN TRANSACTION; DELETE...; DELETE...; UPDATE...; COMMIT;`
 /// 2. The shared metastore backend did not wait for write locks (no busy timeout)
 /// 3. When two concurrent transactions tried to write, one immediately failed with "Database is busy"
