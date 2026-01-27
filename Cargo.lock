@@ -14510,7 +14510,7 @@ dependencies = [
  "snafu",
  "snowflake-api",
  "spice-cloud",
- "spiceai 3.2.0",
+ "spiceai 3.2.0 (git+https://github.com/spiceai/spice-rs.git?tag=v3.1.0)",
  "spicepod",
  "sysinfo 0.37.2",
  "tar",
@@ -16466,7 +16466,7 @@ dependencies = [
 
 [[package]]
 name = "spiceai"
-version = "1.11.0-unstable"
+version = "3.2.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -17583,7 +17583,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "spiceai 3.2.0",
+ "spiceai 3.2.0 (git+https://github.com/spiceai/spice-rs.git?tag=v3.1.0)",
  "spicepod",
  "sysinfo 0.37.2",
  "telemetry",
@@ -17630,7 +17630,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "spiceai 3.2.0",
+ "spiceai 3.2.0 (git+https://github.com/spiceai/spice-rs.git?tag=v3.1.0)",
  "test-framework",
  "tokio",
  "tokio-util",
