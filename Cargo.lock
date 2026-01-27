@@ -16433,6 +16433,7 @@ dependencies = [
  "flightrepl",
  "futures",
  "humantime",
+ "nix 0.29.0",
  "open",
  "pem",
  "predicates",
