@@ -93,4 +93,12 @@ pub enum Error {
     /// Flightrepl error
     #[snafu(display("SQL REPL error: {message}"))]
     Repl { message: String },
+
+    /// Failed to get child process ID
+    #[snafu(display("Failed to get child process ID"))]
+    ChildProcessId,
+
+    /// Failed to register signal handler
+    #[snafu(display("Failed to register signal handler: {source}"))]
+    SignalHandler { source: std::io::Error },
 }
