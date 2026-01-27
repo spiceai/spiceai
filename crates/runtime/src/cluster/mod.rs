@@ -226,6 +226,7 @@ fn spawn_scheduler_poll_loop(
                 Arc::clone(&executor),
                 codec.clone(),
                 Some(tx_ready),
+                None, // poll_now_notify - not needed for Spice runtime
             );
 
             tokio::select! {
