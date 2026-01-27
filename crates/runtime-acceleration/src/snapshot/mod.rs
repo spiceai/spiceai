@@ -4219,7 +4219,7 @@ mod tests {
 
     // ========== Tests for has_existing_snapshots path matching ==========
 
-    /// Creates a SnapshotManager with a specific dataset name for testing path matching.
+    /// Creates a `SnapshotManager` with a specific dataset name for testing path matching.
     fn build_manager_with_dataset_name(
         store: Arc<InMemory>,
         dataset_name: &str,
@@ -4363,7 +4363,7 @@ mod tests {
         );
     }
 
-    /// This test verifies that has_existing_snapshots correctly distinguishes between
+    /// This test verifies that `has_existing_snapshots` correctly distinguishes between
     /// datasets with similar prefixes (e.g., "foo" vs "foobar").
     ///
     /// Previously, the code used `.contains()` for substring matching which would
