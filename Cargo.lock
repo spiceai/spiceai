@@ -6758,6 +6758,7 @@ dependencies = [
 name = "flightrepl"
 version = "1.11.0-unstable"
 dependencies = [
+ "ansi_term",
  "arrow",
  "arrow-flight",
  "arrow-json",

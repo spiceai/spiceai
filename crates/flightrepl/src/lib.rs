@@ -32,6 +32,7 @@ use arrow_flight::{
 };
 
 use crate::completer::SchemaCache;
+use ansi_term::Color;
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
@@ -55,12 +56,9 @@ use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
-mod ansi_colors;
 pub mod cache_control;
 mod completer;
 mod config;
-
-use ansi_colors::Color;
 
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai SQL REPL")]
@@ -296,10 +294,6 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     let client = FlightServiceClient::new(channel)
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
         .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
-
-    #[cfg(target_os = "windows")]
-    // Ensure ANSI support on Windows is enabled for proper color display.
-    let _ = ansi_colors::enable_ansi_support();
 
     let config = Config::builder()
         .completion_type(CompletionType::List)
