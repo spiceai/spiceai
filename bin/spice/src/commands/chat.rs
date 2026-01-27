@@ -17,16 +17,13 @@ limitations under the License.
 //! `spice chat` command - Chat with an LLM.
 
 use crate::context::RuntimeContext;
-use crate::error::{
-    ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
-    Result,
-};
+use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
+use crate::repl::{Spinner, create_editor_with_history, get_or_select_model, save_history};
 use clap::Args;
-use dialoguer::{Select, theme::ColorfulTheme};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::time::Instant;
 
 /// Arguments for the `chat` command.
@@ -100,18 +97,6 @@ struct Usage {
     total_tokens: u32,
 }
 
-/// Model information.
-#[derive(Deserialize)]
-struct Model {
-    id: String,
-}
-
-/// Models response.
-#[derive(Deserialize)]
-struct ModelsResponse {
-    data: Vec<Model>,
-}
-
 /// Execute the `chat` command.
 ///
 /// # Errors
@@ -119,14 +104,7 @@ struct ModelsResponse {
 /// Returns an error if the API requests fail or input/output fails.
 pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
     // Get or select the model
-    let model = match &args.model {
-        Some(m) => {
-            // Validate that the specified model exists
-            validate_model(ctx, m).await?;
-            m.clone()
-        }
-        None => select_model(ctx).await?,
-    };
+    let model = get_or_select_model(ctx, args.model.as_deref()).await?;
 
     // If a message was provided on command line, send it and exit
     if let Some(message) = &args.message {
@@ -147,109 +125,34 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
     run_repl(ctx, &model, args.temperature).await
 }
 
-/// Select a model from available models.
-async fn select_model(ctx: &RuntimeContext) -> Result<String> {
-    let models = get_available_models(ctx).await?;
-
-    snafu::ensure!(!models.is_empty(), NoModelsConfiguredSnafu);
-
-    // If only one model, use it
-    if models.len() == 1 {
-        return Ok(models[0].clone());
-    }
-
-    // Let user select with arrow keys
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select model")
-        .items(&models)
-        .default(0)
-        .interact()
-        .map_err(|e| {
-            InvalidResponseSnafu {
-                message: format!("Failed to read selection: {e}"),
-            }
-            .build()
-        })?;
-
-    Ok(models[selection].clone())
-}
-
-/// Validate that a model exists.
-async fn validate_model(ctx: &RuntimeContext, model: &str) -> Result<()> {
-    let models = get_available_models(ctx).await?;
-
-    if !models.iter().any(|m| m == model) {
-        let available = if models.is_empty() {
-            "none".to_string()
-        } else {
-            models.join(", ")
-        };
-        return Err(ModelNotFoundSnafu {
-            model: model.to_string(),
-            available,
-        }
-        .build());
-    }
-
-    Ok(())
-}
-
-/// Get the list of available models from the runtime.
-async fn get_available_models(ctx: &RuntimeContext) -> Result<Vec<String>> {
-    let url = format!("{}/v1/models?status=true", ctx.http_endpoint());
-
-    let mut request = ctx.http_client().get(&url);
-    for (key, value) in ctx.get_headers() {
-        request = request.header(&key, &value);
-    }
-
-    let response = request
-        .send()
-        .await
-        .context(ConnectionFailedSnafu { endpoint: &url })?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(InvalidResponseSnafu {
-            message: format!("Failed to get models: {status} - {text}"),
-        }
-        .build());
-    }
-
-    let models: ModelsResponse = response.json().await.map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to parse models response: {e}"),
-        }
-        .build()
-    })?;
-
-    Ok(models.data.into_iter().map(|m| m.id).collect())
-}
-
 /// Run the REPL loop.
 async fn run_repl(ctx: &RuntimeContext, model: &str, temperature: Option<f32>) -> Result<()> {
-    let stdin = io::stdin();
+    let (mut rl, history_path) = create_editor_with_history("chat_history.txt")?;
+
     let mut messages: Vec<Message> = Vec::new();
 
     loop {
-        print!("chat> ");
-        let _ = io::stdout().flush();
-
-        let mut input = String::new();
-        match stdin.lock().read_line(&mut input) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+        let readline = rl.readline("chat> ");
+        let user_input = match readline {
+            Ok(line) => line,
+            Err(
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
+            ) => {
+                break;
+            }
             Err(e) => {
                 eprintln!("Error reading input: {e}");
                 continue;
             }
-        }
+        };
 
-        let user_input = input.trim();
+        let user_input = user_input.trim();
         if user_input.is_empty() {
             continue;
         }
+
+        // Add to history
+        let _ = rl.add_history_entry(user_input);
 
         // Handle exit commands
         if user_input == "exit"
@@ -295,6 +198,9 @@ async fn run_repl(ctx: &RuntimeContext, model: &str, temperature: Option<f32>) -
         }
     }
 
+    // Save history
+    save_history(&mut rl, history_path.as_ref());
+
     Ok(())
 }
 
@@ -304,7 +210,7 @@ async fn send_chat_streaming(
     model: &str,
     messages: &[Message],
     temperature: Option<f32>,
-    _interactive: bool,
+    interactive: bool,
 ) -> Result<String> {
     let url = format!("{}/v1/chat/completions", ctx.http_endpoint());
 
@@ -329,12 +235,23 @@ async fn send_chat_streaming(
         request = request.header(&key, &value);
     }
 
+    // Start spinner in interactive mode
+    let spinner = if interactive {
+        Some(Spinner::start())
+    } else {
+        None
+    };
+
     let response = request
         .send()
         .await
         .context(ConnectionFailedSnafu { endpoint: &url })?;
 
     if !response.status().is_success() {
+        // Stop spinner on error
+        if let Some(s) = spinner {
+            s.stop().await;
+        }
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         return Err(InvalidResponseSnafu {
@@ -346,6 +263,7 @@ async fn send_chat_streaming(
     // Stream the response
     let mut full_response = String::new();
     let mut stream = response.bytes_stream();
+    let mut spinner = spinner;
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
@@ -368,6 +286,10 @@ async fn send_chat_streaming(
                 if let Ok(chat_chunk) = serde_json::from_str::<ChatChunk>(data) {
                     for choice in &chat_chunk.choices {
                         if let Some(content) = &choice.delta.content {
+                            // Stop spinner when first content arrives
+                            if let Some(s) = spinner.take() {
+                                s.stop().await;
+                            }
                             print!("{content}");
                             let _ = io::stdout().flush();
                             full_response.push_str(content);
@@ -376,6 +298,11 @@ async fn send_chat_streaming(
                 }
             }
         }
+    }
+
+    // Ensure spinner is stopped
+    if let Some(s) = spinner {
+        s.stop().await;
     }
 
     Ok(full_response)
