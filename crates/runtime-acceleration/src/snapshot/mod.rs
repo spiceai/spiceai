@@ -635,8 +635,14 @@ impl SnapshotManager {
         let mut list_stream = self.object_store.list(Some(&self.snapshots_location));
         while let Some(result) = list_stream.next().await {
             if let Ok(meta) = result {
-                // Check if this file belongs to our dataset partition
-                if meta.location.as_ref().contains(&dataset_partition) {
+                // Check if this file belongs to our dataset partition by matching exact path segment.
+                // Using contains() would incorrectly match prefix names (e.g., dataset=foo matches dataset=foobar).
+                if meta
+                    .location
+                    .as_ref()
+                    .split('/')
+                    .any(|segment| segment == dataset_partition)
+                {
                     return true;
                 }
             }
@@ -4209,5 +4215,291 @@ mod tests {
         assert_eq!(summary.dataset_name, DATASET_NAME);
         assert!(summary.snapshots.is_empty());
         assert!(summary.current_snapshot_id.is_none());
+    }
+
+    // ========== Tests for has_existing_snapshots path matching ==========
+
+    /// Creates a SnapshotManager with a specific dataset name for testing path matching.
+    fn build_manager_with_dataset_name(
+        store: Arc<InMemory>,
+        dataset_name: &str,
+    ) -> SnapshotManager {
+        let object_store: Arc<dyn ObjectStore> = store;
+        let snapshot_engine = create_snapshot_engine(&AccelerationEngine::Cayenne, false);
+
+        SnapshotManager {
+            dataset_name: dataset_name.to_string(),
+            snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
+            snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
+            layout: AccelerationLayout::None,
+            snapshot_engine,
+            object_store,
+            bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
+            checkpointer_factory: None,
+            snapshots_creation_policy: SnapshotsCreationPolicy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn has_existing_snapshots_returns_false_when_no_metadata() {
+        let store = Arc::new(InMemory::new());
+        let manager = build_manager_with_dataset_name(Arc::clone(&store), "foo");
+
+        let result = manager.has_existing_snapshots().await;
+
+        assert!(!result, "Should return false when no metadata exists");
+    }
+
+    #[tokio::test]
+    async fn has_existing_snapshots_returns_false_when_metadata_has_no_snapshots() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        // Create metadata with dataset but no snapshots
+        let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
+        metadata.datasets.insert(
+            "foo".to_string(),
+            DatasetMetadata {
+                name: "foo".to_string(),
+                snapshots: vec![], // Empty snapshots
+                ..Default::default()
+            },
+        );
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let manager = build_manager_with_dataset_name(Arc::clone(&store), "foo");
+        let result = manager.has_existing_snapshots().await;
+
+        assert!(
+            !result,
+            "Should return false when metadata exists but has no snapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_existing_snapshots_returns_false_when_metadata_has_snapshots_but_files_missing() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        // Create metadata claiming snapshots exist
+        let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
+        metadata.datasets.insert(
+            "foo".to_string(),
+            DatasetMetadata {
+                name: "foo".to_string(),
+                snapshots: vec![SnapshotEntry {
+                    snapshot_id: 0,
+                    timestamp_ms: 1_704_153_600_000,
+                    snapshot: "snapshots/month=2025-01/day=2025-01-01/dataset=foo/foo.db"
+                        .to_string(),
+                    snapshot_checksum: "abc123".to_string(),
+                    snapshot_checksum_algorithm: "SHA256".to_string(),
+                    snapshot_size: 1024,
+                    snapshot_last_updated_at_ms: None,
+                }],
+                current_snapshot_id: Some(0),
+                ..Default::default()
+            },
+        );
+        write_metadata(&store, &metadata_path, &metadata).await;
+        // Note: We intentionally don't create the actual snapshot file
+
+        let manager = build_manager_with_dataset_name(Arc::clone(&store), "foo");
+        let result = manager.has_existing_snapshots().await;
+
+        assert!(
+            !result,
+            "Should return false when metadata has snapshots but actual files don't exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_existing_snapshots_returns_true_when_metadata_and_files_exist() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        // Create the actual snapshot file
+        let snapshot_path = base
+            .child("month=2025-01")
+            .child("day=2025-01-01")
+            .child("dataset=foo")
+            .child("foo.db");
+        store
+            .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
+            .await
+            .expect("write snapshot file");
+
+        // Create metadata referencing the snapshot
+        let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
+        metadata.datasets.insert(
+            "foo".to_string(),
+            DatasetMetadata {
+                name: "foo".to_string(),
+                snapshots: vec![SnapshotEntry {
+                    snapshot_id: 0,
+                    timestamp_ms: 1_704_153_600_000,
+                    snapshot: "snapshots/month=2025-01/day=2025-01-01/dataset=foo/foo.db"
+                        .to_string(),
+                    snapshot_checksum: "abc123".to_string(),
+                    snapshot_checksum_algorithm: "SHA256".to_string(),
+                    snapshot_size: 1024,
+                    snapshot_last_updated_at_ms: None,
+                }],
+                current_snapshot_id: Some(0),
+                ..Default::default()
+            },
+        );
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let manager = build_manager_with_dataset_name(Arc::clone(&store), "foo");
+        let result = manager.has_existing_snapshots().await;
+
+        assert!(
+            result,
+            "Should return true when both metadata and actual files exist"
+        );
+    }
+
+    /// This test verifies that has_existing_snapshots correctly distinguishes between
+    /// datasets with similar prefixes (e.g., "foo" vs "foobar").
+    ///
+    /// Previously, the code used `.contains()` for substring matching which would
+    /// incorrectly match "dataset=foo" against paths containing "dataset=foobar".
+    /// The fix uses exact path segment matching with `.split('/').any(|s| s == partition)`.
+    #[tokio::test]
+    async fn has_existing_snapshots_does_not_match_dataset_name_prefix() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        // Create a snapshot file for "foobar" dataset (NOT "foo")
+        let snapshot_path = base
+            .child("month=2025-01")
+            .child("day=2025-01-01")
+            .child("dataset=foobar") // Note: "foobar", not "foo"
+            .child("foobar.db");
+        store
+            .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
+            .await
+            .expect("write snapshot file");
+
+        // Create metadata for BOTH datasets, but only foobar has actual files
+        let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
+
+        // "foo" dataset - metadata exists but no actual file
+        metadata.datasets.insert(
+            "foo".to_string(),
+            DatasetMetadata {
+                name: "foo".to_string(),
+                snapshots: vec![SnapshotEntry {
+                    snapshot_id: 0,
+                    timestamp_ms: 1_704_153_600_000,
+                    snapshot: "snapshots/month=2025-01/day=2025-01-01/dataset=foo/foo.db"
+                        .to_string(),
+                    snapshot_checksum: "abc123".to_string(),
+                    snapshot_checksum_algorithm: "SHA256".to_string(),
+                    snapshot_size: 1024,
+                    snapshot_last_updated_at_ms: None,
+                }],
+                current_snapshot_id: Some(0),
+                ..Default::default()
+            },
+        );
+
+        // "foobar" dataset - both metadata and actual file exist
+        metadata.datasets.insert(
+            "foobar".to_string(),
+            DatasetMetadata {
+                name: "foobar".to_string(),
+                snapshots: vec![SnapshotEntry {
+                    snapshot_id: 0,
+                    timestamp_ms: 1_704_153_600_000,
+                    snapshot: "snapshots/month=2025-01/day=2025-01-01/dataset=foobar/foobar.db"
+                        .to_string(),
+                    snapshot_checksum: "def456".to_string(),
+                    snapshot_checksum_algorithm: "SHA256".to_string(),
+                    snapshot_size: 2048,
+                    snapshot_last_updated_at_ms: None,
+                }],
+                current_snapshot_id: Some(0),
+                ..Default::default()
+            },
+        );
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        // Check "foo" dataset - should return FALSE because:
+        // - metadata exists with snapshots
+        // - BUT no actual file exists for "dataset=foo" (only "dataset=foobar" exists)
+        let manager_foo = build_manager_with_dataset_name(Arc::clone(&store), "foo");
+        let result_foo = manager_foo.has_existing_snapshots().await;
+
+        assert!(
+            !result_foo,
+            "Should return false for 'foo' dataset - must not match 'dataset=foobar' path. \
+             This test catches the substring matching bug where 'dataset=foo' incorrectly \
+             matches paths containing 'dataset=foobar'."
+        );
+
+        // Check "foobar" dataset - should return TRUE
+        let manager_foobar = build_manager_with_dataset_name(Arc::clone(&store), "foobar");
+        let result_foobar = manager_foobar.has_existing_snapshots().await;
+
+        assert!(
+            result_foobar,
+            "Should return true for 'foobar' dataset - actual file exists"
+        );
+    }
+
+    /// Additional test: Verify suffix matching doesn't cause false positives either.
+    /// E.g., "bar" should not match "dataset=foobar".
+    #[tokio::test]
+    async fn has_existing_snapshots_does_not_match_dataset_name_suffix() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        // Create a snapshot file for "foobar" dataset
+        let snapshot_path = base
+            .child("month=2025-01")
+            .child("day=2025-01-01")
+            .child("dataset=foobar")
+            .child("foobar.db");
+        store
+            .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
+            .await
+            .expect("write snapshot file");
+
+        // Create metadata for "bar" dataset (which is a suffix of "foobar")
+        let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
+        metadata.datasets.insert(
+            "bar".to_string(),
+            DatasetMetadata {
+                name: "bar".to_string(),
+                snapshots: vec![SnapshotEntry {
+                    snapshot_id: 0,
+                    timestamp_ms: 1_704_153_600_000,
+                    snapshot: "snapshots/month=2025-01/day=2025-01-01/dataset=bar/bar.db"
+                        .to_string(),
+                    snapshot_checksum: "abc123".to_string(),
+                    snapshot_checksum_algorithm: "SHA256".to_string(),
+                    snapshot_size: 1024,
+                    snapshot_last_updated_at_ms: None,
+                }],
+                current_snapshot_id: Some(0),
+                ..Default::default()
+            },
+        );
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let manager_bar = build_manager_with_dataset_name(Arc::clone(&store), "bar");
+        let result_bar = manager_bar.has_existing_snapshots().await;
+
+        assert!(
+            !result_bar,
+            "Should return false for 'bar' dataset - must not match 'dataset=foobar' path"
+        );
     }
 }
