@@ -171,7 +171,7 @@ async fn retry_query_expecting_results(
         let query = query.clone();
         let data = Arc::clone(&data);
         async move {
-            match spice_client.query(&query).await {
+            match spice_client.sql(&query).await {
                 Ok(stream) => {
                     let Some(rbs) = stream.try_collect::<Vec<RecordBatch>>().await.ok() else {
                         sleep(Duration::from_secs(1)).await;

@@ -16396,6 +16396,7 @@ name = "spice"
 version = "1.11.0-unstable"
 dependencies = [
  "ansi_term",
+ "arrow",
  "assert_cmd",
  "chrono",
  "clap 4.5.54",
@@ -16419,6 +16420,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "snafu",
+ "spiceai",
  "tar",
  "tempfile",
  "time",
@@ -16447,7 +16449,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "3.2.0"
-source = "git+https://github.com/spiceai/spice-rs.git?tag=v3.1.0#0195105ec217dd4ee9701d8d1d69bedf3f812595"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=70d328f3d5daf9e444078ebf9583783f23523a20#70d328f3d5daf9e444078ebf9583783f23523a20"
 dependencies = [
  "arrow",
  "arrow-flight",

@@ -91,6 +91,8 @@ nix = { version = "0.29", features = ["signal", "process"] }
 
 # Internal crates
 flightrepl = { path = "../../crates/flightrepl" }
+spiceai = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
 
 [build-dependencies]
 # None needed - we use include_str! for version
