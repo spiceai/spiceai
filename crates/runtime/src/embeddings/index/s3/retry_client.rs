@@ -158,10 +158,10 @@ impl<T: S3Vectors + Send + Sync + ?Sized> S3VectorsRetryMiddleware<T> {
         &self,
         operation: F,
         is_transient: impl Fn(&E) -> bool + Clone,
-    ) -> Result<O, SdkError<E, HttpResponse>>
+    ) -> Result<O, SdkError<E>>
     where
         F: Fn() -> Fut,
-        Fut: Future<Output = Result<O, SdkError<E, HttpResponse>>>,
+        Fut: Future<Output = Result<O, SdkError<E>>>,
         E: std::fmt::Debug,
     {
         tokio::time::timeout(
@@ -348,8 +348,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn delete_vector_bucket_policy(
         &self,
         input: &DeleteVectorBucketPolicyInput,
-    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError, HttpResponse>>
-    {
+    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError>> {
         self.execute_with_retry(
             || self.inner.delete_vector_bucket_policy(input),
             DeleteVectorBucketPolicyError::is_transient,
@@ -390,8 +389,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn get_vector_bucket_policy(
         &self,
         input: &GetVectorBucketPolicyInput,
-    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError, HttpResponse>>
-    {
+    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError>> {
         self.execute_with_retry(
             || self.inner.get_vector_bucket_policy(input),
             GetVectorBucketPolicyError::is_transient,
@@ -446,8 +444,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn put_vector_bucket_policy(
         &self,
         input: &PutVectorBucketPolicyInput,
-    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError, HttpResponse>>
-    {
+    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError>> {
         self.execute_with_retry(
             || self.inner.put_vector_bucket_policy(input),
             PutVectorBucketPolicyError::is_transient,

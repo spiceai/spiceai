@@ -311,82 +311,82 @@ pub trait S3Vectors {
     async fn create_index(
         &self,
         input: &CreateIndexInput,
-    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError, HttpResponse>>;
+    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError>>;
 
     async fn create_vector_bucket(
         &self,
         input: &CreateVectorBucketInput,
-    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError, HttpResponse>>;
+    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError>>;
 
     async fn delete_index(
         &self,
         input: &DeleteIndexInput,
-    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError, HttpResponse>>;
+    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError>>;
 
     async fn delete_vector_bucket(
         &self,
         input: &DeleteVectorBucketInput,
-    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError, HttpResponse>>;
+    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError>>;
 
     async fn delete_vector_bucket_policy(
         &self,
         input: &DeleteVectorBucketPolicyInput,
-    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError, HttpResponse>>;
+    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError>>;
 
     async fn delete_vectors(
         &self,
         input: &DeleteVectorsInput,
-    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError, HttpResponse>>;
+    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError>>;
 
     async fn get_index(
         &self,
         input: &GetIndexInput,
-    ) -> Result<GetIndexOutput, SdkError<GetIndexError, HttpResponse>>;
+    ) -> Result<GetIndexOutput, SdkError<GetIndexError>>;
 
     async fn get_vector_bucket(
         &self,
         input: &GetVectorBucketInput,
-    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError, HttpResponse>>;
+    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>>;
 
     async fn get_vector_bucket_policy(
         &self,
         input: &GetVectorBucketPolicyInput,
-    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError, HttpResponse>>;
+    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError>>;
 
     async fn get_vectors(
         &self,
         input: &GetVectorsInput,
-    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError, HttpResponse>>;
+    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError>>;
 
     async fn list_indexes(
         &self,
         input: &ListIndexesInput,
-    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>>;
+    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>>;
 
     async fn list_vector_buckets(
         &self,
         input: &ListVectorBucketsInput,
-    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError, HttpResponse>>;
+    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError>>;
 
     async fn list_vectors(
         &self,
         input: &ListVectorsInput,
-    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>>;
+    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError>>;
 
     async fn put_vector_bucket_policy(
         &self,
         input: &PutVectorBucketPolicyInput,
-    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError, HttpResponse>>;
+    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError>>;
 
     async fn put_vectors(
         &self,
         input: &PutVectorsInput,
-    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>>;
+    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError>>;
 
     async fn query_vectors(
         &self,
         input: &QueryVectorsInput,
-    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError, HttpResponse>>;
+    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>>;
 }
 
 #[cfg(test)]

@@ -207,8 +207,7 @@ impl S3Vectors for MockClient {
     async fn delete_vector_bucket_policy(
         &self,
         _input: &DeleteVectorBucketPolicyInput,
-    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError, HttpResponse>>
-    {
+    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError>> {
         unimplemented!()
     }
 
@@ -283,8 +282,7 @@ impl S3Vectors for MockClient {
     async fn get_vector_bucket_policy(
         &self,
         _input: &GetVectorBucketPolicyInput,
-    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError, HttpResponse>>
-    {
+    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError>> {
         unimplemented!()
     }
 
@@ -347,8 +345,7 @@ impl S3Vectors for MockClient {
     async fn put_vector_bucket_policy(
         &self,
         _input: &PutVectorBucketPolicyInput,
-    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError, HttpResponse>>
-    {
+    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError>> {
         unimplemented!()
     }
 

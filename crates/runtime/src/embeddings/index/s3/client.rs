@@ -177,8 +177,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn delete_vector_bucket_policy(
         &self,
         input: &DeleteVectorBucketPolicyInput,
-    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError, HttpResponse>>
-    {
+    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError>> {
         let _guard =
             TimeMeasurement::new(&super::metrics::delete_vector_bucket_policy::LATENCY, &[]);
         super::metrics::delete_vector_bucket_policy::REQUESTS.add(1, &[]);
@@ -218,8 +217,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn get_vector_bucket_policy(
         &self,
         input: &GetVectorBucketPolicyInput,
-    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError, HttpResponse>>
-    {
+    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_vector_bucket_policy::LATENCY, &[]);
         super::metrics::get_vector_bucket_policy::REQUESTS.add(1, &[]);
 
@@ -396,8 +394,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn put_vector_bucket_policy(
         &self,
         input: &PutVectorBucketPolicyInput,
-    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError, HttpResponse>>
-    {
+    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError>> {
         let _guard = TimeMeasurement::new(&super::metrics::put_vector_bucket_policy::LATENCY, &[]);
         super::metrics::put_vector_bucket_policy::REQUESTS.add(1, &[]);
 
