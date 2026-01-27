@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Metrics and caching middleware for S3 Vectors API client.
+//!
+//! This module provides a middleware that wraps an `S3Vectors` implementation
+//! and adds metrics collection and response caching.
+
 use async_trait::async_trait;
 use s3_vectors::{
     CreateIndexError, CreateIndexInput, CreateIndexOutput, CreateVectorBucketError,
@@ -23,13 +28,15 @@ use s3_vectors::{
     DeleteVectorsError, DeleteVectorsInput, DeleteVectorsOutput, GetIndexError, GetIndexInput,
     GetIndexOutput, GetVectorBucketError, GetVectorBucketInput, GetVectorBucketOutput,
     GetVectorBucketPolicyError, GetVectorBucketPolicyInput, GetVectorBucketPolicyOutput,
-    GetVectorsError, GetVectorsInput, GetVectorsOutput, ListIndexesError, ListIndexesInput,
-    ListIndexesOutput, ListVectorBucketsError, ListVectorBucketsInput, ListVectorBucketsOutput,
-    ListVectorsError, ListVectorsInput, ListVectorsOutput, PutVectorBucketPolicyError,
-    PutVectorBucketPolicyInput, PutVectorBucketPolicyOutput, PutVectorsError, PutVectorsInput,
-    PutVectorsOutput, QueryVectorsError, QueryVectorsInput, QueryVectorsOutput, S3Vectors,
-    SdkError,
+    GetVectorsError, GetVectorsInput, GetVectorsOutput, HttpResponse, ListIndexesError,
+    ListIndexesInput, ListIndexesOutput, ListVectorBucketsError, ListVectorBucketsInput,
+    ListVectorBucketsOutput, ListVectorsError, ListVectorsInput, ListVectorsOutput,
+    PutVectorBucketPolicyError, PutVectorBucketPolicyInput, PutVectorBucketPolicyOutput,
+    PutVectorsError, PutVectorsInput, PutVectorsOutput, QueryVectorsError, QueryVectorsInput,
+    QueryVectorsOutput, S3Vectors, SdkError,
 };
+use tracing::info_span;
+use tracing_futures::Instrument;
 
 use crate::timing::TimeMeasurement;
 
@@ -41,14 +48,23 @@ use tokio::time::Instant;
 
 const TTL_DURATION_MINIMUM: Duration = Duration::from_secs(5);
 
-pub struct S3VectorClient {
-    client: Arc<dyn S3Vectors + Send + Sync>,
+/// Metrics and caching middleware for S3 Vectors API.
+///
+/// Wraps an `S3Vectors` implementation and adds:
+/// - Latency, request count, and error count metrics
+/// - TTL-based caching for `list_indexes` responses
+pub struct S3VectorsTelemetryMiddleware<T: S3Vectors + Send + Sync + ?Sized> {
+    inner: Arc<T>,
     list_indexes_cache: RwLock<HashMap<String, (ListIndexesOutput, Instant)>>,
     ttl: Option<Duration>,
 }
 
-impl S3VectorClient {
-    pub fn new(client: Arc<dyn S3Vectors + Send + Sync>, ttl: Option<Duration>) -> Self {
+impl<T: S3Vectors + Send + Sync + ?Sized> S3VectorsTelemetryMiddleware<T> {
+    /// Creates a new metrics/cache middleware wrapping the given client.
+    ///
+    /// If `ttl` is provided, `list_indexes` results will be cached for that duration.
+    /// Minimum TTL is 5 seconds.
+    pub fn new(client: Arc<T>, ttl: Option<Duration>) -> Self {
         let ttl = ttl.map(|d| {
             if d < TTL_DURATION_MINIMUM {
                 tracing::warn!("S3 vector index poll interval minimum is 5s.");
@@ -59,25 +75,39 @@ impl S3VectorClient {
         });
 
         Self {
-            client,
+            inner: client,
             list_indexes_cache: RwLock::new(HashMap::new()),
             ttl,
         }
     }
+
+    /// Returns a reference to the inner client.
+    #[must_use]
+    #[expect(unused)]
+    pub fn inner(&self) -> &Arc<T> {
+        &self.inner
+    }
 }
 
 #[async_trait]
-impl S3Vectors for S3VectorClient {
+impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelemetryMiddleware<T> {
     async fn create_index(
         &self,
         input: CreateIndexInput,
-    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError>> {
+    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::create_index::LATENCY, &[]);
         super::metrics::create_index::REQUESTS.add(1, &[]);
 
         let result = self
-            .client
+            .inner
             .create_index(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__create_index",
+                bucket_name = input.vector_bucket_name(),
+                index_name = input.index_name(),
+                bucket_arn = input.vector_bucket_arn()
+            ))
             .await
             .inspect_err(|_| super::metrics::create_index::ERRORS.add(1, &[]));
 
@@ -96,12 +126,17 @@ impl S3Vectors for S3VectorClient {
     async fn create_vector_bucket(
         &self,
         input: CreateVectorBucketInput,
-    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError>> {
+    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::create_vector_bucket::LATENCY, &[]);
         super::metrics::create_vector_bucket::REQUESTS.add(1, &[]);
 
-        self.client
-            .create_vector_bucket(input)
+        self.inner
+            .create_vector_bucket(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__create_vector_bucket",
+                bucket_name = input.vector_bucket_name(),
+            ))
             .await
             .inspect_err(|_| super::metrics::create_vector_bucket::ERRORS.add(1, &[]))
     }
@@ -109,12 +144,19 @@ impl S3Vectors for S3VectorClient {
     async fn delete_index(
         &self,
         input: DeleteIndexInput,
-    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError>> {
+    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::delete_index::LATENCY, &[]);
         super::metrics::delete_index::REQUESTS.add(1, &[]);
 
-        self.client
-            .delete_index(input)
+        self.inner
+            .delete_index(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__delete_index",
+                bucket_name = input.vector_bucket_name(),
+                index_name = input.index_name(),
+                index_arn = input.index_arn()
+            ))
             .await
             .inspect_err(|_| super::metrics::delete_index::ERRORS.add(1, &[]))
     }
@@ -122,12 +164,18 @@ impl S3Vectors for S3VectorClient {
     async fn delete_vector_bucket(
         &self,
         input: DeleteVectorBucketInput,
-    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError>> {
+    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::delete_vector_bucket::LATENCY, &[]);
         super::metrics::delete_vector_bucket::REQUESTS.add(1, &[]);
 
-        self.client
-            .delete_vector_bucket(input)
+        self.inner
+            .delete_vector_bucket(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__delete_vector_bucket",
+                bucket_name = input.vector_bucket_name(),
+                vector_bucket_arn = input.vector_bucket_arn(),
+            ))
             .await
             .inspect_err(|_| super::metrics::delete_vector_bucket::ERRORS.add(1, &[]))
     }
@@ -135,13 +183,20 @@ impl S3Vectors for S3VectorClient {
     async fn delete_vector_bucket_policy(
         &self,
         input: DeleteVectorBucketPolicyInput,
-    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError>> {
+    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError, HttpResponse>>
+    {
         let _guard =
             TimeMeasurement::new(&super::metrics::delete_vector_bucket_policy::LATENCY, &[]);
         super::metrics::delete_vector_bucket_policy::REQUESTS.add(1, &[]);
 
-        self.client
-            .delete_vector_bucket_policy(input)
+        self.inner
+            .delete_vector_bucket_policy(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__delete_vector_bucket_policy",
+                bucket_name = input.vector_bucket_name(),
+                vector_bucket_arn = input.vector_bucket_arn(),
+            ))
             .await
             .inspect_err(|_| super::metrics::delete_vector_bucket_policy::ERRORS.add(1, &[]))
     }
@@ -149,12 +204,19 @@ impl S3Vectors for S3VectorClient {
     async fn delete_vectors(
         &self,
         input: DeleteVectorsInput,
-    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError>> {
+    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::delete_vectors::LATENCY, &[]);
         super::metrics::delete_vectors::REQUESTS.add(1, &[]);
 
-        self.client
-            .delete_vectors(input)
+        self.inner
+            .delete_vectors(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__delete_vectors",
+                bucket_name = input.vector_bucket_name(),
+                index_name = input.index_name(),
+                index_arn = input.index_arn(),
+            ))
             .await
             .inspect_err(|_| super::metrics::delete_vectors::ERRORS.add(1, &[]))
     }
@@ -162,12 +224,19 @@ impl S3Vectors for S3VectorClient {
     async fn get_vector_bucket_policy(
         &self,
         input: GetVectorBucketPolicyInput,
-    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError>> {
+    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError, HttpResponse>>
+    {
         let _guard = TimeMeasurement::new(&super::metrics::get_vector_bucket_policy::LATENCY, &[]);
         super::metrics::get_vector_bucket_policy::REQUESTS.add(1, &[]);
 
-        self.client
-            .get_vector_bucket_policy(input)
+        self.inner
+            .get_vector_bucket_policy(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__get_vector_bucket_policy",
+                bucket_name = input.vector_bucket_name(),
+                bucket_arn = input.vector_bucket_arn(),
+            ))
             .await
             .inspect_err(|_| super::metrics::get_vector_bucket_policy::ERRORS.add(1, &[]))
     }
@@ -175,12 +244,19 @@ impl S3Vectors for S3VectorClient {
     async fn get_index(
         &self,
         input: GetIndexInput,
-    ) -> Result<GetIndexOutput, SdkError<GetIndexError>> {
+    ) -> Result<GetIndexOutput, SdkError<GetIndexError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_index::LATENCY, &[]);
         super::metrics::get_index::REQUESTS.add(1, &[]);
 
-        self.client
-            .get_index(input)
+        self.inner
+            .get_index(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__get_index",
+                bucket_name = input.vector_bucket_name(),
+                index_name = input.index_name(),
+                index_arn = input.index_arn(),
+            ))
             .await
             .inspect_err(|_| super::metrics::get_index::ERRORS.add(1, &[]))
     }
@@ -188,12 +264,18 @@ impl S3Vectors for S3VectorClient {
     async fn get_vector_bucket(
         &self,
         input: GetVectorBucketInput,
-    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>> {
+    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_vector_bucket::LATENCY, &[]);
         super::metrics::get_vector_bucket::REQUESTS.add(1, &[]);
 
-        self.client
-            .get_vector_bucket(input)
+        self.inner
+            .get_vector_bucket(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__get_vector_bucket",
+                bucket_name = input.vector_bucket_name(),
+                bucket_arn = input.vector_bucket_arn(),
+            ))
             .await
             .inspect_err(|_| super::metrics::get_vector_bucket::ERRORS.add(1, &[]))
     }
@@ -201,12 +283,21 @@ impl S3Vectors for S3VectorClient {
     async fn get_vectors(
         &self,
         input: GetVectorsInput,
-    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError>> {
+    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_vectors::LATENCY, &[]);
         super::metrics::get_vectors::REQUESTS.add(1, &[]);
 
-        self.client
-            .get_vectors(input)
+        self.inner
+            .get_vectors(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__get_vectors",
+                bucket_name = input.vector_bucket_name(),
+                index_name = input.index_name(),
+                index_arn = input.index_arn(),
+                return_data = input.return_data(),
+                return_metadata = input.return_metadata(),
+            ))
             .await
             .inspect_err(|_| super::metrics::get_vectors::ERRORS.add(1, &[]))
     }
@@ -214,7 +305,7 @@ impl S3Vectors for S3VectorClient {
     async fn list_indexes(
         &self,
         input: ListIndexesInput,
-    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>> {
+    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
         // Check cache if next_token is None (full list)
         let is_full_list = input.next_token.is_none();
         if is_full_list && let Some(ttl) = self.ttl {
@@ -235,8 +326,15 @@ impl S3Vectors for S3VectorClient {
             let _guard = TimeMeasurement::new(&super::metrics::list_indexes::LATENCY, &[]);
             super::metrics::list_indexes::REQUESTS.add(1, &[]);
 
-            self.client
+            self.inner
                 .list_indexes(input.clone())
+                .instrument(info_span!(
+                    target: "task_history",
+                    "s3_vectors__list_indexes",
+                    bucket_name = input.vector_bucket_name(),
+                    bucket_arn = input.vector_bucket_arn(),
+                    max_results = input.max_results()
+                ))
                 .await
                 .inspect_err(|_| super::metrics::list_indexes::ERRORS.add(1, &[]))
         };
@@ -264,12 +362,16 @@ impl S3Vectors for S3VectorClient {
     async fn list_vector_buckets(
         &self,
         input: ListVectorBucketsInput,
-    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError>> {
+    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::list_vector_buckets::LATENCY, &[]);
         super::metrics::list_vector_buckets::REQUESTS.add(1, &[]);
 
-        self.client
+        self.inner
             .list_vector_buckets(input)
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__list_vector_buckets",
+            ))
             .await
             .inspect_err(|_| super::metrics::list_vector_buckets::ERRORS.add(1, &[]))
     }
@@ -277,12 +379,22 @@ impl S3Vectors for S3VectorClient {
     async fn list_vectors(
         &self,
         input: ListVectorsInput,
-    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError>> {
+    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::list_vectors::LATENCY, &[]);
         super::metrics::list_vectors::REQUESTS.add(1, &[]);
 
-        self.client
-            .list_vectors(input)
+        self.inner
+            .list_vectors(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__list_vectors",
+                bucket_name = input.vector_bucket_name(),
+                index_name = input.index_name(),
+                index_arn = input.index_arn(),
+                max_results = input.max_results(),
+                return_metadata = input.return_metadata(),
+                return_data = input.return_data()
+            ))
             .await
             .inspect_err(|_| super::metrics::list_vectors::ERRORS.add(1, &[]))
     }
@@ -290,12 +402,19 @@ impl S3Vectors for S3VectorClient {
     async fn put_vector_bucket_policy(
         &self,
         input: PutVectorBucketPolicyInput,
-    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError>> {
+    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError, HttpResponse>>
+    {
         let _guard = TimeMeasurement::new(&super::metrics::put_vector_bucket_policy::LATENCY, &[]);
         super::metrics::put_vector_bucket_policy::REQUESTS.add(1, &[]);
 
-        self.client
-            .put_vector_bucket_policy(input)
+        self.inner
+            .put_vector_bucket_policy(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__put_vector_bucket_policy",
+                bucket_name = input.vector_bucket_name(),
+                bucket_arn = input.vector_bucket_arn(),
+            ))
             .await
             .inspect_err(|_| super::metrics::put_vector_bucket_policy::ERRORS.add(1, &[]))
     }
@@ -303,12 +422,19 @@ impl S3Vectors for S3VectorClient {
     async fn put_vectors(
         &self,
         input: PutVectorsInput,
-    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError>> {
+    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::put_vectors::LATENCY, &[]);
         super::metrics::put_vectors::REQUESTS.add(1, &[]);
 
-        self.client
-            .put_vectors(input)
+        self.inner
+            .put_vectors(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__put_vectors",
+                bucket_name = input.vector_bucket_name(),
+                index_name = input.index_name(),
+                index_arn = input.index_arn()
+            ))
             .await
             .inspect_err(|_| super::metrics::put_vectors::ERRORS.add(1, &[]))
     }
@@ -316,12 +442,22 @@ impl S3Vectors for S3VectorClient {
     async fn query_vectors(
         &self,
         input: QueryVectorsInput,
-    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>> {
+    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::query_vectors::LATENCY, &[]);
         super::metrics::query_vectors::REQUESTS.add(1, &[]);
 
-        self.client
-            .query_vectors(input)
+        self.inner
+            .query_vectors(input.clone())
+            .instrument(info_span!(
+                target: "task_history",
+                "s3_vectors__query_vectors",
+                bucket_name = input.vector_bucket_name(),
+                index_name = input.index_name(),
+                index_arn = input.index_arn(),
+                top_k = input.top_k(),
+                return_metadata = input.return_metadata(),
+                return_distance = input.return_distance()
+            ))
             .await
             .inspect_err(|_| super::metrics::query_vectors::ERRORS.add(1, &[]))
     }

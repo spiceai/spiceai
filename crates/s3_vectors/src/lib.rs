@@ -76,6 +76,7 @@ impl Client {
     }
 }
 
+pub mod middleware;
 pub mod mock;
 
 #[async_trait]
