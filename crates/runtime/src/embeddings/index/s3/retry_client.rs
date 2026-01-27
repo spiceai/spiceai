@@ -49,7 +49,7 @@ use util::{RetryError, retry};
 fn classify_error<E>(
     error: SdkError<E, HttpResponse>,
     is_transient_service_error: impl FnOnce(&E) -> bool,
-) -> RetryError<SdkError<E, HttpResponse>> {
+) -> RetryError<SdkError<E>> {
     match &error {
         SdkError::TimeoutError(_) => RetryError::transient(error),
         SdkError::ServiceError(service_error) => {
@@ -304,7 +304,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn create_index(
         &self,
         input: &CreateIndexInput,
-    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError, HttpResponse>> {
+    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError>> {
         self.execute_with_retry(
             || self.inner.create_index(input),
             CreateIndexError::is_transient,
@@ -315,7 +315,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn create_vector_bucket(
         &self,
         input: &CreateVectorBucketInput,
-    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError, HttpResponse>> {
+    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError>> {
         self.execute_with_retry(
             || self.inner.create_vector_bucket(input),
             CreateVectorBucketError::is_transient,
@@ -326,7 +326,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn delete_index(
         &self,
         input: &DeleteIndexInput,
-    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError, HttpResponse>> {
+    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError>> {
         self.execute_with_retry(
             || self.inner.delete_index(input),
             DeleteIndexError::is_transient,
@@ -337,7 +337,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn delete_vector_bucket(
         &self,
         input: &DeleteVectorBucketInput,
-    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError, HttpResponse>> {
+    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError>> {
         self.execute_with_retry(
             || self.inner.delete_vector_bucket(input),
             DeleteVectorBucketError::is_transient,
@@ -360,7 +360,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn delete_vectors(
         &self,
         input: &DeleteVectorsInput,
-    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError, HttpResponse>> {
+    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError>> {
         self.execute_with_retry(
             || self.inner.delete_vectors(input),
             DeleteVectorsError::is_transient,
@@ -371,7 +371,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn get_index(
         &self,
         input: &GetIndexInput,
-    ) -> Result<GetIndexOutput, SdkError<GetIndexError, HttpResponse>> {
+    ) -> Result<GetIndexOutput, SdkError<GetIndexError>> {
         self.execute_with_retry(|| self.inner.get_index(input), GetIndexError::is_transient)
             .await
     }
@@ -379,7 +379,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn get_vector_bucket(
         &self,
         input: &GetVectorBucketInput,
-    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError, HttpResponse>> {
+    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>> {
         self.execute_with_retry(
             || self.inner.get_vector_bucket(input),
             GetVectorBucketError::is_transient,
@@ -402,7 +402,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn get_vectors(
         &self,
         input: &GetVectorsInput,
-    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError, HttpResponse>> {
+    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError>> {
         self.execute_with_retry(
             || self.inner.get_vectors(input),
             GetVectorsError::is_transient,
@@ -413,7 +413,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn list_indexes(
         &self,
         input: &ListIndexesInput,
-    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
+    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>> {
         self.execute_with_retry(
             || self.inner.list_indexes(input),
             ListIndexesError::is_transient,
@@ -424,7 +424,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn list_vector_buckets(
         &self,
         input: &ListVectorBucketsInput,
-    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError, HttpResponse>> {
+    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError>> {
         self.execute_with_retry(
             || self.inner.list_vector_buckets(input),
             ListVectorBucketsError::is_transient,
@@ -435,7 +435,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn list_vectors(
         &self,
         input: &ListVectorsInput,
-    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>> {
+    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError>> {
         self.execute_with_retry(
             || self.inner.list_vectors(input),
             ListVectorsError::is_transient,
@@ -458,7 +458,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn put_vectors(
         &self,
         input: &PutVectorsInput,
-    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>> {
+    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError>> {
         self.execute_with_retry(
             || self.inner.put_vectors(input),
             PutVectorsError::is_transient,
@@ -469,7 +469,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     async fn query_vectors(
         &self,
         input: &QueryVectorsInput,
-    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError, HttpResponse>> {
+    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>> {
         self.execute_with_retry(
             || self.inner.query_vectors(input),
             QueryVectorsError::is_transient,

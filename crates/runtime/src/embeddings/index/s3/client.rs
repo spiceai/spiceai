@@ -52,6 +52,7 @@ const TTL_DURATION_MINIMUM: Duration = Duration::from_secs(5);
 ///
 /// Wraps an `S3Vectors` implementation and adds:
 /// - Latency, request count, and error count metrics
+/// - Tracing spans for each operation
 /// - TTL-based caching for `list_indexes` responses
 pub struct S3VectorsTelemetryMiddleware<T: S3Vectors + Send + Sync + ?Sized> {
     inner: Arc<T>,
@@ -80,13 +81,6 @@ impl<T: S3Vectors + Send + Sync + ?Sized> S3VectorsTelemetryMiddleware<T> {
             ttl,
         }
     }
-
-    /// Returns a reference to the inner client.
-    #[must_use]
-    #[expect(unused)]
-    pub fn inner(&self) -> &Arc<T> {
-        &self.inner
-    }
 }
 
 #[async_trait]
@@ -94,7 +88,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn create_index(
         &self,
         input: &CreateIndexInput,
-    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError, HttpResponse>> {
+    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError>> {
         let _guard = TimeMeasurement::new(&super::metrics::create_index::LATENCY, &[]);
         super::metrics::create_index::REQUESTS.add(1, &[]);
 
@@ -126,7 +120,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn create_vector_bucket(
         &self,
         input: &CreateVectorBucketInput,
-    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError, HttpResponse>> {
+    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError>> {
         let _guard = TimeMeasurement::new(&super::metrics::create_vector_bucket::LATENCY, &[]);
         super::metrics::create_vector_bucket::REQUESTS.add(1, &[]);
 
@@ -144,7 +138,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn delete_index(
         &self,
         input: &DeleteIndexInput,
-    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError, HttpResponse>> {
+    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError>> {
         let _guard = TimeMeasurement::new(&super::metrics::delete_index::LATENCY, &[]);
         super::metrics::delete_index::REQUESTS.add(1, &[]);
 
@@ -164,7 +158,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn delete_vector_bucket(
         &self,
         input: &DeleteVectorBucketInput,
-    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError, HttpResponse>> {
+    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError>> {
         let _guard = TimeMeasurement::new(&super::metrics::delete_vector_bucket::LATENCY, &[]);
         super::metrics::delete_vector_bucket::REQUESTS.add(1, &[]);
 
@@ -204,7 +198,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn delete_vectors(
         &self,
         input: &DeleteVectorsInput,
-    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError, HttpResponse>> {
+    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError>> {
         let _guard = TimeMeasurement::new(&super::metrics::delete_vectors::LATENCY, &[]);
         super::metrics::delete_vectors::REQUESTS.add(1, &[]);
 
@@ -244,7 +238,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn get_index(
         &self,
         input: &GetIndexInput,
-    ) -> Result<GetIndexOutput, SdkError<GetIndexError, HttpResponse>> {
+    ) -> Result<GetIndexOutput, SdkError<GetIndexError>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_index::LATENCY, &[]);
         super::metrics::get_index::REQUESTS.add(1, &[]);
 
@@ -264,7 +258,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn get_vector_bucket(
         &self,
         input: &GetVectorBucketInput,
-    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError, HttpResponse>> {
+    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_vector_bucket::LATENCY, &[]);
         super::metrics::get_vector_bucket::REQUESTS.add(1, &[]);
 
@@ -283,7 +277,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn get_vectors(
         &self,
         input: &GetVectorsInput,
-    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError, HttpResponse>> {
+    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_vectors::LATENCY, &[]);
         super::metrics::get_vectors::REQUESTS.add(1, &[]);
 
@@ -305,7 +299,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn list_indexes(
         &self,
         input: &ListIndexesInput,
-    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
+    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>> {
         // Check cache if next_token is None (full list)
         let is_full_list = input.next_token.is_none();
         if is_full_list && let Some(ttl) = self.ttl {
@@ -362,7 +356,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn list_vector_buckets(
         &self,
         input: &ListVectorBucketsInput,
-    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError, HttpResponse>> {
+    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError>> {
         let _guard = TimeMeasurement::new(&super::metrics::list_vector_buckets::LATENCY, &[]);
         super::metrics::list_vector_buckets::REQUESTS.add(1, &[]);
 
@@ -379,7 +373,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn list_vectors(
         &self,
         input: &ListVectorsInput,
-    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>> {
+    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError>> {
         let _guard = TimeMeasurement::new(&super::metrics::list_vectors::LATENCY, &[]);
         super::metrics::list_vectors::REQUESTS.add(1, &[]);
 
@@ -422,7 +416,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn put_vectors(
         &self,
         input: &PutVectorsInput,
-    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>> {
+    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError>> {
         let _guard = TimeMeasurement::new(&super::metrics::put_vectors::LATENCY, &[]);
         super::metrics::put_vectors::REQUESTS.add(1, &[]);
 
@@ -442,7 +436,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
     async fn query_vectors(
         &self,
         input: &QueryVectorsInput,
-    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError, HttpResponse>> {
+    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>> {
         let _guard = TimeMeasurement::new(&super::metrics::query_vectors::LATENCY, &[]);
         super::metrics::query_vectors::REQUESTS.add(1, &[]);
 
