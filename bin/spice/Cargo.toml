@@ -98,4 +98,5 @@ nix = { version = "0.29", features = ["signal", "process"] }
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+rstest = "0.26.1"
 tempfile.workspace = true
