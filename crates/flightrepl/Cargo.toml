@@ -15,7 +15,6 @@ arrow-json.workspace = true
 clap.workspace = true
 flight_client = { path = "../flight_client" }
 futures.workspace = true
-llms = { path = "../llms", default-features = false }
 prost.workspace = true
 reqwest.workspace = true
 rustyline = { version = "17.0.2", features = [
@@ -24,6 +23,7 @@ rustyline = { version = "17.0.2", features = [
   "with-file-history",
   "derive",
 ] }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true }
 tonic = { workspace = true, features = [
@@ -32,7 +32,6 @@ tonic = { workspace = true, features = [
   "tls-native-roots",
 ] }
 tracing.workspace = true
-util = { path = "../util" }
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

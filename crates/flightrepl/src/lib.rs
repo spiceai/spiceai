@@ -30,7 +30,6 @@ use arrow_flight::{
     FlightDescriptor, decode::FlightRecordBatchStream, error::FlightError,
     flight_service_client::FlightServiceClient,
 };
-use util::ansi_colors::Color;
 
 use crate::completer::SchemaCache;
 use arrow::array::RecordBatch;
@@ -39,7 +38,6 @@ use clap::Parser;
 use config::get_user_agent;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
 use futures::{StreamExt, TryStreamExt};
-use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
@@ -48,6 +46,7 @@ use rustyline::{
     CompletionType, ConditionalEventHandler, Config, Helper, Hinter, KeyEvent, Validator,
 };
 use rustyline::{Editor, EventHandler};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinHandle;
@@ -56,9 +55,12 @@ use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
+mod ansi_colors;
 pub mod cache_control;
 mod completer;
 mod config;
+
+use ansi_colors::Color;
 
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai SQL REPL")]
@@ -106,6 +108,14 @@ pub struct ReplConfig {
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmRuntime {
+    Candle,
+    Mistral,
+    Openai,
+}
 
 async fn send_nsql_request(
     client: &Client,
@@ -289,7 +299,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
     #[cfg(target_os = "windows")]
     // Ensure ANSI support on Windows is enabled for proper color display.
-    let _ = util::ansi_colors::enable_ansi_support();
+    let _ = ansi_colors::enable_ansi_support();
 
     let config = Config::builder()
         .completion_type(CompletionType::List)

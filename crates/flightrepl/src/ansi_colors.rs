@@ -19,6 +19,7 @@ limitations under the License.
 use std::fmt::{self, Display};
 
 /// ANSI color codes for terminal output.
+#[expect(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
     /// Black (ANSI 30)
@@ -80,20 +81,6 @@ impl<S: AsRef<str>> Display for Painted<S> {
             _ => write!(f, "{}{}{RESET}", self.color.code(), self.text.as_ref()),
         }
     }
-}
-
-/// Enable ANSI support (no-op).
-///
-/// On modern Windows 10+ systems, ANSI escape codes are typically enabled by default.
-/// This function exists for compatibility with code that previously relied on
-/// enabling virtual terminal processing, but is now a no-op on all platforms.
-///
-/// # Errors
-///
-/// This function never returns an error.
-#[inline]
-pub const fn enable_ansi_support() -> std::io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -207,13 +194,13 @@ mod tests {
         assert_eq!(output, "Fixed(42)");
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_enable_ansi_support_succeeds() {
         // On Unix, this should always succeed (no-op)
         // On Windows, it may fail if not running in a proper console
         let result = enable_ansi_support();
-        #[cfg(not(windows))]
-        result.expect("enable_ansi_support should succeed on non-Windows platforms");
+        result.expect("enable_ansi_support should succeed");
     }
 
     #[test]
