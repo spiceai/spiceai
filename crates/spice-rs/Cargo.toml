@@ -1,6 +1,6 @@
 [package]
 name = "spiceai"
-version.workspace = true
+version = "3.2.0"
 edition.workspace = true
 description = "SDK for Spice.ai, an open-source runtime and platform for building AI-driven software."
 license.workspace = true
