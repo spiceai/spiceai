@@ -19,7 +19,7 @@ limitations under the License.
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::github::{
-    GitHubClient, download_release_asset, get_latest_release, get_release, get_runtime_asset_name,
+    GitHubClient, SystemType, download_release_asset, get_latest_release, get_release,
 };
 use clap::Args;
 
@@ -122,7 +122,8 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
     }
 
     // Download and install the runtime
-    let asset_name = get_runtime_asset_name(parsed.flavor.as_str(), allow_accelerator);
+    let asset_name =
+        SystemType::this_pc().runtime_asset_name(parsed.flavor.as_str(), allow_accelerator);
     tracing::info!(
         "Installing Spice.ai runtime {} ({})...",
         release.tag_name,
