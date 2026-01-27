@@ -63,9 +63,9 @@ runs:
         commit_hashes=($(git log FETCH_HEAD --pretty=format:"%H" -n 10))
 
         if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
-          features="odbc_models"
+          features="odbc_"
         else
-          features="models"
+          features=""
         fi
 
         PLATFORM="${{ steps.platform.outputs.os }}_${{ steps.platform.outputs.arch }}"
@@ -73,7 +73,7 @@ runs:
 
         for hash in "${commit_hashes[@]}"; do
           echo "Checking $hash in MinIO for $PLATFORM"
-          if mc stat spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$hash/spiced_${features}_${PLATFORM}.${EXT}; then
+          if mc stat spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$hash/spiced_${features}${PLATFORM}.${EXT}; then
             echo "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
             exit 0
@@ -94,9 +94,9 @@ runs:
         $commitHashes = git log FETCH_HEAD --pretty=format:"%H" -n 10 | ForEach-Object { $_.Trim() }
 
         if ("${{ inputs.with_odbc }}" -eq "true") {
-          $features = "odbc_models"
+          $features = "odbc_"
         } else {
-          $features = "models"
+          $features = ""
         }
 
         $platform = "${{ steps.platform-windows.outputs.os }}-${{ steps.platform-windows.outputs.arch }}"
@@ -104,7 +104,7 @@ runs:
 
         foreach ($hash in $commitHashes) {
           Write-Host "Checking $hash in MinIO for $platform"
-          $statOutput = mc stat "spice-minio/artifacts/spiced/$platform/$hash/spiced_${features}_${platform}.${ext}" 2>&1
+          $statOutput = mc stat "spice-minio/artifacts/spiced/$platform/$hash/spiced_${features}${platform}.${ext}" 2>&1
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $env:GITHUB_ENV
@@ -149,14 +149,14 @@ runs:
       shell: bash
       run: |
         if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
-          features="odbc_models"
+          features="odbc_"
         else
-          features="models"
+          features=""
         fi
         PLATFORM="${{ steps.platform.outputs.os }}_${{ steps.platform.outputs.arch }}"
         EXT="${{ steps.platform.outputs.ext }}"
-        mc cp "spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$SPICED_COMMIT/spiced_${features}_${PLATFORM}.${EXT}" spiced_${features}_${PLATFORM}.${EXT}
-        tar -xzf spiced_${features}_${PLATFORM}.${EXT}
+        mc cp "spice-minio/artifacts/spiced/${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}/$SPICED_COMMIT/spiced_${features}${PLATFORM}.${EXT}" spiced_${features}${PLATFORM}.${EXT}
+        tar -xzf spiced_${features}${PLATFORM}.${EXT}
         sudo cp ./spiced /usr/local/bin/spiced
 
     - name: Download spiced from MinIO (Windows)
@@ -165,13 +165,13 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         if ("${{ inputs.with_odbc }}" -eq "true") {
-          $features = "odbc_models"
+          $features = "odbc_"
         } else {
-          $features = "models"
+          $features = ""
         }
         $platform = "${{ steps.platform-windows.outputs.os }}-${{ steps.platform-windows.outputs.arch }}"
         $ext = "${{ steps.platform-windows.outputs.ext }}"
-        $artifact = "spiced_${features}_${platform}.${ext}"
+        $artifact = "spiced_${features}${platform}.${ext}"
         mc cp "spice-minio/artifacts/spiced/$platform/$env:SPICED_COMMIT/$artifact" $artifact
         Expand-Archive -Path $artifact -DestinationPath . -Force
         $spicedDir = "$env:USERPROFILE\spiced"

@@ -54,11 +54,9 @@ async fn insert_batch(
     table: &Arc<CayenneTableProvider>,
     batch: RecordBatch,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let schema = batch.schema();
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
-    table.insert(boxed_stream).await.map_err(Into::into)
+    common::insert_batch(table.as_ref(), batch)
+        .await
+        .map_err(Into::into)
 }
 
 /// Helper to delete records from a table using the `DeletionTableProvider` API

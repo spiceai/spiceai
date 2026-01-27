@@ -170,6 +170,7 @@ pub(crate) fn init_tracing_with_task_history(
         None, // min_sql_duration_ms
         spicepod::component::runtime::TaskHistoryCapturedPlan::None,
         None, // min_plan_duration_ms
+        None, // scheduler_id - not in cluster mode for tests
     );
 
     // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)

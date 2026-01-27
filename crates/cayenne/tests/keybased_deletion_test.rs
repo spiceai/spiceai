@@ -133,11 +133,9 @@ async fn setup_composite_pk_table(
 }
 
 async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> TestResult<u64> {
-    let schema = batch.schema();
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
-    table.insert(boxed_stream).await.map_err(Into::into)
+    common::insert_batch(table.as_ref(), batch)
+        .await
+        .map_err(Into::into)
 }
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {

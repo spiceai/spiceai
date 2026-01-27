@@ -46,6 +46,7 @@ pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod scan;
+pub(crate) mod sink;
 pub(crate) mod streaming;
 pub(crate) mod table;
 pub(crate) mod utils;
@@ -83,7 +84,6 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::execution::context::SessionContext;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_catalog::TableProvider;
     use datafusion_expr::dml::InsertOp;
     use datafusion_physical_plan::collect;
@@ -584,11 +584,15 @@ mod tests {
         )
         .expect("Failed to create record batch");
 
-        let stream = futures::stream::once(async { Ok(batch) });
-        let batch_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
-
-        table
-            .insert(Box::pin(batch_stream))
+        let ctx = SessionContext::new();
+        let input_exec =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("memory exec");
+        let insert_plan = table
+            .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+            .await
+            .expect("insert_into");
+        collect(insert_plan, ctx.task_ctx())
             .await
             .expect("Failed to insert data");
 
