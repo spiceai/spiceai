@@ -19,8 +19,8 @@ limitations under the License.
 mod release;
 
 pub use release::{
-    ReleaseAsset, RepoRelease, download_release_asset, get_cli_asset_name, get_latest_release,
-    get_release, get_runtime_asset_name,
+    Arch, ReleaseAsset, RepoRelease, SystemType, download_release_asset, get_latest_release,
+    get_release,
 };
 
 use reqwest::Client;
