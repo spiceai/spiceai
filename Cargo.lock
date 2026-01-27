@@ -6758,10 +6758,10 @@ dependencies = [
 name = "flightrepl"
 version = "1.11.0-unstable"
 dependencies = [
+ "arrow",
  "arrow-flight",
  "arrow-json",
  "clap 4.5.54",
- "datafusion",
  "flight_client",
  "futures",
  "insta",

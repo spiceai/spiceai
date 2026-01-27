@@ -33,10 +33,10 @@ use arrow_flight::{
 use util::ansi_colors::Color;
 
 use crate::completer::SchemaCache;
+use arrow::array::RecordBatch;
+use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
 use config::get_user_agent;
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::util::pretty::pretty_format_batches;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
 use futures::{StreamExt, TryStreamExt};
 use llms::chat::LlmRuntime;
@@ -834,8 +834,8 @@ fn display_grpc_error(err: &Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int32Array, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     fn create_test_batch(num_rows: usize, batch_id: i32) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![

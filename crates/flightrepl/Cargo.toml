@@ -9,10 +9,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+arrow.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-json.workspace = true
 clap.workspace = true
-datafusion.workspace = true
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 llms = { path = "../llms", default-features = false }
