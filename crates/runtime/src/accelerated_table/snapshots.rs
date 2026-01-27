@@ -86,7 +86,7 @@ pub fn spawn_snapshot_interval_task(
                 &last_updated_at,
                 ForceCreate(true),
             )
-                .await;
+            .await;
         }
 
         let mut ticker = interval(interval_duration);
@@ -161,7 +161,7 @@ pub fn create_periodic_snapshot_callback(
                         &last_updated_at_clone,
                         ForceCreate(true),
                     )
-                        .await;
+                    .await;
                 }
                 initial_snapshot_created_clone.store(true, Ordering::Release);
                 tracing::debug!(

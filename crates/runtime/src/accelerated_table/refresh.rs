@@ -847,7 +847,7 @@ impl Refresher {
                             &last_updated_at_clone,
                             ForceCreate(true),
                         )
-                            .await;
+                        .await;
                     }
                     initial_snapshot_created_clone.store(true, Ordering::Release);
                     tracing::debug!(

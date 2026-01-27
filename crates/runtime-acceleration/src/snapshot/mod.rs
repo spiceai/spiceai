@@ -634,14 +634,11 @@ impl SnapshotManager {
 
         let mut list_stream = self.object_store.list(Some(&self.snapshots_location));
         while let Some(result) = list_stream.next().await {
-            match result {
-                Ok(meta) => {
-                    // Check if this file belongs to our dataset partition
-                    if meta.location.as_ref().contains(&dataset_partition) {
-                        return true;
-                    }
+            if let Ok(meta) = result {
+                // Check if this file belongs to our dataset partition
+                if meta.location.as_ref().contains(&dataset_partition) {
+                    return true;
                 }
-                Err(_) => {},
             }
         }
 
