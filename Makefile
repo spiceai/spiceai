@@ -223,7 +223,7 @@ install: build
 .PHONY: install-dev
 install-dev: build-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/debug/spice ~/.spice/bin/spice
 	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
 # Data-only variants (without models)
