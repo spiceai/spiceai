@@ -1,5 +1,5 @@
 use crate::EditorHelper;
-use arrow_array::{Array, StringArray};
+use arrow::array::{Array, StringArray};
 use arrow_flight::flight_service_client::FlightServiceClient;
 use rustyline::Context;
 use rustyline::completion::{Completer, Pair};
