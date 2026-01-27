@@ -165,7 +165,11 @@ fn format_size(bytes: u64) -> String {
 /// Get the runtime asset name for the current platform.
 #[must_use]
 pub fn get_runtime_asset_name(flavor: &str, allow_accelerator: bool) -> String {
-    let os = std::env::consts::OS;
+    let os = match std::env::consts::OS {
+        // backwards compatibility to Golang `runtime.GOOS`.
+        "macos" => "darwin",
+        other => other,
+    };
     let arch = get_rust_arch();
 
     let flavor_suffix = match flavor {
@@ -189,7 +193,11 @@ pub fn get_runtime_asset_name(flavor: &str, allow_accelerator: bool) -> String {
 /// Get the CLI asset name for the current platform.
 #[must_use]
 pub fn get_cli_asset_name() -> String {
-    let os = std::env::consts::OS;
+    let os = match std::env::consts::OS {
+        // backwards compatibility to Golang `runtime.GOOS`.
+        "macos" => "darwin",
+        other => other,
+    };
     let arch = get_rust_arch();
     format!("spice_{os}_{arch}.tar.gz")
 }
