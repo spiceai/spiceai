@@ -185,16 +185,18 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
             println!("\nTotal: {} queries", resp.queries.len());
         }
         QuerySubcommand::Status { query_id } => {
-            let job = client.get_query(query_id).map_err(|e| {
-                crate::error::Error::InvalidResponse {
+            let job =
+                client
+                    .get_query(query_id)
+                    .map_err(|e| crate::error::Error::InvalidResponse {
+                        message: e.to_string(),
+                    })?;
+            let info = job
+                .info()
+                .await
+                .map_err(|e| crate::error::Error::InvalidResponse {
                     message: e.to_string(),
-                }
-            })?;
-            let info = job.info().await.map_err(|e| {
-                crate::error::Error::InvalidResponse {
-                    message: e.to_string(),
-                }
-            })?;
+                })?;
             display_query_info(&info);
         }
         QuerySubcommand::Results { query_id } => {
@@ -206,7 +208,10 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
                     message: e.to_string(),
                 }
             })?;
-            println!("Query {} cancelled (status: {})", info.query_id, info.status);
+            println!(
+                "Query {} cancelled (status: {})",
+                info.query_id, info.status
+            );
         }
     }
     Ok(())
@@ -228,11 +233,12 @@ async fn submit_and_wait(
     let query_id = job.id().to_string();
 
     // Get initial status
-    let initial_status = job.status().await.map_err(|e| {
-        crate::error::Error::InvalidResponse {
+    let initial_status = job
+        .status()
+        .await
+        .map_err(|e| crate::error::Error::InvalidResponse {
             message: e.to_string(),
-        }
-    })?;
+        })?;
 
     println!("Submitted query: {} ({})", query_id, initial_status);
 
@@ -256,11 +262,12 @@ async fn submit_and_wait(
         if status.is_success() {
             display_results(client, &query_id, elapsed).await?;
         } else if status.is_failed() {
-            let job = client.get_query(&query_id).map_err(|e| {
-                crate::error::Error::InvalidResponse {
-                    message: e.to_string(),
-                }
-            })?;
+            let job =
+                client
+                    .get_query(&query_id)
+                    .map_err(|e| crate::error::Error::InvalidResponse {
+                        message: e.to_string(),
+                    })?;
             let info = job.info().await.ok();
             if let Some(info) = info
                 && let Some(err) = info.error
@@ -376,10 +383,7 @@ async fn run_query_repl(client: &Arc<Client>) -> Result<()> {
             poll_for_completion(client, &query_id, None).await;
 
         if was_cancelled {
-            println!(
-                "\nStopped waiting. Check status with: .status {}",
-                query_id
-            );
+            println!("\nStopped waiting. Check status with: .status {}", query_id);
             println!("Wait for completion with: .wait {}", query_id);
             continue;
         }
@@ -562,7 +566,10 @@ async fn handle_special_command(
             }
             match client.cancel_query(&query_id).await {
                 Ok(info) => {
-                    println!("Query {} cancelled (status: {})", info.query_id, info.status);
+                    println!(
+                        "Query {} cancelled (status: {})",
+                        info.query_id, info.status
+                    );
                     if let Some(tracked) = tracked_queries.get_mut(&query_id) {
                         tracked.status = info.status.to_string();
                     }
@@ -731,23 +738,20 @@ impl CtrlCGuard {
     }
 }
 
-async fn display_results(
-    client: &Arc<Client>,
-    query_id: &str,
-    elapsed: Duration,
-) -> Result<()> {
+async fn display_results(client: &Arc<Client>, query_id: &str, elapsed: Duration) -> Result<()> {
     // First get query info to check status
-    let job = client.get_query(query_id).map_err(|e| {
-        crate::error::Error::InvalidResponse {
+    let job = client
+        .get_query(query_id)
+        .map_err(|e| crate::error::Error::InvalidResponse {
             message: e.to_string(),
-        }
-    })?;
+        })?;
 
-    let info = job.info().await.map_err(|e| {
-        crate::error::Error::InvalidResponse {
+    let info = job
+        .info()
+        .await
+        .map_err(|e| crate::error::Error::InvalidResponse {
             message: e.to_string(),
-        }
-    })?;
+        })?;
 
     if !info.status.is_success() {
         return Err(crate::error::Error::InvalidResponse {
@@ -759,11 +763,12 @@ async fn display_results(
     }
 
     // Fetch results as Arrow RecordBatches
-    let batches = job.results().await.map_err(|e| {
-        crate::error::Error::InvalidResponse {
+    let batches = job
+        .results()
+        .await
+        .map_err(|e| crate::error::Error::InvalidResponse {
             message: format!("getting results: {e}"),
-        }
-    })?;
+        })?;
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -777,11 +782,10 @@ async fn display_results(
     }
 
     // Use Arrow's pretty formatting to display results
-    let formatted = pretty_format_batches(&batches).map_err(|e| {
-        crate::error::Error::InvalidResponse {
+    let formatted =
+        pretty_format_batches(&batches).map_err(|e| crate::error::Error::InvalidResponse {
             message: format!("formatting results: {e}"),
-        }
-    })?;
+        })?;
 
     println!("{formatted}");
 
