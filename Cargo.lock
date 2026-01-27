@@ -14624,6 +14624,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
