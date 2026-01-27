@@ -119,9 +119,9 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
 async fn run_with_signal_forwarding(
     child: &mut tokio::process::Child,
 ) -> Result<std::process::ExitStatus> {
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let pid = child
         .id()
