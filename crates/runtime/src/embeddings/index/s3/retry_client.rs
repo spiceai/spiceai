@@ -372,11 +372,8 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
         &self,
         input: &GetIndexInput,
     ) -> Result<GetIndexOutput, SdkError<GetIndexError, HttpResponse>> {
-        self.execute_with_retry(
-            || self.inner.get_index(input),
-            GetIndexError::is_transient,
-        )
-        .await
+        self.execute_with_retry(|| self.inner.get_index(input), GetIndexError::is_transient)
+            .await
     }
 
     async fn get_vector_bucket(

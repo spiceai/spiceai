@@ -228,16 +228,20 @@ impl S3VectorsTable {
             )
         };
 
-        let input = CreateIndexInput::builder()
-            .data_type(s3_vectors::DataType::Float32)
-            .dimension(dimension.try_into().unwrap_or(i32::MAX))
-            .distance_metric(distance_metric.clone())
-            .index_name(index_name)
-            .set_metadata_configuration(metadata_configuration)
-            .vector_bucket_name(bucket_name)
-            .build()
-            .context(S3VectorBuildSnafu)?;
-        match client.create_index(&input).await {
+        match client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .data_type(s3_vectors::DataType::Float32)
+                    .dimension(dimension.try_into().unwrap_or(i32::MAX))
+                    .distance_metric(distance_metric.clone())
+                    .index_name(index_name)
+                    .set_metadata_configuration(metadata_configuration)
+                    .vector_bucket_name(bucket_name)
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => match &e {
                 SdkError::ServiceError(service_error)
@@ -265,11 +269,15 @@ impl S3VectorsTable {
         let S3VectorIdentifier::Index { bucket_name, .. } = id else {
             return Err(Error::CreateIndexUsingArn);
         };
-        let input = CreateVectorBucketInput::builder()
-            .vector_bucket_name(bucket_name.clone())
-            .build()
-            .context(S3VectorBuildSnafu)?;
-        match client.create_vector_bucket(&input).await {
+        match client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name(bucket_name.clone())
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => match &e {
                 SdkError::ServiceError(service_error)
@@ -299,11 +307,15 @@ impl S3VectorsTable {
         id: &S3VectorIdentifier,
     ) -> Result<bool> {
         let bucket_name_opt = id.bucket_name().map(ToString::to_string);
-        let input = GetVectorBucketInput::builder()
-            .set_vector_bucket_name(bucket_name_opt)
-            .build()
-            .context(S3VectorBuildSnafu)?;
-        match client.get_vector_bucket(&input).await {
+        match client
+            .get_vector_bucket(
+                &GetVectorBucketInput::builder()
+                    .set_vector_bucket_name(bucket_name_opt)
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
+            .await
+        {
             Ok(_) => Ok(true),
             Err(SdkError::ServiceError(e))
                 if matches!(&e.err(), GetVectorBucketError::NotFoundException(_)) =>
@@ -339,13 +351,17 @@ impl S3VectorsTable {
         client: &Arc<dyn S3Vectors + Send + Sync>,
     ) -> Result<Option<GetIndexOutput>> {
         let (index_arn, vector_bucket_name, index_name) = index.index_identifier_variables();
-        let input = GetIndexInput::builder()
-            .set_index_arn(index_arn)
-            .set_vector_bucket_name(vector_bucket_name)
-            .set_index_name(index_name)
-            .build()
-            .context(S3VectorBuildSnafu)?;
-        match client.get_index(&input).await {
+        match client
+            .get_index(
+                &GetIndexInput::builder()
+                    .set_index_arn(index_arn)
+                    .set_vector_bucket_name(vector_bucket_name)
+                    .set_index_name(index_name)
+                    .build()
+                    .context(S3VectorBuildSnafu)?,
+            )
+            .await
+        {
             Err(SdkError::ServiceError(e))
                 if matches!(&e.err(), GetIndexError::NotFoundException(_msg)) =>
             {
@@ -490,14 +506,18 @@ impl S3VectorsTable {
             let (index_arn, vector_bucket_name, index_name) =
                 current_index.index_identifier_variables();
 
-            let input = PutVectorsInput::builder()
-                .set_index_arn(index_arn.clone())
-                .set_index_name(index_name.clone())
-                .set_vector_bucket_name(vector_bucket_name.clone())
-                .set_vectors(Some(chunk.to_vec()))
-                .build()
-                .context(S3VectorBuildSnafu)?;
-            let result = self.client.put_vectors(&input).await;
+            let result = self
+                .client
+                .put_vectors(
+                    &PutVectorsInput::builder()
+                        .set_index_arn(index_arn.clone())
+                        .set_index_name(index_name.clone())
+                        .set_vector_bucket_name(vector_bucket_name.clone())
+                        .set_vectors(Some(chunk.to_vec()))
+                        .build()
+                        .context(S3VectorBuildSnafu)?,
+                )
+                .await;
 
             match result {
                 Ok(_) => {
@@ -685,19 +705,27 @@ mod tests {
         );
 
         // Create the bucket and index first
-        let bucket_input = CreateVectorBucketInput::builder()
-            .vector_bucket_name("test-bucket")
-            .build()?;
-        table.client.create_vector_bucket(&bucket_input).await?;
+        table
+            .client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()?,
+            )
+            .await?;
 
-        let index_input = CreateIndexInput::builder()
-            .index_name("test-index")
-            .vector_bucket_name("test-bucket")
-            .data_type(S3DataType::Float32)
-            .dimension(3)
-            .distance_metric(DistanceMetric::Cosine)
-            .build()?;
-        table.client.create_index(&index_input).await?;
+        table
+            .client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name("test-index")
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()?,
+            )
+            .await?;
 
         let vectors = create_test_vectors(5);
         let result = table.write_chunk_with_spilling(&vectors, None).await;
@@ -722,19 +750,27 @@ mod tests {
         mock_client.set_quota_limit("test-index.02", 3);
 
         // Create the bucket and index first
-        let bucket_input = CreateVectorBucketInput::builder()
-            .vector_bucket_name("test-bucket")
-            .build()?;
-        table.client.create_vector_bucket(&bucket_input).await?;
+        table
+            .client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()?,
+            )
+            .await?;
 
-        let index_input = CreateIndexInput::builder()
-            .index_name("test-index")
-            .vector_bucket_name("test-bucket")
-            .data_type(S3DataType::Float32)
-            .dimension(3)
-            .distance_metric(DistanceMetric::Cosine)
-            .build()?;
-        table.client.create_index(&index_input).await?;
+        table
+            .client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name("test-index")
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()?,
+            )
+            .await?;
 
         let spill_index = Arc::new(AtomicU8::new(0));
         let vectors = create_test_vectors(3);
@@ -775,19 +811,27 @@ mod tests {
             mock_client.set_quota_limit(&index_name, 1);
         }
 
-        let bucket_input = CreateVectorBucketInput::builder()
-            .vector_bucket_name("test-bucket")
-            .build()?;
-        table.client.create_vector_bucket(&bucket_input).await?;
+        table
+            .client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()?,
+            )
+            .await?;
 
-        let index_input = CreateIndexInput::builder()
-            .index_name("test-index")
-            .vector_bucket_name("test-bucket")
-            .data_type(S3DataType::Float32)
-            .dimension(3)
-            .distance_metric(DistanceMetric::Cosine)
-            .build()?;
-        table.client.create_index(&index_input).await?;
+        table
+            .client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name("test-index")
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()?,
+            )
+            .await?;
 
         let spill_index = Arc::new(AtomicU8::new(0));
         for _ in 0..100 {

@@ -507,10 +507,7 @@ mod tests {
             .vector_bucket_name("test-bucket")
             .build()
             .expect("test assertion");
-        let _ = client
-            .list_indexes(&input)
-            .await
-            .expect("test assertion");
+        let _ = client.list_indexes(&input).await.expect("test assertion");
 
         // within TTL should use cache
         let output = client.list_indexes(&input).await.expect("test assertion");
@@ -535,10 +532,7 @@ mod tests {
             .vector_bucket_name("test-bucket")
             .build()
             .expect("test assertion");
-        let _ = client
-            .list_indexes(&input)
-            .await
-            .expect("test assertion");
+        let _ = client.list_indexes(&input).await.expect("test assertion");
 
         // advance time past TTL
         tokio::time::advance(Duration::from_secs(6)).await;
@@ -564,10 +558,7 @@ mod tests {
             .vector_bucket_name("test-bucket")
             .build()
             .expect("test assertion");
-        let _ = client
-            .list_indexes(&input)
-            .await
-            .expect("test assertion");
+        let _ = client.list_indexes(&input).await.expect("test assertion");
 
         let output = client.list_indexes(&input).await.expect("test assertion");
 
@@ -650,19 +641,13 @@ mod tests {
             .vector_bucket_name("bucket1")
             .build()
             .expect("test assertion");
-        let _ = client
-            .list_indexes(&input1)
-            .await
-            .expect("test assertion");
+        let _ = client.list_indexes(&input1).await.expect("test assertion");
 
         let input2 = ListIndexesInput::builder()
             .vector_bucket_name("bucket2")
             .build()
             .expect("test assertion");
-        let _ = client
-            .list_indexes(&input2)
-            .await
-            .expect("test assertion");
+        let _ = client.list_indexes(&input2).await.expect("test assertion");
 
         let result = client.list_indexes(&input1).await.expect("test assertion");
         assert!(!result.indexes().is_empty());
