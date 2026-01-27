@@ -351,10 +351,9 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "1de
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "8cff5241923989720f86687bdf7d0b3c9c7dad2f" } # spiceai-51
 
-# Spiceai fork of datafusion-ballista with Vortex shuffle format support and PollNow interrupt
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" }      # branch: spiceai-51
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" }  # branch: spiceai-51
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" } # branch: spiceai-51
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "2abc199e4b23f0881a4520e2749412dd35514050" } # branch: spiceai-51
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "2abc199e4b23f0881a4520e2749412dd35514050" } # branch: spiceai-51
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "2abc199e4b23f0881a4520e2749412dd35514050" } # branch: spiceai-51
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
