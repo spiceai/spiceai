@@ -30,7 +30,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 # HTTP client
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 
 # Serialization
 serde.workspace = true
@@ -46,7 +46,7 @@ dirs = "6"
 semver = "1"
 
 # Date/time formatting
-chrono.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 
 # Duration parsing
 humantime = "2"
