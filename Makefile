@@ -36,6 +36,14 @@ build-testoperator-dev:
 build-testoperator:
 	cargo build --release -p testoperator --all-features
 
+.PHONY: sdk
+sdk:
+	cargo build --release -p spiceai
+
+.PHONY: sdk-dev
+sdk-dev:
+	cargo build -p spiceai
+
 .PHONY: ci
 ci:
 	make -C bin/spice
