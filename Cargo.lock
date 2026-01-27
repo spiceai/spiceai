@@ -16408,6 +16408,7 @@ dependencies = [
  "rand 0.9.2",
  "rcgen",
  "reqwest",
+ "rstest 0.26.1",
  "rustyline",
  "semver",
  "serde",
