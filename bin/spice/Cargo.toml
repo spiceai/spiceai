@@ -1,12 +1,12 @@
 [package]
-name = "spice"
-version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
 exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "spice"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [[bin]]
 name = "spice"
@@ -30,7 +30,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 # HTTP client
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 
 # Serialization
 serde.workspace = true
@@ -46,13 +46,13 @@ dirs = "6"
 semver = "1"
 
 # Date/time formatting
-chrono.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 
 # Duration parsing
 humantime = "2"
 
 # Terminal colors
-ansi_term = "0.12"
+ansi_colors = { path = "../../crates/ansi_colors" }
 
 # Archive extraction
 flate2 = "1"
@@ -81,16 +81,16 @@ open = "5"
 urlencoding = "2"
 
 # Certificate generation for cluster TLS
-rcgen = { version = "0.13", features = ["x509-parser"] }
 pem = "3"
+rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
+
+# Internal crates
+flightrepl = { path = "../../crates/flightrepl" }
 
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
-
-# Internal crates
-flightrepl = { path = "../../crates/flightrepl" }
 
 [build-dependencies]
 # None needed - we use include_str! for version

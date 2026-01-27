@@ -30,16 +30,15 @@ use arrow_flight::{
     FlightDescriptor, decode::FlightRecordBatchStream, error::FlightError,
     flight_service_client::FlightServiceClient,
 };
-use util::ansi_colors::Color;
 
 use crate::completer::SchemaCache;
+use ansi_colors::Color;
+use arrow::array::RecordBatch;
+use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
 use config::get_user_agent;
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::util::pretty::pretty_format_batches;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
 use futures::{StreamExt, TryStreamExt};
-use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
@@ -48,6 +47,7 @@ use rustyline::{
     CompletionType, ConditionalEventHandler, Config, Helper, Hinter, KeyEvent, Validator,
 };
 use rustyline::{Editor, EventHandler};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinHandle;
@@ -106,6 +106,14 @@ pub struct ReplConfig {
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmRuntime {
+    Candle,
+    Mistral,
+    Openai,
+}
 
 async fn send_nsql_request(
     client: &Client,
@@ -286,10 +294,6 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     let client = FlightServiceClient::new(channel)
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
         .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
-
-    #[cfg(target_os = "windows")]
-    // Ensure ANSI support on Windows is enabled for proper color display.
-    let _ = util::ansi_colors::enable_ansi_support();
 
     let config = Config::builder()
         .completion_type(CompletionType::List)
@@ -834,8 +838,8 @@ fn display_grpc_error(err: &Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int32Array, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     fn create_test_batch(num_rows: usize, batch_id: i32) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![

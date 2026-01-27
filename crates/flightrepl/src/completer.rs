@@ -1,6 +1,6 @@
 use crate::EditorHelper;
+use arrow::array::{Array, StringArray};
 use arrow_flight::flight_service_client::FlightServiceClient;
-use datafusion::arrow::array::{Array, StringArray};
 use rustyline::Context;
 use rustyline::completion::{Completer, Pair};
 use rustyline::history::SearchDirection;
