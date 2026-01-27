@@ -279,29 +279,27 @@ async fn list_vector_segment(
     let mut segment_vectors_retrieved = 0;
 
     while remaining_limit > 0 {
+        let input = ListVectorsInput::builder()
+            .set_vector_bucket_name(bucket_name.clone())
+            .set_index_arn(arn.clone())
+            .set_index_name(index_name.clone())
+            .max_results(
+                i32::try_from(remaining_limit.min(LIST_VECTORS_MAX_RESULTS)).unwrap_or(i32::MAX),
+            )
+            .set_next_token(next_token.clone())
+            .return_data(true)
+            .return_metadata(true)
+            .segment_count(i32::try_from(segment_count).unwrap_or(i32::MAX))
+            .segment_index(i32::try_from(segment_index).unwrap_or(i32::MAX))
+            .build()
+            .boxed()
+            .map_err(DataFusionError::External)?;
         let ListVectorsOutput {
             next_token: next_token_opt,
             vectors,
             ..
         } = client
-            .list_vectors(
-                ListVectorsInput::builder()
-                    .set_vector_bucket_name(bucket_name.clone())
-                    .set_index_arn(arn.clone())
-                    .set_index_name(index_name.clone())
-                    .max_results(
-                        i32::try_from(remaining_limit.min(LIST_VECTORS_MAX_RESULTS))
-                            .unwrap_or(i32::MAX),
-                    )
-                    .set_next_token(next_token.clone())
-                    .return_data(true)
-                    .return_metadata(true)
-                    .segment_count(i32::try_from(segment_count).unwrap_or(i32::MAX))
-                    .segment_index(i32::try_from(segment_index).unwrap_or(i32::MAX))
-                    .build()
-                    .boxed()
-                    .map_err(DataFusionError::External)?,
-            )
+            .list_vectors(&input)
             .await
             .boxed()
             .map_err(DataFusionError::External)?;

@@ -103,35 +103,35 @@ impl<T: S3Vectors + Send + Sync> S3VectorsMiddleware<T> {
 impl<T: S3Vectors + Send + Sync + 'static> S3Vectors for S3VectorsMiddleware<T> {
     async fn create_index(
         &self,
-        input: CreateIndexInput,
+        input: &CreateIndexInput,
     ) -> Result<CreateIndexOutput, SdkError<CreateIndexError, HttpResponse>> {
         self.inner.create_index(input).await
     }
 
     async fn create_vector_bucket(
         &self,
-        input: CreateVectorBucketInput,
+        input: &CreateVectorBucketInput,
     ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError, HttpResponse>> {
         self.inner.create_vector_bucket(input).await
     }
 
     async fn delete_index(
         &self,
-        input: DeleteIndexInput,
+        input: &DeleteIndexInput,
     ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError, HttpResponse>> {
         self.inner.delete_index(input).await
     }
 
     async fn delete_vector_bucket(
         &self,
-        input: DeleteVectorBucketInput,
+        input: &DeleteVectorBucketInput,
     ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError, HttpResponse>> {
         self.inner.delete_vector_bucket(input).await
     }
 
     async fn delete_vector_bucket_policy(
         &self,
-        input: DeleteVectorBucketPolicyInput,
+        input: &DeleteVectorBucketPolicyInput,
     ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError, HttpResponse>>
     {
         self.inner.delete_vector_bucket_policy(input).await
@@ -139,28 +139,28 @@ impl<T: S3Vectors + Send + Sync + 'static> S3Vectors for S3VectorsMiddleware<T> 
 
     async fn delete_vectors(
         &self,
-        input: DeleteVectorsInput,
+        input: &DeleteVectorsInput,
     ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError, HttpResponse>> {
         self.inner.delete_vectors(input).await
     }
 
     async fn get_index(
         &self,
-        input: GetIndexInput,
+        input: &GetIndexInput,
     ) -> Result<GetIndexOutput, SdkError<GetIndexError, HttpResponse>> {
         self.inner.get_index(input).await
     }
 
     async fn get_vector_bucket(
         &self,
-        input: GetVectorBucketInput,
+        input: &GetVectorBucketInput,
     ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError, HttpResponse>> {
         self.inner.get_vector_bucket(input).await
     }
 
     async fn get_vector_bucket_policy(
         &self,
-        input: GetVectorBucketPolicyInput,
+        input: &GetVectorBucketPolicyInput,
     ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError, HttpResponse>>
     {
         self.inner.get_vector_bucket_policy(input).await
@@ -168,35 +168,35 @@ impl<T: S3Vectors + Send + Sync + 'static> S3Vectors for S3VectorsMiddleware<T> 
 
     async fn get_vectors(
         &self,
-        input: GetVectorsInput,
+        input: &GetVectorsInput,
     ) -> Result<GetVectorsOutput, SdkError<GetVectorsError, HttpResponse>> {
         self.inner.get_vectors(input).await
     }
 
     async fn list_indexes(
         &self,
-        input: ListIndexesInput,
+        input: &ListIndexesInput,
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
         self.inner.list_indexes(input).await
     }
 
     async fn list_vector_buckets(
         &self,
-        input: ListVectorBucketsInput,
+        input: &ListVectorBucketsInput,
     ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError, HttpResponse>> {
         self.inner.list_vector_buckets(input).await
     }
 
     async fn list_vectors(
         &self,
-        input: ListVectorsInput,
+        input: &ListVectorsInput,
     ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>> {
         self.inner.list_vectors(input).await
     }
 
     async fn put_vector_bucket_policy(
         &self,
-        input: PutVectorBucketPolicyInput,
+        input: &PutVectorBucketPolicyInput,
     ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError, HttpResponse>>
     {
         self.inner.put_vector_bucket_policy(input).await
@@ -204,14 +204,14 @@ impl<T: S3Vectors + Send + Sync + 'static> S3Vectors for S3VectorsMiddleware<T> 
 
     async fn put_vectors(
         &self,
-        input: PutVectorsInput,
+        input: &PutVectorsInput,
     ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>> {
         self.inner.put_vectors(input).await
     }
 
     async fn query_vectors(
         &self,
-        input: QueryVectorsInput,
+        input: &QueryVectorsInput,
     ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError, HttpResponse>> {
         self.inner.query_vectors(input).await
     }
@@ -234,7 +234,7 @@ mod tests {
             .build()
             .expect("valid input");
 
-        let result = middleware.create_index(input).await;
+        let result = middleware.create_index(&input).await;
         assert!(result.is_ok());
         assert_eq!(mock.get_create_index_call_count(), 1);
     }

@@ -93,14 +93,14 @@ impl<T: S3Vectors + Send + Sync + ?Sized> S3VectorsTelemetryMiddleware<T> {
 impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelemetryMiddleware<T> {
     async fn create_index(
         &self,
-        input: CreateIndexInput,
+        input: &CreateIndexInput,
     ) -> Result<CreateIndexOutput, SdkError<CreateIndexError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::create_index::LATENCY, &[]);
         super::metrics::create_index::REQUESTS.add(1, &[]);
 
         let result = self
             .inner
-            .create_index(input.clone())
+            .create_index(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__create_index",
@@ -125,13 +125,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn create_vector_bucket(
         &self,
-        input: CreateVectorBucketInput,
+        input: &CreateVectorBucketInput,
     ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::create_vector_bucket::LATENCY, &[]);
         super::metrics::create_vector_bucket::REQUESTS.add(1, &[]);
 
         self.inner
-            .create_vector_bucket(input.clone())
+            .create_vector_bucket(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__create_vector_bucket",
@@ -143,13 +143,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn delete_index(
         &self,
-        input: DeleteIndexInput,
+        input: &DeleteIndexInput,
     ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::delete_index::LATENCY, &[]);
         super::metrics::delete_index::REQUESTS.add(1, &[]);
 
         self.inner
-            .delete_index(input.clone())
+            .delete_index(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__delete_index",
@@ -163,13 +163,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn delete_vector_bucket(
         &self,
-        input: DeleteVectorBucketInput,
+        input: &DeleteVectorBucketInput,
     ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::delete_vector_bucket::LATENCY, &[]);
         super::metrics::delete_vector_bucket::REQUESTS.add(1, &[]);
 
         self.inner
-            .delete_vector_bucket(input.clone())
+            .delete_vector_bucket(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__delete_vector_bucket",
@@ -182,7 +182,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn delete_vector_bucket_policy(
         &self,
-        input: DeleteVectorBucketPolicyInput,
+        input: &DeleteVectorBucketPolicyInput,
     ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError, HttpResponse>>
     {
         let _guard =
@@ -190,7 +190,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
         super::metrics::delete_vector_bucket_policy::REQUESTS.add(1, &[]);
 
         self.inner
-            .delete_vector_bucket_policy(input.clone())
+            .delete_vector_bucket_policy(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__delete_vector_bucket_policy",
@@ -203,13 +203,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn delete_vectors(
         &self,
-        input: DeleteVectorsInput,
+        input: &DeleteVectorsInput,
     ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::delete_vectors::LATENCY, &[]);
         super::metrics::delete_vectors::REQUESTS.add(1, &[]);
 
         self.inner
-            .delete_vectors(input.clone())
+            .delete_vectors(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__delete_vectors",
@@ -223,14 +223,14 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn get_vector_bucket_policy(
         &self,
-        input: GetVectorBucketPolicyInput,
+        input: &GetVectorBucketPolicyInput,
     ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError, HttpResponse>>
     {
         let _guard = TimeMeasurement::new(&super::metrics::get_vector_bucket_policy::LATENCY, &[]);
         super::metrics::get_vector_bucket_policy::REQUESTS.add(1, &[]);
 
         self.inner
-            .get_vector_bucket_policy(input.clone())
+            .get_vector_bucket_policy(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__get_vector_bucket_policy",
@@ -243,13 +243,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn get_index(
         &self,
-        input: GetIndexInput,
+        input: &GetIndexInput,
     ) -> Result<GetIndexOutput, SdkError<GetIndexError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_index::LATENCY, &[]);
         super::metrics::get_index::REQUESTS.add(1, &[]);
 
         self.inner
-            .get_index(input.clone())
+            .get_index(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__get_index",
@@ -263,13 +263,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn get_vector_bucket(
         &self,
-        input: GetVectorBucketInput,
+        input: &GetVectorBucketInput,
     ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_vector_bucket::LATENCY, &[]);
         super::metrics::get_vector_bucket::REQUESTS.add(1, &[]);
 
         self.inner
-            .get_vector_bucket(input.clone())
+            .get_vector_bucket(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__get_vector_bucket",
@@ -282,13 +282,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn get_vectors(
         &self,
-        input: GetVectorsInput,
+        input: &GetVectorsInput,
     ) -> Result<GetVectorsOutput, SdkError<GetVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::get_vectors::LATENCY, &[]);
         super::metrics::get_vectors::REQUESTS.add(1, &[]);
 
         self.inner
-            .get_vectors(input.clone())
+            .get_vectors(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__get_vectors",
@@ -304,7 +304,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn list_indexes(
         &self,
-        input: ListIndexesInput,
+        input: &ListIndexesInput,
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
         // Check cache if next_token is None (full list)
         let is_full_list = input.next_token.is_none();
@@ -327,7 +327,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
             super::metrics::list_indexes::REQUESTS.add(1, &[]);
 
             self.inner
-                .list_indexes(input.clone())
+                .list_indexes(input)
                 .instrument(info_span!(
                     target: "task_history",
                     "s3_vectors__list_indexes",
@@ -361,7 +361,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn list_vector_buckets(
         &self,
-        input: ListVectorBucketsInput,
+        input: &ListVectorBucketsInput,
     ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::list_vector_buckets::LATENCY, &[]);
         super::metrics::list_vector_buckets::REQUESTS.add(1, &[]);
@@ -378,13 +378,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn list_vectors(
         &self,
-        input: ListVectorsInput,
+        input: &ListVectorsInput,
     ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::list_vectors::LATENCY, &[]);
         super::metrics::list_vectors::REQUESTS.add(1, &[]);
 
         self.inner
-            .list_vectors(input.clone())
+            .list_vectors(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__list_vectors",
@@ -401,14 +401,14 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn put_vector_bucket_policy(
         &self,
-        input: PutVectorBucketPolicyInput,
+        input: &PutVectorBucketPolicyInput,
     ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError, HttpResponse>>
     {
         let _guard = TimeMeasurement::new(&super::metrics::put_vector_bucket_policy::LATENCY, &[]);
         super::metrics::put_vector_bucket_policy::REQUESTS.add(1, &[]);
 
         self.inner
-            .put_vector_bucket_policy(input.clone())
+            .put_vector_bucket_policy(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__put_vector_bucket_policy",
@@ -421,13 +421,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn put_vectors(
         &self,
-        input: PutVectorsInput,
+        input: &PutVectorsInput,
     ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::put_vectors::LATENCY, &[]);
         super::metrics::put_vectors::REQUESTS.add(1, &[]);
 
         self.inner
-            .put_vectors(input.clone())
+            .put_vectors(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__put_vectors",
@@ -441,13 +441,13 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
     async fn query_vectors(
         &self,
-        input: QueryVectorsInput,
+        input: &QueryVectorsInput,
     ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError, HttpResponse>> {
         let _guard = TimeMeasurement::new(&super::metrics::query_vectors::LATENCY, &[]);
         super::metrics::query_vectors::REQUESTS.add(1, &[]);
 
         self.inner
-            .query_vectors(input.clone())
+            .query_vectors(input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_vectors__query_vectors",
@@ -465,6 +465,9 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsTelem
 
 #[cfg(test)]
 mod tests {
+    // Type alias for backward compatibility
+    pub type S3VectorClient = S3VectorsTelemetryMiddleware<dyn S3Vectors + Send + Sync>;
+
     use std::{sync::Arc, time::Duration};
 
     use s3_vectors::{
@@ -484,7 +487,7 @@ mod tests {
             .build()
             .expect("test assertion");
         let _create_result = client
-            .create_index(create_input)
+            .create_index(&create_input)
             .await
             .expect("test assertion");
     }
@@ -505,12 +508,12 @@ mod tests {
             .build()
             .expect("test assertion");
         let _ = client
-            .list_indexes(input.clone())
+            .list_indexes(&input)
             .await
             .expect("test assertion");
 
         // within TTL should use cache
-        let output = client.list_indexes(input).await.expect("test assertion");
+        let output = client.list_indexes(&input).await.expect("test assertion");
 
         assert!(!output.indexes().is_empty());
         assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 1);
@@ -533,7 +536,7 @@ mod tests {
             .build()
             .expect("test assertion");
         let _ = client
-            .list_indexes(input.clone())
+            .list_indexes(&input)
             .await
             .expect("test assertion");
 
@@ -541,7 +544,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
 
         // miss cache and call client again
-        let output = client.list_indexes(input).await.expect("test assertion");
+        let output = client.list_indexes(&input).await.expect("test assertion");
 
         assert!(!output.indexes().is_empty());
         assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
@@ -562,11 +565,11 @@ mod tests {
             .build()
             .expect("test assertion");
         let _ = client
-            .list_indexes(input.clone())
+            .list_indexes(&input)
             .await
             .expect("test assertion");
 
-        let output = client.list_indexes(input).await.expect("test assertion");
+        let output = client.list_indexes(&input).await.expect("test assertion");
 
         assert!(!output.indexes().is_empty());
         assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
@@ -586,7 +589,7 @@ mod tests {
             .vector_bucket_name("test-bucket")
             .build()
             .expect("test assertion");
-        let _ = client.list_indexes(input).await.expect("test assertion");
+        let _ = client.list_indexes(&input).await.expect("test assertion");
 
         // call with next_token should bypass cache
         let input = ListIndexesInput::builder()
@@ -594,7 +597,7 @@ mod tests {
             .next_token("some-token")
             .build()
             .expect("test assertion");
-        let output = client.list_indexes(input).await.expect("test assertion");
+        let output = client.list_indexes(&input).await.expect("test assertion");
 
         assert!(!output.indexes().is_empty());
         assert_eq!(mock_client.get_list_indexes_call_count("test-bucket"), 2);
@@ -614,7 +617,7 @@ mod tests {
             .build()
             .expect("test assertion");
         let _ = client
-            .list_indexes(list_input.clone())
+            .list_indexes(&list_input)
             .await
             .expect("test assertion");
 
@@ -622,7 +625,7 @@ mod tests {
         create_test_index(&client, "test-bucket", "new-index").await;
 
         let output = client
-            .list_indexes(list_input)
+            .list_indexes(&list_input)
             .await
             .expect("test assertion");
 
@@ -648,7 +651,7 @@ mod tests {
             .build()
             .expect("test assertion");
         let _ = client
-            .list_indexes(input1.clone())
+            .list_indexes(&input1)
             .await
             .expect("test assertion");
 
@@ -657,14 +660,14 @@ mod tests {
             .build()
             .expect("test assertion");
         let _ = client
-            .list_indexes(input2.clone())
+            .list_indexes(&input2)
             .await
             .expect("test assertion");
 
-        let result = client.list_indexes(input1).await.expect("test assertion");
+        let result = client.list_indexes(&input1).await.expect("test assertion");
         assert!(!result.indexes().is_empty());
 
-        let result = client.list_indexes(input2).await.expect("test assertion");
+        let result = client.list_indexes(&input2).await.expect("test assertion");
         assert!(!result.indexes().is_empty());
 
         assert_eq!(mock_client.get_list_indexes_call_count("bucket1"), 1);

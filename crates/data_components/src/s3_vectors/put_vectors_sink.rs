@@ -119,18 +119,17 @@ impl DataSink for PutVectorsSink {
 
             for chunk in vectors.chunks(batch_size) {
                 let chunk_len = chunk.len();
+                let input = PutVectorsInput::builder()
+                    .set_index_arn(index_arn.clone())
+                    .set_index_name(index_name.clone())
+                    .set_vector_bucket_name(vector_bucket_name.clone())
+                    .set_vectors(Some(chunk.to_vec()))
+                    .build()
+                    .context(BuildInputSnafu)?;
                 let _ = self
                     .table
                     .client
-                    .put_vectors(
-                        PutVectorsInput::builder()
-                            .set_index_arn(index_arn.clone())
-                            .set_index_name(index_name.clone())
-                            .set_vector_bucket_name(vector_bucket_name.clone())
-                            .set_vectors(Some(chunk.to_vec()))
-                            .build()
-                            .context(BuildInputSnafu)?,
-                    )
+                    .put_vectors(&input)
                     .await
                     .map_err(SdkError::into_service_error)
                     .boxed()

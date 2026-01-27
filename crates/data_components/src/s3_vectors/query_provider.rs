@@ -263,21 +263,20 @@ async fn get_vectors_call(
 
     // Batch keys into chunks of GET_VECTORS_MAX_KEYS
     for chunk in keys.chunks(GET_VECTORS_MAX_KEYS) {
+        let input = GetVectorsInput::builder()
+            .set_keys(Some(chunk.to_vec()))
+            .set_vector_bucket_name(bucket_name.clone())
+            .set_index_arn(arn.clone())
+            .set_index_name(index_name.clone())
+            .set_return_data(Some(true))
+            .build()
+            .boxed()
+            .map_err(DataFusionError::External)?;
         let GetVectorsOutput {
             vectors: output_vectors,
             ..
         } = client
-            .get_vectors(
-                GetVectorsInput::builder()
-                    .set_keys(Some(chunk.to_vec()))
-                    .set_vector_bucket_name(bucket_name.clone())
-                    .set_index_arn(arn.clone())
-                    .set_index_name(index_name.clone())
-                    .set_return_data(Some(true))
-                    .build()
-                    .boxed()
-                    .map_err(DataFusionError::External)?,
-            )
+            .get_vectors(&input)
             .instrument(info_span!(
                 target: "task_history",
                 "s3_get_vectors",
@@ -317,21 +316,20 @@ async fn query_vectors_call(
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
     let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
     let s3_filter: Option<Document> = s3_filter_pre.clone().map(Into::into);
+    let input = QueryVectorsInput::builder()
+        .query_vector(VectorData::Float32(query))
+        .return_distance(true)
+        .top_k(limit)
+        .set_filter(s3_filter.clone())
+        .set_vector_bucket_name(bucket_name.clone())
+        .set_index_arn(arn.clone())
+        .set_index_name(index_name.clone())
+        .return_metadata(true)
+        .build()
+        .boxed()
+        .map_err(DataFusionError::External)?;
     let output = client
-        .query_vectors(
-            QueryVectorsInput::builder()
-                .query_vector(VectorData::Float32(query))
-                .return_distance(true)
-                .top_k(limit)
-                .set_filter(s3_filter.clone())
-                .set_vector_bucket_name(bucket_name.clone())
-                .set_index_arn(arn.clone())
-                .set_index_name(index_name.clone())
-                .return_metadata(true)
-                .build()
-                .boxed()
-                .map_err(DataFusionError::External)?,
-        )
+        .query_vectors(&input)
         .instrument(info_span!(
             target: "task_history",
             "s3_query_vectors",

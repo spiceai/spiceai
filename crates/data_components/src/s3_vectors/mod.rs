@@ -183,14 +183,13 @@ pub async fn list_index_names(
     bucket_name: &str,
     prefix: &str,
 ) -> Result<Vec<String>, Error> {
+    let input = ListIndexesInput::builder()
+        .set_vector_bucket_name(Some(bucket_name.to_string()))
+        .set_prefix(Some(prefix.to_string()))
+        .build()
+        .context(S3VectorBuildSnafu)?;
     let list_indexes_output = client
-        .list_indexes(
-            ListIndexesInput::builder()
-                .set_vector_bucket_name(Some(bucket_name.to_string()))
-                .set_prefix(Some(prefix.to_string()))
-                .build()
-                .context(S3VectorBuildSnafu)?,
-        )
+        .list_indexes(&input)
         .await
         .map_err(|e| Error::S3VectorListIndexesError {
             source: Box::new(e.into_service_error()),

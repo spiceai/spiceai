@@ -140,7 +140,7 @@ impl MockClient {
 impl S3Vectors for MockClient {
     async fn create_index(
         &self,
-        input: CreateIndexInput,
+        input: &CreateIndexInput,
     ) -> Result<CreateIndexOutput, SdkError<CreateIndexError, HttpResponse>> {
         let bucket_name = input.vector_bucket_name().unwrap_or_default();
         let index_name = input.index_name().unwrap_or_default();
@@ -185,28 +185,28 @@ impl S3Vectors for MockClient {
 
     async fn create_vector_bucket(
         &self,
-        _input: CreateVectorBucketInput,
+        _input: &CreateVectorBucketInput,
     ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError, HttpResponse>> {
         Ok(CreateVectorBucketOutput::builder().build())
     }
 
     async fn delete_index(
         &self,
-        _input: DeleteIndexInput,
+        _input: &DeleteIndexInput,
     ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError, HttpResponse>> {
         unimplemented!()
     }
 
     async fn delete_vector_bucket(
         &self,
-        _input: DeleteVectorBucketInput,
+        _input: &DeleteVectorBucketInput,
     ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError, HttpResponse>> {
         unimplemented!()
     }
 
     async fn delete_vector_bucket_policy(
         &self,
-        _input: DeleteVectorBucketPolicyInput,
+        _input: &DeleteVectorBucketPolicyInput,
     ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError, HttpResponse>>
     {
         unimplemented!()
@@ -214,14 +214,14 @@ impl S3Vectors for MockClient {
 
     async fn delete_vectors(
         &self,
-        _input: DeleteVectorsInput,
+        _input: &DeleteVectorsInput,
     ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError, HttpResponse>> {
         unimplemented!()
     }
 
     async fn get_index(
         &self,
-        input: GetIndexInput,
+        input: &GetIndexInput,
     ) -> Result<GetIndexOutput, SdkError<GetIndexError, HttpResponse>> {
         let bucket_name = input.vector_bucket_name().unwrap_or_default();
         let index_name = input.index_name().unwrap_or_default();
@@ -275,14 +275,14 @@ impl S3Vectors for MockClient {
 
     async fn get_vector_bucket(
         &self,
-        _input: GetVectorBucketInput,
+        _input: &GetVectorBucketInput,
     ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError, HttpResponse>> {
         Ok(GetVectorBucketOutput::builder().build())
     }
 
     async fn get_vector_bucket_policy(
         &self,
-        _input: GetVectorBucketPolicyInput,
+        _input: &GetVectorBucketPolicyInput,
     ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError, HttpResponse>>
     {
         unimplemented!()
@@ -290,14 +290,14 @@ impl S3Vectors for MockClient {
 
     async fn get_vectors(
         &self,
-        _input: GetVectorsInput,
+        _input: &GetVectorsInput,
     ) -> Result<GetVectorsOutput, SdkError<GetVectorsError, HttpResponse>> {
         unimplemented!()
     }
 
     async fn list_indexes(
         &self,
-        input: ListIndexesInput,
+        input: &ListIndexesInput,
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
         let bucket_name = input.vector_bucket_name().unwrap_or_default();
         let mut data = match self.data.lock() {
@@ -323,14 +323,14 @@ impl S3Vectors for MockClient {
 
     async fn list_vector_buckets(
         &self,
-        _input: ListVectorBucketsInput,
+        _input: &ListVectorBucketsInput,
     ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError, HttpResponse>> {
         unimplemented!()
     }
 
     async fn list_vectors(
         &self,
-        input: ListVectorsInput,
+        input: &ListVectorsInput,
     ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>> {
         let index_name = input.index_name().unwrap_or_default();
         let data = match self.data.lock() {
@@ -346,7 +346,7 @@ impl S3Vectors for MockClient {
 
     async fn put_vector_bucket_policy(
         &self,
-        _input: PutVectorBucketPolicyInput,
+        _input: &PutVectorBucketPolicyInput,
     ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError, HttpResponse>>
     {
         unimplemented!()
@@ -354,7 +354,7 @@ impl S3Vectors for MockClient {
 
     async fn put_vectors(
         &self,
-        input: PutVectorsInput,
+        input: &PutVectorsInput,
     ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>> {
         let index_name = input.index_name().unwrap_or_default();
         let num_vectors = input.vectors().len();
@@ -392,7 +392,7 @@ impl S3Vectors for MockClient {
 
     async fn query_vectors(
         &self,
-        _input: QueryVectorsInput,
+        _input: &QueryVectorsInput,
     ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError, HttpResponse>> {
         unimplemented!()
     }
