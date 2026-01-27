@@ -33,6 +33,7 @@ use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
 use std::{
     collections::HashMap,
     fmt::Write,
+    ops::Not,
     path::PathBuf,
     str::FromStr,
     sync::{Arc, LazyLock},
@@ -509,6 +510,24 @@ impl std::fmt::Debug for SnapshotManager {
     }
 }
 
+pub struct ForceCreate(pub bool);
+
+impl Not for ForceCreate {
+    type Output = bool;
+
+    fn not(self) -> Self::Output {
+        !self.0
+    }
+}
+
+impl Not for &ForceCreate {
+    type Output = bool;
+
+    fn not(self) -> Self::Output {
+        !self.0
+    }
+}
+
 impl SnapshotManager {
     fn metadata_path(&self) -> ObjectPath {
         self.snapshots_location.child(METADATA_FILE_NAME)
@@ -585,6 +604,48 @@ impl SnapshotManager {
         };
 
         Ok(Some(MetadataHandle { metadata, version }))
+    }
+
+    /// Checks if there are any existing snapshots for this dataset.
+    ///
+    /// Returns `true` if both:
+    /// - Metadata exists and contains at least one snapshot entry for this dataset
+    /// - At least one actual snapshot file exists in the object store
+    ///
+    /// Returns `false` if either condition is not met.
+    async fn has_existing_snapshots(&self) -> bool {
+        // Check metadata for snapshot entries
+        let metadata_has_snapshots = match self.load_metadata().await {
+            Ok(Some(handle)) => handle
+                .metadata
+                .datasets
+                .get(&self.dataset_name)
+                .is_some_and(|meta| !meta.snapshots.is_empty()),
+            Ok(None) | Err(_) => false,
+        };
+
+        if !metadata_has_snapshots {
+            return false;
+        }
+
+        // Check if actual snapshot files exist in object store
+        let layout = SnapshotPathLayout::new(&self.dataset_name);
+        let dataset_partition = layout.dataset_partition_raw();
+
+        let mut list_stream = self.object_store.list(Some(&self.snapshots_location));
+        while let Some(result) = list_stream.next().await {
+            match result {
+                Ok(meta) => {
+                    // Check if this file belongs to our dataset partition
+                    if meta.location.as_ref().contains(&dataset_partition) {
+                        return true;
+                    }
+                }
+                Err(_) => {},
+            }
+        }
+
+        false
     }
 
     pub async fn try_new(
@@ -809,12 +870,28 @@ impl SnapshotManager {
         schema: &SchemaRef,
         lock_guard: OwnedMutexGuard<()>,
         last_updated_at: Option<i64>,
+        force_create: ForceCreate,
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
+        // If no existing snapshots (in metadata or as actual files), treat as force_create.
+        // This ensures at least one snapshot exists at all times.
+        let force_create = if force_create.0 {
+            force_create
+        } else if !self.has_existing_snapshots().await {
+            tracing::info!(
+                "No existing snapshots found (metadata or files), forcing snapshot creation. dataset={}",
+                self.dataset_name
+            );
+            ForceCreate(true)
+        } else {
+            force_create
+        };
+
         // Check if we should skip due to no updates (on_change policy)
         if matches!(
             self.snapshots_creation_policy,
             SnapshotsCreationPolicy::OnChange
-        ) {
+        ) && !force_create
+        {
             // Skip if no writes have occurred in this session (last_updated_at is None/0).
             // This avoids creating snapshots before the first refresh completes.
             if last_updated_at.is_none() {
@@ -2522,7 +2599,7 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None)
+            .create_snapshot(&schema, lock_guard, None, ForceCreate(true))
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -2598,7 +2675,7 @@ mod tests {
         let last_updated_at = Some(1_704_153_600_000_i64); // 2024-01-02 00:00:00 UTC
 
         let _uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, last_updated_at)
+            .create_snapshot(&schema, lock_guard, last_updated_at, ForceCreate(true))
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -2652,7 +2729,7 @@ mod tests {
 
         // Create snapshot with None updated_at
         let _uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None)
+            .create_snapshot(&schema, lock_guard, None, ForceCreate(true))
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -3036,7 +3113,7 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None)
+            .create_snapshot(&schema, lock_guard, None, ForceCreate(true))
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -3151,7 +3228,7 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None)
+            .create_snapshot(&schema, lock_guard, None, ForceCreate(true))
             .await
             .expect("create snapshot")
             .expect("path");
@@ -3404,14 +3481,28 @@ mod tests {
         let local_path = temp_path.to_path_buf();
 
         let schema = sample_schema();
-        let manager = build_manager_with_on_change_policy(&store, local_path, &schema);
+        let manager = build_manager_with_on_change_policy(&store, local_path.clone(), &schema);
 
         let mutex = Arc::new(Mutex::new(()));
-        let lock_guard = mutex.lock_owned().await;
 
-        // With OnChange policy and None last_updated_at, snapshot should be skipped
+        // First, create an initial snapshot to establish existing snapshots
+        let lock_guard = Arc::clone(&mutex).lock_owned().await;
+        let first_result = manager
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                Some(1_704_153_600_000_i64),
+                ForceCreate(true),
+            )
+            .await
+            .expect("first snapshot should succeed");
+        assert!(first_result.is_some(), "First snapshot should be created");
+
+        // Now with OnChange policy and None last_updated_at, snapshot should be skipped
+        // because there are existing snapshots but no new writes
+        let lock_guard2 = Arc::clone(&mutex).lock_owned().await;
         let result = manager
-            .create_snapshot(&schema, lock_guard, None)
+            .create_snapshot(&schema, lock_guard2, None, ForceCreate(false))
             .await
             .expect("create_snapshot should not error");
 
@@ -3448,7 +3539,7 @@ mod tests {
         let timestamp = 1_704_153_600_000_i64; // 2024-01-02 00:00:00 UTC
 
         let first_result = manager_always
-            .create_snapshot(&schema, lock_guard, Some(timestamp))
+            .create_snapshot(&schema, lock_guard, Some(timestamp), ForceCreate(true))
             .await
             .expect("first snapshot");
         assert!(first_result.is_some(), "First snapshot should be created");
@@ -3458,7 +3549,7 @@ mod tests {
 
         let lock_guard2 = Arc::clone(&mutex).lock_owned().await;
         let second_result = manager_on_change
-            .create_snapshot(&schema, lock_guard2, Some(timestamp))
+            .create_snapshot(&schema, lock_guard2, Some(timestamp), ForceCreate(false))
             .await
             .expect("second snapshot should not error");
 
@@ -3488,8 +3579,9 @@ mod tests {
         let timestamp = 1_704_153_600_000_i64;
 
         // First snapshot with valid timestamp should be created even with OnChange policy
+        // (no existing snapshots means force_create is automatically set to true)
         let result = manager
-            .create_snapshot(&schema, lock_guard, Some(timestamp))
+            .create_snapshot(&schema, lock_guard, Some(timestamp), ForceCreate(false))
             .await
             .expect("create_snapshot should not error");
 
@@ -3526,7 +3618,12 @@ mod tests {
         let first_timestamp = 1_704_153_600_000_i64;
 
         let first_result = manager
-            .create_snapshot(&schema, lock_guard, Some(first_timestamp))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                Some(first_timestamp),
+                ForceCreate(true),
+            )
             .await
             .expect("first snapshot");
         assert!(first_result.is_some(), "First snapshot should be created");
@@ -3538,7 +3635,12 @@ mod tests {
         let second_timestamp = 1_704_240_000_000_i64; // Next day
 
         let second_result = manager_on_change
-            .create_snapshot(&schema, lock_guard2, Some(second_timestamp))
+            .create_snapshot(
+                &schema,
+                lock_guard2,
+                Some(second_timestamp),
+                ForceCreate(false),
+            )
             .await
             .expect("second snapshot");
 
@@ -3572,14 +3674,145 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         // With Always policy, snapshot should be created even with None last_updated_at
+        // (also, no existing snapshots means force_create is automatically set)
         let result = manager
-            .create_snapshot(&schema, lock_guard, None)
+            .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
             .await
             .expect("create_snapshot should not error");
 
         assert!(
             result.is_some(),
             "With Always policy, snapshot should be created even when no writes occurred"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn force_creates_snapshot_when_no_metadata_exists() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-force-no-metadata".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        let schema = sample_schema();
+        // Use OnChange policy which would normally skip when last_updated_at is None
+        let manager = build_manager_with_on_change_policy(&store, local_path, &schema);
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
+        // Even with OnChange policy and None last_updated_at, snapshot should be created
+        // because no metadata exists (no prior snapshots)
+        let result = manager
+            .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+            .await
+            .expect("create_snapshot should not error");
+
+        assert!(
+            result.is_some(),
+            "Snapshot should be force-created when no metadata exists, even with OnChange policy"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn force_creates_snapshot_when_metadata_exists_but_no_snapshots_for_dataset() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-force-no-dataset-snapshots".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        // Create metadata with a different dataset (not our test dataset)
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
+        metadata.datasets.insert(
+            "other_dataset".to_string(),
+            DatasetMetadata {
+                name: "other_dataset".to_string(),
+                ..Default::default()
+            },
+        );
+        write_metadata(&store, &metadata_path, &metadata).await;
+
+        let schema = sample_schema();
+        let manager = build_manager_with_on_change_policy(&store, local_path, &schema);
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
+        // Even with OnChange policy and None last_updated_at, snapshot should be created
+        // because metadata exists but has no snapshots for THIS dataset
+        let result = manager
+            .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+            .await
+            .expect("create_snapshot should not error");
+
+        assert!(
+            result.is_some(),
+            "Snapshot should be force-created when metadata has no snapshots for this dataset"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn force_creates_snapshot_when_metadata_has_snapshots_but_no_files_exist() {
+        let store = Arc::new(InMemory::new());
+        let contents = b"snapshot-force-no-files".to_vec();
+        let mut temp_file = NamedTempFile::new().expect("create temp file");
+        temp_file.write_all(&contents).expect("write temp snapshot");
+        temp_file.flush().expect("flush temp snapshot");
+        let temp_path = temp_file.into_temp_path();
+        let local_path = temp_path.to_path_buf();
+
+        // Create metadata that claims snapshots exist, but don't actually create the files
+        let schema = sample_schema();
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
+        let schema_metadata =
+            SchemaMetadata::from_schema(0, &schema).expect("schema serialization");
+        metadata.datasets.insert(
+            DATASET_NAME.to_string(),
+            DatasetMetadata {
+                name: DATASET_NAME.to_string(),
+                schemas: vec![schema_metadata],
+                current_schema_id: 0,
+                snapshots: vec![SnapshotEntry {
+                    snapshot_id: 0,
+                    timestamp_ms: 1_704_153_600_000,
+                    snapshot: format!("{SNAPSHOT_URI_PREFIX}/fake_snapshot.db"),
+                    snapshot_checksum: "fake_checksum".to_string(),
+                    snapshot_checksum_algorithm: "sha256".to_string(),
+                    snapshot_size: 1000,
+                    snapshot_last_updated_at_ms: Some(1_704_153_600_000),
+                }],
+                current_snapshot_id: Some(0),
+                properties: HashMap::default(),
+            },
+        );
+        write_metadata(&store, &metadata_path, &metadata).await;
+        // Note: We intentionally don't create the actual snapshot file
+
+        let manager = build_manager_with_on_change_policy(&store, local_path, &schema);
+
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+
+        // Even with OnChange policy and None last_updated_at, snapshot should be created
+        // because metadata has snapshots but actual files don't exist
+        let result = manager
+            .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+            .await
+            .expect("create_snapshot should not error");
+
+        assert!(
+            result.is_some(),
+            "Snapshot should be force-created when metadata has snapshots but no actual files exist"
         );
     }
 

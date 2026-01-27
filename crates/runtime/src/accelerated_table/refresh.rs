@@ -41,6 +41,7 @@ use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::snapshot::ForceCreate;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -731,6 +732,7 @@ impl Refresher {
                             &self.dataset_name,
                             self.federated.schema(),
                             Arc::clone(&self.runtime_status),
+                            self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
                         ),
                     ),
@@ -790,8 +792,6 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
 
-        let runtime_status = Arc::clone(&self.runtime_status);
-
         let (snapshot_interval_task, create_checkpoint_snapshot_after_refresh) =
             match snapshot_trigger {
                 // This will only create checkpoint - default behavior when snapshots are not configured
@@ -816,10 +816,45 @@ impl Refresher {
             };
         self.snapshot_interval_task = snapshot_interval_task;
 
+        // Track whether the initial snapshot has been created (after runtime is ready)
+        let initial_snapshot_created = Arc::new(AtomicBool::new(false));
+        let bootstrap_status = self.bootstrap_status.clone();
+
         if create_checkpoint_snapshot_after_refresh && snapshot_manager.is_some() {
             tracing::info!(
                 "Snapshots for dataset {dataset_name} will be created after every refresh"
             );
+
+            // Spawn a task to create initial snapshot once runtime is ready
+            if let Some(checkpointer) = checkpointer.clone() {
+                let initial_snapshot_created_clone = Arc::clone(&initial_snapshot_created);
+                let runtime_status_clone = Arc::clone(&self.runtime_status);
+                let snapshot_manager_clone = snapshot_manager.clone();
+                let federated_schema_clone = Arc::clone(&federated_schema);
+                let accelerator_write_mutex_clone = Arc::clone(&self.accelerator_write_mutex);
+                let dataset_name_clone = dataset_name.clone();
+                let last_updated_at_clone = Arc::clone(&self.last_updated_at);
+
+                tokio::spawn(async move {
+                    runtime_status_clone.wait_for_ready().await;
+                    if !bootstrap_status.is_bootstrapped() {
+                        create_checkpoint_and_snapshot(
+                            &checkpointer,
+                            snapshot_manager_clone.as_ref(),
+                            &federated_schema_clone,
+                            &accelerator_write_mutex_clone,
+                            &dataset_name_clone,
+                            &last_updated_at_clone,
+                            ForceCreate(true),
+                        )
+                            .await;
+                    }
+                    initial_snapshot_created_clone.store(true, Ordering::Release);
+                    tracing::debug!(
+                        "Refresh-based snapshot creation for {dataset_name_clone} starting after runtime ready"
+                    );
+                });
+            }
         }
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
@@ -881,7 +916,7 @@ impl Refresher {
                                     }
                             }
 
-                            if runtime_status.is_ready() && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
+                            if initial_snapshot_created.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
                                 create_checkpoint_and_snapshot(
                                     checkpointer,
                                     snapshot_manager.as_ref(),
@@ -889,6 +924,7 @@ impl Refresher {
                                     &snapshot_mutex,
                                     &dataset_name,
                                     &last_updated_at,
+                                    ForceCreate(false),
                                 ).await;
                             }
                         }
