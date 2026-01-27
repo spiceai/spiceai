@@ -18,7 +18,7 @@ futures.workspace = true
 llms = { path = "../llms", default-features = false }
 prost.workspace = true
 reqwest.workspace = true
-rustyline = { version = "17.0.1", features = [
+rustyline = { version = "17.0.2", features = [
   "custom-bindings",
   "with-dirs",
   "with-file-history",
