@@ -91,6 +91,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
 
 mod changes;
+mod deletion;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
 
