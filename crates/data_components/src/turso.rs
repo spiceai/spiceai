@@ -385,11 +385,13 @@ fn is_now_function(func: &Function) -> bool {
 ///
 /// ```rust,ignore
 /// // Create pool once and share it
-/// let pool = Arc::new(TursoConnectionPool::new(":memory:", false).await?);
+/// let pool = Arc::new(TursoConnectionPool::new(":memory:").await?);
 ///
 /// // Use pool.connect() for each operation
 /// let conn = pool.connect().await?;
 /// ```
+///
+/// Note: MVCC is always enabled in turso 0.4.x and later.
 ///
 /// For production workloads, prefer using `TursoAccelerator::get_shared_pool()` which
 /// caches pool instances per database file for even better performance.

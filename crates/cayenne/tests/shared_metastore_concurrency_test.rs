@@ -20,10 +20,12 @@ limitations under the License.
 //! where using two Cayenne accelerations with the same metastore causes
 //! "Database is busy" errors during concurrent write operations.
 //!
-//! The bug manifests when:
+//! The bug manifested when:
 //! - Two (or more) Cayenne tables share the same metastore backend
 //! - Both tables perform write operations concurrently
-//! - The backend lacks proper connection pooling or write serialization
+//! - The shared metastore backend did not wait for write locks (no busy timeout)
+//!
+//! This was fixed by adding a busy timeout to the metastore connections.
 //!
 //! Expected behavior: Concurrent writes to different tables with a shared metastore
 //! should succeed without "Database is busy" errors.
@@ -452,10 +454,10 @@ async fn test_separate_sessions(backend: BackendType) -> TestResult<()> {
 
     result1
         .expect("insert1 task panicked")
-        .expect("insert1 failed - possible 'Database is busy' error");
+        .expect("insert1 failed - 'Database is busy' error should no longer occur");
     result2
         .expect("insert2 task panicked")
-        .expect("insert2 failed - possible 'Database is busy' error");
+        .expect("insert2 failed - 'Database is busy' error should no longer occur");
 
     // Verify data
     let verify_ctx = SessionContext::new();
@@ -554,12 +556,12 @@ async fn test_separate_catalog_instances_same_db(backend: BackendType) -> TestRe
 
     let (result1, result2) = tokio::join!(insert1, insert2);
 
-    result1
-        .expect("insert1 task panicked")
-        .expect("insert1 failed - expected 'Database is busy' error with current bug");
-    result2
-        .expect("insert2 task panicked")
-        .expect("insert2 failed - expected 'Database is busy' error with current bug");
+    result1.expect("insert1 task panicked").expect(
+        "insert1 failed - concurrent write to shared metastore should succeed without SQLITE_BUSY",
+    );
+    result2.expect("insert2 task panicked").expect(
+        "insert2 failed - concurrent write to shared metastore should succeed without SQLITE_BUSY",
+    );
 
     // Verify data
     let verify_ctx = SessionContext::new();
@@ -810,7 +812,7 @@ async fn test_highly_concurrent_inserts(backend: BackendType) -> TestResult<()> 
     }
 
     if !errors.is_empty() {
-        return Err(format!("Concurrent operations failed:\n{}", errors.join("\n")).into());
+        return Err(format!("Concurrent operations failed: {}", errors.join("; ")).into());
     }
 
     // Verify row counts
@@ -860,11 +862,13 @@ test_with_backends_multithreaded!(test_concurrent_overwrite_operations, workers 
 /// Test concurrent OVERWRITE operations which trigger the commit_compaction transaction.
 /// This directly exercises the transaction path that causes "Database is busy" in issue #8826.
 ///
-/// The bug occurs because:
+/// The bug occurred because:
 /// 1. Each table's overwrite calls commit_compaction which runs:
 ///    `BEGIN TRANSACTION; DELETE...; DELETE...; UPDATE...; COMMIT;`
-/// 2. Turso metastore has `with_mvcc(false)` and no busy timeout
-/// 3. When two concurrent transactions try to write, one gets "Database is busy"
+/// 2. The shared metastore backend did not wait for write locks (no busy timeout)
+/// 3. When two concurrent transactions tried to write, one immediately failed with "Database is busy"
+///
+/// This was fixed by adding a busy timeout to the metastore connections.
 async fn test_concurrent_overwrite_operations(backend: BackendType) -> TestResult<()> {
     let (_temp_dir, catalog1, catalog2, data_path) = create_separate_catalogs(backend).await?;
     let schema = create_test_schema();
@@ -946,12 +950,12 @@ async fn test_concurrent_overwrite_operations(backend: BackendType) -> TestResul
 
     let (result1, result2) = tokio::join!(overwrite1, overwrite2);
 
-    result1
-        .expect("overwrite1 task panicked")
-        .expect("overwrite1 failed - this is the 'Database is busy' bug from issue #8826");
-    result2
-        .expect("overwrite2 task panicked")
-        .expect("overwrite2 failed - this is the 'Database is busy' bug from issue #8826");
+    result1.expect("overwrite1 task panicked").expect(
+        "overwrite1 failed - unexpected 'Database is busy' (SQLITE_BUSY) regression of issue #8826",
+    );
+    result2.expect("overwrite2 task panicked").expect(
+        "overwrite2 failed - unexpected 'Database is busy' (SQLITE_BUSY) regression of issue #8826",
+    );
 
     // Verify each table has only the overwritten data (2 rows each)
     let count1: i64 = ctx
