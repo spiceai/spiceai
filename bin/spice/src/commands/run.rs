@@ -17,9 +17,9 @@ limitations under the License.
 //! Run command implementation - starts the Spice runtime.
 
 use crate::context::RuntimeContext;
-use crate::error::{Result, RuntimeExecutionSnafu};
+use crate::error::{ChildProcessIdSnafu, Result, RuntimeExecutionSnafu, SignalHandlerSnafu};
 use clap::Args;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use std::process::Stdio;
 
 /// Arguments for the run command.
@@ -91,7 +91,10 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
         spiced_args.push(metrics.clone());
     }
 
-    let mut cmd = ctx.get_run_cmd(&spiced_args, args.http_endpoint.as_deref())?;
+    let std_cmd = ctx.get_run_cmd(&spiced_args, args.http_endpoint.as_deref())?;
+
+    // Convert std::process::Command to tokio::process::Command
+    let mut cmd = tokio::process::Command::from(std_cmd);
 
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -99,11 +102,58 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
 
     let mut child = cmd.spawn().context(RuntimeExecutionSnafu)?;
 
-    let status = child.wait().context(RuntimeExecutionSnafu)?;
+    let status = run_with_signal_forwarding(&mut child).await?;
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
 
     Ok(())
+}
+
+/// Run the child process and forward signals (SIGTERM, SIGINT) to it.
+///
+/// On Unix systems, this listens for SIGTERM and SIGINT and forwards them
+/// to the child process so it can perform graceful shutdown.
+#[cfg(unix)]
+async fn run_with_signal_forwarding(
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus> {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let pid = child
+        .id()
+        .map(|id| Pid::from_raw(id as i32))
+        .context(ChildProcessIdSnafu)?;
+
+    let mut sigterm = signal(SignalKind::terminate()).context(SignalHandlerSnafu)?;
+    let mut sigint = signal(SignalKind::interrupt()).context(SignalHandlerSnafu)?;
+
+    tokio::select! {
+        status = child.wait() => {
+            status.context(RuntimeExecutionSnafu)
+        }
+        _ = sigterm.recv() => {
+            tracing::debug!("Received SIGTERM, forwarding to child process");
+            let _ = kill(pid, Signal::SIGTERM);
+            child.wait().await.context(RuntimeExecutionSnafu)
+        }
+        _ = sigint.recv() => {
+            tracing::debug!("Received SIGINT, forwarding to child process");
+            let _ = kill(pid, Signal::SIGINT);
+            child.wait().await.context(RuntimeExecutionSnafu)
+        }
+    }
+}
+
+/// On non-Unix systems (Windows), just wait for the child process.
+/// Windows handles Ctrl+C differently and typically propagates it to child processes
+/// in the same console automatically.
+#[cfg(not(unix))]
+async fn run_with_signal_forwarding(
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus> {
+    child.wait().await.context(RuntimeExecutionSnafu)
 }
