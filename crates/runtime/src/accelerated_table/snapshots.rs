@@ -72,7 +72,7 @@ pub fn spawn_snapshot_interval_task(
     );
 
     Some(tokio::spawn(async move {
-        // Wait for the dataset to be ready before starting snapshot creation
+        // Wait for the runtime to be ready before starting snapshot creation
         tracing::debug!(
             "Snapshot interval task for {dataset_name} waiting for runtime to be ready"
         );
@@ -152,14 +152,14 @@ pub fn create_periodic_snapshot_callback(
             let batches_processed = Arc::new(RwLock::new(0i64));
 
             // Track whether the dataset is ready (batch counting should start)
-            let dataset_ready = Arc::new(AtomicBool::new(false));
+            let runtime_ready = Arc::new(AtomicBool::new(false));
 
-            // Spawn a task to set dataset_ready when notified
-            let dataset_ready_clone = Arc::clone(&dataset_ready);
+            // Spawn a task to set runtime_ready when notified
+            let runtime_ready_clone = Arc::clone(&runtime_ready);
             let dataset_name_clone = dataset_name.clone();
             tokio::spawn(async move {
                 runtime_status.wait_for_ready().await;
-                dataset_ready_clone.store(true, Ordering::Release);
+                runtime_ready_clone.store(true, Ordering::Release);
                 tracing::debug!(
                     "Batch-based snapshot counting for {dataset_name_clone} starting after runtime ready"
                 );
@@ -172,7 +172,7 @@ pub fn create_periodic_snapshot_callback(
                 let batches_processed = Arc::clone(&batches_processed);
                 let federated_schema = Arc::<Schema>::clone(&federated_schema);
                 let dataset_name = dataset_name.clone();
-                let dataset_ready = Arc::clone(&dataset_ready);
+                let dataset_ready = Arc::clone(&runtime_ready);
                 let last_updated_at = Arc::clone(&last_updated_at);
 
                 Box::pin(async move {
