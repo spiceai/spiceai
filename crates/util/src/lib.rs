@@ -20,7 +20,6 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 
-pub mod ansi_colors;
 pub mod fibonacci_backoff;
 pub mod home_dir;
 pub mod levenshtein;
