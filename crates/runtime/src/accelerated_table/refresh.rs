@@ -816,8 +816,10 @@ impl Refresher {
             };
         self.snapshot_interval_task = snapshot_interval_task;
 
-        // Track whether the initial snapshot has been created (after runtime is ready)
-        let initial_snapshot_created = Arc::new(AtomicBool::new(false));
+        // Gates when checkpoint counting/creation can start after runtime is ready.
+        // Set to true immediately when snapshots are not configured, or after the initial
+        // snapshot task completes (regardless of success) when snapshots are configured.
+        let checkpoint_counting_enabled = Arc::new(AtomicBool::new(snapshot_manager.is_none()));
         let bootstrap_status = self.bootstrap_status.clone();
 
         if create_checkpoint_snapshot_after_refresh && snapshot_manager.is_some() {
@@ -827,7 +829,7 @@ impl Refresher {
 
             // Spawn a task to create initial snapshot once runtime is ready
             if let Some(checkpointer) = checkpointer.clone() {
-                let initial_snapshot_created_clone = Arc::clone(&initial_snapshot_created);
+                let checkpoint_counting_enabled_clone = Arc::clone(&checkpoint_counting_enabled);
                 let runtime_status_clone = Arc::clone(&self.runtime_status);
                 let snapshot_manager_clone = snapshot_manager.clone();
                 let federated_schema_clone = Arc::clone(&federated_schema);
@@ -849,7 +851,7 @@ impl Refresher {
                         )
                         .await;
                     }
-                    initial_snapshot_created_clone.store(true, Ordering::Release);
+                    checkpoint_counting_enabled_clone.store(true, Ordering::Release);
                     tracing::debug!(
                         "Refresh-based snapshot creation for {dataset_name_clone} starting after runtime ready"
                     );
@@ -916,7 +918,7 @@ impl Refresher {
                                     }
                             }
 
-                            if initial_snapshot_created.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
+                            if checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
                                 create_checkpoint_and_snapshot(
                                     checkpointer,
                                     snapshot_manager.as_ref(),

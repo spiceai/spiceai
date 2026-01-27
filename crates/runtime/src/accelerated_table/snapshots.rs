@@ -138,11 +138,12 @@ pub fn create_periodic_snapshot_callback(
             // Track number of processed batches since last snapshot
             let batches_processed = Arc::new(RwLock::new(0i64));
 
-            // Track whether the dataset is ready (batch counting should start)
-            let initial_snapshot_created = Arc::new(AtomicBool::new(false));
+            // Gates when checkpoint counting can start after runtime is ready.
+            // Set to true after the initial snapshot task completes (regardless of success).
+            let checkpoint_counting_enabled = Arc::new(AtomicBool::new(false));
 
             // Spawn a task to create initial snapshot once runtime is ready
-            let initial_snapshot_created_clone = Arc::clone(&initial_snapshot_created);
+            let checkpoint_counting_enabled_clone = Arc::clone(&checkpoint_counting_enabled);
             let dataset_name_clone = dataset_name.clone();
             let last_updated_at_clone = Arc::clone(&last_updated_at);
             let checkpointer_clone = Arc::clone(&checkpointer);
@@ -163,7 +164,7 @@ pub fn create_periodic_snapshot_callback(
                     )
                     .await;
                 }
-                initial_snapshot_created_clone.store(true, Ordering::Release);
+                checkpoint_counting_enabled_clone.store(true, Ordering::Release);
                 tracing::debug!(
                     "Batch-based snapshot counting for {dataset_name_clone} starting after runtime ready"
                 );
@@ -176,14 +177,14 @@ pub fn create_periodic_snapshot_callback(
                 let batches_processed = Arc::clone(&batches_processed);
                 let federated_schema = Arc::<Schema>::clone(&federated_schema);
                 let dataset_name = dataset_name.clone();
-                let initial_snapshot_created = Arc::clone(&initial_snapshot_created);
+                let checkpoint_counting_enabled = Arc::clone(&checkpoint_counting_enabled);
                 let last_updated_at = Arc::clone(&last_updated_at);
 
                 Box::pin(async move {
                     let mut batches_processed_value = batches_processed.write().await;
 
-                    // Only count batches after the initial snapshot is created
-                    if !initial_snapshot_created.load(Ordering::Acquire) {
+                    // Only count batches after checkpoint counting is enabled
+                    if !checkpoint_counting_enabled.load(Ordering::Acquire) {
                         return;
                     }
 
