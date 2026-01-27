@@ -91,9 +91,16 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
             let view = ViewBuilder::try_from(view_copy).expect("to parse view")
                 .build_with(Arc::clone(&rt), Arc::new(app_copy));
 
-            // Ensure Checkpoint is created after initial view load
+            // Ensure Checkpoint is created after initial view load (poll since checkpoint creation is async)
             let checkpoint = DatasetCheckpoint::try_new(&view, OpenOption::OpenExisting).await.expect("Failed to create view checkpoint");
-            assert!(checkpoint.exists().await, "Checkpoint does not exist");
+            let checkpoint_timeout = std::time::Duration::from_secs(30);
+            let checkpoint_start = std::time::Instant::now();
+            while !checkpoint.exists().await {
+                if checkpoint_start.elapsed() > checkpoint_timeout {
+                    return Err(anyhow::anyhow!("Timed out waiting for checkpoint to exist"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             let last_checkpoint_time = checkpoint
                 .last_checkpoint_time()
                 .await

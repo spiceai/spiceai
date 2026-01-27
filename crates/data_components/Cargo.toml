@@ -58,7 +58,7 @@ graphql-parser.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http.workspace = true
 httpdate.workspace = true
-iceberg.workspace = true
+iceberg = { workspace = true, features = ["storage-gcs", "storage-s3"] }
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }

@@ -9,23 +9,24 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ansi_colors = { path = "../ansi_colors" }
+arrow = { workspace = true, features = ["chrono-tz"] }
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-json.workspace = true
 clap.workspace = true
-datafusion.workspace = true
 flight_client = { path = "../flight_client" }
 futures.workspace = true
-llms = { path = "../llms", default-features = false }
 prost.workspace = true
 reqwest.workspace = true
-rustyline = { version = "17.0.1", features = [
+rustyline = { version = "17.0.2", features = [
   "custom-bindings",
   "with-dirs",
   "with-file-history",
   "derive",
 ] }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 tonic = { workspace = true, features = [
   "transport",
   "tls-ring",

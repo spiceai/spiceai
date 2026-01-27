@@ -233,13 +233,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
-name = "ansi_term"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d52a9bb7ec0cf484c551830a7ce27bd20d67eac647e1befb56b0be4ee39a55d2"
-dependencies = [
- "winapi",
-]
+name = "ansi_colors"
+version = "1.11.0-unstable"
 
 [[package]]
 name = "anstream"
@@ -2046,9 +2041,9 @@ dependencies = [
 
 [[package]]
 name = "azure_core"
-version = "0.30.1"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f35444aeeb91e29ca82d04dbb8ad904570f837c82093454dc1989c64a33554a7"
+checksum = "dfe45c6bd7ce3a592327ee4e35b5bd16681714c4443c8a9884abb5731cc4d833"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -2066,9 +2061,9 @@ dependencies = [
 
 [[package]]
 name = "azure_core_macros"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94f7cc1bbae04cfe11de9e39e2c6dc755947901e0f4e76180ab542b6deb5e15e"
+checksum = "190d6e0622d17e2a28239b55d2829d98b348269adcd4ab86a21d3304aa3500cb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2175,7 +2170,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "51.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=626181fbc04a6f964abc459f99f62cf7742f75b4#626181fbc04a6f964abc459f99f62cf7742f75b4"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=2abc199e4b23f0881a4520e2749412dd35514050#2abc199e4b23f0881a4520e2749412dd35514050"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2216,7 +2211,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "51.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=626181fbc04a6f964abc459f99f62cf7742f75b4#626181fbc04a6f964abc459f99f62cf7742f75b4"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=2abc199e4b23f0881a4520e2749412dd35514050#2abc199e4b23f0881a4520e2749412dd35514050"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2249,7 +2244,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "51.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=626181fbc04a6f964abc459f99f62cf7742f75b4#626181fbc04a6f964abc459f99f62cf7742f75b4"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=2abc199e4b23f0881a4520e2749412dd35514050#2abc199e4b23f0881a4520e2749412dd35514050"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -6758,18 +6753,19 @@ dependencies = [
 name = "flightrepl"
 version = "1.11.0"
 dependencies = [
+ "ansi_colors",
+ "arrow",
  "arrow-flight",
  "arrow-json",
  "clap 4.5.54",
- "datafusion",
  "flight_client",
  "futures",
  "insta",
- "llms",
  "prost 0.14.3",
  "regex",
  "reqwest",
- "rustyline 17.0.2",
+ "rustyline",
+ "serde",
  "serde_json",
  "tokio",
  "tonic",
@@ -8317,7 +8313,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -12632,9 +12628,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25868971b9e1fe9c01ada277e85239f83a69986c300f06965deeb4ec871eb786"
 dependencies = [
  "arrayvec",
- "hashbrown 0.5.0",
- "parking_lot 0.11.2",
- "rand 0.7.3",
+ "hashbrown 0.16.1",
+ "parking_lot 0.12.5",
+ "rand 0.9.2",
 ]
 
 [[package]]
@@ -13142,8 +13138,8 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.10.5",
+ "heck 0.5.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -13177,7 +13173,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
@@ -13772,9 +13768,9 @@ dependencies = [
 
 [[package]]
 name = "rdkafka"
-version = "0.38.0"
+version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f1856d72dbbbea0d2a5b2eaf6af7fb3847ef2746e883b11781446a51dbc85c0"
+checksum = "d7956f9ac12b5712e50372d9749a3102f4810a8d42481c5eae3748d36d585bcf"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -13997,11 +13993,13 @@ dependencies = [
  "hmac 0.12.1",
  "home",
  "http 1.4.0",
+ "jsonwebtoken",
  "log",
  "percent-encoding",
  "quick-xml 0.37.5",
  "rand 0.8.5",
  "reqwest",
+ "rsa 0.9.10",
  "rust-ini",
  "serde",
  "serde_json",
@@ -14260,6 +14258,7 @@ dependencies = [
  "pkcs1 0.7.5",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
+ "sha2 0.10.9",
  "signature 2.2.0",
  "spki 0.7.3",
  "subtle",
@@ -14384,7 +14383,7 @@ dependencies = [
  "aws-sdk-sts",
  "axum",
  "axum-extra",
- "azure_core 0.30.1",
+ "azure_core 0.31.0",
  "azure_storage",
  "azure_storage_blobs",
  "ballista-core",
@@ -16412,9 +16411,9 @@ dependencies = [
 
 [[package]]
 name = "spice"
-version = "1.11.0"
+version = "1.11.0-unstable"
 dependencies = [
- "ansi_term",
+ "ansi_colors",
  "assert_cmd",
  "chrono",
  "clap 4.5.54",
@@ -16432,7 +16431,8 @@ dependencies = [
  "rand 0.9.2",
  "rcgen",
  "reqwest",
- "rustyline 15.0.0",
+ "rstest 0.26.1",
+ "rustyline",
  "semver",
  "serde",
  "serde_json",
@@ -18896,9 +18896,9 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
 name = "typespec"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44f91ea93fdd5fd4985fcc0a197ed8e8da18705912bef63c9b9b3148d6f35510"
+checksum = "4dd1eb4a538c1ab3d5c05437129bc16891296146b23c9b0bb3f5df99f5b3a18d"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -18910,9 +18910,9 @@ dependencies = [
 
 [[package]]
 name = "typespec_client_core"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a0f6f7345c3389663551a64fc4dca78fa9689ece758c5ca76e82d6da69349dc"
+checksum = "e632235c99ae896a3c451d1ead00cea11a2219aeda1b35a74027fe99ea3f3b72"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -18935,9 +18935,9 @@ dependencies = [
 
 [[package]]
 name = "typespec_macros"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ecee5b05c459ea4cd97df7685db58699c32e070465f88dc806d7c98a5088edc"
+checksum = "7048df3b053daa72e8ea91894ebcb2f0511ba52737379834524d82074a94a458"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -20554,7 +20554,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
