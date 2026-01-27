@@ -16,7 +16,10 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
+use crate::component::dataset::acceleration::Engine;
 use crate::dataaccelerator::BootstrapStatus;
+#[cfg(not(windows))]
+use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
@@ -30,7 +33,7 @@ use runtime_acceleration::{
     dataset_checkpoint::make_checkpointer_factory,
     snapshot::{SnapshotBehavior, SnapshotManager, metrics},
 };
-use snafu::ResultExt;
+use snafu::{ResultExt, Snafu};
 
 /// Downloads a snapshot if needed for bootstrapping.
 /// Returns `BootstrapStatus`::`Bootstrapped` if a snapshot was successfully downloaded.
@@ -145,4 +148,97 @@ pub(crate) async fn validate_snapshot_paths(sources: Vec<Arc<dyn AccelerationSou
             path.display()
         );
     }
+}
+
+#[derive(Debug, Snafu)]
+pub enum CayenneSnapshotValidationError {
+    #[snafu(display(
+        "Cayenne datasets sharing metadata directory '{metadata_dir}' have inconsistent snapshot settings. \
+        Datasets with snapshots enabled: [{enabled_datasets}]. Datasets with snapshots disabled: [{disabled_datasets}]. \
+        All Cayenne datasets sharing the same metadata directory must have the same snapshot \
+        configuration (either all enabled or all disabled). \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
+    ))]
+    InconsistentSnapshotSettings {
+        metadata_dir: String,
+        enabled_datasets: String,
+        disabled_datasets: String,
+    },
+}
+
+/// Validates that all Cayenne datasets sharing the same metadata directory have consistent
+/// snapshot settings (either all enabled or all disabled).
+///
+/// This validation is necessary because Cayenne uses a shared `SQLite` metadata catalog for
+/// all datasets in the same metadata directory. When snapshots are enabled, the metadata
+/// database must be included in the snapshot archive. To ensure consistency and avoid
+/// conflicts during snapshot restoration, all datasets sharing the metadata directory
+/// must have the same snapshot configuration.
+///
+/// Returns `Ok(())` if the configuration is valid, or an error describing which datasets
+/// have mismatched settings.
+#[cfg(not(windows))]
+pub fn validate_cayenne_snapshot_consistency(
+    sources: &[Arc<dyn AccelerationSource>],
+) -> Result<(), CayenneSnapshotValidationError> {
+    // Group Cayenne datasets by their resolved metadata directory
+    let mut metadata_dir_groups: HashMap<String, Vec<(String, bool)>> = HashMap::new();
+
+    for source in sources {
+        let Some(acceleration) = source.acceleration() else {
+            continue;
+        };
+
+        // Only check Cayenne datasets
+        if acceleration.engine != Engine::Cayenne {
+            continue;
+        }
+
+        let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
+        let snapshots_enabled =
+            !matches!(acceleration.snapshot_behavior, SnapshotBehavior::Disabled);
+        let dataset_name = source.name().to_string();
+
+        metadata_dir_groups
+            .entry(metadata_dir)
+            .or_default()
+            .push((dataset_name, snapshots_enabled));
+    }
+
+    // Check each group for consistency
+    for (metadata_dir, datasets) in metadata_dir_groups {
+        if datasets.len() <= 1 {
+            continue; // Single dataset, no conflict possible
+        }
+
+        let enabled: Vec<&str> = datasets
+            .iter()
+            .filter_map(|(name, enabled)| if *enabled { Some(name.as_str()) } else { None })
+            .collect();
+        let disabled: Vec<&str> = datasets
+            .iter()
+            .filter_map(|(name, enabled)| if *enabled { None } else { Some(name.as_str()) })
+            .collect();
+
+        // If we have both enabled and disabled datasets, that's an error
+        if !enabled.is_empty() && !disabled.is_empty() {
+            return Err(
+                CayenneSnapshotValidationError::InconsistentSnapshotSettings {
+                    metadata_dir,
+                    enabled_datasets: enabled.join(", "),
+                    disabled_datasets: disabled.join(", "),
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// No-op validation on Windows where Cayenne is not supported.
+#[cfg(windows)]
+pub fn validate_cayenne_snapshot_consistency(
+    _sources: &[Arc<dyn AccelerationSource>],
+) -> Result<(), CayenneSnapshotValidationError> {
+    Ok(())
 }
