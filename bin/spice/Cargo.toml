@@ -71,6 +71,9 @@ comfy-table = "7"
 # Line editor for REPL
 rustyline = "17"
 
+# Interactive CLI prompts (arrow-key selection)
+dialoguer = "0.11"
+
 # Random number generation (for auth codes)
 rand = "0.9"
 

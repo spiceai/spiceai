@@ -17,8 +17,12 @@ limitations under the License.
 //! `spice chat` command - Chat with an LLM.
 
 use crate::context::RuntimeContext;
-use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, Result};
+use crate::error::{
+    ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
+    Result,
+};
 use clap::Args;
+use dialoguer::{Select, theme::ColorfulTheme};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
@@ -147,51 +151,27 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
 async fn select_model(ctx: &RuntimeContext) -> Result<String> {
     let models = get_available_models(ctx).await?;
 
-    if models.is_empty() {
-        return Err(InvalidResponseSnafu {
-            message: "No models found. Please configure a model in your Spicepod.".to_string(),
-        }
-        .build());
-    }
+    snafu::ensure!(!models.is_empty(), NoModelsConfiguredSnafu);
 
     // If only one model, use it
     if models.len() == 1 {
         return Ok(models[0].clone());
     }
 
-    // Let user select
-    println!("\nAvailable models:");
-    for (i, model) in models.iter().enumerate() {
-        println!("  {}: {model}", i + 1);
-    }
+    // Let user select with arrow keys
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select model")
+        .items(&models)
+        .default(0)
+        .interact()
+        .map_err(|e| {
+            InvalidResponseSnafu {
+                message: format!("Failed to read selection: {e}"),
+            }
+            .build()
+        })?;
 
-    print!("Select model (1-{}): ", models.len());
-    let _ = io::stdout().flush();
-
-    let stdin = io::stdin();
-    let mut input = String::new();
-    stdin.lock().read_line(&mut input).map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to read input: {e}"),
-        }
-        .build()
-    })?;
-
-    let selection: usize = input.trim().parse().map_err(|_| {
-        InvalidResponseSnafu {
-            message: "Invalid selection".to_string(),
-        }
-        .build()
-    })?;
-
-    if selection == 0 || selection > models.len() {
-        return Err(InvalidResponseSnafu {
-            message: format!("Selection must be between 1 and {}", models.len()),
-        }
-        .build());
-    }
-
-    Ok(models[selection - 1].clone())
+    Ok(models[selection].clone())
 }
 
 /// Validate that a model exists.

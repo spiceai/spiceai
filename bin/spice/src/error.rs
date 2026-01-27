@@ -105,4 +105,8 @@ pub enum Error {
     /// Model not found
     #[snafu(display("Model '{model}' not found. Available models: {available}"))]
     ModelNotFound { model: String, available: String },
+
+    /// No models configured
+    #[snafu(display("No models found. Please configure a model in your Spicepod."))]
+    NoModelsConfigured,
 }
