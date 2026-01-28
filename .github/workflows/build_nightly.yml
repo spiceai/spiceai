@@ -1,4 +1,4 @@
-name: spiced_docker_nightly
+name: build_nightly
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the Docker images to the registry
+        description: Publish the Docker images and CLI binaries
         required: false
         type: boolean
         default: false
@@ -19,6 +19,14 @@ on:
           - 'release'
           - 'release-lto'
         default: 'release'
+
+env:
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   check_commits:
@@ -76,7 +84,227 @@ jobs:
           echo "nightly_label=${nightly_label}" >> $GITHUB_OUTPUT
           echo "Preparing to publish nightly build with version: \"${version}\""
 
-  build-arm64:
+  # ==================== CLI BUILD JOBS ====================
+
+  build-cli-linux-x64:
+    name: Build CLI - Linux x64
+    needs: [check_commits, setup]
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: spiceai-dev-runners
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Add nightly postfix to version in Cargo.toml
+        env:
+          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$NIGHTLY_LABEL"
+          else
+            new_version="${current_version}-$NIGHTLY_LABEL"
+          fi
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+        with:
+          os: linux
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build spiced and spice CLI
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+
+      - name: tar spiced binary
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_linux_x86_64.tar.gz spiced
+
+      - name: tar spice CLI binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar czf spice_linux_x86_64.tar.gz spice
+
+      - name: Print versions
+        run: |
+          ./spiced --version
+          ./spice version
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: spiced_linux_x86_64
+          path: spiced_linux_x86_64.tar.gz
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: spice_linux_x86_64
+          path: spice_linux_x86_64.tar.gz
+
+  build-cli-linux-arm64:
+    name: Build CLI - Linux aarch64
+    needs: [check_commits, setup]
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: hosted-linux-arm-runner
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Add nightly postfix to version in Cargo.toml
+        env:
+          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$NIGHTLY_LABEL"
+          else
+            new_version="${current_version}-$NIGHTLY_LABEL"
+          fi
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Install missing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libssl-dev pkg-config cmake unzip -y
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build spiced and spice CLI
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+
+      - name: tar spiced binary
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_linux_aarch64.tar.gz spiced
+
+      - name: tar spice CLI binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar czf spice_linux_aarch64.tar.gz spice
+
+      - name: Print versions
+        run: |
+          ./spiced --version
+          ./spice version
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: spiced_linux_aarch64
+          path: spiced_linux_aarch64.tar.gz
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: spice_linux_aarch64
+          path: spice_linux_aarch64.tar.gz
+
+  build-cli-macos-arm64:
+    name: Build CLI - macOS aarch64
+    needs: [check_commits, setup]
+    if: needs.check_commits.outputs.has_new_commits == 'true'
+
+    runs-on: spiceai-macos
+    env:
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Add nightly postfix to version in Cargo.toml
+        env:
+          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$NIGHTLY_LABEL"
+          else
+            new_version="${current_version}-$NIGHTLY_LABEL"
+          fi
+          sed -i '' "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Install missing tools
+        run: |
+          brew update
+          brew list cmake || brew install cmake
+          brew install unixodbc
+          echo "RUSTFLAGS=-L /opt/homebrew/lib" >> $GITHUB_ENV
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build spiced and spice CLI
+        working-directory: bin/spiced
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+
+      - name: tar spiced binary
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar czf spiced_darwin_aarch64.tar.gz spiced
+
+      - name: tar spice CLI binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar czf spice_darwin_aarch64.tar.gz spice
+
+      - name: Print versions
+        run: |
+          ./spiced --version
+          ./spice version
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: spiced_darwin_aarch64
+          path: spiced_darwin_aarch64.tar.gz
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: spice_darwin_aarch64
+          path: spice_darwin_aarch64.tar.gz
+
+  # ==================== DOCKER IMAGE BUILD JOBS ====================
+
+  build-docker-arm64:
+    name: Build Docker - ARM64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
@@ -175,7 +403,8 @@ jobs:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
 
-  build-amd64:
+  build-docker-amd64:
+    name: Build Docker - AMD64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
@@ -256,13 +485,20 @@ jobs:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
 
-  publish:
-    needs: [check_commits, setup, build-amd64, build-arm64]
+  publish-docker:
+    name: Publish Docker Images
+    needs: [check_commits, setup, build-docker-amd64, build-docker-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
     runs-on: ubuntu-22.04
+
     steps:
-      - name: Download all artifacts
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          fetch-depth: 0
+
+      # Download Docker image artifacts
+      - name: Download Docker image artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           path: /tmp
@@ -271,6 +507,7 @@ jobs:
 
       - name: Verify artifacts
         run: |
+          echo "Docker images:"
           ls -l /tmp
 
       - name: Set up Docker Buildx
@@ -338,13 +575,7 @@ jobs:
             fi
           done
 
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: github.event_name == 'schedule' || inputs.publish
-        with:
-          fetch-depth: 0
-
       - name: Update nightly tag
-        if: github.event_name == 'schedule' || inputs.publish
         run: |
           git tag -f nightly
           git push origin nightly --force
