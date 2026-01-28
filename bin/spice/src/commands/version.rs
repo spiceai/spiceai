@@ -39,8 +39,12 @@ pub struct VersionArgs {
 #[must_use]
 pub fn cli_version() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    let git_hash = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
-    format!("v{version} ({git_hash})")
+    if cfg!(feature = "release") {
+        format!("v{version}")
+    } else {
+        let git_hash = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
+        format!("v{version} ({git_hash})")
+    }
 }
 
 /// Get just the semver version (e.g., "v1.2.3").
