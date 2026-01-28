@@ -15,13 +15,13 @@ use crate::status::RuntimeStatus;
 use arrow_schema::Schema;
 use datafusion::common::TableReference;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
-use runtime_acceleration::snapshot::{SnapshotManager, metrics as snapshot_metrics};
+use runtime_acceleration::snapshot::{ForceCreate, SnapshotManager, metrics as snapshot_metrics};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use tokio::time::{interval, sleep};
+use tokio::time::interval;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotCreationConfig {
@@ -72,43 +72,11 @@ pub fn spawn_snapshot_interval_task(
     );
 
     Some(tokio::spawn(async move {
-        // Wait for the dataset to be ready before starting snapshot creation
-        tracing::debug!(
-            "Snapshot interval task for {dataset_name} waiting for dataset to be ready"
-        );
-        // Wait for the dataset to become ready
-        runtime_status.wait_for_dataset_ready(&dataset_name).await;
-        tracing::debug!("Snapshot interval task for {dataset_name} starting after dataset ready");
+        // Wait for the runtime to become ready
+        runtime_status.wait_for_ready().await;
 
-        // Determine initial delay based on bootstrapping status and checkpoint time
-        let initial_delay = if bootstrap_status.is_bootstrapped() {
-            // If dataset was bootstrapped, create a snapshot after the full interval after dataset is ready
-            let mut delay = interval_duration;
-            if let Ok(Some(last_checkpoint_time)) = checkpointer.last_checkpoint_time().await
-                && let Ok(elapsed) = SystemTime::now().duration_since(last_checkpoint_time)
-            {
-                // Calculate delay based on last checkpoint time
-                if elapsed < interval_duration {
-                    delay = interval_duration - elapsed;
-                } else {
-                    delay = Duration::from_secs(0);
-                }
-            }
-            delay
-        } else {
-            // When no bootstrapping, create a snapshot immediately after dataset is ready
-            Duration::from_secs(0)
-        };
-
-        if !initial_delay.is_zero() {
-            sleep(initial_delay).await;
-        }
-
-        let mut ticker = interval(interval_duration);
-        // Consume the first tick which returns immediately per tokio::time::interval behavior
-        ticker.tick().await;
-
-        loop {
+        if !bootstrap_status.is_bootstrapped() {
+            // Force create initial snapshot immediately after runtime is ready unless it was bootstrapped
             create_checkpoint_and_snapshot(
                 &checkpointer,
                 Some(&snapshot_manager),
@@ -116,11 +84,29 @@ pub fn spawn_snapshot_interval_task(
                 &accelerator_write_mutex,
                 &dataset_name,
                 &last_updated_at,
+                ForceCreate(true),
             )
             .await;
+        }
 
-            // Wait for the next snapshot interval (accounting for time spent during snapshot creation)
+        let mut ticker = interval(interval_duration);
+        // Consume the first tick which returns immediately per tokio::time::interval behavior
+        ticker.tick().await;
+
+        loop {
+            // Wait for the next snapshot interval (accounting for time spent during previous snapshot creation)
             ticker.tick().await;
+
+            create_checkpoint_and_snapshot(
+                &checkpointer,
+                Some(&snapshot_manager),
+                &federated_schema,
+                &accelerator_write_mutex,
+                &dataset_name,
+                &last_updated_at,
+                ForceCreate(false),
+            )
+            .await;
         }
     }))
 }
@@ -138,6 +124,7 @@ pub fn create_periodic_snapshot_callback(
     dataset_name: &TableReference,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
+    bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
@@ -151,19 +138,35 @@ pub fn create_periodic_snapshot_callback(
             // Track number of processed batches since last snapshot
             let batches_processed = Arc::new(RwLock::new(0i64));
 
-            // Track whether the dataset is ready (batch counting should start)
-            let dataset_ready = Arc::new(AtomicBool::new(false));
+            // Gates when checkpoint counting can start after runtime is ready.
+            // Set to true after the initial snapshot task completes (regardless of success).
+            let checkpoint_counting_enabled = Arc::new(AtomicBool::new(false));
 
-            // Spawn a task to set dataset_ready when notified
-            let dataset_ready_clone = Arc::clone(&dataset_ready);
+            // Spawn a task to create initial snapshot once runtime is ready
+            let checkpoint_counting_enabled_clone = Arc::clone(&checkpoint_counting_enabled);
             let dataset_name_clone = dataset_name.clone();
+            let last_updated_at_clone = Arc::clone(&last_updated_at);
+            let checkpointer_clone = Arc::clone(&checkpointer);
+            let snapshot_manager_clone = Arc::clone(&snapshot_manager);
+            let federated_schema_clone = Arc::clone(&federated_schema);
+            let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
             tokio::spawn(async move {
-                runtime_status
-                    .wait_for_dataset_ready(&dataset_name_clone)
+                runtime_status.wait_for_ready().await;
+                if !bootstrap_status.is_bootstrapped() {
+                    create_checkpoint_and_snapshot(
+                        &checkpointer_clone,
+                        Some(&snapshot_manager_clone),
+                        &federated_schema_clone,
+                        &accelerator_write_mutex_clone,
+                        &dataset_name_clone,
+                        &last_updated_at_clone,
+                        ForceCreate(true),
+                    )
                     .await;
-                dataset_ready_clone.store(true, Ordering::Release);
+                }
+                checkpoint_counting_enabled_clone.store(true, Ordering::Release);
                 tracing::debug!(
-                    "Batch-based snapshot counting for {dataset_name_clone} starting after dataset ready"
+                    "Batch-based snapshot counting for {dataset_name_clone} starting after runtime ready"
                 );
             });
 
@@ -174,16 +177,16 @@ pub fn create_periodic_snapshot_callback(
                 let batches_processed = Arc::clone(&batches_processed);
                 let federated_schema = Arc::<Schema>::clone(&federated_schema);
                 let dataset_name = dataset_name.clone();
-                let dataset_ready = Arc::clone(&dataset_ready);
+                let checkpoint_counting_enabled = Arc::clone(&checkpoint_counting_enabled);
                 let last_updated_at = Arc::clone(&last_updated_at);
 
                 Box::pin(async move {
-                    // Only count batches after the dataset is ready
-                    if !dataset_ready.load(Ordering::Acquire) {
+                    let mut batches_processed_value = batches_processed.write().await;
+
+                    // Only count batches after checkpoint counting is enabled
+                    if !checkpoint_counting_enabled.load(Ordering::Acquire) {
                         return;
                     }
-
-                    let mut batches_processed_value = batches_processed.write().await;
 
                     *batches_processed_value += 1;
                     if *batches_processed_value >= batches {
@@ -196,6 +199,7 @@ pub fn create_periodic_snapshot_callback(
                             &accelerator_write_mutex,
                             &dataset_name,
                             &last_updated_at,
+                            ForceCreate(false),
                         )
                         .await;
                     }
@@ -216,6 +220,7 @@ pub async fn create_checkpoint_and_snapshot(
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
     last_updated_at: &Arc<AtomicI64>,
+    force_create: ForceCreate,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     if let Err(e) = checkpointer.checkpoint(federated_schema).await {
@@ -230,7 +235,7 @@ pub async fn create_checkpoint_and_snapshot(
         };
 
         match snapshot_manager
-            .create_snapshot(federated_schema, lock_guard, updated_at)
+            .create_snapshot(federated_schema, lock_guard, updated_at, force_create)
             .await
         {
             Ok(Some(_)) => {

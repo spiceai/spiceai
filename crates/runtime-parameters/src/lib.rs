@@ -23,12 +23,13 @@ use tokio::sync::RwLock;
 
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const AWS_PREFIXED_FRAGMENT_PARAMS: &[(&str, &str); 5] = &[
+const AWS_PREFIXED_FRAGMENT_PARAMS: &[(&str, &str); 6] = &[
     ("aws_access_key_id", "key"),
     ("aws_secret_access_key", "secret"),
     ("aws_region", "region"),
     ("aws_session_token", "session_token"),
     ("aws_endpoint", "endpoint"),
+    ("aws_allow_http", "allow_http"),
 ];
 
 /// Maps Azure-prefixed parameter names (used by Delta Lake and other connectors)
