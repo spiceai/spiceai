@@ -551,6 +551,7 @@ pub(crate) async fn run_search(
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             let client = spiceai::ClientBuilder::new()
                 .flight_url(format!("http://{}", api_config.flight_bind_address).as_str())
+                .http_url(http_base_url.as_str())
                 .build()
                 .await
                 .unwrap_or_else(|_| {
