@@ -33,6 +33,7 @@ limitations under the License.
 
 use anyhow::Context;
 use app::{App, AppBuilder};
+use futures::TryStreamExt;
 use http::{
     HeaderValue,
     header::{ACCEPT, CONTENT_TYPE},
@@ -609,12 +610,9 @@ pub(crate) async fn run_search(
                         // This is okay to fail. Some times SQL plans cannot be prepared (e.g. FTS on a vector index).
                         // Do not return error, but make a snapshot to ensure if this changes in future, we can track it.
                         let mut disp =
-                            if let Ok(c) = client.query(format!("EXPLAIN {sql}").as_str()).await {
-                                match async {
-                                    c.wait().await?;
-                                    c.results().await
-                                }.await {
-                                    Ok(z) => arrow::util::pretty::pretty_format_batches(&z)?.to_string(),
+                            if let Ok(stream) = client.sql(format!("EXPLAIN {sql}").as_str()).await {
+                                match stream.try_collect::<Vec<arrow::record_batch::RecordBatch>>().await {
+                                    Ok(c) => arrow::util::pretty::pretty_format_batches(&c)?.to_string(),
                                     Err(e) => format!("Could not prepare EXPLAIN plan: {e}")
                                 }
                             } else {
