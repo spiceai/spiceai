@@ -369,3 +369,132 @@ async fn test_many_consecutive_upsert_cycles_impl(fixture: TestFixture) -> TestR
 }
 
 test_with_backends!(test_many_consecutive_upsert_cycles_impl);
+
+// =============================================================================
+// Test: New key in protected snapshot must be detected as conflict in next insert
+// =============================================================================
+//
+// When pending deletions exist from a prior upsert, new data is written to a
+// "protected snapshot" rather than the main listing table. Subsequent inserts
+// must detect keys from protected snapshots as conflicts to prevent duplicates.
+//
+// Scenario:
+// 1. Initial: PKs 0,1,2 loaded to main listing table
+// 2. Refresh 1: upsert PK 2 + insert NEW PK 3
+//    - PK 2 triggers upsert → creates pending deletion
+//    - PK 3 is new → written to protected snapshot (because pending deletion exists)
+// 3. Refresh 2: insert PK 3 again + NEW PK 4
+//    - PK 3 already exists in protected snapshot from step 2
+//    - Conflict detection must find PK 3 in protected snapshot
+//    - PK 3 should be upserted (not duplicated)
+//
+// Expected: After step 3, table should have exactly 5 unique PKs (0,1,2,3,4)
+// with PK 3 containing the value from step 3 (131, not 130).
+
+async fn test_new_key_in_protected_snapshot_detected_as_conflict_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let (table, ctx, schema) = setup_upsert_table(&fixture, "protected_conflict").await?;
+
+    // Step 1: Initial insert - PKs 0, 1, 2
+    let batch1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2])),
+            Arc::new(StringArray::from(vec!["r0", "r1", "r2"])),
+            Arc::new(Int64Array::from(vec![100, 110, 120])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_700_000_000_000_000_i64,
+                1_700_000_000_000_000_i64,
+                1_700_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch1).await?;
+    assert_eq!(
+        get_row_count(&ctx, "protected_conflict").await?,
+        3,
+        "After step 1: should have 3 rows (PKs 0,1,2)"
+    );
+
+    // Step 2: Upsert PK 2 + insert NEW PK 3
+    // - PK 2 triggers upsert → creates pending deletion
+    // - PK 3 is NEW → written to protected snapshot (because pending deletion exists)
+    let batch2 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2, 3])),
+            Arc::new(StringArray::from(vec!["r2_v1", "r3_v1"])),
+            Arc::new(Int64Array::from(vec![121, 130])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_705_000_000_000_000_i64,
+                1_705_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch2).await?;
+    assert_eq!(
+        get_row_count(&ctx, "protected_conflict").await?,
+        4,
+        "After step 2: should have 4 rows (PKs 0,1,2,3)"
+    );
+
+    // Step 3: Insert PK 3 again + NEW PK 4
+    // - PK 3 already exists in protected snapshot from step 2
+    // - Conflict detection must include protected snapshots
+    // - PK 3 should be upserted, not inserted as duplicate
+    let batch3 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![3, 4])),
+            Arc::new(StringArray::from(vec!["r3_v2", "r4_v1"])),
+            Arc::new(Int64Array::from(vec![131, 140])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_710_000_000_000_000_i64,
+                1_710_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch3).await?;
+
+    // CRITICAL ASSERTION: Should have 5 rows, not 6 (PK 3 must be upserted, not duplicated)
+    let count = get_row_count(&ctx, "protected_conflict").await?;
+    assert_eq!(
+        count, 5,
+        "After step 3: should have 5 rows (PKs 0,1,2,3,4), got {count}"
+    );
+
+    // Verify no duplicate PKs
+    let ids = get_ids(&ctx, "protected_conflict").await?;
+    assert_eq!(
+        ids,
+        vec![0, 1, 2, 3, 4],
+        "Should have unique PKs 0-4, but got duplicates: {ids:?}"
+    );
+
+    // Verify PK 3 has the latest value (131 from step 3)
+    let df = ctx
+        .sql("SELECT id, value FROM protected_conflict WHERE id = 3")
+        .await?;
+    let results = df.collect().await?;
+    assert_eq!(
+        results[0].num_rows(),
+        1,
+        "PK 3 should appear exactly once, but got {} rows",
+        results[0].num_rows()
+    );
+    let values = results[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value column");
+    assert_eq!(
+        values.value(0),
+        131,
+        "PK 3 should have latest value 131 from step 3"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_new_key_in_protected_snapshot_detected_as_conflict_impl);
