@@ -871,7 +871,7 @@ impl DataAccelerator for CayenneAccelerator {
                 tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket created)");
             } else {
                 tracing::info!("Using S3 Express One Zone storage: {dir_path} (bucket exists)");
-            };
+            }
             tracing::debug!(
                 "S3 Express One Zone is optimized for low-latency access within the same AWS Availability Zone. Access from outside AWS may experience higher latency."
             );
