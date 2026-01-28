@@ -74,7 +74,6 @@ struct StreamOptions {
 struct ChatChunk {
     choices: Vec<ChunkChoice>,
     #[serde(default)]
-    #[expect(dead_code)]
     usage: Option<Usage>,
 }
 
@@ -92,12 +91,55 @@ struct Delta {
 }
 
 /// Token usage statistics.
-#[derive(Deserialize, Default)]
-#[expect(dead_code, clippy::struct_field_names)]
+#[derive(Deserialize, Default, Clone)]
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[expect(dead_code)]
     total_tokens: u32,
+}
+
+/// Chat response with timing and usage statistics.
+struct ChatResponse {
+    content: String,
+    total_duration: std::time::Duration,
+    first_token_duration: Option<std::time::Duration>,
+    usage: Option<Usage>,
+}
+
+impl ChatResponse {
+    /// Format the stats output like the Go CLI:
+    /// `Time: 16.09s (first token 0.53s). Tokens: 197.`
+    /// `Prompt: 64. Completion: 133 (8.55/s).`
+    fn format_stats(&self) -> String {
+        let total_secs = self.total_duration.as_secs_f64();
+
+        let first_token_part = self.first_token_duration.map_or(String::new(), |d| {
+            format!(" (first token {:.2}s)", d.as_secs_f64())
+        });
+
+        let mut result = if let Some(usage) = &self.usage {
+            let total_tokens = usage.prompt_tokens + usage.completion_tokens;
+            format!("Time: {total_secs:.2}s{first_token_part}. Tokens: {total_tokens}.")
+        } else {
+            format!("Time: {total_secs:.2}s{first_token_part}.")
+        };
+
+        if let Some(usage) = &self.usage {
+            let completion_rate = if total_secs > 0.0 {
+                let rate = f64::from(usage.completion_tokens) / total_secs;
+                format!(" ({rate:.2}/s)")
+            } else {
+                String::new()
+            };
+            result.push_str(&format!(
+                "\nPrompt: {}. Completion: {}{completion_rate}.",
+                usage.prompt_tokens, usage.completion_tokens
+            ));
+        }
+
+        result
+    }
 }
 
 /// Get or validate a model using the runtime context.
@@ -135,8 +177,8 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
             role: "user".to_string(),
             content: message.clone(),
         }];
-        send_chat_streaming(ctx, &model, &messages, args.temperature, false).await?;
-        println!();
+        let response = send_chat_streaming(ctx, &model, &messages, args.temperature, false).await?;
+        println!("\n\n{}\n", response.format_stats());
         return Ok(());
     }
 
@@ -205,18 +247,17 @@ async fn run_repl(ctx: &RuntimeContext, model: &str, temperature: Option<f32>) -
         });
 
         // Send and stream response
-        let start = Instant::now();
         match send_chat_streaming(ctx, model, &messages, temperature, true).await {
-            Ok(response_content) => {
+            Ok(response) => {
+                // Print stats first before consuming content
+                println!("\n\n{}\n", response.format_stats());
                 // Add assistant response to history
-                if !response_content.is_empty() {
+                if !response.content.is_empty() {
                     messages.push(Message {
                         role: "assistant".to_string(),
-                        content: response_content,
+                        content: response.content,
                     });
                 }
-                let elapsed = start.elapsed();
-                println!("\n\n[{:.2}s]\n", elapsed.as_secs_f64());
             }
             Err(e) => {
                 eprintln!("\x1b[31mError\x1b[0m {e}");
@@ -239,7 +280,8 @@ async fn send_chat_streaming(
     messages: &[Message],
     temperature: Option<f32>,
     interactive: bool,
-) -> Result<String> {
+) -> Result<ChatResponse> {
+    let start_time = Instant::now();
     let url = format!("{}/v1/chat/completions", ctx.http_endpoint());
 
     let body = ChatRequest {
@@ -292,6 +334,8 @@ async fn send_chat_streaming(
     let mut full_response = String::new();
     let mut stream = response.bytes_stream();
     let mut spinner = spinner;
+    let mut first_token_time: Option<std::time::Duration> = None;
+    let mut usage: Option<Usage> = None;
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
@@ -312,11 +356,19 @@ async fn send_chat_streaming(
 
                 // Parse the JSON chunk
                 if let Ok(chat_chunk) = serde_json::from_str::<ChatChunk>(data) {
+                    // Capture usage from the final chunk (if present)
+                    if chat_chunk.usage.is_some() {
+                        usage = chat_chunk.usage;
+                    }
+
                     for choice in &chat_chunk.choices {
                         if let Some(content) = &choice.delta.content {
-                            // Stop spinner when first content arrives
-                            if let Some(s) = spinner.take() {
-                                s.stop().await;
+                            // Record first token time and stop spinner
+                            if first_token_time.is_none() {
+                                first_token_time = Some(start_time.elapsed());
+                                if let Some(s) = spinner.take() {
+                                    s.stop().await;
+                                }
                             }
                             print!("{content}");
                             let _ = io::stdout().flush();
@@ -333,5 +385,12 @@ async fn send_chat_streaming(
         s.stop().await;
     }
 
-    Ok(full_response)
+    let total_duration = start_time.elapsed();
+
+    Ok(ChatResponse {
+        content: full_response,
+        total_duration,
+        first_token_duration: first_token_time,
+        usage,
+    })
 }
