@@ -220,7 +220,7 @@ impl SystemType {
 
     /// Get the runtime asset name for the current platform.
     /// Flavor has no affect as we do not currently publish different runtime flavors.
-    pub fn runtime_asset_name(&self, _flavor: &str, allow_accelerator: bool) -> String {
+    pub fn runtime_asset_name(&self, flavor: &str, allow_accelerator: bool) -> String {
         let accelerator_suffix = if allow_accelerator {
             if let Some(accelerator) = detect_accelerator() {
                 format!("_{accelerator}")
@@ -231,8 +231,13 @@ impl SystemType {
             String::new()
         };
 
+        let flavor_suffix = match flavor {
+            "ai" | "default" => "_models".to_string(),
+            _ => String::new()
+        };
+
         format!(
-            "{prefix}{accelerator_suffix}_{os}_{arch}.tar.gz",
+            "{prefix}{flavor_suffix}{accelerator_suffix}_{os}_{arch}.tar.gz",
             prefix = self.runtime_asset_prefix(),
             os = self.os_type_name(),
             arch = self.arch()
@@ -385,27 +390,27 @@ mod tests {
 
     #[rstest]
     // ai and default flavors on x86
-    #[case(SystemType::linux_x86(), "default", "spiced_linux_x86_64.tar.gz")]
-    #[case(SystemType::darwin_x86(), "default", "spiced_darwin_x86_64.tar.gz")]
+    #[case(SystemType::linux_x86(), "default", "spiced_models_linux_x86_64.tar.gz")]
+    #[case(SystemType::darwin_x86(), "default", "spiced_models_darwin_x86_64.tar.gz")]
     #[case(
         SystemType::windows_x86(),
         "default",
-        "spiced.exe_windows_x86_64.tar.gz"
+        "spiced.exe_models_windows_x86_64.tar.gz"
     )]
-    #[case(SystemType::linux_x86(), "ai", "spiced_linux_x86_64.tar.gz")]
-    #[case(SystemType::darwin_x86(), "ai", "spiced_darwin_x86_64.tar.gz")]
-    #[case(SystemType::windows_x86(), "ai", "spiced.exe_windows_x86_64.tar.gz")]
+    #[case(SystemType::linux_x86(), "ai", "spiced_models_linux_x86_64.tar.gz")]
+    #[case(SystemType::darwin_x86(), "ai", "spiced_models_darwin_x86_64.tar.gz")]
+    #[case(SystemType::windows_x86(), "ai", "spiced.exe_models_windows_x86_64.tar.gz")]
     // ai and default flavors on arm
-    #[case(SystemType::linux_arm(), "default", "spiced_linux_aarch64.tar.gz")]
-    #[case(SystemType::darwin_arm(), "default", "spiced_darwin_aarch64.tar.gz")]
+    #[case(SystemType::linux_arm(), "default", "spiced_models_linux_aarch64.tar.gz")]
+    #[case(SystemType::darwin_arm(), "default", "spiced_models_darwin_aarch64.tar.gz")]
     #[case(
         SystemType::windows_arm(),
         "default",
-        "spiced.exe_windows_aarch64.tar.gz"
+        "spiced.exe_models_windows_aarch64.tar.gz"
     )]
-    #[case(SystemType::linux_arm(), "ai", "spiced_linux_aarch64.tar.gz")]
-    #[case(SystemType::darwin_arm(), "ai", "spiced_darwin_aarch64.tar.gz")]
-    #[case(SystemType::windows_arm(), "ai", "spiced.exe_windows_aarch64.tar.gz")]
+    #[case(SystemType::linux_arm(), "ai", "spiced_models_linux_aarch64.tar.gz")]
+    #[case(SystemType::darwin_arm(), "ai", "spiced_models_darwin_aarch64.tar.gz")]
+    #[case(SystemType::windows_arm(), "ai", "spiced.exe_models_windows_aarch64.tar.gz")]
     // random flavor on x86
     #[case(SystemType::linux_x86(), "random", "spiced_linux_x86_64.tar.gz")]
     #[case(SystemType::darwin_x86(), "random", "spiced_darwin_x86_64.tar.gz")]
