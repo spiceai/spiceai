@@ -137,6 +137,96 @@ async fn check_and_notify_upgrade(ctx: &RuntimeContext) {
     }
 }
 
+/// Get just the semver version (e.g., "v1.2.3").
+#[must_use]
+fn cli_semver() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    format!("v{version}")
+}
+
+/// Get the path to the cached version file.
+fn version_cache_path(ctx: &RuntimeContext) -> PathBuf {
+    ctx.spice_runtime_dir().join("cli_version.txt")
+}
+
+/// Check if a version string indicates a pre-release build.
+/// Matches Go CLI logic: prefix "local" or contains "build".
+fn is_prerelease(version: &str) -> bool {
+    version.starts_with("local") || version.contains("build")
+}
+
+/// Compare two semver versions. Returns true if `latest` is newer than `current`.
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    // Strip 'v' prefix if present
+    let current = current.strip_prefix('v').unwrap_or(current);
+    let latest = latest.strip_prefix('v').unwrap_or(latest);
+
+    // Parse versions
+    let parse_version = |s: &str| -> (u32, u32, u32) {
+        let parts: Vec<&str> = s.split('-').next().unwrap_or(s).split('.').collect();
+        (
+            parts.first().and_then(|s| s.parse().ok()).unwrap_or(0),
+            parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
+            parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
+        )
+    };
+
+    let current_parts = parse_version(current);
+    let latest_parts = parse_version(latest);
+
+    latest_parts > current_parts
+}
+
+/// Check for the latest CLI release version.
+async fn check_latest_version(ctx: &RuntimeContext) -> Option<String> {
+    let cache_path = version_cache_path(ctx);
+
+    // Check cache first - if valid, return cached version
+    if let Ok(metadata) = fs::metadata(&cache_path)
+        && let Ok(modified) = metadata.modified()
+        && let Ok(age) = SystemTime::now().duration_since(modified)
+        && age < VERSION_CACHE_DURATION
+        && let Ok(version) = fs::read_to_string(&cache_path)
+    {
+        return Some(version.trim().to_string());
+    }
+
+    // Fetch from GitHub
+    let client = GitHubClient::new_runtime_client();
+    let release = get_latest_release(&client).await.ok()?;
+    let version = release.tag_name;
+
+    // Update cache
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&cache_path, format!("{version}\n"));
+
+    Some(version)
+}
+
+/// Display upgrade notification if a newer version is available.
+async fn check_and_notify_upgrade(ctx: &RuntimeContext) {
+    let current = cli_semver();
+
+    // Skip check for pre-release builds
+    if is_prerelease(&current) {
+        return;
+    }
+
+    let Some(latest) = check_latest_version(ctx).await else {
+        return;
+    };
+
+    if is_newer_version(&current, &latest) {
+        // Use green color for the version
+        let green_version = format!("\x1b[92m{latest}\x1b[0m");
+        println!();
+        tracing::info!("CLI version {green_version} is now available!");
+        tracing::info!("To upgrade, run \"spice upgrade\".");
+    }
+}
+
 /// Execute the version command.
 ///
 /// # Errors
