@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the Docker images and CLI binaries
+        description: Publish the Docker images to the registry (CLI binaries are uploaded as artifacts only)
         required: false
         type: boolean
         default: false
@@ -185,13 +185,16 @@ jobs:
           sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
           grep '^version =' Cargo.toml
 
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
       - name: Install missing tools
         run: |
           sudo apt-get update
           sudo apt-get install build-essential libssl-dev pkg-config cmake unzip -y
-
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
 
       - name: Install protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
