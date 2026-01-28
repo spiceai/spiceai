@@ -969,27 +969,22 @@ mod tests {
     fn test_json_array_to_jsonl_single_item() {
         let input = r#"[{"key": "value"}]"#;
         let result = json_array_to_jsonl(input).expect("should parse single item array");
-        let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines.len(), 1);
+        assert_eq!(result.lines().count(), 1);
     }
 
     #[test]
     fn test_json_array_to_jsonl_invalid_json() {
         let input = "not valid json";
         let result = json_array_to_jsonl(input);
-        assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .is_some_and(|e| e.to_string().contains("Invalid JSON array"))
-        );
+        let err = result.expect_err("invalid JSON should fail");
+        assert!(err.to_string().contains("Invalid JSON array"));
     }
 
     #[test]
     fn test_json_array_to_jsonl_not_an_array() {
         let input = r#"{"key": "value"}"#;
         let result = json_array_to_jsonl(input);
-        assert!(result.is_err());
+        let _ = result.expect_err("non-array JSON should fail");
     }
 
     #[test]
