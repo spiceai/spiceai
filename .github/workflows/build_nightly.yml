@@ -84,10 +84,10 @@ jobs:
           echo "nightly_label=${nightly_label}" >> $GITHUB_OUTPUT
           echo "Preparing to publish nightly build with version: \"${version}\""
 
-  # ==================== CLI BUILD JOBS ====================
+  # ==================== BINARY BUILD JOBS ====================
 
-  build-cli-linux-x64:
-    name: Build CLI - Linux x64
+  build-linux-x64:
+    name: Build - Linux x64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
@@ -159,8 +159,8 @@ jobs:
           name: spice_linux_x86_64
           path: spice_linux_x86_64.tar.gz
 
-  build-cli-linux-arm64:
-    name: Build CLI - Linux aarch64
+  build-linux-arm64:
+    name: Build - Linux aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
@@ -229,8 +229,8 @@ jobs:
           name: spice_linux_aarch64
           path: spice_linux_aarch64.tar.gz
 
-  build-cli-macos-arm64:
-    name: Build CLI - macOS aarch64
+  build-macos-arm64:
+    name: Build - macOS aarch64
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
