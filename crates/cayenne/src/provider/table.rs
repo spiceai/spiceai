@@ -1925,6 +1925,9 @@ impl CayenneTableProvider {
 
     /// Build the existing keyset (primary key bytes -> row location) for append-mode inserts.
     ///
+    /// This method scans BOTH the main listing table AND any protected snapshots to build
+    /// a complete keyset of all existing primary keys.
+    ///
     /// This method respects ALL deletion caches based on `pk_deletion_strategy`:
     /// - `Int64Pk`: Uses `cached_deleted_pk_i64` and `cached_insert_records_pk_i64`
     /// - `RowConverterBased`: Uses `cached_deleted_row_keys` and `cached_insert_records_row_keys`
@@ -1948,19 +1951,67 @@ impl CayenneTableProvider {
             Arc::clone(&guard)
         };
 
+        // Clone protected snapshots to avoid holding locks across await points
+        let protected_snapshots = {
+            let guard =
+                self.protected_snapshots
+                    .read()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "read protected snapshots in load_existing_keyset".to_string(),
+                    })?;
+            guard.clone()
+        };
+
         let ctx = SessionContext::new();
+        // Only read PK columns - no need to load all columns for keyset building
+        let pk_projection = pk_indices.to_vec();
         let scan_plan = listing_table
-            .scan(&ctx.state(), None, &[], None)
+            .scan(&ctx.state(), Some(&pk_projection), &[], None)
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Failed to scan listing table for primary keys: {err}"),
             })?;
 
-        let batches = collect(scan_plan, ctx.task_ctx()).await.map_err(|err| {
+        let mut all_batches = collect(scan_plan, ctx.task_ctx()).await.map_err(|err| {
             CatalogError::InvalidOperationNoSource {
                 message: format!("Failed to collect primary key scan: {err}"),
             }
         })?;
+
+        // Also collect batches from each protected snapshot
+        for snapshot_id in protected_snapshots.keys() {
+            let snapshot_url = Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                snapshot_id,
+            );
+
+            let snapshot_listing_table = Self::create_listing_table(
+                &snapshot_url,
+                Arc::clone(&self.table_metadata.schema),
+                self.context.file_format(),
+            )?;
+
+            // Only read PK columns - no need to load all columns for keyset building
+            let snapshot_plan = snapshot_listing_table
+                .scan(&ctx.state(), Some(&pk_projection), &[], None)
+                .await
+                .map_err(|err| CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Failed to scan protected snapshot {snapshot_id} for primary keys: {err}"
+                    ),
+                })?;
+
+            let snapshot_batches = collect(snapshot_plan, ctx.task_ctx())
+                .await
+                .map_err(|err| CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Failed to collect protected snapshot {snapshot_id} scan: {err}"
+                    ),
+                })?;
+
+            all_batches.extend(snapshot_batches);
+        }
 
         // Load the appropriate deletion cache based on pk_deletion_strategy.
         // This ensures keys that were previously deleted are not considered as conflicts.
@@ -2024,8 +2075,11 @@ impl CayenneTableProvider {
         let mut keyset = HashMap::with_capacity(1024);
         let mut row_id_base: i64 = 0;
 
-        for batch in batches {
-            let pk_columns: Vec<_> = pk_indices
+        // After projection, batch columns are at indices 0..pk_indices.len()
+        let projected_pk_indices: Vec<usize> = (0..pk_indices.len()).collect();
+
+        for batch in all_batches {
+            let pk_columns: Vec<_> = projected_pk_indices
                 .iter()
                 .map(|idx| Arc::clone(batch.column(*idx)))
                 .collect();
@@ -2041,7 +2095,7 @@ impl CayenneTableProvider {
                 == PkDeletionStrategy::Int64Pk
                 && pk_indices.len() == 1
             {
-                batch.column(pk_indices[0]).as_any().downcast_ref()
+                batch.column(0).as_any().downcast_ref()
             } else {
                 None
             };
@@ -2109,23 +2163,17 @@ impl CayenneTableProvider {
 
                 let key = rows.row(row_idx).owned();
 
-                if keyset
-                    .insert(
-                        key,
-                        RowLocation {
-                            data_file_id: DEFAULT_DATA_FILE_ID,
-                            row_id,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(CatalogError::InvalidOperationNoSource {
-                        message: format!(
-                            "Existing data for table {} violates primary key uniqueness",
-                            self.table_metadata.table_name
-                        ),
-                    });
-                }
+                // Insert or update the key in the keyset.
+                // Keys from protected snapshots may override keys from the main listing table
+                // because protected snapshots contain data inserted at higher sequence numbers.
+                // This is expected behavior for upserts.
+                keyset.insert(
+                    key,
+                    RowLocation {
+                        data_file_id: DEFAULT_DATA_FILE_ID,
+                        row_id,
+                    },
+                );
             }
 
             row_id_base += i64::try_from(batch.num_rows()).map_err(|_| {
@@ -3376,6 +3424,17 @@ impl CayenneTableProvider {
             *guard = Arc::new(HashMap::new());
         }
 
+        // Clear protected snapshots - after compaction all data is in the main snapshot
+        {
+            let mut guard =
+                self.protected_snapshots
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "clear protected snapshots".to_string(),
+                    })?;
+            guard.clear();
+        }
+
         tracing::debug!(
             "Cleared all deletion and insert records caches for table {}",
             self.table_metadata.table_name
@@ -4262,7 +4321,7 @@ impl CayenneTableProvider {
                         plan,
                         Arc::new(filtered_deletions),
                         empty_insert_records,
-                        self.pk_column_indices.clone(),
+                        pk_indices_in_projection.to_vec(),
                         Arc::clone(row_converter),
                     )))
                 } else {
