@@ -28,12 +28,12 @@ use s3_vectors::{
     DeleteVectorsError, DeleteVectorsInput, DeleteVectorsOutput, GetIndexError, GetIndexInput,
     GetIndexOutput, GetVectorBucketError, GetVectorBucketInput, GetVectorBucketOutput,
     GetVectorBucketPolicyError, GetVectorBucketPolicyInput, GetVectorBucketPolicyOutput,
-    GetVectorsError, GetVectorsInput, GetVectorsOutput, HttpResponse, ListIndexesError,
-    ListIndexesInput, ListIndexesOutput, ListVectorBucketsError, ListVectorBucketsInput,
-    ListVectorBucketsOutput, ListVectorsError, ListVectorsInput, ListVectorsOutput,
-    PutVectorBucketPolicyError, PutVectorBucketPolicyInput, PutVectorBucketPolicyOutput,
-    PutVectorsError, PutVectorsInput, PutVectorsOutput, QueryVectorsError, QueryVectorsInput,
-    QueryVectorsOutput, S3Vectors, SdkError,
+    GetVectorsError, GetVectorsInput, GetVectorsOutput, ListIndexesError, ListIndexesInput,
+    ListIndexesOutput, ListVectorBucketsError, ListVectorBucketsInput, ListVectorBucketsOutput,
+    ListVectorsError, ListVectorsInput, ListVectorsOutput, PutVectorBucketPolicyError,
+    PutVectorBucketPolicyInput, PutVectorBucketPolicyOutput, PutVectorsError, PutVectorsInput,
+    PutVectorsOutput, QueryVectorsError, QueryVectorsInput, QueryVectorsOutput, S3Vectors,
+    SdkError,
 };
 use tracing::info_span;
 use tracing_futures::Instrument;
