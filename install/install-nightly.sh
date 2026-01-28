@@ -22,21 +22,17 @@ set -e
 # colors
 blue="\033[0;94m"
 green="\033[0;32m"
-white="\033[0;97m"
 yellow="\033[0;33m"
 red="\033[0;31m"
 reset="\033[0m"
 
 # Install directories
 SPICE_BIN=".spice/bin"
-: ${SPICE_CLI_INSTALL_DIR:="$HOME/$SPICE_BIN"}
-: ${SPICED_INSTALL_DIR:="/usr/local/bin"}
+: "${SPICE_CLI_INSTALL_DIR:="$HOME/$SPICE_BIN"}"
+: "${SPICED_INSTALL_DIR:="/usr/local/bin"}"
 
 # sudo is required to copy binary to SPICED_INSTALL_DIR for linux
-: ${USE_SUDO:="false"}
-
-# Http request CLI
-SPICE_HTTP_REQUEST_CLI=curl
+: "${USE_SUDO:="false"}"
 
 # GitHub Organization and repo name
 GITHUB_ORG=spiceai
@@ -98,7 +94,8 @@ getSystemInfo() {
         fi
     else
         # Directory doesn't exist, check parent directory
-        local parent_dir=$(dirname "$SPICED_INSTALL_DIR")
+        local parent_dir
+        parent_dir=$(dirname "$SPICED_INSTALL_DIR")
         if [[ ! -w "$parent_dir" ]]; then
             USE_SUDO="true"
         fi
@@ -131,13 +128,9 @@ runAsRoot() {
     eval "$CMD"
 }
 
-checkHttpRequestCLI() {
-    if type "curl" 1> /dev/null 2>&1; then
-        SPICE_HTTP_REQUEST_CLI=curl
-    elif type "wget" 1> /dev/null 2>&1; then
-        SPICE_HTTP_REQUEST_CLI=wget
-    else
-        echo -e "${red}Error:${reset} Either 'curl' or 'wget' is required"
+checkCurl() {
+    if ! type "curl" 1> /dev/null 2>&1; then
+        echo -e "${red}Error:${reset} 'curl' is required"
         echo ""
         echo "To install curl (macOS): 'brew install curl'"
         echo "To install curl (Ubuntu): 'apt install curl'"
@@ -502,7 +495,7 @@ echo ""
 # Pre-flight checks
 getSystemInfo
 verifySupported
-checkHttpRequestCLI
+checkCurl
 checkJq
 checkGitHubToken
 
