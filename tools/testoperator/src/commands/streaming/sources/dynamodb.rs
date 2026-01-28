@@ -33,7 +33,7 @@ use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType, PutRequest,
-    ScalarAttributeType, StreamSpecification, StreamViewType, WriteRequest,
+    ScalarAttributeType, StreamSpecification, StreamViewType, Tag, WriteRequest,
 };
 use futures::stream::{self, StreamExt};
 use test_framework::anyhow::{self, Context, Result};
@@ -43,7 +43,16 @@ use tokio::time::sleep;
 const BATCH_SIZE: usize = 25;
 
 /// Number of concurrent batch write requests.
-const CONCURRENT_BATCHES: usize = 10;
+const CONCURRENT_BATCHES: usize = 30;
+
+/// Tag key for creation timestamp (Unix seconds).
+const TAG_CREATED_AT: &str = "testoperator:created_at";
+
+/// Tag key for run ID.
+const TAG_RUN_ID: &str = "testoperator:run_id";
+
+/// Maximum age of tables before cleanup (24 hours).
+const STALE_TABLE_AGE_SECS: u64 = 24 * 60 * 60;
 
 use crate::commands::streaming::datasets::DatasetType;
 use crate::commands::streaming::traits::StreamingSource;
@@ -228,6 +237,139 @@ impl DynamoDbStreamsSource {
         // Fallback to string matching
         let err_str = format!("{err:?}");
         err_str.contains("ResourceNotFoundException") || err_str.contains("resource not found")
+    }
+
+    /// Build tags for a new table.
+    fn build_table_tags(run_id: &str) -> Vec<Tag> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Note: Tag::builder().build() can't fail with valid key/value
+        vec![
+            Tag::builder()
+                .key(TAG_CREATED_AT)
+                .value(now.to_string())
+                .build()
+                .expect("valid tag"),
+            Tag::builder()
+                .key(TAG_RUN_ID)
+                .value(run_id)
+                .build()
+                .expect("valid tag"),
+        ]
+    }
+
+    /// Clean up stale tables (older than 24 hours) created by testoperator.
+    ///
+    /// This scans all tables, checks for the `testoperator:created_at` tag,
+    /// and deletes tables older than `STALE_TABLE_AGE_SECS`.
+    async fn cleanup_stale_tables(client: &Client) -> Result<()> {
+        println!("Scanning for stale testoperator tables (>24h old)...");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let cutoff = now.saturating_sub(STALE_TABLE_AGE_SECS);
+
+        // List all tables
+        let mut tables_to_delete = Vec::new();
+        let mut last_evaluated_table: Option<String> = None;
+
+        loop {
+            let mut request = client.list_tables();
+            if let Some(ref last) = last_evaluated_table {
+                request = request.exclusive_start_table_name(last);
+            }
+
+            let response = request.send().await.context("Failed to list tables")?;
+
+            if let Some(table_names) = response.table_names {
+                for table_name in table_names {
+                    // Get table ARN via describe_table
+                    let table_arn = match client
+                        .describe_table()
+                        .table_name(&table_name)
+                        .send()
+                        .await
+                    {
+                        Ok(desc) => {
+                            desc.table()
+                                .and_then(|t| t.table_arn())
+                                .map(String::from)
+                        }
+                        Err(_) => continue, // Skip if we can't describe the table
+                    };
+
+                    let Some(arn) = table_arn else {
+                        continue;
+                    };
+
+                    // Get tags for this table using the ARN
+                    match client.list_tags_of_resource().resource_arn(&arn).send().await {
+                        Ok(tags_response) => {
+                            if let Some(tags) = tags_response.tags {
+                                // Look for our created_at tag
+                                for tag in tags {
+                                    if tag.key() == TAG_CREATED_AT {
+                                        let value = tag.value();
+                                        if let Ok(created_at) = value.parse::<u64>() {
+                                            if created_at < cutoff {
+                                                let age_hours = (now - created_at) / 3600;
+                                                println!(
+                                                    "  Found stale table: {} ({}h old)",
+                                                    table_name, age_hours
+                                                );
+                                                tables_to_delete.push(table_name.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Can't get tags, skip this table (might not be ours)
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            last_evaluated_table = response.last_evaluated_table_name;
+            if last_evaluated_table.is_none() {
+                break;
+            }
+        }
+
+        if tables_to_delete.is_empty() {
+            println!("No stale tables found");
+            return Ok(());
+        }
+
+        println!("Deleting {} stale tables...", tables_to_delete.len());
+
+        for table_name in tables_to_delete {
+            match client.delete_table().table_name(&table_name).send().await {
+                Ok(_) => {
+                    println!("  Deleted stale table: {table_name}");
+                }
+                Err(e) => {
+                    if Self::is_resource_not_found(&e) {
+                        // Already deleted by another process
+                        println!("  Table {table_name} already deleted");
+                    } else {
+                        // Log but continue with other tables
+                        eprintln!("  Failed to delete {table_name}: {e}");
+                    }
+                }
+            }
+        }
+
+        println!("Stale table cleanup complete");
+        Ok(())
     }
 
     /// Delete a table if it exists and wait for deletion to complete.
@@ -570,6 +712,9 @@ impl DynamoDbStreamsSource {
         table_name: &str,
         hash_key: &str,
     ) -> Result<()> {
+        let run_id = self.table_prefix.as_deref().unwrap_or("unknown");
+        let tags = Self::build_table_tags(run_id);
+
         client
             .create_table()
             .table_name(table_name)
@@ -595,6 +740,7 @@ impl DynamoDbStreamsSource {
                     .build()
                     .context("Failed to build stream specification")?,
             )
+            .set_tags(Some(tags))
             .send()
             .await
             .with_context(|| format!("Failed to create {table_name} table"))?;
@@ -605,6 +751,9 @@ impl DynamoDbStreamsSource {
 
     /// Create the lineitem table with composite key and specified table name.
     async fn create_lineitem_table_named(&self, client: &Client, table_name: &str) -> Result<()> {
+        let run_id = self.table_prefix.as_deref().unwrap_or("unknown");
+        let tags = Self::build_table_tags(run_id);
+
         client
             .create_table()
             .table_name(table_name)
@@ -644,6 +793,7 @@ impl DynamoDbStreamsSource {
                     .build()
                     .context("Failed to build stream specification")?,
             )
+            .set_tags(Some(tags))
             .send()
             .await
             .with_context(|| format!("Failed to create {table_name} table"))?;
@@ -654,6 +804,9 @@ impl DynamoDbStreamsSource {
 
     /// Create the partsupp table with composite key and specified table name.
     async fn create_partsupp_table_named(&self, client: &Client, table_name: &str) -> Result<()> {
+        let run_id = self.table_prefix.as_deref().unwrap_or("unknown");
+        let tags = Self::build_table_tags(run_id);
+
         client
             .create_table()
             .table_name(table_name)
@@ -693,6 +846,7 @@ impl DynamoDbStreamsSource {
                     .build()
                     .context("Failed to build stream specification")?,
             )
+            .set_tags(Some(tags))
             .send()
             .await
             .with_context(|| format!("Failed to create {table_name} table"))?;
@@ -778,7 +932,15 @@ impl StreamingSource for DynamoDbStreamsSource {
             println!("Using table prefix: {prefix}");
         }
 
-        self.client = Some(Self::create_client(&self.config));
+        let client = Self::create_client(&self.config);
+
+        // Clean up stale tables from previous runs (>24h old)
+        if let Err(e) = Self::cleanup_stale_tables(&client).await {
+            // Log but don't fail - cleanup is best-effort
+            eprintln!("Warning: Failed to cleanup stale tables: {e}");
+        }
+
+        self.client = Some(client);
 
         println!("AWS DynamoDB client initialized successfully");
         Ok(())
