@@ -30,7 +30,7 @@ fn get_spicerack_base_url() -> String {
 
     let version = env!("CARGO_PKG_VERSION");
     if version.ends_with("-dev") || version.ends_with("-unstable") {
-        "https://dev-data.spiceai.io/v1".to_string()
+        "https://dev-api.spicerack.org/v1".to_string()
     } else {
         "https://api.spicerack.org/v1".to_string()
     }
