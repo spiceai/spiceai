@@ -108,7 +108,7 @@ impl NFSObjectStore {
             }
         };
 
-        dir.filter_map(|e| e.ok())
+        dir.filter_map(std::result::Result::ok)
             .filter_map(|entry| {
                 let name = entry.path.to_string_lossy().to_string();
                 match entry.d_type {
@@ -154,13 +154,13 @@ impl NFSObjectStore {
         .map_err(|e| generic_error(STORE_NAME, e))?
     }
 
-    /// List a single directory level (for list_with_delimiter).
+    /// List a single directory level (for `list_with_delimiter`).
     async fn list_directory_shallow(
         &self,
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
         let config = Arc::clone(&self.config);
-        let prefix_str = prefix.map_or(String::new(), |p| p.to_string());
+        let prefix_str = prefix.map_or(String::new(), std::string::ToString::to_string);
 
         tokio::task::spawn_blocking(move || {
             let mut nfs = config.connect()?;
@@ -177,7 +177,7 @@ impl NFSObjectStore {
         let location = location.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut nfs = config.connect()?;
+            let nfs = config.connect()?;
             let location_string = format!("/{location}");
 
             let stat = nfs.stat64(StdPath::new(&location_string)).map_err(|e| {
@@ -234,24 +234,24 @@ impl ObjectStore for NFSObjectStore {
 
         let (object_meta, start, end, data) = tokio::task::spawn_blocking({
             let location = location.clone();
-            let config = config.clone();
+            let cfg = Arc::clone(&config);
             move || -> object_store::Result<(ObjectMeta, u64, u64, Vec<u8>)> {
-                let mut nfs = config.connect()?;
+                let mut nfs = cfg.connect()?;
                 let location_string = format!("/{location}");
 
-                let stat = nfs.stat64(StdPath::new(&location_string)).map_err(|e| {
+                let file_stat = nfs.stat64(StdPath::new(&location_string)).map_err(|e| {
                     object_store::Error::NotFound {
                         path: location_string.clone(),
                         source: e.into(),
                     }
                 })?;
 
-                let size = stat.nfs_size;
+                let size = file_stat.nfs_size;
                 let last_modified = {
                     #[expect(clippy::cast_possible_wrap)]
-                    let mtime = stat.nfs_mtime as i64;
+                    let mtime = file_stat.nfs_mtime as i64;
                     #[expect(clippy::cast_possible_truncation)]
-                    let mtime_nsec = stat.nfs_mtime_nsec as u32;
+                    let mtime_nsec = file_stat.nfs_mtime_nsec as u32;
                     DateTime::<Utc>::from_timestamp(mtime, mtime_nsec).unwrap_or_else(Utc::now)
                 };
                 let object_meta = build_object_meta(location.clone(), size, last_modified);

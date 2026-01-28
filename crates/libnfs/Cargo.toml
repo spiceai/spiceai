@@ -1,0 +1,12 @@
+[package]
+name = "libnfs"
+version = "0.1.0"
+edition = "2024"
+description = "Safe Rust bindings to libnfs C library for NFS client operations"
+license = "MIT"
+
+[dependencies]
+nix = { workspace = true, features = ["fs"] }
+
+[build-dependencies]
+bindgen = "0.71"
