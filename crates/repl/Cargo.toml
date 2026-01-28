@@ -1,9 +1,9 @@
 [package]
-description = "Spice OSS Flight Query Repl"
+description = "Spice OSS REPL utilities and Flight Query REPL"
 edition.workspace = true
 homepage.workspace = true
 license.workspace = true
-name = "flightrepl"
+name = "repl"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -14,6 +14,8 @@ arrow = { workspace = true, features = ["chrono-tz"] }
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-json.workspace = true
 clap.workspace = true
+dialoguer = "0.11"
+dirs = "6"
 flight_client = { path = "../flight_client" }
 futures.workspace = true
 prost.workspace = true
@@ -40,3 +42,4 @@ winver = "1.0.0"
 [dev-dependencies]
 insta.workspace = true
 regex.workspace = true
+tempfile.workspace = true
