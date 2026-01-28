@@ -23,6 +23,7 @@ use super::CommonArgs;
 
 /// Arguments for streaming ingestion benchmarks.
 #[derive(Parser, Debug, Clone)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct StreamingTestArgs {
     #[command(flatten)]
     pub common: CommonArgs,
@@ -56,15 +57,15 @@ pub struct StreamingTestArgs {
     #[arg(long, default_value = "us-east-1")]
     pub aws_region: String,
 
-    /// AWS authentication method: iam_role, key, or env
+    /// AWS authentication method: `iam_role`, key, or env
     #[arg(long, value_enum, default_value = "iam-role")]
     pub aws_auth: AwsAuth,
 
-    /// AWS access key ID (required when aws_auth=key)
+    /// AWS access key ID (required when `aws_auth=key`)
     #[arg(long)]
     pub aws_access_key_id: Option<String>,
 
-    /// AWS secret access key (required when aws_auth=key)
+    /// AWS secret access key (required when `aws_auth=key`)
     #[arg(long)]
     pub aws_secret_access_key: Option<String>,
 
@@ -72,12 +73,21 @@ pub struct StreamingTestArgs {
     #[arg(long)]
     pub aws_session_token: Option<String>,
 
-    /// Custom AWS endpoint URL (for LocalStack, testing, etc.)
+    /// Custom AWS endpoint URL (for `LocalStack`, testing, etc.)
     #[arg(long)]
     pub aws_endpoint_url: Option<String>,
 
+    // Query liveness monitoring arguments
+    /// Enable query liveness monitoring (runs COUNT(*) queries and tracks latency)
+    #[arg(long)]
+    pub enable_query_liveness: bool,
+
+    /// Poll interval for query liveness checks in milliseconds
+    #[arg(long, default_value = "500")]
+    pub query_liveness_interval_ms: u64,
+
     // Mutation testing arguments (for CDC testing)
-    /// Enable CDC mutation testing (generates INSERT, UPDATE, DELETE operations)
+    /// Enable CDC mutation testing (each row goes through X mutations before final state)
     #[arg(long)]
     pub enable_mutations: bool,
 
@@ -85,21 +95,13 @@ pub struct StreamingTestArgs {
     #[arg(long, default_value = "42")]
     pub mutation_seed: u64,
 
-    /// Number of mutations to generate
+    /// Number of mutations per row (including initial insert and final update)
+    #[arg(long, default_value = "3")]
+    pub mutations_per_row: usize,
+
+    /// Maximum number of rows to mutate per dataset (0 for all rows)
     #[arg(long, default_value = "100")]
-    pub mutation_count: usize,
-
-    /// Ratio of INSERT operations (0.0-1.0)
-    #[arg(long, default_value = "0.5")]
-    pub insert_ratio: f64,
-
-    /// Ratio of UPDATE operations (0.0-1.0)
-    #[arg(long, default_value = "0.3")]
-    pub update_ratio: f64,
-
-    /// Ratio of DELETE operations (0.0-1.0)
-    #[arg(long, default_value = "0.2")]
-    pub delete_ratio: f64,
+    pub max_mutation_rows: usize,
 }
 
 /// AWS authentication methods for CLI.
@@ -110,6 +112,6 @@ pub enum AwsAuth {
     IamRole,
     /// Use explicit access key credentials
     Key,
-    /// Use environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+    /// Use environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
     Env,
 }

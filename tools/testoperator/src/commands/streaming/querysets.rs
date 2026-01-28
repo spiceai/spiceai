@@ -18,40 +18,34 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use super::datasets::{
-    CustomerDataset, LineitemDataset, NationDataset, OrdersDataset, PartDataset, PartsuppDataset,
-    RegionDataset, SupplierDataset,
+    CustomerDataset, HitsDataset, LineitemDataset, NationDataset, OrdersDataset, PartDataset,
+    PartsuppDataset, RegionDataset, SupplierDataset,
 };
 use super::traits::StreamingDataset;
 
-/// Available query set types for streaming benchmarks.
-///
-/// Each query set defines which datasets (tables) to load for the benchmark.
 #[derive(Debug, Clone, Copy, ValueEnum, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum QuerySetType {
-    /// Just the lineitem table (fastest for basic testing)
-    TpchLineitem,
-    /// All 8 TPCH tables (full benchmark)
-    TpchFull,
+    Tpch,
+    Clickbench,
 }
 
 impl QuerySetType {
-    /// Create the dataset instances for this query set.
     #[must_use]
-    pub fn create_datasets(&self) -> Vec<Box<dyn StreamingDataset>> {
+    pub fn get_datasets(self) -> Vec<Box<dyn StreamingDataset>> {
         match self {
-            QuerySetType::TpchLineitem => vec![Box::new(LineitemDataset)],
-            QuerySetType::TpchFull => vec![
+            Self::Tpch => vec![
                 // Load in order of dependencies: small dimension tables first
                 Box::new(RegionDataset),
                 Box::new(NationDataset),
-                Box::new(SupplierDataset),
-                Box::new(PartDataset),
-                Box::new(PartsuppDataset),
-                Box::new(CustomerDataset),
-                Box::new(OrdersDataset),
-                Box::new(LineitemDataset),
+                // Box::new(SupplierDataset),
+                // Box::new(PartDataset),
+                // Box::new(PartsuppDataset),
+                // Box::new(CustomerDataset),
+                // Box::new(OrdersDataset),
+                // Box::new(LineitemDataset),
             ],
+            Self::Clickbench => vec![Box::new(HitsDataset)],
         }
     }
 }
@@ -59,8 +53,8 @@ impl QuerySetType {
 impl std::fmt::Display for QuerySetType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QuerySetType::TpchLineitem => write!(f, "tpch-lineitem"),
-            QuerySetType::TpchFull => write!(f, "tpch-full"),
+            QuerySetType::Tpch => write!(f, "tpch"),
+            QuerySetType::Clickbench => write!(f, "clickbench"),
         }
     }
 }

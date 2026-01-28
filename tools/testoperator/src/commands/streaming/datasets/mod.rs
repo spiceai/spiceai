@@ -20,6 +20,7 @@ limitations under the License.
 //! into a streaming source. Query sets determine which datasets to load.
 
 mod customer;
+mod hits;
 mod lineitem;
 mod nation;
 mod orders;
@@ -29,6 +30,7 @@ mod region;
 mod supplier;
 
 pub use customer::CustomerDataset;
+pub use hits::HitsDataset;
 pub use lineitem::LineitemDataset;
 pub use nation::NationDataset;
 pub use orders::OrdersDataset;
@@ -56,21 +58,40 @@ pub enum DatasetType {
     Nation,
     /// TPCH region table (5 rows)
     Region,
+    /// `ClickBench` hits table (100M rows at SF=1)
+    Hits,
 }
 
 impl DatasetType {
     /// Returns the table name for this dataset type.
     #[must_use]
-    pub fn table_name(&self) -> &'static str {
+    pub fn table_name(self) -> &'static str {
         match self {
-            DatasetType::Lineitem => "lineitem",
-            DatasetType::Orders => "orders",
-            DatasetType::Customer => "customer",
-            DatasetType::Part => "part",
-            DatasetType::Supplier => "supplier",
-            DatasetType::Partsupp => "partsupp",
-            DatasetType::Nation => "nation",
-            DatasetType::Region => "region",
+            Self::Lineitem => "lineitem",
+            Self::Orders => "orders",
+            Self::Customer => "customer",
+            Self::Part => "part",
+            Self::Supplier => "supplier",
+            Self::Partsupp => "partsupp",
+            Self::Nation => "nation",
+            Self::Region => "region",
+            Self::Hits => "hits",
+        }
+    }
+
+    /// Creates a boxed dataset instance for this dataset type.
+    #[must_use]
+    pub fn create_dataset(self) -> Box<dyn super::traits::StreamingDataset> {
+        match self {
+            Self::Lineitem => Box::new(LineitemDataset),
+            Self::Orders => Box::new(OrdersDataset),
+            Self::Customer => Box::new(CustomerDataset),
+            Self::Part => Box::new(PartDataset),
+            Self::Supplier => Box::new(SupplierDataset),
+            Self::Partsupp => Box::new(PartsuppDataset),
+            Self::Nation => Box::new(NationDataset),
+            Self::Region => Box::new(RegionDataset),
+            Self::Hits => Box::new(HitsDataset),
         }
     }
 }

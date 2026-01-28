@@ -120,4 +120,12 @@ impl StreamingDataset for RegionDataset {
             self.table_name()
         )
     }
+
+    fn schema(&self) -> arrow::datatypes::Schema {
+        Self::schema()
+    }
+
+    fn primary_key_columns(&self) -> Vec<&'static str> {
+        vec!["r_regionkey"]
+    }
 }

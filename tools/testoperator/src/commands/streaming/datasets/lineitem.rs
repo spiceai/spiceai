@@ -195,4 +195,12 @@ impl StreamingDataset for LineitemDataset {
             self.table_name()
         )
     }
+
+    fn schema(&self) -> arrow::datatypes::Schema {
+        Self::schema()
+    }
+
+    fn primary_key_columns(&self) -> Vec<&'static str> {
+        vec!["l_orderkey", "l_linenumber"]
+    }
 }

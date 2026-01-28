@@ -16,11 +16,11 @@ limitations under the License.
 
 //! Streaming source implementations for benchmarks.
 
-mod aws_dynamodb;
 mod dynamodb;
+mod dynamodb_local;
 
-pub use aws_dynamodb::{AwsAuthMethod, AwsDynamoDbConfig, AwsDynamoDbStreamsSource};
-pub use dynamodb::DynamoDbStreamsSource;
+pub use dynamodb::{AwsAuthMethod, DynamoDbConfig, DynamoDbStreamsSource};
+pub use dynamodb_local::DynamoDbStreamsLocalSource;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -32,9 +32,9 @@ use super::traits::StreamingSource;
 #[serde(rename_all = "kebab-case")]
 pub enum SourceType {
     /// `DynamoDB` Streams (local Docker container)
-    DynamodbStreams,
+    DynamodbStreamsLocal,
     /// AWS `DynamoDB` Streams (actual AWS service)
-    AwsDynamodbStreams,
+    DynamodbStreams,
     // Future: Kafka, Debezium, etc.
 }
 
@@ -43,11 +43,12 @@ impl SourceType {
     ///
     /// For `AwsDynamodbStreams`, this creates a source with default configuration.
     /// Use `create_aws` to configure AWS-specific options.
-    pub fn create(&self) -> Box<dyn StreamingSource> {
+    #[must_use]
+    pub fn create(self) -> Box<dyn StreamingSource> {
         match self {
-            SourceType::DynamodbStreams => Box::new(DynamoDbStreamsSource::new()),
-            SourceType::AwsDynamodbStreams => {
-                Box::new(AwsDynamoDbStreamsSource::new(AwsDynamoDbConfig::default()))
+            Self::DynamodbStreamsLocal => Box::new(DynamoDbStreamsLocalSource::new()),
+            Self::DynamodbStreams => {
+                Box::new(DynamoDbStreamsSource::new(DynamoDbConfig::default()))
             }
         }
     }
@@ -55,25 +56,26 @@ impl SourceType {
     /// Create an AWS `DynamoDB` source with the given configuration.
     ///
     /// This is only valid for `AwsDynamodbStreams` source type.
-    pub fn create_aws(&self, config: AwsDynamoDbConfig) -> Box<dyn StreamingSource> {
+    #[must_use]
+    pub fn create_aws(self, config: DynamoDbConfig) -> Box<dyn StreamingSource> {
         match self {
-            SourceType::AwsDynamodbStreams => Box::new(AwsDynamoDbStreamsSource::new(config)),
-            SourceType::DynamodbStreams => Box::new(DynamoDbStreamsSource::new()),
+            Self::DynamodbStreams => Box::new(DynamoDbStreamsSource::new(config)),
+            Self::DynamodbStreamsLocal => Box::new(DynamoDbStreamsLocalSource::new()),
         }
     }
 
     /// Check if this source type requires AWS configuration.
     #[must_use]
-    pub fn requires_aws_config(&self) -> bool {
-        matches!(self, SourceType::AwsDynamodbStreams)
+    pub fn requires_aws_config(self) -> bool {
+        matches!(self, Self::DynamodbStreams)
     }
 }
 
 impl std::fmt::Display for SourceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SourceType::DynamodbStreams => write!(f, "dynamodb-streams"),
-            SourceType::AwsDynamodbStreams => write!(f, "aws-dynamodb-streams"),
+            SourceType::DynamodbStreamsLocal => write!(f, "dynamodb-streams"),
+            SourceType::DynamodbStreams => write!(f, "aws-dynamodb-streams"),
         }
     }
 }

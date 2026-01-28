@@ -1,0 +1,31 @@
+version: v1beta1
+kind: Spicepod
+name: streaming-benchmark-dynamodb
+
+datasets:
+#  - from: dynamodb:nation
+#    name: nation
+#    params:
+#      dynamodb_aws_auth: key
+#      dynamodb_aws_access_key_id: test
+#      dynamodb_aws_secret_access_key: test
+#      dynamodb_aws_region: us-east-1
+#      endpoint_url: http://localhost:8000
+#      ready_lag: 1h
+#    acceleration:
+#      enabled: true
+#      engine: arrow
+#      refresh_mode: changes
+  - from: dynamodb:region
+    name: region
+    params:
+      dynamodb_aws_auth: key
+      dynamodb_aws_access_key_id: test
+      dynamodb_aws_secret_access_key: test
+      dynamodb_aws_region: us-east-1
+      endpoint_url: http://localhost:8000
+      ready_lag: 1h
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: changes

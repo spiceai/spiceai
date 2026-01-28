@@ -36,6 +36,7 @@ limitations under the License.
 
 pub mod datasets;
 pub mod mutations;
+pub mod query_liveness;
 pub mod querysets;
 pub mod sources;
 mod traits;
@@ -54,7 +55,7 @@ use test_framework::spiced::{SpicedInstance, StartRequest};
 use test_framework::spicepod_utils::load_spicepod;
 
 pub use datasets::DatasetType;
-pub use sources::{AwsAuthMethod, AwsDynamoDbConfig, SourceType};
+pub use sources::{AwsAuthMethod, DynamoDbConfig, SourceType};
 pub use traits::{StreamingDataset, StreamingSource};
 
 use crate::args::{AwsAuth, StreamingTestArgs};
@@ -65,11 +66,13 @@ struct DatasetInfo {
     dataset: Box<dyn StreamingDataset>,
     marker: RecordBatch,
     record_count: usize,
+    /// Original generated data (for mutation testing).
+    generated_data: Vec<RecordBatch>,
 }
 
 /// Run the streaming ingestion benchmark.
 pub async fn run(args: &StreamingTestArgs) -> Result<()> {
-    let datasets = args.queryset.create_datasets();
+    let datasets = args.queryset.get_datasets();
 
     println!("Starting streaming ingestion benchmark");
     println!("Source: {}", args.source);
@@ -100,10 +103,9 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     // Small delay to ensure tables are ready
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Phase 3 & 4: Generate data and insert for each dataset
-    println!("Phase 3-4: Generating and inserting data for all datasets");
+    // Phase 3: Generate data for all datasets
+    println!("Phase 3: Generating data for all datasets");
     let mut dataset_infos = Vec::new();
-    let mut total_insert_duration = Duration::ZERO;
 
     for dataset in datasets {
         let dataset_type = dataset.dataset_type();
@@ -113,19 +115,70 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
         let record_count: usize = records.iter().map(RecordBatch::num_rows).sum();
         println!("Generated {record_count} records for {dataset_type}");
 
-        println!("Inserting data for {dataset_type}");
-        let insert_start = Instant::now();
-        source.insert(dataset.table_name(), &records).await?;
-        total_insert_duration += insert_start.elapsed();
-
         let marker = dataset.marker_record()?;
         dataset_infos.push(DatasetInfo {
-            // dataset_type,
             dataset,
             marker,
             record_count,
+            generated_data: records,
         });
     }
+
+    // Phase 4: Insert data (with or without mutations)
+    let mut total_insert_duration = Duration::ZERO;
+    let mutation_summary = if args.enable_mutations {
+        // Phase 4a: Execute mutation sequences (INSERT mutated → UPDATEs → final UPDATE with TPC-H)
+        println!("Phase 4: Executing mutation sequences for CDC testing");
+        println!(
+            "  Seed: {}, Mutations per row: {}, Max rows per dataset: {}",
+            args.mutation_seed, args.mutations_per_row, args.max_mutation_rows
+        );
+
+        let config = mutations::MutationConfig {
+            seed: args.mutation_seed,
+            mutations_per_row: args.mutations_per_row,
+            max_rows_per_dataset: if args.max_mutation_rows == 0 {
+                None
+            } else {
+                Some(args.max_mutation_rows)
+            },
+        };
+
+        // Collect datasets and original data for mutation execution
+        let datasets_for_mutation: Vec<Box<dyn StreamingDataset>> = dataset_infos
+            .iter()
+            .map(|info| info.dataset.dataset_type().create_dataset())
+            .collect();
+        let original_data: Vec<(DatasetType, Vec<RecordBatch>)> = dataset_infos
+            .iter()
+            .map(|info| (info.dataset.dataset_type(), info.generated_data.clone()))
+            .collect();
+
+        let insert_start = Instant::now();
+        let summary = mutations::execute_mutation_sequences(
+            source.as_ref(),
+            &datasets_for_mutation,
+            &original_data,
+            config,
+        )
+        .await?;
+        total_insert_duration = insert_start.elapsed();
+        summary.print();
+        Some(summary)
+    } else {
+        // Phase 4b: Direct data insertion (no mutations)
+        println!("Phase 4: Inserting data for all datasets");
+        for info in &dataset_infos {
+            let dataset_type = info.dataset.dataset_type();
+            println!("Inserting data for {dataset_type}");
+            let insert_start = Instant::now();
+            source
+                .insert(info.dataset.table_name(), &info.generated_data)
+                .await?;
+            total_insert_duration += insert_start.elapsed();
+        }
+        None
+    };
 
     println!("Data insertion completed in {total_insert_duration:?}");
 
@@ -133,7 +186,10 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     println!("Phase 5: Inserting marker records for all datasets");
     for info in &dataset_infos {
         source
-            .insert(info.dataset.table_name(), &[info.marker.clone()])
+            .insert(
+                info.dataset.table_name(),
+                std::slice::from_ref(&info.marker),
+            )
             .await?;
     }
 
@@ -164,6 +220,26 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     let health_monitor = if args.enable_liveness {
         println!("Starting health monitor for liveness checks");
         Some(HealthMonitor::spawn()?)
+    } else {
+        None
+    };
+
+    // Phase 6b: Start query liveness monitoring (optional)
+    let datasets_for_liveness: Vec<Box<dyn StreamingDataset>> = dataset_infos
+        .iter()
+        .map(|info| info.dataset.dataset_type().create_dataset())
+        .collect();
+    let query_liveness_monitor = if args.enable_query_liveness {
+        println!("Starting query liveness monitor");
+        let poll_interval = Duration::from_millis(args.query_liveness_interval_ms);
+        Some(
+            query_liveness::QueryLivenessMonitor::spawn(
+                &spiced_instance,
+                &datasets_for_liveness,
+                poll_interval,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -216,6 +292,16 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
         None
     };
 
+    // Phase 8a2: Stop query liveness monitoring and collect report
+    let query_liveness_report = if let Some(monitor) = query_liveness_monitor {
+        println!("Stopping query liveness monitor and collecting report");
+        let report = monitor.stop().await?;
+        report.print_summary();
+        Some(report)
+    } else {
+        None
+    };
+
     // Phase 8b: Verify TPCH queries (optional)
     let verification_passed = if args.verify {
         println!("Phase 8b: Verifying TPCH queries");
@@ -224,35 +310,6 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
         report.all_passed()
     } else {
         true
-    };
-
-    // Phase 8c: Execute mutations (optional, for CDC testing)
-    let mutation_summary = if args.enable_mutations {
-        println!("Phase 8c: Executing mutations for CDC testing");
-        println!(
-            "  Seed: {}, Count: {}, Insert/Update/Delete: {:.0}%/{:.0}%/{:.0}%",
-            args.mutation_seed,
-            args.mutation_count,
-            args.insert_ratio * 100.0,
-            args.update_ratio * 100.0,
-            args.delete_ratio * 100.0
-        );
-
-        let config = mutations::MutationConfig {
-            seed: args.mutation_seed,
-            count: args.mutation_count,
-            insert_ratio: args.insert_ratio,
-            update_ratio: args.update_ratio,
-            delete_ratio: args.delete_ratio,
-        };
-
-        let mut generator = mutations::MutationGenerator::new(config);
-        let mutation_list = generator.generate_mutations()?;
-        let summary = mutations::execute_mutations(source.as_ref(), &mutation_list).await?;
-        summary.print();
-        Some(summary)
-    } else {
-        None
     };
 
     // Phase 9: Report metrics
@@ -355,12 +412,23 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     }
     if let Some(ref summary) = mutation_summary {
         println!(
-            "Mutations:              {} total ({} inserts, {} updates, {} deletes, {} errors)",
-            summary.total(),
-            summary.inserts,
-            summary.updates,
-            summary.deletes,
-            summary.errors
+            "Mutations:              {} rows, {} mutations ({} successful, {} failed)",
+            summary.total_rows,
+            summary.total_mutations,
+            summary.successful_mutations,
+            summary.failed_mutations
+        );
+    }
+    if args.enable_query_liveness
+        && let Some(ref report) = query_liveness_report
+    {
+        let aggregate = report.aggregate_stats();
+        println!(
+            "Query Liveness:         {} queries ({:.1}% success, avg {:.1}ms, max {:.1}ms)",
+            aggregate.total_queries,
+            aggregate.success_rate(),
+            aggregate.avg_latency().as_secs_f64() * 1000.0,
+            aggregate.max_latency.as_secs_f64() * 1000.0
         );
     }
     println!("{}", "=".repeat(60));
@@ -406,17 +474,19 @@ async fn poll_for_all_markers(
             }
 
             if let Ok(stream) = spice_client.query(query).await
-                && let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
-                    for batch in &batches {
-                        if batch.num_rows() > 0
-                            && let Some(count) = get_count_from_batch(batch)
-                                && count > 0 {
-                                    println!("Marker detected for {dataset_type}");
-                                    detected.insert(*dataset_type, true);
-                                    break;
-                                }
+                && let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await
+            {
+                for batch in &batches {
+                    if batch.num_rows() > 0
+                        && let Some(count) = get_count_from_batch(batch)
+                        && count > 0
+                    {
+                        println!("Marker detected for {dataset_type}");
+                        detected.insert(*dataset_type, true);
+                        break;
                     }
                 }
+            }
         }
 
         // Check if all markers are detected
@@ -461,17 +531,19 @@ async fn wait_for_all_marker_deletions(
             }
 
             if let Ok(stream) = spice_client.query(query).await
-                && let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
-                    for batch in &batches {
-                        if batch.num_rows() > 0
-                            && let Some(count) = get_count_from_batch(batch)
-                                && count == 0 {
-                                    println!("Marker deletion confirmed for {dataset_type}");
-                                    deleted.insert(*dataset_type, true);
-                                    break;
-                                }
+                && let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await
+            {
+                for batch in &batches {
+                    if batch.num_rows() > 0
+                        && let Some(count) = get_count_from_batch(batch)
+                        && count == 0
+                    {
+                        println!("Marker deletion confirmed for {dataset_type}");
+                        deleted.insert(*dataset_type, true);
+                        break;
                     }
                 }
+            }
         }
 
         if deleted.values().all(|&v| v) {
@@ -528,7 +600,7 @@ fn create_source(args: &StreamingTestArgs) -> Result<Box<dyn StreamingSource>> {
             }
         };
 
-        let config = AwsDynamoDbConfig {
+        let config = DynamoDbConfig {
             region: args.aws_region.clone(),
             auth,
             endpoint_url: args.aws_endpoint_url.clone(),

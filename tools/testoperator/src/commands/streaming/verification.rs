@@ -16,13 +16,17 @@ limitations under the License.
 
 //! TPCH query verification for streaming benchmarks.
 //!
-//! Runs TPCH queries against the ingested data to verify correctness.
+//! Uses the existing test-framework validation logic to verify query results
+//! against expected TPCH answers at SF=1.
 
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
 use test_framework::anyhow::{self, Context, Result};
+use test_framework::queries::validation::{
+    QueryValidationFailReason, QueryValidationResult, validate_tpch_query,
+};
 use test_framework::queries::{Query, QueryOverrides, get_tpch_test_queries};
 use test_framework::spiced::SpicedInstance;
 
@@ -95,15 +99,15 @@ impl VerificationReport {
         if self.all_passed() {
             println!("All queries passed verification!");
         } else {
-            println!(
-                "WARNING: {} queries failed verification!",
-                self.failed
-            );
+            println!("WARNING: {} queries failed verification!", self.failed);
         }
     }
 }
 
 /// Run TPCH query verification against the spiced instance.
+///
+/// Uses the test-framework's `validate_tpch_query` function to compare
+/// actual results against expected TPCH answers at SF=1.
 pub async fn verify_tpch_queries(spiced: &SpicedInstance) -> Result<VerificationReport> {
     // Get TPCH queries with DynamoDB overrides (removes unsupported queries like q6)
     let queries = get_tpch_test_queries(Some(QueryOverrides::DynamoDB));
@@ -111,9 +115,7 @@ pub async fn verify_tpch_queries(spiced: &SpicedInstance) -> Result<Verification
     // Filter to only the main 22 TPCH queries (q1-q22), excluding simple queries
     let queries: Vec<Query> = queries
         .into_iter()
-        .filter(|q| {
-            q.name.starts_with("tpch_q") && !q.name.contains("simple")
-        })
+        .filter(|q| q.name.starts_with("tpch_q") && !q.name.contains("simple"))
         .collect();
 
     let mut results = Vec::with_capacity(queries.len());
@@ -146,11 +148,9 @@ pub async fn verify_tpch_queries(spiced: &SpicedInstance) -> Result<Verification
     })
 }
 
-/// Verify a single query.
-async fn verify_single_query(
-    client: &spiceai::Client,
-    query: &Query,
-) -> VerificationResult {
+/// Verify a single query using test-framework's validation logic.
+#[expect(clippy::cast_possible_truncation)]
+async fn verify_single_query(client: &spiceai::Client, query: &Query) -> VerificationResult {
     let start = std::time::Instant::now();
     let sql = query.to_sql_with_inlined_params();
 
@@ -159,11 +159,29 @@ async fn verify_single_query(
             let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
             let duration_ms = start.elapsed().as_millis() as u64;
 
-            VerificationResult {
-                query_name: query.name.to_string(),
-                status: VerificationStatus::Pass,
-                row_count,
-                duration_ms,
+            // Use test-framework's validation logic
+            match validate_tpch_query(query, &batches) {
+                Ok(QueryValidationResult::Pass) => VerificationResult {
+                    query_name: query.name.to_string(),
+                    status: VerificationStatus::Pass,
+                    row_count,
+                    duration_ms,
+                },
+                Ok(QueryValidationResult::Fail(reason)) => {
+                    let error_msg = format_validation_failure(&reason);
+                    VerificationResult {
+                        query_name: query.name.to_string(),
+                        status: VerificationStatus::Failed(error_msg),
+                        row_count,
+                        duration_ms,
+                    }
+                }
+                Err(e) => VerificationResult {
+                    query_name: query.name.to_string(),
+                    status: VerificationStatus::Failed(format!("Validation error: {e}")),
+                    row_count,
+                    duration_ms,
+                },
             }
         }
         Err(e) => {
@@ -190,6 +208,35 @@ async fn verify_single_query(
     }
 }
 
+/// Format a validation failure reason into a human-readable string.
+fn format_validation_failure(reason: &QueryValidationFailReason) -> String {
+    match reason {
+        QueryValidationFailReason::NoExpectedAnswer => "No expected answer available".to_string(),
+        QueryValidationFailReason::NoAnswer => "Query returned no results".to_string(),
+        QueryValidationFailReason::SchemaMismatch => "Schema mismatch".to_string(),
+        QueryValidationFailReason::RowCountMismatch { expected, actual } => {
+            format!("Row count mismatch: expected {expected}, got {actual}")
+        }
+        QueryValidationFailReason::DataMismatch {
+            column,
+            row_number,
+            expected,
+            actual,
+        } => {
+            format!(
+                "Data mismatch in column '{column}' row {row_number}: expected {expected}, got {actual}"
+            )
+        }
+        QueryValidationFailReason::ColumnLengthMismatch {
+            column_name,
+            left_len,
+            right_len,
+        } => {
+            format!("Column length mismatch in '{column_name}': {left_len} vs {right_len}")
+        }
+    }
+}
+
 /// Execute a query with a timeout.
 async fn execute_query_with_timeout(
     client: &spiceai::Client,
@@ -197,10 +244,7 @@ async fn execute_query_with_timeout(
     timeout: Duration,
 ) -> Result<Vec<RecordBatch>> {
     tokio::time::timeout(timeout, async {
-        let stream = client
-            .query(sql)
-            .await
-            .context("Failed to execute query")?;
+        let stream = client.query(sql).await.context("Failed to execute query")?;
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
@@ -208,5 +252,5 @@ async fn execute_query_with_timeout(
         Ok(batches)
     })
     .await
-    .map_err(|_| anyhow::anyhow!("Query execution timed out after {:?}", timeout))?
+    .map_err(|_| anyhow::anyhow!("Query execution timed out after {timeout:?}"))?
 }

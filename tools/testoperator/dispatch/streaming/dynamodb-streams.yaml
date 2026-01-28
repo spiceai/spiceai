@@ -3,7 +3,7 @@ tests:
     spicepod_path: streaming/dynamodb/tpch.yaml
     runner_type: spiceai-dev-runners
     source: dynamodb-streams
-    datasets: tpch
+    queryset: tpch
     scale_factor: 0.01
     ingestion_timeout: 300
     ready_wait: 30

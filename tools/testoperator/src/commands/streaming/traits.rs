@@ -47,6 +47,18 @@ pub trait StreamingDataset: Send + Sync {
 
     /// Returns a SQL query to detect the marker in Spice's accelerated table.
     fn marker_detection_query(&self) -> String;
+
+    /// Returns a simple liveness query for this dataset (e.g., SELECT COUNT(*) FROM table).
+    /// Used for tracking query latency and success rate during ingestion.
+    fn liveness_query(&self) -> String {
+        format!("SELECT COUNT(*) as cnt FROM {}", self.table_name())
+    }
+
+    /// Returns the Arrow schema for this dataset.
+    fn schema(&self) -> arrow::datatypes::Schema;
+
+    /// Returns the primary key column names for this dataset.
+    fn primary_key_columns(&self) -> Vec<&'static str>;
 }
 
 /// Represents a streaming source that can receive data.
@@ -82,6 +94,7 @@ pub trait StreamingSource: Send {
     /// Delete records from the specified table.
     ///
     /// The records should contain only the primary key columns.
+    #[expect(dead_code)]
     async fn delete(&self, table: &str, keys: &[RecordBatch]) -> Result<()>;
 
     /// Cleanup resources (stop containers, etc.).

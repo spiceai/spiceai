@@ -30,7 +30,7 @@ use crate::commands::streaming::traits::StreamingDataset;
 ///
 /// Generates partsupp data using `DuckDB`'s TPCH extension.
 /// Contains 800,000 rows at SF=1.
-/// Has composite primary key: (ps_partkey, ps_suppkey).
+/// Has composite primary key: (`ps_partkey`, `ps_suppkey`).
 pub struct PartsuppDataset;
 
 impl PartsuppDataset {
@@ -131,5 +131,13 @@ impl StreamingDataset for PartsuppDataset {
             "SELECT COUNT(*) as cnt FROM {} WHERE ps_partkey = -1 AND ps_suppkey = -1",
             self.table_name()
         )
+    }
+
+    fn schema(&self) -> arrow::datatypes::Schema {
+        Self::schema()
+    }
+
+    fn primary_key_columns(&self) -> Vec<&'static str> {
+        vec!["ps_partkey", "ps_suppkey"]
     }
 }
