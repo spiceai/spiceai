@@ -16417,6 +16417,7 @@ dependencies = [
  "serde_yaml",
  "snafu",
  "spiceai",
+ "spicepod",
  "tar",
  "tempfile",
  "time",

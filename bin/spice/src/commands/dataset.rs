@@ -21,6 +21,8 @@ use crate::error::{ConfigIoSnafu, CreateDirectorySnafu, InvalidArgumentSnafu};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
+use spicepod::component::{ComponentOrReference, ComponentReference};
+use spicepod::spec::SpicepodDefinition;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -81,39 +83,6 @@ struct AccelerationSpec {
     refresh_check_interval: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh_mode: Option<String>,
-}
-
-/// Spicepod specification for reading/writing spicepod.yaml.
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct SpicepodSpec {
-    #[serde(default)]
-    version: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    datasets: Vec<DatasetRef>,
-    // Preserve other fields
-    #[serde(flatten)]
-    other: HashMap<String, serde_yaml::Value>,
-}
-
-/// Dataset reference in spicepod.yaml.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(untagged)]
-enum DatasetRef {
-    Reference { r#ref: String },
-    Inline(serde_yaml::Value),
-}
-
-impl DatasetRef {
-    fn get_ref(&self) -> Option<&str> {
-        match self {
-            Self::Reference { r#ref } => Some(r#ref),
-            Self::Inline(_) => None,
-        }
-    }
 }
 
 /// Interactive dataset configuration.
@@ -334,23 +303,26 @@ fn update_spicepod_with_dataset(dataset_dir: &Path) -> Result<()> {
         path: spicepod_path.to_path_buf(),
     })?;
 
-    let mut spicepod: SpicepodSpec =
+    let mut spicepod: SpicepodDefinition =
         serde_yaml::from_str(&content).map_err(|e| crate::error::Error::ConfigParse {
             message: format!("Failed to parse spicepod.yaml: {e}"),
         })?;
 
     // Check if dataset is already referenced
     let dataset_ref_path = dataset_dir.to_string_lossy().to_string();
-    let already_referenced = spicepod
-        .datasets
-        .iter()
-        .any(|d| d.get_ref() == Some(&dataset_ref_path));
+    let already_referenced = spicepod.datasets.iter().any(|d| match d {
+        ComponentOrReference::Reference(r) => r.r#ref == dataset_ref_path,
+        ComponentOrReference::Component(_) => false,
+    });
 
     if !already_referenced {
         // Add the dataset reference
-        spicepod.datasets.push(DatasetRef::Reference {
-            r#ref: dataset_ref_path,
-        });
+        spicepod
+            .datasets
+            .push(ComponentOrReference::Reference(ComponentReference {
+                r#ref: dataset_ref_path,
+                depends_on: Vec::new(),
+            }));
 
         // Write back to spicepod.yaml
         let updated_yaml =
@@ -397,13 +369,15 @@ mod tests {
     }
 
     #[test]
-    fn test_dataset_ref_get_ref() {
-        let ref_dataset = DatasetRef::Reference {
-            r#ref: "datasets/test".to_string(),
-        };
-        assert_eq!(ref_dataset.get_ref(), Some("datasets/test"));
-
-        let inline_dataset = DatasetRef::Inline(serde_yaml::Value::Null);
-        assert_eq!(inline_dataset.get_ref(), None);
+    fn test_component_reference() {
+        let ref_dataset: ComponentOrReference<spicepod::component::dataset::Dataset> =
+            ComponentOrReference::Reference(ComponentReference {
+                r#ref: "datasets/test".to_string(),
+                depends_on: Vec::new(),
+            });
+        match &ref_dataset {
+            ComponentOrReference::Reference(r) => assert_eq!(r.r#ref, "datasets/test"),
+            ComponentOrReference::Component(_) => panic!("expected reference"),
+        }
     }
 }

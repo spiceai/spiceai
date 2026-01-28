@@ -87,6 +87,7 @@ time = "0.3"
 
 # Internal crates
 flightrepl = { path = "../../crates/flightrepl" }
+spicepod = { path = "../../crates/spicepod", default-features = false }
 spiceai = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
 
