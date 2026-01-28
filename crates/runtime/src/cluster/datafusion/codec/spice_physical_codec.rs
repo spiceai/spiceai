@@ -18,6 +18,7 @@ use crate::Runtime;
 use crate::metrics::telemetry::track_bytes_processed;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
+#[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
 use datafusion::common::{DataFusionError, Result, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
@@ -90,9 +91,16 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 .fallback_to_new_context(),
             ))
         } else if CayenneAccelerationExecNode::decode(buf).is_ok() {
-            Ok(Arc::new(CayenneAccelerationExec::new(Arc::clone(
-                &inputs[0],
-            ))))
+            #[cfg(not(windows))]
+            {
+                Ok(Arc::new(CayenneAccelerationExec::new(Arc::clone(
+                    &inputs[0],
+                ))))
+            }
+            #[cfg(windows)]
+            {
+                exec_err!("CayenneAccelerationExec is not supported on Windows")
+            }
         } else {
             exec_err!("Cannot deserialize unknown execution plan")
         }
@@ -113,16 +121,23 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             let node = BytesProcessedExecNode {};
             node.encode(buf)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        } else if node
-            .as_any()
-            .downcast_ref::<CayenneAccelerationExec>()
-            .is_some()
-        {
-            let node = CayenneAccelerationExecNode {};
-            node.encode(buf)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
         } else {
-            return self.inner.try_encode(node, buf);
+            #[cfg(not(windows))]
+            if node
+                .as_any()
+                .downcast_ref::<CayenneAccelerationExec>()
+                .is_some()
+            {
+                let node = CayenneAccelerationExecNode {};
+                node.encode(buf)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            } else {
+                return self.inner.try_encode(node, buf);
+            }
+            #[cfg(windows)]
+            {
+                return self.inner.try_encode(node, buf);
+            }
         }
 
         Ok(())
