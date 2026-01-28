@@ -277,22 +277,13 @@ pub async fn create_checkpoint_and_snapshot(
             None
         };
 
-        match snapshot_manager
-            .create_snapshot(
-                federated_schema,
-                lock_guard,
-                updated_at,
-                row_count,
-                force_create,
-            )
+        if let Err(e) = snapshot_manager
+            .create_snapshot(federated_schema, lock_guard, updated_at, row_count, force_create)
             .await
         {
-            Ok(_) => {}
-            Err(e) => {
-                let dataset_label = dataset_name.to_string();
-                snapshot_metrics::record_snapshot_failure(&dataset_label);
-                tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
-            }
+            let dataset_label = dataset_name.to_string();
+            snapshot_metrics::record_snapshot_failure(&dataset_label);
+            tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
         }
     }
 }
