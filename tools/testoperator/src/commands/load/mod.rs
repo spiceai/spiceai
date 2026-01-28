@@ -76,13 +76,14 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let branch_name = git::get_branch_name();
     let spicepod = args.test_args.common.spicepod_path.display().to_string();
 
+    let query_set = args.test_args.load_query_set()?;
     let load_resource = Resource::builder_empty()
         .with_attributes(vec![
             KeyValue::new("service.name", "testoperator"),
             KeyValue::new("type", "load_test"),
             KeyValue::new("name", app.name.clone()),
             KeyValue::new("spiced_version", spiced_version),
-            KeyValue::new("query_set", format!("{:?}", args.test_args.query_set)),
+            KeyValue::new("query_set", query_set.to_string()),
             KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
             KeyValue::new("spiced_commit_sha", spiced_commit_sha),
             KeyValue::new("branch_name", branch_name),
@@ -148,7 +149,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // baseline run
     println!("Running baseline throughput test for {baseline_duration_secs}s",);
 
-    let (_query_set, test_builder) = super::build_test_with_validation(
+    let (_, test_builder) = super::build_test_with_validation(
         &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
