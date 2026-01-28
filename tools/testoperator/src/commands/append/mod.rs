@@ -308,7 +308,7 @@ async fn check_table_counts(
         let expected_count = f64::from(expected_count) * scale_factor;
         let sql = format!("SELECT COUNT(*) FROM {name}");
         let batches = spice_client
-            .query(&sql)
+            .sql(&sql)
             .await?
             .try_collect::<Vec<_>>()
             .await?;

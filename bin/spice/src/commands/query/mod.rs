@@ -16,23 +16,24 @@ limitations under the License.
 
 //! Async query command implementation - submit and manage async queries via /v1/queries API.
 
-mod api;
-
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::output::TableOutput;
-use api::{POLL_INTERVAL, QueriesClient, QueryInfo, QueryStatus, SubmitRequest};
+use arrow::util::pretty::pretty_format_batches;
 use clap::{Args, Subcommand};
 use rustyline::error::ReadlineError;
 use rustyline::{Config, Editor};
+use spiceai::query::{QueryInfo, QueryStatus};
+use spiceai::{Client, ClientBuilder};
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::sync::mpsc;
 
-/// Maximum number of rows to display in results.
-const MAX_DISPLAY_ROWS: usize = 500;
+/// Default poll interval for checking query status.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Spinner frames for the progress indicator.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -106,9 +107,36 @@ struct TrackedQuery {
     submitted_at: Instant,
 }
 
+/// Build the spiceai SDK client from the runtime context.
+async fn build_client(ctx: &RuntimeContext) -> Result<Arc<Client>> {
+    let mut builder = ClientBuilder::new().http_url(ctx.http_endpoint());
+
+    if let Some(api_key) = ctx.api_key() {
+        builder = builder.api_key(api_key);
+    }
+
+    builder = builder.user_agent(ctx.user_agent());
+
+    let client = builder.build().await.map_err(|e| {
+        let err_str = e.to_string();
+        if err_str.contains("connection refused") {
+            crate::error::Error::InvalidResponse {
+                message: format!(
+                    "Spice runtime is unavailable at {}. Is it running?",
+                    ctx.http_endpoint()
+                ),
+            }
+        } else {
+            crate::error::Error::InvalidResponse { message: err_str }
+        }
+    })?;
+
+    Ok(Arc::new(client))
+}
+
 /// Execute the query command.
 pub async fn execute(ctx: &RuntimeContext, args: &QueryArgs) -> Result<()> {
-    let client = QueriesClient::new(ctx);
+    let client = build_client(ctx).await?;
 
     // Handle subcommands
     if let Some(subcmd) = &args.command {
@@ -124,11 +152,11 @@ pub async fn execute(ctx: &RuntimeContext, args: &QueryArgs) -> Result<()> {
     run_query_repl(&client).await
 }
 
-async fn execute_subcommand(client: &QueriesClient<'_>, cmd: &QuerySubcommand) -> Result<()> {
+async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Result<()> {
     match cmd {
         QuerySubcommand::List { status, limit } => {
             let resp = client
-                .list(status.as_deref(), Some(*limit))
+                .queries(status.as_deref(), Some(*limit))
                 .await
                 .map_err(|e| crate::error::Error::InvalidResponse {
                     message: e.to_string(),
@@ -157,25 +185,32 @@ async fn execute_subcommand(client: &QueriesClient<'_>, cmd: &QuerySubcommand) -
             println!("\nTotal: {} queries", resp.queries.len());
         }
         QuerySubcommand::Status { query_id } => {
-            let info = client.get_query(query_id).await.map_err(|e| {
-                crate::error::Error::InvalidResponse {
+            let job =
+                client
+                    .get_query(query_id)
+                    .map_err(|e| crate::error::Error::InvalidResponse {
+                        message: e.to_string(),
+                    })?;
+            let info = job
+                .info()
+                .await
+                .map_err(|e| crate::error::Error::InvalidResponse {
                     message: e.to_string(),
-                }
-            })?;
+                })?;
             display_query_info(&info);
         }
         QuerySubcommand::Results { query_id } => {
             display_results(client, query_id, Duration::ZERO).await?;
         }
         QuerySubcommand::Cancel { query_id } => {
-            let info = client.cancel(query_id).await.map_err(|e| {
+            let info = client.cancel_query(query_id).await.map_err(|e| {
                 crate::error::Error::InvalidResponse {
                     message: e.to_string(),
                 }
             })?;
             println!(
                 "Query {} cancelled (status: {})",
-                info.query_id, info.status.state
+                info.query_id, info.status
             );
         }
     }
@@ -183,47 +218,60 @@ async fn execute_subcommand(client: &QueriesClient<'_>, cmd: &QuerySubcommand) -
 }
 
 async fn submit_and_wait(
-    client: &QueriesClient<'_>,
+    client: &Arc<Client>,
     sql: &str,
     wait: bool,
     timeout: Option<Duration>,
 ) -> Result<()> {
-    let req = SubmitRequest {
-        sql: sql.to_string(),
-        parameters: None,
-        timeout_seconds: None,
-    };
-
-    let resp = client
-        .submit(&req)
+    let job = client
+        .query(sql)
         .await
         .map_err(|e| crate::error::Error::InvalidResponse {
             message: e.to_string(),
         })?;
 
-    println!("Submitted query: {} ({})", resp.query_id, resp.status.state);
+    let query_id = job.id().to_string();
+
+    // Get initial status
+    let initial_status = job
+        .status()
+        .await
+        .map_err(|e| crate::error::Error::InvalidResponse {
+            message: e.to_string(),
+        })?;
+
+    println!("Submitted query: {query_id} ({initial_status})");
 
     if !wait {
-        println!("Status URL: {}", resp.status_url);
-        println!("Results URL: {}", resp.results_url);
+        println!("Check status with: spice query status {query_id}");
+        println!("Get results with: spice query results {query_id}");
         return Ok(());
     }
 
     println!("Waiting for completion... (Ctrl+C to stop waiting)");
 
     let (final_status, was_cancelled, elapsed) =
-        poll_for_completion(client, &resp.query_id, timeout).await;
+        poll_for_completion(client, &query_id, timeout).await;
 
     if was_cancelled {
-        println!("\nStopped waiting. Query ID: {}", resp.query_id);
+        println!("\nStopped waiting. Query ID: {query_id}");
         return Ok(());
     }
 
     if let Some(status) = final_status {
         if status.is_success() {
-            display_results(client, &resp.query_id, elapsed).await?;
+            display_results(client, &query_id, elapsed).await?;
         } else if status.is_failed() {
-            if let Some(err) = &status.error {
+            let job =
+                client
+                    .get_query(&query_id)
+                    .map_err(|e| crate::error::Error::InvalidResponse {
+                        message: e.to_string(),
+                    })?;
+            let info = job.info().await.ok();
+            if let Some(info) = info
+                && let Some(err) = info.error
+            {
                 return Err(crate::error::Error::InvalidResponse {
                     message: format!("query failed: {}", err.message),
                 });
@@ -239,7 +287,7 @@ async fn submit_and_wait(
     Ok(())
 }
 
-async fn run_query_repl(client: &QueriesClient<'_>) -> Result<()> {
+async fn run_query_repl(client: &Arc<Client>) -> Result<()> {
     println!("Welcome to the Spice.ai async query REPL.");
     println!("Type SQL to submit a query, or .help for commands.");
     println!();
@@ -300,69 +348,72 @@ async fn run_query_repl(client: &QueriesClient<'_>) -> Result<()> {
         let _ = rl.add_history_entry(input);
 
         // Submit query
-        let req = SubmitRequest {
-            sql: input.to_string(),
-            parameters: None,
-            timeout_seconds: None,
-        };
-
-        let resp = match client.submit(&req).await {
-            Ok(r) => r,
+        let job = match client.query(input).await {
+            Ok(j) => j,
             Err(e) => {
                 println!("\x1b[31mError:\x1b[0m {e}");
                 continue;
             }
         };
 
+        let query_id = job.id().to_string();
+
+        // Get initial status
+        let initial_state = match job.status().await {
+            Ok(s) => s.to_string(),
+            Err(_) => "PENDING".to_string(),
+        };
+
         // Track the query
         tracked_queries.insert(
-            resp.query_id.clone(),
+            query_id.clone(),
             TrackedQuery {
-                query_id: resp.query_id.clone(),
+                query_id: query_id.clone(),
                 sql: input.to_string(),
-                status: resp.status.state.clone(),
+                status: initial_state.clone(),
                 submitted_at: Instant::now(),
             },
         );
 
-        println!("Submitted query: {} ({})", resp.query_id, resp.status.state);
+        println!("Submitted query: {query_id} ({initial_state})");
         println!("Press Ctrl+C to stop waiting (query continues in background)");
 
         // Poll for completion
         let (final_status, was_cancelled, elapsed) =
-            poll_for_completion(client, &resp.query_id, None).await;
+            poll_for_completion(client, &query_id, None).await;
 
         if was_cancelled {
-            println!(
-                "\nStopped waiting. Check status with: .status {}",
-                resp.query_id
-            );
-            println!("Wait for completion with: .wait {}", resp.query_id);
+            println!("\nStopped waiting. Check status with: .status {query_id}");
+            println!("Wait for completion with: .wait {query_id}");
             continue;
         }
 
         // Update tracked query
-        if let Some(tracked) = tracked_queries.get_mut(&resp.query_id)
+        if let Some(tracked) = tracked_queries.get_mut(&query_id)
             && let Some(ref status) = final_status
         {
-            tracked.status.clone_from(&status.state);
+            tracked.status = status.to_string();
         }
 
         // Handle final status
         if let Some(status) = final_status {
             if status.is_success() {
-                if let Err(e) = display_results(client, &resp.query_id, elapsed).await {
+                if let Err(e) = display_results(client, &query_id, elapsed).await {
                     println!("\x1b[31mError displaying results:\x1b[0m {e}");
                 }
             } else if status.is_failed() {
                 println!("\x1b[31m✗ FAILED\x1b[0m");
-                if let Some(err) = &status.error {
+                let job = client.get_query(&query_id).ok();
+                if let Some(job) = job
+                    && let Ok(info) = job.info().await
+                    && let Some(err) = info.error
+                {
                     println!("Error: {}", err.message);
                 }
             } else if status.is_cancelled() {
                 println!("\x1b[33m⊘ CANCELLED\x1b[0m");
             } else {
-                println!("Query ended with status: {}", status.state);
+                println!("Query ended with status: {status}");
             }
         }
     }
@@ -424,7 +475,7 @@ fn read_query_input(
 }
 
 async fn handle_special_command(
-    client: &QueriesClient<'_>,
+    client: &Arc<Client>,
     cmd: &str,
     tracked_queries: &mut HashMap<String, TrackedQuery>,
 ) -> bool {
@@ -469,8 +520,11 @@ async fn handle_special_command(
             if query_id.is_empty() {
                 return true;
             }
-            match client.get_query(&query_id).await {
-                Ok(info) => display_query_info(&info),
+            match client.get_query(&query_id) {
+                Ok(job) => match job.info().await {
+                    Ok(info) => display_query_info(&info),
+                    Err(e) => println!("\x1b[31mError:\x1b[0m {e}"),
+                },
                 Err(e) => println!("\x1b[31mError:\x1b[0m {e}"),
             }
         }
@@ -510,14 +564,14 @@ async fn handle_special_command(
             if query_id.is_empty() {
                 return true;
             }
-            match client.cancel(&query_id).await {
+            match client.cancel_query(&query_id).await {
                 Ok(info) => {
                     println!(
                         "Query {} cancelled (status: {})",
-                        info.query_id, info.status.state
+                        info.query_id, info.status
                     );
                     if let Some(tracked) = tracked_queries.get_mut(&query_id) {
-                        tracked.status = info.status.state;
+                        tracked.status = info.status.to_string();
                     }
                 }
                 Err(e) => println!("\x1b[31mError:\x1b[0m {e}"),
@@ -568,7 +622,7 @@ fn resolve_query_id(partial: &str, tracked_queries: &HashMap<String, TrackedQuer
 }
 
 async fn wait_for_query(
-    client: &QueriesClient<'_>,
+    client: &Arc<Client>,
     query_id: &str,
     tracked_queries: &mut HashMap<String, TrackedQuery>,
 ) {
@@ -585,7 +639,7 @@ async fn wait_for_query(
     if let Some(tracked) = tracked_queries.get_mut(query_id)
         && let Some(ref status) = final_status
     {
-        tracked.status.clone_from(&status.state);
+        tracked.status = status.to_string();
     }
 
     if let Some(status) = final_status {
@@ -595,7 +649,11 @@ async fn wait_for_query(
             }
         } else if status.is_failed() {
             println!("\x1b[31m✗ FAILED\x1b[0m");
-            if let Some(err) = &status.error {
+            let job = client.get_query(query_id).ok();
+            if let Some(job) = job
+                && let Ok(info) = job.info().await
+                && let Some(err) = info.error
+            {
                 println!("Error: {}", err.message);
             }
         } else if status.is_cancelled() {
@@ -605,7 +663,7 @@ async fn wait_for_query(
 }
 
 async fn poll_for_completion(
-    client: &QueriesClient<'_>,
+    client: &Arc<Client>,
     query_id: &str,
     timeout: Option<Duration>,
 ) -> (Option<QueryStatus>, bool, Duration) {
@@ -636,25 +694,26 @@ async fn poll_for_completion(
                     return (None, true, start_time.elapsed());
                 }
 
-                if let Ok(status) = client.get_status(query_id).await {
-                    let elapsed = start_time.elapsed();
+                if let Ok(job) = client.get_query(query_id)
+                    && let Ok(status) = job.status().await {
+                        let elapsed = start_time.elapsed();
 
-                    if status.is_terminal() {
-                        // Clear spinner and show final status
-                        print!("\r\x1b[K");
-                        let _ = std::io::stdout().flush();
-                        if status.is_success() {
-                            println!("\x1b[32m✓ SUCCEEDED\x1b[0m ({:.1}s)", elapsed.as_secs_f64());
+                        if status.is_terminal() {
+                            // Clear spinner and show final status
+                            print!("\r\x1b[K");
+                            let _ = std::io::stdout().flush();
+                            if status.is_success() {
+                                println!("\x1b[32m✓ SUCCEEDED\x1b[0m ({:.1}s)", elapsed.as_secs_f64());
+                            }
+                            return (Some(status), false, elapsed);
                         }
-                        return (Some(status), false, elapsed);
-                    }
 
-                    // Update spinner
-                    let frame = SPINNER_FRAMES[spinner_idx % SPINNER_FRAMES.len()];
-                    spinner_idx += 1;
-                    print!("\r{} {} ({:.1}s)...", frame, status.state, elapsed.as_secs_f64());
-                    let _ = std::io::stdout().flush();
-                }
+                        // Update spinner
+                        let frame = SPINNER_FRAMES[spinner_idx % SPINNER_FRAMES.len()];
+                        spinner_idx += 1;
+                        print!("\r{} {} ({:.1}s)...", frame, status, elapsed.as_secs_f64());
+                        let _ = std::io::stdout().flush();
+                    }
                 // Continue polling on transient errors
             }
         }
@@ -678,64 +737,44 @@ impl CtrlCGuard {
     }
 }
 
-async fn display_results(
-    client: &QueriesClient<'_>,
-    query_id: &str,
-    elapsed: Duration,
-) -> Result<()> {
-    // First get query info to check status and get manifest
-    let info =
-        client
-            .get_query(query_id)
-            .await
-            .map_err(|e| crate::error::Error::InvalidResponse {
-                message: e.to_string(),
-            })?;
+async fn display_results(client: &Arc<Client>, query_id: &str, elapsed: Duration) -> Result<()> {
+    // First get query info to check status
+    let job = client
+        .get_query(query_id)
+        .map_err(|e| crate::error::Error::InvalidResponse {
+            message: e.to_string(),
+        })?;
+
+    let info = job
+        .info()
+        .await
+        .map_err(|e| crate::error::Error::InvalidResponse {
+            message: e.to_string(),
+        })?;
 
     if !info.status.is_success() {
         return Err(crate::error::Error::InvalidResponse {
             message: format!(
                 "query '{}' is still {}. Use .wait {} to wait for completion",
-                query_id, info.status.state, query_id
+                query_id, info.status, query_id
             ),
         });
     }
 
-    let manifest = info
-        .manifest
-        .ok_or_else(|| crate::error::Error::InvalidResponse {
-            message: "no result manifest available".to_string(),
+    // Fetch results as Arrow RecordBatches
+    let batches = job
+        .results()
+        .await
+        .map_err(|e| crate::error::Error::InvalidResponse {
+            message: format!("getting results: {e}"),
         })?;
 
-    // Collect all rows up to MAX_DISPLAY_ROWS
-    let mut all_rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
-    let total_rows = manifest.total_row_count;
-    let mut chunk_index = 0;
+    let total_rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
 
-    while all_rows.len() < MAX_DISPLAY_ROWS && chunk_index < manifest.total_chunk_count {
-        let chunk = client
-            .get_results(query_id, chunk_index)
-            .await
-            .map_err(|e| crate::error::Error::InvalidResponse {
-                message: format!("getting chunk {chunk_index}: {e}"),
-            })?;
-
-        if let Some(data_array) = chunk.data_array {
-            for row in data_array {
-                if all_rows.len() >= MAX_DISPLAY_ROWS {
-                    break;
-                }
-                all_rows.push(row);
-            }
-        }
-
-        match chunk.next_chunk_index {
-            Some(next) => chunk_index = next,
-            None => break,
-        }
-    }
-
-    if all_rows.is_empty() {
+    if total_rows == 0 {
         if elapsed > Duration::ZERO {
             println!("Time: {:.8} seconds. 0 rows.", elapsed.as_secs_f64());
         } else {
@@ -744,30 +783,13 @@ async fn display_results(
         return Ok(());
     }
 
-    // Build column info from manifest
-    let mut col_names: Vec<String> = vec![String::new(); manifest.schema.columns.len()];
-    let mut col_types: Vec<String> = vec![String::new(); manifest.schema.columns.len()];
+    // Use Arrow's pretty formatting to display results
+    let formatted =
+        pretty_format_batches(&batches).map_err(|e| crate::error::Error::InvalidResponse {
+            message: format!("formatting results: {e}"),
+        })?;
 
-    for col in &manifest.schema.columns {
-        if col.position < col_names.len() {
-            col_names[col.position].clone_from(&col.name);
-            col_types[col.position].clone_from(&col.type_name);
-        }
-    }
-
-    // Build table
-    let headers: Vec<&str> = col_names.iter().map(String::as_str).collect();
-    let mut table = TableOutput::new(headers);
-
-    for row in &all_rows {
-        let row_values: Vec<String> = col_names
-            .iter()
-            .map(|col_name| row.get(col_name).map(format_json_value).unwrap_or_default())
-            .collect();
-        table.add_row(row_values);
-    }
-
-    table.print();
+    println!("{formatted}");
 
     // Show timing and row count
     if elapsed > Duration::ZERO {
@@ -776,44 +798,22 @@ async fn display_results(
             elapsed.as_secs_f64(),
             total_rows
         );
-    } else if all_rows.len() < total_rows {
-        println!("\nShowing {}/{} rows", all_rows.len(), total_rows);
     } else {
-        println!("\n{} row(s)", all_rows.len());
+        println!("\n{total_rows} row(s)");
     }
 
     Ok(())
 }
 
-fn format_json_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        _ => v.to_string(),
-    }
-}
-
 fn display_query_info(info: &QueryInfo) {
     println!("Query ID:    {}", info.query_id);
-    println!("Status:      {}", info.status.state);
-    println!("Created:     {}", info.created_at);
-    if let Some(ref started) = info.started_at {
-        println!("Started:     {started}");
-    }
-    if let Some(ref completed) = info.completed_at {
-        println!("Completed:   {completed}");
-    }
-    if let Some(ref expires) = info.expires_at {
-        println!("Expires:     {expires}");
-    }
-    if let Some(ref err) = info.status.error {
+    println!("Status:      {}", info.status);
+    if let Some(ref err) = info.error {
         println!("Error:       {}", err.message);
     }
-    if let Some(ref manifest) = info.manifest {
-        println!("Rows:        {}", manifest.total_row_count);
-        println!("Chunks:      {}", manifest.total_chunk_count);
+    if let Some(ref result) = info.result {
+        println!("Rows:        {}", result.total_rows);
+        println!("Chunks:      {}", result.total_chunks);
     }
 }
 

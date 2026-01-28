@@ -564,7 +564,7 @@ impl SpiceTestQueryWorker {
         let query_start = Instant::now();
 
         let mut result_stream = spice_client
-            .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
+            .sql_with_params(&query.sql, query.get_parameters_batch().transpose()?)
             .await?;
 
         let mut row_count: usize = 0;
@@ -632,7 +632,7 @@ impl SpiceTestQueryWorker {
                 );
 
                 let mut ref_result_stream = spice_client
-                    .query_with_params(
+                    .sql_with_params(
                         &reference_query.sql,
                         reference_query.get_parameters_batch().transpose()?,
                     )
