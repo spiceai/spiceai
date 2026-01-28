@@ -302,31 +302,30 @@ jobs:
           path: spice_darwin_aarch64.tar.gz
 
   # ==================== DOCKER IMAGE BUILD JOBS ====================
+  # These jobs use pre-built spiced binaries from the CLI build jobs
 
   build-docker-arm64:
     name: Build Docker - ARM64
-    needs: [check_commits, setup]
+    needs: [check_commits, setup, build-cli-linux-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: hosted-linux-arm-runner
-    env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - name: Add nightly postfix to version in Cargo.toml
-        env:
-          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
+      - name: Download spiced binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        with:
+          name: spiced_linux_aarch64
+          path: /tmp
+
+      - name: Extract spiced binary
         run: |
-          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
-            new_version="${current_version}.$NIGHTLY_LABEL"
-          else
-            new_version="${current_version}-$NIGHTLY_LABEL"
-          fi
-          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
-          grep '^version =' Cargo.toml
+          tar -xzf /tmp/spiced_linux_aarch64.tar.gz -C .
+          chmod +x spiced
+          mv spiced .spiced-local-tmp
+          ./.spiced-local-tmp --version
 
       - name: Install docker
         run: |
@@ -353,137 +352,66 @@ jobs:
           driver-opts: |
             image=moby/buildkit:latest
 
-      - name: default
-        run: |
-          echo "IMAGE_TAG=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
-      - &build-arm64-image
-        name: Build ARM64 ${{ env.IMAGE_TAG }} image
+      - name: Build ARM64 Docker image
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.local
           platforms: linux/arm64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64,dest=/tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-arm64
-          cache-to: type=gha,scope=build-arm64,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            CARGO_NO_DEFAULT_FEATURES=${{ env.CARGO_NO_DEFAULT_FEATURES }}
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
-      - name: data
-        run: |
-          echo "IMAGE_TAG=data" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=true" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: jemalloc
-        run: |
-          echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: mimalloc
-        run: |
-          echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: sysalloc
-        run: |
-          echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-system" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
-      - *build-arm64-image
-      - name: Upload ARM64 artifacts
+          outputs: type=docker,name=localhost:5000/spiceai:default-arm64,dest=/tmp/image-arm64-default.tar
+          cache-from: type=gha,scope=build-docker-arm64
+          cache-to: type=gha,scope=build-docker-arm64,mode=max
+
+      - name: Upload ARM64 Docker image
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: images-arm64
-          path: /tmp/image-arm64-*.tar
+          path: /tmp/image-arm64-default.tar
 
   build-docker-amd64:
     name: Build Docker - AMD64
-    needs: [check_commits, setup]
+    needs: [check_commits, setup, build-cli-linux-x64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: spiceai-dev-runners
-    env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - name: Add nightly postfix to version in Cargo.toml
-        env:
-          NIGHTLY_LABEL: ${{ needs.setup.outputs.nightly_label }}
+      - name: Download spiced binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        with:
+          name: spiced_linux_x86_64
+          path: /tmp
+
+      - name: Extract spiced binary
         run: |
-          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
-            new_version="${current_version}.$NIGHTLY_LABEL"
-          else
-            new_version="${current_version}-$NIGHTLY_LABEL"
-          fi
-          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
-          grep '^version =' Cargo.toml
+          tar -xzf /tmp/spiced_linux_x86_64.tar.gz -C .
+          chmod +x spiced
+          mv spiced .spiced-local-tmp
+          ./.spiced-local-tmp --version
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
-          # Enable docker driver for layer caching
           driver-opts: |
             image=moby/buildkit:latest
 
-      - name: default
-        run: |
-          echo "IMAGE_TAG=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
-      - &build-amd64-image
-        name: Build AMD64 ${{ env.IMAGE_TAG }} image
+      - name: Build AMD64 Docker image
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.local
           platforms: linux/amd64
-          outputs: type=docker,name=localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64,dest=/tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
-          cache-from: type=gha,scope=build-amd64
-          cache-to: type=gha,scope=build-amd64,mode=max
-          build-args: |
-            REL_VERSION=${{ needs.setup.outputs.rel_version }}
-            CARGO_FEATURES=${{ env.CARGO_FEATURES }}
-            CARGO_NO_DEFAULT_FEATURES=${{ env.CARGO_NO_DEFAULT_FEATURES }}
-            RUST_PROFILE=${{ env.RUST_PROFILE }}
-      - name: data
-        run: |
-          echo "IMAGE_TAG=data" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=true" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: jemalloc
-        run: |
-          echo "IMAGE_TAG=jemalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-jemalloc" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: mimalloc
-        run: |
-          echo "IMAGE_TAG=mimalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-mimalloc" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: sysalloc
-        run: |
-          echo "IMAGE_TAG=sysalloc" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models,postgres-accel,alloc-system" >> $GITHUB_ENV
-          echo "CARGO_NO_DEFAULT_FEATURES=false" >> $GITHUB_ENV
-      - *build-amd64-image
-      - name: Upload AMD64 artifacts
+          outputs: type=docker,name=localhost:5000/spiceai:default-amd64,dest=/tmp/image-amd64-default.tar
+          cache-from: type=gha,scope=build-docker-amd64
+          cache-to: type=gha,scope=build-docker-amd64,mode=max
+
+      - name: Upload AMD64 Docker image
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: images-amd64
-          path: /tmp/image-amd64-*.tar
+          path: /tmp/image-amd64-default.tar
 
   publish-docker:
     name: Publish Docker Images
@@ -533,47 +461,38 @@ jobs:
           echo "REL_VERSION=${REL_VERSION}"
           echo "PUBLISH=${PUBLISH}"
 
-          # Variants: default (models), data (no models), and allocator variants
-          variants=("default" "data" "jemalloc" "mimalloc" "sysalloc")
-          for variant in "${variants[@]}"; do
-            suffix=""
-            if [ "$variant" != "default" ]; then
-              suffix="-${variant}"
-            fi
+          # Load both architecture images
+          echo "Loading AMD64 image"
+          docker load -i /tmp/image-amd64-default.tar
+          echo "Loading ARM64 image"
+          docker load -i /tmp/image-arm64-default.tar
 
-            # Load both architecture images
-            echo "Loading AMD64 image for ${variant}"
-            docker load -i /tmp/image-amd64-${variant}.tar
-            echo "Loading ARM64 image for ${variant}"
-            docker load -i /tmp/image-arm64-${variant}.tar
+          # Push images to local registry
+          echo "Pushing images to local registry"
+          docker push localhost:5000/spiceai:default-amd64
+          docker push localhost:5000/spiceai:default-arm64
 
-            # Push images to local registry
-            echo "Pushing images to local registry"
-            docker push localhost:5000/spiceai:${variant}-amd64
-            docker push localhost:5000/spiceai:${variant}-arm64
+          if [[ "${PUBLISH}" == "true" ]]; then
+            # Push to GitHub Container Registry
+            echo "Pushing to GHCR"
+            docker buildx imagetools create \
+              -t ghcr.io/spiceai/spiceai-nightly:${REL_VERSION} \
+              -t ghcr.io/spiceai/spiceai-nightly:latest \
+              localhost:5000/spiceai:default-amd64 \
+              localhost:5000/spiceai:default-arm64
 
-            if [[ "${PUBLISH}" == "true" ]]; then
-              # Push to GitHub Container Registry
-              echo "Pushing ${variant} to GHCR"
-              docker buildx imagetools create \
-                -t ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}${suffix} \
-                -t ghcr.io/spiceai/spiceai-nightly:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
+            echo "Verifying GHCR image:"
+            docker buildx imagetools inspect ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}
+          else
+            echo "Skipping push for non-tag build"
+            echo "Creating local manifest for testing:"
+            docker buildx imagetools create \
+              -t localhost:5000/spiceai:latest \
+              localhost:5000/spiceai:default-amd64 \
+              localhost:5000/spiceai:default-arm64
 
-              echo "Verifying GHCR image:"
-              docker buildx imagetools inspect ghcr.io/spiceai/spiceai-nightly:${REL_VERSION}${suffix}
-            else
-              echo "Skipping push for non-tag build"
-              echo "Creating local manifest for testing:"
-              docker buildx imagetools create \
-                -t localhost:5000/spiceai:latest${suffix} \
-                localhost:5000/spiceai:${variant}-amd64 \
-                localhost:5000/spiceai:${variant}-arm64
-
-              docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
-            fi
-          done
+            docker buildx imagetools inspect localhost:5000/spiceai:latest
+          fi
 
       - name: Update nightly tag
         run: |
