@@ -252,7 +252,7 @@ pub async fn execute_mutation_sequences(
 
     for dataset in datasets {
         let dataset_type = dataset.dataset_type();
-        let table_name = dataset.table_name();
+        let table_name = source.get_table_name(dataset.table_name());
 
         // Find the original data for this dataset
         let Some((_, batches)) = original_data.iter().find(|(dt, _)| *dt == dataset_type) else {
@@ -308,9 +308,9 @@ pub async fn execute_mutation_sequences(
 
             // Execute the batch operation
             let result = if is_insert {
-                source.insert(table_name, &batches).await
+                source.insert(&table_name, &batches).await
             } else {
-                source.update(table_name, &batches).await
+                source.update(&table_name, &batches).await
             };
 
             match result {

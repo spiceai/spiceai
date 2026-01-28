@@ -38,6 +38,7 @@ pub mod datasets;
 pub mod mutations;
 pub mod query_liveness;
 pub mod querysets;
+pub mod run_config;
 pub mod sources;
 mod traits;
 pub mod verification;
@@ -87,8 +88,18 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     );
     println!("Scale factor: {}", args.scale_factor);
 
-    // Create source
+    // Create run config for isolated test runs
+    let mut run_config = run_config::RunConfig::new();
+
+    // Collect table names for spicepod rewriting
+    let table_names: Vec<&str> = datasets.iter().map(|d| d.table_name()).collect();
+
+    // Prepare the spicepod with rewritten table names
+    let spicepod_path = run_config.prepare_spicepod(&args.common.spicepod_path, &table_names)?;
+
+    // Create source and set table prefix
     let mut source = create_source(args)?;
+    source.set_table_prefix(run_config.run_id().to_string());
 
     // Phase 1: Prepare source
     println!("Phase 1: Preparing streaming source");
@@ -170,11 +181,10 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
         println!("Phase 4: Inserting data for all datasets");
         for info in &dataset_infos {
             let dataset_type = info.dataset.dataset_type();
-            println!("Inserting data for {dataset_type}");
+            let table_name = source.get_table_name(info.dataset.table_name());
+            println!("Inserting data for {dataset_type} into {table_name}");
             let insert_start = Instant::now();
-            source
-                .insert(info.dataset.table_name(), &info.generated_data)
-                .await?;
+            source.insert(&table_name, &info.generated_data).await?;
             total_insert_duration += insert_start.elapsed();
         }
         None
@@ -185,11 +195,9 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     // Phase 5: Insert markers for all datasets
     println!("Phase 5: Inserting marker records for all datasets");
     for info in &dataset_infos {
+        let table_name = source.get_table_name(info.dataset.table_name());
         source
-            .insert(
-                info.dataset.table_name(),
-                std::slice::from_ref(&info.marker),
-            )
+            .insert(&table_name, std::slice::from_ref(&info.marker))
             .await?;
     }
 
@@ -198,9 +206,9 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
 
     // Phase 6: Start Spiced
     println!("Phase 6: Starting Spiced with streaming connector");
-    println!("Using spicepod: {}", args.common.spicepod_path.display());
+    println!("Using spicepod: {}", spicepod_path.display());
 
-    let spicepod_def = load_spicepod(args.common.spicepod_path.clone())?;
+    let spicepod_def = load_spicepod(spicepod_path.clone())?;
     let mut start_request = StartRequest::new(args.common.spiced_path_buf(), spicepod_def)?;
 
     if let Some(ref data_dir) = args.common.data_dir {

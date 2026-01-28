@@ -67,6 +67,15 @@ pub trait StreamingDataset: Send + Sync {
 /// like key schemas, topic settings, etc.
 #[async_trait::async_trait]
 pub trait StreamingSource: Send {
+    /// Set a table name prefix for isolated test runs.
+    ///
+    /// When set, all table names will be prefixed with this value.
+    /// For example, with prefix "abc123", table "lineitem" becomes "abc123_lineitem".
+    fn set_table_prefix(&mut self, prefix: String);
+
+    /// Get the actual table name, applying the prefix if set.
+    fn get_table_name(&self, base_name: &str) -> String;
+
     /// Start containers and initialize the source.
     async fn prepare(&mut self) -> Result<()>;
 

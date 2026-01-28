@@ -96,6 +96,8 @@ impl DynamoDbConfig {
 pub struct DynamoDbStreamsSource {
     config: DynamoDbConfig,
     client: Option<Client>,
+    /// Optional table name prefix for isolated test runs.
+    table_prefix: Option<String>,
 }
 
 impl DynamoDbStreamsSource {
@@ -105,6 +107,15 @@ impl DynamoDbStreamsSource {
         Self {
             config,
             client: None,
+            table_prefix: None,
+        }
+    }
+
+    /// Get the actual table name, applying prefix if set.
+    fn prefixed_table_name(&self, base_name: &str) -> String {
+        match &self.table_prefix {
+            Some(prefix) => format!("{prefix}_{base_name}"),
+            None => base_name.to_string(),
         }
     }
 
@@ -592,11 +603,11 @@ impl DynamoDbStreamsSource {
         Ok(())
     }
 
-    /// Create the lineitem table with composite key.
-    async fn create_lineitem_table(&self, client: &Client) -> Result<()> {
+    /// Create the lineitem table with composite key and specified table name.
+    async fn create_lineitem_table_named(&self, client: &Client, table_name: &str) -> Result<()> {
         client
             .create_table()
-            .table_name("lineitem")
+            .table_name(table_name)
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name("l_orderkey")
@@ -635,17 +646,17 @@ impl DynamoDbStreamsSource {
             )
             .send()
             .await
-            .context("Failed to create lineitem table")?;
+            .with_context(|| format!("Failed to create {table_name} table"))?;
 
-        println!("Created table 'lineitem' with DynamoDB Streams enabled");
+        println!("Created table '{table_name}' with DynamoDB Streams enabled");
         Ok(())
     }
 
-    /// Create the partsupp table with composite key.
-    async fn create_partsupp_table(&self, client: &Client) -> Result<()> {
+    /// Create the partsupp table with composite key and specified table name.
+    async fn create_partsupp_table_named(&self, client: &Client, table_name: &str) -> Result<()> {
         client
             .create_table()
-            .table_name("partsupp")
+            .table_name(table_name)
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name("ps_partkey")
@@ -684,9 +695,9 @@ impl DynamoDbStreamsSource {
             )
             .send()
             .await
-            .context("Failed to create partsupp table")?;
+            .with_context(|| format!("Failed to create {table_name} table"))?;
 
-        println!("Created table 'partsupp' with DynamoDB Streams enabled");
+        println!("Created table '{table_name}' with DynamoDB Streams enabled");
         Ok(())
     }
 
@@ -709,39 +720,48 @@ impl DynamoDbStreamsSource {
         Ok(())
     }
 
-    /// Delete the lineitem marker record.
-    async fn delete_lineitem_marker(&self, client: &Client) -> Result<()> {
+    /// Delete the lineitem marker record from the specified table.
+    async fn delete_lineitem_marker_named(&self, client: &Client, table_name: &str) -> Result<()> {
         client
             .delete_item()
-            .table_name("lineitem")
+            .table_name(table_name)
             .key("l_orderkey", AttributeValue::N("-1".to_string()))
             .key("l_linenumber", AttributeValue::N("-1".to_string()))
             .send()
             .await
-            .context("Failed to delete lineitem marker record")?;
+            .with_context(|| format!("Failed to delete {table_name} marker record"))?;
 
-        println!("Deleted marker record from 'lineitem'");
+        println!("Deleted marker record from '{table_name}'");
         Ok(())
     }
 
-    /// Delete the partsupp marker record.
-    async fn delete_partsupp_marker(&self, client: &Client) -> Result<()> {
+    /// Delete the partsupp marker record from the specified table.
+    async fn delete_partsupp_marker_named(&self, client: &Client, table_name: &str) -> Result<()> {
         client
             .delete_item()
-            .table_name("partsupp")
+            .table_name(table_name)
             .key("ps_partkey", AttributeValue::N("-1".to_string()))
             .key("ps_suppkey", AttributeValue::N("-1".to_string()))
             .send()
             .await
-            .context("Failed to delete partsupp marker record")?;
+            .with_context(|| format!("Failed to delete {table_name} marker record"))?;
 
-        println!("Deleted marker record from 'partsupp'");
+        println!("Deleted marker record from '{table_name}'");
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl StreamingSource for DynamoDbStreamsSource {
+    fn set_table_prefix(&mut self, prefix: String) {
+        println!("Setting table prefix: {prefix}");
+        self.table_prefix = Some(prefix);
+    }
+
+    fn get_table_name(&self, base_name: &str) -> String {
+        self.prefixed_table_name(base_name)
+    }
+
     async fn prepare(&mut self) -> Result<()> {
         // For AWS DynamoDB, we just need to create the client
         // No container management needed
@@ -754,6 +774,10 @@ impl StreamingSource for DynamoDbStreamsSource {
             println!("Using custom endpoint: {endpoint}");
         }
 
+        if let Some(ref prefix) = self.table_prefix {
+            println!("Using table prefix: {prefix}");
+        }
+
         self.client = Some(Self::create_client(&self.config));
 
         println!("AWS DynamoDB client initialized successfully");
@@ -762,46 +786,53 @@ impl StreamingSource for DynamoDbStreamsSource {
 
     async fn create_table(&self, dataset: DatasetType) -> Result<()> {
         let client = self.client()?;
-        let table_name = dataset.table_name();
+        let base_name = dataset.table_name();
+        let table_name = self.prefixed_table_name(base_name);
 
         // Delete table if it exists
-        Self::delete_table_if_exists(client, table_name).await?;
+        Self::delete_table_if_exists(client, &table_name).await?;
 
-        // Create the table
+        // Create the table with prefixed name
         match dataset {
-            DatasetType::Lineitem => self.create_lineitem_table(client).await?,
+            DatasetType::Lineitem => {
+                self.create_lineitem_table_named(client, &table_name).await?;
+            }
             DatasetType::Orders => {
-                self.create_simple_table(client, "orders", "o_orderkey")
+                self.create_simple_table(client, &table_name, "o_orderkey")
                     .await?;
             }
             DatasetType::Customer => {
-                self.create_simple_table(client, "customer", "c_custkey")
+                self.create_simple_table(client, &table_name, "c_custkey")
                     .await?;
             }
             DatasetType::Part => {
-                self.create_simple_table(client, "part", "p_partkey")
+                self.create_simple_table(client, &table_name, "p_partkey")
                     .await?;
             }
             DatasetType::Supplier => {
-                self.create_simple_table(client, "supplier", "s_suppkey")
+                self.create_simple_table(client, &table_name, "s_suppkey")
                     .await?;
             }
-            DatasetType::Partsupp => self.create_partsupp_table(client).await?,
+            DatasetType::Partsupp => {
+                self.create_partsupp_table_named(client, &table_name)
+                    .await?;
+            }
             DatasetType::Nation => {
-                self.create_simple_table(client, "nation", "n_nationkey")
+                self.create_simple_table(client, &table_name, "n_nationkey")
                     .await?;
             }
             DatasetType::Region => {
-                self.create_simple_table(client, "region", "r_regionkey")
+                self.create_simple_table(client, &table_name, "r_regionkey")
                     .await?;
             }
             DatasetType::Hits => {
-                self.create_simple_table(client, "hits", "WatchID").await?;
+                self.create_simple_table(client, &table_name, "WatchID")
+                    .await?;
             }
         }
 
         // Wait for table to be ACTIVE
-        Self::wait_for_table_active(client, table_name).await?;
+        Self::wait_for_table_active(client, &table_name).await?;
 
         Ok(())
     }
@@ -813,36 +844,45 @@ impl StreamingSource for DynamoDbStreamsSource {
 
     async fn delete_marker(&self, dataset: DatasetType) -> Result<()> {
         let client = self.client()?;
+        let base_name = dataset.table_name();
+        let table_name = self.prefixed_table_name(base_name);
 
         match dataset {
-            DatasetType::Lineitem => self.delete_lineitem_marker(client).await?,
+            DatasetType::Lineitem => {
+                self.delete_lineitem_marker_named(client, &table_name)
+                    .await?;
+            }
             DatasetType::Orders => {
-                self.delete_simple_marker(client, "orders", "o_orderkey")
+                self.delete_simple_marker(client, &table_name, "o_orderkey")
                     .await?;
             }
             DatasetType::Customer => {
-                self.delete_simple_marker(client, "customer", "c_custkey")
+                self.delete_simple_marker(client, &table_name, "c_custkey")
                     .await?;
             }
             DatasetType::Part => {
-                self.delete_simple_marker(client, "part", "p_partkey")
+                self.delete_simple_marker(client, &table_name, "p_partkey")
                     .await?;
             }
             DatasetType::Supplier => {
-                self.delete_simple_marker(client, "supplier", "s_suppkey")
+                self.delete_simple_marker(client, &table_name, "s_suppkey")
                     .await?;
             }
-            DatasetType::Partsupp => self.delete_partsupp_marker(client).await?,
+            DatasetType::Partsupp => {
+                self.delete_partsupp_marker_named(client, &table_name)
+                    .await?;
+            }
             DatasetType::Nation => {
-                self.delete_simple_marker(client, "nation", "n_nationkey")
+                self.delete_simple_marker(client, &table_name, "n_nationkey")
                     .await?;
             }
             DatasetType::Region => {
-                self.delete_simple_marker(client, "region", "r_regionkey")
+                self.delete_simple_marker(client, &table_name, "r_regionkey")
                     .await?;
             }
             DatasetType::Hits => {
-                self.delete_simple_marker(client, "hits", "WatchID").await?;
+                self.delete_simple_marker(client, &table_name, "WatchID")
+                    .await?;
             }
         }
 
