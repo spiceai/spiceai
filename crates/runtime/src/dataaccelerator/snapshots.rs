@@ -100,7 +100,7 @@ pub(super) async fn download_snapshot_if_needed(
             }
             Ok(None) => BootstrapStatus::none(),
             Err(e) => {
-                tracing::error!("Failed to download snapshot: {}", e);
+                tracing::error!(dataset = %dataset_name, error = %e, "Failed to download snapshot");
                 BootstrapStatus::none()
             }
         }
