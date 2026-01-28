@@ -16,8 +16,8 @@ datasets:
 #      enabled: true
 #      engine: arrow
 #      refresh_mode: changes
-  - from: dynamodb:region
-    name: region
+  - from: dynamodb:lineitem
+    name: lineitem
     params:
       dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: test

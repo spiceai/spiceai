@@ -36,14 +36,14 @@ impl QuerySetType {
         match self {
             Self::Tpch => vec![
                 // Load in order of dependencies: small dimension tables first
-                Box::new(RegionDataset),
-                Box::new(NationDataset),
+                // Box::new(RegionDataset),
+                // Box::new(NationDataset),
                 // Box::new(SupplierDataset),
                 // Box::new(PartDataset),
                 // Box::new(PartsuppDataset),
                 // Box::new(CustomerDataset),
                 // Box::new(OrdersDataset),
-                // Box::new(LineitemDataset),
+                Box::new(LineitemDataset),
             ],
             Self::Clickbench => vec![Box::new(HitsDataset)],
         }
