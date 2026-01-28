@@ -98,8 +98,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version=$(spice version 2>&1)
-          # Released CLI version format: "v1.11.0" (no commit hash in release builds)
-          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
+          # CLI version may include commit hash like "v1.11.0 (f2e8ad5)" - extract just the version
+          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
           runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
 
           release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')"
@@ -186,8 +186,8 @@ jobs:
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
           version=$(spice version 2>&1)
-          # Released CLI version format: "v1.11.0" (no commit hash in release builds)
-          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
+          # CLI version may include commit hash like "v1.11.0 (f2e8ad5)" - extract just the version
+          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
           runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
 
           # Use bash array for optional curl args to avoid quoting issues
