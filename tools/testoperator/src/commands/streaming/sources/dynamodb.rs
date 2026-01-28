@@ -38,39 +38,45 @@ use test_framework::anyhow::{self, Context, Result};
 use crate::commands::streaming::datasets::DatasetType;
 use crate::commands::streaming::traits::StreamingSource;
 
-/// AWS authentication method for `DynamoDB` access.
-#[derive(Debug, Clone)]
-pub enum AwsAuthMethod {
-    /// Use IAM role authentication (from environment, metadata service, etc.)
-    IamRole,
-    /// Use explicit access key credentials
-    Key {
-        access_key_id: String,
-        secret_access_key: String,
-        session_token: Option<String>,
-    },
-    /// Use environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-    Environment,
-}
-
 /// Configuration for AWS `DynamoDB` source.
+///
+/// Configuration is read from environment variables:
+/// - `DYNAMODB_AWS_REGION`: AWS region (required)
+/// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
+/// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
+/// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for LocalStack)
 #[derive(Debug, Clone)]
 pub struct DynamoDbConfig {
     /// AWS region (e.g., "us-east-1")
     pub region: String,
-    /// Authentication method
-    pub auth: AwsAuthMethod,
+    /// AWS access key ID
+    pub access_key_id: String,
+    /// AWS secret access key
+    pub secret_access_key: String,
     /// Optional custom endpoint URL (for `LocalStack`, testing, etc.)
     pub endpoint_url: Option<String>,
 }
 
-impl Default for DynamoDbConfig {
-    fn default() -> Self {
-        Self {
-            region: "us-east-1".to_string(),
-            auth: AwsAuthMethod::IamRole,
-            endpoint_url: None,
-        }
+impl DynamoDbConfig {
+    /// Create configuration from environment variables.
+    ///
+    /// # Errors
+    /// Returns an error if required environment variables are not set.
+    pub fn from_env() -> Result<Self> {
+        let region = std::env::var("DYNAMODB_AWS_REGION")
+            .context("DYNAMODB_AWS_REGION environment variable is required")?;
+        let access_key_id = std::env::var("DYNAMODB_AWS_ACCESS_KEY_ID")
+            .context("DYNAMODB_AWS_ACCESS_KEY_ID environment variable is required")?;
+        let secret_access_key = std::env::var("DYNAMODB_AWS_SECRET_ACCESS_KEY")
+            .context("DYNAMODB_AWS_SECRET_ACCESS_KEY environment variable is required")?;
+        let endpoint_url = std::env::var("DYNAMODB_AWS_ENDPOINT_URL").ok();
+
+        Ok(Self {
+            region,
+            access_key_id,
+            secret_access_key,
+            endpoint_url,
+        })
     }
 }
 
@@ -100,7 +106,7 @@ impl DynamoDbStreamsSource {
     }
 
     /// Create a `DynamoDB` client with the configured authentication.
-    async fn create_client(config: &DynamoDbConfig) -> Result<Client> {
+    fn create_client(config: &DynamoDbConfig) -> Client {
         let mut sdk_config_builder = SdkConfig::builder()
             .retry_config(RetryConfig::standard().with_max_attempts(5))
             .behavior_version(BehaviorVersion::latest())
@@ -111,38 +117,19 @@ impl DynamoDbStreamsSource {
             sdk_config_builder = sdk_config_builder.endpoint_url(endpoint_url.clone());
         }
 
-        // Configure credentials based on auth method
-        match &config.auth {
-            AwsAuthMethod::IamRole | AwsAuthMethod::Environment => {
-                // Use the default credential chain (includes environment, IAM roles, etc.)
-                let default_config = aws_config::defaults(BehaviorVersion::latest())
-                    .region(Region::new(config.region.clone()))
-                    .load()
-                    .await;
-
-                if let Some(provider) = default_config.credentials_provider() {
-                    sdk_config_builder = sdk_config_builder.credentials_provider(provider);
-                }
-            }
-            AwsAuthMethod::Key {
-                access_key_id,
-                secret_access_key,
-                session_token,
-            } => {
-                let credentials = Credentials::new(
-                    access_key_id.clone(),
-                    secret_access_key.clone(),
-                    session_token.clone(),
-                    None,
-                    "testoperator-aws-dynamodb",
-                );
-                sdk_config_builder = sdk_config_builder
-                    .credentials_provider(SharedCredentialsProvider::new(credentials));
-            }
-        }
+        // Configure credentials from config (key-based auth only)
+        let credentials = Credentials::new(
+            config.access_key_id.clone(),
+            config.secret_access_key.clone(),
+            None,
+            None,
+            "testoperator-aws-dynamodb",
+        );
+        sdk_config_builder =
+            sdk_config_builder.credentials_provider(SharedCredentialsProvider::new(credentials));
 
         let sdk_config = sdk_config_builder.build();
-        Ok(Client::new(&sdk_config))
+        Client::new(&sdk_config)
     }
 
     /// Convert an Arrow array value to a `DynamoDB` `AttributeValue`.
@@ -407,7 +394,7 @@ impl StreamingSource for DynamoDbStreamsSource {
             println!("Using custom endpoint: {endpoint}");
         }
 
-        self.client = Some(Self::create_client(&self.config).await?);
+        self.client = Some(Self::create_client(&self.config));
 
         println!("AWS DynamoDB client initialized successfully");
         Ok(())

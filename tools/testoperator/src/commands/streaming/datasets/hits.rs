@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,6 +15,17 @@ limitations under the License.
 */
 
 //! `ClickBench` hits dataset for streaming benchmarks.
+//!
+//! Loads the ClickBench hits dataset from S3/MinIO or downloads from ClickHouse.
+//!
+//! ## Environment Variables
+//!
+//! - `CLICKBENCH_S3_URI`: S3 URI to hits.parquet (e.g., `s3://bucket/path/hits.parquet`)
+//! - `CLICKBENCH_S3_ENDPOINT`: S3/MinIO endpoint (optional, for MinIO)
+//! - `CLICKBENCH_S3_ACCESS_KEY_ID`: S3 access key ID (required when using S3)
+//! - `CLICKBENCH_S3_SECRET_ACCESS_KEY`: S3 secret access key (required when using S3)
+//!
+//! If no S3 configuration is provided, downloads from ClickHouse's public dataset.
 
 use std::sync::Arc;
 
@@ -23,16 +34,19 @@ use arrow::array::{
     TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use duckdb::Connection;
 use test_framework::anyhow::{Context, Result};
 
 use super::DatasetType;
 use crate::commands::streaming::traits::StreamingDataset;
 
+/// Default URL for ClickBench hits dataset.
+const CLICKBENCH_DEFAULT_URL: &str =
+    "https://datasets.clickhouse.com/hits_compatible/hits.parquet";
+
 /// `ClickBench` hits dataset.
 ///
-/// Generates synthetic web analytics data matching the `ClickBench` schema.
+/// Loads the ClickBench hits dataset from S3/MinIO or downloads from ClickHouse.
 /// The hits table contains 105 columns representing web page visits.
 pub struct HitsDataset;
 
@@ -161,231 +175,53 @@ impl HitsDataset {
         ])
     }
 
-    /// Generate a single row of synthetic data.
-    fn generate_row(rng: &mut StdRng, watch_id: i64) -> HitsRow {
-        // Base timestamp: 2013-07-15 (typical ClickBench date range)
-        let base_timestamp_us = 1_373_846_400_000_000i64; // 2013-07-15 00:00:00 UTC in microseconds
-        let event_offset = rng.random_range(0..86_400_000_000i64); // Within a day
+    /// Get the parquet source URL, configuring S3 if needed.
+    fn get_parquet_source(conn: &Connection) -> Result<String> {
+        // Check if S3 configuration is provided
+        if let Ok(s3_uri) = std::env::var("CLICKBENCH_S3_URI") {
+            let access_key = std::env::var("CLICKBENCH_S3_ACCESS_KEY_ID")
+                .context("CLICKBENCH_S3_ACCESS_KEY_ID required when CLICKBENCH_S3_URI is set")?;
+            let secret_key = std::env::var("CLICKBENCH_S3_SECRET_ACCESS_KEY")
+                .context("CLICKBENCH_S3_SECRET_ACCESS_KEY required when CLICKBENCH_S3_URI is set")?;
 
-        HitsRow {
-            watch_id,
-            java_enable: rng.random_range(0..2),
-            title: format!("Page Title {}", rng.random_range(1..1000)),
-            good_event: 1,
-            event_time: base_timestamp_us + event_offset,
-            event_date: 15901, // Days since epoch for 2013-07-15
-            counter_id: rng.random_range(1..100_000),
-            client_ip: rng.random_range(0..i32::MAX),
-            region_id: rng.random_range(1..1000),
-            user_id: rng.random_range(1..10_000_000),
-            counter_class: rng.random_range(0..10),
-            os: rng.random_range(0..20),
-            user_agent: rng.random_range(0..100),
-            url: format!("https://example.com/page/{}", rng.random_range(1..10000)),
-            referer: format!("https://referer.com/{}", rng.random_range(1..1000)),
-            is_refresh: rng.random_range(0..2),
-            referer_category_id: rng.random_range(0..100),
-            referer_region_id: rng.random_range(0..1000),
-            url_category_id: rng.random_range(0..100),
-            url_region_id: rng.random_range(0..1000),
-            resolution_width: rng.random_range(320..1920),
-            resolution_height: rng.random_range(240..1080),
-            resolution_depth: rng.random_range(8..32),
-            flash_major: rng.random_range(0..20),
-            flash_minor: rng.random_range(0..10),
-            flash_minor2: String::new(),
-            net_major: rng.random_range(0..10),
-            net_minor: rng.random_range(0..10),
-            user_agent_major: rng.random_range(0..100),
-            user_agent_minor: format!("{}", rng.random_range(0..100)),
-            cookie_enable: rng.random_range(0..2),
-            javascript_enable: rng.random_range(0..2),
-            is_mobile: rng.random_range(0..2),
-            mobile_phone: rng.random_range(0..10),
-            mobile_phone_model: String::new(),
-            params: String::new(),
-            ip_network_id: rng.random_range(0..10000),
-            trafic_source_id: rng.random_range(0..10),
-            search_engine_id: rng.random_range(0..50),
-            search_phrase: String::new(),
-            adv_engine_id: rng.random_range(0..20),
-            is_artifical: 0,
-            window_client_width: rng.random_range(320..1920),
-            window_client_height: rng.random_range(240..1080),
-            client_time_zone: rng.random_range(-12..12),
-            client_event_time: base_timestamp_us
-                + event_offset
-                + rng.random_range(0..3_600_000_000),
-            silverlight_version1: 0,
-            silverlight_version2: 0,
-            silverlight_version3: 0,
-            silverlight_version4: 0,
-            page_charset: String::from("UTF-8"),
-            code_version: rng.random_range(1..100),
-            is_link: rng.random_range(0..2),
-            is_download: rng.random_range(0..2),
-            is_not_bounce: rng.random_range(0..2),
-            f_uniq_id: rng.random_range(1..i64::MAX),
-            original_url: String::new(),
-            hid: rng.random_range(0..1000),
-            is_old_counter: 0,
-            is_event: rng.random_range(0..2),
-            is_parameter: 0,
-            dont_count_hits: 0,
-            with_hash: 0,
-            hit_color: String::from("W"),
-            local_event_time: base_timestamp_us + event_offset,
-            age: rng.random_range(0..100),
-            sex: rng.random_range(0..3),
-            income: rng.random_range(0..10),
-            interests: rng.random_range(0..100),
-            robotness: rng.random_range(0..10),
-            remote_ip: rng.random_range(0..i32::MAX),
-            window_name: 0,
-            opener_name: 0,
-            history_length: rng.random_range(0..100),
-            browser_language: String::from("en"),
-            browser_country: String::from("US"),
-            social_network: String::new(),
-            social_action: String::new(),
-            http_error: 0,
-            send_timing: rng.random_range(0..10000),
-            dns_timing: rng.random_range(0..1000),
-            connect_timing: rng.random_range(0..1000),
-            response_start_timing: rng.random_range(0..5000),
-            response_end_timing: rng.random_range(0..10000),
-            fetch_timing: rng.random_range(0..10000),
-            social_source_network_id: 0,
-            social_source_page: String::new(),
-            param_price: 0,
-            param_order_id: String::new(),
-            param_currency: String::new(),
-            param_currency_id: 0,
-            openstat_service_name: String::new(),
-            openstat_campaign_id: String::new(),
-            openstat_ad_id: String::new(),
-            openstat_source_id: String::new(),
-            utm_source: String::new(),
-            utm_medium: String::new(),
-            utm_campaign: String::new(),
-            utm_content: String::new(),
-            utm_term: String::new(),
-            from_tag: String::new(),
-            has_gclid: 0,
-            referer_hash: rng.random_range(0..i64::MAX),
-            url_hash: rng.random_range(0..i64::MAX),
-            clid: rng.random_range(0..1000),
+            // Configure DuckDB S3 settings
+            conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
+                .context("Failed to load httpfs extension")?;
+
+            // Set S3 credentials
+            conn.execute_batch(&format!(
+                "SET s3_access_key_id='{access_key}';
+                 SET s3_secret_access_key='{secret_key}';"
+            ))
+            .context("Failed to set S3 credentials")?;
+
+            // Set endpoint if provided (for MinIO)
+            if let Ok(endpoint) = std::env::var("CLICKBENCH_S3_ENDPOINT") {
+                // Remove http:// or https:// prefix for DuckDB
+                let endpoint_host = endpoint
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://");
+                let use_ssl = endpoint.starts_with("https://");
+
+                conn.execute_batch(&format!(
+                    "SET s3_endpoint='{endpoint_host}';
+                     SET s3_url_style='path';
+                     SET s3_use_ssl={use_ssl};"
+                ))
+                .context("Failed to set S3 endpoint")?;
+            }
+
+            println!("Using S3 source: {s3_uri}");
+            Ok(s3_uri)
+        } else {
+            // Use default ClickHouse URL
+            conn.execute_batch("INSTALL httpfs; LOAD httpfs;")
+                .context("Failed to load httpfs extension")?;
+
+            println!("Using default ClickBench URL: {CLICKBENCH_DEFAULT_URL}");
+            Ok(CLICKBENCH_DEFAULT_URL.to_string())
         }
     }
-}
-
-/// Single row of hits data.
-struct HitsRow {
-    watch_id: i64,
-    java_enable: i16,
-    title: String,
-    good_event: i16,
-    event_time: i64,
-    event_date: i32,
-    counter_id: i32,
-    client_ip: i32,
-    region_id: i32,
-    user_id: i64,
-    counter_class: i16,
-    os: i16,
-    user_agent: i16,
-    url: String,
-    referer: String,
-    is_refresh: i16,
-    referer_category_id: i16,
-    referer_region_id: i32,
-    url_category_id: i16,
-    url_region_id: i32,
-    resolution_width: i16,
-    resolution_height: i16,
-    resolution_depth: i16,
-    flash_major: i16,
-    flash_minor: i16,
-    flash_minor2: String,
-    net_major: i16,
-    net_minor: i16,
-    user_agent_major: i16,
-    user_agent_minor: String,
-    cookie_enable: i16,
-    javascript_enable: i16,
-    is_mobile: i16,
-    mobile_phone: i16,
-    mobile_phone_model: String,
-    params: String,
-    ip_network_id: i32,
-    trafic_source_id: i16,
-    search_engine_id: i16,
-    search_phrase: String,
-    adv_engine_id: i16,
-    is_artifical: i16,
-    window_client_width: i16,
-    window_client_height: i16,
-    client_time_zone: i16,
-    client_event_time: i64,
-    silverlight_version1: i16,
-    silverlight_version2: i16,
-    silverlight_version3: i32,
-    silverlight_version4: i16,
-    page_charset: String,
-    code_version: i32,
-    is_link: i16,
-    is_download: i16,
-    is_not_bounce: i16,
-    f_uniq_id: i64,
-    original_url: String,
-    hid: i32,
-    is_old_counter: i16,
-    is_event: i16,
-    is_parameter: i16,
-    dont_count_hits: i16,
-    with_hash: i16,
-    hit_color: String,
-    local_event_time: i64,
-    age: i16,
-    sex: i16,
-    income: i16,
-    interests: i16,
-    robotness: i16,
-    remote_ip: i32,
-    window_name: i32,
-    opener_name: i32,
-    history_length: i16,
-    browser_language: String,
-    browser_country: String,
-    social_network: String,
-    social_action: String,
-    http_error: i16,
-    send_timing: i32,
-    dns_timing: i32,
-    connect_timing: i32,
-    response_start_timing: i32,
-    response_end_timing: i32,
-    fetch_timing: i32,
-    social_source_network_id: i16,
-    social_source_page: String,
-    param_price: i64,
-    param_order_id: String,
-    param_currency: String,
-    param_currency_id: i16,
-    openstat_service_name: String,
-    openstat_campaign_id: String,
-    openstat_ad_id: String,
-    openstat_source_id: String,
-    utm_source: String,
-    utm_medium: String,
-    utm_campaign: String,
-    utm_content: String,
-    utm_term: String,
-    from_tag: String,
-    has_gclid: i16,
-    referer_hash: i64,
-    url_hash: i64,
-    clid: i32,
 }
 
 impl StreamingDataset for HitsDataset {
@@ -397,244 +233,306 @@ impl StreamingDataset for HitsDataset {
         DatasetType::Hits
     }
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::similar_names,
-        clippy::cast_possible_wrap
-    )]
     fn generate(&self, scale_factor: f64) -> Result<Vec<RecordBatch>> {
-        // ClickBench full dataset has ~100M rows, scale accordingly
-        // SF=0.01 -> 1M rows, SF=0.001 -> 100K rows, SF=0.0001 -> 10K rows
-        let row_count = (100_000_000.0 * scale_factor) as usize;
-        let row_count = row_count.max(100); // At least 100 rows
+        println!("Loading ClickBench hits data with scale factor {scale_factor}");
 
-        println!("Generating ClickBench hits data: {row_count} rows (scale factor {scale_factor})");
+        let conn =
+            Connection::open_in_memory().context("Failed to open in-memory DuckDB connection")?;
 
-        let mut rng = StdRng::seed_from_u64(42);
+        let parquet_source = Self::get_parquet_source(&conn)?;
 
-        // Pre-allocate vectors
-        let mut watch_ids = Vec::with_capacity(row_count);
-        let mut java_enables = Vec::with_capacity(row_count);
-        let mut titles = Vec::with_capacity(row_count);
-        let mut good_events = Vec::with_capacity(row_count);
-        let mut event_times = Vec::with_capacity(row_count);
-        let mut event_dates = Vec::with_capacity(row_count);
-        let mut counter_ids = Vec::with_capacity(row_count);
-        let mut client_ips = Vec::with_capacity(row_count);
-        let mut region_ids = Vec::with_capacity(row_count);
-        let mut user_ids = Vec::with_capacity(row_count);
-        let mut counter_classes = Vec::with_capacity(row_count);
-        let mut os_values = Vec::with_capacity(row_count);
-        let mut user_agents = Vec::with_capacity(row_count);
-        let mut urls = Vec::with_capacity(row_count);
-        let mut referers = Vec::with_capacity(row_count);
-        let mut is_refreshes = Vec::with_capacity(row_count);
-        let mut referer_category_ids = Vec::with_capacity(row_count);
-        let mut referer_region_ids = Vec::with_capacity(row_count);
-        let mut url_category_ids = Vec::with_capacity(row_count);
-        let mut url_region_ids = Vec::with_capacity(row_count);
-        let mut resolution_widths = Vec::with_capacity(row_count);
-        let mut resolution_heights = Vec::with_capacity(row_count);
-        let mut resolution_depths = Vec::with_capacity(row_count);
-        let mut flash_majors = Vec::with_capacity(row_count);
-        let mut flash_minors = Vec::with_capacity(row_count);
-        let mut flash_minor2s = Vec::with_capacity(row_count);
-        let mut net_majors = Vec::with_capacity(row_count);
-        let mut net_minors = Vec::with_capacity(row_count);
-        let mut user_agent_majors = Vec::with_capacity(row_count);
-        let mut user_agent_minors = Vec::with_capacity(row_count);
-        let mut cookie_enables = Vec::with_capacity(row_count);
-        let mut javascript_enables = Vec::with_capacity(row_count);
-        let mut is_mobiles = Vec::with_capacity(row_count);
-        let mut mobile_phones = Vec::with_capacity(row_count);
-        let mut mobile_phone_models = Vec::with_capacity(row_count);
-        let mut params_vec = Vec::with_capacity(row_count);
-        let mut ip_network_ids = Vec::with_capacity(row_count);
-        let mut trafic_source_ids = Vec::with_capacity(row_count);
-        let mut search_engine_ids = Vec::with_capacity(row_count);
-        let mut search_phrases = Vec::with_capacity(row_count);
-        let mut adv_engine_ids = Vec::with_capacity(row_count);
-        let mut is_artificals = Vec::with_capacity(row_count);
-        let mut window_client_widths = Vec::with_capacity(row_count);
-        let mut window_client_heights = Vec::with_capacity(row_count);
-        let mut client_time_zones = Vec::with_capacity(row_count);
-        let mut client_event_times = Vec::with_capacity(row_count);
-        let mut silverlight_version1s = Vec::with_capacity(row_count);
-        let mut silverlight_version2s = Vec::with_capacity(row_count);
-        let mut silverlight_version3s = Vec::with_capacity(row_count);
-        let mut silverlight_version4s = Vec::with_capacity(row_count);
-        let mut page_charsets = Vec::with_capacity(row_count);
-        let mut code_versions = Vec::with_capacity(row_count);
-        let mut is_links = Vec::with_capacity(row_count);
-        let mut is_downloads = Vec::with_capacity(row_count);
-        let mut is_not_bounces = Vec::with_capacity(row_count);
-        let mut f_uniq_ids = Vec::with_capacity(row_count);
-        let mut original_urls = Vec::with_capacity(row_count);
-        let mut hids = Vec::with_capacity(row_count);
-        let mut is_old_counters = Vec::with_capacity(row_count);
-        let mut is_events = Vec::with_capacity(row_count);
-        let mut is_parameters = Vec::with_capacity(row_count);
-        let mut dont_count_hits_vec = Vec::with_capacity(row_count);
-        let mut with_hashes = Vec::with_capacity(row_count);
-        let mut hit_colors = Vec::with_capacity(row_count);
-        let mut local_event_times = Vec::with_capacity(row_count);
-        let mut ages = Vec::with_capacity(row_count);
-        let mut sexes = Vec::with_capacity(row_count);
-        let mut incomes = Vec::with_capacity(row_count);
-        let mut interests_vec = Vec::with_capacity(row_count);
-        let mut robotnesses = Vec::with_capacity(row_count);
-        let mut remote_ips = Vec::with_capacity(row_count);
-        let mut window_names = Vec::with_capacity(row_count);
-        let mut opener_names = Vec::with_capacity(row_count);
-        let mut history_lengths = Vec::with_capacity(row_count);
-        let mut browser_languages = Vec::with_capacity(row_count);
-        let mut browser_countries = Vec::with_capacity(row_count);
-        let mut social_networks = Vec::with_capacity(row_count);
-        let mut social_actions = Vec::with_capacity(row_count);
-        let mut http_errors = Vec::with_capacity(row_count);
-        let mut send_timings = Vec::with_capacity(row_count);
-        let mut dns_timings = Vec::with_capacity(row_count);
-        let mut connect_timings = Vec::with_capacity(row_count);
-        let mut response_start_timings = Vec::with_capacity(row_count);
-        let mut response_end_timings = Vec::with_capacity(row_count);
-        let mut fetch_timings = Vec::with_capacity(row_count);
-        let mut social_source_network_ids = Vec::with_capacity(row_count);
-        let mut social_source_pages = Vec::with_capacity(row_count);
-        let mut param_prices = Vec::with_capacity(row_count);
-        let mut param_order_ids = Vec::with_capacity(row_count);
-        let mut param_currencies = Vec::with_capacity(row_count);
-        let mut param_currency_ids = Vec::with_capacity(row_count);
-        let mut openstat_service_names = Vec::with_capacity(row_count);
-        let mut openstat_campaign_ids = Vec::with_capacity(row_count);
-        let mut openstat_ad_ids = Vec::with_capacity(row_count);
-        let mut openstat_source_ids = Vec::with_capacity(row_count);
-        let mut utm_sources = Vec::with_capacity(row_count);
-        let mut utm_mediums = Vec::with_capacity(row_count);
-        let mut utm_campaigns = Vec::with_capacity(row_count);
-        let mut utm_contents = Vec::with_capacity(row_count);
-        let mut utm_terms = Vec::with_capacity(row_count);
-        let mut from_tags = Vec::with_capacity(row_count);
-        let mut has_gclids = Vec::with_capacity(row_count);
-        let mut referer_hashes = Vec::with_capacity(row_count);
-        let mut url_hashes = Vec::with_capacity(row_count);
-        let mut clids = Vec::with_capacity(row_count);
+        // Calculate sample percentage (ClickBench has ~100M rows)
+        // SF=1.0 -> 100%, SF=0.01 -> 1%, SF=0.001 -> 0.1%
+        let sample_pct = (scale_factor * 100.0).min(100.0);
 
-        for i in 0..row_count {
-            let row = Self::generate_row(&mut rng, (i + 1) as i64);
+        // Build query with sampling
+        let query = if sample_pct >= 100.0 {
+            format!(
+                "SELECT
+                    WatchID, JavaEnable, Title, GoodEvent,
+                    epoch_us(EventTime) as EventTime, EventDate, CounterID, ClientIP,
+                    RegionID, UserID, CounterClass, OS, UserAgent, URL, Referer,
+                    IsRefresh, RefererCategoryID, RefererRegionID, URLCategoryID, URLRegionID,
+                    ResolutionWidth, ResolutionHeight, ResolutionDepth, FlashMajor, FlashMinor,
+                    FlashMinor2, NetMajor, NetMinor, UserAgentMajor, UserAgentMinor,
+                    CookieEnable, JavascriptEnable, IsMobile, MobilePhone, MobilePhoneModel,
+                    Params, IPNetworkID, TraficSourceID, SearchEngineID, SearchPhrase,
+                    AdvEngineID, IsArtifical, WindowClientWidth, WindowClientHeight, ClientTimeZone,
+                    epoch_us(ClientEventTime) as ClientEventTime,
+                    SilverlightVersion1, SilverlightVersion2, SilverlightVersion3, SilverlightVersion4,
+                    PageCharset, CodeVersion, IsLink, IsDownload, IsNotBounce,
+                    FUniqID, OriginalURL, HID, IsOldCounter, IsEvent,
+                    IsParameter, DontCountHits, WithHash, HitColor,
+                    epoch_us(LocalEventTime) as LocalEventTime,
+                    Age, Sex, Income, Interests, Robotness,
+                    RemoteIP, WindowName, OpenerName, HistoryLength, BrowserLanguage,
+                    BrowserCountry, SocialNetwork, SocialAction, HTTPError, SendTiming,
+                    DNSTiming, ConnectTiming, ResponseStartTiming, ResponseEndTiming, FetchTiming,
+                    SocialSourceNetworkID, SocialSourcePage, ParamPrice, ParamOrderID, ParamCurrency,
+                    ParamCurrencyID, OpenstatServiceName, OpenstatCampaignID, OpenstatAdID, OpenstatSourceID,
+                    UTMSource, UTMMedium, UTMCampaign, UTMContent, UTMTerm,
+                    FromTag, HasGCLID, RefererHash, URLHash, CLID
+                FROM read_parquet('{parquet_source}')"
+            )
+        } else {
+            format!(
+                "SELECT
+                    WatchID, JavaEnable, Title, GoodEvent,
+                    epoch_us(EventTime) as EventTime, EventDate, CounterID, ClientIP,
+                    RegionID, UserID, CounterClass, OS, UserAgent, URL, Referer,
+                    IsRefresh, RefererCategoryID, RefererRegionID, URLCategoryID, URLRegionID,
+                    ResolutionWidth, ResolutionHeight, ResolutionDepth, FlashMajor, FlashMinor,
+                    FlashMinor2, NetMajor, NetMinor, UserAgentMajor, UserAgentMinor,
+                    CookieEnable, JavascriptEnable, IsMobile, MobilePhone, MobilePhoneModel,
+                    Params, IPNetworkID, TraficSourceID, SearchEngineID, SearchPhrase,
+                    AdvEngineID, IsArtifical, WindowClientWidth, WindowClientHeight, ClientTimeZone,
+                    epoch_us(ClientEventTime) as ClientEventTime,
+                    SilverlightVersion1, SilverlightVersion2, SilverlightVersion3, SilverlightVersion4,
+                    PageCharset, CodeVersion, IsLink, IsDownload, IsNotBounce,
+                    FUniqID, OriginalURL, HID, IsOldCounter, IsEvent,
+                    IsParameter, DontCountHits, WithHash, HitColor,
+                    epoch_us(LocalEventTime) as LocalEventTime,
+                    Age, Sex, Income, Interests, Robotness,
+                    RemoteIP, WindowName, OpenerName, HistoryLength, BrowserLanguage,
+                    BrowserCountry, SocialNetwork, SocialAction, HTTPError, SendTiming,
+                    DNSTiming, ConnectTiming, ResponseStartTiming, ResponseEndTiming, FetchTiming,
+                    SocialSourceNetworkID, SocialSourcePage, ParamPrice, ParamOrderID, ParamCurrency,
+                    ParamCurrencyID, OpenstatServiceName, OpenstatCampaignID, OpenstatAdID, OpenstatSourceID,
+                    UTMSource, UTMMedium, UTMCampaign, UTMContent, UTMTerm,
+                    FromTag, HasGCLID, RefererHash, URLHash, CLID
+                FROM read_parquet('{parquet_source}')
+                USING SAMPLE {sample_pct} PERCENT (bernoulli)"
+            )
+        };
 
-            watch_ids.push(row.watch_id);
-            java_enables.push(row.java_enable);
-            titles.push(row.title);
-            good_events.push(row.good_event);
-            event_times.push(row.event_time);
-            event_dates.push(row.event_date);
-            counter_ids.push(row.counter_id);
-            client_ips.push(row.client_ip);
-            region_ids.push(row.region_id);
-            user_ids.push(row.user_id);
-            counter_classes.push(row.counter_class);
-            os_values.push(row.os);
-            user_agents.push(row.user_agent);
-            urls.push(row.url);
-            referers.push(row.referer);
-            is_refreshes.push(row.is_refresh);
-            referer_category_ids.push(row.referer_category_id);
-            referer_region_ids.push(row.referer_region_id);
-            url_category_ids.push(row.url_category_id);
-            url_region_ids.push(row.url_region_id);
-            resolution_widths.push(row.resolution_width);
-            resolution_heights.push(row.resolution_height);
-            resolution_depths.push(row.resolution_depth);
-            flash_majors.push(row.flash_major);
-            flash_minors.push(row.flash_minor);
-            flash_minor2s.push(row.flash_minor2);
-            net_majors.push(row.net_major);
-            net_minors.push(row.net_minor);
-            user_agent_majors.push(row.user_agent_major);
-            user_agent_minors.push(row.user_agent_minor);
-            cookie_enables.push(row.cookie_enable);
-            javascript_enables.push(row.javascript_enable);
-            is_mobiles.push(row.is_mobile);
-            mobile_phones.push(row.mobile_phone);
-            mobile_phone_models.push(row.mobile_phone_model);
-            params_vec.push(row.params);
-            ip_network_ids.push(row.ip_network_id);
-            trafic_source_ids.push(row.trafic_source_id);
-            search_engine_ids.push(row.search_engine_id);
-            search_phrases.push(row.search_phrase);
-            adv_engine_ids.push(row.adv_engine_id);
-            is_artificals.push(row.is_artifical);
-            window_client_widths.push(row.window_client_width);
-            window_client_heights.push(row.window_client_height);
-            client_time_zones.push(row.client_time_zone);
-            client_event_times.push(row.client_event_time);
-            silverlight_version1s.push(row.silverlight_version1);
-            silverlight_version2s.push(row.silverlight_version2);
-            silverlight_version3s.push(row.silverlight_version3);
-            silverlight_version4s.push(row.silverlight_version4);
-            page_charsets.push(row.page_charset);
-            code_versions.push(row.code_version);
-            is_links.push(row.is_link);
-            is_downloads.push(row.is_download);
-            is_not_bounces.push(row.is_not_bounce);
-            f_uniq_ids.push(row.f_uniq_id);
-            original_urls.push(row.original_url);
-            hids.push(row.hid);
-            is_old_counters.push(row.is_old_counter);
-            is_events.push(row.is_event);
-            is_parameters.push(row.is_parameter);
-            dont_count_hits_vec.push(row.dont_count_hits);
-            with_hashes.push(row.with_hash);
-            hit_colors.push(row.hit_color);
-            local_event_times.push(row.local_event_time);
-            ages.push(row.age);
-            sexes.push(row.sex);
-            incomes.push(row.income);
-            interests_vec.push(row.interests);
-            robotnesses.push(row.robotness);
-            remote_ips.push(row.remote_ip);
-            window_names.push(row.window_name);
-            opener_names.push(row.opener_name);
-            history_lengths.push(row.history_length);
-            browser_languages.push(row.browser_language);
-            browser_countries.push(row.browser_country);
-            social_networks.push(row.social_network);
-            social_actions.push(row.social_action);
-            http_errors.push(row.http_error);
-            send_timings.push(row.send_timing);
-            dns_timings.push(row.dns_timing);
-            connect_timings.push(row.connect_timing);
-            response_start_timings.push(row.response_start_timing);
-            response_end_timings.push(row.response_end_timing);
-            fetch_timings.push(row.fetch_timing);
-            social_source_network_ids.push(row.social_source_network_id);
-            social_source_pages.push(row.social_source_page);
-            param_prices.push(row.param_price);
-            param_order_ids.push(row.param_order_id);
-            param_currencies.push(row.param_currency);
-            param_currency_ids.push(row.param_currency_id);
-            openstat_service_names.push(row.openstat_service_name);
-            openstat_campaign_ids.push(row.openstat_campaign_id);
-            openstat_ad_ids.push(row.openstat_ad_id);
-            openstat_source_ids.push(row.openstat_source_id);
-            utm_sources.push(row.utm_source);
-            utm_mediums.push(row.utm_medium);
-            utm_campaigns.push(row.utm_campaign);
-            utm_contents.push(row.utm_content);
-            utm_terms.push(row.utm_term);
-            from_tags.push(row.from_tag);
-            has_gclids.push(row.has_gclid);
-            referer_hashes.push(row.referer_hash);
-            url_hashes.push(row.url_hash);
-            clids.push(row.clid);
+        println!("Executing query with {sample_pct}% sample...");
 
-            if (i + 1) % 100_000 == 0 {
-                println!("Generated {} rows...", i + 1);
+        let mut stmt = conn.prepare(&query).context("Failed to prepare query")?;
+
+        // Collect data into vectors
+        let mut watch_ids = Vec::new();
+        let mut java_enables = Vec::new();
+        let mut titles: Vec<Option<String>> = Vec::new();
+        let mut good_events = Vec::new();
+        let mut event_times = Vec::new();
+        let mut event_dates = Vec::new();
+        let mut counter_ids = Vec::new();
+        let mut client_ips = Vec::new();
+        let mut region_ids = Vec::new();
+        let mut user_ids = Vec::new();
+        let mut counter_classes = Vec::new();
+        let mut os_values = Vec::new();
+        let mut user_agents = Vec::new();
+        let mut urls: Vec<Option<String>> = Vec::new();
+        let mut referers: Vec<Option<String>> = Vec::new();
+        let mut is_refreshes = Vec::new();
+        let mut referer_category_ids = Vec::new();
+        let mut referer_region_ids = Vec::new();
+        let mut url_category_ids = Vec::new();
+        let mut url_region_ids = Vec::new();
+        let mut resolution_widths = Vec::new();
+        let mut resolution_heights = Vec::new();
+        let mut resolution_depths = Vec::new();
+        let mut flash_majors = Vec::new();
+        let mut flash_minors = Vec::new();
+        let mut flash_minor2s: Vec<Option<String>> = Vec::new();
+        let mut net_majors = Vec::new();
+        let mut net_minors = Vec::new();
+        let mut user_agent_majors = Vec::new();
+        let mut user_agent_minors = Vec::new();
+        let mut cookie_enables = Vec::new();
+        let mut javascript_enables = Vec::new();
+        let mut is_mobiles = Vec::new();
+        let mut mobile_phones = Vec::new();
+        let mut mobile_phone_models: Vec<Option<String>> = Vec::new();
+        let mut params_vec: Vec<Option<String>> = Vec::new();
+        let mut ip_network_ids = Vec::new();
+        let mut trafic_source_ids = Vec::new();
+        let mut search_engine_ids = Vec::new();
+        let mut search_phrases: Vec<Option<String>> = Vec::new();
+        let mut adv_engine_ids = Vec::new();
+        let mut is_artificals = Vec::new();
+        let mut window_client_widths = Vec::new();
+        let mut window_client_heights = Vec::new();
+        let mut client_time_zones = Vec::new();
+        let mut client_event_times = Vec::new();
+        let mut silverlight_version1s = Vec::new();
+        let mut silverlight_version2s = Vec::new();
+        let mut silverlight_version3s = Vec::new();
+        let mut silverlight_version4s = Vec::new();
+        let mut page_charsets: Vec<Option<String>> = Vec::new();
+        let mut code_versions = Vec::new();
+        let mut is_links = Vec::new();
+        let mut is_downloads = Vec::new();
+        let mut is_not_bounces = Vec::new();
+        let mut f_uniq_ids = Vec::new();
+        let mut original_urls: Vec<Option<String>> = Vec::new();
+        let mut hids = Vec::new();
+        let mut is_old_counters = Vec::new();
+        let mut is_events = Vec::new();
+        let mut is_parameters = Vec::new();
+        let mut dont_count_hits_vec = Vec::new();
+        let mut with_hashes = Vec::new();
+        let mut hit_colors = Vec::new();
+        let mut local_event_times = Vec::new();
+        let mut ages = Vec::new();
+        let mut sexes = Vec::new();
+        let mut incomes = Vec::new();
+        let mut interests_vec = Vec::new();
+        let mut robotnesses = Vec::new();
+        let mut remote_ips = Vec::new();
+        let mut window_names = Vec::new();
+        let mut opener_names = Vec::new();
+        let mut history_lengths = Vec::new();
+        let mut browser_languages: Vec<Option<String>> = Vec::new();
+        let mut browser_countries: Vec<Option<String>> = Vec::new();
+        let mut social_networks: Vec<Option<String>> = Vec::new();
+        let mut social_actions: Vec<Option<String>> = Vec::new();
+        let mut http_errors = Vec::new();
+        let mut send_timings = Vec::new();
+        let mut dns_timings = Vec::new();
+        let mut connect_timings = Vec::new();
+        let mut response_start_timings = Vec::new();
+        let mut response_end_timings = Vec::new();
+        let mut fetch_timings = Vec::new();
+        let mut social_source_network_ids = Vec::new();
+        let mut social_source_pages: Vec<Option<String>> = Vec::new();
+        let mut param_prices = Vec::new();
+        let mut param_order_ids: Vec<Option<String>> = Vec::new();
+        let mut param_currencies: Vec<Option<String>> = Vec::new();
+        let mut param_currency_ids = Vec::new();
+        let mut openstat_service_names: Vec<Option<String>> = Vec::new();
+        let mut openstat_campaign_ids: Vec<Option<String>> = Vec::new();
+        let mut openstat_ad_ids: Vec<Option<String>> = Vec::new();
+        let mut openstat_source_ids: Vec<Option<String>> = Vec::new();
+        let mut utm_sources: Vec<Option<String>> = Vec::new();
+        let mut utm_mediums: Vec<Option<String>> = Vec::new();
+        let mut utm_campaigns: Vec<Option<String>> = Vec::new();
+        let mut utm_contents: Vec<Option<String>> = Vec::new();
+        let mut utm_terms: Vec<Option<String>> = Vec::new();
+        let mut from_tags: Vec<Option<String>> = Vec::new();
+        let mut has_gclids = Vec::new();
+        let mut referer_hashes = Vec::new();
+        let mut url_hashes = Vec::new();
+        let mut clids = Vec::new();
+
+        let mut rows = stmt.query([]).context("Failed to execute query")?;
+        let mut row_count = 0usize;
+
+        while let Some(row) = rows.next().context("Failed to read row")? {
+            watch_ids.push(row.get::<_, i64>(0)?);
+            java_enables.push(row.get::<_, i16>(1)?);
+            titles.push(row.get::<_, Option<String>>(2)?);
+            good_events.push(row.get::<_, i16>(3)?);
+            event_times.push(row.get::<_, i64>(4)?);
+            event_dates.push(row.get::<_, i32>(5)?);
+            counter_ids.push(row.get::<_, i32>(6)?);
+            client_ips.push(row.get::<_, i32>(7)?);
+            region_ids.push(row.get::<_, i32>(8)?);
+            user_ids.push(row.get::<_, i64>(9)?);
+            counter_classes.push(row.get::<_, i16>(10)?);
+            os_values.push(row.get::<_, i16>(11)?);
+            user_agents.push(row.get::<_, i16>(12)?);
+            urls.push(row.get::<_, Option<String>>(13)?);
+            referers.push(row.get::<_, Option<String>>(14)?);
+            is_refreshes.push(row.get::<_, i16>(15)?);
+            referer_category_ids.push(row.get::<_, i16>(16)?);
+            referer_region_ids.push(row.get::<_, i32>(17)?);
+            url_category_ids.push(row.get::<_, i16>(18)?);
+            url_region_ids.push(row.get::<_, i32>(19)?);
+            resolution_widths.push(row.get::<_, i16>(20)?);
+            resolution_heights.push(row.get::<_, i16>(21)?);
+            resolution_depths.push(row.get::<_, i16>(22)?);
+            flash_majors.push(row.get::<_, i16>(23)?);
+            flash_minors.push(row.get::<_, i16>(24)?);
+            flash_minor2s.push(row.get::<_, Option<String>>(25)?);
+            net_majors.push(row.get::<_, i16>(26)?);
+            net_minors.push(row.get::<_, i16>(27)?);
+            user_agent_majors.push(row.get::<_, i16>(28)?);
+            user_agent_minors.push(row.get::<_, String>(29)?);
+            cookie_enables.push(row.get::<_, i16>(30)?);
+            javascript_enables.push(row.get::<_, i16>(31)?);
+            is_mobiles.push(row.get::<_, i16>(32)?);
+            mobile_phones.push(row.get::<_, i16>(33)?);
+            mobile_phone_models.push(row.get::<_, Option<String>>(34)?);
+            params_vec.push(row.get::<_, Option<String>>(35)?);
+            ip_network_ids.push(row.get::<_, i32>(36)?);
+            trafic_source_ids.push(row.get::<_, i16>(37)?);
+            search_engine_ids.push(row.get::<_, i16>(38)?);
+            search_phrases.push(row.get::<_, Option<String>>(39)?);
+            adv_engine_ids.push(row.get::<_, i16>(40)?);
+            is_artificals.push(row.get::<_, i16>(41)?);
+            window_client_widths.push(row.get::<_, i16>(42)?);
+            window_client_heights.push(row.get::<_, i16>(43)?);
+            client_time_zones.push(row.get::<_, i16>(44)?);
+            client_event_times.push(row.get::<_, i64>(45)?);
+            silverlight_version1s.push(row.get::<_, i16>(46)?);
+            silverlight_version2s.push(row.get::<_, i16>(47)?);
+            silverlight_version3s.push(row.get::<_, i32>(48)?);
+            silverlight_version4s.push(row.get::<_, i16>(49)?);
+            page_charsets.push(row.get::<_, Option<String>>(50)?);
+            code_versions.push(row.get::<_, i32>(51)?);
+            is_links.push(row.get::<_, i16>(52)?);
+            is_downloads.push(row.get::<_, i16>(53)?);
+            is_not_bounces.push(row.get::<_, i16>(54)?);
+            f_uniq_ids.push(row.get::<_, i64>(55)?);
+            original_urls.push(row.get::<_, Option<String>>(56)?);
+            hids.push(row.get::<_, i32>(57)?);
+            is_old_counters.push(row.get::<_, i16>(58)?);
+            is_events.push(row.get::<_, i16>(59)?);
+            is_parameters.push(row.get::<_, i16>(60)?);
+            dont_count_hits_vec.push(row.get::<_, i16>(61)?);
+            with_hashes.push(row.get::<_, i16>(62)?);
+            hit_colors.push(row.get::<_, String>(63)?);
+            local_event_times.push(row.get::<_, i64>(64)?);
+            ages.push(row.get::<_, i16>(65)?);
+            sexes.push(row.get::<_, i16>(66)?);
+            incomes.push(row.get::<_, i16>(67)?);
+            interests_vec.push(row.get::<_, i16>(68)?);
+            robotnesses.push(row.get::<_, i16>(69)?);
+            remote_ips.push(row.get::<_, i32>(70)?);
+            window_names.push(row.get::<_, i32>(71)?);
+            opener_names.push(row.get::<_, i32>(72)?);
+            history_lengths.push(row.get::<_, i16>(73)?);
+            browser_languages.push(row.get::<_, Option<String>>(74)?);
+            browser_countries.push(row.get::<_, Option<String>>(75)?);
+            social_networks.push(row.get::<_, Option<String>>(76)?);
+            social_actions.push(row.get::<_, Option<String>>(77)?);
+            http_errors.push(row.get::<_, i16>(78)?);
+            send_timings.push(row.get::<_, i32>(79)?);
+            dns_timings.push(row.get::<_, i32>(80)?);
+            connect_timings.push(row.get::<_, i32>(81)?);
+            response_start_timings.push(row.get::<_, i32>(82)?);
+            response_end_timings.push(row.get::<_, i32>(83)?);
+            fetch_timings.push(row.get::<_, i32>(84)?);
+            social_source_network_ids.push(row.get::<_, i16>(85)?);
+            social_source_pages.push(row.get::<_, Option<String>>(86)?);
+            param_prices.push(row.get::<_, i64>(87)?);
+            param_order_ids.push(row.get::<_, Option<String>>(88)?);
+            param_currencies.push(row.get::<_, Option<String>>(89)?);
+            param_currency_ids.push(row.get::<_, i16>(90)?);
+            openstat_service_names.push(row.get::<_, Option<String>>(91)?);
+            openstat_campaign_ids.push(row.get::<_, Option<String>>(92)?);
+            openstat_ad_ids.push(row.get::<_, Option<String>>(93)?);
+            openstat_source_ids.push(row.get::<_, Option<String>>(94)?);
+            utm_sources.push(row.get::<_, Option<String>>(95)?);
+            utm_mediums.push(row.get::<_, Option<String>>(96)?);
+            utm_campaigns.push(row.get::<_, Option<String>>(97)?);
+            utm_contents.push(row.get::<_, Option<String>>(98)?);
+            utm_terms.push(row.get::<_, Option<String>>(99)?);
+            from_tags.push(row.get::<_, Option<String>>(100)?);
+            has_gclids.push(row.get::<_, i16>(101)?);
+            referer_hashes.push(row.get::<_, i64>(102)?);
+            url_hashes.push(row.get::<_, i64>(103)?);
+            clids.push(row.get::<_, i32>(104)?);
+
+            row_count += 1;
+            if row_count.is_multiple_of(100_000) {
+                println!("Loaded {row_count} rows...");
             }
         }
 
-        println!("Generated {row_count} hits records");
+        println!("Loaded {row_count} hits records");
 
         let batch = RecordBatch::try_new(
             Arc::new(Self::schema()),

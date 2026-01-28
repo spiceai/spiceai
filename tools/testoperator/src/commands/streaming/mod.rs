@@ -55,10 +55,10 @@ use test_framework::spiced::{SpicedInstance, StartRequest};
 use test_framework::spicepod_utils::load_spicepod;
 
 pub use datasets::DatasetType;
-pub use sources::{AwsAuthMethod, DynamoDbConfig, SourceType};
+pub use sources::SourceType;
 pub use traits::{StreamingDataset, StreamingSource};
 
-use crate::args::{AwsAuth, StreamingTestArgs};
+use crate::args::StreamingTestArgs;
 use crate::health::{HealthCheckReport, HealthMonitor};
 
 /// Information about a dataset being benchmarked.
@@ -579,35 +579,8 @@ fn calculate_liveness_stats(report: Option<&HealthCheckReport>) -> (u64, f64) {
 }
 
 /// Create a streaming source based on the arguments.
+///
+/// Configuration is read from environment variables.
 fn create_source(args: &StreamingTestArgs) -> Result<Box<dyn StreamingSource>> {
-    if args.source.requires_aws_config() {
-        // Build AWS configuration from CLI arguments
-        let auth = match args.aws_auth {
-            AwsAuth::IamRole => AwsAuthMethod::IamRole,
-            AwsAuth::Env => AwsAuthMethod::Environment,
-            AwsAuth::Key => {
-                let access_key_id = args.aws_access_key_id.clone().ok_or_else(|| {
-                    anyhow::anyhow!("--aws-access-key-id is required when --aws-auth=key")
-                })?;
-                let secret_access_key = args.aws_secret_access_key.clone().ok_or_else(|| {
-                    anyhow::anyhow!("--aws-secret-access-key is required when --aws-auth=key")
-                })?;
-                AwsAuthMethod::Key {
-                    access_key_id,
-                    secret_access_key,
-                    session_token: args.aws_session_token.clone(),
-                }
-            }
-        };
-
-        let config = DynamoDbConfig {
-            region: args.aws_region.clone(),
-            auth,
-            endpoint_url: args.aws_endpoint_url.clone(),
-        };
-
-        Ok(args.source.create_aws(config))
-    } else {
-        Ok(args.source.create())
-    }
+    args.source.create()
 }

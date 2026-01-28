@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,13 +22,30 @@ use crate::commands::streaming::querysets::QuerySetType;
 use super::CommonArgs;
 
 /// Arguments for streaming ingestion benchmarks.
+///
+/// Source and dataset configuration is done via environment variables:
+///
+/// ## DynamoDB Local (`--source dynamodb-streams-local`)
+/// - `DYNAMODB_LOCAL_PORT`: Port for DynamoDB local (optional, default: 8000)
+///
+/// ## AWS DynamoDB (`--source dynamodb-streams`)
+/// - `DYNAMODB_AWS_REGION`: AWS region (required)
+/// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
+/// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
+/// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for LocalStack)
+///
+/// ## ClickBench data (`--queryset clickbench`)
+/// - `CLICKBENCH_S3_URI`: S3 URI to hits.parquet (e.g., `s3://bucket/path/hits.parquet`)
+/// - `CLICKBENCH_S3_ENDPOINT`: S3/MinIO endpoint (optional, for MinIO)
+/// - `CLICKBENCH_S3_ACCESS_KEY_ID`: S3 access key ID (required when using S3)
+/// - `CLICKBENCH_S3_SECRET_ACCESS_KEY`: S3 secret access key (required when using S3)
 #[derive(Parser, Debug, Clone)]
 #[expect(clippy::struct_excessive_bools)]
 pub struct StreamingTestArgs {
     #[command(flatten)]
     pub common: CommonArgs,
 
-    /// Streaming source type (e.g., dynamodb-streams, kafka)
+    /// Streaming source type (e.g., dynamodb-streams-local, dynamodb-streams)
     #[arg(long, value_enum)]
     pub source: SourceType,
 
@@ -51,31 +68,6 @@ pub struct StreamingTestArgs {
     /// Run TPCH queries to verify data integrity after ingestion
     #[arg(long)]
     pub verify: bool,
-
-    // AWS-specific arguments (for aws-dynamodb-streams source)
-    /// AWS region (required for aws-dynamodb-streams source)
-    #[arg(long, default_value = "us-east-1")]
-    pub aws_region: String,
-
-    /// AWS authentication method: `iam_role`, key, or env
-    #[arg(long, value_enum, default_value = "iam-role")]
-    pub aws_auth: AwsAuth,
-
-    /// AWS access key ID (required when `aws_auth=key`)
-    #[arg(long)]
-    pub aws_access_key_id: Option<String>,
-
-    /// AWS secret access key (required when `aws_auth=key`)
-    #[arg(long)]
-    pub aws_secret_access_key: Option<String>,
-
-    /// AWS session token (optional, for temporary credentials)
-    #[arg(long)]
-    pub aws_session_token: Option<String>,
-
-    /// Custom AWS endpoint URL (for `LocalStack`, testing, etc.)
-    #[arg(long)]
-    pub aws_endpoint_url: Option<String>,
 
     // Query liveness monitoring arguments
     /// Enable query liveness monitoring (runs COUNT(*) queries and tracks latency)
@@ -102,16 +94,4 @@ pub struct StreamingTestArgs {
     /// Maximum number of rows to mutate per dataset (0 for all rows)
     #[arg(long, default_value = "100")]
     pub max_mutation_rows: usize,
-}
-
-/// AWS authentication methods for CLI.
-#[derive(Debug, Clone, Copy, clap::ValueEnum, Default)]
-pub enum AwsAuth {
-    /// Use IAM role authentication (from environment, metadata service, etc.)
-    #[default]
-    IamRole,
-    /// Use explicit access key credentials
-    Key,
-    /// Use environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-    Env,
 }

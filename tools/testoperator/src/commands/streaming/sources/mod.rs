@@ -19,11 +19,12 @@ limitations under the License.
 mod dynamodb;
 mod dynamodb_local;
 
-pub use dynamodb::{AwsAuthMethod, DynamoDbConfig, DynamoDbStreamsSource};
+pub use dynamodb::{DynamoDbConfig, DynamoDbStreamsSource};
 pub use dynamodb_local::DynamoDbStreamsLocalSource;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use test_framework::anyhow::Result;
 
 use super::traits::StreamingSource;
 
@@ -41,33 +42,21 @@ pub enum SourceType {
 impl SourceType {
     /// Create a streaming source instance for this type.
     ///
-    /// For `AwsDynamodbStreams`, this creates a source with default configuration.
-    /// Use `create_aws` to configure AWS-specific options.
-    #[must_use]
-    pub fn create(self) -> Box<dyn StreamingSource> {
+    /// Configuration is read from environment variables:
+    /// - `DynamodbStreamsLocal`: `DYNAMODB_LOCAL_PORT` (optional, default: 8000)
+    /// - `DynamodbStreams`: `DYNAMODB_AWS_REGION`, `DYNAMODB_AWS_ACCESS_KEY_ID`,
+    ///   `DYNAMODB_AWS_SECRET_ACCESS_KEY` (required), `DYNAMODB_AWS_ENDPOINT_URL` (optional)
+    ///
+    /// # Errors
+    /// Returns an error if required environment variables are not set for `DynamodbStreams`.
+    pub fn create(self) -> Result<Box<dyn StreamingSource>> {
         match self {
-            Self::DynamodbStreamsLocal => Box::new(DynamoDbStreamsLocalSource::new()),
+            Self::DynamodbStreamsLocal => Ok(Box::new(DynamoDbStreamsLocalSource::new())),
             Self::DynamodbStreams => {
-                Box::new(DynamoDbStreamsSource::new(DynamoDbConfig::default()))
+                let config = DynamoDbConfig::from_env()?;
+                Ok(Box::new(DynamoDbStreamsSource::new(config)))
             }
         }
-    }
-
-    /// Create an AWS `DynamoDB` source with the given configuration.
-    ///
-    /// This is only valid for `AwsDynamodbStreams` source type.
-    #[must_use]
-    pub fn create_aws(self, config: DynamoDbConfig) -> Box<dyn StreamingSource> {
-        match self {
-            Self::DynamodbStreams => Box::new(DynamoDbStreamsSource::new(config)),
-            Self::DynamodbStreamsLocal => Box::new(DynamoDbStreamsLocalSource::new()),
-        }
-    }
-
-    /// Check if this source type requires AWS configuration.
-    #[must_use]
-    pub fn requires_aws_config(self) -> bool {
-        matches!(self, Self::DynamodbStreams)
     }
 }
 

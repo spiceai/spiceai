@@ -63,12 +63,20 @@ pub struct DynamoDbStreamsLocalSource {
 
 impl DynamoDbStreamsLocalSource {
     /// Create a new `DynamoDB` Streams source.
+    ///
+    /// Configuration is read from environment variables:
+    /// - `DYNAMODB_LOCAL_PORT`: Port for DynamoDB local (default: 8000)
     #[must_use]
     pub fn new() -> Self {
+        let port = std::env::var("DYNAMODB_LOCAL_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8000);
+
         Self {
             docker: None,
             container_name: None,
-            port: 8000,
+            port,
             client: None,
         }
     }

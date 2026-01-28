@@ -39,7 +39,7 @@ mod text_to_sql;
 pub use text_to_sql::TextToSqlArgs;
 
 mod streaming;
-pub use streaming::{AwsAuth, StreamingTestArgs};
+pub use streaming::StreamingTestArgs;
 
 #[derive(Subcommand)]
 pub enum Commands {

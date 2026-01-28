@@ -17,6 +17,8 @@ limitations under the License.
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
+// TODO: Enable all TPCH tables once DynamoDB source supports them
+#[expect(unused_imports)]
 use super::datasets::{
     CustomerDataset, HitsDataset, LineitemDataset, NationDataset, OrdersDataset, PartDataset,
     PartsuppDataset, RegionDataset, SupplierDataset,
