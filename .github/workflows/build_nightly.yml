@@ -309,7 +309,7 @@ jobs:
 
   build-docker-arm64:
     name: Build Docker - ARM64
-    needs: [check_commits, setup, build-cli-linux-arm64]
+    needs: [check_commits, setup, build-linux-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: hosted-linux-arm-runner
@@ -373,7 +373,7 @@ jobs:
 
   build-docker-amd64:
     name: Build Docker - AMD64
-    needs: [check_commits, setup, build-cli-linux-x64]
+    needs: [check_commits, setup, build-linux-x64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: spiceai-dev-runners
