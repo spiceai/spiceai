@@ -35,9 +35,11 @@ limitations under the License.
 //! 6. Report ingestion duration
 
 pub mod datasets;
+pub mod mutations;
 pub mod querysets;
 pub mod sources;
 mod traits;
+pub mod verification;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -52,10 +54,11 @@ use test_framework::spiced::{SpicedInstance, StartRequest};
 use test_framework::spicepod_utils::load_spicepod;
 
 pub use datasets::DatasetType;
-pub use sources::SourceType;
+pub use sources::{AwsAuthMethod, AwsDynamoDbConfig, SourceType};
 pub use traits::{StreamingDataset, StreamingSource};
 
-use crate::args::StreamingTestArgs;
+use crate::args::{AwsAuth, StreamingTestArgs};
+use crate::health::{HealthCheckReport, HealthMonitor};
 
 /// Information about a dataset being benchmarked.
 struct DatasetInfo {
@@ -82,7 +85,7 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     println!("Scale factor: {}", args.scale_factor);
 
     // Create source
-    let mut source = args.source.create();
+    let mut source = create_source(args)?;
 
     // Phase 1: Prepare source
     println!("Phase 1: Preparing streaming source");
@@ -157,6 +160,14 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
 
     let spiced_version = spiced_instance.version().to_string();
 
+    // Phase 6a: Start health monitoring (optional)
+    let health_monitor = if args.enable_liveness {
+        println!("Starting health monitor for liveness checks");
+        Some(HealthMonitor::spawn()?)
+    } else {
+        None
+    };
+
     // Phase 7: Poll for ALL markers
     println!("Phase 7: Polling for all marker records");
     let ingestion_start = Instant::now();
@@ -196,6 +207,53 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     println!("Waiting for marker deletions to propagate...");
     wait_for_all_marker_deletions(&spiced_instance, &marker_queries, Duration::from_secs(30))
         .await?;
+
+    // Phase 8a: Stop health monitoring and collect report
+    let health_report = if let Some(monitor) = health_monitor {
+        println!("Stopping health monitor and collecting report");
+        Some(monitor.stop().await?)
+    } else {
+        None
+    };
+
+    // Phase 8b: Verify TPCH queries (optional)
+    let verification_passed = if args.verify {
+        println!("Phase 8b: Verifying TPCH queries");
+        let report = verification::verify_tpch_queries(&spiced_instance).await?;
+        report.print_summary();
+        report.all_passed()
+    } else {
+        true
+    };
+
+    // Phase 8c: Execute mutations (optional, for CDC testing)
+    let mutation_summary = if args.enable_mutations {
+        println!("Phase 8c: Executing mutations for CDC testing");
+        println!(
+            "  Seed: {}, Count: {}, Insert/Update/Delete: {:.0}%/{:.0}%/{:.0}%",
+            args.mutation_seed,
+            args.mutation_count,
+            args.insert_ratio * 100.0,
+            args.update_ratio * 100.0,
+            args.delete_ratio * 100.0
+        );
+
+        let config = mutations::MutationConfig {
+            seed: args.mutation_seed,
+            count: args.mutation_count,
+            insert_ratio: args.insert_ratio,
+            update_ratio: args.update_ratio,
+            delete_ratio: args.delete_ratio,
+        };
+
+        let mut generator = mutations::MutationGenerator::new(config);
+        let mutation_list = generator.generate_mutations()?;
+        let summary = mutations::execute_mutations(source.as_ref(), &mutation_list).await?;
+        summary.print();
+        Some(summary)
+    } else {
+        None
+    };
 
     // Phase 9: Report metrics
     println!("Phase 9: Reporting metrics");
@@ -250,6 +308,14 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     crate::metrics::RECORD_COUNT.record(total_record_count.try_into().unwrap_or(u64::MAX), &[]);
     crate::metrics::RECORDS_PER_SECOND.record(records_per_sec, &[]);
 
+    // Record liveness metrics if enabled
+    let (liveness_failures, liveness_max_latency_ms) =
+        calculate_liveness_stats(health_report.as_ref());
+    if args.enable_liveness {
+        crate::metrics::LIVENESS_FAILURES.record(liveness_failures, &[]);
+        crate::metrics::LIVENESS_MAX_LATENCY.record(liveness_max_latency_ms, &[]);
+    }
+
     // Print summary
     println!("\n{}", "=".repeat(60));
     println!("Streaming Ingestion Benchmark Results");
@@ -269,6 +335,34 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     println!("Data Insertion Time:    {total_insert_duration:?}");
     println!("Ingestion Duration:     {ingestion_duration:?}");
     println!("Throughput:             {records_per_sec:.2} records/sec");
+    if args.enable_liveness {
+        println!("Liveness Failures:      {liveness_failures}");
+        println!("Liveness Max Latency:   {liveness_max_latency_ms:.2} ms");
+        if let Some(ref report) = health_report {
+            if let Some(msg) = report.failure_message() {
+                println!("Liveness Issues:        {msg}");
+            } else {
+                println!("Liveness Status:        All checks passed");
+            }
+        }
+    }
+    if args.verify {
+        if verification_passed {
+            println!("Verification:           PASSED");
+        } else {
+            println!("Verification:           FAILED");
+        }
+    }
+    if let Some(ref summary) = mutation_summary {
+        println!(
+            "Mutations:              {} total ({} inserts, {} updates, {} deletes, {} errors)",
+            summary.total(),
+            summary.inserts,
+            summary.updates,
+            summary.deletes,
+            summary.errors
+        );
+    }
     println!("{}", "=".repeat(60));
 
     telemetry.emit().await?;
@@ -398,4 +492,50 @@ fn get_count_from_batch(batch: &RecordBatch) -> Option<i64> {
         return Some(array.value(0) as i64);
     }
     None
+}
+
+/// Calculate aggregate liveness stats from a health check report.
+fn calculate_liveness_stats(report: Option<&HealthCheckReport>) -> (u64, f64) {
+    let Some(report) = report else {
+        return (0, 0.0);
+    };
+
+    let (total_failures, max_latency) = report.aggregate_stats();
+    let max_latency_ms = max_latency.as_secs_f64() * 1000.0;
+
+    (total_failures, max_latency_ms)
+}
+
+/// Create a streaming source based on the arguments.
+fn create_source(args: &StreamingTestArgs) -> Result<Box<dyn StreamingSource>> {
+    if args.source.requires_aws_config() {
+        // Build AWS configuration from CLI arguments
+        let auth = match args.aws_auth {
+            AwsAuth::IamRole => AwsAuthMethod::IamRole,
+            AwsAuth::Env => AwsAuthMethod::Environment,
+            AwsAuth::Key => {
+                let access_key_id = args.aws_access_key_id.clone().ok_or_else(|| {
+                    anyhow::anyhow!("--aws-access-key-id is required when --aws-auth=key")
+                })?;
+                let secret_access_key = args.aws_secret_access_key.clone().ok_or_else(|| {
+                    anyhow::anyhow!("--aws-secret-access-key is required when --aws-auth=key")
+                })?;
+                AwsAuthMethod::Key {
+                    access_key_id,
+                    secret_access_key,
+                    session_token: args.aws_session_token.clone(),
+                }
+            }
+        };
+
+        let config = AwsDynamoDbConfig {
+            region: args.aws_region.clone(),
+            auth,
+            endpoint_url: args.aws_endpoint_url.clone(),
+        };
+
+        Ok(args.source.create_aws(config))
+    } else {
+        Ok(args.source.create())
+    }
 }

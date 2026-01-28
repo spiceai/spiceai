@@ -58,6 +58,21 @@ pub(crate) struct HealthCheckReport {
 }
 
 impl HealthCheckReport {
+    /// Calculate aggregate stats across all endpoints.
+    pub(crate) fn aggregate_stats(&self) -> (u64, Duration) {
+        let mut total_failures = 0u64;
+        let mut max_latency = Duration::ZERO;
+
+        for stats in self.endpoints.values() {
+            total_failures = total_failures.saturating_add(stats.failure_count);
+            if stats.max_latency > max_latency {
+                max_latency = stats.max_latency;
+            }
+        }
+
+        (total_failures, max_latency)
+    }
+
     pub(crate) fn failure_message(&self) -> Option<String> {
         let mut parts = Vec::new();
 

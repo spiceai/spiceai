@@ -27,6 +27,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 spiceai.workspace = true
 test-framework = { path = "../../crates/test-framework" }
+rand.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 

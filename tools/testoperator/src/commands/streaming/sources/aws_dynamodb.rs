@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `DynamoDB` Streams source implementation.
+//! AWS `DynamoDB` Streams source implementation.
+//!
+//! This source connects to actual AWS DynamoDB (not a local Docker container).
+//! It supports multiple authentication methods: IAM role, explicit keys, or environment.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
@@ -29,43 +30,61 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
     ScalarAttributeType, StreamSpecification, StreamViewType,
 };
-use bollard::Docker;
-use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
-    StartContainerOptions,
-};
-use bollard::image::CreateImageOptions;
-use bollard::secret::{
-    ContainerState, ContainerStateStatusEnum, Health, HealthConfig, HealthStatusEnum, HostConfig,
-    PortBinding,
-};
-use futures::StreamExt;
 use test_framework::anyhow::{self, Context, Result};
 
 use crate::commands::streaming::datasets::DatasetType;
 use crate::commands::streaming::traits::StreamingSource;
 
-const DYNAMODB_DOCKER_IMAGE: &str = "amazon/dynamodb-local:latest";
-const CONTAINER_NAME_PREFIX: &str = "testoperator-dynamodb";
-const ACCESS_KEY: &str = "test";
-const SECRET_KEY: &str = "test";
+/// AWS authentication method for DynamoDB access.
+#[derive(Debug, Clone)]
+pub enum AwsAuthMethod {
+    /// Use IAM role authentication (from environment, metadata service, etc.)
+    IamRole,
+    /// Use explicit access key credentials
+    Key {
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: Option<String>,
+    },
+    /// Use environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+    Environment,
+}
 
-/// `DynamoDB` Streams source for streaming benchmarks.
-pub struct DynamoDbStreamsSource {
-    docker: Option<Docker>,
-    container_name: Option<String>,
-    port: u16,
+/// Configuration for AWS DynamoDB source.
+#[derive(Debug, Clone)]
+pub struct AwsDynamoDbConfig {
+    /// AWS region (e.g., "us-east-1")
+    pub region: String,
+    /// Authentication method
+    pub auth: AwsAuthMethod,
+    /// Optional custom endpoint URL (for LocalStack, testing, etc.)
+    pub endpoint_url: Option<String>,
+}
+
+impl Default for AwsDynamoDbConfig {
+    fn default() -> Self {
+        Self {
+            region: "us-east-1".to_string(),
+            auth: AwsAuthMethod::IamRole,
+            endpoint_url: None,
+        }
+    }
+}
+
+/// AWS `DynamoDB` Streams source for streaming benchmarks.
+///
+/// Unlike the local Docker-based source, this connects to actual AWS DynamoDB.
+pub struct AwsDynamoDbStreamsSource {
+    config: AwsDynamoDbConfig,
     client: Option<Client>,
 }
 
-impl DynamoDbStreamsSource {
-    /// Create a new `DynamoDB` Streams source.
+impl AwsDynamoDbStreamsSource {
+    /// Create a new AWS `DynamoDB` Streams source with the given configuration.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(config: AwsDynamoDbConfig) -> Self {
         Self {
-            docker: None,
-            container_name: None,
-            port: 8000,
+            config,
             client: None,
         }
     }
@@ -77,22 +96,51 @@ impl DynamoDbStreamsSource {
         })
     }
 
-    /// Create a `DynamoDB` client for the given port.
-    fn create_client(port: u16) -> Client {
-        let config = SdkConfig::builder()
-            .endpoint_url(format!("http://localhost:{port}"))
-            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
-                ACCESS_KEY,
-                SECRET_KEY,
-                None,
-                None,
-                "testoperator",
-            )))
+    /// Create a `DynamoDB` client with the configured authentication.
+    async fn create_client(config: &AwsDynamoDbConfig) -> Result<Client> {
+        let mut sdk_config_builder = SdkConfig::builder()
             .retry_config(RetryConfig::standard().with_max_attempts(5))
             .behavior_version(BehaviorVersion::latest())
-            .region(Some(Region::from_static("us-east-1")))
-            .build();
-        Client::new(&config)
+            .region(Some(Region::new(config.region.clone())));
+
+        // Configure endpoint URL if provided
+        if let Some(ref endpoint_url) = config.endpoint_url {
+            sdk_config_builder = sdk_config_builder.endpoint_url(endpoint_url.clone());
+        }
+
+        // Configure credentials based on auth method
+        match &config.auth {
+            AwsAuthMethod::IamRole | AwsAuthMethod::Environment => {
+                // Use the default credential chain (includes environment, IAM roles, etc.)
+                let default_config = aws_config::defaults(BehaviorVersion::latest())
+                    .region(Region::new(config.region.clone()))
+                    .load()
+                    .await;
+
+                if let Some(provider) = default_config.credentials_provider() {
+                    sdk_config_builder =
+                        sdk_config_builder.credentials_provider(provider.clone());
+                }
+            }
+            AwsAuthMethod::Key {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                let credentials = Credentials::new(
+                    access_key_id.clone(),
+                    secret_access_key.clone(),
+                    session_token.clone(),
+                    None,
+                    "testoperator-aws-dynamodb",
+                );
+                sdk_config_builder = sdk_config_builder
+                    .credentials_provider(SharedCredentialsProvider::new(credentials));
+            }
+        }
+
+        let sdk_config = sdk_config_builder.build();
+        Ok(Client::new(&sdk_config))
     }
 
     /// Convert an Arrow array value to a `DynamoDB` `AttributeValue`.
@@ -123,7 +171,47 @@ impl DynamoDbStreamsSource {
         }
     }
 
-    /// Create the lineitem table with `DynamoDB` Streams enabled.
+    /// Create a simple table with a single hash key.
+    async fn create_simple_table(
+        &self,
+        client: &Client,
+        table_name: &str,
+        hash_key: &str,
+    ) -> Result<()> {
+        client
+            .create_table()
+            .table_name(table_name)
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name(hash_key)
+                    .attribute_type(ScalarAttributeType::N)
+                    .build()
+                    .context("Failed to build attribute definition")?,
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(hash_key)
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .context("Failed to build key schema")?,
+            )
+            .billing_mode(BillingMode::PayPerRequest)
+            .stream_specification(
+                StreamSpecification::builder()
+                    .stream_enabled(true)
+                    .stream_view_type(StreamViewType::NewAndOldImages)
+                    .build()
+                    .context("Failed to build stream specification")?,
+            )
+            .send()
+            .await
+            .with_context(|| format!("Failed to create {table_name} table"))?;
+
+        println!("Created table '{table_name}' with DynamoDB Streams enabled");
+        Ok(())
+    }
+
+    /// Create the lineitem table with composite key.
     async fn create_lineitem_table(&self, client: &Client) -> Result<()> {
         client
             .create_table()
@@ -169,61 +257,6 @@ impl DynamoDbStreamsSource {
             .context("Failed to create lineitem table")?;
 
         println!("Created table 'lineitem' with DynamoDB Streams enabled");
-        Ok(())
-    }
-
-    /// Delete the lineitem marker record.
-    async fn delete_lineitem_marker(&self, client: &Client) -> Result<()> {
-        client
-            .delete_item()
-            .table_name("lineitem")
-            .key("l_orderkey", AttributeValue::N("-1".to_string()))
-            .key("l_linenumber", AttributeValue::N("-1".to_string()))
-            .send()
-            .await
-            .context("Failed to delete lineitem marker record")?;
-
-        println!("Deleted marker record from 'lineitem'");
-        Ok(())
-    }
-
-    /// Create a simple table with a single hash key.
-    async fn create_simple_table(
-        &self,
-        client: &Client,
-        table_name: &str,
-        hash_key: &str,
-    ) -> Result<()> {
-        client
-            .create_table()
-            .table_name(table_name)
-            .attribute_definitions(
-                AttributeDefinition::builder()
-                    .attribute_name(hash_key)
-                    .attribute_type(ScalarAttributeType::N)
-                    .build()
-                    .context("Failed to build attribute definition")?,
-            )
-            .key_schema(
-                KeySchemaElement::builder()
-                    .attribute_name(hash_key)
-                    .key_type(KeyType::Hash)
-                    .build()
-                    .context("Failed to build key schema")?,
-            )
-            .billing_mode(BillingMode::PayPerRequest)
-            .stream_specification(
-                StreamSpecification::builder()
-                    .stream_enabled(true)
-                    .stream_view_type(StreamViewType::NewAndOldImages)
-                    .build()
-                    .context("Failed to build stream specification")?,
-            )
-            .send()
-            .await
-            .with_context(|| format!("Failed to create {table_name} table"))?;
-
-        println!("Created table '{table_name}' with DynamoDB Streams enabled");
         Ok(())
     }
 
@@ -295,6 +328,21 @@ impl DynamoDbStreamsSource {
         Ok(())
     }
 
+    /// Delete the lineitem marker record.
+    async fn delete_lineitem_marker(&self, client: &Client) -> Result<()> {
+        client
+            .delete_item()
+            .table_name("lineitem")
+            .key("l_orderkey", AttributeValue::N("-1".to_string()))
+            .key("l_linenumber", AttributeValue::N("-1".to_string()))
+            .send()
+            .await
+            .context("Failed to delete lineitem marker record")?;
+
+        println!("Deleted marker record from 'lineitem'");
+        Ok(())
+    }
+
     /// Delete the partsupp marker record.
     async fn delete_partsupp_marker(&self, client: &Client) -> Result<()> {
         client
@@ -311,118 +359,23 @@ impl DynamoDbStreamsSource {
     }
 }
 
-impl Default for DynamoDbStreamsSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait::async_trait]
-impl StreamingSource for DynamoDbStreamsSource {
+impl StreamingSource for AwsDynamoDbStreamsSource {
     async fn prepare(&mut self) -> Result<()> {
-        let docker =
-            Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
-
-        let name = format!("{CONTAINER_NAME_PREFIX}-{}", self.port);
-
-        // Remove existing container if present
-        if container_exists(&docker, &name).await? {
-            remove_container(&docker, &name).await?;
-        }
-
-        // Pull image if needed
-        pull_image_if_needed(&docker, DYNAMODB_DOCKER_IMAGE).await?;
-
-        // Create port bindings
-        let mut port_bindings = HashMap::new();
-        port_bindings.insert(
-            "8000/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some(self.port.to_string()),
-            }]),
+        // For AWS DynamoDB, we just need to create the client
+        // No container management needed
+        println!(
+            "Initializing AWS DynamoDB client for region {}",
+            self.config.region
         );
 
-        let host_config = Some(HostConfig {
-            port_bindings: Some(port_bindings),
-            ..Default::default()
-        });
-
-        let healthcheck = HealthConfig {
-            test: Some(vec![
-                "CMD-SHELL".to_string(),
-                "curl -s http://localhost:8000 | grep -q 'MissingAuthenticationToken' || exit 1"
-                    .to_string(),
-            ]),
-            interval: Some(2_000_000_000), // 2 seconds
-            timeout: Some(10_000_000_000), // 10 seconds
-            retries: Some(15),
-            start_period: Some(10_000_000_000), // 10 seconds
-            start_interval: None,
-        };
-
-        #[expect(clippy::zero_sized_map_values)]
-        let exposed_ports: HashMap<&str, HashMap<(), ()>> =
-            [("8000/tcp", HashMap::new())].into_iter().collect();
-
-        let config = Config::<&str> {
-            image: Some(DYNAMODB_DOCKER_IMAGE),
-            host_config,
-            healthcheck: Some(healthcheck),
-            exposed_ports: Some(exposed_ports),
-            ..Default::default()
-        };
-
-        let options = CreateContainerOptions {
-            name: name.as_str(),
-            platform: None,
-        };
-
-        docker
-            .create_container(Some(options), config)
-            .await
-            .context("Failed to create DynamoDB Local container")?;
-
-        docker
-            .start_container(&name, None::<StartContainerOptions<String>>)
-            .await
-            .context("Failed to start DynamoDB Local container")?;
-
-        // Wait for container to be healthy
-        let start_time = std::time::Instant::now();
-        let timeout = Duration::from_secs(60);
-
-        loop {
-            let inspect = docker.inspect_container(&name, None).await?;
-
-            if let Some(ContainerState {
-                status: Some(ContainerStateStatusEnum::RUNNING),
-                health:
-                    Some(Health {
-                        status: Some(HealthStatusEnum::HEALTHY),
-                        ..
-                    }),
-                ..
-            }) = inspect.state
-            {
-                println!("DynamoDB Local container is healthy on port {}", self.port);
-                break;
-            }
-
-            if start_time.elapsed() > timeout {
-                let _ = remove_container(&docker, &name).await;
-                return Err(anyhow::anyhow!(
-                    "DynamoDB Local container failed to become healthy within {timeout:?}"
-                ));
-            }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(ref endpoint) = self.config.endpoint_url {
+            println!("Using custom endpoint: {endpoint}");
         }
 
-        self.docker = Some(docker);
-        self.container_name = Some(name);
-        self.client = Some(Self::create_client(self.port));
+        self.client = Some(Self::create_client(&self.config).await?);
 
+        println!("AWS DynamoDB client initialized successfully");
         Ok(())
     }
 
@@ -574,66 +527,10 @@ impl StreamingSource for DynamoDbStreamsSource {
     }
 
     async fn cleanup(self: Box<Self>) -> Result<()> {
-        if let (Some(docker), Some(name)) = (self.docker, self.container_name) {
-            remove_container(&docker, &name).await?;
-        }
+        // For AWS DynamoDB, we don't delete the tables on cleanup
+        // as they may be expensive to recreate or contain other data.
+        // Users should manage table lifecycle separately.
+        println!("AWS DynamoDB cleanup complete (tables preserved)");
         Ok(())
     }
-}
-
-async fn container_exists(docker: &Docker, name: &str) -> Result<bool> {
-    let containers = docker
-        .list_containers::<&str>(Some(ListContainersOptions {
-            all: true,
-            ..Default::default()
-        }))
-        .await?;
-
-    for container in containers {
-        if let Some(names) = container.names
-            && names.iter().any(|n| n == name || n == &format!("/{name}")) {
-                return Ok(true);
-            }
-    }
-    Ok(false)
-}
-
-async fn remove_container(docker: &Docker, name: &str) -> Result<()> {
-    docker
-        .remove_container(
-            name,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .context("Failed to remove container")?;
-    Ok(())
-}
-
-async fn pull_image_if_needed(docker: &Docker, image: &str) -> Result<()> {
-    let images = docker.list_images::<&str>(None).await?;
-    for img in images {
-        if img.repo_tags.iter().any(|t| t == image) {
-            println!("Docker image {image} already pulled");
-            return Ok(());
-        }
-    }
-
-    println!("Pulling Docker image: {image}");
-    let options = Some(CreateImageOptions::<&str> {
-        from_image: image,
-        ..Default::default()
-    });
-
-    let mut stream = docker.create_image(options, None, None);
-    while let Some(event) = stream.next().await {
-        if let Err(e) = event {
-            return Err(anyhow::anyhow!("Failed to pull image: {e}"));
-        }
-    }
-
-    println!("Successfully pulled Docker image: {image}");
-    Ok(())
 }

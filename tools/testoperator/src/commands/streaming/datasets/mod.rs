@@ -19,21 +19,64 @@ limitations under the License.
 //! Each dataset type represents a specific table that can be loaded
 //! into a streaming source. Query sets determine which datasets to load.
 
+mod customer;
 mod lineitem;
+mod nation;
+mod orders;
+mod part;
+mod partsupp;
+mod region;
+mod supplier;
 
+pub use customer::CustomerDataset;
 pub use lineitem::LineitemDataset;
+pub use nation::NationDataset;
+pub use orders::OrdersDataset;
+pub use part::PartDataset;
+pub use partsupp::PartsuppDataset;
+pub use region::RegionDataset;
+pub use supplier::SupplierDataset;
 
 /// Available dataset types (tables) for streaming benchmarks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DatasetType {
-    /// TPCH
+    /// TPCH lineitem table (6M rows at SF=1)
     Lineitem,
+    /// TPCH orders table (1.5M rows at SF=1)
+    Orders,
+    /// TPCH customer table (150K rows at SF=1)
+    Customer,
+    /// TPCH part table (200K rows at SF=1)
+    Part,
+    /// TPCH supplier table (10K rows at SF=1)
+    Supplier,
+    /// TPCH partsupp table (800K rows at SF=1)
+    Partsupp,
+    /// TPCH nation table (25 rows)
+    Nation,
+    /// TPCH region table (5 rows)
+    Region,
+}
+
+impl DatasetType {
+    /// Returns the table name for this dataset type.
+    #[must_use]
+    pub fn table_name(&self) -> &'static str {
+        match self {
+            DatasetType::Lineitem => "lineitem",
+            DatasetType::Orders => "orders",
+            DatasetType::Customer => "customer",
+            DatasetType::Part => "part",
+            DatasetType::Supplier => "supplier",
+            DatasetType::Partsupp => "partsupp",
+            DatasetType::Nation => "nation",
+            DatasetType::Region => "region",
+        }
+    }
 }
 
 impl std::fmt::Display for DatasetType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DatasetType::Lineitem => write!(f, "lineitem"),
-        }
+        write!(f, "{}", self.table_name())
     }
 }

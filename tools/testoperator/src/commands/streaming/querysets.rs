@@ -17,7 +17,10 @@ limitations under the License.
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use super::datasets::LineitemDataset;
+use super::datasets::{
+    CustomerDataset, LineitemDataset, NationDataset, OrdersDataset, PartDataset, PartsuppDataset,
+    RegionDataset, SupplierDataset,
+};
 use super::traits::StreamingDataset;
 
 /// Available query set types for streaming benchmarks.
@@ -26,7 +29,10 @@ use super::traits::StreamingDataset;
 #[derive(Debug, Clone, Copy, ValueEnum, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum QuerySetType {
-    Tpch,
+    /// Just the lineitem table (fastest for basic testing)
+    TpchLineitem,
+    /// All 8 TPCH tables (full benchmark)
+    TpchFull,
 }
 
 impl QuerySetType {
@@ -34,7 +40,18 @@ impl QuerySetType {
     #[must_use]
     pub fn create_datasets(&self) -> Vec<Box<dyn StreamingDataset>> {
         match self {
-            QuerySetType::Tpch => vec![Box::new(LineitemDataset)],
+            QuerySetType::TpchLineitem => vec![Box::new(LineitemDataset)],
+            QuerySetType::TpchFull => vec![
+                // Load in order of dependencies: small dimension tables first
+                Box::new(RegionDataset),
+                Box::new(NationDataset),
+                Box::new(SupplierDataset),
+                Box::new(PartDataset),
+                Box::new(PartsuppDataset),
+                Box::new(CustomerDataset),
+                Box::new(OrdersDataset),
+                Box::new(LineitemDataset),
+            ],
         }
     }
 }
@@ -42,7 +59,8 @@ impl QuerySetType {
 impl std::fmt::Display for QuerySetType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QuerySetType::Tpch => write!(f, "tpch"),
+            QuerySetType::TpchLineitem => write!(f, "tpch-lineitem"),
+            QuerySetType::TpchFull => write!(f, "tpch-full"),
         }
     }
 }

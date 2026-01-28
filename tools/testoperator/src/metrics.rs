@@ -402,3 +402,19 @@ pub static RECORDS_PER_SECOND: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .with_unit("records/s")
         .build()
 });
+
+pub static LIVENESS_FAILURES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("liveness_failures")
+        .with_description("Total health check failures during streaming ingestion.")
+        .with_unit("failures")
+        .build()
+});
+
+pub static LIVENESS_MAX_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("liveness_max_latency_ms")
+        .with_description("Maximum health check latency during streaming ingestion.")
+        .with_unit("ms")
+        .build()
+});

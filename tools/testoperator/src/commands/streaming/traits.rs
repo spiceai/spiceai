@@ -74,6 +74,16 @@ pub trait StreamingSource: Send {
     /// Delete a marker record.
     async fn delete_marker(&self, dataset: DatasetType) -> Result<()>;
 
+    /// Update existing records in the specified table.
+    ///
+    /// The records should contain the primary key columns and the columns to update.
+    async fn update(&self, table: &str, records: &[RecordBatch]) -> Result<()>;
+
+    /// Delete records from the specified table.
+    ///
+    /// The records should contain only the primary key columns.
+    async fn delete(&self, table: &str, keys: &[RecordBatch]) -> Result<()>;
+
     /// Cleanup resources (stop containers, etc.).
     async fn cleanup(self: Box<Self>) -> Result<()>;
 }
