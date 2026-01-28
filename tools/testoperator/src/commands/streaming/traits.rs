@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! The streaming benchmark system is built around two abstractions:
 //! - [`StreamingDataset`]: Defines a table within a benchmark dataset (e.g., TPCH lineitem)
-//! - [`StreamingSource`]: Defines where data is sent (e.g., DynamoDB Streams, Kafka)
+//! - [`StreamingSource`]: Defines where data is sent (e.g., `DynamoDB` Streams, Kafka)
 //!
 //! Sources match on dataset type to know source-specific configuration (key schemas, etc.).
 

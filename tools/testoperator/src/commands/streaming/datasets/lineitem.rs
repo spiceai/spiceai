@@ -28,7 +28,7 @@ use crate::commands::streaming::traits::StreamingDataset;
 
 /// Lineitem dataset (TPCH).
 ///
-/// Generates lineitem data using DuckDB's TPCH extension.
+/// Generates lineitem data using `DuckDB`'s TPCH extension.
 pub struct LineitemDataset;
 
 impl LineitemDataset {
@@ -57,7 +57,7 @@ impl LineitemDataset {
 }
 
 impl StreamingDataset for LineitemDataset {
-    fn table_name(&self) -> &str {
+    fn table_name(&self) -> &'static str {
         "lineitem"
     }
 
@@ -66,7 +66,7 @@ impl StreamingDataset for LineitemDataset {
     }
 
     fn generate(&self, scale_factor: f64) -> Result<Vec<RecordBatch>> {
-        tracing::info!("Generating TPCH lineitem data with scale factor {scale_factor}");
+        println!("Generating TPCH lineitem data with scale factor {scale_factor}");
 
         let conn =
             Connection::open_in_memory().context("Failed to open in-memory DuckDB connection")?;
@@ -131,7 +131,7 @@ impl StreamingDataset for LineitemDataset {
         }
 
         let record_count = l_orderkey.len();
-        tracing::info!("Generated {record_count} lineitem records");
+        println!("Generated {record_count} lineitem records");
 
         // Build Arrow arrays
         let batch = RecordBatch::try_new(

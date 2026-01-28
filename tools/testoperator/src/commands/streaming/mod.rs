@@ -17,11 +17,11 @@ limitations under the License.
 //! Streaming ingestion benchmark command.
 //!
 //! This benchmark measures the time it takes for Spice to ingest data from
-//! streaming sources like DynamoDB Streams, Kafka, etc.
+//! streaming sources like `DynamoDB` Streams, Kafka, etc.
 //!
 //! The benchmark is built around two abstractions:
 //! - [`datasets::DatasetType`]: What table to generate (e.g., TPCH lineitem)
-//! - [`sources::SourceType`]: Where data is sent (e.g., DynamoDB Streams)
+//! - [`sources::SourceType`]: Where data is sent (e.g., `DynamoDB` Streams)
 //!
 //! Multiple datasets can be specified for multi-table benchmarks.
 //!
@@ -68,10 +68,10 @@ struct DatasetInfo {
 pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     let datasets = args.queryset.create_datasets();
 
-    tracing::info!("Starting streaming ingestion benchmark");
-    tracing::info!("Source: {}", args.source);
-    tracing::info!("Query set: {}", args.queryset);
-    tracing::info!(
+    println!("Starting streaming ingestion benchmark");
+    println!("Source: {}", args.source);
+    println!("Query set: {}", args.queryset);
+    println!(
         "Datasets: {}",
         datasets
             .iter()
@@ -79,17 +79,17 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    tracing::info!("Scale factor: {}", args.scale_factor);
+    println!("Scale factor: {}", args.scale_factor);
 
     // Create source
     let mut source = args.source.create();
 
     // Phase 1: Prepare source
-    tracing::info!("Phase 1: Preparing streaming source");
+    println!("Phase 1: Preparing streaming source");
     source.prepare().await?;
 
     // Phase 2: Create tables for all datasets
-    tracing::info!("Phase 2: Creating tables for all datasets");
+    println!("Phase 2: Creating tables for all datasets");
     for dataset in &datasets {
         source.create_table(dataset.dataset_type()).await?;
     }
@@ -98,19 +98,19 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Phase 3 & 4: Generate data and insert for each dataset
-    tracing::info!("Phase 3-4: Generating and inserting data for all datasets");
+    println!("Phase 3-4: Generating and inserting data for all datasets");
     let mut dataset_infos = Vec::new();
     let mut total_insert_duration = Duration::ZERO;
 
     for dataset in datasets {
         let dataset_type = dataset.dataset_type();
 
-        tracing::info!("Generating data for {}", dataset_type);
+        println!("Generating data for {dataset_type}");
         let records = dataset.generate(args.scale_factor)?;
         let record_count: usize = records.iter().map(RecordBatch::num_rows).sum();
-        tracing::info!("Generated {record_count} records for {}", dataset_type);
+        println!("Generated {record_count} records for {dataset_type}");
 
-        tracing::info!("Inserting data for {}", dataset_type);
+        println!("Inserting data for {dataset_type}");
         let insert_start = Instant::now();
         source.insert(dataset.table_name(), &records).await?;
         total_insert_duration += insert_start.elapsed();
@@ -124,10 +124,10 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
         });
     }
 
-    tracing::info!("Data insertion completed in {total_insert_duration:?}");
+    println!("Data insertion completed in {total_insert_duration:?}");
 
     // Phase 5: Insert markers for all datasets
-    tracing::info!("Phase 5: Inserting marker records for all datasets");
+    println!("Phase 5: Inserting marker records for all datasets");
     for info in &dataset_infos {
         source
             .insert(info.dataset.table_name(), &[info.marker.clone()])
@@ -138,8 +138,8 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Phase 6: Start Spiced
-    tracing::info!("Phase 6: Starting Spiced with streaming connector");
-    tracing::info!("Using spicepod: {}", args.common.spicepod_path.display());
+    println!("Phase 6: Starting Spiced with streaming connector");
+    println!("Using spicepod: {}", args.common.spicepod_path.display());
 
     let spicepod_def = load_spicepod(args.common.spicepod_path.clone())?;
     let mut start_request = StartRequest::new(args.common.spiced_path_buf(), spicepod_def)?;
@@ -158,7 +158,7 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     let spiced_version = spiced_instance.version().to_string();
 
     // Phase 7: Poll for ALL markers
-    tracing::info!("Phase 7: Polling for all marker records");
+    println!("Phase 7: Polling for all marker records");
     let ingestion_start = Instant::now();
     let timeout = Duration::from_secs(args.ingestion_timeout);
 
@@ -184,21 +184,21 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
         ));
     }
 
-    tracing::info!("All markers detected! Ingestion completed in {ingestion_duration:?}");
+    println!("All markers detected! Ingestion completed in {ingestion_duration:?}");
 
     // Phase 8: Delete all markers
-    tracing::info!("Phase 8: Deleting all marker records");
+    println!("Phase 8: Deleting all marker records");
     for info in &dataset_infos {
         source.delete_marker(info.dataset.dataset_type()).await?;
     }
 
     // Wait for deletes to propagate
-    tracing::info!("Waiting for marker deletions to propagate...");
+    println!("Waiting for marker deletions to propagate...");
     wait_for_all_marker_deletions(&spiced_instance, &marker_queries, Duration::from_secs(30))
         .await?;
 
     // Phase 9: Report metrics
-    tracing::info!("Phase 9: Reporting metrics");
+    println!("Phase 9: Reporting metrics");
 
     let total_record_count: usize = dataset_infos.iter().map(|info| info.record_count).sum();
 
@@ -301,7 +301,7 @@ async fn poll_for_all_markers(
                 .filter(|&(_, v)| !v)
                 .map(|(k, _)| k.to_string())
                 .collect();
-            tracing::warn!("Timeout waiting for markers: {:?}", missing);
+            println!("Timeout waiting for markers: {missing:?}");
             return Ok(false);
         }
 
@@ -311,21 +311,18 @@ async fn poll_for_all_markers(
                 continue;
             }
 
-            if let Ok(stream) = spice_client.query(query).await {
-                if let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
+            if let Ok(stream) = spice_client.query(query).await
+                && let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
                     for batch in &batches {
-                        if batch.num_rows() > 0 {
-                            if let Some(count) = get_count_from_batch(batch) {
-                                if count > 0 {
-                                    tracing::info!("Marker detected for {}", dataset_type);
+                        if batch.num_rows() > 0
+                            && let Some(count) = get_count_from_batch(batch)
+                                && count > 0 {
+                                    println!("Marker detected for {dataset_type}");
                                     detected.insert(*dataset_type, true);
                                     break;
                                 }
-                            }
-                        }
                     }
                 }
-            }
         }
 
         // Check if all markers are detected
@@ -358,9 +355,8 @@ async fn wait_for_all_marker_deletions(
                 .filter(|&(_, v)| !v)
                 .map(|(k, _)| k.to_string())
                 .collect();
-            tracing::warn!(
-                "Marker deletion did not propagate for all datasets within timeout: {:?}",
-                missing
+            println!(
+                "Marker deletion did not propagate for all datasets within timeout: {missing:?}"
             );
             return Ok(());
         }
@@ -370,28 +366,22 @@ async fn wait_for_all_marker_deletions(
                 continue;
             }
 
-            if let Ok(stream) = spice_client.query(query).await {
-                if let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
+            if let Ok(stream) = spice_client.query(query).await
+                && let Ok(batches) = stream.try_collect::<Vec<RecordBatch>>().await {
                     for batch in &batches {
-                        if batch.num_rows() > 0 {
-                            if let Some(count) = get_count_from_batch(batch) {
-                                if count == 0 {
-                                    tracing::info!(
-                                        "Marker deletion confirmed for {}",
-                                        dataset_type
-                                    );
+                        if batch.num_rows() > 0
+                            && let Some(count) = get_count_from_batch(batch)
+                                && count == 0 {
+                                    println!("Marker deletion confirmed for {dataset_type}");
                                     deleted.insert(*dataset_type, true);
                                     break;
                                 }
-                            }
-                        }
                     }
                 }
-            }
         }
 
         if deleted.values().all(|&v| v) {
-            tracing::info!("All marker deletions confirmed");
+            println!("All marker deletions confirmed");
             return Ok(());
         }
 

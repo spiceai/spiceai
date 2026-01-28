@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! DynamoDB Streams source implementation.
+//! `DynamoDB` Streams source implementation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,7 +50,7 @@ const CONTAINER_NAME_PREFIX: &str = "testoperator-dynamodb";
 const ACCESS_KEY: &str = "test";
 const SECRET_KEY: &str = "test";
 
-/// DynamoDB Streams source for streaming benchmarks.
+/// `DynamoDB` Streams source for streaming benchmarks.
 pub struct DynamoDbStreamsSource {
     docker: Option<Docker>,
     container_name: Option<String>,
@@ -59,7 +59,7 @@ pub struct DynamoDbStreamsSource {
 }
 
 impl DynamoDbStreamsSource {
-    /// Create a new DynamoDB Streams source.
+    /// Create a new `DynamoDB` Streams source.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -70,14 +70,14 @@ impl DynamoDbStreamsSource {
         }
     }
 
-    /// Get the DynamoDB client.
+    /// Get the `DynamoDB` client.
     fn client(&self) -> Result<&Client> {
         self.client.as_ref().ok_or_else(|| {
             anyhow::anyhow!("DynamoDB client not initialized - call prepare() first")
         })
     }
 
-    /// Create a DynamoDB client for the given port.
+    /// Create a `DynamoDB` client for the given port.
     fn create_client(port: u16) -> Client {
         let config = SdkConfig::builder()
             .endpoint_url(format!("http://localhost:{port}"))
@@ -95,7 +95,7 @@ impl DynamoDbStreamsSource {
         Client::new(&config)
     }
 
-    /// Convert an Arrow array value to a DynamoDB AttributeValue.
+    /// Convert an Arrow array value to a `DynamoDB` `AttributeValue`.
     fn array_to_attribute(array: &Arc<dyn Array>, row: usize) -> Result<AttributeValue> {
         match array.data_type() {
             DataType::Int64 => {
@@ -123,7 +123,7 @@ impl DynamoDbStreamsSource {
         }
     }
 
-    /// Create the lineitem table with DynamoDB Streams enabled.
+    /// Create the lineitem table with `DynamoDB` Streams enabled.
     async fn create_lineitem_table(&self, client: &Client) -> Result<()> {
         client
             .create_table()
@@ -168,7 +168,7 @@ impl DynamoDbStreamsSource {
             .await
             .context("Failed to create lineitem table")?;
 
-        tracing::info!("Created table 'lineitem' with DynamoDB Streams enabled");
+        println!("Created table 'lineitem' with DynamoDB Streams enabled");
         Ok(())
     }
 
@@ -183,7 +183,7 @@ impl DynamoDbStreamsSource {
             .await
             .context("Failed to delete lineitem marker record")?;
 
-        tracing::info!("Deleted marker record from 'lineitem'");
+        println!("Deleted marker record from 'lineitem'");
         Ok(())
     }
 }
@@ -282,7 +282,7 @@ impl StreamingSource for DynamoDbStreamsSource {
                 ..
             }) = inspect.state
             {
-                tracing::info!("DynamoDB Local container is healthy on port {}", self.port);
+                println!("DynamoDB Local container is healthy on port {}", self.port);
                 break;
             }
 
@@ -319,7 +319,7 @@ impl StreamingSource for DynamoDbStreamsSource {
         let client = self.client()?;
 
         let total_rows: usize = records.iter().map(RecordBatch::num_rows).sum();
-        tracing::info!("Inserting {total_rows} records into DynamoDB table '{table}'");
+        println!("Inserting {total_rows} records into DynamoDB table '{table}'");
 
         let mut inserted = 0;
 
@@ -343,15 +343,15 @@ impl StreamingSource for DynamoDbStreamsSource {
                 inserted += 1;
 
                 if inserted % 1000 == 0 {
-                    tracing::info!(
+                    println!(
                         "Inserted {inserted}/{total_rows} records ({:.1}%)",
-                        (inserted as f64 / total_rows as f64) * 100.0
+                        (f64::from(inserted) / total_rows as f64) * 100.0
                     );
                 }
             }
         }
 
-        tracing::info!("Successfully inserted {inserted} records into '{table}'");
+        println!("Successfully inserted {inserted} records into '{table}'");
         Ok(())
     }
 
@@ -384,11 +384,10 @@ async fn container_exists(docker: &Docker, name: &str) -> Result<bool> {
         .await?;
 
     for container in containers {
-        if let Some(names) = container.names {
-            if names.iter().any(|n| n == name || n == &format!("/{name}")) {
+        if let Some(names) = container.names
+            && names.iter().any(|n| n == name || n == &format!("/{name}")) {
                 return Ok(true);
             }
-        }
     }
     Ok(false)
 }
@@ -411,12 +410,12 @@ async fn pull_image_if_needed(docker: &Docker, image: &str) -> Result<()> {
     let images = docker.list_images::<&str>(None).await?;
     for img in images {
         if img.repo_tags.iter().any(|t| t == image) {
-            tracing::debug!("Docker image {image} already pulled");
+            println!("Docker image {image} already pulled");
             return Ok(());
         }
     }
 
-    tracing::info!("Pulling Docker image: {image}");
+    println!("Pulling Docker image: {image}");
     let options = Some(CreateImageOptions::<&str> {
         from_image: image,
         ..Default::default()
@@ -429,6 +428,6 @@ async fn pull_image_if_needed(docker: &Docker, image: &str) -> Result<()> {
         }
     }
 
-    tracing::info!("Successfully pulled Docker image: {image}");
+    println!("Successfully pulled Docker image: {image}");
     Ok(())
 }

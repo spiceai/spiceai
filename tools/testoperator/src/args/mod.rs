@@ -72,7 +72,7 @@ pub enum TestCommands {
     Query(QueryArgs),
     /// Run a text-to-sql test
     TextToSql(TextToSqlArgs),
-    /// Run a streaming ingestion benchmark (DynamoDB Streams)
+    /// Run a streaming ingestion benchmark (`DynamoDB` Streams)
     Streaming(StreamingTestArgs),
 }
 

@@ -29,7 +29,6 @@ spiceai.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
 tokio-util.workspace = true
-tracing.workspace = true
 
 [features]
 default = ["append"]

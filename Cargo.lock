@@ -17618,7 +17618,6 @@ dependencies = [
  "test-framework",
  "tokio",
  "tokio-util",
- "tracing",
 ]
 
 [[package]]

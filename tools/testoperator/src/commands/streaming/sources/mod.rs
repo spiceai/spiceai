@@ -29,7 +29,7 @@ use super::traits::StreamingSource;
 #[derive(Debug, Clone, Copy, ValueEnum, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceType {
-    /// DynamoDB Streams
+    /// `DynamoDB` Streams
     DynamodbStreams,
     // Future: Kafka, Debezium, etc.
 }

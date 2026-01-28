@@ -6,13 +6,13 @@ datasets:
   - from: dynamodb:lineitem
     name: lineitem
     params:
+      dynamodb_aws_auth: key
       dynamodb_aws_access_key_id: test
       dynamodb_aws_secret_access_key: test
       dynamodb_aws_region: us-east-1
       endpoint_url: http://localhost:8000
+      ready_lag: 1h
     acceleration:
       enabled: true
       engine: arrow
       refresh_mode: changes
-      # High ready_lag so the dataset is immediately "ready" even during ingestion
-      ready_lag: 1h
