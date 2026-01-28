@@ -941,4 +941,109 @@ mod tests {
 
         insta::assert_snapshot!(test_name, result);
     }
+
+    #[test]
+    fn test_json_array_to_jsonl_basic() {
+        let input = r#"[{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]"#;
+        let result = json_array_to_jsonl(input).expect("should parse valid JSON array");
+
+        // Each line should be a valid JSON object
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        // Verify each line is valid JSON
+        for line in &lines {
+            let _: serde_json::Value =
+                serde_json::from_str(line).expect("each line should be valid JSON");
+        }
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_empty_array() {
+        let input = "[]";
+        let result = json_array_to_jsonl(input).expect("should parse empty array");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_single_item() {
+        let input = r#"[{"key": "value"}]"#;
+        let result = json_array_to_jsonl(input).expect("should parse single item array");
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_invalid_json() {
+        let input = "not valid json";
+        let result = json_array_to_jsonl(input);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .is_some_and(|e| e.to_string().contains("Invalid JSON array"))
+        );
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_not_an_array() {
+        let input = r#"{"key": "value"}"#;
+        let result = json_array_to_jsonl(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lines_need_truncation_short_lines() {
+        let lines = vec!["short line", "another short line", "abc"];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_exactly_280() {
+        let line_280 = "a".repeat(280);
+        let lines = vec![line_280.as_str()];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_over_280() {
+        let line_281 = "a".repeat(281);
+        let lines = vec![line_281.as_str()];
+        assert!(lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_mixed() {
+        let long_line = "a".repeat(300);
+        let lines = vec!["short", long_line.as_str(), "also short"];
+        assert!(lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_empty() {
+        let lines: Vec<&str> = vec![];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_cache_control_default() {
+        let default = cache_control::CacheControl::default();
+        assert_eq!(default, cache_control::CacheControl::Cache);
+    }
+
+    #[test]
+    fn test_cache_control_equality() {
+        assert_eq!(
+            cache_control::CacheControl::Cache,
+            cache_control::CacheControl::Cache
+        );
+        assert_eq!(
+            cache_control::CacheControl::NoCache,
+            cache_control::CacheControl::NoCache
+        );
+        assert_ne!(
+            cache_control::CacheControl::Cache,
+            cache_control::CacheControl::NoCache
+        );
+    }
 }
