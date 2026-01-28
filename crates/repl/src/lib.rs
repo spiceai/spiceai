@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,6 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+//! Spice.ai REPL utilities and Flight SQL REPL.
+//!
+//! This crate provides:
+//! - Shared REPL utilities (spinner, model selection, history management) via the `util` module
+//! - Flight SQL REPL implementation via the `run` function
 
 use std::borrow::Cow;
 use std::error::Error;
@@ -59,6 +65,7 @@ use tonic::{Code, IntoRequest, Status};
 pub mod cache_control;
 mod completer;
 mod config;
+pub mod util;
 
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai SQL REPL")]
@@ -103,6 +110,10 @@ pub struct ReplConfig {
         help_heading = "SQL REPL"
     )]
     pub cache_control: cache_control::CacheControl,
+
+    /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
+    #[arg(long = "headers", value_name = "KEY:VALUE", help_heading = "SQL REPL")]
+    pub custom_headers: Vec<String>,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -243,6 +254,15 @@ impl Highlighter for EditorHelper {
 
 #[expect(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // Note: custom_headers are currently not applied to the gRPC Flight connection.
+    // Adding gRPC metadata headers requires interceptor changes.
+    // For now, this flag is accepted but not used.
+    if !repl_config.custom_headers.is_empty() {
+        tracing::warn!(
+            "Custom headers are not currently supported for the SQL REPL's Flight gRPC connection"
+        );
+    }
+
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
     let mut user_agent = get_user_agent();
     if let Some(user_agent_override) = repl_config.user_agent {
@@ -920,5 +940,105 @@ mod tests {
             .expect("Failed to display records");
 
         insta::assert_snapshot!(test_name, result);
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_basic() {
+        let input = r#"[{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]"#;
+        let result = json_array_to_jsonl(input).expect("should parse valid JSON array");
+
+        // Each line should be a valid JSON object
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        // Verify each line is valid JSON
+        for line in &lines {
+            let _: serde_json::Value =
+                serde_json::from_str(line).expect("each line should be valid JSON");
+        }
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_empty_array() {
+        let input = "[]";
+        let result = json_array_to_jsonl(input).expect("should parse empty array");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_single_item() {
+        let input = r#"[{"key": "value"}]"#;
+        let result = json_array_to_jsonl(input).expect("should parse single item array");
+        assert_eq!(result.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_invalid_json() {
+        let input = "not valid json";
+        let result = json_array_to_jsonl(input);
+        let err = result.expect_err("invalid JSON should fail");
+        assert!(err.to_string().contains("Invalid JSON array"));
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_not_an_array() {
+        let input = r#"{"key": "value"}"#;
+        let result = json_array_to_jsonl(input);
+        let _ = result.expect_err("non-array JSON should fail");
+    }
+
+    #[test]
+    fn test_lines_need_truncation_short_lines() {
+        let lines = vec!["short line", "another short line", "abc"];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_exactly_280() {
+        let line_280 = "a".repeat(280);
+        let lines = vec![line_280.as_str()];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_over_280() {
+        let line_281 = "a".repeat(281);
+        let lines = vec![line_281.as_str()];
+        assert!(lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_mixed() {
+        let long_line = "a".repeat(300);
+        let lines = vec!["short", long_line.as_str(), "also short"];
+        assert!(lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_empty() {
+        let lines: Vec<&str> = vec![];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_cache_control_default() {
+        let default = cache_control::CacheControl::default();
+        assert_eq!(default, cache_control::CacheControl::Cache);
+    }
+
+    #[test]
+    fn test_cache_control_equality() {
+        assert_eq!(
+            cache_control::CacheControl::Cache,
+            cache_control::CacheControl::Cache
+        );
+        assert_eq!(
+            cache_control::CacheControl::NoCache,
+            cache_control::CacheControl::NoCache
+        );
+        assert_ne!(
+            cache_control::CacheControl::Cache,
+            cache_control::CacheControl::NoCache
+        );
     }
 }

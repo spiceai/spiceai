@@ -16,7 +16,7 @@ members = [
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
-    "crates/flightrepl",
+    "crates/repl",
     "crates/google-genai",
     "crates/hash-index",
     "crates/llms",
