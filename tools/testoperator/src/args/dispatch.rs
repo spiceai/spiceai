@@ -59,6 +59,7 @@ pub enum Workflow {
     Append,
     DataConsistency,
     TextToSql,
+    Streaming,
 }
 
 impl From<Workflow> for TestType {
@@ -70,6 +71,7 @@ impl From<Workflow> for TestType {
             Workflow::Append => TestType::Append,
             Workflow::DataConsistency => TestType::DataConsistency,
             Workflow::TextToSql => TestType::TextToSql,
+            Workflow::Streaming => TestType::Streaming,
         }
     }
 }
@@ -96,6 +98,8 @@ pub struct DispatchTests {
     pub append: Vec<AppendArgs>,
     #[serde(deserialize_with = "deserialize_single_or_vec", default)]
     pub text_to_sql: Vec<TextToSqlArgs>,
+    #[serde(deserialize_with = "deserialize_single_or_vec", default)]
+    pub streaming: Vec<StreamingArgs>,
 }
 
 /// Benchmark and throughput workflow arguments, defined in the test files
@@ -331,6 +335,51 @@ pub enum BenchmarkQueryset {
     BirdBenchSmallThrombosisPrediction,
     #[serde(rename = "bird-bench-small[toxicology]")]
     BirdBenchSmallToxicology,
+}
+
+/// Payload sent to the GitHub Actions workflow request for streaming ingestion benchmarks.
+/// Should match inputs in `.github/workflows/testoperator_run_streaming.yml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StreamingArgs {
+    pub spicepod_path: PathBuf,
+    pub runner_type: RunnerType,
+
+    /// Streaming source type (e.g., dynamodb-streams, kafka)
+    pub source: StreamingSourceType,
+
+    /// Query set type (e.g., tpch-lineitem). Determines which datasets to load.
+    pub queryset: StreamingQuerySetType,
+
+    /// Scale factor for data generation (e.g., 0.01, 0.1, 1.0)
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_scale_factor"
+    )]
+    pub scale_factor: Option<f64>,
+
+    /// Timeout in seconds to wait for ingestion to complete
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingestion_timeout: Option<u64>,
+
+    /// Time in seconds to wait for Spiced to be ready
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_wait: Option<u64>,
+}
+
+/// Streaming source types for dispatch configuration.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StreamingSourceType {
+    DynamodbStreams,
+    // Future: Kafka, Debezium, etc.
+}
+
+/// Query set types for streaming benchmarks in dispatch configuration.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StreamingQuerySetType {
+    TpchLineitem,
+    // Future: TpchFull, Clickbench, etc.
 }
 
 /// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects

@@ -1,0 +1,79 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Trait definitions for streaming ingestion benchmarks.
+//!
+//! The streaming benchmark system is built around two abstractions:
+//! - [`StreamingDataset`]: Defines a table within a benchmark dataset (e.g., TPCH lineitem)
+//! - [`StreamingSource`]: Defines where data is sent (e.g., DynamoDB Streams, Kafka)
+//!
+//! Sources match on dataset type to know source-specific configuration (key schemas, etc.).
+
+use arrow::array::RecordBatch;
+use test_framework::anyhow::Result;
+
+use super::datasets::DatasetType;
+
+/// Represents a table that can be generated and inserted into a streaming source.
+///
+/// Each dataset implementation knows:
+/// - How to generate test data at various scale factors
+/// - How to create and detect marker records for benchmark timing
+pub trait StreamingDataset: Send + Sync {
+    /// Returns the table name for this dataset.
+    fn table_name(&self) -> &str;
+
+    /// Returns the dataset type enum for this dataset.
+    fn dataset_type(&self) -> DatasetType;
+
+    /// Generate records for the given scale factor.
+    fn generate(&self, scale_factor: f64) -> Result<Vec<RecordBatch>>;
+
+    /// Create a marker record that fits this dataset's schema.
+    fn marker_record(&self) -> Result<RecordBatch>;
+
+    /// Returns a SQL query to detect the marker in Spice's accelerated table.
+    fn marker_detection_query(&self) -> String;
+}
+
+/// Represents a streaming source that can receive data.
+///
+/// Sources match on `DatasetType` to determine source-specific configuration
+/// like key schemas, topic settings, etc.
+#[async_trait::async_trait]
+pub trait StreamingSource: Send {
+    /// Start containers and initialize the source.
+    async fn prepare(&mut self) -> Result<()>;
+
+    /// Create a table/topic for the given dataset type.
+    ///
+    ///
+    /// The implementation matches on dataset type to determine the appropriate
+    /// key schema and other source-specific configuration.
+    async fn create_table(&self, dataset: DatasetType) -> Result<()>;
+
+    /// Insert records into the specified table.
+    async fn insert(&self, table: &str, records: &[RecordBatch]) -> Result<()>;
+
+    // /// Insert a marker record.
+    // async fn insert_marker(&self, dataset: DatasetType, marker: &RecordBatch) -> Result<()>;
+
+    /// Delete a marker record.
+    async fn delete_marker(&self, dataset: DatasetType) -> Result<()>;
+
+    /// Cleanup resources (stop containers, etc.).
+    async fn cleanup(self: Box<Self>) -> Result<()>;
+}

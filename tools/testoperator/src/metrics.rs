@@ -368,3 +368,37 @@ pub static SPICED_ACTIVE_CONNECTIONS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .with_unit("connections")
         .build()
 });
+
+// Streaming ingestion benchmark metrics
+
+pub static INGESTION_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("ingestion_duration_ms")
+        .with_description("Duration from spiced start until all data ingested (marker detected).")
+        .with_unit("ms")
+        .build()
+});
+
+pub static DATA_INSERTION_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("data_insertion_duration_ms")
+        .with_description("Duration to insert all data into DynamoDB.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static RECORD_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("record_count")
+        .with_description("Number of records generated and inserted.")
+        .with_unit("records")
+        .build()
+});
+
+pub static RECORDS_PER_SECOND: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("records_per_second")
+        .with_description("Ingestion throughput in records per second.")
+        .with_unit("records/s")
+        .build()
+});

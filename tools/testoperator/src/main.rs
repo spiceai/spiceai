@@ -24,8 +24,8 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, TestCommands,
-    TextToSqlArgs,
+    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, StreamingTestArgs,
+    TestCommands, TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -92,6 +92,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run(TestCommands::TextToSql(args)) => {
             commands::text_to_sql::run(&args).await?;
+        }
+        Commands::Run(TestCommands::Streaming(args)) => {
+            commands::streaming::run(&args).await?;
+        }
+        Commands::Export(TestCommands::Streaming(StreamingTestArgs { common, .. })) => {
+            commands::env_export(&common).await?;
         }
         _ => {
             return Err(anyhow::anyhow!("Unsupported command"));

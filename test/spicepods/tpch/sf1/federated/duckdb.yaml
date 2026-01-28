@@ -5,7 +5,7 @@ datasets:
   - from: duckdb:customer
     name: customer
     params: &duckdb_params
-      duckdb_open: ./data/tpch.db
+      duckdb_open: /Users/viktor/workspace/spiceai/data/data/tpch.db
   - from: duckdb:lineitem
     name: lineitem
     params: *duckdb_params

@@ -1,0 +1,434 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! DynamoDB Streams source implementation.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::DataType;
+use aws_config::{BehaviorVersion, Region, SdkConfig, retry::RetryConfig};
+use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
+use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::types::{
+    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
+    ScalarAttributeType, StreamSpecification, StreamViewType,
+};
+use bollard::Docker;
+use bollard::container::{
+    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+    StartContainerOptions,
+};
+use bollard::image::CreateImageOptions;
+use bollard::secret::{
+    ContainerState, ContainerStateStatusEnum, Health, HealthConfig, HealthStatusEnum, HostConfig,
+    PortBinding,
+};
+use futures::StreamExt;
+use test_framework::anyhow::{self, Context, Result};
+
+use crate::commands::streaming::datasets::DatasetType;
+use crate::commands::streaming::traits::StreamingSource;
+
+const DYNAMODB_DOCKER_IMAGE: &str = "amazon/dynamodb-local:latest";
+const CONTAINER_NAME_PREFIX: &str = "testoperator-dynamodb";
+const ACCESS_KEY: &str = "test";
+const SECRET_KEY: &str = "test";
+
+/// DynamoDB Streams source for streaming benchmarks.
+pub struct DynamoDbStreamsSource {
+    docker: Option<Docker>,
+    container_name: Option<String>,
+    port: u16,
+    client: Option<Client>,
+}
+
+impl DynamoDbStreamsSource {
+    /// Create a new DynamoDB Streams source.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            docker: None,
+            container_name: None,
+            port: 8000,
+            client: None,
+        }
+    }
+
+    /// Get the DynamoDB client.
+    fn client(&self) -> Result<&Client> {
+        self.client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("DynamoDB client not initialized - call prepare() first")
+        })
+    }
+
+    /// Create a DynamoDB client for the given port.
+    fn create_client(port: u16) -> Client {
+        let config = SdkConfig::builder()
+            .endpoint_url(format!("http://localhost:{port}"))
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+                ACCESS_KEY,
+                SECRET_KEY,
+                None,
+                None,
+                "testoperator",
+            )))
+            .retry_config(RetryConfig::standard().with_max_attempts(5))
+            .behavior_version(BehaviorVersion::latest())
+            .region(Some(Region::from_static("us-east-1")))
+            .build();
+        Client::new(&config)
+    }
+
+    /// Convert an Arrow array value to a DynamoDB AttributeValue.
+    fn array_to_attribute(array: &Arc<dyn Array>, row: usize) -> Result<AttributeValue> {
+        match array.data_type() {
+            DataType::Int64 => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to downcast to Int64Array"))?;
+                Ok(AttributeValue::N(arr.value(row).to_string()))
+            }
+            DataType::Float64 => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to downcast to Float64Array"))?;
+                Ok(AttributeValue::N(arr.value(row).to_string()))
+            }
+            DataType::Utf8 => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to downcast to StringArray"))?;
+                Ok(AttributeValue::S(arr.value(row).to_string()))
+            }
+            dt => Err(anyhow::anyhow!("Unsupported data type: {dt:?}")),
+        }
+    }
+
+    /// Create the lineitem table with DynamoDB Streams enabled.
+    async fn create_lineitem_table(&self, client: &Client) -> Result<()> {
+        client
+            .create_table()
+            .table_name("lineitem")
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("l_orderkey")
+                    .attribute_type(ScalarAttributeType::N)
+                    .build()
+                    .context("Failed to build l_orderkey attribute definition")?,
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name("l_linenumber")
+                    .attribute_type(ScalarAttributeType::N)
+                    .build()
+                    .context("Failed to build l_linenumber attribute definition")?,
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("l_orderkey")
+                    .key_type(KeyType::Hash)
+                    .build()
+                    .context("Failed to build l_orderkey key schema")?,
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name("l_linenumber")
+                    .key_type(KeyType::Range)
+                    .build()
+                    .context("Failed to build l_linenumber key schema")?,
+            )
+            .billing_mode(BillingMode::PayPerRequest)
+            .stream_specification(
+                StreamSpecification::builder()
+                    .stream_enabled(true)
+                    .stream_view_type(StreamViewType::NewAndOldImages)
+                    .build()
+                    .context("Failed to build stream specification")?,
+            )
+            .send()
+            .await
+            .context("Failed to create lineitem table")?;
+
+        tracing::info!("Created table 'lineitem' with DynamoDB Streams enabled");
+        Ok(())
+    }
+
+    /// Delete the lineitem marker record.
+    async fn delete_lineitem_marker(&self, client: &Client) -> Result<()> {
+        client
+            .delete_item()
+            .table_name("lineitem")
+            .key("l_orderkey", AttributeValue::N("-1".to_string()))
+            .key("l_linenumber", AttributeValue::N("-1".to_string()))
+            .send()
+            .await
+            .context("Failed to delete lineitem marker record")?;
+
+        tracing::info!("Deleted marker record from 'lineitem'");
+        Ok(())
+    }
+}
+
+impl Default for DynamoDbStreamsSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamingSource for DynamoDbStreamsSource {
+    async fn prepare(&mut self) -> Result<()> {
+        let docker =
+            Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
+
+        let name = format!("{CONTAINER_NAME_PREFIX}-{}", self.port);
+
+        // Remove existing container if present
+        if container_exists(&docker, &name).await? {
+            remove_container(&docker, &name).await?;
+        }
+
+        // Pull image if needed
+        pull_image_if_needed(&docker, DYNAMODB_DOCKER_IMAGE).await?;
+
+        // Create port bindings
+        let mut port_bindings = HashMap::new();
+        port_bindings.insert(
+            "8000/tcp".to_string(),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some(self.port.to_string()),
+            }]),
+        );
+
+        let host_config = Some(HostConfig {
+            port_bindings: Some(port_bindings),
+            ..Default::default()
+        });
+
+        let healthcheck = HealthConfig {
+            test: Some(vec![
+                "CMD-SHELL".to_string(),
+                "curl -s http://localhost:8000 | grep -q 'MissingAuthenticationToken' || exit 1"
+                    .to_string(),
+            ]),
+            interval: Some(2_000_000_000), // 2 seconds
+            timeout: Some(10_000_000_000), // 10 seconds
+            retries: Some(15),
+            start_period: Some(10_000_000_000), // 10 seconds
+            start_interval: None,
+        };
+
+        #[expect(clippy::zero_sized_map_values)]
+        let exposed_ports: HashMap<&str, HashMap<(), ()>> =
+            [("8000/tcp", HashMap::new())].into_iter().collect();
+
+        let config = Config::<&str> {
+            image: Some(DYNAMODB_DOCKER_IMAGE),
+            host_config,
+            healthcheck: Some(healthcheck),
+            exposed_ports: Some(exposed_ports),
+            ..Default::default()
+        };
+
+        let options = CreateContainerOptions {
+            name: name.as_str(),
+            platform: None,
+        };
+
+        docker
+            .create_container(Some(options), config)
+            .await
+            .context("Failed to create DynamoDB Local container")?;
+
+        docker
+            .start_container(&name, None::<StartContainerOptions<String>>)
+            .await
+            .context("Failed to start DynamoDB Local container")?;
+
+        // Wait for container to be healthy
+        let start_time = std::time::Instant::now();
+        let timeout = Duration::from_secs(60);
+
+        loop {
+            let inspect = docker.inspect_container(&name, None).await?;
+
+            if let Some(ContainerState {
+                status: Some(ContainerStateStatusEnum::RUNNING),
+                health:
+                    Some(Health {
+                        status: Some(HealthStatusEnum::HEALTHY),
+                        ..
+                    }),
+                ..
+            }) = inspect.state
+            {
+                tracing::info!("DynamoDB Local container is healthy on port {}", self.port);
+                break;
+            }
+
+            if start_time.elapsed() > timeout {
+                let _ = remove_container(&docker, &name).await;
+                return Err(anyhow::anyhow!(
+                    "DynamoDB Local container failed to become healthy within {timeout:?}"
+                ));
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        self.docker = Some(docker);
+        self.container_name = Some(name);
+        self.client = Some(Self::create_client(self.port));
+
+        Ok(())
+    }
+
+    async fn create_table(&self, dataset: DatasetType) -> Result<()> {
+        let client = self.client()?;
+
+        match dataset {
+            DatasetType::Lineitem => {
+                self.create_lineitem_table(client).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn insert(&self, table: &str, records: &[RecordBatch]) -> Result<()> {
+        let client = self.client()?;
+
+        let total_rows: usize = records.iter().map(RecordBatch::num_rows).sum();
+        tracing::info!("Inserting {total_rows} records into DynamoDB table '{table}'");
+
+        let mut inserted = 0;
+
+        for batch in records {
+            let schema = batch.schema();
+
+            for row in 0..batch.num_rows() {
+                let mut put_item = client.put_item().table_name(table);
+
+                for (col_idx, field) in schema.fields().iter().enumerate() {
+                    let array = batch.column(col_idx);
+                    let attr_value = Self::array_to_attribute(array, row)?;
+                    put_item = put_item.item(field.name(), attr_value);
+                }
+
+                put_item
+                    .send()
+                    .await
+                    .with_context(|| format!("Failed to insert record {inserted}"))?;
+
+                inserted += 1;
+
+                if inserted % 1000 == 0 {
+                    tracing::info!(
+                        "Inserted {inserted}/{total_rows} records ({:.1}%)",
+                        (inserted as f64 / total_rows as f64) * 100.0
+                    );
+                }
+            }
+        }
+
+        tracing::info!("Successfully inserted {inserted} records into '{table}'");
+        Ok(())
+    }
+
+    async fn delete_marker(&self, dataset: DatasetType) -> Result<()> {
+        let client = self.client()?;
+
+        match dataset {
+            DatasetType::Lineitem => {
+                self.delete_lineitem_marker(client).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup(self: Box<Self>) -> Result<()> {
+        if let (Some(docker), Some(name)) = (self.docker, self.container_name) {
+            remove_container(&docker, &name).await?;
+        }
+        Ok(())
+    }
+}
+
+async fn container_exists(docker: &Docker, name: &str) -> Result<bool> {
+    let containers = docker
+        .list_containers::<&str>(Some(ListContainersOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await?;
+
+    for container in containers {
+        if let Some(names) = container.names {
+            if names.iter().any(|n| n == name || n == &format!("/{name}")) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn remove_container(docker: &Docker, name: &str) -> Result<()> {
+    docker
+        .remove_container(
+            name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .context("Failed to remove container")?;
+    Ok(())
+}
+
+async fn pull_image_if_needed(docker: &Docker, image: &str) -> Result<()> {
+    let images = docker.list_images::<&str>(None).await?;
+    for img in images {
+        if img.repo_tags.iter().any(|t| t == image) {
+            tracing::debug!("Docker image {image} already pulled");
+            return Ok(());
+        }
+    }
+
+    tracing::info!("Pulling Docker image: {image}");
+    let options = Some(CreateImageOptions::<&str> {
+        from_image: image,
+        ..Default::default()
+    });
+
+    let mut stream = docker.create_image(options, None, None);
+    while let Some(event) = stream.next().await {
+        if let Err(e) = event {
+            return Err(anyhow::anyhow!("Failed to pull image: {e}"));
+        }
+    }
+
+    tracing::info!("Successfully pulled Docker image: {image}");
+    Ok(())
+}

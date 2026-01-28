@@ -1,0 +1,198 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Lineitem dataset for streaming benchmarks.
+
+use std::sync::Arc;
+
+use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use duckdb::Connection;
+use test_framework::anyhow::{Context, Result};
+
+use super::DatasetType;
+use crate::commands::streaming::traits::StreamingDataset;
+
+/// Lineitem dataset (TPCH).
+///
+/// Generates lineitem data using DuckDB's TPCH extension.
+pub struct LineitemDataset;
+
+impl LineitemDataset {
+    /// Get the Arrow schema for the lineitem table.
+    #[must_use]
+    pub fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_partkey", DataType::Int64, false),
+            Field::new("l_suppkey", DataType::Int64, false),
+            Field::new("l_linenumber", DataType::Int64, false),
+            Field::new("l_quantity", DataType::Float64, false),
+            Field::new("l_extendedprice", DataType::Float64, false),
+            Field::new("l_discount", DataType::Float64, false),
+            Field::new("l_tax", DataType::Float64, false),
+            Field::new("l_returnflag", DataType::Utf8, false),
+            Field::new("l_linestatus", DataType::Utf8, false),
+            Field::new("l_shipdate", DataType::Utf8, false),
+            Field::new("l_commitdate", DataType::Utf8, false),
+            Field::new("l_receiptdate", DataType::Utf8, false),
+            Field::new("l_shipinstruct", DataType::Utf8, false),
+            Field::new("l_shipmode", DataType::Utf8, false),
+            Field::new("l_comment", DataType::Utf8, false),
+        ])
+    }
+}
+
+impl StreamingDataset for LineitemDataset {
+    fn table_name(&self) -> &str {
+        "lineitem"
+    }
+
+    fn dataset_type(&self) -> DatasetType {
+        DatasetType::Lineitem
+    }
+
+    fn generate(&self, scale_factor: f64) -> Result<Vec<RecordBatch>> {
+        tracing::info!("Generating TPCH lineitem data with scale factor {scale_factor}");
+
+        let conn =
+            Connection::open_in_memory().context("Failed to open in-memory DuckDB connection")?;
+
+        // Load TPCH extension and generate data
+        conn.execute_batch("INSTALL tpch; LOAD tpch;")
+            .context("Failed to load TPCH extension")?;
+
+        conn.execute_batch(&format!("CALL dbgen(sf={scale_factor});"))
+            .context("Failed to generate TPCH data")?;
+
+        // Query the lineitem table and collect into vectors
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    l_orderkey, l_partkey, l_suppkey, l_linenumber,
+                    l_quantity, l_extendedprice, l_discount, l_tax,
+                    l_returnflag, l_linestatus,
+                    l_shipdate::VARCHAR, l_commitdate::VARCHAR, l_receiptdate::VARCHAR,
+                    l_shipinstruct, l_shipmode, l_comment
+                FROM lineitem
+                ORDER BY l_orderkey, l_linenumber",
+            )
+            .context("Failed to prepare lineitem query")?;
+
+        // Collect all rows into vectors
+        let mut l_orderkey = Vec::new();
+        let mut l_partkey = Vec::new();
+        let mut l_suppkey = Vec::new();
+        let mut l_linenumber = Vec::new();
+        let mut l_quantity = Vec::new();
+        let mut l_extendedprice = Vec::new();
+        let mut l_discount = Vec::new();
+        let mut l_tax = Vec::new();
+        let mut l_returnflag = Vec::new();
+        let mut l_linestatus = Vec::new();
+        let mut l_shipdate = Vec::new();
+        let mut l_commitdate = Vec::new();
+        let mut l_receiptdate = Vec::new();
+        let mut l_shipinstruct = Vec::new();
+        let mut l_shipmode = Vec::new();
+        let mut l_comment = Vec::new();
+
+        let mut rows = stmt.query([]).context("Failed to query lineitem data")?;
+        while let Some(row) = rows.next().context("Failed to read row")? {
+            l_orderkey.push(row.get::<_, i64>(0)?);
+            l_partkey.push(row.get::<_, i64>(1)?);
+            l_suppkey.push(row.get::<_, i64>(2)?);
+            l_linenumber.push(row.get::<_, i64>(3)?);
+            l_quantity.push(row.get::<_, f64>(4)?);
+            l_extendedprice.push(row.get::<_, f64>(5)?);
+            l_discount.push(row.get::<_, f64>(6)?);
+            l_tax.push(row.get::<_, f64>(7)?);
+            l_returnflag.push(row.get::<_, String>(8)?);
+            l_linestatus.push(row.get::<_, String>(9)?);
+            l_shipdate.push(row.get::<_, String>(10)?);
+            l_commitdate.push(row.get::<_, String>(11)?);
+            l_receiptdate.push(row.get::<_, String>(12)?);
+            l_shipinstruct.push(row.get::<_, String>(13)?);
+            l_shipmode.push(row.get::<_, String>(14)?);
+            l_comment.push(row.get::<_, String>(15)?);
+        }
+
+        let record_count = l_orderkey.len();
+        tracing::info!("Generated {record_count} lineitem records");
+
+        // Build Arrow arrays
+        let batch = RecordBatch::try_new(
+            Arc::new(Self::schema()),
+            vec![
+                Arc::new(Int64Array::from(l_orderkey)),
+                Arc::new(Int64Array::from(l_partkey)),
+                Arc::new(Int64Array::from(l_suppkey)),
+                Arc::new(Int64Array::from(l_linenumber)),
+                Arc::new(Float64Array::from(l_quantity)),
+                Arc::new(Float64Array::from(l_extendedprice)),
+                Arc::new(Float64Array::from(l_discount)),
+                Arc::new(Float64Array::from(l_tax)),
+                Arc::new(StringArray::from(l_returnflag)),
+                Arc::new(StringArray::from(l_linestatus)),
+                Arc::new(StringArray::from(l_shipdate)),
+                Arc::new(StringArray::from(l_commitdate)),
+                Arc::new(StringArray::from(l_receiptdate)),
+                Arc::new(StringArray::from(l_shipinstruct)),
+                Arc::new(StringArray::from(l_shipmode)),
+                Arc::new(StringArray::from(l_comment)),
+            ],
+        )
+        .context("Failed to create Arrow RecordBatch")?;
+
+        Ok(vec![batch])
+    }
+
+    fn marker_record(&self) -> Result<RecordBatch> {
+        // Create a marker record with l_orderkey = -1 and l_linenumber = -1
+        // These values won't conflict with real TPCH data (which has positive IDs)
+        let batch = RecordBatch::try_new(
+            Arc::new(Self::schema()),
+            vec![
+                Arc::new(Int64Array::from(vec![-1i64])),         // l_orderkey
+                Arc::new(Int64Array::from(vec![0i64])),          // l_partkey
+                Arc::new(Int64Array::from(vec![0i64])),          // l_suppkey
+                Arc::new(Int64Array::from(vec![-1i64])),         // l_linenumber
+                Arc::new(Float64Array::from(vec![0.0])),         // l_quantity
+                Arc::new(Float64Array::from(vec![0.0])),         // l_extendedprice
+                Arc::new(Float64Array::from(vec![0.0])),         // l_discount
+                Arc::new(Float64Array::from(vec![0.0])),         // l_tax
+                Arc::new(StringArray::from(vec!["X"])),          // l_returnflag
+                Arc::new(StringArray::from(vec!["X"])),          // l_linestatus
+                Arc::new(StringArray::from(vec!["1970-01-01"])), // l_shipdate
+                Arc::new(StringArray::from(vec!["1970-01-01"])), // l_commitdate
+                Arc::new(StringArray::from(vec!["1970-01-01"])), // l_receiptdate
+                Arc::new(StringArray::from(vec!["MARKER"])),     // l_shipinstruct
+                Arc::new(StringArray::from(vec!["MARKER"])),     // l_shipmode
+                Arc::new(StringArray::from(vec!["BENCHMARK_MARKER"])), // l_comment
+            ],
+        )
+        .context("Failed to create marker RecordBatch")?;
+
+        Ok(batch)
+    }
+
+    fn marker_detection_query(&self) -> String {
+        format!(
+            "SELECT COUNT(*) as cnt FROM {} WHERE l_orderkey = -1 AND l_linenumber = -1",
+            self.table_name()
+        )
+    }
+}

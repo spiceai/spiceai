@@ -17600,7 +17600,14 @@ version = "1.11.0-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-dynamodb",
+ "bollard",
  "clap 4.5.54",
+ "duckdb",
+ "futures",
  "hf-hub",
  "itertools 0.14.0",
  "reqwest",
@@ -17611,6 +17618,7 @@ dependencies = [
  "test-framework",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

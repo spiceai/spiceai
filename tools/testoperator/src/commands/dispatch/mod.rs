@@ -114,6 +114,17 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     ));
                 }
             }
+            TestType::Streaming => {
+                for streaming in &test_file.tests.streaming {
+                    tests_to_dispatch.push((
+                        path,
+                        serde_json::json!(WorkflowArgs {
+                            specific_args: streaming.clone(),
+                            spiced_commit: args.spiced_commit.clone(),
+                        }),
+                    ));
+                }
+            }
             _ => {
                 println!("Test type {test_type} not supported for dispatching");
             }

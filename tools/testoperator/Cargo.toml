@@ -11,7 +11,14 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-json.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-dynamodb.workspace = true
+bollard = "0.18.1"
 clap.workspace = true
+duckdb = { workspace = true, features = ["bundled"] }
+futures.workspace = true
 itertools.workspace = true
 hf-hub = { workspace = true }
 reqwest.workspace = true
@@ -22,6 +29,7 @@ spiceai.workspace = true
 test-framework = { path = "../../crates/test-framework" }
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 
 [features]
 default = ["append"]
