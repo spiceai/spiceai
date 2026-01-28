@@ -498,3 +498,124 @@ async fn test_new_key_in_protected_snapshot_detected_as_conflict_impl(
 }
 
 test_with_backends!(test_new_key_in_protected_snapshot_detected_as_conflict_impl);
+
+// =============================================================================
+// Test: Protected snapshots must remain readable when pending deletions exist
+// =============================================================================
+//
+// When pending deletions exist, new data is written to a "protected snapshot" -
+// a separate snapshot that contains data written after pending deletions were
+// created. This test verifies that data in protected snapshots is correctly
+// visible in queries.
+//
+// This test verifies:
+// 1. Data in protected snapshots is accessible via queries
+// 2. All rows (from both main snapshots and protected snapshots) are returned
+//
+// Scenario:
+// 1. Initial insert creates snapshot S1 with PKs 1, 2, 3
+// 2. Upsert PK 2 → creates pending deletion for PK 2, new snapshot S2
+// 3. Insert NEW PK 4 while pending deletions exist → creates PROTECTED snapshot S3
+//    (S3 is protected because it contains data written after pending deletions)
+// 4. Query all rows → must return all 4 rows without error
+
+async fn test_protected_snapshots_readable_with_pending_deletions_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let (table, ctx, schema) = setup_upsert_table(&fixture, "protected_cleanup").await?;
+
+    // Step 1: Initial insert - PKs 1, 2, 3
+    let batch1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_700_000_000_000_000_i64,
+                1_700_000_000_000_000_i64,
+                1_700_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch1).await?;
+    assert_eq!(
+        get_row_count(&ctx, "protected_cleanup").await?,
+        3,
+        "After initial insert: should have 3 rows"
+    );
+
+    // Step 2: Upsert PK 2 - this creates pending deletions
+    let batch2 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(StringArray::from(vec!["b_updated"])),
+            Arc::new(Int64Array::from(vec![250])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_705_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch2).await?;
+    assert_eq!(
+        get_row_count(&ctx, "protected_cleanup").await?,
+        3,
+        "After upsert: should still have 3 rows"
+    );
+
+    // Step 3: Insert NEW PK 4 while pending deletions exist
+    // This creates a PROTECTED snapshot because there are pending deletions
+    let batch3 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![4])),
+            Arc::new(StringArray::from(vec!["d"])),
+            Arc::new(Int64Array::from(vec![400])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_710_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch3).await?;
+
+    // Step 4: Query all rows - protected snapshot data must be visible
+    let count = get_row_count(&ctx, "protected_cleanup").await?;
+    assert_eq!(
+        count, 4,
+        "Protected snapshot data must be visible: should have 4 rows, got {count}"
+    );
+
+    // Verify all PKs are present
+    let ids = get_ids(&ctx, "protected_cleanup").await?;
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "All PKs should be visible: expected 1-4, got {ids:?}"
+    );
+
+    // Verify PK 4 (in protected snapshot) has correct value
+    let df = ctx
+        .sql("SELECT value FROM protected_cleanup WHERE id = 4")
+        .await?;
+    let results = df.collect().await?;
+    assert_eq!(
+        results[0].num_rows(),
+        1,
+        "PK 4 from protected snapshot should be visible"
+    );
+    let values = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value column");
+    assert_eq!(
+        values.value(0),
+        400,
+        "PK 4 should have value 400 from protected snapshot"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_protected_snapshots_readable_with_pending_deletions_impl);
