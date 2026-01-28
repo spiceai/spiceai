@@ -90,7 +90,7 @@ pub enum Error {
     ))]
     HomeDirectoryNotFound,
 
-    /// Flightrepl error
+    /// REPL error
     #[snafu(display("SQL REPL error: {message}"))]
     Repl { message: String },
 
@@ -101,4 +101,12 @@ pub enum Error {
     /// Failed to register signal handler
     #[snafu(display("Failed to register signal handler: {source}"))]
     SignalHandler { source: std::io::Error },
+
+    /// Model not found
+    #[snafu(display("Model '{model}' not found. Available models: {available}"))]
+    ModelNotFound { model: String, available: String },
+
+    /// No models configured
+    #[snafu(display("No models found. Please configure a model in your Spicepod."))]
+    NoModelsConfigured,
 }

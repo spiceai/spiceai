@@ -71,6 +71,9 @@ comfy-table = "7"
 # Line editor for REPL
 rustyline = "17"
 
+# Interactive CLI prompts (arrow-key selection)
+dialoguer = "0.11"
+
 # Random number generation (for auth codes)
 rand = "0.9"
 
@@ -86,7 +89,7 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 
 # Internal crates
-flightrepl = { path = "../../crates/flightrepl" }
+repl = { path = "../../crates/repl" }
 
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]
