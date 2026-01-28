@@ -103,7 +103,6 @@ pub trait StreamingSource: Send {
     /// Delete records from the specified table.
     ///
     /// The records should contain only the primary key columns.
-    #[expect(dead_code)]
     async fn delete(&self, table: &str, keys: &[RecordBatch]) -> Result<()>;
 
     /// Cleanup resources (stop containers, etc.).

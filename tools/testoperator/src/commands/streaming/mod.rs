@@ -137,22 +137,19 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
 
     // Phase 4: Insert data (with or without mutations)
     let mut total_insert_duration = Duration::ZERO;
-    let mutation_summary = if args.enable_mutations {
-        // Phase 4a: Execute mutation sequences (INSERT mutated → UPDATEs → final UPDATE with TPC-H)
+    let mutation_summary = if args.mutation_ratio > 0.0 {
+        // Phase 4a: Execute mutation sequences for CDC testing
+        // - 50% of mutated rows: INSERT wrong → UPDATE correct
+        // - 50% of mutated rows: INSERT wrong → DELETE → INSERT correct
         println!("Phase 4: Executing mutation sequences for CDC testing");
         println!(
-            "  Seed: {}, Mutations per row: {}, Max rows per dataset: {}",
-            args.mutation_seed, args.mutations_per_row, args.max_mutation_rows
+            "  Seed: {}, Mutation ratio: {:.1}%",
+            args.mutation_seed, args.mutation_ratio * 100.0
         );
 
         let config = mutations::MutationConfig {
             seed: args.mutation_seed,
-            mutations_per_row: args.mutations_per_row,
-            max_rows_per_dataset: if args.max_mutation_rows == 0 {
-                None
-            } else {
-                Some(args.max_mutation_rows)
-            },
+            mutation_ratio: args.mutation_ratio,
         };
 
         // Collect datasets and original data for mutation execution
@@ -420,12 +417,15 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     }
     if let Some(ref summary) = mutation_summary {
         println!(
-            "Mutations:              {} rows, {} mutations ({} successful, {} failed)",
-            summary.total_rows,
-            summary.total_mutations,
-            summary.successful_mutations,
-            summary.failed_mutations
+            "Mutations:              {} update-path + {} delete-path + {} direct = {} total",
+            summary.update_path_rows,
+            summary.delete_path_rows,
+            summary.direct_insert_rows,
+            summary.total_rows
         );
+        if summary.failed_operations > 0 {
+            println!("  Failed Operations:    {}", summary.failed_operations);
+        }
     }
     if args.enable_query_liveness
         && let Some(ref report) = query_liveness_report

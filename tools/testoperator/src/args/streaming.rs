@@ -79,19 +79,14 @@ pub struct StreamingTestArgs {
     pub query_liveness_interval_ms: u64,
 
     // Mutation testing arguments (for CDC testing)
-    /// Enable CDC mutation testing (each row goes through X mutations before final state)
-    #[arg(long)]
-    pub enable_mutations: bool,
+    /// Ratio of rows to mutate (0.0-1.0). When > 0, selected rows are split 50/50:
+    /// - Half go through: INSERT (wrong) → UPDATE (correct)
+    /// - Half go through: INSERT (wrong) → DELETE → INSERT (correct)
+    /// Remaining rows are inserted directly with final values.
+    #[arg(long, default_value = "0.0")]
+    pub mutation_ratio: f64,
 
-    /// Random seed for reproducible mutations
+    /// Random seed for reproducible mutation row selection
     #[arg(long, default_value = "42")]
     pub mutation_seed: u64,
-
-    /// Number of mutations per row (including initial insert and final update)
-    #[arg(long, default_value = "3")]
-    pub mutations_per_row: usize,
-
-    /// Maximum number of rows to mutate per dataset (0 for all rows)
-    #[arg(long, default_value = "100")]
-    pub max_mutation_rows: usize,
 }

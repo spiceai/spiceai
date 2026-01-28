@@ -448,7 +448,7 @@ impl DynamoDbStreamsSource {
     }
 
     /// Perform batch deletes with parallelization.
-    #[expect(clippy::cast_precision_loss, dead_code)]
+    #[expect(clippy::cast_precision_loss)]
     async fn batch_delete_items(
         client: &Client,
         table: &str,
