@@ -17,9 +17,11 @@ limitations under the License.
 //! AWS `DynamoDB` Streams source implementation.
 //!
 //! This source connects to actual AWS `DynamoDB` (not a local Docker container).
-//! It supports multiple authentication methods: IAM role, explicit keys, or environment.
+//! It supports key-based authentication configured via environment variables.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{
     Array, Date32Array, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
@@ -30,10 +32,18 @@ use aws_config::{BehaviorVersion, Region, SdkConfig, retry::RetryConfig};
 use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
-    ScalarAttributeType, StreamSpecification, StreamViewType,
+    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType, PutRequest,
+    ScalarAttributeType, StreamSpecification, StreamViewType, WriteRequest,
 };
+use futures::stream::{self, StreamExt};
 use test_framework::anyhow::{self, Context, Result};
+use tokio::time::sleep;
+
+/// Maximum items per batch write request (DynamoDB limit).
+const BATCH_SIZE: usize = 25;
+
+/// Number of concurrent batch write requests.
+const CONCURRENT_BATCHES: usize = 10;
 
 use crate::commands::streaming::datasets::DatasetType;
 use crate::commands::streaming::traits::StreamingSource;
@@ -190,6 +200,356 @@ impl DynamoDbStreamsSource {
             }
             dt => Err(anyhow::anyhow!("Unsupported data type: {dt:?}")),
         }
+    }
+
+    /// Check if an error is a "resource not found" error.
+    fn is_resource_not_found<E: std::fmt::Debug>(err: &aws_sdk_dynamodb::error::SdkError<E>) -> bool {
+        // Check the raw response for 400 status with ResourceNotFoundException
+        if let aws_sdk_dynamodb::error::SdkError::ServiceError(service_err) = err {
+            let raw = service_err.raw();
+            // ResourceNotFoundException returns 400 status
+            if raw.status().as_u16() == 400 {
+                // Check error code in the response
+                let body = format!("{:?}", service_err.err());
+                return body.contains("ResourceNotFoundException");
+            }
+        }
+        // Fallback to string matching
+        let err_str = format!("{err:?}");
+        err_str.contains("ResourceNotFoundException") || err_str.contains("resource not found")
+    }
+
+    /// Delete a table if it exists and wait for deletion to complete.
+    async fn delete_table_if_exists(client: &Client, table_name: &str) -> Result<()> {
+        // Check if table exists
+        match client.describe_table().table_name(table_name).send().await {
+            Ok(_) => {
+                println!("Table '{table_name}' exists, deleting...");
+                client
+                    .delete_table()
+                    .table_name(table_name)
+                    .send()
+                    .await
+                    .with_context(|| format!("Failed to delete table {table_name}"))?;
+
+                // Wait for table to be deleted
+                let timeout = Duration::from_secs(120);
+                let start = std::time::Instant::now();
+
+                loop {
+                    match client.describe_table().table_name(table_name).send().await {
+                        Ok(_) => {
+                            if start.elapsed() > timeout {
+                                return Err(anyhow::anyhow!(
+                                    "Timeout waiting for table '{table_name}' to be deleted"
+                                ));
+                            }
+                            sleep(Duration::from_secs(2)).await;
+                        }
+                        Err(e) => {
+                            if Self::is_resource_not_found(&e) {
+                                println!("Table '{table_name}' deleted successfully");
+                                return Ok(());
+                            }
+                            // Some other error, keep waiting
+                            if start.elapsed() > timeout {
+                                return Err(anyhow::anyhow!(
+                                    "Timeout waiting for table '{table_name}' to be deleted"
+                                ));
+                            }
+                            sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if Self::is_resource_not_found(&e) {
+                    // Table doesn't exist, nothing to delete
+                    println!("Table '{table_name}' does not exist, skipping deletion");
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Failed to describe table {table_name}: {e}"))
+                }
+            }
+        }
+    }
+
+    /// Wait for a table to become ACTIVE.
+    async fn wait_for_table_active(client: &Client, table_name: &str) -> Result<()> {
+        let timeout = Duration::from_secs(120);
+        let start = std::time::Instant::now();
+
+        loop {
+            let response = client
+                .describe_table()
+                .table_name(table_name)
+                .send()
+                .await
+                .with_context(|| format!("Failed to describe table {table_name}"))?;
+
+            if let Some(table) = response.table()
+                && let Some(status) = table.table_status()
+            {
+                if status.as_str() == "ACTIVE" {
+                    println!("Table '{table_name}' is now ACTIVE");
+                    return Ok(());
+                }
+                println!(
+                    "Table '{table_name}' status: {}, waiting...",
+                    status.as_str()
+                );
+            }
+
+            if start.elapsed() > timeout {
+                return Err(anyhow::anyhow!(
+                    "Timeout waiting for table '{table_name}' to become ACTIVE"
+                ));
+            }
+
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// Convert a record batch row to a HashMap of attribute values.
+    fn row_to_item(batch: &RecordBatch, row: usize) -> Result<HashMap<String, AttributeValue>> {
+        let schema = batch.schema();
+        let mut item = HashMap::new();
+
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            let array = batch.column(col_idx);
+            let attr_value = Self::array_to_attribute(array, row)?;
+            item.insert(field.name().clone(), attr_value);
+        }
+
+        Ok(item)
+    }
+
+    /// Perform batch writes with parallelization.
+    #[expect(clippy::cast_precision_loss)]
+    async fn batch_write_items(
+        client: &Client,
+        table: &str,
+        records: &[RecordBatch],
+    ) -> Result<()> {
+        let total_rows: usize = records.iter().map(RecordBatch::num_rows).sum();
+        println!("Inserting {total_rows} records into DynamoDB table '{table}' using batch writes");
+
+        // Collect all items as WriteRequests
+        let mut all_requests: Vec<WriteRequest> = Vec::with_capacity(total_rows);
+
+        for batch in records {
+            for row in 0..batch.num_rows() {
+                let item = Self::row_to_item(batch, row)?;
+                let put_request = PutRequest::builder().set_item(Some(item)).build()?;
+                let write_request = WriteRequest::builder().put_request(put_request).build();
+                all_requests.push(write_request);
+            }
+        }
+
+        // Split into batches of BATCH_SIZE
+        let batches: Vec<Vec<WriteRequest>> = all_requests
+            .chunks(BATCH_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        let total_batches = batches.len();
+        println!(
+            "Split into {total_batches} batches of up to {BATCH_SIZE} items, processing {CONCURRENT_BATCHES} concurrently"
+        );
+
+        let inserted = std::sync::atomic::AtomicUsize::new(0);
+
+        // Process batches concurrently
+        let results: Vec<Result<()>> = stream::iter(batches.into_iter().enumerate())
+            .map(|(batch_idx, batch)| {
+                let client = client.clone();
+                let table = table.to_string();
+                let inserted = &inserted;
+                async move {
+                    let batch_len = batch.len();
+
+                    // Retry logic for unprocessed items
+                    let mut items_to_write = batch;
+                    let mut retry_count = 0;
+                    const MAX_RETRIES: usize = 5;
+
+                    while !items_to_write.is_empty() && retry_count < MAX_RETRIES {
+                        let mut request_items = HashMap::new();
+                        request_items.insert(table.clone(), items_to_write.clone());
+
+                        let response = client
+                            .batch_write_item()
+                            .set_request_items(Some(request_items))
+                            .send()
+                            .await
+                            .with_context(|| {
+                                format!("Failed to batch write items (batch {batch_idx})")
+                            })?;
+
+                        // Check for unprocessed items
+                        if let Some(unprocessed) = response.unprocessed_items()
+                            && let Some(remaining) = unprocessed.get(&table)
+                            && !remaining.is_empty()
+                        {
+                            retry_count += 1;
+                            let backoff = Duration::from_millis(100 * (1 << retry_count));
+                            sleep(backoff).await;
+                            items_to_write = remaining.clone();
+                            continue;
+                        }
+
+                        // All items written successfully
+                        items_to_write.clear();
+                    }
+
+                    if !items_to_write.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Failed to write {} items after {MAX_RETRIES} retries",
+                            items_to_write.len()
+                        ));
+                    }
+
+                    let prev = inserted.fetch_add(batch_len, std::sync::atomic::Ordering::Relaxed);
+                    let current = prev + batch_len;
+
+                    if current.is_multiple_of(1000) || current == total_rows {
+                        println!(
+                            "Inserted {current}/{total_rows} records ({:.1}%)",
+                            (current as f64 / total_rows as f64) * 100.0
+                        );
+                    }
+
+                    Ok(())
+                }
+            })
+            .buffer_unordered(CONCURRENT_BATCHES)
+            .collect()
+            .await;
+
+        // Check for any errors
+        for result in results {
+            result?;
+        }
+
+        let final_count = inserted.load(std::sync::atomic::Ordering::Relaxed);
+        println!("Successfully inserted {final_count} records into '{table}'");
+        Ok(())
+    }
+
+    /// Perform batch deletes with parallelization.
+    #[expect(clippy::cast_precision_loss, dead_code)]
+    async fn batch_delete_items(
+        client: &Client,
+        table: &str,
+        keys: &[RecordBatch],
+    ) -> Result<()> {
+        use aws_sdk_dynamodb::types::DeleteRequest;
+
+        let total_rows: usize = keys.iter().map(RecordBatch::num_rows).sum();
+        println!("Deleting {total_rows} records from DynamoDB table '{table}' using batch deletes");
+
+        // Collect all items as WriteRequests (for delete)
+        let mut all_requests: Vec<WriteRequest> = Vec::with_capacity(total_rows);
+
+        for batch in keys {
+            for row in 0..batch.num_rows() {
+                let item = Self::row_to_item(batch, row)?;
+                let delete_request = DeleteRequest::builder().set_key(Some(item)).build()?;
+                let write_request = WriteRequest::builder()
+                    .delete_request(delete_request)
+                    .build();
+                all_requests.push(write_request);
+            }
+        }
+
+        // Split into batches of BATCH_SIZE
+        let batches: Vec<Vec<WriteRequest>> = all_requests
+            .chunks(BATCH_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        let total_batches = batches.len();
+        println!(
+            "Split into {total_batches} batches of up to {BATCH_SIZE} items, processing {CONCURRENT_BATCHES} concurrently"
+        );
+
+        let deleted = std::sync::atomic::AtomicUsize::new(0);
+
+        // Process batches concurrently
+        let results: Vec<Result<()>> = stream::iter(batches.into_iter().enumerate())
+            .map(|(batch_idx, batch)| {
+                let client = client.clone();
+                let table = table.to_string();
+                let deleted = &deleted;
+                async move {
+                    let batch_len = batch.len();
+
+                    // Retry logic for unprocessed items
+                    let mut items_to_delete = batch;
+                    let mut retry_count = 0;
+                    const MAX_RETRIES: usize = 5;
+
+                    while !items_to_delete.is_empty() && retry_count < MAX_RETRIES {
+                        let mut request_items = HashMap::new();
+                        request_items.insert(table.clone(), items_to_delete.clone());
+
+                        let response = client
+                            .batch_write_item()
+                            .set_request_items(Some(request_items))
+                            .send()
+                            .await
+                            .with_context(|| {
+                                format!("Failed to batch delete items (batch {batch_idx})")
+                            })?;
+
+                        // Check for unprocessed items
+                        if let Some(unprocessed) = response.unprocessed_items()
+                            && let Some(remaining) = unprocessed.get(&table)
+                            && !remaining.is_empty()
+                        {
+                            retry_count += 1;
+                            let backoff = Duration::from_millis(100 * (1 << retry_count));
+                            sleep(backoff).await;
+                            items_to_delete = remaining.clone();
+                            continue;
+                        }
+
+                        // All items deleted successfully
+                        items_to_delete.clear();
+                    }
+
+                    if !items_to_delete.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Failed to delete {} items after {MAX_RETRIES} retries",
+                            items_to_delete.len()
+                        ));
+                    }
+
+                    let prev = deleted.fetch_add(batch_len, std::sync::atomic::Ordering::Relaxed);
+                    let current = prev + batch_len;
+
+                    if current.is_multiple_of(100) || current == total_rows {
+                        println!(
+                            "Deleted {current}/{total_rows} records ({:.1}%)",
+                            (current as f64 / total_rows as f64) * 100.0
+                        );
+                    }
+
+                    Ok(())
+                }
+            })
+            .buffer_unordered(CONCURRENT_BATCHES)
+            .collect()
+            .await;
+
+        // Check for any errors
+        for result in results {
+            result?;
+        }
+
+        let final_count = deleted.load(std::sync::atomic::Ordering::Relaxed);
+        println!("Successfully deleted {final_count} records from '{table}'");
+        Ok(())
     }
 
     /// Create a simple table with a single hash key.
@@ -402,7 +762,12 @@ impl StreamingSource for DynamoDbStreamsSource {
 
     async fn create_table(&self, dataset: DatasetType) -> Result<()> {
         let client = self.client()?;
+        let table_name = dataset.table_name();
 
+        // Delete table if it exists
+        Self::delete_table_if_exists(client, table_name).await?;
+
+        // Create the table
         match dataset {
             DatasetType::Lineitem => self.create_lineitem_table(client).await?,
             DatasetType::Orders => {
@@ -435,48 +800,15 @@ impl StreamingSource for DynamoDbStreamsSource {
             }
         }
 
+        // Wait for table to be ACTIVE
+        Self::wait_for_table_active(client, table_name).await?;
+
         Ok(())
     }
 
-    #[expect(clippy::cast_precision_loss)]
     async fn insert(&self, table: &str, records: &[RecordBatch]) -> Result<()> {
         let client = self.client()?;
-
-        let total_rows: usize = records.iter().map(RecordBatch::num_rows).sum();
-        println!("Inserting {total_rows} records into DynamoDB table '{table}'");
-
-        let mut inserted = 0;
-
-        for batch in records {
-            let schema = batch.schema();
-
-            for row in 0..batch.num_rows() {
-                let mut put_item = client.put_item().table_name(table);
-
-                for (col_idx, field) in schema.fields().iter().enumerate() {
-                    let array = batch.column(col_idx);
-                    let attr_value = Self::array_to_attribute(array, row)?;
-                    put_item = put_item.item(field.name(), attr_value);
-                }
-
-                put_item
-                    .send()
-                    .await
-                    .with_context(|| format!("Failed to insert record {inserted}"))?;
-
-                inserted += 1;
-
-                if inserted % 1000 == 0 {
-                    println!(
-                        "Inserted {inserted}/{total_rows} records ({:.1}%)",
-                        (f64::from(inserted) / total_rows as f64) * 100.0
-                    );
-                }
-            }
-        }
-
-        println!("Successfully inserted {inserted} records into '{table}'");
-        Ok(())
+        Self::batch_write_items(client, table, records).await
     }
 
     async fn delete_marker(&self, dataset: DatasetType) -> Result<()> {
@@ -522,46 +854,9 @@ impl StreamingSource for DynamoDbStreamsSource {
         self.insert(table, records).await
     }
 
-    #[expect(clippy::cast_precision_loss)]
     async fn delete(&self, table: &str, keys: &[RecordBatch]) -> Result<()> {
         let client = self.client()?;
-
-        let total_rows: usize = keys.iter().map(RecordBatch::num_rows).sum();
-        println!("Deleting {total_rows} records from DynamoDB table '{table}'");
-
-        let mut deleted = 0;
-
-        for batch in keys {
-            let schema = batch.schema();
-
-            for row in 0..batch.num_rows() {
-                let mut delete_item = client.delete_item().table_name(table);
-
-                // Add all columns as key attributes (assumes the batch contains only key columns)
-                for (col_idx, field) in schema.fields().iter().enumerate() {
-                    let array = batch.column(col_idx);
-                    let attr_value = Self::array_to_attribute(array, row)?;
-                    delete_item = delete_item.key(field.name(), attr_value);
-                }
-
-                delete_item
-                    .send()
-                    .await
-                    .with_context(|| format!("Failed to delete record {deleted}"))?;
-
-                deleted += 1;
-
-                if deleted % 100 == 0 {
-                    println!(
-                        "Deleted {deleted}/{total_rows} records ({:.1}%)",
-                        (f64::from(deleted) / total_rows as f64) * 100.0
-                    );
-                }
-            }
-        }
-
-        println!("Successfully deleted {deleted} records from '{table}'");
-        Ok(())
+        Self::batch_delete_items(client, table, keys).await
     }
 
     async fn cleanup(self: Box<Self>) -> Result<()> {

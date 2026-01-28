@@ -2,30 +2,48 @@ version: v1beta1
 kind: Spicepod
 name: streaming-benchmark-dynamodb
 
+common_config:
+  params: &common_params
+    dynamodb_aws_auth: key
+    dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
+    dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
+    dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
+    ready_lag: 1h
+  acceleration: &common_acceleration
+    enabled: true
+    engine: arrow
+    refresh_mode: changes
+
 datasets:
-#  - from: dynamodb:nation
-#    name: nation
-#    params:
-#      dynamodb_aws_auth: key
-#      dynamodb_aws_access_key_id: test
-#      dynamodb_aws_secret_access_key: test
-#      dynamodb_aws_region: us-east-1
-#      endpoint_url: http://localhost:8000
-#      ready_lag: 1h
-#    acceleration:
-#      enabled: true
-#      engine: arrow
-#      refresh_mode: changes
+  - from: dynamodb:region
+    name: region
+    params: *common_params
+    acceleration: *common_acceleration
+  - from: dynamodb:nation
+    name: nation
+    params: *common_params
+    acceleration: *common_acceleration
+  - from: dynamodb:supplier
+    name: supplier
+    params: *common_params
+    acceleration: *common_acceleration
+  - from: dynamodb:part
+    name: part
+    params: *common_params
+    acceleration: *common_acceleration
+  - from: dynamodb:partsupp
+    name: partsupp
+    params: *common_params
+    acceleration: *common_acceleration
+  - from: dynamodb:customer
+    name: customer
+    params: *common_params
+    acceleration: *common_acceleration
+  - from: dynamodb:orders
+    name: orders
+    params: *common_params
+    acceleration: *common_acceleration
   - from: dynamodb:lineitem
     name: lineitem
-    params:
-      dynamodb_aws_auth: key
-      dynamodb_aws_access_key_id: test
-      dynamodb_aws_secret_access_key: test
-      dynamodb_aws_region: us-east-1
-      endpoint_url: http://localhost:8000
-      ready_lag: 1h
-    acceleration:
-      enabled: true
-      engine: arrow
-      refresh_mode: changes
+    params: *common_params
+    acceleration: *common_acceleration

@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,12 +21,14 @@ limitations under the License.
 //! its final TPC-H state.
 //!
 //! The mutation sequence for each row:
-//! 1. INSERT with initial values (different from final)
-//! 2. UPDATE 1..N-1 with intermediate values
+//! 1. INSERT with mutated values (different from final)
+//! 2. UPDATE 1..N-1 with intermediate mutated values
 //! 3. UPDATE N with final TPC-H values
 //!
-//! This allows testing that CDC correctly propagates all changes and the final
-//! state matches the expected TPC-H data.
+//! Mutations are batched by round for efficiency:
+//! - Round 1: All INSERTs (batched 25 at a time)
+//! - Round 2: All first UPDATEs (batched 25 at a time)
+//! - Round N: All final UPDATEs with correct values (batched 25 at a time)
 
 use std::sync::Arc;
 
@@ -166,48 +168,76 @@ impl MutationGenerator {
             .context("Failed to create mutated row batch")
     }
 
-    /// Execute mutation sequence for a single row.
-    async fn execute_row_mutations(
+    /// Generate all mutations for a dataset, organized by round.
+    ///
+    /// Returns a Vec where each element is a round of mutations.
+    /// Round 0 = all INSERTs, Round 1..N-1 = UPDATEs, Round N = final UPDATEs.
+    fn generate_all_mutations(
         &mut self,
-        source: &dyn StreamingSource,
         dataset: &dyn StreamingDataset,
-        original_batch: &RecordBatch,
-        row: usize,
-    ) -> Result<usize> {
-        let table_name = dataset.table_name();
+        batches: &[RecordBatch],
+    ) -> Result<Vec<Vec<RecordBatch>>> {
         let schema = dataset.schema();
         let pk_columns = dataset.primary_key_columns();
-        let mut successful = 0;
+        let max_rows = self.config.max_rows_per_dataset.unwrap_or(usize::MAX);
 
-        for mutation_idx in 0..self.config.mutations_per_row {
-            let is_final = mutation_idx == self.config.mutations_per_row - 1;
-            let mutated_row =
-                self.generate_mutated_row(&schema, original_batch, row, &pk_columns, is_final)?;
+        // Each round is a vector of single-row batches
+        let mut rounds: Vec<Vec<RecordBatch>> =
+            vec![Vec::new(); self.config.mutations_per_row];
 
-            // First mutation is INSERT, rest are UPDATEs
-            let result = if mutation_idx == 0 {
-                source.insert(table_name, &[mutated_row]).await
-            } else {
-                source.update(table_name, &[mutated_row]).await
-            };
+        let mut rows_processed = 0;
 
-            if result.is_ok() {
-                successful += 1;
+        'batch_loop: for batch in batches {
+            for row in 0..batch.num_rows() {
+                if rows_processed >= max_rows {
+                    break 'batch_loop;
+                }
+
+                // Generate mutations for each round
+                for (round_idx, round) in rounds.iter_mut().enumerate() {
+                    let is_final = round_idx == self.config.mutations_per_row - 1;
+                    let mutated_row =
+                        self.generate_mutated_row(&schema, batch, row, &pk_columns, is_final)?;
+                    round.push(mutated_row);
+                }
+
+                rows_processed += 1;
             }
         }
 
-        Ok(successful)
+        Ok(rounds)
     }
 }
 
-/// Execute mutation sequences for all datasets.
+/// Concatenate multiple single-row batches into larger batches.
+fn concatenate_batches(single_row_batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    if single_row_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Group into batches of ~1000 rows for efficient processing
+    const BATCH_SIZE: usize = 1000;
+
+    let schema = single_row_batches[0].schema();
+    let mut result = Vec::new();
+
+    for chunk in single_row_batches.chunks(BATCH_SIZE) {
+        let batch = arrow::compute::concat_batches(&schema, chunk)
+            .context("Failed to concatenate batches")?;
+        result.push(batch);
+    }
+
+    Ok(result)
+}
+
+/// Execute mutation sequences for all datasets using batched operations.
 ///
 /// For each dataset, this will:
-/// 1. Take the generated data
-/// 2. For each row (up to `max_rows_per_dataset)`:
-///    a. INSERT with mutated values
-///    b. Apply mutations_per_row-2 UPDATE operations with intermediate values
-///    c. Apply final UPDATE with the original TPC-H values
+/// 1. Generate all mutations organized by round
+/// 2. Execute each round as batched operations:
+///    - Round 0: Batch INSERT all mutated rows
+///    - Round 1..N-1: Batch UPDATE with intermediate values
+///    - Round N: Batch UPDATE with final TPC-H values
 ///
 /// This tests that CDC correctly processes all mutations and the final state
 /// matches the expected TPC-H data.
@@ -222,6 +252,7 @@ pub async fn execute_mutation_sequences(
 
     for dataset in datasets {
         let dataset_type = dataset.dataset_type();
+        let table_name = dataset.table_name();
 
         // Find the original data for this dataset
         let Some((_, batches)) = original_data.iter().find(|(dt, _)| *dt == dataset_type) else {
@@ -229,48 +260,74 @@ pub async fn execute_mutation_sequences(
             continue;
         };
 
+        println!("\nGenerating mutations for {dataset_type}...");
+
+        // Generate all mutations organized by round
+        let rounds = generator.generate_all_mutations(dataset.as_ref(), batches)?;
+
+        let total_rows = if rounds.is_empty() {
+            0
+        } else {
+            rounds[0].len()
+        };
+
         summary.datasets_processed += 1;
+        summary.total_rows += total_rows;
+        summary.total_mutations += total_rows * config.mutations_per_row;
 
-        // Process rows up to the limit
-        let mut rows_processed = 0;
-        let max_rows = config.max_rows_per_dataset.unwrap_or(usize::MAX);
+        println!(
+            "Generated {} rows × {} mutations = {} total mutations",
+            total_rows,
+            config.mutations_per_row,
+            total_rows * config.mutations_per_row
+        );
 
-        'batch_loop: for batch in batches {
-            for row in 0..batch.num_rows() {
-                if rows_processed >= max_rows {
-                    break 'batch_loop;
+        // Execute each round
+        for (round_idx, round_batches) in rounds.into_iter().enumerate() {
+            let is_insert = round_idx == 0;
+            let is_final = round_idx == config.mutations_per_row - 1;
+
+            let operation = if is_insert {
+                "INSERT"
+            } else if is_final {
+                "UPDATE (final)"
+            } else {
+                "UPDATE"
+            };
+
+            println!(
+                "  Round {}/{}: {} {} rows...",
+                round_idx + 1,
+                config.mutations_per_row,
+                operation,
+                round_batches.len()
+            );
+
+            // Concatenate single-row batches for efficient insertion
+            let batches = concatenate_batches(round_batches)?;
+
+            // Execute the batch operation
+            let result = if is_insert {
+                source.insert(table_name, &batches).await
+            } else {
+                source.update(table_name, &batches).await
+            };
+
+            match result {
+                Ok(()) => {
+                    summary.successful_mutations += total_rows;
+                    println!("    Completed {} for {} rows", operation, total_rows);
                 }
-
-                summary.total_rows += 1;
-                summary.total_mutations += config.mutations_per_row;
-
-                match generator
-                    .execute_row_mutations(source, dataset.as_ref(), batch, row)
-                    .await
-                {
-                    Ok(successful) => {
-                        summary.successful_mutations += successful;
-                        summary.failed_mutations += config.mutations_per_row - successful;
-                    }
-                    Err(e) => {
-                        eprintln!("Error executing mutations for row {row}: {e}");
-                        summary.failed_mutations += config.mutations_per_row;
-                    }
-                }
-
-                rows_processed += 1;
-
-                if rows_processed % 10 == 0 {
-                    println!("Processed {rows_processed}/{max_rows} rows for {dataset_type}");
+                Err(e) => {
+                    summary.failed_mutations += total_rows;
+                    eprintln!("    Failed {} for {} rows: {}", operation, total_rows, e);
                 }
             }
         }
 
         println!(
-            "Completed mutations for {}: {} rows, {} mutations",
-            dataset_type,
-            rows_processed,
-            rows_processed * config.mutations_per_row
+            "Completed mutations for {}: {} rows processed",
+            dataset_type, total_rows
         );
     }
 
