@@ -33,7 +33,6 @@ limitations under the License.
 
 use anyhow::Context;
 use app::{App, AppBuilder};
-use arrow::array::RecordBatch;
 use futures::TryStreamExt;
 use http::{
     HeaderValue,
@@ -553,6 +552,7 @@ pub(crate) async fn run_search(
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             let client = spiceai::ClientBuilder::new()
                 .flight_url(format!("http://{}", api_config.flight_bind_address).as_str())
+                .http_url(http_base_url.as_str())
                 .build()
                 .await
                 .unwrap_or_else(|_| {
@@ -610,9 +610,11 @@ pub(crate) async fn run_search(
                         // This is okay to fail. Some times SQL plans cannot be prepared (e.g. FTS on a vector index).
                         // Do not return error, but make a snapshot to ensure if this changes in future, we can track it.
                         let mut disp =
-                            if let Ok(c) = client.query(format!("EXPLAIN {sql}").as_str()).await {
-                                let z = c.try_collect::<Vec<RecordBatch>>().await?;
-                                arrow::util::pretty::pretty_format_batches(&z)?.to_string()
+                            if let Ok(stream) = client.sql(format!("EXPLAIN {sql}").as_str()).await {
+                                match stream.try_collect::<Vec<arrow::record_batch::RecordBatch>>().await {
+                                    Ok(c) => arrow::util::pretty::pretty_format_batches(&c)?.to_string(),
+                                    Err(e) => format!("Could not prepare EXPLAIN plan: {e}")
+                                }
                             } else {
                                 format!("Could not prepare EXPLAIN plan. SQL error: {resp}")
                             };
