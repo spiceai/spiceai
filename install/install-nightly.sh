@@ -233,6 +233,24 @@ getArtifactDownloadUrl() {
     local response
     response=$(gh_curl -s "$artifacts_url")
 
+    # Check if the response contains an error message (run not found, etc.)
+    local error_message
+    error_message=$(echo "$response" | jq -r '.message // empty')
+    if [ -n "$error_message" ]; then
+        echo -e "${red}Error:${reset} GitHub API error: $error_message"
+        echo "Run ID $run_id may not exist or you may not have access to it."
+        exit 1
+    fi
+
+    # Check if artifacts array exists
+    local artifacts_count
+    artifacts_count=$(echo "$response" | jq -r '.artifacts | length // 0')
+    if [ "$artifacts_count" -eq 0 ]; then
+        echo -e "${red}Error:${reset} No artifacts found for run $run_id"
+        echo "The run may still be in progress, or artifacts may have expired."
+        exit 1
+    fi
+
     local artifact_id
     artifact_id=$(echo "$response" | jq -r ".artifacts[] | select(.name == \"$artifact_name\") | .id // empty")
 
