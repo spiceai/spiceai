@@ -110,6 +110,10 @@ pub struct ReplConfig {
         help_heading = "SQL REPL"
     )]
     pub cache_control: cache_control::CacheControl,
+
+    /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
+    #[arg(long = "headers", value_name = "KEY:VALUE", help_heading = "SQL REPL")]
+    pub custom_headers: Vec<String>,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -250,6 +254,15 @@ impl Highlighter for EditorHelper {
 
 #[expect(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // Note: custom_headers are currently not applied to the gRPC Flight connection.
+    // Adding gRPC metadata headers requires interceptor changes.
+    // For now, this flag is accepted but not used.
+    if !repl_config.custom_headers.is_empty() {
+        tracing::warn!(
+            "Custom headers are not currently supported for the SQL REPL's Flight gRPC connection"
+        );
+    }
+
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
     let mut user_agent = get_user_agent();
     if let Some(user_agent_override) = repl_config.user_agent {

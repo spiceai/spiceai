@@ -52,6 +52,10 @@ pub struct SqlArgs {
     /// The path to the root certificate file used to verify the Spice.ai runtime server certificate
     #[arg(long)]
     tls_root_certificate_file: Option<String>,
+
+    /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
+    #[arg(long = "headers", value_name = "KEY:VALUE")]
+    custom_headers: Vec<String>,
 }
 
 /// Execute the sql command.
@@ -106,5 +110,6 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         api_key: ctx.api_key().map(String::from),
         user_agent: Some(ctx.user_agent().to_string()),
         cache_control,
+        custom_headers: args.custom_headers.clone(),
     }
 }
