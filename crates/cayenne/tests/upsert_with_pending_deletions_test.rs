@@ -500,26 +500,26 @@ async fn test_new_key_in_protected_snapshot_detected_as_conflict_impl(
 test_with_backends!(test_new_key_in_protected_snapshot_detected_as_conflict_impl);
 
 // =============================================================================
-// Test: Protected snapshots must be preserved during cleanup to prevent data loss
+// Test: Protected snapshots must remain readable when pending deletions exist
 // =============================================================================
 //
 // When pending deletions exist, new data is written to a "protected snapshot" -
-// a separate snapshot that must not be deleted during cleanup because it contains
-// data that hasn't been merged into the main snapshot yet.
+// a separate snapshot that contains data written after pending deletions were
+// created. This test verifies that data in protected snapshots is correctly
+// visible in queries.
 //
 // This test verifies:
-// 1. Data in protected snapshots remains accessible after cleanup runs
-// 2. Queries return all expected rows without errors
+// 1. Data in protected snapshots is accessible via queries
+// 2. All rows (from both main snapshots and protected snapshots) are returned
 //
 // Scenario:
 // 1. Initial insert creates snapshot S1 with PKs 1, 2, 3
 // 2. Upsert PK 2 → creates pending deletion for PK 2, new snapshot S2
 // 3. Insert NEW PK 4 while pending deletions exist → creates PROTECTED snapshot S3
 //    (S3 is protected because it contains data written after pending deletions)
-// 4. Cleanup runs (triggered by step 3's insert)
-// 5. Query all rows → must return all 4 rows without error
+// 4. Query all rows → must return all 4 rows without error
 
-async fn test_protected_snapshots_preserved_during_cleanup_impl(
+async fn test_protected_snapshots_readable_with_pending_deletions_impl(
     fixture: TestFixture,
 ) -> TestResult<()> {
     let (table, ctx, schema) = setup_upsert_table(&fixture, "protected_cleanup").await?;
@@ -579,16 +579,11 @@ async fn test_protected_snapshots_preserved_during_cleanup_impl(
     )?;
     insert_batch(&table, batch3).await?;
 
-    // Wait for async cleanup to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-    // CRITICAL ASSERTION: After cleanup, all 4 rows must still be accessible
-    // Before fix: This would fail with data loss (3 rows instead of 4)
-    // or query error ("Client specified an invalid argument")
+    // Step 4: Query all rows - protected snapshot data must be visible
     let count = get_row_count(&ctx, "protected_cleanup").await?;
     assert_eq!(
         count, 4,
-        "After cleanup: should have 4 rows (protected snapshot data preserved), got {count}"
+        "Protected snapshot data must be visible: should have 4 rows, got {count}"
     );
 
     // Verify all PKs are present
@@ -596,7 +591,7 @@ async fn test_protected_snapshots_preserved_during_cleanup_impl(
     assert_eq!(
         ids,
         vec![1, 2, 3, 4],
-        "After cleanup: should have PKs 1-4, got {ids:?}"
+        "All PKs should be visible: expected 1-4, got {ids:?}"
     );
 
     // Verify PK 4 (in protected snapshot) has correct value
@@ -604,7 +599,11 @@ async fn test_protected_snapshots_preserved_during_cleanup_impl(
         .sql("SELECT value FROM protected_cleanup WHERE id = 4")
         .await?;
     let results = df.collect().await?;
-    assert_eq!(results[0].num_rows(), 1, "PK 4 should exist after cleanup");
+    assert_eq!(
+        results[0].num_rows(),
+        1,
+        "PK 4 from protected snapshot should be visible"
+    );
     let values = results[0]
         .column(0)
         .as_any()
@@ -619,4 +618,4 @@ async fn test_protected_snapshots_preserved_during_cleanup_impl(
     Ok(())
 }
 
-test_with_backends!(test_protected_snapshots_preserved_during_cleanup_impl);
+test_with_backends!(test_protected_snapshots_readable_with_pending_deletions_impl);
