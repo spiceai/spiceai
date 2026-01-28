@@ -103,7 +103,7 @@ mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 mod tpcds_postgres;
 mod utils;
 mod view;
