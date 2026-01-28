@@ -424,9 +424,24 @@ impl CayenneTableProvider {
     ///
     /// This is a non-blocking operation that logs warnings on failure but doesn't
     /// propagate errors, as cleanup failures shouldn't fail the write operation.
+    ///
+    /// Protected snapshots (those containing data written after deletions) are preserved
+    /// alongside the current snapshot to prevent data loss for queries that reference them.
     pub(crate) async fn trigger_old_snapshot_cleanup(&self, current_snapshot: &str) {
+        // Collect protected snapshot IDs to preserve during cleanup
+        let protected_snapshot_ids: HashSet<String> = {
+            let Ok(guard) = self.protected_snapshots.read() else {
+                tracing::warn!("Failed to read protected snapshots for cleanup");
+                return;
+            };
+            guard.keys().cloned().collect()
+        };
+
         if self.table_metadata.path.starts_with("s3://") {
-            if let Err(err) = self.cleanup_old_snapshots_s3(current_snapshot).await {
+            if let Err(err) = self
+                .cleanup_old_snapshots_s3(current_snapshot, &protected_snapshot_ids)
+                .await
+            {
                 tracing::warn!(
                     "Failed to cleanup old S3 snapshots for table {}: {err}",
                     self.table_metadata.table_id
@@ -437,9 +452,12 @@ impl CayenneTableProvider {
             let table_id = self.table_metadata.table_id;
             let current_snapshot = current_snapshot.to_string();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) =
-                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
-                {
+                if let Err(e) = Self::cleanup_old_snapshots_blocking(
+                    &table_path,
+                    table_id,
+                    &current_snapshot,
+                    &protected_snapshot_ids,
+                ) {
                     tracing::warn!(
                         "Failed to cleanup old snapshots for table {}: {e}",
                         table_id
@@ -566,7 +584,11 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    async fn cleanup_old_snapshots_s3(&self, current_snapshot: &str) -> CatalogResult<()> {
+    async fn cleanup_old_snapshots_s3(
+        &self,
+        current_snapshot: &str,
+        protected_snapshot_ids: &HashSet<String>,
+    ) -> CatalogResult<()> {
         let config = self.require_object_store()?;
 
         let base_url = url::Url::parse(&self.table_metadata.path).map_err(|e| {
@@ -598,9 +620,15 @@ impl CayenneTableProvider {
 
         for common_prefix in list_result.common_prefixes {
             if let Some(snapshot_id) = common_prefix.parts().last() {
-                if snapshot_id.as_ref() != current_snapshot {
-                    self.delete_prefix_with_object_store(&common_prefix).await?;
+                let snapshot_id_str = snapshot_id.as_ref();
+                // Skip current snapshot and protected snapshots
+                if snapshot_id_str == current_snapshot
+                    || protected_snapshot_ids.contains(snapshot_id_str)
+                {
+                    tracing::debug!("Keeping snapshot: {snapshot_id_str} (current or protected)");
+                    continue;
                 }
+                self.delete_prefix_with_object_store(&common_prefix).await?;
             }
         }
 
@@ -749,6 +777,7 @@ impl CayenneTableProvider {
         table_path: &str,
         table_id: i64,
         current_snapshot_id: &str,
+        protected_snapshot_ids: &HashSet<String>,
     ) -> CatalogResult<()> {
         let table_dir = std::path::PathBuf::from(table_path).join(table_id.to_string());
 
@@ -758,9 +787,10 @@ impl CayenneTableProvider {
         }
 
         tracing::debug!(
-            "Cleaning up old snapshots for table {} (keeping {})",
+            "Cleaning up old snapshots for table {} (keeping current={}, protected={})",
             table_id,
-            current_snapshot_id
+            current_snapshot_id,
+            protected_snapshot_ids.len()
         );
 
         // Read all entries in the table directory using blocking I/O
@@ -782,9 +812,9 @@ impl CayenneTableProvider {
                 continue;
             };
 
-            // Skip the current snapshot
-            if snapshot_id == current_snapshot_id {
-                tracing::debug!("Keeping current snapshot: {}", snapshot_id);
+            // Skip the current snapshot and protected snapshots
+            if snapshot_id == current_snapshot_id || protected_snapshot_ids.contains(snapshot_id) {
+                tracing::debug!("Keeping snapshot: {} (current or protected)", snapshot_id);
                 continue;
             }
 
@@ -3749,7 +3779,18 @@ impl CayenneTableProvider {
         // Update the in-memory snapshot ID to match the new catalog state
         self.update_current_snapshot_id(&new_snapshot_id)?;
 
-        // Clear all in-memory cached deletion vectors since they've been applied
+        // Collect protected snapshot IDs before clearing caches (needed for catalog cleanup)
+        let protected_snapshot_ids: HashSet<String> = {
+            let guard =
+                self.protected_snapshots
+                    .read()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "read protected snapshots before compaction cleanup".to_string(),
+                    })?;
+            guard.keys().cloned().collect()
+        };
+
+        // Clear all in-memory cached deletion vectors and protected snapshots
         self.clear_all_deletion_caches()?;
 
         // Update the provider's listing table to point to the new snapshot
@@ -3763,10 +3804,17 @@ impl CayenneTableProvider {
             *listing_table_guard = new_listing_table;
         }
 
-        // Cleanup old snapshots
+        // Cleanup old snapshots (including the now-merged protected snapshots)
+        // After compaction, protected snapshots have been merged into the new snapshot
+        // so they can safely be deleted.
         if self.table_metadata.path.starts_with("s3://") {
             let current_snapshot = new_snapshot_id.clone();
-            if let Err(err) = self.cleanup_old_snapshots_s3(&current_snapshot).await {
+            // After compaction, we can delete protected snapshots since they're merged
+            let empty_protected = HashSet::new();
+            if let Err(err) = self
+                .cleanup_old_snapshots_s3(&current_snapshot, &empty_protected)
+                .await
+            {
                 tracing::warn!(
                     "Failed to cleanup old S3 snapshots for table {}: {err}",
                     self.table_metadata.table_id
@@ -3776,16 +3824,35 @@ impl CayenneTableProvider {
             let table_path = self.table_metadata.path.clone();
             let table_id = self.table_metadata.table_id;
             let current_snapshot = new_snapshot_id.clone();
+            // After compaction, we can delete protected snapshots since they're merged
+            let empty_protected: HashSet<String> = HashSet::new();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) =
-                    Self::cleanup_old_snapshots_blocking(&table_path, table_id, &current_snapshot)
-                {
+                if let Err(e) = Self::cleanup_old_snapshots_blocking(
+                    &table_path,
+                    table_id,
+                    &current_snapshot,
+                    &empty_protected,
+                ) {
                     tracing::warn!(
                         "Failed to cleanup old snapshots for table {}: {e}",
                         table_id
                     );
                 }
             });
+        }
+
+        // Clear the snapshot sequences in the catalog for the merged protected snapshots
+        for snapshot_id in &protected_snapshot_ids {
+            if let Err(e) = self
+                .catalog
+                .clear_snapshot_sequence(self.table_metadata.table_id, snapshot_id)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to clear snapshot sequence for {} after compaction: {e}",
+                    snapshot_id
+                );
+            }
         }
 
         tracing::info!(

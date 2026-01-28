@@ -498,3 +498,125 @@ async fn test_new_key_in_protected_snapshot_detected_as_conflict_impl(
 }
 
 test_with_backends!(test_new_key_in_protected_snapshot_detected_as_conflict_impl);
+
+// =============================================================================
+// Test: Protected snapshots must be preserved during cleanup to prevent data loss
+// =============================================================================
+//
+// When pending deletions exist, new data is written to a "protected snapshot" -
+// a separate snapshot that must not be deleted during cleanup because it contains
+// data that hasn't been merged into the main snapshot yet.
+//
+// This test verifies:
+// 1. Data in protected snapshots remains accessible after cleanup runs
+// 2. Queries return all expected rows without errors
+//
+// Scenario:
+// 1. Initial insert creates snapshot S1 with PKs 1, 2, 3
+// 2. Upsert PK 2 → creates pending deletion for PK 2, new snapshot S2
+// 3. Insert NEW PK 4 while pending deletions exist → creates PROTECTED snapshot S3
+//    (S3 is protected because it contains data written after pending deletions)
+// 4. Cleanup runs (triggered by step 3's insert)
+// 5. Query all rows → must return all 4 rows without error
+
+async fn test_protected_snapshots_preserved_during_cleanup_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let (table, ctx, schema) = setup_upsert_table(&fixture, "protected_cleanup").await?;
+
+    // Step 1: Initial insert - PKs 1, 2, 3
+    let batch1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_700_000_000_000_000_i64,
+                1_700_000_000_000_000_i64,
+                1_700_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch1).await?;
+    assert_eq!(
+        get_row_count(&ctx, "protected_cleanup").await?,
+        3,
+        "After initial insert: should have 3 rows"
+    );
+
+    // Step 2: Upsert PK 2 - this creates pending deletions
+    let batch2 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(StringArray::from(vec!["b_updated"])),
+            Arc::new(Int64Array::from(vec![250])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_705_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch2).await?;
+    assert_eq!(
+        get_row_count(&ctx, "protected_cleanup").await?,
+        3,
+        "After upsert: should still have 3 rows"
+    );
+
+    // Step 3: Insert NEW PK 4 while pending deletions exist
+    // This creates a PROTECTED snapshot because there are pending deletions
+    let batch3 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![4])),
+            Arc::new(StringArray::from(vec!["d"])),
+            Arc::new(Int64Array::from(vec![400])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_710_000_000_000_000_i64,
+            ])),
+        ],
+    )?;
+    insert_batch(&table, batch3).await?;
+
+    // Wait for async cleanup to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // CRITICAL ASSERTION: After cleanup, all 4 rows must still be accessible
+    // Before fix: This would fail with data loss (3 rows instead of 4)
+    // or query error ("Client specified an invalid argument")
+    let count = get_row_count(&ctx, "protected_cleanup").await?;
+    assert_eq!(
+        count, 4,
+        "After cleanup: should have 4 rows (protected snapshot data preserved), got {count}"
+    );
+
+    // Verify all PKs are present
+    let ids = get_ids(&ctx, "protected_cleanup").await?;
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "After cleanup: should have PKs 1-4, got {ids:?}"
+    );
+
+    // Verify PK 4 (in protected snapshot) has correct value
+    let df = ctx
+        .sql("SELECT value FROM protected_cleanup WHERE id = 4")
+        .await?;
+    let results = df.collect().await?;
+    assert_eq!(results[0].num_rows(), 1, "PK 4 should exist after cleanup");
+    let values = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("value column");
+    assert_eq!(
+        values.value(0),
+        400,
+        "PK 4 should have value 400 from protected snapshot"
+    );
+
+    Ok(())
+}
+
+test_with_backends!(test_protected_snapshots_preserved_during_cleanup_impl);
