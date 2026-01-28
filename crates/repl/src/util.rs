@@ -129,6 +129,10 @@ impl Drop for Spinner {
 }
 
 /// Get the list of available models from the runtime.
+///
+/// # Errors
+///
+/// Returns an error if the connection fails or the response is invalid.
 pub async fn get_available_models(
     client: &reqwest::Client,
     http_endpoint: &str,
@@ -141,10 +145,13 @@ pub async fn get_available_models(
         request = request.header(key, value);
     }
 
-    let response = request.send().await.map_err(|e| UtilError::ConnectionFailed {
-        endpoint: url.clone(),
-        source: e.to_string(),
-    })?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| UtilError::ConnectionFailed {
+            endpoint: url.clone(),
+            source: e.to_string(),
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -154,14 +161,21 @@ pub async fn get_available_models(
         });
     }
 
-    let models: ModelsResponse = response.json().await.map_err(|e| UtilError::InvalidResponse {
-        message: format!("Failed to parse models response: {e}"),
-    })?;
+    let models: ModelsResponse = response
+        .json()
+        .await
+        .map_err(|e| UtilError::InvalidResponse {
+            message: format!("Failed to parse models response: {e}"),
+        })?;
 
     Ok(models.data.into_iter().map(|m| m.id).collect())
 }
 
 /// Validate that a model exists in the runtime.
+///
+/// # Errors
+///
+/// Returns an error if the model is not found or the connection fails.
 pub async fn validate_model(
     client: &reqwest::Client,
     http_endpoint: &str,
@@ -186,6 +200,10 @@ pub async fn validate_model(
 }
 
 /// Select a model from available models using an interactive picker.
+///
+/// # Errors
+///
+/// Returns an error if no models are configured or user selection fails.
 pub async fn select_model(
     client: &reqwest::Client,
     http_endpoint: &str,
@@ -216,6 +234,11 @@ pub async fn select_model(
 }
 
 /// Get or validate a model - validates if specified, selects interactively if not.
+///
+/// # Errors
+///
+/// Returns an error if the model is not found, no models are configured,
+/// or the connection fails.
 pub async fn get_or_select_model(
     client: &reqwest::Client,
     http_endpoint: &str,

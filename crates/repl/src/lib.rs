@@ -64,8 +64,8 @@ use tonic::{Code, IntoRequest, Status};
 
 pub mod cache_control;
 mod completer;
-pub mod util;
 mod config;
+pub mod util;
 
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai SQL REPL")]
