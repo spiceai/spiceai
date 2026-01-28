@@ -240,7 +240,7 @@ async fn submit_and_wait(
             message: e.to_string(),
         })?;
 
-    println!("Submitted query: {} ({})", query_id, initial_status);
+    println!("Submitted query: {query_id} ({initial_status})");
 
     if !wait {
         println!("Check status with: spice query status {query_id}");
@@ -254,7 +254,7 @@ async fn submit_and_wait(
         poll_for_completion(client, &query_id, timeout).await;
 
     if was_cancelled {
-        println!("\nStopped waiting. Query ID: {}", query_id);
+        println!("\nStopped waiting. Query ID: {query_id}");
         return Ok(());
     }
 
@@ -375,7 +375,7 @@ async fn run_query_repl(client: &Arc<Client>) -> Result<()> {
             },
         );
 
-        println!("Submitted query: {} ({})", query_id, initial_state);
+        println!("Submitted query: {query_id} ({initial_state})");
         println!("Press Ctrl+C to stop waiting (query continues in background)");
 
         // Poll for completion
@@ -383,8 +383,8 @@ async fn run_query_repl(client: &Arc<Client>) -> Result<()> {
             poll_for_completion(client, &query_id, None).await;
 
         if was_cancelled {
-            println!("\nStopped waiting. Check status with: .status {}", query_id);
-            println!("Wait for completion with: .wait {}", query_id);
+            println!("\nStopped waiting. Check status with: .status {query_id}");
+            println!("Wait for completion with: .wait {query_id}");
             continue;
         }
 
@@ -413,7 +413,7 @@ async fn run_query_repl(client: &Arc<Client>) -> Result<()> {
             } else if status.is_cancelled() {
                 println!("\x1b[33m⊘ CANCELLED\x1b[0m");
             } else {
-                println!("Query ended with status: {}", status);
+                println!("Query ended with status: {status}");
             }
         }
     }
@@ -694,8 +694,8 @@ async fn poll_for_completion(
                     return (None, true, start_time.elapsed());
                 }
 
-                if let Ok(job) = client.get_query(query_id) {
-                    if let Ok(status) = job.status().await {
+                if let Ok(job) = client.get_query(query_id)
+                    && let Ok(status) = job.status().await {
                         let elapsed = start_time.elapsed();
 
                         if status.is_terminal() {
@@ -714,7 +714,6 @@ async fn poll_for_completion(
                         print!("\r{} {} ({:.1}s)...", frame, status, elapsed.as_secs_f64());
                         let _ = std::io::stdout().flush();
                     }
-                }
                 // Continue polling on transient errors
             }
         }
@@ -770,7 +769,10 @@ async fn display_results(client: &Arc<Client>, query_id: &str, elapsed: Duration
             message: format!("getting results: {e}"),
         })?;
 
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
 
     if total_rows == 0 {
         if elapsed > Duration::ZERO {
@@ -797,7 +799,7 @@ async fn display_results(client: &Arc<Client>, query_id: &str, elapsed: Duration
             total_rows
         );
     } else {
-        println!("\n{} row(s)", total_rows);
+        println!("\n{total_rows} row(s)");
     }
 
     Ok(())

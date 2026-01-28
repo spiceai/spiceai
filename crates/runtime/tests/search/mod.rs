@@ -33,8 +33,6 @@ limitations under the License.
 
 use anyhow::Context;
 use app::{App, AppBuilder};
-use arrow::array::RecordBatch;
-use futures::TryStreamExt;
 use http::{
     HeaderValue,
     header::{ACCEPT, CONTENT_TYPE},
@@ -611,8 +609,13 @@ pub(crate) async fn run_search(
                         // Do not return error, but make a snapshot to ensure if this changes in future, we can track it.
                         let mut disp =
                             if let Ok(c) = client.query(format!("EXPLAIN {sql}").as_str()).await {
-                                let z = c.try_collect::<Vec<RecordBatch>>().await?;
-                                arrow::util::pretty::pretty_format_batches(&z)?.to_string()
+                                match async {
+                                    c.wait().await?;
+                                    c.results().await
+                                }.await {
+                                    Ok(z) => arrow::util::pretty::pretty_format_batches(&z)?.to_string(),
+                                    Err(e) => format!("Could not prepare EXPLAIN plan: {e}")
+                                }
                             } else {
                                 format!("Could not prepare EXPLAIN plan. SQL error: {resp}")
                             };

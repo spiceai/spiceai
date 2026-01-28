@@ -26,9 +26,7 @@ use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use anyhow::Context;
 use app::{App, AppBuilder};
-use arrow::array::RecordBatch;
 use datafusion::sql::TableReference;
-use futures::TryStreamExt;
 use http::HeaderValue;
 use http::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::header::HeaderMap;
@@ -378,11 +376,9 @@ pub(crate) async fn run_search_w_explain(
                         insta::assert_json_snapshot!(test_name.clone(), resp?);
 
                         if explain_sql {
-                            let c = client
-                                .query(format!("EXPLAIN {sql}").as_str())
-                                .await?
-                                .try_collect::<Vec<RecordBatch>>()
-                                .await?;
+                            let job = client.query(format!("EXPLAIN {sql}").as_str()).await?;
+                            job.wait().await?;
+                            let c = job.results().await?;
 
                             let mut disp =
                                 arrow::util::pretty::pretty_format_batches(&c)?.to_string();
