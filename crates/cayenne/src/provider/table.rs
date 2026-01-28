@@ -23,8 +23,8 @@ use super::constants::{
     DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
 };
 use super::delete::{
-    is_pk_visible_i64, is_pk_visible_row_key, read_deletion_vectors, CayenneDeletionSink,
-    DeletionFilterExec, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
+    is_pk_visible_i64, is_pk_visible_row_key, CayenneDeletionSink, DeletionFilterExec,
+    Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
@@ -3988,65 +3988,6 @@ impl CayenneTableProvider {
         );
 
         Ok(())
-    }
-
-    /// Load deletion vectors from the catalog and return a `RoaringBitmap` of deleted row IDs.
-    ///
-    /// This method queries the catalog for delete files and loads all deletion vectors
-    /// into memory. It should be called once during table provider initialization and
-    /// whenever delete files are added/updated.
-    ///
-    /// # Design Constraints
-    ///
-    /// `RoaringBitmap` uses u32 internally, limiting support to row IDs < 4 billion.
-    /// Tables approaching this limit should trigger compaction. Excessive deletion vectors
-    /// severely degrade query performance and indicate poor table health. Compaction removes
-    /// deleted rows and clears deletion vectors.
-    ///
-    /// # Performance Notes
-    ///
-    /// - Queries metastore once via catalog
-    /// - Reads deletion vector files in a blocking task
-    /// - Result is cached in the table provider to avoid repeated queries on every scan
-    /// - `RoaringBitmap` provides 50-90% memory savings vs `HashSet` for sparse deletions
-    async fn load_deletion_vectors(
-        table_id: i64,
-        catalog: Arc<dyn MetadataCatalog>,
-    ) -> CatalogResult<RoaringBitmap> {
-        // Query catalog for delete files (this spawns a blocking task internally)
-        let delete_files = catalog
-            .get_table_delete_files(table_id)
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to load deletion vectors from catalog.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        if delete_files.is_empty() {
-            return Ok(RoaringBitmap::new());
-        }
-
-        // Read deletion vector files in a blocking task
-        let deleted_row_ids = task::spawn_blocking(move || read_deletion_vectors(delete_files))
-            .await
-            .map_err(|err| CatalogError::InvalidOperation {
-                message: "Deletion vector reader task panicked or was cancelled.".to_string(),
-                source: Box::new(err),
-            })
-            .and_then(|result| {
-                result.map_err(|err| CatalogError::InvalidOperation {
-                    message: "Failed to read deletion vectors.".to_string(),
-                    source: Box::new(err),
-                })
-            })?;
-
-        tracing::debug!(
-            "Cached {} deletion vectors ({} deleted rows) for table_id {table_id}",
-            deleted_row_ids.len(),
-            deleted_row_ids.len(),
-        );
-
-        Ok(deleted_row_ids)
     }
 
     /// Load both position-based and key-based deletion vectors from the catalog.
