@@ -469,8 +469,7 @@ async fn test_new_key_in_protected_snapshot_detected_as_conflict_impl(
     assert_eq!(
         ids,
         vec![0, 1, 2, 3, 4],
-        "Should have unique PKs 0-4, but got duplicates: {:?}",
-        ids
+        "Should have unique PKs 0-4, but got duplicates: {ids:?}"
     );
 
     // Verify PK 3 has the latest value (131 from step 3)
