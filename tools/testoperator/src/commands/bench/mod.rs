@@ -90,13 +90,14 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     let testoperator_commit_sha = git::get_commit_sha();
     let branch_name = git::get_branch_name();
 
+    let query_set = args.load_query_set()?;
     let benchmark_resource = Resource::builder_empty()
         .with_attributes(vec![
             KeyValue::new("service.name", "testoperator"),
             KeyValue::new("type", "benchmark_query"),
             KeyValue::new("name", app.name.clone()),
             KeyValue::new("spiced_version", spiced_version),
-            KeyValue::new("query_set", format!("{:?}", args.query_set)),
+            KeyValue::new("query_set", query_set.to_string()),
             KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
             KeyValue::new("spiced_commit_sha", spiced_commit_sha),
             KeyValue::new("branch_name", branch_name),
@@ -119,7 +120,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     // baseline run
     println!("Running benchmark test");
 
-    let (_query_set, test_builder) = super::build_test_with_validation(
+    let (_, test_builder) = super::build_test_with_validation(
         args,
         NotStarted::new()
             .with_parallel_count(1)
