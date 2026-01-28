@@ -203,7 +203,7 @@ bollard = "0.18.1"
 bytes.workspace = true
 chrono.workspace = true
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-flightrepl = { path = "../flightrepl" }
+repl = { path = "../repl" }
 hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
