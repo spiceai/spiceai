@@ -471,6 +471,121 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+async fn openai_test_chat_completion_gpt5_mini() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context().scope(async {
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        let mut model_with_tools = get_openai_model("gpt-5-mini", "openai_model");
+        model_with_tools
+            .params
+            .insert("tools".to_string(), "auto".into());
+
+        let app = AppBuilder::new("text-to-sql")
+            .with_dataset(get_taxi_trips_dataset())
+            .with_model(model_with_tools)
+            .build();
+
+        let api_config = create_api_bindings_config();
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+        let rt_ref_copy = Arc::clone(&rt);
+        tokio::spawn(async move {
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = Arc::clone(&rt).load_components() => {}
+        }
+
+        runtime_ready_check(&rt).await;
+
+        let response = send_chat_completions_request(
+            http_base_url.as_str(),
+            vec![
+                ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
+                ("user".to_string(), "Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string()),
+            ],
+            "openai_model",
+            false,
+        ).await?;
+
+        insta::assert_snapshot!(
+            "chat_completion_gpt5_mini",
+            normalize_chat_completion_response(response, false)
+        );
+
+        Ok(())
+    }).await
+}
+
+#[tokio::test]
+async fn openai_test_chat_completion_gpt5_mini_with_endpoint() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context().scope(async {
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        let mut model_with_tools = get_openai_model("gpt-5-mini", "openai_model");
+        model_with_tools
+            .params
+            .insert("tools".to_string(), "auto".into());
+        model_with_tools
+            .params
+            .insert("endpoint".to_string(), "https://api.openai.com/v1".into());
+
+        let app = AppBuilder::new("text-to-sql")
+            .with_dataset(get_taxi_trips_dataset())
+            .with_model(model_with_tools)
+            .build();
+
+        let api_config = create_api_bindings_config();
+        let http_base_url = format!("http://{}", api_config.http_bind_address);
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+        let rt_ref_copy = Arc::clone(&rt);
+        tokio::spawn(async move {
+            Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+        });
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+            }
+            () = Arc::clone(&rt).load_components() => {}
+        }
+
+        runtime_ready_check(&rt).await;
+
+        let response = send_chat_completions_request(
+            http_base_url.as_str(),
+            vec![
+                ("system".to_string(), "You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string()),
+                ("user".to_string(), "Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string()),
+            ],
+            "openai_model",
+            false,
+        ).await?;
+
+        insta::assert_snapshot!(
+            "chat_completion_gpt5_mini_with_endpoint",
+            normalize_chat_completion_response(response, false)
+        );
+
+        Ok(())
+    }).await
+}
+
+#[tokio::test]
 async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
