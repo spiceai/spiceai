@@ -3081,24 +3081,76 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if deletion vectors cannot be loaded from the catalog.
     async fn refresh_deletion_cache(&self) -> CatalogResult<()> {
-        let deleted_row_ids =
-            Self::load_deletion_vectors(self.table_metadata.table_id, Arc::clone(&self.catalog))
-                .await?;
+        let (
+            deleted_row_ids,
+            deleted_pk_i64,
+            deleted_row_keys,
+            insert_records_pk_i64,
+            insert_records_row_keys,
+        ) = Self::load_deletion_vectors_all(
+            self.table_metadata.table_id,
+            Arc::clone(&self.catalog),
+            self.pk_deletion_strategy,
+        )
+        .await?;
 
-        let mut guard =
-            self.cached_deleted_row_ids
-                .write()
-                .map_err(|_| CatalogError::LockPoisoned {
-                    operation: "refresh deletion cache (write)".to_string(),
-                })?;
+        // Update position-based cache
+        {
+            let mut guard =
+                self.cached_deleted_row_ids
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "refresh deletion cache (position write)".to_string(),
+                    })?;
+            *guard = Arc::new(deleted_row_ids);
+        }
 
-        // Replace with new Arc-wrapped HashSet for zero-copy sharing
-        *guard = Arc::new(deleted_row_ids);
+        // Update Int64 PK-based cache
+        {
+            let mut guard =
+                self.cached_deleted_pk_i64
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "refresh deletion cache (pk_i64 write)".to_string(),
+                    })?;
+            *guard = Arc::new(deleted_pk_i64);
+        }
+
+        // Update row key-based cache
+        {
+            let mut guard =
+                self.cached_deleted_row_keys
+                    .write()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "refresh deletion cache (row_keys write)".to_string(),
+                    })?;
+            *guard = Arc::new(deleted_row_keys);
+        }
+
+        // Update Int64 PK insert records cache
+        {
+            let mut guard = self.cached_insert_records_pk_i64.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "refresh deletion cache (insert_pk_i64 write)".to_string(),
+                }
+            })?;
+            *guard = Arc::new(insert_records_pk_i64);
+        }
+
+        // Update row key insert records cache
+        {
+            let mut guard = self.cached_insert_records_row_keys.write().map_err(|_| {
+                CatalogError::LockPoisoned {
+                    operation: "refresh deletion cache (insert_row_keys write)".to_string(),
+                }
+            })?;
+            *guard = Arc::new(insert_records_row_keys);
+        }
 
         tracing::debug!(
-            "Refreshed deletion cache for table {} ({} deleted rows)",
+            "Refreshed deletion cache for table {} (strategy: {:?})",
             self.table_metadata.table_name,
-            guard.len()
+            self.pk_deletion_strategy,
         );
 
         Ok(())
