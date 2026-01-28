@@ -90,6 +90,9 @@ time = "0.3"
 
 # Internal crates
 repl = { path = "../../crates/repl" }
+spicepod = { path = "../../crates/spicepod", default-features = false }
+spiceai = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
 
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]

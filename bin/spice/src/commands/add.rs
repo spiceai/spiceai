@@ -20,8 +20,8 @@ use crate::context::RuntimeContext;
 use crate::error::{ConfigIoSnafu, Result};
 use crate::registry;
 use clap::Args;
-use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
+use spicepod::spec::SpicepodDefinition;
 use std::path::Path;
 
 /// Arguments for the add command.
@@ -80,7 +80,7 @@ pub async fn execute_add_or_connect(
 
     // Read or create spicepod.yaml
     let spicepod_path = ctx.app_dir().join("spicepod.yaml");
-    let mut spicepod = if spicepod_path.exists() {
+    let mut spicepod: SpicepodDefinition = if spicepod_path.exists() {
         let contents = std::fs::read_to_string(&spicepod_path).context(ConfigIoSnafu {
             operation: "read",
             path: spicepod_path.clone(),
@@ -96,7 +96,7 @@ pub async fn execute_add_or_connect(
             .and_then(|n| n.to_str())
             .unwrap_or("app");
         println!("\x1b[32mspicepod.yaml initialized!\x1b[0m");
-        SpicepodSpec::new(name)
+        SpicepodDefinition::new(name)
     };
 
     // Add dependency if not already present
@@ -123,28 +123,4 @@ pub async fn execute_add_or_connect(
 fn get_relative_path(base: &Path, path: &Path) -> String {
     path.strip_prefix(base)
         .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
-}
-
-/// Minimal Spicepod spec for reading/writing dependencies.
-#[derive(Debug, Serialize, Deserialize)]
-struct SpicepodSpec {
-    version: String,
-    kind: String,
-    name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    dependencies: Vec<String>,
-    #[serde(flatten)]
-    other: serde_yaml::Mapping,
-}
-
-impl SpicepodSpec {
-    fn new(name: &str) -> Self {
-        Self {
-            version: "v1beta1".to_string(),
-            kind: "Spicepod".to_string(),
-            name: name.to_string(),
-            dependencies: Vec::new(),
-            other: serde_yaml::Mapping::new(),
-        }
-    }
 }
