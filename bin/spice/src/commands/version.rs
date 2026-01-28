@@ -100,7 +100,7 @@ async fn check_latest_version(ctx: &RuntimeContext) -> Option<String> {
     // Fetch from GitHub
     let client = GitHubClient::new_runtime_client();
     let release = get_latest_release(&client).await.ok()?;
-    let version = release.tag_name.clone();
+    let version = release.tag_name;
 
     // Update cache
     if let Some(parent) = cache_path.parent() {

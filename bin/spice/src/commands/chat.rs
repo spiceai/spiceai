@@ -108,6 +108,7 @@ struct Delta {
 
 /// Token usage statistics.
 #[derive(Deserialize, Default, Clone)]
+#[expect(clippy::struct_field_names)]
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -204,7 +205,9 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
     let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
     // Read piped stdin if available
-    let stdin_input = if !is_terminal {
+    let stdin_input = if is_terminal {
+        None
+    } else {
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input).ok();
         let trimmed = input.trim();
@@ -213,8 +216,6 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
         } else {
             Some(trimmed.to_string())
         }
-    } else {
-        None
     };
 
     // Combine piped input with command line message

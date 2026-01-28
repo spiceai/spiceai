@@ -283,3 +283,145 @@ pub fn save_history(rl: &mut DefaultEditor, history_path: Option<&PathBuf>) {
         let _ = rl.save_history(path);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_util_error_display_connection_failed() {
+        let err = UtilError::ConnectionFailed {
+            endpoint: "http://localhost:8090".to_string(),
+            source: "connection refused".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Failed to connect to http://localhost:8090: connection refused"
+        );
+    }
+
+    #[test]
+    fn test_util_error_display_invalid_response() {
+        let err = UtilError::InvalidResponse {
+            message: "Bad JSON".to_string(),
+        };
+        assert_eq!(err.to_string(), "Bad JSON");
+    }
+
+    #[test]
+    fn test_util_error_display_model_not_found() {
+        let err = UtilError::ModelNotFound {
+            model: "gpt-5".to_string(),
+            available: "gpt-3, gpt-4".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Model 'gpt-5' not found. Available models: gpt-3, gpt-4"
+        );
+    }
+
+    #[test]
+    fn test_util_error_display_no_models_configured() {
+        let err = UtilError::NoModelsConfigured;
+        assert_eq!(err.to_string(), "No models are configured in the runtime");
+    }
+
+    #[test]
+    fn test_spinner_frames_constant() {
+        // Verify spinner frames are defined correctly
+        assert_eq!(SPINNER_FRAMES.len(), 10);
+        assert!(SPINNER_FRAMES.iter().all(|f| !f.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_spinner_start_and_stop() {
+        // Test that spinner can be started and stopped without panic
+        let spinner = Spinner::start();
+        // Give it a moment to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Stop should complete without error
+        spinner.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_spinner_drop_stops_animation() {
+        // Test that dropping the spinner stops the animation
+        let spinner = Spinner::start();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(spinner);
+        // Just verify no panic occurs
+    }
+
+    #[test]
+    fn test_create_editor_with_history() {
+        // Test that we can create an editor (may fail in some CI environments without a terminal)
+        let result = create_editor_with_history("test_history.txt");
+        // This should succeed if rustyline can initialize
+        if let Ok((editor, history_path)) = result {
+            // Verify history path is constructed correctly
+            if let Some(path) = history_path {
+                assert!(path.ends_with(".spice/test_history.txt"));
+            }
+            drop(editor);
+        }
+        // If it fails (e.g., no terminal in CI), that's acceptable for this test
+    }
+
+    #[test]
+    fn test_save_history_creates_directory() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let history_path = temp_dir.path().join("nested").join("history.txt");
+
+        // Create editor
+        if let Ok((mut editor, _)) = create_editor_with_history("test.txt") {
+            // Add some history entries
+            let _ = editor.add_history_entry("SELECT * FROM table1");
+            let _ = editor.add_history_entry("SELECT * FROM table2");
+
+            // Save to the nested path
+            save_history(&mut editor, Some(&history_path));
+
+            // Verify parent directory was created
+            assert!(history_path.parent().is_some_and(std::path::Path::exists));
+        }
+    }
+
+    #[test]
+    fn test_save_history_with_none_path() {
+        // Test that save_history handles None path gracefully
+        if let Ok((mut editor, _)) = create_editor_with_history("test.txt") {
+            // This should not panic
+            save_history(&mut editor, None);
+        }
+    }
+
+    // Note: The following functions require network calls and are tested via integration tests:
+    // - get_available_models
+    // - validate_model
+    // - select_model (also requires TTY for interactive selection)
+    // - get_or_select_model
+    //
+    // See test/spicepods/ for integration tests that exercise these functions
+    // with a running Spice runtime.
+
+    #[test]
+    fn test_models_response_deserialization() {
+        // Test that ModelsResponse can be deserialized correctly
+        let json = r#"{"data": [{"id": "model1"}, {"id": "model2"}]}"#;
+        let response: ModelsResponse =
+            serde_json::from_str(json).expect("Failed to parse ModelsResponse");
+        assert_eq!(response.data.len(), 2);
+        assert_eq!(response.data[0].id, "model1");
+        assert_eq!(response.data[1].id, "model2");
+    }
+
+    #[test]
+    fn test_models_response_empty() {
+        // Test empty models list
+        let json = r#"{"data": []}"#;
+        let response: ModelsResponse =
+            serde_json::from_str(json).expect("Failed to parse empty ModelsResponse");
+        assert!(response.data.is_empty());
+    }
+}
