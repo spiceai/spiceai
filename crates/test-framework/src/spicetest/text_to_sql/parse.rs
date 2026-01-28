@@ -486,7 +486,7 @@ pub async fn sql_schema(
 ) -> Result<Schema, anyhow::Error> {
     match sql_schema_describe(http_client.clone(), http_base_url, sql).await {
         Ok(schema) => Ok(schema),
-        Err(e) => sql_schema_fallback(http_client, http_base_url, sql).await,
+        Err(_) => sql_schema_fallback(http_client, http_base_url, sql).await,
     }
 }
 
