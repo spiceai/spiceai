@@ -378,7 +378,11 @@ pub(crate) async fn run_search_w_explain(
                         insta::assert_json_snapshot!(test_name.clone(), resp?);
 
                         if explain_sql {
-                            let c: Vec<arrow::record_batch::RecordBatch> = client.sql(format!("EXPLAIN {sql}").as_str()).await?.try_collect().await?;
+                            let c: Vec<arrow::record_batch::RecordBatch> = client
+                                .sql(format!("EXPLAIN {sql}").as_str())
+                                .await?
+                                .try_collect()
+                                .await?;
 
                             let mut disp =
                                 arrow::util::pretty::pretty_format_batches(&c)?.to_string();
