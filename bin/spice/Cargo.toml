@@ -101,6 +101,9 @@ nix = { version = "0.29", features = ["signal", "process"] }
 [build-dependencies]
 # None needed - we use include_str! for version
 
+[features]
+release = []
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
