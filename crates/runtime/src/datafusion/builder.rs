@@ -33,7 +33,7 @@ use datafusion::{
     execution::{
         DiskManager, SessionStateBuilder,
         disk_manager::DiskManagerMode,
-        memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
+        memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
@@ -523,7 +523,17 @@ pub(crate) fn runtime_env(
             unreachable!("Memory pool TopN must be greater than 0");
         };
 
-        Arc::new(TrackConsumersPool::new(FairSpillPool::new(limit), topn))
+        // Use GreedyMemoryPool instead of FairSpillPool for better handling of concurrent queries.
+        // FairSpillPool divides memory equally among all spillable consumers, which causes issues when:
+        // 1. Many queries run concurrently (e.g., throughput tests)
+        // 2. Each query creates multiple spillable consumers (partitions)
+        // 3. The per-consumer share becomes too small to hold even batch_size groups
+        //
+        // GreedyMemoryPool uses first-come-first-served allocation, which:
+        // - Allows consumers to use available memory as needed
+        // - Triggers spilling when actual memory pressure occurs
+        // - Better handles variable concurrent workloads
+        Arc::new(TrackConsumersPool::new(GreedyMemoryPool::new(limit), topn))
     } else {
         let Some(topn) = NonZeroUsize::new(5) else {
             unreachable!("Memory pool TopN must be greater than 0");
