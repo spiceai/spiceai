@@ -53,26 +53,51 @@ pub async fn find_task_history_metrics(
 ) -> Result<(Option<String>, TaskHistoryMetrics)> {
     // Query to get metrics with token counts extracted via SQL
     // This matches the Go implementation in queryTaskHistoryMetrics
+    // Updated to exclude SQL queries that are children of tool_use::* tasks
     let query = format!(
         r"
-WITH ordered_tasks AS (
+WITH all_tasks AS (
     SELECT
         task,
+        span_id,
+        parent_span_id,
+        input,
+        execution_duration_ms,
+        start_time,
+        labels
+    FROM runtime.task_history
+    WHERE trace_id = '{trace_id}'
+),
+tool_spans AS (
+    SELECT span_id
+    FROM all_tasks
+    WHERE task LIKE 'tool_use::%'
+),
+ordered_tasks AS (
+    SELECT
+        task,
+        parent_span_id,
         input,
         execution_duration_ms,
         start_time,
         labels,
         MIN(CASE WHEN task = 'ai_completion' THEN start_time END) OVER () AS first_ai_completion_time
-    FROM runtime.task_history
-    WHERE trace_id = '{trace_id}'
-      AND task IN ('sql_query', 'ai_completion')
+    FROM all_tasks
+    WHERE task IN ('sql_query', 'ai_completion')
+),
+candidate_sql AS (
+    SELECT *
+    FROM ordered_tasks
+    WHERE task = 'sql_query'
+      AND first_ai_completion_time IS NOT NULL
+      AND start_time > first_ai_completion_time
+      AND parent_span_id NOT IN (SELECT span_id FROM tool_spans)
 ),
 sql_stats AS (
     SELECT
         COUNT(*) AS sql_count,
         COALESCE(SUM(execution_duration_ms), 0) AS sql_duration_ms
-    FROM ordered_tasks
-    WHERE task = 'sql_query'
+    FROM candidate_sql
 ),
 llm_stats AS (
     SELECT
@@ -85,10 +110,7 @@ llm_stats AS (
 ),
 last_candidate_sql AS (
     SELECT COALESCE(input, '') AS generated_sql
-    FROM ordered_tasks
-    WHERE task = 'sql_query'
-      AND first_ai_completion_time IS NOT NULL
-      AND start_time > first_ai_completion_time
+    FROM candidate_sql
     ORDER BY start_time DESC
     LIMIT 1
 ),
@@ -200,25 +222,40 @@ async fn fetch_attempted_sql(
     trace_id: &TraceId,
     timeout: Duration,
 ) -> Vec<String> {
+    // This query finds SQL queries that are candidate answers (not tool sampling queries).
+    // It excludes SQL queries that are children of tool_use::* tasks (like sample_data, table_schema).
     let query = format!(
         r"
-SELECT input
-FROM (
+WITH trace_tasks AS (
     SELECT
         task,
+        span_id,
+        parent_span_id,
         input,
-        start_time,
-        MIN(CASE WHEN task = 'ai_completion' THEN start_time END) OVER () AS first_ai_completion_time
+        start_time
     FROM runtime.task_history
     WHERE trace_id = '{trace_id}'
-      AND task IN ('sql_query', 'ai_completion')
-) sub
-WHERE task = 'sql_query'
-  AND first_ai_completion_time IS NOT NULL
-  AND start_time > first_ai_completion_time
-  AND input IS NOT NULL
-  AND input != ''
-ORDER BY start_time ASC
+),
+tool_spans AS (
+    SELECT span_id
+    FROM trace_tasks
+    WHERE task LIKE 'tool_use::%'
+),
+first_ai_completion AS (
+    SELECT MIN(start_time) AS first_ai_time
+    FROM trace_tasks
+    WHERE task = 'ai_completion'
+)
+SELECT t.input
+FROM trace_tasks t
+CROSS JOIN first_ai_completion f
+WHERE t.task = 'sql_query'
+  AND f.first_ai_time IS NOT NULL
+  AND t.start_time > f.first_ai_time
+  AND t.input IS NOT NULL
+  AND t.input != ''
+  AND t.parent_span_id NOT IN (SELECT span_id FROM tool_spans)
+ORDER BY t.start_time ASC
 "
     );
 
