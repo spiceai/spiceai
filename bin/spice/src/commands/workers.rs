@@ -20,7 +20,7 @@ use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
 use crate::output::{TableRow, write_table};
 use clap::Args;
-use serde::Deserialize;
+use runtime_api_types::v1::{WorkerInfo, WorkerListResponse};
 
 /// Arguments for the workers command.
 #[derive(Args, Debug)]
@@ -35,33 +35,15 @@ See more at: https://spiceai.org/docs/"#
 )]
 pub struct WorkersArgs {}
 
-/// Worker information from the runtime API.
-#[derive(Debug, Deserialize)]
-pub struct Worker {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    #[serde(rename = "type")]
-    pub worker_type: Option<String>,
-    pub is_llm: Option<bool>,
-}
-
-/// Response wrapper for workers API.
-#[derive(Debug, Deserialize)]
-pub struct WorkerResponse {
-    pub object: Option<String>,
-    pub data: Vec<Worker>,
-}
-
-impl TableRow for Worker {
+impl TableRow for WorkerInfo {
     fn headers() -> Vec<&'static str> {
-        vec!["NAME", "TYPE", "IS_LLM", "DESCRIPTION"]
+        vec!["NAME", "IS_LLM", "DESCRIPTION"]
     }
 
     fn values(&self) -> Vec<String> {
         vec![
-            self.name.clone().unwrap_or_default(),
-            self.worker_type.clone().unwrap_or_default(),
-            self.is_llm.map_or("false".to_string(), |v| v.to_string()),
+            self.name.clone(),
+            self.is_llm.to_string(),
             self.description.clone().unwrap_or_default(),
         ]
     }
@@ -83,7 +65,7 @@ pub async fn execute(ctx: &RuntimeContext, _args: &WorkersArgs) -> Result<()> {
         .build());
     }
 
-    let worker_response: WorkerResponse = response.json().await.map_err(|e| {
+    let worker_response: WorkerListResponse = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
             message: format!("Failed to parse workers response: {e}"),
         }
