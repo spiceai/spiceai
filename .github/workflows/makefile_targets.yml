@@ -59,10 +59,6 @@ jobs:
         run: |
           make install-runtime
 
-      - name: make install-with-models
+      - name: make install-odbc
         run: |
-          make install-with-models
-
-      - name: make install-with-odbc
-        run: |
-          make install-with-odbc
+          make install-odbc

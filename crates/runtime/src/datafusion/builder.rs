@@ -414,6 +414,7 @@ impl DataFusionBuilder {
             cluster_config: self.cluster_config.unwrap_or_default(),
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
+            executor_stream_registry: RwLock::new(None),
         }
     }
 }

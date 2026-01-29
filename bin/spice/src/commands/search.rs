@@ -20,10 +20,11 @@ use crate::context::RuntimeContext;
 use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
 use crate::output::TableOutput;
 use clap::Args;
+use repl::util::{Spinner, create_editor_with_history, save_history};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 /// Arguments for the `search` command.
 #[derive(Args, Debug)]
@@ -81,6 +82,12 @@ struct SearchResponse {
     duration_ms: u64,
 }
 
+/// Full search result with metadata.
+struct SearchResult {
+    response: SearchResponse,
+    from_cache: bool,
+}
+
 /// A string or array of strings (for flexible JSON parsing).
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -112,27 +119,36 @@ pub async fn execute(ctx: &RuntimeContext, args: &SearchArgs) -> Result<()> {
 
 /// Run the REPL loop.
 async fn run_repl(ctx: &RuntimeContext, args: &SearchArgs) -> Result<()> {
-    let stdin = io::stdin();
+    let (mut rl, history_path) = create_editor_with_history("search_history.txt").map_err(|e| {
+        InvalidResponseSnafu {
+            message: e.to_string(),
+        }
+        .build()
+    })?;
 
     loop {
-        print!("search> ");
-        let _ = io::stdout().flush();
-
-        let mut input = String::new();
-        match stdin.lock().read_line(&mut input) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+        let readline = rl.readline("search> ");
+        let user_input = match readline {
+            Ok(line) => line,
+            Err(
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
+            ) => {
+                break;
+            }
             Err(e) => {
                 eprintln!("Error reading input: {e}");
                 continue;
             }
-        }
+        };
 
-        let query = input.trim();
+        let query = user_input.trim();
         if query.is_empty() {
             println!("Enter a search query.");
             continue;
         }
+
+        // Add to history
+        let _ = rl.add_history_entry(query);
 
         // Handle exit commands
         if query == "exit" || query == "quit" || query == ".exit" || query == ".quit" {
@@ -146,15 +162,16 @@ async fn run_repl(ctx: &RuntimeContext, args: &SearchArgs) -> Result<()> {
             continue;
         }
 
-        // Execute the search
-        match send_search_request(ctx, query, args).await {
-            Ok(response) => {
-                display_results(&response);
+        // Execute the search with spinner
+        match send_search_request_with_spinner(ctx, query, args).await {
+            Ok(result) => {
+                display_results(&result.response);
                 #[expect(clippy::cast_precision_loss)]
-                let duration_secs = response.duration_ms as f64 / 1000.0;
+                let duration_secs = result.response.duration_ms as f64 / 1000.0;
+                let cached_str = if result.from_cache { " (cached)" } else { "" };
                 println!(
-                    "\nTime: {duration_secs:.3} seconds. {} results.",
-                    response.results.len()
+                    "\nTime: {duration_secs:.3} seconds. {} results{cached_str}.",
+                    result.response.results.len()
                 );
                 println!();
             }
@@ -164,7 +181,25 @@ async fn run_repl(ctx: &RuntimeContext, args: &SearchArgs) -> Result<()> {
         }
     }
 
+    // Save history
+    save_history(&mut rl, history_path.as_ref());
+
     Ok(())
+}
+
+/// Send a request to the search endpoint with spinner.
+async fn send_search_request_with_spinner(
+    ctx: &RuntimeContext,
+    query: &str,
+    args: &SearchArgs,
+) -> Result<SearchResult> {
+    let spinner = Spinner::start();
+
+    let result = send_search_request(ctx, query, args).await;
+
+    spinner.stop().await;
+
+    result
 }
 
 /// Send a request to the search endpoint.
@@ -172,7 +207,7 @@ async fn send_search_request(
     ctx: &RuntimeContext,
     query: &str,
     args: &SearchArgs,
-) -> Result<SearchResponse> {
+) -> Result<SearchResult> {
     // Use endpoint override if provided, otherwise use context's endpoint
     let base_url = args
         .endpoint
@@ -213,6 +248,14 @@ async fn send_search_request(
         .context(ConnectionFailedSnafu { endpoint: &url })?;
 
     let status = response.status();
+    // Check cache status header
+    let cache_status = response
+        .headers()
+        .get("Search-Results-Cache-Status")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let from_cache = matches!(cache_status.as_deref(), Some("HIT" | "STALE"));
+
     let text = response.text().await.unwrap_or_default();
 
     if !status.is_success() {
@@ -222,11 +265,16 @@ async fn send_search_request(
         .build());
     }
 
-    serde_json::from_str(&text).map_err(|e| {
+    let response: SearchResponse = serde_json::from_str(&text).map_err(|e| {
         InvalidResponseSnafu {
             message: format!("Failed to parse response: {e}"),
         }
         .build()
+    })?;
+
+    Ok(SearchResult {
+        response,
+        from_cache,
     })
 }
 

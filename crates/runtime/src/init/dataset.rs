@@ -35,7 +35,9 @@ use crate::{
             builder::DatasetBuilder,
         },
     },
-    dataaccelerator::{AccelerationSource, validate_snapshot_paths},
+    dataaccelerator::{
+        AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
+    },
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
@@ -81,6 +83,16 @@ impl Runtime {
         self.initialize_views_accelerators(&valid_views).await;
 
         let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
+
+        // Validate Cayenne snapshot consistency before initializing accelerators.
+        // All Cayenne datasets sharing the same metadata directory must have the same
+        // snapshot configuration (either all enabled or all disabled).
+        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
+            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
+        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+            tracing::error!("{err}");
+            return;
+        }
 
         let init_results = self.initialize_datasets_accelerators(&valid_datasets).await;
         // Create a map of dataset names to their futures
@@ -802,6 +814,15 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
+
+        // Validate Cayenne snapshot consistency before initializing accelerators.
+        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
+            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
+        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+            tracing::error!("{err}");
+            return;
+        }
+
         let init_results = self.initialize_datasets_accelerators(&valid_datasets).await;
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 

@@ -20,7 +20,6 @@ use futures::Stream;
 use nsql::SqlGeneration;
 #[cfg(feature = "local_llm")]
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
 #[cfg(feature = "local_llm")]
 use snafu::ResultExt;
 use snafu::Snafu;
@@ -69,14 +68,6 @@ static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".gguf",
     ".ggml",
 ];
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum LlmRuntime {
-    Candle,
-    Mistral,
-    Openai,
-}
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -54,6 +54,12 @@ fn get_catalog(fixture: &TestFixture) -> Arc<dyn MetadataCatalog> {
     Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>
 }
 
+async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> TestResult<u64> {
+    common::insert_batch(table.as_ref(), batch)
+        .await
+        .map_err(Into::into)
+}
+
 // =============================================================================
 // Test Strategy Detection by Schema Configuration
 // =============================================================================
@@ -86,14 +92,7 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
             Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
         ],
     )?;
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-    table.insert(boxed_stream).await?;
+    insert_batch(&table, batch).await?;
 
     // Delete and verify it works correctly (Int64Pk strategy)
     let ctx = SessionContext::new();
@@ -169,14 +168,7 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
             Arc::new(Int64Array::from(vec![100, 200, 300, 400])),
         ],
     )?;
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-    table.insert(boxed_stream).await?;
+    insert_batch(&table, batch).await?;
 
     // Delete and verify
     let ctx = SessionContext::new();
@@ -253,14 +245,7 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
             Arc::new(Int64Array::from(vec![100, 200, 300, 400])),
         ],
     )?;
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-    table.insert(boxed_stream).await?;
+    insert_batch(&table, batch).await?;
 
     // Delete with composite key
     let ctx = SessionContext::new();
@@ -333,14 +318,7 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
             Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
         ],
     )?;
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-    table.insert(boxed_stream).await?;
+    insert_batch(&table, batch).await?;
 
     // Delete by value (not PK)
     let ctx = SessionContext::new();
@@ -408,14 +386,7 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
             Arc::new(StringArray::from(vec!["a", "b", "c"])),
         ],
     )?;
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-    table.insert(boxed_stream).await?;
+    insert_batch(&table, batch).await?;
 
     // Delete and verify
     let ctx = SessionContext::new();
@@ -491,14 +462,7 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
             Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
         ],
     )?;
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-    table.insert(boxed_stream).await?;
+    insert_batch(&table, batch).await?;
 
     // Delete a row
     let ctx = SessionContext::new();
@@ -571,14 +535,7 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
             Arc::new(Int64Array::from(vec![1, 2, 3])),
         ],
     )?;
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-    table.insert(boxed_stream).await?;
+    insert_batch(&table, batch).await?;
 
     // Delete
     let ctx = SessionContext::new();
@@ -655,14 +612,7 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
             Arc::new(StringArray::from(vec!["a", "b"])),
         ],
     )?;
-    let stream1 = futures::stream::once(async { Ok(batch1) });
-    let boxed_stream1 = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema1),
-            stream1,
-        ),
-    );
-    table1.insert(boxed_stream1).await?;
+    insert_batch(&table1, batch1).await?;
 
     // Table 2: String PK strategy
     let schema2 = Arc::new(Schema::new(vec![
@@ -691,14 +641,7 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
             Arc::new(Int64Array::from(vec![10, 20])),
         ],
     )?;
-    let stream2 = futures::stream::once(async { Ok(batch2) });
-    let boxed_stream2 = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema2),
-            stream2,
-        ),
-    );
-    table2.insert(boxed_stream2).await?;
+    insert_batch(&table2, batch2).await?;
 
     // Table 3: PositionBased strategy
     let schema3 = Arc::new(Schema::new(vec![
@@ -727,14 +670,7 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
             Arc::new(Int64Array::from(vec![100, 200])),
         ],
     )?;
-    let stream3 = futures::stream::once(async { Ok(batch3) });
-    let boxed_stream3 = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema3),
-            stream3,
-        ),
-    );
-    table3.insert(boxed_stream3).await?;
+    insert_batch(&table3, batch3).await?;
 
     // Delete from each table
     let plan1 = table1

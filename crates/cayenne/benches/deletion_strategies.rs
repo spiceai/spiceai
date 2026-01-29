@@ -162,11 +162,25 @@ fn generate_no_pk_batch(schema: Arc<Schema>, size: usize) -> RecordBatch {
 }
 
 async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
+    let ctx = SessionContext::new();
     let schema = batch.schema();
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
-    table.insert(boxed_stream).await.expect("insert");
+    let input_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![batch]],
+        schema,
+        None,
+    )
+    .expect("memory exec");
+    let insert_plan = table
+        .insert_into(
+            &ctx.state(),
+            input_exec,
+            datafusion_expr::dml::InsertOp::Append,
+        )
+        .await
+        .expect("insert_into");
+    datafusion_physical_plan::collect(insert_plan, ctx.task_ctx())
+        .await
+        .expect("collect");
 }
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> u64 {

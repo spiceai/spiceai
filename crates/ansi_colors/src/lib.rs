@@ -82,20 +82,6 @@ impl<S: AsRef<str>> Display for Painted<S> {
     }
 }
 
-/// Enable ANSI support (no-op).
-///
-/// On modern Windows 10+ systems, ANSI escape codes are typically enabled by default.
-/// This function exists for compatibility with code that previously relied on
-/// enabling virtual terminal processing, but is now a no-op on all platforms.
-///
-/// # Errors
-///
-/// This function never returns an error.
-#[inline]
-pub const fn enable_ansi_support() -> std::io::Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,15 +191,6 @@ mod tests {
 
         let output = format!("{:?}", Color::Fixed(42));
         assert_eq!(output, "Fixed(42)");
-    }
-
-    #[test]
-    fn test_enable_ansi_support_succeeds() {
-        // On Unix, this should always succeed (no-op)
-        // On Windows, it may fail if not running in a proper console
-        let result = enable_ansi_support();
-        #[cfg(not(windows))]
-        result.expect("enable_ansi_support should succeed on non-Windows platforms");
     }
 
     #[test]

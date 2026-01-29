@@ -101,6 +101,7 @@ pub mod internal_table;
 pub mod jobs;
 mod management;
 mod metrics;
+pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
 mod opentelemetry;
@@ -149,6 +150,9 @@ pub enum Error {
 
     #[snafu(display("Unable to start internal cluster server: {source}"))]
     UnableToStartClusterServer { source: flight::Error },
+
+    #[snafu(display("Failed to start cluster scheduler: executor registry missing"))]
+    MissingSchedulerExecutorRegistry,
 
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
@@ -470,6 +474,9 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    /// On-demand metrics reader for cluster observability.
+    /// Used by `GetMetrics` RPC and executor control stream to collect local OTLP metrics.
+    metrics_reader: Option<metrics_reader::MetricsReader>,
     rate_limits: Arc<RateLimits>,
     io_runtime: Handle,
 
@@ -579,6 +586,16 @@ impl Runtime {
     #[must_use]
     pub fn scheduler_peers(&self) -> Arc<RwLock<SchedulerPeers>> {
         Arc::clone(&self.scheduler_peers)
+    }
+
+    /// Returns the metrics reader for on-demand OTLP metrics collection.
+    ///
+    /// This is used in cluster mode by:
+    /// - `GetMetrics` RPC to return local metrics to peer schedulers
+    /// - Executors responding to metrics requests from schedulers via control stream
+    #[must_use]
+    pub fn metrics_reader(&self) -> Option<&metrics_reader::MetricsReader> {
+        self.metrics_reader.as_ref()
     }
 
     /// Returns the job executor for async SQL queries if available (cluster mode only).
@@ -697,6 +714,17 @@ impl Runtime {
             reason = "type alias scoped to cluster setup"
         )]
         type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+
+        // Create executor registry for scheduler mode (will be None for non-scheduler)
+        let scheduler_executor_registry: Option<Arc<cluster::ExecutorRegistry>> = if matches!(
+            self.df.cluster_config.effective_role(),
+            Some(ClusterRole::Scheduler)
+        ) {
+            Some(Arc::new(cluster::ExecutorRegistry::new()))
+        } else {
+            None
+        };
+
         let maybe_cluster_future: Option<BoxedClusterFuture> =
             match self.df.cluster_config.effective_role() {
                 Some(ClusterRole::Scheduler) => {
@@ -705,10 +733,16 @@ impl Runtime {
                     let internal_server_shutdown = CancellationToken::new();
                     let self_ref = Arc::clone(&self);
                     let cloned_shutdown = internal_server_shutdown.clone();
+                    let executor_registry = Arc::clone(
+                        scheduler_executor_registry
+                            .as_ref()
+                            .context(MissingSchedulerExecutorRegistrySnafu)?,
+                    );
                     let internal_server_fut = async move {
                         cluster::start_internal_cluster_server(
                             Arc::clone(&self_ref),
                             Some(cloned_shutdown),
+                            executor_registry,
                         )
                         .await
                         .context(UnableToStartClusterServerSnafu)
@@ -897,11 +931,56 @@ impl Runtime {
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
 
+        // Create ClusterMetricsCollector for scheduler mode
+        let cluster_collector: Option<Arc<metrics_server::cluster::ClusterMetricsCollector>> =
+            if let Some(ref executor_registry) = scheduler_executor_registry {
+                // Get the node's advertise address for node identification
+                let node_id = self
+                    .df
+                    .cluster_config
+                    .scheduler_url_string()
+                    .map(str::to_string)
+                    .or_else(|| {
+                        self.df
+                            .cluster_config
+                            .node_advertise_address()
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| self.df.cluster_config.node_bind_address().to_string());
+
+                // Create local metrics collector closure that uses MetricsReader
+                let metrics_reader_for_collector = self.metrics_reader.clone();
+                let local_metrics_collector: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
+                    Arc::new(move || {
+                        metrics_reader_for_collector
+                            .as_ref()
+                            .map(metrics_reader::MetricsReader::collect_otlp)
+                            .unwrap_or_default()
+                    });
+
+                Some(Arc::new(
+                    metrics_server::cluster::ClusterMetricsCollector::new(
+                        self.scheduler_peers(),
+                        Arc::clone(executor_registry),
+                        self.df.cluster_config.client_tls_config().cloned(),
+                        node_id,
+                        local_metrics_collector,
+                    ),
+                ))
+            } else {
+                None
+            };
+
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
-                metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
-                    .await
-                    .context(UnableToStartMetricsServerSnafu)
+                metrics_server::start(
+                    metrics_endpoint,
+                    prometheus_registry,
+                    cloned_tls_config,
+                    cluster_collector,
+                )
+                .await
+                .context(UnableToStartMetricsServerSnafu)
             })
             .await;
 

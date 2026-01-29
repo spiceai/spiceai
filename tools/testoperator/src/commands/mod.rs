@@ -71,7 +71,7 @@ pub(crate) fn create_telemetry_with_resource(common: &CommonArgs, resource: Reso
 /// 4. Adds reference schema for validation against known good tables
 ///
 /// # Returns
-/// Tuple of (`QuerySet`, Vec<Query>, `NotStarted` builder)
+/// Tuple of (`QuerySet`, `NotStarted` builder)
 pub(crate) async fn build_test_with_validation(
     args: &DatasetTestArgs,
     test_builder: NotStarted,
