@@ -17,7 +17,8 @@ limitations under the License.
 //! Internal cluster gRPC service implementation.
 //!
 //! This service handles scheduler-executor communication for cluster mode,
-//! including app definition retrieval and secret expansion.
+//! including app definition retrieval, secret expansion, and control stream
+//! management for sending `PollNow` commands to executors.
 
 use std::ops::ControlFlow;
 use std::pin::Pin;
@@ -30,18 +31,22 @@ use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use futures::{Stream, StreamExt, TryStreamExt};
+use parking_lot::RwLock;
 use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::executor_control_message::Message as ExecutorMessage;
+use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
     ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
     GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
-    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, SchedulerControlMessage,
-    SchedulerInstance,
+    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand,
+    SchedulerControlMessage, SchedulerInstance,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
+use std::collections::HashMap;
 use std::task::{Context, Poll};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
@@ -52,26 +57,101 @@ use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 
+/// Handle for sending messages to a connected executor.
+struct ExecutorStreamHandle {
+    tx: mpsc::Sender<SchedulerControlMessage>,
+}
+
+/// Shared registry of connected executor control streams.
+///
+/// This is extracted from `ClusterServiceImpl` to allow sharing with the
+/// scheduler callback for broadcasting `PollNow` notifications.
+#[derive(Clone, Default)]
+pub struct ExecutorControlStreamRegistry {
+    streams: Arc<RwLock<HashMap<String, ExecutorStreamHandle>>>,
+}
+
+impl ExecutorControlStreamRegistry {
+    /// Creates a new empty executor stream registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            streams: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Broadcasts a `PollNow` command to all connected executors.
+    ///
+    /// This notifies executors that new work may be available, causing them
+    /// to immediately poll for tasks rather than waiting for the next poll interval.
+    pub fn broadcast_poll_now(&self, reason: &str) {
+        let streams = self.streams.read();
+        if streams.is_empty() {
+            return;
+        }
+
+        let message = SchedulerControlMessage {
+            message: Some(SchedulerMessage::PollNow(PollNowCommand {
+                reason: reason.to_string(),
+            })),
+        };
+
+        let count = streams.len();
+        for (executor_id, handle) in streams.iter() {
+            // Use try_send to avoid blocking. If the channel is full, the executor
+            // will poll on its next interval anyway.
+            if let Err(e) = handle.tx.try_send(message.clone()) {
+                tracing::debug!("Failed to send PollNow to executor {executor_id}: {e}");
+            }
+        }
+
+        tracing::debug!("Broadcast PollNow to {count} executors: {reason}");
+    }
+
+    /// Registers an executor stream for receiving control messages.
+    pub(crate) fn register(&self, executor_id: &str, tx: mpsc::Sender<SchedulerControlMessage>) {
+        let mut streams = self.streams.write();
+        streams.insert(executor_id.to_string(), ExecutorStreamHandle { tx });
+        tracing::debug!(
+            "Registered executor stream: {executor_id} (total: {})",
+            streams.len()
+        );
+    }
+
+    /// Unregisters an executor stream.
+    pub(crate) fn unregister(&self, executor_id: &str) {
+        let mut streams = self.streams.write();
+        if streams.remove(executor_id).is_some() {
+            tracing::debug!(
+                "Unregistered executor stream: {executor_id} (remaining: {})",
+                streams.len()
+            );
+        }
+    }
+}
+
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
-    app: Arc<RwLock<Option<Arc<App>>>>,
-    secrets: Arc<RwLock<Secrets>>,
+    app: Arc<TokioRwLock<Option<Arc<App>>>>,
+    secrets: Arc<TokioRwLock<Secrets>>,
     advertise_address: String,
-    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+    scheduler_peers: Arc<TokioRwLock<SchedulerPeers>>,
     datafusion: Arc<DataFusion>,
     executor_registry: Arc<ExecutorRegistry>,
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
+    /// Registry of connected executor streams for [`PollNow`] broadcasts.
+    executor_streams: ExecutorControlStreamRegistry,
 }
 
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
     pub fn new(
-        app: Arc<RwLock<Option<Arc<App>>>>,
-        secrets: Arc<RwLock<Secrets>>,
+        app: Arc<TokioRwLock<Option<Arc<App>>>>,
+        secrets: Arc<TokioRwLock<Secrets>>,
         advertise_address: String,
-        scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+        scheduler_peers: Arc<TokioRwLock<SchedulerPeers>>,
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
@@ -84,7 +164,52 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            executor_streams: ExecutorControlStreamRegistry::new(),
         }
+    }
+
+    /// Creates a new cluster service with a pre-existing executor stream registry.
+    ///
+    /// This allows sharing the registry with the scheduler callback for
+    /// broadcasting `PollNow` notifications.
+    #[must_use]
+    #[expect(clippy::too_many_arguments)]
+    pub fn with_executor_streams(
+        app: Arc<TokioRwLock<Option<Arc<App>>>>,
+        secrets: Arc<TokioRwLock<Secrets>>,
+        advertise_address: String,
+        scheduler_peers: Arc<TokioRwLock<SchedulerPeers>>,
+        datafusion: Arc<DataFusion>,
+        executor_registry: Arc<ExecutorRegistry>,
+        metrics_reader: Option<MetricsReader>,
+        executor_streams: ExecutorControlStreamRegistry,
+    ) -> Self {
+        Self {
+            app,
+            secrets,
+            advertise_address,
+            scheduler_peers,
+            datafusion,
+            executor_registry,
+            metrics_reader,
+            executor_streams,
+        }
+    }
+
+    /// Returns a clone of the executor stream registry.
+    ///
+    /// This can be used to share the registry with the scheduler callback.
+    #[must_use]
+    pub fn executor_streams(&self) -> ExecutorControlStreamRegistry {
+        self.executor_streams.clone()
+    }
+
+    /// Broadcasts a `PollNow` command to all connected executors.
+    ///
+    /// This notifies executors that new work may be available, causing them
+    /// to immediately poll for tasks rather than waiting for the next poll interval.
+    pub fn broadcast_poll_now(&self, reason: &str) {
+        self.executor_streams.broadcast_poll_now(reason);
     }
 
     /// Returns the executor registry for use by other components.
@@ -292,8 +417,14 @@ impl ClusterService for ClusterServiceImpl {
         let cancel = CancellationToken::new();
         let inbound_cancel = cancel.clone();
 
-        // Create a channel for outbound messages to the executor
+        // Create a channel for outbound messages to the executor.
         let (outbound_tx, outbound_rx) = mpsc::channel::<SchedulerControlMessage>(32);
+
+        // Clone the executor_streams registry for use in the spawned task.
+        let executor_streams = self.executor_streams.clone();
+
+        // Clone outbound_tx for registration after we identify the executor.
+        let registration_tx = outbound_tx.clone();
 
         // We need to identify the executor from its first message.
         // Spawn a task to handle the bidirectional stream.
@@ -329,6 +460,9 @@ impl ClusterService for ClusterServiceImpl {
             let pending_requests = executor_registry
                 .register(executor_id.clone(), outbound_tx_for_registry)
                 .await;
+
+            // Register the executor stream for PollNow broadcasts.
+            executor_streams.register(&executor_id, registration_tx);
 
             loop {
                 tokio::select! {
@@ -375,6 +509,10 @@ impl ClusterService for ClusterServiceImpl {
 
             // Unregister the executor when the stream ends.
             executor_registry.unregister(&executor_id).await;
+
+            // Unregister the executor stream.
+            executor_streams.unregister(&executor_id);
+
             tracing::debug!("Executor control stream ended: {executor_id}");
         });
 

@@ -304,6 +304,11 @@ jobs:
           chmod +x spice
           tar czf spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spice
 
+      ## Windows CLI - build and package (runtime not supported on Windows, CLI only)
+      - name: Build spice CLI (Windows)
+        if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
+        run: cargo build --profile ${{ env.RUST_PROFILE }} -p spice --target-dir target
+
       - name: tar CLI binary (Windows)
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: |

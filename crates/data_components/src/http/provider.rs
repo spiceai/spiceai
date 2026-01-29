@@ -1465,18 +1465,13 @@ impl HttpTableProvider {
         }
 
         let query = raw.strip_prefix('?').unwrap_or(raw);
-        Ok(Self::sort_query_params(query))
-    }
 
-    /// Sort query parameters alphabetically by key for consistent primary key handling
-    fn sort_query_params(query: &str) -> String {
-        if query.is_empty() {
-            return String::new();
-        }
-
-        let mut params: Vec<&str> = query.split('&').collect();
-        params.sort_unstable();
-        params.join("&")
+        // We preserve the original query parameter order without sorting.
+        // DataFusion's FilterExec uses the original filter value for matching:
+        //   FilterExec: request_query@1 = q=test&page=1
+        // If we sorted params to `page=1&q=test`, the stored data wouldn't match
+        // the filter and queries would return no results.
+        Ok(query.to_string())
     }
 
     fn ensure_allowed_body(&self, raw: &str) -> Result<String> {
@@ -2097,39 +2092,50 @@ mod tests {
         assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
     }
 
-    #[test]
-    fn test_sort_query_params() {
-        // Test empty query
-        assert_eq!(HttpTableProvider::sort_query_params(""), "");
+    #[tokio::test]
+    async fn test_query_params_any_order_works() {
+        use datafusion::prelude::SessionContext;
 
-        // Test single parameter
-        assert_eq!(
-            HttpTableProvider::sort_query_params("key=value"),
-            "key=value"
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/search/people".to_string()])
+            .expect("allowed paths")
+            .enable_query_filters(128);
+
+        let ctx = SessionContext::new();
+        ctx.register_table("tvmaze", Arc::new(provider))
+            .expect("register table");
+
+        // Query with unordered params (q first, page second)
+        let df1 = ctx
+            .sql("SELECT content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=lauren&page=1'")
+            .await
+            .expect("unordered query should succeed");
+
+        let results1 = df1.collect().await.expect("collect should succeed");
+        assert!(
+            !results1.is_empty(),
+            "Should have results for unordered params"
+        );
+        assert!(
+            results1[0].num_rows() > 0,
+            "Should have rows for unordered params"
         );
 
-        // Test already sorted parameters
-        assert_eq!(
-            HttpTableProvider::sort_query_params("a=1&b=2&c=3"),
-            "a=1&b=2&c=3"
-        );
+        // Query with alphabetically ordered params (page first, q second)
+        let df2 = ctx
+            .sql("SELECT content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'page=1&q=michael'")
+            .await
+            .expect("alphabetical query should succeed");
 
-        // Test unsorted parameters - should be sorted alphabetically
-        assert_eq!(
-            HttpTableProvider::sort_query_params("c=3&a=1&b=2"),
-            "a=1&b=2&c=3"
+        let results2 = df2.collect().await.expect("collect should succeed");
+        assert!(
+            !results2.is_empty(),
+            "Should have results for alphabetical params"
         );
-
-        // Test with URL encoding
-        assert_eq!(
-            HttpTableProvider::sort_query_params("z=last&a=first&m=middle"),
-            "a=first&m=middle&z=last"
-        );
-
-        // Test complex query string
-        assert_eq!(
-            HttpTableProvider::sort_query_params("userId=1&title=foo&body=bar"),
-            "body=bar&title=foo&userId=1"
+        assert!(
+            results2[0].num_rows() > 0,
+            "Should have rows for alphabetical params"
         );
     }
 

@@ -40,30 +40,27 @@ type SpicedMemoryUsageMonitor = (
 
 pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
     let (app, spiced_instance) = run_or_connect_spiced(&args.common).await?;
-
-    // Build resource with attributes known upfront, before creating telemetry.
-    let spiced_version = spiced_instance.version().to_string();
-    let spiced_commit_sha =
-        std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string());
-    let testoperator_commit_sha = git::get_commit_sha();
-    let branch_name = git::get_branch_name();
     let run_name = args.get_configuration_name(&app.name);
 
-    let text_to_sql_resource = Resource::builder_empty()
-        .with_attributes(vec![
-            KeyValue::new("service.name", "testoperator"),
-            KeyValue::new("type", "text_to_sql"),
-            KeyValue::new("name", run_name.clone()),
-            KeyValue::new("spiced_version", spiced_version),
-            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-            KeyValue::new("model_name", args.model.clone()),
-            KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
-            KeyValue::new("branch_name", branch_name),
-        ])
-        .build();
-
-    let telemetry =
-        Telemetry::new_with_resource(&text_to_sql_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+    // Build resource with attributes known upfront, before creating telemetry.
+    let telemetry = Telemetry::new_with_resource(
+        &Resource::builder_empty()
+            .with_attributes(vec![
+                KeyValue::new("service.name", "testoperator"),
+                KeyValue::new("type", "text_to_sql"),
+                KeyValue::new("name", run_name.clone()),
+                KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+                KeyValue::new(
+                    "spiced_commit_sha",
+                    std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
+                ),
+                KeyValue::new("model_name", args.model.clone()),
+                KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+                KeyValue::new("branch_name", git::get_branch_name()),
+            ])
+            .build(),
+        "SPICEAI_BENCHMARK_METRICS_KEY",
+    );
 
     // If we are running `spiced`, monitor its memory usage.
     let memory_handle_opt: Option<SpicedMemoryUsageMonitor> =

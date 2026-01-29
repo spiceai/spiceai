@@ -39,7 +39,8 @@ use ballista_core::utils::create_grpc_client_endpoint;
 use ballista_core::{ConfigProducer, RuntimeProducer};
 use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
-use ballista_scheduler::cluster::BallistaCluster;
+use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
+use ballista_scheduler::cluster::{BallistaCluster, ClusterState};
 use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
@@ -57,10 +58,11 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
@@ -110,6 +112,7 @@ fn spawn_scheduler_poll_loop(
     executor: Arc<Executor>,
     codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
     readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    poll_now_notify: Option<Arc<Notify>>,
 ) -> SchedulerPollHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -225,6 +228,7 @@ fn spawn_scheduler_poll_loop(
                 Arc::clone(&executor),
                 codec.clone(),
                 Some(tx_ready),
+                poll_now_notify.clone(),
             );
 
             tokio::select! {
@@ -285,6 +289,7 @@ async fn fetch_scheduler_membership(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 fn update_scheduler_pollers(
     pollers: &mut HashMap<String, SchedulerPollHandle>,
     known_schedulers: &mut HashSet<String>,
@@ -293,6 +298,7 @@ fn update_scheduler_pollers(
     executor: &Arc<Executor>,
     codec: &BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
     readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    poll_now_notify: Option<&Arc<Notify>>,
 ) {
     let next_schedulers: HashSet<String> = addresses.into_iter().collect();
 
@@ -320,6 +326,7 @@ fn update_scheduler_pollers(
             Arc::clone(executor),
             codec.clone(),
             Arc::clone(readiness_sender),
+            poll_now_notify.cloned(),
         );
         pollers.insert(address, handle);
     }
@@ -349,7 +356,7 @@ pub use executor_registry::ExecutorRegistry;
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-pub use service::ClusterServiceImpl;
+pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
 /// mTLS configuration for cluster communications.
 ///
@@ -672,10 +679,16 @@ impl ResolvedClusterConfig {
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
-    let scheduler = create_scheduler_server(rt).await?;
+    let (scheduler, executor_stream_registry) = create_scheduler_server(rt).await?;
 
     rt.df
         .bind_scheduler_server(Arc::new(scheduler))
+        .map_err(|e| FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+
+    rt.df
+        .bind_executor_stream_registry(executor_stream_registry)
         .map_err(|e| FailedToStartClusterScheduler {
             source: Box::new(e),
         })?;
@@ -993,6 +1006,10 @@ pub async fn initialize_cluster_executor(
             control_stream_metrics_reader,
         );
 
+        // Get the shared poll_now notify handle from the control stream manager.
+        // When any scheduler sends a PollNow command, this will wake the poll loops.
+        let poll_now_notify = control_stream_manager.poll_now_notify();
+
         let mut current_addresses = initial_scheduler_addresses_for_manager;
         if current_addresses.is_empty() {
             current_addresses.push(scheduler_url_for_manager.to_string());
@@ -1013,6 +1030,7 @@ pub async fn initialize_cluster_executor(
             &executor_for_manager,
             &codec_for_manager,
             &readiness_sender,
+            Some(&poll_now_notify),
         );
 
         let mut refresh = tokio::time::interval(SCHEDULER_REFRESH_INTERVAL);
@@ -1041,6 +1059,7 @@ pub async fn initialize_cluster_executor(
                     &executor_for_manager,
                     &codec_for_manager,
                     &readiness_sender,
+                    Some(&poll_now_notify),
                 );
             }
         }
@@ -1068,7 +1087,10 @@ pub async fn initialize_cluster_executor(
 
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
-) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
+) -> crate::Result<(
+    SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
+    ExecutorControlStreamRegistry,
+)> {
     let bind_addr = rt.df.cluster_config.node_bind_address();
 
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
@@ -1144,26 +1166,66 @@ async fn create_scheduler_server(
         .scheduler_url_string()
         .map_or_else(|| bind_addr.to_string(), ToString::to_string);
     let scheduler_metrics_collector = Arc::new(
-        metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id),
+        metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id.clone()),
     );
 
-    let scheduler_config = SchedulerConfig {
-        bind_host: bind_addr.ip().to_string(),
-        bind_port: bind_addr.port(),
+    // Create the executor stream registry for PollNow broadcasts.
+    // This registry will be shared with the ClusterServiceImpl.
+    let executor_stream_registry = ExecutorControlStreamRegistry::new();
 
-        override_logical_codec: Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt))),
-        override_physical_codec: Some(
-            SpicePhysicalCodec::new(Arc::clone(rt))
-                .boxed()
-                .context(FailedToStartClusterSchedulerSnafu)?,
-        ),
+    // Create callback that broadcasts PollNow to all connected executors when work is available.
+    let registry_for_callback = executor_stream_registry.clone();
+    let on_work_available: Arc<dyn Fn(&str) + Send + Sync> =
+        Arc::new(move |reason: &str| registry_for_callback.broadcast_poll_now(reason));
 
-        grpc_server_max_decoding_message_size: u32::MAX,
-        grpc_server_max_encoding_message_size: u32::MAX,
+    // Create InMemoryClusterState first so we can reference it in the config_producer
+    let cluster_state: Arc<dyn ClusterState> = Arc::new(InMemoryClusterState::default());
 
-        override_session_builder: Some(Arc::new(move |_cfg| {
+    // Create an atomic counter for total executor slots, updated by a background task
+    // This allows session_builder to read the value synchronously without blocking
+    let total_executor_slots = Arc::new(AtomicUsize::new(0));
+
+    // Spawn background task to periodically update total executor slots from cluster state
+    let cluster_state_for_slots = Arc::clone(&cluster_state);
+    let slots_counter = Arc::clone(&total_executor_slots);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let metadata = cluster_state_for_slots.registered_executor_metadata().await;
+            let total: usize = metadata
+                .iter()
+                .map(|m| m.specification.task_slots as usize)
+                .sum();
+            let prev = slots_counter.swap(total, Ordering::Relaxed);
+            if total != prev {
+                tracing::info!(
+                    executor_count = metadata.len(),
+                    total_slots = total,
+                    "Cluster executor slots updated"
+                );
+            }
+        }
+    });
+
+    // Create the session builder that will build SessionState from SessionConfig
+    // Uses the dynamic total_executor_slots to set target_partitions
+    let slots_for_session = Arc::clone(&total_executor_slots);
+    let session_builder: ballista_scheduler::scheduler_server::SessionBuilder =
+        Arc::new(move |_cfg| {
+            // Get dynamic target_partitions based on cluster capacity
+            let total_slots = slots_for_session.load(Ordering::Relaxed);
+            let target_partitions = if total_slots > 0 { total_slots } else { 16 };
+
+            tracing::debug!(
+                total_slots,
+                target_partitions,
+                "Cluster session_builder: setting target_partitions based on cluster capacity"
+            );
+
             let mut cfg = current_context
                 .copied_config()
+                .with_target_partitions(target_partitions)
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_ballista_shuffle_format(ballista_shuffle_format)
                 .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
@@ -1183,16 +1245,57 @@ async fn create_scheduler_server(
                     .with_physical_optimizer_rules(datafusion_and_cluster_physical_optimizers())
                     .build(),
             )
-        })),
+        });
+
+    // Create config_producer that dynamically sets target_partitions based on cluster capacity
+    // Reads from the atomic counter updated by the background task above
+    let slots_for_config = Arc::clone(&total_executor_slots);
+    let config_producer: ConfigProducer = Arc::new(move || {
+        let total_slots = slots_for_config.load(Ordering::Relaxed);
+
+        // Use total slots if executors have registered, otherwise fall back to default
+        let target_partitions = if total_slots > 0 { total_slots } else { 16 };
+
+        tracing::debug!(
+            total_slots,
+            target_partitions,
+            "Cluster config_producer: setting target_partitions based on cluster capacity"
+        );
+
+        SessionConfig::new_with_ballista()
+            .with_target_partitions(target_partitions)
+            .with_option_extension(SpiceClusterConfig::default())
+            .with_ballista_shuffle_format(ballista_shuffle_format)
+            .with_ballista_shuffle_memory_mode(shuffle_memory_mode)
+    });
+
+    // Manually create the BallistaCluster with our custom config_producer
+    let job_state = Arc::new(InMemoryJobState::new(
+        metrics_node_id,
+        session_builder,
+        config_producer,
+    ));
+    let cluster = BallistaCluster::new(cluster_state, job_state);
+
+    let scheduler_config = SchedulerConfig {
+        bind_host: bind_addr.ip().to_string(),
+        bind_port: bind_addr.port(),
+
+        override_logical_codec: Some(SpiceLogicalCodec::new_with_runtime(Arc::clone(rt))),
+        override_physical_codec: Some(
+            SpicePhysicalCodec::new(Arc::clone(rt))
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?,
+        ),
+
+        grpc_server_max_decoding_message_size: u32::MAX,
+        grpc_server_max_encoding_message_size: u32::MAX,
+
         override_create_grpc_client_endpoint,
         override_metrics_collector: Some(scheduler_metrics_collector),
+        on_work_available: Some(on_work_available),
         ..Default::default()
     };
-
-    let cluster = BallistaCluster::new_from_config(&scheduler_config)
-        .await
-        .boxed()
-        .context(FailedToStartClusterSchedulerSnafu)?;
 
     rt.status
         .update_cluster("scheduler", ComponentStatus::Ready);
@@ -1207,13 +1310,15 @@ async fn create_scheduler_server(
         shuffle_location_display
     );
 
-    scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
+    let scheduler = scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
         cluster,
         scheduler_config.into(),
     )
     .await
     .boxed()
-    .context(FailedToStartClusterSchedulerSnafu)
+    .context(FailedToStartClusterSchedulerSnafu)?;
+
+    Ok((scheduler, executor_stream_registry))
 }
 
 /// Creates a gRPC client for the scheduler's internal cluster service.

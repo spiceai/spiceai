@@ -28,6 +28,7 @@ runtime-request-context = { path = "../runtime-request-context" }
 search = { path = "../search", default-features = false }
 snafu.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,6 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+//! Spice.ai REPL utilities and Flight SQL REPL.
+//!
+//! This crate provides:
+//! - Shared REPL utilities (spinner, model selection, history management) via the `util` module
+//! - Flight SQL REPL implementation via the `run` function
 
 use std::borrow::Cow;
 use std::error::Error;
@@ -30,16 +36,15 @@ use arrow_flight::{
     FlightDescriptor, decode::FlightRecordBatchStream, error::FlightError,
     flight_service_client::FlightServiceClient,
 };
-use util::ansi_colors::Color;
 
 use crate::completer::SchemaCache;
+use ansi_colors::Color;
+use arrow::array::RecordBatch;
+use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
 use config::get_user_agent;
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::util::pretty::pretty_format_batches;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
 use futures::{StreamExt, TryStreamExt};
-use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
@@ -48,6 +53,7 @@ use rustyline::{
     CompletionType, ConditionalEventHandler, Config, Helper, Hinter, KeyEvent, Validator,
 };
 use rustyline::{Editor, EventHandler};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinHandle;
@@ -59,6 +65,7 @@ use tonic::{Code, IntoRequest, Status};
 pub mod cache_control;
 mod completer;
 mod config;
+pub mod util;
 
 #[derive(Parser, Debug)]
 #[clap(about = "Spice.ai SQL REPL")]
@@ -103,9 +110,21 @@ pub struct ReplConfig {
         help_heading = "SQL REPL"
     )]
     pub cache_control: cache_control::CacheControl,
+
+    /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
+    #[arg(long = "headers", value_name = "KEY:VALUE", help_heading = "SQL REPL")]
+    pub custom_headers: Vec<String>,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmRuntime {
+    Candle,
+    Mistral,
+    Openai,
+}
 
 async fn send_nsql_request(
     client: &Client,
@@ -235,6 +254,15 @@ impl Highlighter for EditorHelper {
 
 #[expect(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // Note: custom_headers are currently not applied to the gRPC Flight connection.
+    // Adding gRPC metadata headers requires interceptor changes.
+    // For now, this flag is accepted but not used.
+    if !repl_config.custom_headers.is_empty() {
+        tracing::warn!(
+            "Custom headers are not currently supported for the SQL REPL's Flight gRPC connection"
+        );
+    }
+
     let mut repl_flight_endpoint = repl_config.repl_flight_endpoint;
     let mut user_agent = get_user_agent();
     if let Some(user_agent_override) = repl_config.user_agent {
@@ -286,10 +314,6 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     let client = FlightServiceClient::new(channel)
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
         .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
-
-    #[cfg(target_os = "windows")]
-    // Ensure ANSI support on Windows is enabled for proper color display.
-    let _ = util::ansi_colors::enable_ansi_support();
 
     let config = Config::builder()
         .completion_type(CompletionType::List)
@@ -834,8 +858,8 @@ fn display_grpc_error(err: &Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int32Array, StringArray};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     fn create_test_batch(num_rows: usize, batch_id: i32) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -916,5 +940,105 @@ mod tests {
             .expect("Failed to display records");
 
         insta::assert_snapshot!(test_name, result);
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_basic() {
+        let input = r#"[{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]"#;
+        let result = json_array_to_jsonl(input).expect("should parse valid JSON array");
+
+        // Each line should be a valid JSON object
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        // Verify each line is valid JSON
+        for line in &lines {
+            let _: serde_json::Value =
+                serde_json::from_str(line).expect("each line should be valid JSON");
+        }
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_empty_array() {
+        let input = "[]";
+        let result = json_array_to_jsonl(input).expect("should parse empty array");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_single_item() {
+        let input = r#"[{"key": "value"}]"#;
+        let result = json_array_to_jsonl(input).expect("should parse single item array");
+        assert_eq!(result.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_invalid_json() {
+        let input = "not valid json";
+        let result = json_array_to_jsonl(input);
+        let err = result.expect_err("invalid JSON should fail");
+        assert!(err.to_string().contains("Invalid JSON array"));
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_not_an_array() {
+        let input = r#"{"key": "value"}"#;
+        let result = json_array_to_jsonl(input);
+        let _ = result.expect_err("non-array JSON should fail");
+    }
+
+    #[test]
+    fn test_lines_need_truncation_short_lines() {
+        let lines = vec!["short line", "another short line", "abc"];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_exactly_280() {
+        let line_280 = "a".repeat(280);
+        let lines = vec![line_280.as_str()];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_over_280() {
+        let line_281 = "a".repeat(281);
+        let lines = vec![line_281.as_str()];
+        assert!(lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_mixed() {
+        let long_line = "a".repeat(300);
+        let lines = vec!["short", long_line.as_str(), "also short"];
+        assert!(lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_empty() {
+        let lines: Vec<&str> = vec![];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_cache_control_default() {
+        let default = cache_control::CacheControl::default();
+        assert_eq!(default, cache_control::CacheControl::Cache);
+    }
+
+    #[test]
+    fn test_cache_control_equality() {
+        assert_eq!(
+            cache_control::CacheControl::Cache,
+            cache_control::CacheControl::Cache
+        );
+        assert_eq!(
+            cache_control::CacheControl::NoCache,
+            cache_control::CacheControl::NoCache
+        );
+        assert_ne!(
+            cache_control::CacheControl::Cache,
+            cache_control::CacheControl::NoCache
+        );
     }
 }
