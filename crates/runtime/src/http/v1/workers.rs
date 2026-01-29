@@ -51,11 +51,12 @@ fn worker_details(worker: &Arc<dyn Worker>) -> WorkerInfo {
 
 /// List Workers
 ///
-/// Returns a list of workers in the system.
+/// Returns a list of all registered workers in the runtime. Workers are configurable processing units that can perform tasks like load balancing between models or implementing fallback strategies.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/workers",
     operation_id = "get_workers",
+    tag = "Workers",
     params(WorkersQueryParams),
     responses(
         (status = 200, description = "List of workers in JSON format", content((
