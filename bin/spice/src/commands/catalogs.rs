@@ -20,7 +20,7 @@ use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
 use crate::output::{TableRow, write_table};
 use clap::Args;
-use serde::Deserialize;
+use runtime_api_types::v1::CatalogInfo;
 
 /// Arguments for the catalogs command.
 #[derive(Args, Debug)]
@@ -35,23 +35,13 @@ See more at: https://spiceai.org/docs/"#
 )]
 pub struct CatalogsArgs {}
 
-/// Catalog information from the runtime API.
-#[derive(Debug, Deserialize)]
-pub struct Catalog {
-    pub from: Option<String>,
-    pub name: Option<String>,
-}
-
-impl TableRow for Catalog {
+impl TableRow for CatalogInfo {
     fn headers() -> Vec<&'static str> {
         vec!["NAME", "FROM"]
     }
 
     fn values(&self) -> Vec<String> {
-        vec![
-            self.name.clone().unwrap_or_default(),
-            self.from.clone().unwrap_or_default(),
-        ]
+        vec![self.name.clone(), self.from.clone()]
     }
 }
 
@@ -71,7 +61,7 @@ pub async fn execute(ctx: &RuntimeContext, _args: &CatalogsArgs) -> Result<()> {
         .build());
     }
 
-    let catalogs: Vec<Catalog> = response.json().await.map_err(|e| {
+    let catalogs: Vec<CatalogInfo> = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
             message: format!("Failed to parse catalogs response: {e}"),
         }

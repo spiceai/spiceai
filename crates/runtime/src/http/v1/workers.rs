@@ -22,7 +22,8 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use csv::Writer;
-use serde::{Deserialize, Serialize};
+use runtime_api_types::v1::{WorkerInfo, WorkerListResponse};
+use serde::Deserialize;
 
 use super::Format;
 use crate::worker::{Worker, WorkerRegistry};
@@ -35,28 +36,16 @@ pub struct WorkersQueryParams {
     pub format: Format,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub(crate) struct WorkerResponse {
-    object: String,
-    data: Vec<WorkerResponseItem>,
-}
+// Re-export shared types for backwards compatibility
+pub use runtime_api_types::v1::WorkerInfo as WorkerResponseItem;
+pub use runtime_api_types::v1::WorkerListResponse as WorkerResponse;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub(crate) struct WorkerResponseItem {
-    name: String,
-    description: Option<String>,
-    is_llm: bool,
-}
-
-fn worker_details(worker: &Arc<dyn Worker>) -> WorkerResponseItem {
-    WorkerResponseItem {
+fn worker_details(worker: &Arc<dyn Worker>) -> WorkerInfo {
+    WorkerInfo {
         name: worker.name().to_string(),
         description: worker.description().map(|d| d.to_string()),
         is_llm: Arc::clone(worker).as_model().is_some(),
+        status: None,
     }
 }
 
@@ -70,7 +59,7 @@ fn worker_details(worker: &Arc<dyn Worker>) -> WorkerResponseItem {
     params(WorkersQueryParams),
     responses(
         (status = 200, description = "List of workers in JSON format", content((
-            WorkerResponse = "application/json",
+            WorkerListResponse = "application/json",
             example = json!({
                 "object": "list",
                 "data": [
@@ -116,7 +105,7 @@ pub(crate) async fn get(
     match params.format {
         Format::Json => (
             status::StatusCode::OK,
-            Json(WorkerResponse {
+            Json(WorkerListResponse {
                 object: "list".to_string(),
                 data: result.to_vec(),
             }),
@@ -133,7 +122,7 @@ pub(crate) async fn get(
 }
 
 fn convert_details_to_csv(
-    workers: &[WorkerResponseItem],
+    workers: &[WorkerInfo],
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut w = Writer::from_writer(vec![]);
     for worker in workers {
