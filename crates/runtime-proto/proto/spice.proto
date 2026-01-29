@@ -205,9 +205,9 @@ message RrfArgs {
     // Decay rate constant for exponential decay (default: 0.01).
     optional double decay_constant = 6;
     // Time scale in seconds for decay calculation (default: 86400).
-    optional int64 decay_scale_secs = 7;
+    optional double decay_scale_secs = 7;
     // Window size for linear decay function (default: 86400).
-    optional int64 decay_window_secs = 8;
+    optional double decay_window_secs = 8;
 }
 
 // A nested query within an RRF invocation.

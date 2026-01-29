@@ -45,6 +45,7 @@ use crate::cluster::datafusion::codec::udtf_args::{
 };
 use crate::embeddings::udtf::VECTOR_SEARCH_UDTF_NAME;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
+use crate::search::util::table_ref_from_column_expr;
 
 pub static RRF_UDF_NAME: &str = "rrf";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
@@ -211,6 +212,8 @@ struct ReciprocalRankFusionArgs {
     pub decay_window_secs: Option<f64>,
 }
 
+type SearchUdtfArgs = (String, String, Option<String>, Option<usize>, Option<bool>);
+
 impl ReciprocalRankFusionArgs {
     /// Constructs `ReciprocalRankFusionArgs` from an rrf UDTF invocation, which is a `TableScan` node
     /// that looks like this...
@@ -282,7 +285,6 @@ impl ReciprocalRankFusionArgs {
     ///
     /// This extracts the nested search UDTF invocations and converts them to `RrfNestedQuery`
     /// variants that can be serialized and sent to remote executors.
-    #[allow(clippy::cast_possible_truncation)]
     fn to_serializable(&self) -> Result<SerializableRrfArgs> {
         let queries = self
             .search_udtf_exprs
@@ -303,8 +305,8 @@ impl ReciprocalRankFusionArgs {
                 RecencyDecay::Exponential => "exponential".to_string(),
             }),
             decay_constant: self.decay_constant,
-            decay_scale_secs: self.decay_scale_secs.map(|s| s as i64),
-            decay_window_secs: self.decay_window_secs.map(|s| s as i64),
+            decay_scale_secs: self.decay_scale_secs,
+            decay_window_secs: self.decay_window_secs,
         })
     }
 
@@ -348,13 +350,31 @@ impl ReciprocalRankFusionArgs {
         }
     }
 
+    fn parse_limit_u64(value: u64) -> Result<usize> {
+        usize::try_from(value).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "{RRF_UDF_NAME} limit value {value} exceeds usize range."
+            ))
+        })
+    }
+
+    fn parse_limit_i64(value: i64) -> Result<usize> {
+        if value < 0 {
+            return exec_err!("{RRF_UDF_NAME} limit value {value} must be non-negative");
+        }
+
+        let value = u64::try_from(value).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "{RRF_UDF_NAME} limit value {value} exceeds usize range."
+            ))
+        })?;
+        Self::parse_limit_u64(value)
+    }
+
     /// Parses common search UDTF arguments from expressions.
     ///
     /// Returns: (table, query, column, limit, `include_score`)
-    #[allow(clippy::type_complexity)]
-    fn parse_search_args(
-        args: &[Expr],
-    ) -> Result<(String, String, Option<String>, Option<usize>, Option<bool>)> {
+    fn parse_search_args(args: &[Expr]) -> Result<SearchUdtfArgs> {
         // Filter out passthrough parameters (those with spice.parameter_name metadata)
         let args: Vec<_> = args
             .iter()
@@ -365,13 +385,7 @@ impl ReciprocalRankFusionArgs {
 
         // Extract table reference from first arg
         let table = match args.first() {
-            Some(Expr::Column(c)) => {
-                // Reconstruct table reference from column expression
-                match (&c.relation, &c.name) {
-                    (Some(rel), name) => format!("{rel}.{name}"),
-                    (None, name) => name.clone(),
-                }
-            }
+            Some(Expr::Column(c)) => table_ref_from_column_expr(c).to_quoted_string(),
             _ => {
                 return exec_err!("First argument to search UDTF must be a table reference");
             }
@@ -390,17 +404,16 @@ impl ReciprocalRankFusionArgs {
         let mut limit = None;
         let mut include_score = None;
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         for arg in args.iter().skip(2) {
             match arg {
                 Expr::Column(Column { name, .. }) => {
                     column = Some(name.clone());
                 }
                 Expr::Literal(ScalarValue::UInt64(Some(l)), _) => {
-                    limit = Some(*l as usize);
+                    limit = Some(Self::parse_limit_u64(*l)?);
                 }
                 Expr::Literal(ScalarValue::Int64(Some(l)), _) => {
-                    limit = Some(*l as usize);
+                    limit = Some(Self::parse_limit_i64(*l)?);
                 }
                 Expr::Literal(ScalarValue::Boolean(Some(b)), _) => {
                     include_score = Some(*b);

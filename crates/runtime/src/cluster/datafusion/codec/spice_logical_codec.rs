@@ -76,14 +76,15 @@ impl SpiceLogicalCodec {
         ))
     }
 
+    fn limit_from_u64(value: u64) -> Result<usize> {
+        usize::try_from(value).map_err(|_| {
+            DataFusionError::Plan(format!("UDTF limit value {value} exceeds usize range."))
+        })
+    }
+
     /// Reconstructs a UDTF-produced `TableProvider` by re-invoking the UDTF with
     /// the serialized arguments.
-    #[allow(clippy::cast_possible_truncation)]
-    fn invoke_udtf(
-        &self,
-        udtf_args: UdtfArgs,
-        runtime: &Arc<Runtime>,
-    ) -> Result<Arc<dyn TableProvider>> {
+    fn invoke_udtf(udtf_args: UdtfArgs, runtime: &Arc<Runtime>) -> Result<Arc<dyn TableProvider>> {
         use datafusion::catalog::TableFunctionImpl;
 
         let Some(args) = udtf_args.args else {
@@ -101,7 +102,7 @@ impl SpiceLogicalCodec {
                     tbl: SqlTableReference::parse_str(&text_args.table),
                     query: text_args.query,
                     column: text_args.column,
-                    limit: text_args.limit.map(|l| l as usize),
+                    limit: text_args.limit.map(Self::limit_from_u64).transpose()?,
                     include_score: text_args.include_score,
                 });
                 udtf.call(&exprs)
@@ -115,23 +116,18 @@ impl SpiceLogicalCodec {
                     tbl: SqlTableReference::parse_str(&vector_args.table),
                     query: vector_args.query,
                     column: vector_args.column,
-                    limit: vector_args.limit.map(|l| l as usize),
+                    limit: vector_args.limit.map(Self::limit_from_u64).transpose()?,
                     include_score: vector_args.include_score,
                 });
                 udtf.call(&exprs)
             }
-            Args::Rrf(rrf_args) => self.invoke_rrf(rrf_args, runtime),
+            Args::Rrf(rrf_args) => Self::invoke_rrf(&rrf_args, runtime),
         }
     }
 
     /// Reconstructs an RRF (Reciprocal Rank Fusion) `TableProvider` by re-invoking
     /// the nested search UDTFs and then the RRF UDTF.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    fn invoke_rrf(
-        &self,
-        rrf_args: RrfArgs,
-        runtime: &Arc<Runtime>,
-    ) -> Result<Arc<dyn TableProvider>> {
+    fn invoke_rrf(rrf_args: &RrfArgs, runtime: &Arc<Runtime>) -> Result<Arc<dyn TableProvider>> {
         use datafusion::catalog::TableFunctionImpl;
         use datafusion::logical_expr::expr::FieldMetadata;
         use datafusion::prelude::Expr;
@@ -154,7 +150,7 @@ impl SpiceLogicalCodec {
                         tbl: SqlTableReference::parse_str(&args.table),
                         query: args.query.clone(),
                         column: args.column.clone(),
-                        limit: args.limit.map(|l| l as usize),
+                        limit: args.limit.map(Self::limit_from_u64).transpose()?,
                         include_score: args.include_score,
                     });
                     (text_exprs, ts.rank_weight)
@@ -167,7 +163,7 @@ impl SpiceLogicalCodec {
                         tbl: SqlTableReference::parse_str(&args.table),
                         query: args.query.clone(),
                         column: args.column.clone(),
-                        limit: args.limit.map(|l| l as usize),
+                        limit: args.limit.map(Self::limit_from_u64).transpose()?,
                         include_score: args.include_score,
                     });
                     (vector_exprs, vs.rank_weight)
@@ -218,13 +214,13 @@ impl SpiceLogicalCodec {
         if let Some(decay_scale_secs) = rrf_args.decay_scale_secs {
             exprs.push(Self::named_literal(
                 "decay_scale_secs",
-                ScalarValue::Float64(Some(decay_scale_secs as f64)),
+                ScalarValue::Float64(Some(decay_scale_secs)),
             ));
         }
         if let Some(decay_window_secs) = rrf_args.decay_window_secs {
             exprs.push(Self::named_literal(
                 "decay_window_secs",
-                ScalarValue::Float64(Some(decay_window_secs as f64)),
+                ScalarValue::Float64(Some(decay_window_secs)),
             ));
         }
 
@@ -233,7 +229,7 @@ impl SpiceLogicalCodec {
         rrf_udtf.call(&exprs)
     }
 
-    /// Creates a literal expression with spice.parameter_name metadata.
+    /// Creates a literal expression with `spice.parameter_name` metadata.
     fn named_literal(name: &str, value: ScalarValue) -> datafusion::prelude::Expr {
         use datafusion::logical_expr::expr::FieldMetadata;
         use std::collections::BTreeMap;
@@ -291,7 +287,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
         if !buf.is_empty()
             && let Ok(udtf_args) = UdtfArgs::decode(buf)
         {
-            return self.invoke_udtf(udtf_args, &runtime);
+            return Self::invoke_udtf(udtf_args, &runtime);
         }
 
         // Fall back to regular table lookup
