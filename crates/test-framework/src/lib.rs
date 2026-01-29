@@ -45,7 +45,7 @@ pub use octocrab;
 pub use opentelemetry;
 pub use opentelemetry_sdk;
 pub use rustls;
-pub use serde_yaml;
+pub use yaml;
 pub use spicepod;
 pub use tokio_util;
 

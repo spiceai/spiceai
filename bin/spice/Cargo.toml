@@ -60,7 +60,7 @@ tar = "0.4"
 zip = "6"
 
 # YAML parsing for spicepod
-serde_yaml = "0.9"
+yaml = { path = "../../crates/yaml" }
 
 # Temp file handling
 tempfile.workspace = true

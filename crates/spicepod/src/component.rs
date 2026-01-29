@@ -121,7 +121,7 @@ pub enum Error {
 
     #[snafu(display("Unable to parse spicepod component {}: {source}", path.display()))]
     UnableToParseSpicepodComponent {
-        source: serde_yaml::Error,
+        source: yaml::Error,
         path: PathBuf,
     },
 
@@ -158,7 +158,7 @@ where
                                 path: component_base_path.clone(),
                             })?;
 
-                        let component_definition: ComponentType = serde_yaml::from_reader(
+                        let component_definition: ComponentType = yaml::from_reader(
                             component_rdr,
                         )
                         .context(UnableToParseSpicepodComponentSnafu {

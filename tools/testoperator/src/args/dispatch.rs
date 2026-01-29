@@ -370,7 +370,7 @@ tests:
 ";
 
         let test_file: DispatchTestFile =
-            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+            yaml::from_str(yaml).expect("Failed to deserialize");
 
         // Verify bench section (single item becomes vec with one element)
         assert_eq!(test_file.tests.bench.len(), 1);
@@ -429,7 +429,7 @@ tests:
 ";
 
         let test_file: DispatchTestFile =
-            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+            yaml::from_str(yaml).expect("Failed to deserialize");
 
         // Verify we have 3 load sections
         assert_eq!(test_file.tests.load.len(), 3);
@@ -488,7 +488,7 @@ tests: {}
 ";
 
         let test_file: DispatchTestFile =
-            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+            yaml::from_str(yaml).expect("Failed to deserialize");
 
         // All sections should default to empty vectors
         assert_eq!(test_file.tests.bench.len(), 0);

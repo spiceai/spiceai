@@ -188,7 +188,7 @@ x509-certificate.workspace = true
 gethostname.workspace = true
 
 [build-dependencies]
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -213,7 +213,7 @@ rdkafka = { workspace = true, features = ["ssl-vendored"] }
 rstest = "0.26.1"
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 pem.workspace = true
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
