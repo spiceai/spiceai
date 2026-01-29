@@ -132,7 +132,112 @@ pub async fn download_release_asset(
 
     Ok(())
 }
+/// Upgrade the CLI binary in-place by downloading and replacing the current executable.
+///
+/// This function:
+/// 1. Downloads the CLI asset from the release
+/// 2. Extracts the binary to a temporary file
+/// 3. Atomically replaces the current executable with the new one
+///
+/// # Errors
+///
+/// Returns an error if the download fails, extraction fails, or the file replacement fails.
+pub async fn upgrade_cli_in_place(
+    client: &GitHubClient,
+    release: &RepoRelease,
+    asset_name: &str,
+) -> Result<(), GitHubError> {
+    let asset = release
+        .get_asset(asset_name)
+        .ok_or_else(|| GitHubError::AssetNotFound {
+            name: asset_name.to_string(),
+        })?;
 
+    tracing::debug!(
+        "Downloading CLI asset: {} ({})",
+        asset.name,
+        format_size(asset.size)
+    );
+
+    // Download with progress
+    let total_size = asset.size;
+    let start_time = std::time::Instant::now();
+
+    let data = client
+        .download_with_progress(&asset.browser_download_url, |downloaded, _| {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                downloaded as f64 / elapsed / 1024.0 / 1024.0
+            } else {
+                0.0
+            };
+            let percent = (downloaded as f64 / total_size as f64) * 100.0;
+
+            eprint!(
+                "\rDownloading CLI: {:.1}% ({}/{}) @ {:.1} MB/s",
+                percent,
+                format_size(downloaded),
+                format_size(total_size),
+                speed
+            );
+        })
+        .await?;
+
+    eprintln!(); // New line after progress
+
+    // Get the current executable path
+    let current_exe = std::env::current_exe().map_err(|e| GitHubError::Io {
+        message: format!("Failed to get current executable path: {e}"),
+    })?;
+
+    // Create a temporary directory for extraction
+    let temp_dir = tempfile::tempdir().map_err(|e| GitHubError::Io {
+        message: format!("Failed to create temporary directory: {e}"),
+    })?;
+
+    // Extract tar.gz to temp directory
+    extract_tar_gz(&data, temp_dir.path())?;
+
+    // Find the extracted CLI binary
+    let cli_binary_name = if cfg!(windows) { "spice.exe" } else { "spice" };
+    let extracted_binary = temp_dir.path().join(cli_binary_name);
+
+    if !extracted_binary.exists() {
+        return Err(GitHubError::Io {
+            message: format!("Extracted CLI binary not found at {}", extracted_binary.display()),
+        });
+    }
+
+    // On Unix, we can replace the binary directly even while running
+    // On Windows, we need to rename the old binary first
+    #[cfg(windows)]
+    {
+        let backup_path = current_exe.with_extension("old.exe");
+        // Try to remove old backup if it exists
+        let _ = std::fs::remove_file(&backup_path);
+        // Rename current executable to backup
+        std::fs::rename(&current_exe, &backup_path).map_err(|e| GitHubError::Io {
+            message: format!("Failed to backup current executable: {e}"),
+        })?;
+    }
+
+    // Copy the new binary to the current executable location
+    std::fs::copy(&extracted_binary, &current_exe).map_err(|e| GitHubError::Io {
+        message: format!("Failed to replace CLI binary: {e}"),
+    })?;
+
+    // Make the binary executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&current_exe, permissions).map_err(|e| GitHubError::Io {
+            message: format!("Failed to set executable permissions: {e}"),
+        })?;
+    }
+
+    Ok(())
+}
 /// Extract a tar.gz archive to a directory.
 fn extract_tar_gz(data: &[u8], dest: &Path) -> Result<(), GitHubError> {
     let decoder = GzDecoder::new(data);
