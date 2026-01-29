@@ -204,7 +204,10 @@ pub async fn upgrade_cli_in_place(
 
     if !extracted_binary.exists() {
         return Err(GitHubError::Io {
-            message: format!("Extracted CLI binary not found at {}", extracted_binary.display()),
+            message: format!(
+                "Extracted CLI binary not found at {}",
+                extracted_binary.display()
+            ),
         });
     }
 
