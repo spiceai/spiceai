@@ -8,6 +8,8 @@ datasets:
       enabled: true
       engine: sqlite
       mode: file
+      params:
+        busy_timeout: 30s
       indexes:
         c_phone: enabled
         c_acctbal: enabled
@@ -17,6 +19,8 @@ datasets:
       enabled: true
       engine: sqlite
       mode: file
+      params:
+        busy_timeout: 30s
       indexes:
         l_orderkey: enabled
         l_suppkey: enabled
@@ -30,6 +34,8 @@ datasets:
       enabled: true
       engine: sqlite
       mode: file
+      params:
+        busy_timeout: 30s
       indexes:
         n_nationkey: enabled
   - from: file:data/orders.parquet
@@ -38,6 +44,8 @@ datasets:
       enabled: true
       engine: sqlite
       mode: file
+      params:
+        busy_timeout: 30s
       indexes:
         o_orderdate: enabled
         o_orderkey: enabled
@@ -48,6 +56,8 @@ datasets:
       enabled: true
       engine: sqlite
       mode: file
+      params:
+        busy_timeout: 30s
       indexes:
         p_partkey: enabled
         p_brand: enabled
@@ -58,6 +68,8 @@ datasets:
       enabled: true
       engine: sqlite
       mode: file
+      params:
+        busy_timeout: 30s
       indexes:
         ps_suppkey: enabled
         ps_partkey: enabled
@@ -67,12 +79,16 @@ datasets:
       enabled: true
       engine: sqlite
       mode: file
+      params:
+        busy_timeout: 30s
   - from: file:data/supplier.parquet
     name: supplier
     acceleration:
       enabled: true
       engine: sqlite
       mode: file
+      params:
+        busy_timeout: 30s
       indexes:
         s_suppkey: enabled
         s_nationkey: enabled

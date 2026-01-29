@@ -19,36 +19,31 @@ limitations under the License.
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::github::{
-    GitHubClient, SystemType, download_release_asset, get_latest_release, get_release,
+    GitHubClient, SystemType, download_release_asset_with_fallback, get_latest_release, get_release,
 };
 use clap::Args;
 
 /// Arguments for the install command.
 #[derive(Args, Debug, Default)]
 #[command(
-    about = "Install or reinstall the Spice.ai runtime and CLI",
-    long_about = r#"Install or reinstall the Spice.ai runtime and CLI
+    about = "Install or reinstall the Spice.ai runtime",
+    long_about = r#"Install or reinstall the Spice.ai runtime
 
 Examples:
-  spice install              # Install latest version
-  spice install ai           # Install AI flavor
+  spice install              # Install latest version (auto-detects Metal/CUDA)
   spice install v1.8.3       # Install specific version
-  spice install v1.8.3 ai    # Install specific version with AI flavor
+  spice install cuda         # Install with CUDA support (Linux only)
 
 See more at: https://spiceai.org/docs/"#
 )]
 pub struct InstallArgs {
-    /// Version to install (e.g., v1.8.3) and/or flavor (ai)
+    /// Version to install (e.g., v1.8.3) and/or flavor (cuda)
     #[arg(num_args = 0..=2)]
     args: Vec<String>,
 
     /// Force installation even if already installed
     #[arg(short, long)]
     force: bool,
-
-    /// Install the CPU-only version (only valid with 'ai' flavor)
-    #[arg(short, long)]
-    cpu: bool,
 }
 
 /// Parsed install arguments.
@@ -58,17 +53,20 @@ struct ParsedArgs {
 }
 
 /// Runtime flavor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Flavor {
+    /// Default flavor - auto-detects hardware accelerator (Metal on macOS, CUDA on Linux if available)
+    #[default]
     Default,
-    Ai,
+    /// Explicit CUDA flavor for Linux systems with NVIDIA GPUs
+    Cuda,
 }
 
 impl Flavor {
     fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Ai => "ai",
+            Self::Cuda => "cuda",
         }
     }
 }
@@ -77,19 +75,8 @@ impl Flavor {
 pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
     let parsed = parse_args(&args.args)?;
 
-    // Validate CPU flag
-    if args.cpu && parsed.flavor != Flavor::Ai {
-        tracing::error!(
-            "CPU flag is only allowed when installing the 'ai' flavor. Try: `spice install ai --cpu`"
-        );
-        return Ok(());
-    }
-
-    let allow_accelerator = !args.cpu;
-
     // Prepare installation directory
     ctx.prepare_install_dir()?;
-
     let client = GitHubClient::new_runtime_client();
 
     // Get the release
@@ -121,23 +108,21 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Download and install the runtime
-    let asset_name =
-        SystemType::this_pc().runtime_asset_name(parsed.flavor.as_str(), allow_accelerator);
-    tracing::info!(
-        "Installing Spice.ai runtime {} ({})...",
-        release.tag_name,
-        asset_name
-    );
+    // Get possible runtime asset names (handles version-specific naming)
+    let asset_names = SystemType::this_pc().runtime_asset_names(parsed.flavor.as_str());
+    tracing::info!("Installing Spice.ai runtime {}...", release.tag_name);
 
-    download_release_asset(&client, &release, &asset_name, ctx.spice_bin_dir())
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to download runtime: {e}");
-            crate::error::Error::RuntimeVersion {
-                message: e.to_string(),
-            }
-        })?;
+    let downloaded_asset =
+        download_release_asset_with_fallback(&client, &release, &asset_names, ctx.spice_bin_dir())
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to download runtime: {e}");
+                crate::error::Error::RuntimeVersion {
+                    message: e.to_string(),
+                }
+            })?;
+
+    tracing::debug!("Downloaded runtime asset: {downloaded_asset}");
 
     // Make the binary executable
     #[cfg(unix)]
@@ -172,15 +157,15 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs> {
             version = Some(arg.clone());
         } else {
             match arg.to_lowercase().as_str() {
-                "ai" => flavor = Flavor::Ai,
+                "cuda" => flavor = Flavor::Cuda,
                 "default" => flavor = Flavor::Default,
                 _ => {
                     tracing::error!(
-                        "Invalid argument: {arg}. Expected version (e.g., v1.8.3) or flavor (ai)"
+                        "Invalid argument: {arg}. Expected version (e.g., v1.8.3) or flavor (cuda)"
                     );
                     return Err(crate::error::Error::InvalidArgument {
                         message: format!(
-                            "Invalid argument: {arg}. Expected version (e.g., v1.8.3) or flavor (ai)"
+                            "Invalid argument: {arg}. Expected version (e.g., v1.8.3) or flavor (cuda)"
                         ),
                     });
                 }
