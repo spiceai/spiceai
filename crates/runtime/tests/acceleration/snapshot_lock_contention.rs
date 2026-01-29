@@ -461,15 +461,21 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
     tokio::time::sleep(baseline_duration).await;
     stop_signal.store(true, Ordering::Relaxed);
 
-    let baseline_results: Vec<ContentionMetrics> =
-        join_all(baseline_handles).await.into_iter().filter_map(|r| r.ok()).collect();
+    let baseline_results: Vec<ContentionMetrics> = join_all(baseline_handles)
+        .await
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .collect();
 
     let mut query_baseline = ContentionMetrics::new();
     for result in baseline_results {
         query_baseline.merge(result);
     }
 
-    println!("Baseline complete: {} queries executed", query_baseline.successful_ops);
+    println!(
+        "Baseline complete: {} queries executed",
+        query_baseline.successful_ops
+    );
 
     println!("\n=== Phase 2: Under Load (queries + concurrent snapshots) ===");
     let stop_signal = Arc::new(AtomicBool::new(false));
@@ -510,8 +516,11 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
     tokio::time::sleep(load_test_duration).await;
     stop_signal.store(true, Ordering::Relaxed);
 
-    let load_results: Vec<ContentionMetrics> =
-        join_all(load_handles).await.into_iter().filter_map(|r| r.ok()).collect();
+    let load_results: Vec<ContentionMetrics> = join_all(load_handles)
+        .await
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .collect();
 
     let snapshot_metrics = snapshot_handle.await?;
 
@@ -779,7 +788,10 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     let snapshot_interval = Duration::from_millis(50);
     let num_workers = 4;
 
-    println!("  Running baseline ({:.0}s, {num_workers} workers)...", baseline_duration.as_secs_f64());
+    println!(
+        "  Running baseline ({:.0}s, {num_workers} workers)...",
+        baseline_duration.as_secs_f64()
+    );
     let stop_signal = Arc::new(AtomicBool::new(false));
 
     let mut baseline_handles = Vec::new();
@@ -803,7 +815,10 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     }
 
     // Run under load (with snapshots)
-    println!("  Running under load ({:.0}s, {num_workers} workers + snapshots)...", load_duration.as_secs_f64());
+    println!(
+        "  Running under load ({:.0}s, {num_workers} workers + snapshots)...",
+        load_duration.as_secs_f64()
+    );
     let stop_signal = Arc::new(AtomicBool::new(false));
 
     let mut load_handles = Vec::new();
@@ -857,17 +872,20 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     };
 
     println!("\n  Results for {engine_type}:");
-    println!("    Baseline: {} ops, median {}ms, p99 {}ms",
+    println!(
+        "    Baseline: {} ops, median {}ms, p99 {}ms",
         results.query_baseline.successful_ops,
         results.query_baseline.median().unwrap_or(0),
         results.query_baseline.p99().unwrap_or(0),
     );
-    println!("    Under Load: {} ops, median {}ms, p99 {}ms",
+    println!(
+        "    Under Load: {} ops, median {}ms, p99 {}ms",
         results.query_under_load.successful_ops,
         results.query_under_load.median().unwrap_or(0),
         results.query_under_load.p99().unwrap_or(0),
     );
-    println!("    Snapshots: {} created, median {}ms",
+    println!(
+        "    Snapshots: {} created, median {}ms",
         results.snapshot_metrics.successful_ops,
         results.snapshot_metrics.median().unwrap_or(0),
     );
