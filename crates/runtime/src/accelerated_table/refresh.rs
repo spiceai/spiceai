@@ -847,6 +847,7 @@ impl Refresher {
                             &accelerator_write_mutex_clone,
                             &dataset_name_clone,
                             &last_updated_at_clone,
+                            None,
                             ForceCreate(true),
                         )
                         .await;
@@ -926,6 +927,7 @@ impl Refresher {
                                     &snapshot_mutex,
                                     &dataset_name,
                                     &last_updated_at,
+                                    None,
                                     ForceCreate(false),
                                 ).await;
                             }

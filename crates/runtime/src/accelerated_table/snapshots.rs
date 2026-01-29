@@ -84,6 +84,7 @@ pub fn spawn_snapshot_interval_task(
                 &accelerator_write_mutex,
                 &dataset_name,
                 &last_updated_at,
+                None,
                 ForceCreate(true),
             )
             .await;
@@ -104,6 +105,7 @@ pub fn spawn_snapshot_interval_task(
                 &accelerator_write_mutex,
                 &dataset_name,
                 &last_updated_at,
+                None,
                 ForceCreate(false),
             )
             .await;
@@ -160,6 +162,7 @@ pub fn create_periodic_snapshot_callback(
                         &accelerator_write_mutex_clone,
                         &dataset_name_clone,
                         &last_updated_at_clone,
+                        None,
                         ForceCreate(true),
                     )
                     .await;
@@ -199,6 +202,7 @@ pub fn create_periodic_snapshot_callback(
                             &accelerator_write_mutex,
                             &dataset_name,
                             &last_updated_at,
+                            None,
                             ForceCreate(false),
                         )
                         .await;
@@ -213,6 +217,7 @@ pub fn create_periodic_snapshot_callback(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 pub async fn create_checkpoint_and_snapshot(
     checkpointer: &Arc<dyn DatasetCheckpointer>,
     snapshot_manager: Option<&Arc<SnapshotManager>>,
@@ -220,6 +225,7 @@ pub async fn create_checkpoint_and_snapshot(
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
     last_updated_at: &Arc<AtomicI64>,
+    row_count: Option<u64>,
     force_create: ForceCreate,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
@@ -235,7 +241,7 @@ pub async fn create_checkpoint_and_snapshot(
         };
 
         match snapshot_manager
-            .create_snapshot(federated_schema, lock_guard, updated_at, force_create)
+            .create_snapshot(federated_schema, lock_guard, updated_at, row_count, force_create)
             .await
         {
             Ok(Some(_)) => {
