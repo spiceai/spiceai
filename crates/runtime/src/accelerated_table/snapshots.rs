@@ -14,6 +14,8 @@ use crate::accelerated_table::SnapshotCreateTrigger;
 use crate::status::RuntimeStatus;
 use arrow_schema::Schema;
 use datafusion::common::TableReference;
+use datafusion::datasource::TableProvider;
+use datafusion::prelude::SessionContext;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::{ForceCreate, SnapshotManager, metrics as snapshot_metrics};
 use std::pin::Pin;
@@ -61,6 +63,7 @@ pub fn spawn_snapshot_interval_task(
     runtime_status: Arc<RuntimeStatus>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
+    accelerator: Option<Arc<dyn TableProvider>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
     let checkpointer = checkpointer?;
@@ -84,8 +87,8 @@ pub fn spawn_snapshot_interval_task(
                 &accelerator_write_mutex,
                 &dataset_name,
                 &last_updated_at,
-                None,
                 ForceCreate(true),
+                accelerator.as_ref(),
             )
             .await;
         }
@@ -105,8 +108,8 @@ pub fn spawn_snapshot_interval_task(
                 &accelerator_write_mutex,
                 &dataset_name,
                 &last_updated_at,
-                None,
                 ForceCreate(false),
+                accelerator.as_ref(),
             )
             .await;
         }
@@ -128,6 +131,7 @@ pub fn create_periodic_snapshot_callback(
     runtime_status: Arc<RuntimeStatus>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
+    accelerator: Option<Arc<dyn TableProvider>>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
@@ -152,6 +156,7 @@ pub fn create_periodic_snapshot_callback(
             let snapshot_manager_clone = Arc::clone(&snapshot_manager);
             let federated_schema_clone = Arc::clone(&federated_schema);
             let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
+            let accelerator_clone = accelerator.clone();
             tokio::spawn(async move {
                 runtime_status.wait_for_ready().await;
                 if !bootstrap_status.is_bootstrapped() {
@@ -162,8 +167,8 @@ pub fn create_periodic_snapshot_callback(
                         &accelerator_write_mutex_clone,
                         &dataset_name_clone,
                         &last_updated_at_clone,
-                        None,
                         ForceCreate(true),
+                        accelerator_clone.as_ref(),
                     )
                     .await;
                 }
@@ -182,6 +187,7 @@ pub fn create_periodic_snapshot_callback(
                 let dataset_name = dataset_name.clone();
                 let checkpoint_counting_enabled = Arc::clone(&checkpoint_counting_enabled);
                 let last_updated_at = Arc::clone(&last_updated_at);
+                let accelerator = accelerator.clone();
 
                 Box::pin(async move {
                     let mut batches_processed_value = batches_processed.write().await;
@@ -202,8 +208,8 @@ pub fn create_periodic_snapshot_callback(
                             &accelerator_write_mutex,
                             &dataset_name,
                             &last_updated_at,
-                            None,
                             ForceCreate(false),
+                            accelerator.as_ref(),
                         )
                         .await;
                     }
@@ -225,8 +231,8 @@ pub async fn create_checkpoint_and_snapshot(
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
     last_updated_at: &Arc<AtomicI64>,
-    row_count: Option<u64>,
     force_create: ForceCreate,
+    accelerator: Option<&Arc<dyn TableProvider>>,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     if let Err(e) = checkpointer.checkpoint(federated_schema).await {
@@ -238,6 +244,14 @@ pub async fn create_checkpoint_and_snapshot(
         let updated_at = match last_updated_at.load(Ordering::Acquire) {
             0 => None,
             i => Some(i),
+        };
+
+        // Get the current row count from the accelerator using the `DataFrame` API.
+        // This must be done after checkpoint while holding the write lock to ensure atomicity.
+        let row_count = if let Some(accelerator) = accelerator {
+            get_row_count(accelerator, dataset_name).await
+        } else {
+            None
         };
 
         match snapshot_manager
@@ -256,6 +270,39 @@ pub async fn create_checkpoint_and_snapshot(
                 snapshot_metrics::record_snapshot_failure(&dataset_label);
                 tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
             }
+        }
+    }
+}
+
+/// Gets the row count from the accelerator using the `DataFrame` API.
+///
+/// Returns `None` if the row count cannot be determined (e.g., due to errors).
+async fn get_row_count(
+    accelerator: &Arc<dyn TableProvider>,
+    dataset_name: &TableReference,
+) -> Option<u64> {
+    let ctx = SessionContext::new();
+    let table_name = dataset_name.table();
+
+    if ctx
+        .register_table(table_name, Arc::clone(accelerator))
+        .is_err()
+    {
+        tracing::debug!(dataset = %dataset_name, "Failed to register accelerator table for row count query");
+        return None;
+    }
+
+    match ctx.table(table_name).await {
+        Ok(df) => match df.count().await {
+            Ok(count) => Some(count as u64),
+            Err(e) => {
+                tracing::debug!(dataset = %dataset_name, error = %e, "Failed to get row count for snapshot; proceeding without it");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!(dataset = %dataset_name, error = %e, "Failed to get DataFrame for row count query");
+            None
         }
     }
 }
