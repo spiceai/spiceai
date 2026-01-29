@@ -132,6 +132,30 @@ pub async fn download_release_asset(
 
     Ok(())
 }
+
+/// Download a release asset with fallback to alternative asset names.
+///
+/// Tries each asset name in order until one succeeds.
+/// Returns the name of the asset that was successfully downloaded.
+pub async fn download_release_asset_with_fallback(
+    client: &GitHubClient,
+    release: &RepoRelease,
+    asset_names: &[String],
+    download_dir: &Path,
+) -> Result<String, GitHubError> {
+    for asset_name in asset_names {
+        if release.has_asset(asset_name) {
+            download_release_asset(client, release, asset_name, download_dir).await?;
+            return Ok(asset_name.clone());
+        }
+        tracing::debug!("Asset not found: {asset_name}, trying next...");
+    }
+
+    // None of the asset names were found
+    let tried = asset_names.join(", ");
+    Err(GitHubError::AssetNotFound { name: tried })
+}
+
 /// Upgrade the CLI binary in-place by downloading and replacing the current executable.
 ///
 /// This function:
@@ -326,25 +350,42 @@ impl SystemType {
         }
     }
 
-    /// Get the runtime asset name for the current platform.
-    /// Flavor has no affect as we do not currently publish different runtime flavors.
-    pub fn runtime_asset_name(&self, _flavor: &str, allow_accelerator: bool) -> String {
-        let accelerator_suffix = if allow_accelerator {
-            if let Some(accelerator) = detect_accelerator() {
-                format!("_{accelerator}")
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
+    /// Get the runtime asset names for the current platform.
+    ///
+    /// Returns a list of possible asset names to try, in order of preference.
+    /// This handles the naming change between versions:
+    /// - v1.11+/trunk: `spiced_metal_...` (models included by default)
+    /// - v1.11 and earlier: `spiced_models_metal_...` (models suffix explicit)
+    pub fn runtime_asset_names(&self, _flavor: &str, allow_accelerator: bool) -> Vec<String> {
+        let mut names = Vec::new();
 
-        format!(
-            "{prefix}{accelerator_suffix}_{os}_{arch}.tar.gz",
+        if allow_accelerator && let Some(accelerator) = detect_accelerator() {
+            // New naming (v1.11+/trunk): accelerator without "models_" prefix
+            names.push(format!(
+                "{prefix}_{accelerator}_{os}_{arch}.tar.gz",
+                prefix = self.runtime_asset_prefix(),
+                os = self.os_type_name(),
+                arch = self.arch()
+            ));
+
+            // Old naming (v1.11 and earlier): with "models_" prefix
+            names.push(format!(
+                "{prefix}_models_{accelerator}_{os}_{arch}.tar.gz",
+                prefix = self.runtime_asset_prefix(),
+                os = self.os_type_name(),
+                arch = self.arch()
+            ));
+        }
+
+        // Fallback: base runtime without accelerator
+        names.push(format!(
+            "{prefix}_{os}_{arch}.tar.gz",
             prefix = self.runtime_asset_prefix(),
             os = self.os_type_name(),
             arch = self.arch()
-        )
+        ));
+
+        names
     }
 
     /// Get the CLI asset name for the current platform.
@@ -522,11 +563,14 @@ mod tests {
         "random",
         "spiced.exe_windows_x86_64.tar.gz"
     )]
-    fn test_runtime_asset_name(
+    fn test_runtime_asset_names(
         #[case] os_type: SystemType,
         #[case] flavor: &str,
         #[case] expected: &str,
     ) {
-        assert_eq!(os_type.runtime_asset_name(flavor, false), expected);
+        // With allow_accelerator = false, the list should only contain the base name
+        let names = os_type.runtime_asset_names(flavor, false);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], expected);
     }
 }

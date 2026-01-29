@@ -19,7 +19,7 @@ limitations under the License.
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::github::{
-    GitHubClient, SystemType, download_release_asset, get_latest_release, get_release,
+    GitHubClient, SystemType, download_release_asset_with_fallback, get_latest_release, get_release,
 };
 use clap::Args;
 
@@ -121,23 +121,22 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Download and install the runtime
-    let asset_name =
-        SystemType::this_pc().runtime_asset_name(parsed.flavor.as_str(), allow_accelerator);
-    tracing::info!(
-        "Installing Spice.ai runtime {} ({})...",
-        release.tag_name,
-        asset_name
-    );
+    // Get possible runtime asset names (handles version-specific naming)
+    let asset_names =
+        SystemType::this_pc().runtime_asset_names(parsed.flavor.as_str(), allow_accelerator);
+    tracing::info!("Installing Spice.ai runtime {}...", release.tag_name);
 
-    download_release_asset(&client, &release, &asset_name, ctx.spice_bin_dir())
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to download runtime: {e}");
-            crate::error::Error::RuntimeVersion {
-                message: e.to_string(),
-            }
-        })?;
+    let downloaded_asset =
+        download_release_asset_with_fallback(&client, &release, &asset_names, ctx.spice_bin_dir())
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to download runtime: {e}");
+                crate::error::Error::RuntimeVersion {
+                    message: e.to_string(),
+                }
+            })?;
+
+    tracing::debug!("Downloaded runtime asset: {downloaded_asset}");
 
     // Make the binary executable
     #[cfg(unix)]
