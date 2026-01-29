@@ -1,1 +1,1 @@
-1.11.0-enterprise-beta
+2.0.0-enterprise-beta

@@ -13,8 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::{
     common::Column,
     sql::{
@@ -24,7 +23,7 @@ use datafusion::{
 };
 use reqwest::Client;
 use serde_json::Value;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 // Fetches the logical plan by running `EXPLAIN FORMAT PGJSON <sql>` against `v1/sql`.
 //
@@ -478,8 +477,65 @@ fn extract_table_scans(
 
 /// Finds the SQL query's schema by running the SQL against `v1/sql` endpoint.
 ///
-/// Attempts to use more efficient SQL with equivalent outputs.
+/// Uses `DESCRIBE <sql>` (Apache `DataFusion` v51+) for efficiency, falls back to running the query if unavailable.
 pub async fn sql_schema(
+    http_client: Client,
+    http_base_url: &str,
+    sql: &str,
+) -> Result<Schema, anyhow::Error> {
+    match sql_schema_describe(http_client.clone(), http_base_url, sql).await {
+        Ok(schema) => Ok(schema),
+        Err(_) => sql_schema_fallback(http_client, http_base_url, sql).await,
+    }
+}
+
+/// Uses `DESCRIBE <sql>` to get the schema without executing the query.
+async fn sql_schema_describe(
+    http_client: Client,
+    http_base_url: &str,
+    sql: &str,
+) -> Result<Schema, anyhow::Error> {
+    let url = format!("{http_base_url}/v1/sql");
+
+    let response = http_client
+        .post(&url)
+        .body(format!("DESCRIBE {}", sql.strip_suffix(";").unwrap_or(sql)))
+        .header("Content-Type", "text/plain")
+        .header("Accept", "application/vnd.spiceai.nsql.v1+json")
+        .send()
+        .await?;
+
+    let json: Value = response.json().await?;
+
+    let Some(data) = json.get("data").and_then(Value::as_array) else {
+        return Err(anyhow::anyhow!(
+            "Failed to extract data from DESCRIBE response"
+        ));
+    };
+
+    let mut fields = Vec::new();
+    for row in data {
+        let Some(column_name) = row.get("column_name").and_then(Value::as_str) else {
+            return Err(anyhow::anyhow!("Missing column_name in DESCRIBE row"));
+        };
+        let Some(data_type_str) = row.get("data_type").and_then(Value::as_str) else {
+            return Err(anyhow::anyhow!("Missing data_type in DESCRIBE row"));
+        };
+        let nullable = row
+            .get("is_nullable")
+            .and_then(Value::as_str)
+            .is_none_or(|s| !s.eq_ignore_ascii_case("NO"));
+
+        let data_type = DataType::from_str(data_type_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse data_type '{data_type_str}': {e}"))?;
+
+        fields.push(Field::new(column_name, data_type, nullable));
+    }
+    Ok(Schema::new(fields))
+}
+
+/// Fallback method: runs the query with LIMIT 1 to extract schema.
+async fn sql_schema_fallback(
     http_client: Client,
     http_base_url: &str,
     sql: &str,
