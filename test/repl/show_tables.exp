@@ -3,6 +3,10 @@
 # Runtime response timeout
 set timeout 15:
 
+# Set TERM=dumb to disable advanced terminal features (bracketed paste, etc.)
+# that interfere with expect's input handling
+set env(TERM) dumb
+
 spawn spice sql
 
 proc verify_show_tables {} {

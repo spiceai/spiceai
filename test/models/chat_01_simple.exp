@@ -3,6 +3,10 @@
 # Runtime response timeout
 set timeout 30:
 
+# Set TERM=dumb to disable advanced terminal features (bracketed paste, etc.)
+# that interfere with expect's input handling
+set env(TERM) dumb
+
 spawn spice chat
 
 proc chat {message}  {

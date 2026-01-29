@@ -3,6 +3,10 @@
 # spiced runtime response timeout
 set timeout 5
 
+# Set TERM=dumb to disable advanced terminal features (bracketed paste, etc.)
+# that interfere with expect's input handling
+set env(TERM) dumb
+
 spawn spice search
 
 proc perform_search {search_term expected_term} {

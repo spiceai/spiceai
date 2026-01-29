@@ -1,3 +1,7 @@
+# Set TERM=dumb to disable advanced terminal features (bracketed paste, etc.)
+# that interfere with expect's input handling
+set env(TERM) dumb
+
 # Test single message mode (non-interactive)
 proc test_spice_chat_message {} {
     set command "spice chat \"hello\" --model model1"
