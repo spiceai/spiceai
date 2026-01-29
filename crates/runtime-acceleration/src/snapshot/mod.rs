@@ -720,12 +720,10 @@ impl SnapshotManager {
                 (s, secrets.upgrade()?, io_runtime, false)
             }
         };
-        tracing::debug!("Snapshots are enabled for {dataset_name}");
+        tracing::debug!(dataset = %dataset_name, "Snapshots enabled");
 
         let Some(snapshot_location) = &snapshot_config.location else {
-            tracing::warn!(
-                "Snapshots are enabled for dataset {dataset_name} but no location is configured"
-            );
+            tracing::warn!(dataset = %dataset_name, "Snapshots enabled but no location configured");
             return None;
         };
         let snapshot_location_uri = snapshot_location.clone();
@@ -752,7 +750,7 @@ impl SnapshotManager {
             )
             .await
             .inspect_err(|e| {
-                tracing::error!("Error connecting to S3 snapshot location: {e}");
+                tracing::error!(dataset = %dataset_name, location = %snapshots_location_url, error = %e, "Failed to connect to S3 snapshot location");
             })
             .ok()?;
             let path = object_store::path::Path::from(path);
@@ -766,11 +764,9 @@ impl SnapshotManager {
 
         if compaction_enabled {
             if snapshot_engine.supports_compaction() {
-                tracing::info!("Snapshot compaction is enabled for dataset {dataset_name}");
+                tracing::info!(dataset = %dataset_name, "Snapshot compaction enabled");
             } else {
-                tracing::warn!(
-                    "Snapshot compaction is enabled for dataset {dataset_name} but engine does not support compaction"
-                );
+                tracing::warn!(dataset = %dataset_name, "Snapshot compaction enabled but engine does not support it");
             }
         }
 
@@ -820,9 +816,7 @@ impl SnapshotManager {
         };
 
         let Some(snapshot_location) = &snapshot_config.location else {
-            tracing::warn!(
-                "Snapshots are enabled for dataset {dataset_name} but no location is configured"
-            );
+            tracing::warn!(dataset = %dataset_name, "Snapshots enabled but no location configured");
             return None;
         };
         let snapshot_location_uri = snapshot_location.clone();
@@ -830,9 +824,7 @@ impl SnapshotManager {
         let snapshots_location_url = match Url::from_str(snapshot_location) {
             Ok(url) => url,
             Err(e) => {
-                tracing::error!(
-                    "Failed to parse snapshot location URL: {snapshot_location}, error: {e}"
-                );
+                tracing::error!(dataset = %dataset_name, location = %snapshot_location, error = %e, "Failed to parse snapshot location URL");
                 return None;
             }
         };
@@ -849,7 +841,7 @@ impl SnapshotManager {
             )
             .await
             .inspect_err(|e| {
-                tracing::error!("Error connecting to S3 snapshot location: {e}");
+                tracing::error!(dataset = %dataset_name, location = %snapshots_location_url, error = %e, "Failed to connect to S3 snapshot location");
             })
             .ok()?;
             let path = object_store::path::Path::from(path);
@@ -927,8 +919,8 @@ impl SnapshotManager {
             force_create
         } else if !self.has_existing_snapshots().await {
             tracing::info!(
-                "No existing snapshots found (metadata or files), forcing snapshot creation. dataset={}",
-                self.dataset_name
+                dataset = %self.dataset_name,
+                "No existing snapshots found, forcing initial snapshot creation"
             );
             ForceCreate(true)
         } else {
@@ -944,10 +936,7 @@ impl SnapshotManager {
             // Skip if no writes have occurred in this session (last_updated_at is None/0).
             // This avoids creating snapshots before the first refresh completes.
             if last_updated_at.is_none() {
-                tracing::info!(
-                    "Skipping snapshot creation - no data writes have occurred yet. dataset={}",
-                    self.dataset_name
-                );
+                tracing::info!(dataset = %self.dataset_name, "Skipping snapshot creation, awaiting first data refresh");
                 metrics::record_snapshot_skipped(&self.dataset_name);
                 return Ok(None);
             }
@@ -959,11 +948,7 @@ impl SnapshotManager {
                 && let Some(snapshot_entry) = dataset_meta.snapshots.last()
                 && snapshot_entry.snapshot_last_updated_at_ms == Some(last_updated_at)
             {
-                tracing::info!(
-                    "Skipping snapshot creation - no updates since last snapshot. dataset={} last_updated_at_ms={}",
-                    self.dataset_name,
-                    last_updated_at
-                );
+                tracing::info!(dataset = %self.dataset_name, last_updated_at_ms = last_updated_at, "Skipping snapshot creation, no updates since last snapshot");
                 metrics::record_snapshot_skipped(&self.dataset_name);
                 return Ok(None);
             }
@@ -975,9 +960,10 @@ impl SnapshotManager {
         let destination_location = layout.build_location(&self.snapshots_location, now);
         let timestamp_ms = now.timestamp_millis();
 
-        tracing::info!(
-            "Uploading snapshot. dataset={} snapshot={destination_location}",
-            self.dataset_name
+        tracing::debug!(
+            dataset = %self.dataset_name,
+            snapshot = %destination_location,
+            "Uploading snapshot"
         );
 
         let (total_bytes, checksum) = match &self.layout {
@@ -1017,8 +1003,12 @@ impl SnapshotManager {
         );
 
         tracing::info!(
-            "Snapshot uploaded. dataset={} snapshot={destination_location} size={total_bytes} sha={checksum}",
-            self.dataset_name,
+            dataset = %self.dataset_name,
+            snapshot = %destination_location,
+            size_bytes = total_bytes,
+            duration_ms = format_args!("{duration_ms:.1}"),
+            sha = %checksum,
+            "Snapshot created"
         );
 
         Ok(Some(destination_location))
@@ -1522,12 +1512,12 @@ impl SnapshotManager {
                 source,
             })?;
 
-        tracing::info!(
-            "Downloading snapshot. dataset={} snapshot={} snapshot_id={} sha={sha}",
-            self.dataset_name,
-            entry.snapshot,
-            entry.snapshot_id,
-            sha = entry.snapshot_checksum.as_str(),
+        tracing::debug!(
+            dataset = %self.dataset_name,
+            snapshot = %entry.snapshot,
+            snapshot_id = entry.snapshot_id,
+            sha = %entry.snapshot_checksum,
+            "Downloading snapshot"
         );
 
         let (actual_size, actual_checksum) = match &self.layout {
@@ -1577,10 +1567,11 @@ impl SnapshotManager {
                 .primary_path()
                 .map_or_else(|| "<directories>".to_string(), |p| p.display().to_string());
             tracing::info!(
-                "Snapshot downloaded to {local_path_display}. dataset={} snapshot={} size={actual_size} sha={sha}",
-                self.dataset_name,
-                entry.snapshot,
-                sha = actual_checksum.as_str(),
+                dataset = %self.dataset_name,
+                snapshot = %entry.snapshot,
+                size_bytes = actual_size,
+                sha = %actual_checksum,
+                "Snapshot restored to {local_path_display}"
             );
             Ok(SnapshotDownloadInfo {
                 schema,
@@ -1590,10 +1581,10 @@ impl SnapshotManager {
             })
         } else {
             tracing::warn!(
-                "Snapshot schema not found. dataset={} snapshot={} sha={sha}",
-                self.dataset_name,
-                entry.snapshot,
-                sha = entry.snapshot_checksum.as_str(),
+                dataset = %self.dataset_name,
+                snapshot = %entry.snapshot,
+                sha = %entry.snapshot_checksum,
+                "Snapshot schema not found"
             );
             Err(SnapshotDownloadError::MissingSchema { path: path_display })
         }
