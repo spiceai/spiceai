@@ -162,36 +162,92 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Get the runtime asset name for the current platform.
-#[must_use]
-pub fn get_runtime_asset_name(flavor: &str, allow_accelerator: bool) -> String {
-    let os = std::env::consts::OS;
-    let arch = get_rust_arch();
+pub struct Arch(pub String);
 
-    let flavor_suffix = match flavor {
-        "ai" | "default" => {
-            if allow_accelerator {
-                if let Some(accelerator) = detect_accelerator() {
-                    format!("_models_{accelerator}")
-                } else {
-                    "_models".to_string()
-                }
-            } else {
-                "_models".to_string()
-            }
-        }
-        _ => String::new(),
-    };
-
-    format!("spiced{flavor_suffix}_{os}_{arch}.tar.gz")
+pub enum SystemType {
+    Linux(Arch),
+    Darwin(Arch),
+    Windows(Arch),
+    Other(Arch, String),
 }
 
-/// Get the CLI asset name for the current platform.
-#[must_use]
-pub fn get_cli_asset_name() -> String {
-    let os = std::env::consts::OS;
-    let arch = get_rust_arch();
-    format!("spice_{os}_{arch}.tar.gz")
+impl SystemType {
+    /// Get the OS type for the current platform.
+    pub fn this_pc() -> SystemType {
+        let arch = Arch(get_rust_arch().to_string());
+        match std::env::consts::OS {
+            "linux" => SystemType::Linux(arch),
+            "macos" => SystemType::Darwin(arch),
+            "windows" => SystemType::Windows(arch),
+            other => SystemType::Other(arch, other.to_string()),
+        }
+    }
+
+    fn arch(&self) -> &str {
+        match self {
+            SystemType::Linux(Arch(a))
+            | SystemType::Darwin(Arch(a))
+            | SystemType::Windows(Arch(a))
+            | SystemType::Other(Arch(a), _) => a,
+        }
+    }
+
+    /// Get the OS type name for the current platform.
+    fn os_type_name(&self) -> &str {
+        match self {
+            SystemType::Linux(_) => "linux",
+            SystemType::Darwin(_) => "darwin",
+            SystemType::Windows(_) => "windows",
+            SystemType::Other(_, name) => name,
+        }
+    }
+
+    /// Get the CLI asset prefix for the current platform.
+    fn cli_asset_prefix(&self) -> &str {
+        match self {
+            SystemType::Windows(_) => "spice.exe",
+            _ => "spice",
+        }
+    }
+
+    /// Get the runtime asset prefix for the current platform.
+    fn runtime_asset_prefix(&self) -> &str {
+        match self {
+            SystemType::Windows(_) => "spiced.exe",
+            _ => "spiced",
+        }
+    }
+
+    /// Get the runtime asset name for the current platform.
+    /// Flavor has no affect as we do not currently publish different runtime flavors.
+    pub fn runtime_asset_name(&self, _flavor: &str, allow_accelerator: bool) -> String {
+        let accelerator_suffix = if allow_accelerator {
+            if let Some(accelerator) = detect_accelerator() {
+                format!("_{accelerator}")
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        format!(
+            "{prefix}{accelerator_suffix}_{os}_{arch}.tar.gz",
+            prefix = self.runtime_asset_prefix(),
+            os = self.os_type_name(),
+            arch = self.arch()
+        )
+    }
+
+    /// Get the CLI asset name for the current platform.
+    pub fn cli_asset_name(&self) -> String {
+        format!(
+            "{prefix}_{os}_{arch}.tar.gz",
+            prefix = self.cli_asset_prefix(),
+            os = self.os_type_name(),
+            arch = self.arch()
+        )
+    }
 }
 
 /// Map Go arch names to Rust target names.
@@ -272,5 +328,97 @@ fn get_cuda_version() -> Option<String> {
         None
     } else {
         Some(version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    impl Arch {
+        fn x86() -> Arch {
+            Arch("x86_64".to_string())
+        }
+
+        fn arm() -> Arch {
+            Arch("aarch64".to_string())
+        }
+    }
+
+    impl SystemType {
+        fn linux_x86() -> SystemType {
+            SystemType::Linux(Arch::x86())
+        }
+
+        fn darwin_x86() -> SystemType {
+            SystemType::Darwin(Arch::x86())
+        }
+
+        fn windows_x86() -> SystemType {
+            SystemType::Windows(Arch::x86())
+        }
+
+        fn linux_arm() -> SystemType {
+            SystemType::Linux(Arch::arm())
+        }
+
+        fn darwin_arm() -> SystemType {
+            SystemType::Darwin(Arch::arm())
+        }
+
+        fn windows_arm() -> SystemType {
+            SystemType::Windows(Arch::arm())
+        }
+    }
+
+    #[rstest]
+    #[case(SystemType::linux_x86(), "spice_linux_x86_64.tar.gz")]
+    #[case(SystemType::darwin_x86(), "spice_darwin_x86_64.tar.gz")]
+    #[case(SystemType::windows_x86(), "spice.exe_windows_x86_64.tar.gz")]
+    #[case(SystemType::linux_arm(), "spice_linux_aarch64.tar.gz")]
+    #[case(SystemType::darwin_arm(), "spice_darwin_aarch64.tar.gz")]
+    #[case(SystemType::windows_arm(), "spice.exe_windows_aarch64.tar.gz")]
+    fn test_cli_asset_name(#[case] os_type: SystemType, #[case] expected: &str) {
+        assert_eq!(os_type.cli_asset_name(), expected);
+    }
+
+    #[rstest]
+    // ai and default flavors on x86
+    #[case(SystemType::linux_x86(), "default", "spiced_linux_x86_64.tar.gz")]
+    #[case(SystemType::darwin_x86(), "default", "spiced_darwin_x86_64.tar.gz")]
+    #[case(
+        SystemType::windows_x86(),
+        "default",
+        "spiced.exe_windows_x86_64.tar.gz"
+    )]
+    #[case(SystemType::linux_x86(), "ai", "spiced_linux_x86_64.tar.gz")]
+    #[case(SystemType::darwin_x86(), "ai", "spiced_darwin_x86_64.tar.gz")]
+    #[case(SystemType::windows_x86(), "ai", "spiced.exe_windows_x86_64.tar.gz")]
+    // ai and default flavors on arm
+    #[case(SystemType::linux_arm(), "default", "spiced_linux_aarch64.tar.gz")]
+    #[case(SystemType::darwin_arm(), "default", "spiced_darwin_aarch64.tar.gz")]
+    #[case(
+        SystemType::windows_arm(),
+        "default",
+        "spiced.exe_windows_aarch64.tar.gz"
+    )]
+    #[case(SystemType::linux_arm(), "ai", "spiced_linux_aarch64.tar.gz")]
+    #[case(SystemType::darwin_arm(), "ai", "spiced_darwin_aarch64.tar.gz")]
+    #[case(SystemType::windows_arm(), "ai", "spiced.exe_windows_aarch64.tar.gz")]
+    // random flavor on x86
+    #[case(SystemType::linux_x86(), "random", "spiced_linux_x86_64.tar.gz")]
+    #[case(SystemType::darwin_x86(), "random", "spiced_darwin_x86_64.tar.gz")]
+    #[case(
+        SystemType::windows_x86(),
+        "random",
+        "spiced.exe_windows_x86_64.tar.gz"
+    )]
+    fn test_runtime_asset_name(
+        #[case] os_type: SystemType,
+        #[case] flavor: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(os_type.runtime_asset_name(flavor, false), expected);
     }
 }

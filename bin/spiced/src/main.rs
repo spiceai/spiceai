@@ -89,7 +89,7 @@ fn main() {
     let _ = CryptoProvider::install_default(crypto::aws_lc_rs::default_provider());
 
     if args.repl {
-        if let Err(e) = tokio_runtime.block_on(flightrepl::run(args.repl_config)) {
+        if let Err(e) = tokio_runtime.block_on(repl::run(args.repl_config)) {
             eprintln!("SQL REPL Error: {e}");
         }
         return;

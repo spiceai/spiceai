@@ -766,6 +766,7 @@ impl Builder {
                 retention,
                 self.caching.clone(),
                 self.io_runtime.clone(),
+                Arc::clone(&accelerator_write_mutex),
             ));
             handlers.push(retention_check_handle);
         }

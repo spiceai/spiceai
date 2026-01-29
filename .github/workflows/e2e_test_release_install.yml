@@ -98,23 +98,26 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version=$(spice version 2>&1)
-          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
+          # CLI version may include commit hash like "v1.11.0 (f2e8ad5)" - extract just the version
+          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
           runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
 
-          release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')+models"
+          release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')"
+          release_version_with_models="${release_version}+models"
 
           echo "Release Version: $release_version"
           echo "CLI Version: $cli_version"
           echo "Runtime Version: $runtime_version"
 
-          # Release version contains '+models' suffix, so we need to add it to the cli_version for comparison
-          if [ "$cli_version+models" != "$release_version" ]; then
+          # CLI does not have '+models' suffix, so compare base versions
+          if [ "$cli_version" != "$release_version" ]; then
             echo "CLI version $cli_version does not match the latest release version $release_version."
             exit 1
           fi
 
-          if [ "$runtime_version" != "$release_version" ]; then
-            echo "Runtime version $runtime_version does not match the latest release version $release_version."
+          # Runtime has '+models' suffix
+          if [ "$runtime_version" != "$release_version_with_models" ]; then
+            echo "Runtime version $runtime_version does not match the latest release version $release_version_with_models."
             exit 1
           fi
 
@@ -183,7 +186,8 @@ jobs:
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
           version=$(spice version 2>&1)
-          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
+          # CLI version may include commit hash like "v1.11.0 (f2e8ad5)" - extract just the version
+          cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
           runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
 
           # Use bash array for optional curl args to avoid quoting issues
@@ -191,19 +195,21 @@ jobs:
           if [ -n "${GITHUB_TOKEN:-}" ]; then
             auth_args=(-H "Authorization: token $GITHUB_TOKEN")
           fi
-          release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" "${auth_args[@]}" | jq -r '.tag_name')+models"
+          release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" "${auth_args[@]}" | jq -r '.tag_name')"
+          release_version_with_models="${release_version}+models"
 
           echo "Release Version: $release_version"
           echo "CLI Version: $cli_version"
           echo "Runtime Version: $runtime_version"
 
-          # Release version contains '+models' suffix, so we need to add it to the cli_version for comparison
-          if [ "$cli_version+models" != "$release_version" ]; then
+          # CLI does not have '+models' suffix, so compare base versions
+          if [ "$cli_version" != "$release_version" ]; then
             echo "CLI version $cli_version does not match the latest release version $release_version."
             exit 1
           fi
 
-          if [ "$runtime_version" != "$release_version" ]; then
-            echo "Runtime version $runtime_version does not match the latest release version $release_version."
+          # Runtime has '+models' suffix
+          if [ "$runtime_version" != "$release_version_with_models" ]; then
+            echo "Runtime version $runtime_version does not match the latest release version $release_version_with_models."
             exit 1
           fi

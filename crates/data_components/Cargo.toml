@@ -101,7 +101,7 @@ twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util" }
 uuid.workspace = true
-zip = "3.0.0"
+zip = "6.0.0"
 tokio-stream.workspace = true
 
 [target.'cfg(windows)'.dependencies]

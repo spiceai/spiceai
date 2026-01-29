@@ -12,7 +12,7 @@ version.workspace = true
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 event_stream = { path = "../../crates/event_stream" }
-flightrepl = { path = "../../crates/flightrepl" }
+repl = { path = "../../crates/repl" }
 futures.workspace = true
 mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true

@@ -66,6 +66,7 @@ use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
 use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
+use crate::cluster::metrics_collector::OtelResultFetchMetricsCallback;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
@@ -208,7 +209,11 @@ impl Query {
             // Use 100MB max message size to match other gRPC configurations in the codebase
             // (see flight_client::MAX_DECODING_MESSAGE_SIZE). The default Ballista config
             // is 16MB which is too small for queries returning large batches.
-            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024);
+            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024)
+            // Enable result fetch metrics callback to track final result fetching from executors
+            .with_ballista_result_fetch_metrics_callback(OtelResultFetchMetricsCallback::new_arc(
+                scheduler_url.to_string(),
+            ));
 
         if let Some(tls_config) = client_tls_config {
             cfg = cfg.with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
