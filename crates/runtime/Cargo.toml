@@ -294,13 +294,8 @@ mongodb = ["data_components/mongodb"]
 mssql = ["data_components/mssql"]
 mysql = ["db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]
-odbc = []
-openapi = [
-    "dep:utoipa-swagger-ui",
-    "dep:utoipa",
-    "mcp",
-    "runtime-api-types/openapi",
-]
+odbc = ["db_connection_pool/odbc", "data_components/odbc"]
+openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp", "runtime-api-types/openapi"]
 oracle = ["data_components/oracle"]
 pingora = ["cache/pingora"]
 postgres = [
