@@ -26,9 +26,9 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use test_framework::anyhow::Result;
 
-use super::traits::StreamingSource;
+use super::traits::DynamoDBStreamingSource;
 
-/// Available streaming source types for benchmarks.
+/// Available DynamoDB streaming source types for benchmarks.
 #[derive(Debug, Clone, Copy, ValueEnum, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceType {
@@ -36,11 +36,10 @@ pub enum SourceType {
     DynamodbStreamsLocal,
     /// AWS `DynamoDB` Streams (actual AWS service)
     DynamodbStreams,
-    // Future: Kafka, Debezium, etc.
 }
 
 impl SourceType {
-    /// Create a streaming source instance for this type.
+    /// Create a DynamoDB streaming source instance for this type.
     ///
     /// Configuration is read from environment variables:
     /// - `DynamodbStreamsLocal`: `DYNAMODB_LOCAL_PORT` (optional, default: 8000)
@@ -49,7 +48,7 @@ impl SourceType {
     ///
     /// # Errors
     /// Returns an error if required environment variables are not set for `DynamodbStreams`.
-    pub fn create(self) -> Result<Box<dyn StreamingSource>> {
+    pub fn create_dynamodb(self) -> Result<Box<dyn DynamoDBStreamingSource>> {
         match self {
             Self::DynamodbStreamsLocal => Ok(Box::new(DynamoDbStreamsLocalSource::new())),
             Self::DynamodbStreams => {

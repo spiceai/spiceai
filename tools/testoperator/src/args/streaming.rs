@@ -101,10 +101,6 @@ pub struct StreamingDynamodbTestArgs {
     /// When multiple configs are provided, each is benchmarked against the same data.
     #[arg(long = "spicepod-path", value_name = "PATH")]
     pub additional_spicepod_paths: Vec<std::path::PathBuf>,
-
-    /// Run benchmark configs in parallel (may cause resource contention)
-    #[arg(long)]
-    pub parallel: bool,
 }
 
 impl StreamingDynamodbTestArgs {

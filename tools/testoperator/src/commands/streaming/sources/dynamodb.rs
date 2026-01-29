@@ -61,7 +61,7 @@ use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
 
 use crate::commands::streaming::datasets::DatasetType;
-use crate::commands::streaming::traits::{SnapshotConfig, StreamingSource};
+use crate::commands::streaming::traits::{DynamoDBStreamingSource, SnapshotConfig, StreamingSource};
 
 /// Configuration for AWS `DynamoDB` source.
 ///
@@ -1074,21 +1074,23 @@ impl StreamingSource for DynamoDbStreamsSource {
         println!("AWS DynamoDB cleanup complete (tables preserved)");
         Ok(())
     }
+}
 
+impl DynamoDBStreamingSource for DynamoDbStreamsSource {
     fn prepare_checkpoint_spicepod(
         &self,
         spicepod: SpicepodDefinition,
         run_id: &str,
         config_name: &str,
         snapshot_config: &SnapshotConfig,
-    ) -> Option<SpicepodDefinition> {
-        Some(transform_spicepod(
+    ) -> SpicepodDefinition {
+        transform_spicepod(
             spicepod,
             run_id,
             config_name,
             snapshot_config,
             SnapshotBehavior::CreateOnly,
-        ))
+        )
     }
 
     fn prepare_benchmark_spicepod(
@@ -1097,14 +1099,14 @@ impl StreamingSource for DynamoDbStreamsSource {
         run_id: &str,
         config_name: &str,
         snapshot_config: &SnapshotConfig,
-    ) -> Option<SpicepodDefinition> {
-        Some(transform_spicepod(
+    ) -> SpicepodDefinition {
+        transform_spicepod(
             spicepod,
             run_id,
             config_name,
             snapshot_config,
             SnapshotBehavior::BootstrapOnly,
-        ))
+        )
     }
 }
 

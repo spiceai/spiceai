@@ -16,11 +16,10 @@ limitations under the License.
 
 //! Trait definitions for streaming ingestion benchmarks.
 //!
-//! The streaming benchmark system is built around two abstractions:
+//! The streaming benchmark system is built around these abstractions:
 //! - [`StreamingDataset`]: Defines a table within a benchmark dataset (e.g., TPCH lineitem)
-//! - [`StreamingSource`]: Defines where data is sent (e.g., `DynamoDB` Streams, Kafka)
-//!
-//! Sources match on dataset type to know source-specific configuration (key schemas, etc.).
+//! - [`StreamingSource`]: Generic interface for streaming sources (DynamoDB, Kafka, etc.)
+//! - [`DynamoDBStreamingSource`]: DynamoDB-specific extension with snapshot/checkpoint support
 
 use arrow::array::RecordBatch;
 use spicepod::spec::SpicepodDefinition;
@@ -62,12 +61,6 @@ pub trait StreamingDataset: Send + Sync {
     /// Returns a SQL query to detect the marker in Spice's accelerated table.
     fn marker_detection_query(&self) -> String;
 
-    /// Returns a simple liveness query for this dataset (e.g., SELECT COUNT(*) FROM table).
-    /// Used for tracking query latency and success rate during ingestion.
-    fn liveness_query(&self) -> String {
-        format!("SELECT COUNT(*) as cnt FROM {}", self.table_name())
-    }
-
     /// Returns the Arrow schema for this dataset.
     fn schema(&self) -> arrow::datatypes::Schema;
 
@@ -77,6 +70,7 @@ pub trait StreamingDataset: Send + Sync {
 
 /// Represents a streaming source that can receive data.
 ///
+/// This is the generic interface for all streaming sources (DynamoDB, Kafka, etc.).
 /// Sources match on `DatasetType` to determine source-specific configuration
 /// like key schemas, topic settings, etc.
 #[async_trait::async_trait]
@@ -95,16 +89,12 @@ pub trait StreamingSource: Send + Sync {
 
     /// Create a table/topic for the given dataset type.
     ///
-    ///
     /// The implementation matches on dataset type to determine the appropriate
     /// key schema and other source-specific configuration.
     async fn create_table(&self, dataset: DatasetType) -> Result<()>;
 
     /// Insert records into the specified table.
     async fn insert(&self, table: &str, records: &[RecordBatch]) -> Result<()>;
-
-    // /// Insert a marker record.
-    // async fn insert_marker(&self, dataset: DatasetType, marker: &RecordBatch) -> Result<()>;
 
     /// Delete a marker record.
     async fn delete_marker(&self, dataset: DatasetType) -> Result<()>;
@@ -121,40 +111,40 @@ pub trait StreamingSource: Send + Sync {
 
     /// Cleanup resources (stop containers, etc.).
     async fn cleanup(&self) -> Result<()>;
+}
 
+/// DynamoDB-specific streaming source with snapshot/checkpoint support.
+///
+/// This trait extends [`StreamingSource`] with methods for transforming spicepods
+/// to capture checkpoints and restore from snapshots. This is required for DynamoDB
+/// benchmarks because DynamoDB Streams has limited retention (24 hours) and shard
+/// lifecycle issues that require snapshot-based checkpoint capture.
+pub trait DynamoDBStreamingSource: StreamingSource {
     /// Transform spicepod for checkpoint capture phase.
     ///
-    /// For sources that require checkpoint snapshots (e.g., DynamoDB), this method:
-    /// - Renames datasets with run_id prefix
-    /// - Sets `acceleration.snapshots: create_only`
+    /// This method:
+    /// - Renames datasets with run_id prefix to match DynamoDB table names
+    /// - Sets `acceleration.snapshots: create_only` to capture checkpoint
     /// - Configures runtime snapshot location
-    ///
-    /// Returns `None` if no transformation is needed (e.g., Kafka with infinite retention).
     fn prepare_checkpoint_spicepod(
         &self,
-        _spicepod: SpicepodDefinition,
-        _run_id: &str,
-        _config_name: &str,
-        _snapshot_config: &SnapshotConfig,
-    ) -> Option<SpicepodDefinition> {
-        None
-    }
+        spicepod: SpicepodDefinition,
+        run_id: &str,
+        config_name: &str,
+        snapshot_config: &SnapshotConfig,
+    ) -> SpicepodDefinition;
 
     /// Transform spicepod for benchmark phase.
     ///
-    /// For sources that require checkpoint snapshots (e.g., DynamoDB), this method:
-    /// - Renames datasets with run_id prefix
-    /// - Sets `acceleration.snapshots: bootstrap_only`
+    /// This method:
+    /// - Renames datasets with run_id prefix to match DynamoDB table names
+    /// - Sets `acceleration.snapshots: bootstrap_only` to restore from snapshot
     /// - Configures runtime snapshot location
-    ///
-    /// Returns `None` if no transformation is needed (e.g., Kafka with infinite retention).
     fn prepare_benchmark_spicepod(
         &self,
-        _spicepod: SpicepodDefinition,
-        _run_id: &str,
-        _config_name: &str,
-        _snapshot_config: &SnapshotConfig,
-    ) -> Option<SpicepodDefinition> {
-        None
-    }
+        spicepod: SpicepodDefinition,
+        run_id: &str,
+        config_name: &str,
+        snapshot_config: &SnapshotConfig,
+    ) -> SpicepodDefinition;
 }
