@@ -241,7 +241,13 @@ pub async fn create_checkpoint_and_snapshot(
         };
 
         match snapshot_manager
-            .create_snapshot(federated_schema, lock_guard, updated_at, row_count, force_create)
+            .create_snapshot(
+                federated_schema,
+                lock_guard,
+                updated_at,
+                row_count,
+                force_create,
+            )
             .await
         {
             Ok(Some(_)) => {

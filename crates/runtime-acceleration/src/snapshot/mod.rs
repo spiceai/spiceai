@@ -327,7 +327,9 @@ pub enum SnapshotDownloadError {
     },
     #[snafu(display("Snapshot schema mismatch for dataset {dataset}"))]
     SchemaMismatch { dataset: String },
-    #[snafu(display("Snapshot engine mismatch for dataset {dataset}. snapshot_engine={snapshot_engine} current_engine={current_engine}"))]
+    #[snafu(display(
+        "Snapshot engine mismatch for dataset {dataset}. snapshot_engine={snapshot_engine} current_engine={current_engine}"
+    ))]
     EngineMismatch {
         dataset: String,
         snapshot_engine: String,
@@ -2768,7 +2770,13 @@ mod tests {
         let last_updated_at = Some(1_704_153_600_000_i64); // 2024-01-02 00:00:00 UTC
 
         let _uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, last_updated_at, None, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                last_updated_at,
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -3720,7 +3728,13 @@ mod tests {
         let timestamp = 1_704_153_600_000_i64; // 2024-01-02 00:00:00 UTC
 
         let first_result = manager_always
-            .create_snapshot(&schema, lock_guard, Some(timestamp), None, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                Some(timestamp),
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect("first snapshot");
         assert!(first_result.is_some(), "First snapshot should be created");
@@ -3730,7 +3744,13 @@ mod tests {
 
         let lock_guard2 = Arc::clone(&mutex).lock_owned().await;
         let second_result = manager_on_change
-            .create_snapshot(&schema, lock_guard2, Some(timestamp), None, ForceCreate(false))
+            .create_snapshot(
+                &schema,
+                lock_guard2,
+                Some(timestamp),
+                None,
+                ForceCreate(false),
+            )
             .await
             .expect("second snapshot should not error");
 
@@ -3762,7 +3782,13 @@ mod tests {
         // First snapshot with valid timestamp should be created even with OnChange policy
         // (no existing snapshots means force_create is automatically set to true)
         let result = manager
-            .create_snapshot(&schema, lock_guard, Some(timestamp), None, ForceCreate(false))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                Some(timestamp),
+                None,
+                ForceCreate(false),
+            )
             .await
             .expect("create_snapshot should not error");
 
@@ -3963,7 +3989,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
-            engine: None,
+                engine: None,
                 schemas: vec![schema_metadata],
                 current_schema_id: 0,
                 snapshots: vec![SnapshotEntry {
@@ -4064,7 +4090,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
-            engine: None,
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![snapshot_entry],
@@ -4124,7 +4150,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
-            engine: None,
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![snapshot_entry],
@@ -4165,7 +4191,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
-            engine: None,
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![],
@@ -4238,7 +4264,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
-            engine: None,
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![snapshot_entry1, snapshot_entry2],
@@ -4311,7 +4337,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
-            engine: None,
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![snapshot_entry],
@@ -4732,10 +4758,7 @@ mod tests {
         let metadata: SnapshotMetadata =
             serde_json::from_value(old_metadata_json).expect("deserialize old metadata");
 
-        let dataset = metadata
-            .datasets
-            .get("my_dataset")
-            .expect("dataset exists");
+        let dataset = metadata.datasets.get("my_dataset").expect("dataset exists");
         assert!(dataset.engine.is_none(), "engine should default to None");
 
         let snapshot = dataset.snapshots.first().expect("snapshot exists");
