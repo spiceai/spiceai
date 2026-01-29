@@ -95,7 +95,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                runner: "spicehq-dev-runners",
+                runner: linuxRunner,
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
