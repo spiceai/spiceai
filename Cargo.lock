@@ -17616,6 +17616,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "spiceai",
+ "spicepod",
  "test-framework",
  "tokio",
  "tokio-util",

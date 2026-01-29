@@ -39,7 +39,7 @@ mod text_to_sql;
 pub use text_to_sql::TextToSqlArgs;
 
 mod streaming;
-pub use streaming::StreamingTestArgs;
+pub use streaming::StreamingDynamodbTestArgs;
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -72,8 +72,9 @@ pub enum TestCommands {
     Query(QueryArgs),
     /// Run a text-to-sql test
     TextToSql(TextToSqlArgs),
-    /// Run a streaming ingestion benchmark (`DynamoDB` Streams)
-    Streaming(StreamingTestArgs),
+    /// Run a streaming ingestion benchmark for DynamoDB Streams
+    #[command(name = "streaming-dynamodb")]
+    StreamingDynamodb(StreamingDynamodbTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

@@ -23,9 +23,23 @@ limitations under the License.
 //! Sources match on dataset type to know source-specific configuration (key schemas, etc.).
 
 use arrow::array::RecordBatch;
+use spicepod::spec::SpicepodDefinition;
 use test_framework::anyhow::Result;
 
 use super::datasets::DatasetType;
+
+/// Configuration for snapshot storage (S3).
+#[derive(Debug, Clone)]
+pub struct SnapshotConfig {
+    /// Base S3 location for snapshots (e.g., "s3://bucket/snapshots/")
+    pub location: String,
+    /// S3 access key ID
+    pub access_key_id: Option<String>,
+    /// S3 secret access key
+    pub secret_access_key: Option<String>,
+    /// S3 region
+    pub region: Option<String>,
+}
 
 /// Represents a table that can be generated and inserted into a streaming source.
 ///
@@ -107,4 +121,40 @@ pub trait StreamingSource: Send + Sync {
 
     /// Cleanup resources (stop containers, etc.).
     async fn cleanup(&self) -> Result<()>;
+
+    /// Transform spicepod for checkpoint capture phase.
+    ///
+    /// For sources that require checkpoint snapshots (e.g., DynamoDB), this method:
+    /// - Renames datasets with run_id prefix
+    /// - Sets `acceleration.snapshots: create_only`
+    /// - Configures runtime snapshot location
+    ///
+    /// Returns `None` if no transformation is needed (e.g., Kafka with infinite retention).
+    fn prepare_checkpoint_spicepod(
+        &self,
+        _spicepod: SpicepodDefinition,
+        _run_id: &str,
+        _config_name: &str,
+        _snapshot_config: &SnapshotConfig,
+    ) -> Option<SpicepodDefinition> {
+        None
+    }
+
+    /// Transform spicepod for benchmark phase.
+    ///
+    /// For sources that require checkpoint snapshots (e.g., DynamoDB), this method:
+    /// - Renames datasets with run_id prefix
+    /// - Sets `acceleration.snapshots: bootstrap_only`
+    /// - Configures runtime snapshot location
+    ///
+    /// Returns `None` if no transformation is needed (e.g., Kafka with infinite retention).
+    fn prepare_benchmark_spicepod(
+        &self,
+        _spicepod: SpicepodDefinition,
+        _run_id: &str,
+        _config_name: &str,
+        _snapshot_config: &SnapshotConfig,
+    ) -> Option<SpicepodDefinition> {
+        None
+    }
 }

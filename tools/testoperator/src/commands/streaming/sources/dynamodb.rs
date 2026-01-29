@@ -54,8 +54,14 @@ const TAG_RUN_ID: &str = "testoperator:run_id";
 /// Maximum age of tables before cleanup (24 hours).
 const STALE_TABLE_AGE_SECS: u64 = 24 * 60 * 60;
 
+use spicepod::acceleration::SnapshotBehavior;
+use spicepod::component::snapshot::Snapshots;
+use spicepod::component::ComponentOrReference;
+use spicepod::param::{ParamValue, Params};
+use spicepod::spec::SpicepodDefinition;
+
 use crate::commands::streaming::datasets::DatasetType;
-use crate::commands::streaming::traits::StreamingSource;
+use crate::commands::streaming::traits::{SnapshotConfig, StreamingSource};
 
 /// Configuration for AWS `DynamoDB` source.
 ///
@@ -1068,4 +1074,91 @@ impl StreamingSource for DynamoDbStreamsSource {
         println!("AWS DynamoDB cleanup complete (tables preserved)");
         Ok(())
     }
+
+    fn prepare_checkpoint_spicepod(
+        &self,
+        spicepod: SpicepodDefinition,
+        run_id: &str,
+        config_name: &str,
+        snapshot_config: &SnapshotConfig,
+    ) -> Option<SpicepodDefinition> {
+        Some(transform_spicepod(
+            spicepod,
+            run_id,
+            config_name,
+            snapshot_config,
+            SnapshotBehavior::CreateOnly,
+        ))
+    }
+
+    fn prepare_benchmark_spicepod(
+        &self,
+        spicepod: SpicepodDefinition,
+        run_id: &str,
+        config_name: &str,
+        snapshot_config: &SnapshotConfig,
+    ) -> Option<SpicepodDefinition> {
+        Some(transform_spicepod(
+            spicepod,
+            run_id,
+            config_name,
+            snapshot_config,
+            SnapshotBehavior::BootstrapOnly,
+        ))
+    }
+}
+
+/// Transform a spicepod for DynamoDB streaming benchmarks.
+///
+/// This function:
+/// 1. Renames all datasets with `{run_id}_` prefix
+/// 2. Sets `acceleration.snapshots` to the specified behavior
+/// 3. Configures runtime snapshots with unique location per config
+fn transform_spicepod(
+    mut spicepod: SpicepodDefinition,
+    run_id: &str,
+    config_name: &str,
+    snapshot_config: &SnapshotConfig,
+    snapshot_behavior: SnapshotBehavior,
+) -> SpicepodDefinition {
+    // 1. Rename datasets and set acceleration snapshot behavior
+    for dataset in &mut spicepod.datasets {
+        if let ComponentOrReference::Component(d) = dataset {
+            // Prefix dataset name
+            d.name = format!("{run_id}_{}", d.name);
+
+            // Set acceleration snapshot behavior
+            if let Some(ref mut accel) = d.acceleration {
+                accel.snapshots = snapshot_behavior.clone();
+            }
+        }
+    }
+
+    // 2. Configure runtime snapshots
+    let location = format!(
+        "{}/{}/{}/",
+        snapshot_config.location.trim_end_matches('/'),
+        run_id,
+        config_name
+    );
+
+    let mut params = Params::default();
+    if let Some(ref key) = snapshot_config.access_key_id {
+        params.data.insert("aws_access_key_id".to_string(), ParamValue::String(key.clone()));
+    }
+    if let Some(ref secret) = snapshot_config.secret_access_key {
+        params.data.insert("aws_secret_access_key".to_string(), ParamValue::String(secret.clone()));
+    }
+    if let Some(ref region) = snapshot_config.region {
+        params.data.insert("aws_region".to_string(), ParamValue::String(region.clone()));
+    }
+
+    spicepod.snapshots = Some(Snapshots {
+        enabled: true,
+        location: Some(location),
+        params: if params.data.is_empty() { None } else { Some(params) },
+        ..Default::default()
+    });
+
+    spicepod
 }

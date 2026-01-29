@@ -21,7 +21,7 @@ use crate::commands::streaming::querysets::QuerySetType;
 
 use super::CommonArgs;
 
-/// Arguments for streaming ingestion benchmarks.
+/// Arguments for DynamoDB streaming ingestion benchmarks.
 ///
 /// Source and dataset configuration is done via environment variables:
 ///
@@ -34,6 +34,12 @@ use super::CommonArgs;
 /// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
 /// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for LocalStack)
 ///
+/// ## Snapshot Storage (required for DynamoDB benchmarks)
+/// - `SNAPSHOT_S3_LOCATION`: S3 location for snapshots (e.g., `s3://bucket/snapshots/`)
+/// - `SNAPSHOT_S3_ACCESS_KEY_ID`: S3 access key ID (optional)
+/// - `SNAPSHOT_S3_SECRET_ACCESS_KEY`: S3 secret access key (optional)
+/// - `SNAPSHOT_S3_REGION`: S3 region (optional)
+///
 /// ## ClickBench data (`--queryset clickbench`)
 /// - `CLICKBENCH_S3_URI`: S3 URI to hits.parquet (e.g., `s3://bucket/path/hits.parquet`)
 /// - `CLICKBENCH_S3_ENDPOINT`: S3/MinIO endpoint (optional, for MinIO)
@@ -41,7 +47,7 @@ use super::CommonArgs;
 /// - `CLICKBENCH_S3_SECRET_ACCESS_KEY`: S3 secret access key (required when using S3)
 #[derive(Parser, Debug, Clone)]
 #[expect(clippy::struct_excessive_bools)]
-pub struct StreamingTestArgs {
+pub struct StreamingDynamodbTestArgs {
     #[command(flatten)]
     pub common: CommonArgs,
 
@@ -89,4 +95,23 @@ pub struct StreamingTestArgs {
     /// Random seed for reproducible mutation row selection
     #[arg(long, default_value = "42")]
     pub mutation_seed: u64,
+
+    // Multi-config benchmark arguments
+    /// Additional spicepod paths for multi-config benchmarks.
+    /// When multiple configs are provided, each is benchmarked against the same data.
+    #[arg(long = "spicepod-path", value_name = "PATH")]
+    pub additional_spicepod_paths: Vec<std::path::PathBuf>,
+
+    /// Run benchmark configs in parallel (may cause resource contention)
+    #[arg(long)]
+    pub parallel: bool,
+}
+
+impl StreamingDynamodbTestArgs {
+    /// Get all spicepod paths (common + additional).
+    pub fn all_spicepod_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut paths = vec![self.common.spicepod_path.clone()];
+        paths.extend(self.additional_spicepod_paths.clone());
+        paths
+    }
 }

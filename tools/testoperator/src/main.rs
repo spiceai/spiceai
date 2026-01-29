@@ -24,8 +24,8 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, StreamingTestArgs,
-    TestCommands, TextToSqlArgs,
+    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs,
+    StreamingDynamodbTestArgs, TestCommands, TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -93,10 +93,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(TestCommands::TextToSql(args)) => {
             commands::text_to_sql::run(&args).await?;
         }
-        Commands::Run(TestCommands::Streaming(args)) => {
-            commands::streaming::run(&args).await?;
+        Commands::Run(TestCommands::StreamingDynamodb(args)) => {
+            commands::streaming::run_dynamodb(&args).await?;
         }
-        Commands::Export(TestCommands::Streaming(StreamingTestArgs { common, .. })) => {
+        Commands::Export(TestCommands::StreamingDynamodb(StreamingDynamodbTestArgs {
+            common, ..
+        })) => {
             commands::env_export(&common).await?;
         }
         _ => {
