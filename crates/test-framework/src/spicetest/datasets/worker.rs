@@ -200,6 +200,7 @@ impl SpiceTestQueryWorker {
         self
     }
 
+    #[expect(dead_code)]
     pub fn with_validate_row_counts(mut self, validate_row_counts: bool) -> Self {
         self.validate_row_counts = validate_row_counts;
         self

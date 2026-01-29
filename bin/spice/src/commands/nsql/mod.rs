@@ -16,12 +16,14 @@ limitations under the License.
 
 //! `spice nsql` command - Natural language to SQL REPL.
 
+mod analyze;
+
 use crate::context::RuntimeContext;
 use crate::error::{
     ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
     Result,
 };
-use clap::Args;
+use clap::{Args, Subcommand};
 use repl::util::{Spinner, create_editor_with_history, save_history};
 use serde::Serialize;
 use snafu::ResultExt;
@@ -33,6 +35,16 @@ pub struct NsqlArgs {
     /// Model to use for text-to-SQL conversion
     #[arg(long, short)]
     pub model: Option<String>,
+
+    #[command(subcommand)]
+    pub command: Option<NsqlCommands>,
+}
+
+/// NSQL subcommands.
+#[derive(Subcommand, Debug)]
+pub enum NsqlCommands {
+    /// Analyze Text-to-SQL performance by comparing generated SQL against expected SQL
+    Analyze(analyze::AnalyzeArgs),
 }
 
 /// Request body for the nsql endpoint.
@@ -68,6 +80,11 @@ async fn get_or_select_model(ctx: &RuntimeContext, model: Option<&str>) -> Resul
 ///
 /// Returns an error if the API requests fail or input/output fails.
 pub async fn execute(ctx: &RuntimeContext, args: &NsqlArgs) -> Result<()> {
+    // Handle subcommands
+    if let Some(NsqlCommands::Analyze(analyze_args)) = &args.command {
+        return analyze::execute(ctx, analyze_args).await;
+    }
+
     println!("Welcome to the Spice.ai NSQL REPL!");
 
     // Get or select the model
