@@ -36,6 +36,7 @@ opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 rand.workspace = true
+rcgen = { version = "0.13", features = ["x509-parser"] }
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
@@ -48,6 +49,7 @@ spicepod = { path = "../spicepod" }
 sysinfo = "0.37.2"
 telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
+time = "0.3"
 tokio.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
