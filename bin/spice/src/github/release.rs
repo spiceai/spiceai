@@ -356,13 +356,36 @@ impl SystemType {
     /// This handles the naming change between versions:
     /// - v1.11+/trunk: `spiced_metal_...` (models included by default)
     /// - v1.11 and earlier: `spiced_models_metal_...` (models suffix explicit)
-    pub fn runtime_asset_names(&self, _flavor: &str, allow_accelerator: bool) -> Vec<String> {
+    ///
+    /// # Arguments
+    /// * `flavor` - The flavor to install: "default" (auto-detect), or "cuda" (explicit CUDA)
+    pub fn runtime_asset_names(&self, flavor: &str) -> Vec<String> {
         let mut names = Vec::new();
 
-        if allow_accelerator && let Some(accelerator) = detect_accelerator() {
+        // Determine the accelerator based on flavor
+        let accelerator = match flavor {
+            "cuda" => {
+                // Explicit CUDA request - try to detect CUDA version
+                #[cfg(target_os = "linux")]
+                {
+                    get_cuda_version()
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    tracing::warn!("CUDA flavor is only supported on Linux");
+                    None
+                }
+            }
+            _ => {
+                // Default: auto-detect accelerator
+                detect_accelerator()
+            }
+        };
+
+        if let Some(accel) = accelerator {
             // New naming (v1.11+/trunk): accelerator without "models_" prefix
             names.push(format!(
-                "{prefix}_{accelerator}_{os}_{arch}.tar.gz",
+                "{prefix}_{accel}_{os}_{arch}.tar.gz",
                 prefix = self.runtime_asset_prefix(),
                 os = self.os_type_name(),
                 arch = self.arch()
@@ -370,7 +393,7 @@ impl SystemType {
 
             // Old naming (v1.11 and earlier): with "models_" prefix
             names.push(format!(
-                "{prefix}_models_{accelerator}_{os}_{arch}.tar.gz",
+                "{prefix}_models_{accel}_{os}_{arch}.tar.gz",
                 prefix = self.runtime_asset_prefix(),
                 os = self.os_type_name(),
                 arch = self.arch()
@@ -533,7 +556,7 @@ mod tests {
     }
 
     #[rstest]
-    // ai and default flavors on x86
+    // default flavor on x86 - auto-detects accelerator, but in tests no accelerator is present
     #[case(SystemType::linux_x86(), "default", "spiced_linux_x86_64.tar.gz")]
     #[case(SystemType::darwin_x86(), "default", "spiced_darwin_x86_64.tar.gz")]
     #[case(
@@ -541,10 +564,7 @@ mod tests {
         "default",
         "spiced.exe_windows_x86_64.tar.gz"
     )]
-    #[case(SystemType::linux_x86(), "ai", "spiced_linux_x86_64.tar.gz")]
-    #[case(SystemType::darwin_x86(), "ai", "spiced_darwin_x86_64.tar.gz")]
-    #[case(SystemType::windows_x86(), "ai", "spiced.exe_windows_x86_64.tar.gz")]
-    // ai and default flavors on arm
+    // default flavor on arm
     #[case(SystemType::linux_arm(), "default", "spiced_linux_aarch64.tar.gz")]
     #[case(SystemType::darwin_arm(), "default", "spiced_darwin_aarch64.tar.gz")]
     #[case(
@@ -552,15 +572,12 @@ mod tests {
         "default",
         "spiced.exe_windows_aarch64.tar.gz"
     )]
-    #[case(SystemType::linux_arm(), "ai", "spiced_linux_aarch64.tar.gz")]
-    #[case(SystemType::darwin_arm(), "ai", "spiced_darwin_aarch64.tar.gz")]
-    #[case(SystemType::windows_arm(), "ai", "spiced.exe_windows_aarch64.tar.gz")]
-    // random flavor on x86
-    #[case(SystemType::linux_x86(), "random", "spiced_linux_x86_64.tar.gz")]
-    #[case(SystemType::darwin_x86(), "random", "spiced_darwin_x86_64.tar.gz")]
+    // unknown flavor falls back to default behavior
+    #[case(SystemType::linux_x86(), "unknown", "spiced_linux_x86_64.tar.gz")]
+    #[case(SystemType::darwin_x86(), "unknown", "spiced_darwin_x86_64.tar.gz")]
     #[case(
         SystemType::windows_x86(),
-        "random",
+        "unknown",
         "spiced.exe_windows_x86_64.tar.gz"
     )]
     fn test_runtime_asset_names(
@@ -568,9 +585,9 @@ mod tests {
         #[case] flavor: &str,
         #[case] expected: &str,
     ) {
-        // With allow_accelerator = false, the list should only contain the base name
-        let names = os_type.runtime_asset_names(flavor, false);
-        assert_eq!(names.len(), 1);
-        assert_eq!(names[0], expected);
+        // In test environment, no accelerator is detected, so the list contains only the base name
+        let names = os_type.runtime_asset_names(flavor);
+        // The last entry should always be the fallback base name
+        assert!(names.last().is_some_and(|n| n == expected));
     }
 }

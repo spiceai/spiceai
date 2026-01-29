@@ -138,11 +138,9 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
         // Prepare installation directory
         ctx.prepare_install_dir()?;
 
-        // TODO: control accelerator usage via CLI flag. Default to always install if available (e.g. metal, CUDA)
-        let allow_accelerator = true;
-
         // Get possible runtime asset names (handles version-specific naming)
-        let asset_names = SystemType::this_pc().runtime_asset_names("default", allow_accelerator);
+        // Default flavor auto-detects accelerator (Metal on macOS, CUDA on Linux)
+        let asset_names = SystemType::this_pc().runtime_asset_names("default");
         tracing::info!("Upgrading Spice runtime to {target_version}...");
 
         let downloaded_asset = download_release_asset_with_fallback(
