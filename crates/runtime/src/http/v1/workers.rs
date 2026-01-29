@@ -36,10 +36,6 @@ pub struct WorkersQueryParams {
     pub format: Format,
 }
 
-// Re-export shared types for backwards compatibility
-pub use runtime_api_types::v1::WorkerInfo as WorkerResponseItem;
-pub use runtime_api_types::v1::WorkerListResponse as WorkerResponse;
-
 fn worker_details(worker: &Arc<dyn Worker>) -> WorkerInfo {
     WorkerInfo {
         name: worker.name().to_string(),
@@ -122,9 +118,7 @@ pub(crate) async fn get(
     }
 }
 
-fn convert_details_to_csv(
-    workers: &[WorkerInfo],
-) -> Result<String, Box<dyn std::error::Error>> {
+fn convert_details_to_csv(workers: &[WorkerInfo]) -> Result<String, Box<dyn std::error::Error>> {
     let mut w = Writer::from_writer(vec![]);
     for worker in workers {
         let _ = w.serialize(worker);

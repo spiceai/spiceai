@@ -33,7 +33,6 @@ use crate::metrics;
 // Re-export ComponentStatus from the shared API types crate
 pub use runtime_api_types::v1::ComponentStatus;
 
-
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeStatus {
     /// Stores the current status of all components.

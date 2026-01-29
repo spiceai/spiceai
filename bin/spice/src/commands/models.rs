@@ -46,7 +46,7 @@ impl TableRow for ModelInfo {
             self.owned_by.clone(),
             self.status
                 .as_ref()
-                .map_or(String::new(), |s| s.to_string()),
+                .map_or_else(String::new, ToString::to_string),
         ]
     }
 }

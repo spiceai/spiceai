@@ -48,7 +48,7 @@ impl TableRow for DatasetInfo {
             self.acceleration_enabled.to_string(),
             self.status
                 .as_ref()
-                .map_or(String::new(), |s| s.to_string()),
+                .map_or_else(String::new, ToString::to_string),
         ]
     }
 }

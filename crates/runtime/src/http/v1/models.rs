@@ -54,7 +54,6 @@ pub struct ModelsQueryParams {
 // Re-export shared types for backwards compatibility
 pub use runtime_api_types::v1::ModelInfo as OpenAIModel;
 pub use runtime_api_types::v1::ModelListResponse as OpenAIModelResponse;
-pub use runtime_api_types::v1::ModelMetadata as Metadata;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) enum MetadataKeys {
