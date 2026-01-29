@@ -478,8 +478,52 @@ fn extract_table_scans(
 
 /// Finds the SQL query's schema by running the SQL against `v1/sql` endpoint.
 ///
-/// Attempts to use more efficient SQL with equivalent outputs.
+/// Uses `DESCRIBE <sql>` (Apache `DataFusion` v51+) for efficiency, falls back to running the query if unavailable.
 pub async fn sql_schema(
+    http_client: Client,
+    http_base_url: &str,
+    sql: &str,
+) -> Result<Schema, anyhow::Error> {
+    match sql_schema_describe(http_client.clone(), http_base_url, sql).await {
+        Ok(schema) => Ok(schema),
+        Err(_) => sql_schema_fallback(http_client, http_base_url, sql).await,
+    }
+}
+
+/// Uses `DESCRIBE <sql>` to get the schema without executing the query.
+async fn sql_schema_describe(
+    http_client: Client,
+    http_base_url: &str,
+    sql: &str,
+) -> Result<Schema, anyhow::Error> {
+    let url = format!("{http_base_url}/v1/sql");
+
+    let response = http_client
+        .post(&url)
+        .body(format!("DESCRIBE {}", sql.strip_suffix(";").unwrap_or(sql)))
+        .header("Content-Type", "text/plain")
+        .header("Accept", "application/vnd.spiceai.nsql.v1+json")
+        .send()
+        .await?;
+
+    let mut json: Value = response.json().await?;
+    let Some(schema) = json.get_mut("schema") else {
+        return Err(anyhow::anyhow!(
+            "Failed to extract schema from DESCRIBE response"
+        ));
+    };
+    let Some(f) = schema.get_mut("fields") else {
+        return Err(anyhow::anyhow!(
+            "Failed to extract fields from DESCRIBE schema"
+        ));
+    };
+    let fields: Vec<Field> = serde_json::from_value(f.take())
+        .map_err(|e| anyhow::anyhow!("Failed to deserialize fields from DESCRIBE schema: {e}"))?;
+    Ok(Schema::new(fields))
+}
+
+/// Fallback method: runs the query with LIMIT 1 to extract schema.
+async fn sql_schema_fallback(
     http_client: Client,
     http_base_url: &str,
     sql: &str,
