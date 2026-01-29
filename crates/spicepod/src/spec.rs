@@ -139,3 +139,16 @@ pub enum SpicepodKind {
     #[default]
     Spicepod,
 }
+
+impl SpicepodDefinition {
+    /// Create a new `SpicepodDefinition` with the given name.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: SpicepodVersion::V1,
+            kind: SpicepodKind::Spicepod,
+            ..Default::default()
+        }
+    }
+}

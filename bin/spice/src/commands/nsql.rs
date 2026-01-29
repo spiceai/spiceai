@@ -17,11 +17,14 @@ limitations under the License.
 //! `spice nsql` command - Natural language to SQL REPL.
 
 use crate::context::RuntimeContext;
-use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
+use crate::error::{
+    ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
+    Result,
+};
 use clap::Args;
-use serde::{Deserialize, Serialize};
+use repl::util::{Spinner, create_editor_with_history, save_history};
+use serde::Serialize;
 use snafu::ResultExt;
-use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
 /// Arguments for the `nsql` command.
@@ -39,16 +42,24 @@ struct NsqlRequest {
     model: String,
 }
 
-/// Model information from the models endpoint.
-#[derive(Deserialize)]
-struct Model {
-    id: String,
-}
-
-/// Response from the models endpoint.
-#[derive(Deserialize)]
-struct ModelsResponse {
-    data: Vec<Model>,
+/// Get or validate a model using the runtime context.
+async fn get_or_select_model(ctx: &RuntimeContext, model: Option<&str>) -> Result<String> {
+    let headers: Vec<(String, String)> = ctx.get_headers().into_iter().collect();
+    repl::util::get_or_select_model(ctx.http_client(), ctx.http_endpoint(), &headers, model)
+        .await
+        .map_err(|e| match e {
+            repl::util::UtilError::ModelNotFound { model, available } => {
+                ModelNotFoundSnafu { model, available }.build()
+            }
+            repl::util::UtilError::NoModelsConfigured => NoModelsConfiguredSnafu.build(),
+            repl::util::UtilError::ConnectionFailed { endpoint, source } => InvalidResponseSnafu {
+                message: format!("Failed to connect to {endpoint}: {source}"),
+            }
+            .build(),
+            repl::util::UtilError::InvalidResponse { message } => {
+                InvalidResponseSnafu { message }.build()
+            }
+        })
 }
 
 /// Execute the `nsql` command.
@@ -60,10 +71,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &NsqlArgs) -> Result<()> {
     println!("Welcome to the Spice.ai NSQL REPL!");
 
     // Get or select the model
-    let model = match &args.model {
-        Some(m) => m.clone(),
-        None => select_model(ctx).await?,
-    };
+    let model = get_or_select_model(ctx, args.model.as_deref()).await?;
 
     println!("\nUsing model:\n {model}");
     println!("\nEnter a query in natural language.");
@@ -72,115 +80,47 @@ pub async fn execute(ctx: &RuntimeContext, args: &NsqlArgs) -> Result<()> {
     run_repl(ctx, &model).await
 }
 
-/// Select a model from available models.
-async fn select_model(ctx: &RuntimeContext) -> Result<String> {
-    let url = format!("{}/v1/models?status=true", ctx.http_endpoint());
-
-    let mut request = ctx.http_client().get(&url);
-    for (key, value) in ctx.get_headers() {
-        request = request.header(&key, &value);
-    }
-
-    let response = request
-        .send()
-        .await
-        .context(ConnectionFailedSnafu { endpoint: &url })?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(InvalidResponseSnafu {
-            message: format!("Failed to get models: {status} - {text}"),
-        }
-        .build());
-    }
-
-    let models: ModelsResponse = response.json().await.map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to parse models response: {e}"),
-        }
-        .build()
-    })?;
-
-    if models.data.is_empty() {
-        return Err(InvalidResponseSnafu {
-            message: "No models found. Please configure a model in your Spicepod.".to_string(),
-        }
-        .build());
-    }
-
-    // If only one model, use it
-    if models.data.len() == 1 {
-        return Ok(models.data[0].id.clone());
-    }
-
-    // Let user select from multiple models
-    println!("\nAvailable models:");
-    for (i, model) in models.data.iter().enumerate() {
-        println!("  {}: {}", i + 1, model.id);
-    }
-
-    print!("Select model (1-{}): ", models.data.len());
-    let _ = io::stdout().flush();
-
-    let stdin = io::stdin();
-    let mut input = String::new();
-    stdin.lock().read_line(&mut input).map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to read input: {e}"),
-        }
-        .build()
-    })?;
-
-    let selection: usize = input.trim().parse().map_err(|_| {
-        InvalidResponseSnafu {
-            message: "Invalid selection".to_string(),
-        }
-        .build()
-    })?;
-
-    if selection == 0 || selection > models.data.len() {
-        return Err(InvalidResponseSnafu {
-            message: format!("Selection must be between 1 and {}", models.data.len()),
-        }
-        .build());
-    }
-
-    Ok(models.data[selection - 1].id.clone())
-}
-
 /// Run the REPL loop.
 async fn run_repl(ctx: &RuntimeContext, model: &str) -> Result<()> {
-    let stdin = io::stdin();
+    let (mut rl, history_path) = create_editor_with_history("nsql_history.txt").map_err(|e| {
+        InvalidResponseSnafu {
+            message: e.to_string(),
+        }
+        .build()
+    })?;
 
     loop {
-        print!("nsql> ");
-        let _ = io::stdout().flush();
-
-        let mut input = String::new();
-        match stdin.lock().read_line(&mut input) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+        let readline = rl.readline("nsql> ");
+        let user_input = match readline {
+            Ok(line) => line,
+            Err(
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
+            ) => {
+                break;
+            }
             Err(e) => {
                 eprintln!("Error reading input: {e}");
                 continue;
             }
-        }
+        };
 
-        let query = input.trim();
+        let query = user_input.trim();
         if query.is_empty() {
             println!("Enter a No-SQL (natural language) query.");
             continue;
         }
+
+        // Add to history
+        let _ = rl.add_history_entry(query);
 
         // Handle exit commands
         if query == "exit" || query == "quit" || query == ".exit" || query == ".quit" {
             break;
         }
 
-        // Execute the query
+        // Execute the query with spinner
         let start = Instant::now();
-        match send_nsql_request(ctx, query, model).await {
+        match send_nsql_request_with_spinner(ctx, query, model).await {
             Ok(result) => {
                 let elapsed = start.elapsed().as_secs_f64();
                 display_result(&result, elapsed);
@@ -191,7 +131,25 @@ async fn run_repl(ctx: &RuntimeContext, model: &str) -> Result<()> {
         }
     }
 
+    // Save history
+    save_history(&mut rl, history_path.as_ref());
+
     Ok(())
+}
+
+/// Send a request to the nsql endpoint with spinner.
+async fn send_nsql_request_with_spinner(
+    ctx: &RuntimeContext,
+    query: &str,
+    model: &str,
+) -> Result<String> {
+    let spinner = Spinner::start();
+
+    let result = send_nsql_request(ctx, query, model).await;
+
+    spinner.stop().await;
+
+    result
 }
 
 /// Send a request to the nsql endpoint.

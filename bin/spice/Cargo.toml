@@ -71,6 +71,9 @@ comfy-table = "7"
 # Line editor for REPL
 rustyline = "17"
 
+# Interactive CLI prompts (arrow-key selection)
+dialoguer = "0.11"
+
 # Random number generation (for auth codes)
 rand = "0.9"
 
@@ -86,7 +89,10 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 time = "0.3"
 
 # Internal crates
-flightrepl = { path = "../../crates/flightrepl" }
+repl = { path = "../../crates/repl" }
+spicepod = { path = "../../crates/spicepod", default-features = false }
+spiceai = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
 
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]
@@ -94,6 +100,9 @@ nix = { version = "0.29", features = ["signal", "process"] }
 
 [build-dependencies]
 # None needed - we use include_str! for version
+
+[features]
+release = []
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -17,12 +17,16 @@ limitations under the License.
 //! `spice chat` command - Chat with an LLM.
 
 use crate::context::RuntimeContext;
-use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
+use crate::error::{
+    ConnectionFailedSnafu, InvalidResponseSnafu, ModelNotFoundSnafu, NoModelsConfiguredSnafu,
+    Result,
+};
 use clap::Args;
 use futures::StreamExt;
+use repl::util::{Spinner, create_editor_with_history, save_history};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Read, Write};
 use std::time::Instant;
 
 /// Arguments for the `chat` command.
@@ -38,6 +42,22 @@ pub struct ChatArgs {
     /// Temperature for sampling (0.0 = deterministic, higher = more random)
     #[arg(long)]
     pub temperature: Option<f32>,
+
+    /// Remote Spice instance HTTP endpoint (e.g., `http://localhost:8090`)
+    #[arg(long)]
+    pub endpoint: Option<String>,
+
+    /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
+    #[arg(long = "headers", value_name = "KEY:VALUE")]
+    pub custom_headers: Vec<String>,
+}
+
+/// Configuration for chat operations.
+struct ChatConfig<'a> {
+    model: &'a str,
+    temperature: Option<f32>,
+    endpoint: Option<&'a str>,
+    custom_headers: &'a [String],
 }
 
 /// A chat message.
@@ -70,7 +90,6 @@ struct StreamOptions {
 struct ChatChunk {
     choices: Vec<ChunkChoice>,
     #[serde(default)]
-    #[expect(dead_code)]
     usage: Option<Usage>,
 }
 
@@ -88,24 +107,83 @@ struct Delta {
 }
 
 /// Token usage statistics.
-#[derive(Deserialize, Default)]
-#[expect(dead_code, clippy::struct_field_names)]
+#[derive(Deserialize, Default, Clone)]
+#[expect(clippy::struct_field_names)]
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[expect(dead_code)]
     total_tokens: u32,
 }
 
-/// Model information.
-#[derive(Deserialize)]
-struct Model {
-    id: String,
+/// Chat response with timing and usage statistics.
+struct ChatResponse {
+    content: String,
+    total_duration: std::time::Duration,
+    first_token_duration: Option<std::time::Duration>,
+    usage: Option<Usage>,
 }
 
-/// Models response.
-#[derive(Deserialize)]
-struct ModelsResponse {
-    data: Vec<Model>,
+impl ChatResponse {
+    /// Format the stats output like the Go CLI:
+    /// `Time: 3.36s (first token 0.45s). Tokens: 1652. Prompt: 1475. Completion: 177 (292.25/s).`
+    fn format_stats(&self) -> String {
+        let total_secs = self.total_duration.as_secs_f64();
+
+        let first_token_part = self.first_token_duration.map_or(String::new(), |d| {
+            format!(" (first token {:.2}s)", d.as_secs_f64())
+        });
+
+        if let Some(usage) = &self.usage {
+            let total_tokens = usage.prompt_tokens + usage.completion_tokens;
+            let completion_rate = if total_secs > 0.0 {
+                let rate = f64::from(usage.completion_tokens) / total_secs;
+                format!(" ({rate:.2}/s)")
+            } else {
+                String::new()
+            };
+            format!(
+                "Time: {total_secs:.2}s{first_token_part}. Tokens: {total_tokens}. Prompt: {}. Completion: {}{completion_rate}.",
+                usage.prompt_tokens, usage.completion_tokens
+            )
+        } else {
+            format!("Time: {total_secs:.2}s{first_token_part}.")
+        }
+    }
+}
+
+/// Get or validate a model using the runtime context.
+async fn get_or_select_model(
+    ctx: &RuntimeContext,
+    model: Option<&str>,
+    endpoint: Option<&str>,
+    custom_headers: &[String],
+) -> Result<String> {
+    let base_endpoint = endpoint.unwrap_or_else(|| ctx.http_endpoint());
+    let mut headers: Vec<(String, String)> = ctx.get_headers().into_iter().collect();
+
+    // Add custom headers from command line
+    for header in custom_headers {
+        if let Some((key, value)) = header.split_once(':') {
+            headers.push((key.trim().to_string(), value.trim().to_string()));
+        }
+    }
+
+    repl::util::get_or_select_model(ctx.http_client(), base_endpoint, &headers, model)
+        .await
+        .map_err(|e| match e {
+            repl::util::UtilError::ModelNotFound { model, available } => {
+                ModelNotFoundSnafu { model, available }.build()
+            }
+            repl::util::UtilError::NoModelsConfigured => NoModelsConfiguredSnafu.build(),
+            repl::util::UtilError::ConnectionFailed { endpoint, source } => InvalidResponseSnafu {
+                message: format!("Failed to connect to {endpoint}: {source}"),
+            }
+            .build(),
+            repl::util::UtilError::InvalidResponse { message } => {
+                InvalidResponseSnafu { message }.build()
+            }
+        })
 }
 
 /// Execute the `chat` command.
@@ -115,19 +193,60 @@ struct ModelsResponse {
 /// Returns an error if the API requests fail or input/output fails.
 pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
     // Get or select the model
-    let model = match &args.model {
-        Some(m) => m.clone(),
-        None => select_model(ctx).await?,
+    let model = get_or_select_model(
+        ctx,
+        args.model.as_deref(),
+        args.endpoint.as_deref(),
+        &args.custom_headers,
+    )
+    .await?;
+
+    // Check if running in a terminal (interactive) vs piped input
+    let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+
+    // Read piped stdin if available
+    let stdin_input = if is_terminal {
+        None
+    } else {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).ok();
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     };
 
-    // If a message was provided on command line, send it and exit
-    if let Some(message) = &args.message {
+    // Combine piped input with command line message
+    let message = match (&args.message, stdin_input) {
+        (Some(arg_msg), Some(stdin_msg)) => Some(format!("{stdin_msg}\n{arg_msg}")),
+        (Some(arg_msg), None) => Some(arg_msg.clone()),
+        (None, Some(stdin_msg)) => Some(stdin_msg),
+        (None, None) => None,
+    };
+
+    // Create chat config
+    let config = ChatConfig {
+        model: &model,
+        temperature: args.temperature,
+        endpoint: args.endpoint.as_deref(),
+        custom_headers: &args.custom_headers,
+    };
+
+    // If a message was provided (command line or piped), send it and exit
+    if let Some(message) = message {
         let messages = vec![Message {
             role: "user".to_string(),
-            content: message.clone(),
+            content: message,
         }];
-        send_chat_streaming(ctx, &model, &messages, args.temperature, false).await?;
-        println!();
+        let response = send_chat_streaming(ctx, &config, &messages, false).await?;
+        // Only show stats if running in a terminal
+        if is_terminal {
+            println!("\n\n{}\n", response.format_stats());
+        } else {
+            println!();
+        }
         return Ok(());
     }
 
@@ -136,109 +255,42 @@ pub async fn execute(ctx: &RuntimeContext, args: &ChatArgs) -> Result<()> {
     println!("\nUsing model:\n {model}");
     println!("\nType your message and press Enter. Type 'exit' to quit.\n");
 
-    run_repl(ctx, &model, args.temperature).await
-}
-
-/// Select a model from available models.
-async fn select_model(ctx: &RuntimeContext) -> Result<String> {
-    let url = format!("{}/v1/models?status=true", ctx.http_endpoint());
-
-    let mut request = ctx.http_client().get(&url);
-    for (key, value) in ctx.get_headers() {
-        request = request.header(&key, &value);
-    }
-
-    let response = request
-        .send()
-        .await
-        .context(ConnectionFailedSnafu { endpoint: &url })?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(InvalidResponseSnafu {
-            message: format!("Failed to get models: {status} - {text}"),
-        }
-        .build());
-    }
-
-    let models: ModelsResponse = response.json().await.map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to parse models response: {e}"),
-        }
-        .build()
-    })?;
-
-    if models.data.is_empty() {
-        return Err(InvalidResponseSnafu {
-            message: "No models found. Please configure a model in your Spicepod.".to_string(),
-        }
-        .build());
-    }
-
-    // If only one model, use it
-    if models.data.len() == 1 {
-        return Ok(models.data[0].id.clone());
-    }
-
-    // Let user select
-    println!("\nAvailable models:");
-    for (i, model) in models.data.iter().enumerate() {
-        println!("  {}: {}", i + 1, model.id);
-    }
-
-    print!("Select model (1-{}): ", models.data.len());
-    let _ = io::stdout().flush();
-
-    let stdin = io::stdin();
-    let mut input = String::new();
-    stdin.lock().read_line(&mut input).map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to read input: {e}"),
-        }
-        .build()
-    })?;
-
-    let selection: usize = input.trim().parse().map_err(|_| {
-        InvalidResponseSnafu {
-            message: "Invalid selection".to_string(),
-        }
-        .build()
-    })?;
-
-    if selection == 0 || selection > models.data.len() {
-        return Err(InvalidResponseSnafu {
-            message: format!("Selection must be between 1 and {}", models.data.len()),
-        }
-        .build());
-    }
-
-    Ok(models.data[selection - 1].id.clone())
+    run_repl(ctx, &config).await
 }
 
 /// Run the REPL loop.
-async fn run_repl(ctx: &RuntimeContext, model: &str, temperature: Option<f32>) -> Result<()> {
-    let stdin = io::stdin();
+async fn run_repl(ctx: &RuntimeContext, config: &ChatConfig<'_>) -> Result<()> {
+    let (mut rl, history_path) = create_editor_with_history("chat_history.txt").map_err(|e| {
+        InvalidResponseSnafu {
+            message: e.to_string(),
+        }
+        .build()
+    })?;
+
     let mut messages: Vec<Message> = Vec::new();
 
     loop {
-        print!("chat> ");
-        let _ = io::stdout().flush();
-
-        let mut input = String::new();
-        match stdin.lock().read_line(&mut input) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+        let readline = rl.readline("chat> ");
+        let user_input = match readline {
+            Ok(line) => line,
+            Err(
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
+            ) => {
+                break;
+            }
             Err(e) => {
                 eprintln!("Error reading input: {e}");
                 continue;
             }
-        }
+        };
 
-        let user_input = input.trim();
+        let user_input = user_input.trim();
         if user_input.is_empty() {
             continue;
         }
+
+        // Add to history
+        let _ = rl.add_history_entry(user_input);
 
         // Handle exit commands
         if user_input == "exit"
@@ -249,10 +301,27 @@ async fn run_repl(ctx: &RuntimeContext, model: &str, temperature: Option<f32>) -
             break;
         }
 
-        // Handle clear history
+        // Handle clear screen
         if user_input.to_lowercase() == ".clear" {
+            print!("\x1b[H\x1b[2J");
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        // Handle clear history (both in-memory and persistent)
+        if user_input.to_lowercase() == ".clear history" {
             messages.clear();
-            println!("Chat history cleared.");
+            let _ = rl.clear_history();
+            // Clear persistent history file
+            if let Some(path) = &history_path {
+                if std::fs::remove_file(path).is_ok() {
+                    println!("Chat history cleared.");
+                } else {
+                    println!("Chat history cleared (in-memory only).");
+                }
+            } else {
+                println!("Chat history cleared.");
+            }
             continue;
         }
 
@@ -263,18 +332,17 @@ async fn run_repl(ctx: &RuntimeContext, model: &str, temperature: Option<f32>) -
         });
 
         // Send and stream response
-        let start = Instant::now();
-        match send_chat_streaming(ctx, model, &messages, temperature, true).await {
-            Ok(response_content) => {
+        match send_chat_streaming(ctx, config, &messages, true).await {
+            Ok(response) => {
+                // Print stats first before consuming content
+                println!("\n\n{}\n", response.format_stats());
                 // Add assistant response to history
-                if !response_content.is_empty() {
+                if !response.content.is_empty() {
                     messages.push(Message {
                         role: "assistant".to_string(),
-                        content: response_content,
+                        content: response.content,
                     });
                 }
-                let elapsed = start.elapsed();
-                println!("\n\n[{:.2}s]\n", elapsed.as_secs_f64());
             }
             Err(e) => {
                 eprintln!("\x1b[31mError\x1b[0m {e}");
@@ -284,24 +352,28 @@ async fn run_repl(ctx: &RuntimeContext, model: &str, temperature: Option<f32>) -
         }
     }
 
+    // Save history
+    save_history(&mut rl, history_path.as_ref());
+
     Ok(())
 }
 
 /// Send a chat request with streaming response.
 async fn send_chat_streaming(
     ctx: &RuntimeContext,
-    model: &str,
+    config: &ChatConfig<'_>,
     messages: &[Message],
-    temperature: Option<f32>,
-    _interactive: bool,
-) -> Result<String> {
-    let url = format!("{}/v1/chat/completions", ctx.http_endpoint());
+    interactive: bool,
+) -> Result<ChatResponse> {
+    let start_time = Instant::now();
+    let base_endpoint = config.endpoint.unwrap_or_else(|| ctx.http_endpoint());
+    let url = format!("{base_endpoint}/v1/chat/completions");
 
     let body = ChatRequest {
         messages: messages.to_vec(),
-        model: model.to_string(),
+        model: config.model.to_string(),
         stream: true,
-        temperature,
+        temperature: config.temperature,
         stream_options: Some(StreamOptions {
             include_usage: true,
         }),
@@ -318,12 +390,30 @@ async fn send_chat_streaming(
         request = request.header(&key, &value);
     }
 
+    // Add custom headers from command line
+    for header in config.custom_headers {
+        if let Some((key, value)) = header.split_once(':') {
+            request = request.header(key.trim(), value.trim());
+        }
+    }
+
+    // Start spinner in interactive mode
+    let spinner = if interactive {
+        Some(Spinner::start())
+    } else {
+        None
+    };
+
     let response = request
         .send()
         .await
         .context(ConnectionFailedSnafu { endpoint: &url })?;
 
     if !response.status().is_success() {
+        // Stop spinner on error
+        if let Some(s) = spinner {
+            s.stop().await;
+        }
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         return Err(InvalidResponseSnafu {
@@ -335,6 +425,9 @@ async fn send_chat_streaming(
     // Stream the response
     let mut full_response = String::new();
     let mut stream = response.bytes_stream();
+    let mut spinner = spinner;
+    let mut first_token_time: Option<std::time::Duration> = None;
+    let mut usage: Option<Usage> = None;
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
@@ -355,8 +448,20 @@ async fn send_chat_streaming(
 
                 // Parse the JSON chunk
                 if let Ok(chat_chunk) = serde_json::from_str::<ChatChunk>(data) {
+                    // Capture usage from the final chunk (if present)
+                    if chat_chunk.usage.is_some() {
+                        usage = chat_chunk.usage;
+                    }
+
                     for choice in &chat_chunk.choices {
                         if let Some(content) = &choice.delta.content {
+                            // Record first token time and stop spinner
+                            if first_token_time.is_none() {
+                                first_token_time = Some(start_time.elapsed());
+                                if let Some(s) = spinner.take() {
+                                    s.stop().await;
+                                }
+                            }
                             print!("{content}");
                             let _ = io::stdout().flush();
                             full_response.push_str(content);
@@ -367,5 +472,17 @@ async fn send_chat_streaming(
         }
     }
 
-    Ok(full_response)
+    // Ensure spinner is stopped
+    if let Some(s) = spinner {
+        s.stop().await;
+    }
+
+    let total_duration = start_time.elapsed();
+
+    Ok(ChatResponse {
+        content: full_response,
+        total_duration,
+        first_token_duration: first_token_time,
+        usage,
+    })
 }
