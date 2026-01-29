@@ -256,7 +256,7 @@ impl<'input> Parser<'input> {
         Ok(ArrowDataType::Struct(fields.into()))
     }
 
-    fn token_is_identifier(&self, token: &Token<'input>) -> bool {
+    fn token_is_identifier(token: &Token<'input>) -> bool {
         matches!(
             token,
             Token::BigInt
@@ -289,7 +289,7 @@ impl<'input> Parser<'input> {
                 self.advance();
                 name.to_string()
             }
-            Some(Ok(token)) if self.token_is_identifier(&token) => {
+            Some(Ok(token)) if Self::token_is_identifier(&token) => {
                 let name = self.lexer.slice().to_string();
                 self.advance();
                 name
