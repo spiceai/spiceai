@@ -1174,7 +1174,7 @@ impl Runtime {
 
         let ctx = &self.datafusion().ctx;
         ctx.register_udtf(
-            "list_udfs",
+            udtfs::LIST_UDFS_UDTF_NAME,
             Arc::new(ListUDFTableFunc::new(Arc::clone(ctx))),
         );
 

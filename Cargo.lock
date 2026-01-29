@@ -15943,6 +15943,7 @@ dependencies = [
  "llms",
  "runtime-datafusion-index",
  "runtime-table-partition",
+ "serde",
  "serde_json",
  "snafu",
  "tantivy",

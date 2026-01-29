@@ -15,6 +15,9 @@ use datafusion_datasource::source::DataSourceExec;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+/// UDTF name constant for `list_udfs`
+pub const LIST_UDFS_UDTF_NAME: &str = "list_udfs";
+
 pub struct ListUDFTableFunc {
     context: Arc<SessionContext>,
 }
@@ -38,14 +41,17 @@ impl TableFunctionImpl for ListUDFTableFunc {
     }
 }
 
+/// The `TableProvider` produced by the `list_udfs()` UDTF.
+///
+/// This table contains a single column "name" with all registered UDF names.
 #[derive(Debug)]
-struct ListUDFTable {
+pub struct ListUDFTable {
     schema: SchemaRef,
     udf_names: Vec<String>,
 }
 
 impl ListUDFTable {
-    fn new(udf_names: Vec<String>) -> Self {
+    pub fn new(udf_names: Vec<String>) -> Self {
         Self {
             schema: Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)])),
             udf_names,
