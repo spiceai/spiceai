@@ -66,7 +66,7 @@ pub trait StreamingDataset: Send + Sync {
 /// Sources match on `DatasetType` to determine source-specific configuration
 /// like key schemas, topic settings, etc.
 #[async_trait::async_trait]
-pub trait StreamingSource: Send {
+pub trait StreamingSource: Send + Sync {
     /// Set a table name prefix for isolated test runs.
     ///
     /// When set, all table names will be prefixed with this value.
@@ -106,5 +106,5 @@ pub trait StreamingSource: Send {
     async fn delete(&self, table: &str, keys: &[RecordBatch]) -> Result<()>;
 
     /// Cleanup resources (stop containers, etc.).
-    async fn cleanup(self: Box<Self>) -> Result<()>;
+    async fn cleanup(&self) -> Result<()>;
 }

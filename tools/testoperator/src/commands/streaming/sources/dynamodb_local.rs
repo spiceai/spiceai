@@ -670,9 +670,9 @@ impl StreamingSource for DynamoDbStreamsLocalSource {
         Ok(())
     }
 
-    async fn cleanup(self: Box<Self>) -> Result<()> {
-        if let (Some(docker), Some(name)) = (self.docker, self.container_name) {
-            remove_container(&docker, &name).await?;
+    async fn cleanup(&self) -> Result<()> {
+        if let (Some(docker), Some(name)) = (self.docker.as_ref(), self.container_name.as_ref()) {
+            remove_container(docker, name).await?;
         }
         Ok(())
     }

@@ -44,9 +44,11 @@ mod traits;
 pub mod verification;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, RecordBatch, UInt64Array};
+use futures::future::try_join_all;
 use futures::TryStreamExt;
 use test_framework::anyhow::{self, Result};
 use test_framework::git;
@@ -105,11 +107,24 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     println!("Phase 1: Preparing streaming source");
     source.prepare().await?;
 
-    // Phase 2: Create tables for all datasets
-    println!("Phase 2: Creating tables for all datasets");
-    for dataset in &datasets {
-        source.create_table(dataset.dataset_type()).await?;
-    }
+    // Convert to Arc for parallel operations
+    let source: Arc<dyn StreamingSource> = Arc::from(source);
+
+    // Phase 2: Create tables for all datasets (in parallel)
+    println!("Phase 2: Creating tables for all datasets (parallel)");
+    let table_creation_futures: Vec<_> = datasets
+        .iter()
+        .map(|dataset| {
+            let source = Arc::clone(&source);
+            let dataset_type = dataset.dataset_type();
+            async move {
+                source.create_table(dataset_type).await
+            }
+        })
+        .collect();
+
+    try_join_all(table_creation_futures).await?;
+    println!("All tables created");
 
     // Small delay to ensure tables are ready
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -136,6 +151,8 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     }
 
     // Phase 4: Insert data (with or without mutations)
+    // Track when data insertion starts for end-to-end timing
+    let data_insertion_start = Instant::now();
     let mut total_insert_duration = Duration::ZERO;
     let mutation_summary = if args.mutation_ratio > 0.0 {
         // Phase 4a: Execute mutation sequences for CDC testing
@@ -198,6 +215,9 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
             .await?;
     }
 
+    // Track when markers were inserted for stream lag measurement
+    let marker_insertion_time = Instant::now();
+
     // Small delay to ensure all writes are committed to the stream
     tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -251,7 +271,6 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
 
     // Phase 7: Poll for ALL markers
     println!("Phase 7: Polling for all marker records");
-    let ingestion_start = Instant::now();
     let timeout = Duration::from_secs(args.ingestion_timeout);
 
     let marker_queries: HashMap<DatasetType, String> = dataset_infos
@@ -266,7 +285,10 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
 
     let all_markers_detected =
         poll_for_all_markers(&spiced_instance, &marker_queries, timeout).await?;
-    let ingestion_duration = ingestion_start.elapsed();
+
+    // Calculate timing metrics
+    let end_to_end_duration = data_insertion_start.elapsed();
+    let stream_lag = marker_insertion_time.elapsed();
 
     if !all_markers_detected {
         spiced_instance.stop()?;
@@ -276,7 +298,9 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
         ));
     }
 
-    println!("All markers detected! Ingestion completed in {ingestion_duration:?}");
+    println!(
+        "All markers detected! End-to-end: {end_to_end_duration:?}, Stream lag: {stream_lag:?}"
+    );
 
     // Phase 8: Delete all markers
     println!("Phase 8: Deleting all marker records");
@@ -351,21 +375,23 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     let telemetry = super::create_telemetry_with_resource(&args.common, resource);
 
     // Record metrics
-    let ingestion_ms: u64 = ingestion_duration
+    let end_to_end_ms: u64 = end_to_end_duration
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX);
+    let stream_lag_ms: u64 = stream_lag.as_millis().try_into().unwrap_or(u64::MAX);
     let insert_ms: u64 = total_insert_duration
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX);
-    let records_per_sec = if ingestion_duration.as_secs_f64() > 0.0 {
-        total_record_count as f64 / ingestion_duration.as_secs_f64()
+    let records_per_sec = if end_to_end_duration.as_secs_f64() > 0.0 {
+        total_record_count as f64 / end_to_end_duration.as_secs_f64()
     } else {
         0.0
     };
 
-    crate::metrics::INGESTION_DURATION.record(ingestion_ms, &[]);
+    crate::metrics::INGESTION_DURATION.record(end_to_end_ms, &[]);
+    crate::metrics::STREAM_LAG.record(stream_lag_ms, &[]);
     crate::metrics::DATA_INSERTION_DURATION.record(insert_ms, &[]);
     crate::metrics::RECORD_COUNT.record(total_record_count.try_into().unwrap_or(u64::MAX), &[]);
     crate::metrics::RECORDS_PER_SECOND.record(records_per_sec, &[]);
@@ -395,7 +421,8 @@ pub async fn run(args: &StreamingTestArgs) -> Result<()> {
     println!("Scale Factor:           {}", args.scale_factor);
     println!("Total Records:          {total_record_count}");
     println!("Data Insertion Time:    {total_insert_duration:?}");
-    println!("Ingestion Duration:     {ingestion_duration:?}");
+    println!("End-to-End Duration:    {end_to_end_duration:?}");
+    println!("Stream Lag:             {stream_lag:?}");
     println!("Throughput:             {records_per_sec:.2} records/sec");
     if args.enable_liveness {
         println!("Liveness Failures:      {liveness_failures}");

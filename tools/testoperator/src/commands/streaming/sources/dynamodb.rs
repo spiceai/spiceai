@@ -43,7 +43,7 @@ use tokio::time::sleep;
 const BATCH_SIZE: usize = 25;
 
 /// Number of concurrent batch write requests.
-const CONCURRENT_BATCHES: usize = 30;
+const CONCURRENT_BATCHES: usize = 20;
 
 /// Tag key for creation timestamp (Unix seconds).
 const TAG_CREATED_AT: &str = "testoperator:created_at";
@@ -1061,7 +1061,7 @@ impl StreamingSource for DynamoDbStreamsSource {
         Self::batch_delete_items(client, table, keys).await
     }
 
-    async fn cleanup(self: Box<Self>) -> Result<()> {
+    async fn cleanup(&self) -> Result<()> {
         // For AWS DynamoDB, we don't delete the tables on cleanup
         // as they may be expensive to recreate or contain other data.
         // Users should manage table lifecycle separately.

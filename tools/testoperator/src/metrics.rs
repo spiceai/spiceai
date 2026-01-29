@@ -374,7 +374,15 @@ pub static SPICED_ACTIVE_CONNECTIONS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
 pub static INGESTION_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("ingestion_duration_ms")
-        .with_description("Duration from spiced start until all data ingested (marker detected).")
+        .with_description("End-to-end duration from first data insert until all data ingested (marker detected).")
+        .with_unit("ms")
+        .build()
+});
+
+pub static STREAM_LAG: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("stream_lag_ms")
+        .with_description("Duration from marker insertion until marker detected (CDC stream lag).")
         .with_unit("ms")
         .build()
 });
