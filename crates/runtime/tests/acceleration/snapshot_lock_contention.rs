@@ -122,6 +122,10 @@ impl ContentionMetrics {
     }
 
     fn record_success(&mut self, duration: Duration) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "duration in ms fits in u64"
+        )]
         self.latencies_ms.push(duration.as_millis() as u64);
         self.successful_ops += 1;
     }
@@ -142,6 +146,12 @@ impl ContentionMetrics {
         }
         let mut sorted = self.latencies_ms.clone();
         sorted.sort_unstable();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "percentile index calculation is safe for typical latency array sizes"
+        )]
         let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
         Some(sorted[idx.min(sorted.len() - 1)])
     }
@@ -171,6 +181,10 @@ impl ContentionMetrics {
             return None;
         }
         let sum: u64 = self.latencies_ms.iter().sum();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "precision loss acceptable for average"
+        )]
         Some(sum as f64 / self.latencies_ms.len() as f64)
     }
 }
@@ -191,18 +205,22 @@ impl ContentionTestResults {
         println!("\n=== Snapshot Lock Contention Test Results ===\n");
 
         println!("Query Baseline (no snapshots):");
-        self.print_metrics(&self.query_baseline);
+        Self::print_metrics(&self.query_baseline);
 
         println!("\nQuery Under Load (with concurrent snapshots):");
-        self.print_metrics(&self.query_under_load);
+        Self::print_metrics(&self.query_under_load);
 
         println!("\nSnapshot Creation:");
-        self.print_metrics(&self.snapshot_metrics);
+        Self::print_metrics(&self.snapshot_metrics);
 
         // Calculate degradation
         if let (Some(baseline_p50), Some(load_p50)) =
             (self.query_baseline.median(), self.query_under_load.median())
         {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "precision loss acceptable for percentage"
+            )]
             let degradation = if baseline_p50 > 0 {
                 ((load_p50 as f64 - baseline_p50 as f64) / baseline_p50 as f64) * 100.0
             } else {
@@ -214,6 +232,10 @@ impl ContentionTestResults {
         if let (Some(baseline_p99), Some(load_p99)) =
             (self.query_baseline.p99(), self.query_under_load.p99())
         {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "precision loss acceptable for percentage"
+            )]
             let degradation = if baseline_p99 > 0 {
                 ((load_p99 as f64 - baseline_p99 as f64) / baseline_p99 as f64) * 100.0
             } else {
@@ -223,7 +245,7 @@ impl ContentionTestResults {
         }
     }
 
-    fn print_metrics(&self, metrics: &ContentionMetrics) {
+    fn print_metrics(metrics: &ContentionMetrics) {
         println!(
             "  Operations: {} successful, {} failed",
             metrics.successful_ops, metrics.failed_ops
@@ -257,8 +279,18 @@ fn create_test_accelerator(num_rows: usize) -> anyhow::Result<Arc<dyn TableProvi
         Field::new("value", DataType::Int32, false),
     ]));
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "test data size is small"
+    )]
     let ids: Vec<i32> = (0..num_rows as i32).collect();
     let names: Vec<String> = (0..num_rows).map(|i| format!("item_{i}")).collect();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "test data size is small"
+    )]
     let values: Vec<i32> = (0..num_rows as i32).map(|i| i * 10).collect();
 
     let batch = RecordBatch::try_new(
@@ -326,6 +358,7 @@ async fn run_query_workload(
 }
 
 /// Run snapshot creation workload
+#[expect(clippy::too_many_arguments, reason = "test helper function")]
 async fn run_snapshot_workload(
     snapshot_manager: &Arc<SnapshotManager>,
     checkpointer: &Arc<dyn DatasetCheckpointer>,
@@ -559,6 +592,10 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
     if let (Some(baseline_p99), Some(load_p99)) =
         (results.query_baseline.p99(), results.query_under_load.p99())
     {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "precision loss acceptable for percentage"
+        )]
         let degradation_pct = if baseline_p99 > 0 {
             ((load_p99 as f64 - baseline_p99 as f64) / baseline_p99 as f64) * 100.0
         } else {
@@ -641,7 +678,7 @@ impl std::fmt::Display for EngineType {
 }
 
 impl EngineType {
-    fn to_acceleration_engine(&self) -> AccelerationEngine {
+    fn to_acceleration_engine(self) -> AccelerationEngine {
         match self {
             #[cfg(feature = "duckdb")]
             Self::DuckDB => AccelerationEngine::DuckDB,
@@ -902,6 +939,10 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     if let (Some(baseline_p99), Some(load_p99)) =
         (results.query_baseline.p99(), results.query_under_load.p99())
     {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "precision loss acceptable for percentage"
+        )]
         let degradation = if baseline_p99 > 0 {
             ((load_p99 as f64 - baseline_p99 as f64) / baseline_p99 as f64) * 100.0
         } else {
@@ -927,8 +968,18 @@ async fn insert_test_data(
     use datafusion::physical_plan::collect;
     use datafusion_table_providers::util::test::MockExec;
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "test data size is small"
+    )]
     let ids: Vec<i32> = (0..num_rows as i32).collect();
     let names: Vec<String> = (0..num_rows).map(|i| format!("item_{i}")).collect();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "test data size is small"
+    )]
     let values: Vec<i32> = (0..num_rows as i32).map(|i| i * 10).collect();
 
     let batch = RecordBatch::try_new(
