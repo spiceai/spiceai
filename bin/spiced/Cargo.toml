@@ -11,6 +11,29 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
+connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
+connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }
+connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake", optional = true }
+connector-dremio = { path = "../../crates/data-connectors/connector-dremio", optional = true }
+connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
+connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
+connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
+connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
+connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
+connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optional = true }
+connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
+connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
+connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
+# connector-nfs requires system libnfs library - build separately with `nfs` feature
+connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
+connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
+connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
+connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
+connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
+connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
+connector-smb = { path = "../../crates/data-connectors/connector-smb", optional = true }
+connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
+connector-spark = { path = "../../crates/data-connectors/connector-spark", optional = true }
 event_stream = { path = "../../crates/event_stream" }
 repl = { path = "../../crates/repl" }
 futures.workspace = true
@@ -48,9 +71,9 @@ alloc-snmalloc = []
 alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
-clickhouse = ["runtime/clickhouse"]
+clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
 cuda = ["runtime/cuda"]
-databricks = ["runtime/databricks"]
+databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
     "duckdb",
@@ -85,38 +108,39 @@ default = [
     "scylladb",
     "models",
 ]
-delta_lake = ["runtime/delta_lake"]
+delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
-dremio = ["runtime/dremio"]
-duckdb = ["runtime/duckdb"]
+dremio = ["connector-dremio", "runtime/dremio"]
+duckdb = ["connector-duckdb", "runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
-flightsql = ["runtime/flightsql"]
-ftp = ["runtime/ftp"]
+flightsql = ["connector-flightsql", "runtime/flightsql"]
+ftp = ["connector-ftp", "runtime/ftp"]
 iceberg-write = ["runtime/iceberg-write"]
-imap = ["runtime/imap"]
+imap = ["connector-imap", "runtime/imap"]
 kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]
 models = ["runtime/models"]
-mongodb = ["runtime/mongodb"]
-mssql = ["runtime/mssql"]
-mysql = ["runtime/mysql"]
-nfs = ["runtime/nfs"]
-odbc = ["runtime/odbc"]
-oracle = ["runtime/oracle"]
+mongodb = ["connector-mongodb", "runtime/mongodb"]
+mssql = ["connector-mssql", "runtime/mssql"]
+mysql = ["connector-mysql", "runtime/mysql"]
+# nfs feature requires system libnfs library and connector-nfs crate
+nfs = ["connector-nfs", "runtime/nfs"]
+odbc = ["connector-odbc"]
+oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
-postgres = ["runtime/postgres"]
+postgres = ["connector-postgres", "runtime/postgres"]
 postgres-accel = ["runtime/postgres-accel"]
 postgres-write = ["runtime/postgres-write"]
 release = []
-scylladb = ["runtime/scylladb"]
-sftp = ["runtime/sftp"]
-sharepoint = ["runtime/sharepoint"]
-smb = ["runtime/smb"]
+scylladb = ["connector-scylladb", "runtime/scylladb"]
+sftp = ["connector-sftp", "runtime/sftp"]
+sharepoint = ["connector-sharepoint", "runtime/sharepoint"]
+smb = ["connector-smb"]
 snapshots = ["runtime/snapshots"]
-snowflake = ["runtime/snowflake"]
-spark = ["runtime/spark"]
+snowflake = ["connector-snowflake", "runtime/snowflake"]
+spark = ["connector-spark", "runtime/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 turso = ["runtime/turso"]

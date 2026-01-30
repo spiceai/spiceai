@@ -29,7 +29,7 @@ use mediatype::{
     MediaType,
     names::{APPLICATION, CSV, JSON, TEXT},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use super::{Format, convert_entry_to_csv};
@@ -41,28 +41,26 @@ pub(crate) struct CatalogFilter {
     from: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "lowercase")]
-pub(crate) struct CatalogResponseItem {
-    pub from: String,
-    pub name: String,
-}
+// Re-export shared type for backwards compatibility
+pub use runtime_api_types::v1::CatalogInfo;
+pub use runtime_api_types::v1::CatalogInfo as CatalogResponseItem;
 
 const APPLICATION_JSON: MediaType = MediaType::from_parts(APPLICATION, JSON, None, &[]);
 const TEXT_CSV: MediaType = MediaType::from_parts(TEXT, CSV, None, &[]);
 const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
 
 /// List Catalogs
+///
+/// Returns a list of all registered catalogs (data sources). Catalogs provide metadata about schemas and tables available from external data sources.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/catalogs",
     operation_id = "get_catalogs",
-    tag = "Datasets",
+    tag = "Catalogs",
     params(CatalogFilter),
     responses(
         (status = 200, description = "List of catalogs", content((
-            CatalogResponseItem = "application/json",
+            CatalogInfo = "application/json",
             example = json!([
                 {
                     "from": "spiceai",

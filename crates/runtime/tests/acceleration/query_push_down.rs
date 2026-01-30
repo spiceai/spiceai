@@ -22,7 +22,10 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
-use crate::{init_tracing, utils::test_request_context};
+use crate::{
+    init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 #[cfg(feature = "postgres-accel")]
 #[tokio::test]
@@ -35,6 +38,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
     use std::sync::Arc;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

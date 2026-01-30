@@ -22,7 +22,10 @@ use futures::StreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 pub fn get_s3_hive_partitioned_dataset(
     name: &str,
@@ -50,6 +53,7 @@ pub fn get_s3_hive_partitioned_dataset(
 #[tokio::test]
 async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

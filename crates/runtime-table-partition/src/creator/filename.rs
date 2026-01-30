@@ -99,6 +99,26 @@ pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
     Ok(key.unwrap_or("none".to_string()))
 }
 
+/// Encodes multiple [`ScalarValue`] partition keys into a composite key string.
+///
+/// This is used for hierarchical partitions where the partition is identified
+/// by multiple values (e.g., year=2025 and month=10).
+///
+/// The composite key is encoded by joining individual keys with "/",
+/// e.g., `"2025/10"` for the example above. This provides a unique, stable
+/// identifier for the partition that can be used as a `HashMap` key.
+///
+/// Note: This function produces a compact key format (e.g., "2025/10") without
+/// column names. For Hive-style partition directories with column names
+/// (e.g., "year=2025/month=10"), see [`to_hive_partition_dir`].
+///
+/// # Errors
+/// Returns [`Error::UnsupportedPartitionKey`] if any scalar value type is not supported.
+pub fn encode_composite_key(keys: &[ScalarValue]) -> Result<String, Error> {
+    let encoded: Result<Vec<String>, Error> = keys.iter().map(encode_key).collect();
+    Ok(encoded?.join("/"))
+}
+
 /// Discover hive style partitions in the `base_dir` recursively.
 ///
 /// # Errors
