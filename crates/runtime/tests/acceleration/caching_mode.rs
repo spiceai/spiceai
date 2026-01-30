@@ -59,7 +59,7 @@ use std::sync::Arc;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 /// Test that caching mode properly propagates filters to the HTTP connector on cache miss.
@@ -418,6 +418,7 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=info,runtime=info,data_components=info,runtime::accelerated_table::caching=info",
     ));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -635,6 +636,7 @@ async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=info,runtime=info,data_components=info,runtime::accelerated_table::caching=info",
     ));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

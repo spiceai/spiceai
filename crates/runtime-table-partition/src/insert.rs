@@ -47,16 +47,18 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::Partition;
 use crate::creator::PartitionCreator;
-use crate::creator::filename::encode_key;
+use crate::creator::filename::encode_composite_key;
 use crate::expression::PartitionedBy;
-use crate::provider::ScalarValueString;
+use crate::provider::CompositePartitionKey;
 
 #[derive(Debug)]
 pub struct PartitionerExec {
     input: Arc<dyn ExecutionPlan>,
     creator: Arc<dyn PartitionCreator>,
-    partitions: Arc<RwLock<HashMap<String, Partition>>>,
-    partition_by: PartitionedBy,
+    partitions: Arc<RwLock<HashMap<CompositePartitionKey, Partition>>>,
+    /// The partition expressions. For hierarchical partitions (e.g., year/month),
+    /// this contains multiple expressions in order.
+    partition_by: Vec<PartitionedBy>,
     insert_op: InsertOp,
     schema: SchemaRef,
     properties: PlanProperties,
@@ -65,9 +67,9 @@ pub struct PartitionerExec {
 impl PartitionerExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
-        partition_by: PartitionedBy,
+        partition_by: Vec<PartitionedBy>,
         creator: Arc<dyn PartitionCreator>,
-        partitions: Arc<RwLock<HashMap<String, Partition>>>,
+        partitions: Arc<RwLock<HashMap<CompositePartitionKey, Partition>>>,
         insert_op: InsertOp,
         schema: SchemaRef,
     ) -> Self {
@@ -95,12 +97,16 @@ impl DisplayAs for PartitionerExec {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
+        let partition_strs: Vec<_> = self
+            .partition_by
+            .iter()
+            .map(|p| format!("{} AS {}", p.expression, p.name))
+            .collect();
         write!(
             f,
-            "{} (partition_by = {} AS {}, insert_op = {})",
+            "{} (partition_by = [{}], insert_op = {})",
             self.name(),
-            self.partition_by.expression,
-            self.partition_by.name,
+            partition_strs.join(", "),
             self.insert_op
         )
     }
@@ -160,7 +166,12 @@ impl ExecutionPlan for PartitionerExec {
             let schema = self.schema();
             let row_count_schema = Arc::clone(&row_count_schema);
             let input = Arc::clone(&self.input);
-            let physical_expr = create_physical_expr(&self.partition_by.expression, self.schema())?;
+            // Create physical expressions for all partition columns
+            let physical_exprs: Vec<Arc<dyn PhysicalExpr>> = self
+                .partition_by
+                .iter()
+                .map(|p| create_physical_expr(&p.expression, Arc::clone(&schema)))
+                .collect::<Result<Vec<_>, _>>()?;
             let creator = Arc::clone(&self.creator);
             let partition_providers = Arc::clone(&self.partitions);
             let insert_op = self.insert_op;
@@ -181,11 +192,11 @@ impl ExecutionPlan for PartitionerExec {
                         continue;
                     }
 
-                    // Partition the batch using the partition_by expression
-                    // into multiple batches
-                    let batches = partition_batch(&batch, physical_expr.as_ref())?;
+                    // Partition the batch using all partition_by expressions
+                    // into multiple batches based on composite keys
+                    let batches = partition_batch_composite(&batch, &physical_exprs)?;
 
-                    for (partition_key, (partition_value, batch)) in batches {
+                    for (partition_key, (partition_values, batch)) in batches {
                         let tx = if let Some(tx) = partition_senders.get(&partition_key) {
                             tx.clone()
                         } else {
@@ -203,7 +214,7 @@ impl ExecutionPlan for PartitionerExec {
                                     drop(providers);
 
                                     let partition = creator
-                                        .create_partition(partition_value)
+                                        .create_partition(partition_values)
                                         .await
                                         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                                     let new_provider = Arc::clone(&partition.table_provider);
@@ -409,45 +420,126 @@ impl DisplayAs for PartitionInputExec {
 /// created for each unique value produced by evaluating the expression
 /// containing the rows that produced that unique partition value.
 ///
+/// This is a single-expression version for backward compatibility.
+/// For multiple partition expressions, use [`partition_batch_composite`].
+///
 /// # Errors
 /// Returns an error when the expressions cannot be evaluated, the batch cannot
 /// be partitioned, Arrays cannot be created or the batch cannot be filtered.
 pub fn partition_batch(
     batch: &RecordBatch,
     physical_expr: &dyn PhysicalExpr,
-) -> Result<HashMap<String, (ScalarValue, RecordBatch)>, DataFusionError> {
+) -> Result<HashMap<String, (Vec<ScalarValue>, RecordBatch)>, DataFusionError> {
+    // Evaluate the partition expression to get an array
     let column = physical_expr.evaluate(batch)?;
     let array = match column {
         ColumnarValue::Array(array) => array,
         ColumnarValue::Scalar(_) => {
             return Err(DataFusionError::Execution(
-                "Invalid partition expression".to_string(),
+                "Invalid partition expression: expected array, got scalar".to_string(),
             ));
         }
     };
 
+    // Use arrow's partition function
     let partitions = compute::partition(&[Arc::clone(&array)])?;
     let mut batches = HashMap::with_capacity(partitions.len());
 
-    // Group indices by partition value
-    let mut value_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    // Group indices by partition key
+    let mut key_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
     for partition in partitions.ranges() {
         let partition_value = ScalarValue::try_from_array(&array, partition.start)?;
-        let partition_key = encode_key(&partition_value).map_err(|e| {
+        let partition_key = encode_composite_key(&[partition_value]).map_err(|e| {
             DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
         })?;
-        let value_indices = value_to_indices.entry(partition_key.clone()).or_default();
+
+        let value_indices = key_to_indices.entry(partition_key).or_default();
         partition.into_iter().for_each(|i| value_indices.push(i));
     }
 
     // Create batches for each partition
-    for (partition_key, indices) in value_to_indices {
+    for (partition_key, indices) in key_to_indices {
         if indices.is_empty() {
             continue;
         }
+
         let partition_value = ScalarValue::try_from_array(&array, indices[0])?;
         let new_batch = filter_batch_by_indices(batch, &indices)?;
-        batches.insert(partition_key, (partition_value, new_batch));
+        batches.insert(partition_key, (vec![partition_value], new_batch));
+    }
+
+    Ok(batches)
+}
+
+/// Evaluate multiple `physical_exprs` for each row in `batch`. A partition batch is
+/// created for each unique combination of values produced by evaluating the expressions,
+/// containing the rows that produced that unique combination.
+///
+/// For hierarchical partitions (e.g., year/month/day), this groups rows by their
+/// composite partition key.
+///
+/// # Errors
+/// Returns an error when the expressions cannot be evaluated, the batch cannot
+/// be partitioned, Arrays cannot be created or the batch cannot be filtered.
+pub fn partition_batch_composite(
+    batch: &RecordBatch,
+    physical_exprs: &[Arc<dyn PhysicalExpr>],
+) -> Result<HashMap<String, (Vec<ScalarValue>, RecordBatch)>, DataFusionError> {
+    if physical_exprs.is_empty() {
+        return Err(DataFusionError::Execution(
+            "At least one partition expression is required".to_string(),
+        ));
+    }
+
+    // Evaluate all partition expressions to get arrays
+    let arrays: Vec<Arc<dyn Array>> = physical_exprs
+        .iter()
+        .map(|expr| {
+            let column = expr.evaluate(batch)?;
+            match column {
+                ColumnarValue::Array(array) => Ok(array),
+                ColumnarValue::Scalar(_) => Err(DataFusionError::Execution(
+                    "Invalid partition expression: expected array, got scalar".to_string(),
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Use arrow's partition function with all arrays to group by composite key
+    let partitions = compute::partition(&arrays)?;
+    let mut batches = HashMap::with_capacity(partitions.len());
+
+    // Group indices by composite partition key
+    let mut key_to_indices: HashMap<String, Vec<usize>> = HashMap::new();
+    for partition in partitions.ranges() {
+        // Extract partition values for this partition (one value per expression)
+        let partition_values: Vec<ScalarValue> = arrays
+            .iter()
+            .map(|array| ScalarValue::try_from_array(array, partition.start))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let partition_key = encode_composite_key(&partition_values).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
+        })?;
+
+        let value_indices = key_to_indices.entry(partition_key).or_default();
+        partition.into_iter().for_each(|i| value_indices.push(i));
+    }
+
+    // Create batches for each partition
+    for (partition_key, indices) in key_to_indices {
+        if indices.is_empty() {
+            continue;
+        }
+
+        // Extract partition values from the first index of this partition
+        let partition_values: Vec<ScalarValue> = arrays
+            .iter()
+            .map(|array| ScalarValue::try_from_array(array, indices[0]))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let new_batch = filter_batch_by_indices(batch, &indices)?;
+        batches.insert(partition_key, (partition_values, new_batch));
     }
 
     Ok(batches)
@@ -477,8 +569,10 @@ pub trait InsertStrategy: Send + Sync + std::fmt::Debug {
 #[derive(Debug)]
 pub struct PartitionContext {
     pub creator: Arc<dyn PartitionCreator>,
-    pub partition_by: PartitionedBy,
-    pub partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
+    /// The partition expressions. For hierarchical partitions (e.g., year/month),
+    /// this contains multiple expressions in order.
+    pub partition_by: Vec<PartitionedBy>,
+    pub partitions: Arc<RwLock<HashMap<CompositePartitionKey, Partition>>>,
     pub schema: SchemaRef,
 }
 
@@ -525,12 +619,13 @@ mod tests {
 
         let physical_expr = create_physical_expr(&expr, batch.schema())?;
 
-        let partitions = partition_batch(&batch, physical_expr.as_ref())?;
+        let partitions = partition_batch_composite(&batch, &[physical_expr])?;
 
         assert_eq!(partitions.len(), 1);
 
-        for (partition_value, partitioned_batch) in partitions.into_values() {
-            assert_eq!(partition_value, ScalarValue::Boolean(Some(true)));
+        for (partition_values, partitioned_batch) in partitions.into_values() {
+            assert_eq!(partition_values.len(), 1);
+            assert_eq!(partition_values[0], ScalarValue::Boolean(Some(true)));
             assert_eq!(batch, partitioned_batch);
         }
 
@@ -559,12 +654,13 @@ mod tests {
 
         let physical_expr = create_physical_expr(&expr, batch.schema())?;
 
-        let partitions = partition_batch(&batch, physical_expr.as_ref())?;
+        let partitions = partition_batch_composite(&batch, &[physical_expr])?;
 
         assert_eq!(partitions.len(), 2);
 
-        for (partition_value, partitioned_batch) in partitions.into_values() {
-            if partition_value == ScalarValue::Boolean(Some(true)) {
+        for (partition_values, partitioned_batch) in partitions.into_values() {
+            assert_eq!(partition_values.len(), 1);
+            if partition_values[0] == ScalarValue::Boolean(Some(true)) {
                 assert_eq!(
                     record_batch!(
                         ("id", Int64, [1, 4]),
@@ -584,6 +680,50 @@ mod tests {
                     )?,
                     partitioned_batch
                 );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_partition_batch_composite() -> Result<(), DataFusionError> {
+        // Test partitioning by multiple columns (year, month)
+        let batch = record_batch!(
+            ("id", Int64, [1, 2, 3, 4, 5, 6]),
+            ("year", Int32, [2024, 2024, 2024, 2025, 2025, 2025]),
+            ("month", Int32, [1, 1, 2, 1, 1, 2])
+        )?;
+
+        let year_expr = create_physical_expr(&col("year"), batch.schema())?;
+        let month_expr = create_physical_expr(&col("month"), batch.schema())?;
+
+        let partitions = partition_batch_composite(&batch, &[year_expr, month_expr])?;
+
+        // Should have 4 partitions: (2024, 1), (2024, 2), (2025, 1), (2025, 2)
+        assert_eq!(partitions.len(), 4);
+
+        // Check that each partition has correct values
+        for (key, (partition_values, partitioned_batch)) in &partitions {
+            assert_eq!(partition_values.len(), 2, "Should have 2 partition values");
+
+            let year = match &partition_values[0] {
+                ScalarValue::Int32(Some(y)) => *y,
+                _ => panic!("Expected Int32 for year"),
+            };
+            let month = match &partition_values[1] {
+                ScalarValue::Int32(Some(m)) => *m,
+                _ => panic!("Expected Int32 for month"),
+            };
+
+            // Verify key format
+            assert_eq!(*key, format!("{year}/{month}"));
+
+            // Verify row counts
+            match (year, month) {
+                (2024 | 2025, 1) => assert_eq!(partitioned_batch.num_rows(), 2),
+                (2024 | 2025, 2) => assert_eq!(partitioned_batch.num_rows(), 1),
+                _ => panic!("Unexpected partition: year={year}, month={month}"),
             }
         }
 

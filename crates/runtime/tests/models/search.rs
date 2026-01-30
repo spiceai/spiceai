@@ -21,7 +21,7 @@ use crate::models::s3_vectors::basic_vector_search_tests;
 use crate::models::{
     create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
 };
-use crate::utils::{runtime_ready_check, test_request_context};
+use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use anyhow::Context;
@@ -292,6 +292,7 @@ pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
 }
 
 pub async fn start_app(app: App) -> Result<Config, anyhow::Error> {
+    register_test_connectors().await;
     configure_test_datafusion();
     let api_config = create_api_bindings_config();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);

@@ -1,0 +1,21 @@
+[package]
+name = "connector-dremio"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Dremio data connector for Spice.ai runtime"
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+data_components = { path = "../../data_components" }
+datafusion.workspace = true
+datafusion-federation.workspace = true
+flight_client = { path = "../../flight_client" }
+linkme.workspace = true
+ns_lookup = { path = "../../ns_lookup" }
+paste.workspace = true
+runtime = { path = "../../runtime" }
+snafu.workspace = true
+tracing.workspace = true

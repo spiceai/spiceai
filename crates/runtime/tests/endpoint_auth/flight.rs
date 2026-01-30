@@ -22,7 +22,7 @@ use std::{
 
 use crate::{
     init_tracing,
-    utils::{test_request_context, wait_until_true},
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 use arrow_flight::{error::FlightError, flight_service_client::FlightServiceClient};
 use rand::Rng;
@@ -37,6 +37,7 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 #[tokio::test]
 async fn test_flight_auth() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

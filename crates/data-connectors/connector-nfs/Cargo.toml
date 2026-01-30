@@ -1,0 +1,17 @@
+# This crate is excluded from the workspace because it requires system libnfs library.
+# Build with: cargo build -p connector-nfs --manifest-path crates/data-connectors/connector-nfs/Cargo.toml
+[package]
+name = "connector-nfs"
+edition = "2024"
+version = "1.11.0-unstable"
+rust-version = "1.91"
+license = "Apache-2.0"
+description = "NFS data connector for Spice.ai runtime"
+
+[dependencies]
+linkme = "0.3.35"
+paste = "1.0.15"
+runtime = { path = "../../runtime" }
+snafu = "0.8.6"
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "test-util", "time"] }
+url = "2.5"

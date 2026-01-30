@@ -29,7 +29,7 @@ use spicepod::{acceleration::Acceleration, component::dataset::Dataset};
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context, wait_until_true},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context, wait_until_true},
 };
 
 mod refresh_max_timestamp_df;
@@ -50,6 +50,7 @@ async fn spiceai_integration_test_refresh_sql_override_append() -> Result<(), an
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
