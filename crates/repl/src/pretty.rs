@@ -23,9 +23,6 @@ use arrow::util::pretty::pretty_format_batches;
 
 /// Formats Arrow `RecordBatch`es with data types displayed below column names.
 ///
-/// This mimics DuckDB's output format by inserting a row with data types
-/// below the column headers.
-///
 /// # Errors
 ///
 /// Returns an error if the record batches cannot be formatted.
@@ -126,7 +123,7 @@ fn build_centered_header_row(widths: &[usize], schema: &SchemaRef) -> String {
 
         // Center the column name within the column width without exceeding it; when padding is odd, bias left
         let padding = width.saturating_sub(name.len());
-        let left_pad = (padding + 1) / 2;
+        let left_pad = padding.div_ceil(2);
         let right_pad = padding - left_pad;
 
         row.push_str(&" ".repeat(left_pad));
@@ -148,7 +145,7 @@ fn build_type_row(widths: &[usize], schema: &SchemaRef) -> String {
 
         // Center the type string within the column width without exceeding it; when padding is odd, bias left
         let padding = width.saturating_sub(type_str.len());
-        let left_pad = (padding + 1) / 2;
+        let left_pad = padding.div_ceil(2);
         let right_pad = padding - left_pad;
 
         row.push_str(&" ".repeat(left_pad));
@@ -160,10 +157,10 @@ fn build_type_row(widths: &[usize], schema: &SchemaRef) -> String {
     row
 }
 
-
 /// Format a `DataType` to a user-friendly string representation.
 ///
-/// This produces shorter, more readable type names similar to DuckDB's format.
+/// This produces shorter, more readable type names similar to `DuckDB`'s format.
+#[must_use]
 pub fn format_data_type(data_type: &DataType) -> String {
     match data_type {
         DataType::Null => "null".to_string(),
@@ -179,15 +176,10 @@ pub fn format_data_type(data_type: &DataType) -> String {
         DataType::Float16 => "float16".to_string(),
         DataType::Float32 => "float32".to_string(),
         DataType::Float64 => "float64".to_string(),
-        DataType::Utf8 => "varchar".to_string(),
-        DataType::LargeUtf8 => "varchar".to_string(),
-        DataType::Utf8View => "varchar".to_string(),
-        DataType::Binary => "binary".to_string(),
-        DataType::LargeBinary => "binary".to_string(),
-        DataType::BinaryView => "binary".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "varchar".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "binary".to_string(),
         DataType::FixedSizeBinary(size) => format!("binary({size})"),
-        DataType::Date32 => "date".to_string(),
-        DataType::Date64 => "date".to_string(),
+        DataType::Date32 | DataType::Date64 => "date".to_string(),
         DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
         DataType::Timestamp(unit, tz) => {
             let tz_suffix = tz.as_ref().map_or(String::new(), |tz| format!(" ({tz})"));
@@ -205,7 +197,10 @@ pub fn format_data_type(data_type: &DataType) -> String {
             TimeUnit::Nanosecond => "duration[ns]".to_string(),
         },
         DataType::Interval(unit) => format!("interval[{unit:?}]").to_lowercase(),
-        DataType::List(field) | DataType::LargeList(field) | DataType::ListView(field) | DataType::LargeListView(field) => {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field) => {
             format!("{}[]", format_data_type(field.data_type()))
         }
         DataType::FixedSizeList(field, size) => {
@@ -220,10 +215,10 @@ pub fn format_data_type(data_type: &DataType) -> String {
                 format_data_type(value_type)
             )
         }
-        DataType::Decimal32(precision, scale) => format!("decimal({precision},{scale})"),
-        DataType::Decimal64(precision, scale) => format!("decimal({precision},{scale})"),
-        DataType::Decimal128(precision, scale) => format!("decimal({precision},{scale})"),
-        DataType::Decimal256(precision, scale) => format!("decimal({precision},{scale})"),
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale) => format!("decimal({precision},{scale})"),
         DataType::Map(field, _) => {
             if let DataType::Struct(fields) = field.data_type()
                 && fields.len() == 2
@@ -264,7 +259,10 @@ mod tests {
         let formatted = format_batches_with_types(&[batch]).expect("formatting should succeed");
 
         // Verify output contains column names and types
-        assert!(formatted.contains("id"), "output should contain column name");
+        assert!(
+            formatted.contains("id"),
+            "output should contain column name"
+        );
         assert!(
             formatted.contains("int32"),
             "output should contain data type int32"
@@ -282,7 +280,10 @@ mod tests {
     #[test]
     fn test_format_empty_batches() {
         let formatted = format_batches_with_types(&[]).expect("formatting should succeed");
-        assert!(formatted.is_empty(), "empty batches should produce empty output");
+        assert!(
+            formatted.is_empty(),
+            "empty batches should produce empty output"
+        );
     }
 
     #[test]
