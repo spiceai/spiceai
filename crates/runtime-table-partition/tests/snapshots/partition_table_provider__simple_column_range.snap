@@ -3,5 +3,5 @@ source: crates/runtime-table-partition/tests/partition_table_provider.rs
 expression: explain_plan
 ---
 PartitionedUnionExec
-  PartitionMemTableExec: partition_value=20
-  PartitionMemTableExec: partition_value=30
+  PartitionMemTableExec: partition_values=[Int32(20)]
+  PartitionMemTableExec: partition_values=[Int32(30)]
