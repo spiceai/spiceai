@@ -348,7 +348,7 @@ impl JobStore {
 
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result.map_err(|e| super::error::Error::StreamRead {
-                message: e.to_string(),
+                source: Box::new(e),
             })?;
 
             let batch_rows = batch.num_rows();
