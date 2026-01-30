@@ -116,12 +116,22 @@ fn collect_merge_values(yaml: &Yaml, merge_values: &mut Vec<Mapping>) {
 }
 
 /// Parse a YAML string into a Value.
+///
+/// # Errors
+///
+/// Returns an error if the YAML string contains multiple documents.
+/// Multi-document YAML is not supported to avoid silent data loss.
 pub(crate) fn parse_yaml(s: &str) -> Result<Value> {
     let docs = YamlLoader::load_from_str(s)?;
-    if docs.is_empty() {
-        Ok(Value::Null)
-    } else {
-        Ok(yaml_to_value(docs.into_iter().next().unwrap_or(Yaml::Null)))
+    match docs.len() {
+        0 => Ok(Value::Null),
+        1 => {
+            // Safe to use .into_iter().next() since we verified len == 1
+            Ok(yaml_to_value(docs.into_iter().next().unwrap_or(Yaml::Null)))
+        }
+        n => Err(Error::deserialize(format!(
+            "multi-document YAML is not supported (found {n} documents). Use `---` only at the start of a single document."
+        ))),
     }
 }
 
@@ -729,33 +739,45 @@ mod tests {
 
     #[test]
     fn test_yaml_to_value() {
-        let yaml = YamlLoader::load_from_str("key: value").unwrap();
-        let value = yaml_to_value(yaml.into_iter().next().unwrap());
+        let yaml = YamlLoader::load_from_str("key: value").expect("valid YAML");
+        let value = yaml_to_value(yaml.into_iter().next().expect("should have one document"));
         assert!(value.is_mapping());
         assert_eq!(value.get("key").and_then(Value::as_str), Some("value"));
     }
 
     #[test]
     fn test_parse_yaml() {
-        let value = parse_yaml("42").unwrap();
+        let value = parse_yaml("42").expect("valid YAML");
         assert_eq!(value.as_i64(), Some(42));
 
-        let value = parse_yaml("true").unwrap();
+        let value = parse_yaml("true").expect("valid YAML");
         assert_eq!(value.as_bool(), Some(true));
 
-        let value = parse_yaml("hello").unwrap();
+        let value = parse_yaml("hello").expect("valid YAML");
         assert_eq!(value.as_str(), Some("hello"));
 
-        let value = parse_yaml("[1, 2, 3]").unwrap();
+        let value = parse_yaml("[1, 2, 3]").expect("valid YAML");
         assert!(value.is_sequence());
 
-        let value = parse_yaml("key: value").unwrap();
+        let value = parse_yaml("key: value").expect("valid YAML");
         assert!(value.is_mapping());
     }
 
     #[test]
     fn test_parse_yaml_empty() {
-        let value = parse_yaml("").unwrap();
+        let value = parse_yaml("").expect("empty YAML is valid");
         assert!(value.is_null());
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_document_error() {
+        // Multi-document YAML should return an error
+        let result = parse_yaml("---\nfirst: 1\n---\nsecond: 2");
+        assert!(result.is_err());
+        let err = result.expect_err("should be an error");
+        assert!(
+            err.to_string().contains("multi-document"),
+            "Error should mention multi-document: {err}"
+        );
     }
 }

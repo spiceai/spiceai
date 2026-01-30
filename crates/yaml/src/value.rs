@@ -55,12 +55,12 @@ impl PartialEq for Number {
             (Number::PosInt(a), Number::PosInt(b)) => a == b,
             (Number::NegInt(a), Number::NegInt(b)) => a == b,
             (Number::Float(a), Number::Float(b)) => {
-                // Handle NaN specially
-                if a.is_nan() && b.is_nan() {
-                    true
-                } else {
-                    a == b
-                }
+                // Use bitwise comparison for floats to maintain Eq/Hash contract.
+                // This ensures that equal values always hash the same.
+                // Note: This means NaN values with different bit patterns are not equal,
+                // and -0.0 != 0.0, which differs from IEEE 754 but is required for
+                // correct HashMap/HashSet behavior.
+                a.to_bits() == b.to_bits()
             }
             _ => false,
         }
