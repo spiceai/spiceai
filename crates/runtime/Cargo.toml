@@ -52,7 +52,6 @@ datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true }
 datafusion-spark.workspace = true
 datafusion-table-providers = { workspace = true }
-dynamodb-streams = { path="../dynamodb-streams", optional = true }
 db_connection_pool = { path = "../db_connection_pool" }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
@@ -60,6 +59,7 @@ duckdb = { workspace = true, features = [
     "r2d2",
     "extensions-full",
 ], optional = true }
+dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
@@ -80,6 +80,7 @@ iceberg-datafusion.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
+linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
 model_components = { path = "../model_components" }
@@ -99,9 +100,8 @@ opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
 package = { path = "../package" }
 parking_lot.workspace = true
-percent-encoding.workspace = true
-linkme.workspace = true
 paste.workspace = true
+percent-encoding.workspace = true
 pin-project.workspace = true
 postcard.workspace = true
 prometheus.workspace = true
@@ -137,10 +137,11 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
-scopeguard = "1.2.0"
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
+scopeguard = "1.2.0"
+scylla = { workspace = true, optional = true }
 search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
@@ -175,10 +176,10 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
     "axum",
 ], optional = true }
 
+gethostname.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
-gethostname.workspace = true
 
 [build-dependencies]
 serde_yaml.workspace = true
@@ -187,10 +188,13 @@ serde_yaml.workspace = true
 anyhow.workspace = true
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
-aws-credential-types = { workspace = true, features = ["hardcoded-credentials"] }
+aws-credential-types = { workspace = true, features = [
+    "hardcoded-credentials",
+] }
 azure_core = "0.31.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
+ballista-core.workspace = true
 bcder = "0.7.4"
 bollard = "0.18.1"
 bytes.workspace = true
@@ -217,40 +221,34 @@ connector-smb = { path = "../data-connectors/connector-smb" }
 connector-snowflake = { path = "../data-connectors/connector-snowflake" }
 connector-spark = { path = "../data-connectors/connector-spark" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-repl = { path = "../repl" }
 hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
+mongodb.workspace = true
+mysql_async.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
+pem.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"] }
+repl = { path = "../repl" }
 rstest = "0.26.1"
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml.workspace = true
-pem.workspace = true
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
+tar = "0.4"
 tempfile.workspace = true
 test-framework = { path = "../test-framework" }
+tiberius.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-tar = "0.4"
-mongodb.workspace = true
-mysql_async.workspace = true
-tiberius.workspace = true
 
 [features]
-aws-secrets-manager = [
-    "dep:aws-sdk-sts",
-    "runtime-secrets/aws-secrets-manager",
-]
+aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 bedrock = []
-clickhouse = [
-    "db_connection_pool/clickhouse",
-    "data_components/clickhouse",
-]
+clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
@@ -270,7 +268,12 @@ duckdb = [
     "datafusion-optimizer-rules/duckdb",
     "runtime-acceleration/duckdb",
 ]
-dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb", "dep:dynamodb-streams", "dep:humantime"]
+dynamodb = [
+    "dep:aws-sdk-dynamodb",
+    "data_components/dynamodb",
+    "dep:dynamodb-streams",
+    "dep:humantime",
+]
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
@@ -293,7 +296,12 @@ mssql = ["data_components/mssql"]
 mysql = ["db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]
 odbc = []
-openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp", "runtime-api-types/openapi"]
+openapi = [
+    "dep:utoipa-swagger-ui",
+    "dep:utoipa",
+    "mcp",
+    "runtime-api-types/openapi",
+]
 oracle = ["data_components/oracle"]
 pingora = ["cache/pingora"]
 postgres = [
@@ -308,18 +316,12 @@ s3_vectors = [
     "dep:s3_vectors",
     "search/s3_vectors",
 ]
-scylladb = [
-    "db_connection_pool/scylladb",
-    "data_components/scylladb",
-]
+scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
 sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint"]
 smb = ["runtime-object-store/smb"]
 snapshots = ["runtime-acceleration/snapshots"]
-snowflake = [
-    "db_connection_pool/snowflake",
-    "data_components/snowflake",
-]
+snowflake = ["db_connection_pool/snowflake", "data_components/snowflake"]
 spark = ["data_components/spark_connect"]
 sqlite = [
     "dep:tokio-rusqlite",
@@ -335,7 +337,7 @@ turso = [
     "data_components/sqlite",
     "data_components/turso",
     "dep:rusqlite",
-    "runtime-acceleration/turso"
+    "runtime-acceleration/turso",
 ]
 vortex = ["ballista-core/vortex", "ballista-executor/vortex"]
 [target.'cfg(not(windows))'.dependencies]

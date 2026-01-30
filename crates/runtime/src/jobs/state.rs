@@ -237,6 +237,11 @@ impl JobState {
             JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled | JobStatus::Closed
         )
     }
+
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        self.status == JobStatus::Succeeded
+    }
 }
 
 /// Gets the current Unix timestamp in milliseconds, logging a warning if the system
