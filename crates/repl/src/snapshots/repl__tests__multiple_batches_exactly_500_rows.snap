@@ -3,7 +3,8 @@ source: crates/repl/src/lib.rs
 expression: result
 ---
 +------+-----------+
-| id   | name      |
+|  id  |    name   |
+| int32|  varchar  |
 +------+-----------+
 | 1000 | name_1000 |
 | 1001 | name_1001 |
