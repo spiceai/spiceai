@@ -46,6 +46,8 @@ pub enum Error {
         key: String,
         source: object_store::Error,
     },
+    #[snafu(display("Unexpected deletion of object with key {key}"))]
+    UnexpectedDeletionError { key: String },
 }
 
 impl Error {
@@ -54,15 +56,17 @@ impl Error {
     #[must_use]
     pub fn into_object_store(self, store: &'static str) -> object_store::Error {
         match self {
-            Error::Serialization { source, .. } => object_store::Error::Generic {
-                store,
-                source: Box::new(source),
-            },
-            Error::Deserialization { source, .. } => object_store::Error::Generic {
-                store,
-                source: Box::new(source),
-            },
+            Error::Deserialization { source, .. } | Error::Serialization { source, .. } => {
+                object_store::Error::Generic {
+                    store,
+                    source: Box::new(source),
+                }
+            }
             Error::ObjectStore { source, .. } => source,
+            Error::UnexpectedDeletionError { .. } => object_store::Error::Generic {
+                store,
+                source: Box::new(self),
+            },
         }
     }
 }

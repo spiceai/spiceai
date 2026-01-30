@@ -594,7 +594,7 @@ async fn test_concurrent_async_writers_with_retry() {
 }
 
 /// Tests that an update fails with `Conflict` when an external process modifies the object
-/// between our `get()` (which caches the ETag) and `update()` calls.
+/// between our `get()` (which caches the `ETag`) and `update()` calls.
 /// This verifies S3's conditional write mechanism (If-Match headers) at the protocol level.
 #[tokio::test]
 async fn test_update_races_with_external_write() {

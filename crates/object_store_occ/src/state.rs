@@ -208,23 +208,12 @@ where
         // Object exists, try update
         match self.update(key, value).await? {
             UpdateResult::Ok => Ok(WriteResult::Updated),
-            UpdateResult::NotFound => {
-                // Object was deleted between insert check and update - try insert again
-                match self.insert(key, value).await? {
-                    InsertResult::Ok => Ok(WriteResult::Inserted),
-                    InsertResult::AlreadyExists => {
-                        // Object recreated - update it
-                        match self.update(key, value).await? {
-                            UpdateResult::Ok => Ok(WriteResult::Updated),
-                            UpdateResult::NotFound | UpdateResult::Conflict { .. } => {
-                                // Give up - return current state as conflict
-                                let current = self.get(key).await?.unwrap_or_else(|| value.clone());
-                                Ok(WriteResult::Conflict { current })
-                            }
-                        }
-                    }
-                }
-            }
+            UpdateResult::NotFound => match self.get(key).await? {
+                Some(current) => Ok(WriteResult::Conflict { current }),
+                None => Err(Error::UnexpectedDeletionError {
+                    key: key.to_string(),
+                }),
+            },
             UpdateResult::Conflict { current } => Ok(WriteResult::Conflict { current }),
         }
     }
