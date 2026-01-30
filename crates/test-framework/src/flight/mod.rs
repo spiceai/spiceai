@@ -36,7 +36,7 @@ pub async fn query_to_batches(
     sql: &str,
     params: Option<RecordBatch>,
 ) -> Result<Vec<RecordBatch>> {
-    let mut stream = spice_client.query_with_params(sql, params).await?;
+    let mut stream = spice_client.sql_with_params(sql, params).await?;
 
     let mut batches = Vec::new();
     while let Some(batch) = stream.next().await {

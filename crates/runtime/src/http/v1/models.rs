@@ -27,10 +27,11 @@ use axum::{
 };
 use csv::Writer;
 use http::StatusCode;
+use runtime_api_types::v1::ModelMetadata;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::{Runtime, model::LLMResponsesModelStore, status::ComponentStatus};
+use crate::{Runtime, model::LLMResponsesModelStore};
 
 use super::Format;
 
@@ -50,19 +51,9 @@ pub struct ModelsQueryParams {
     pub metadata_fields: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub(crate) struct OpenAIModelResponse {
-    object: String,
-    data: Vec<OpenAIModel>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub(crate) struct Metadata {
-    pub supports_responses_api: bool,
-}
+// Re-export shared types for backwards compatibility
+pub use runtime_api_types::v1::ModelInfo as OpenAIModel;
+pub use runtime_api_types::v1::ModelListResponse as OpenAIModelResponse;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) enum MetadataKeys {
@@ -78,29 +69,6 @@ impl TryFrom<&str> for MetadataKeys {
             _ => Err(format!("Invalid metadata key: {value}")),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub(crate) struct OpenAIModel {
-    /// The name of the model
-    id: String,
-
-    /// The type of the model (always `model`)
-    object: String,
-
-    /// The source from which the model was loaded (e.g., `openai`, `spiceai`)
-    owned_by: String,
-
-    /// The datasets associated with this model, if any
-    datasets: Option<Vec<String>>,
-
-    /// The status of the model (e.g., `ready`, `initializing`, `error`)
-    status: Option<ComponentStatus>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<Metadata>,
 }
 
 fn get_metadata_keys(params: &ModelsQueryParams) -> Result<Vec<MetadataKeys>, String> {
@@ -119,12 +87,12 @@ fn generate_metadata(
     model_name: &str,
     metadata_keys: &Vec<MetadataKeys>,
     responses_models: &HashSet<String>,
-) -> Option<Metadata> {
+) -> Option<ModelMetadata> {
     if metadata_keys.is_empty() {
         return None;
     }
 
-    let mut metadata = Metadata::default();
+    let mut metadata = ModelMetadata::default();
     for key in metadata_keys {
         match key {
             MetadataKeys::SupportsResponsesAPI => {

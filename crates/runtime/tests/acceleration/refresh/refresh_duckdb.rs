@@ -19,12 +19,16 @@ use crate::acceleration::refresh::common::{
 };
 use crate::postgres::common;
 use crate::postgres::common::get_random_port;
-use crate::{init_tracing, utils::test_request_context};
+use crate::{
+    init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 use std::sync::Arc;
 
 #[tokio::test]
 async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -70,6 +74,7 @@ async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> 
 #[tokio::test]
 async fn test_acceleration_refresh_duckdb_full() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

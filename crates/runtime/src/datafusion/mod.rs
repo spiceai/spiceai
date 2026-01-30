@@ -1383,6 +1383,7 @@ impl DataFusion {
 
         // Check if this is an S3 Express One Zone acceleration (Cayenne with S3 Express config)
         // This is used for better error messages when S3 Express upload fails
+        #[cfg(not(windows))]
         let is_s3_express_acceleration = acceleration_settings.engine == Engine::Cayenne
             && (acceleration_settings
                 .params
@@ -1393,6 +1394,8 @@ impl DataFusion {
                 || acceleration_settings
                     .params
                     .contains_key("cayenne_s3_zone_ids"));
+        #[cfg(windows)]
+        let is_s3_express_acceleration = false;
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
 
         accelerated_table_builder

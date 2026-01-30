@@ -30,7 +30,10 @@ use test_framework::{
 
 const ENDPOINTS: [&str; 2] = [HEALTH_ENDPOINT, READY_ENDPOINT];
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
-const LATENCY_THRESHOLD: Duration = Duration::from_millis(50);
+
+// Use a large latency threshold for health endpoints as latency can spike when the CPU is fully utilized during
+// intensive benchmark runs. This reduces noise from false positives. See <https://github.com/spiceai/spiceai/issues/7766>
+const LATENCY_THRESHOLD: Duration = Duration::from_millis(125);
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct EndpointStats {
@@ -99,7 +102,7 @@ impl HealthMonitor {
         let task_token = cancel_token.clone();
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(100))
+            .timeout(Duration::from_millis(200))
             .build()
             .context("Failed to create health monitor HTTP client")?;
 

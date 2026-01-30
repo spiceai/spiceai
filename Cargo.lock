@@ -233,13 +233,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
 
 [[package]]
-name = "ansi_term"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d52a9bb7ec0cf484c551830a7ce27bd20d67eac647e1befb56b0be4ee39a55d2"
-dependencies = [
- "winapi",
-]
+name = "ansi_colors"
+version = "2.0.0-unstable"
 
 [[package]]
 name = "anstream"
@@ -345,7 +340,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "serde",
  "snafu",
@@ -667,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -681,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -1439,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2046,9 +2041,9 @@ dependencies = [
 
 [[package]]
 name = "azure_core"
-version = "0.30.1"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f35444aeeb91e29ca82d04dbb8ad904570f837c82093454dc1989c64a33554a7"
+checksum = "dfe45c6bd7ce3a592327ee4e35b5bd16681714c4443c8a9884abb5731cc4d833"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -2066,9 +2061,9 @@ dependencies = [
 
 [[package]]
 name = "azure_core_macros"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94f7cc1bbae04cfe11de9e39e2c6dc755947901e0f4e76180ab542b6deb5e15e"
+checksum = "190d6e0622d17e2a28239b55d2829d98b348269adcd4ab86a21d3304aa3500cb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2175,7 +2170,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "51.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=626181fbc04a6f964abc459f99f62cf7742f75b4#626181fbc04a6f964abc459f99f62cf7742f75b4"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=20ef1eb38c0ca526f96507e1f32632672b868116#20ef1eb38c0ca526f96507e1f32632672b868116"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2216,7 +2211,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "51.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=626181fbc04a6f964abc459f99f62cf7742f75b4#626181fbc04a6f964abc459f99f62cf7742f75b4"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=20ef1eb38c0ca526f96507e1f32632672b868116#20ef1eb38c0ca526f96507e1f32632672b868116"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2249,7 +2244,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "51.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=626181fbc04a6f964abc459f99f62cf7742f75b4#626181fbc04a6f964abc459f99f62cf7742f75b4"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=20ef1eb38c0ca526f96507e1f32632672b868116#20ef1eb38c0ca526f96507e1f32632672b868116"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2948,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3241,7 +3236,7 @@ dependencies = [
 
 [[package]]
 name = "cayenne"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "aegis",
  "arrow",
@@ -3468,7 +3463,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "criterion 0.7.0",
  "snafu",
@@ -3749,6 +3744,347 @@ name = "connection-string"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
+
+[[package]]
+name = "connector-clickhouse"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "clickhouse-rs",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "db_connection_pool",
+ "linkme",
+ "ns_lookup",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "url",
+]
+
+[[package]]
+name = "connector-databricks"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-sdk-credential-bridge",
+ "data_components",
+ "datafusion",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime",
+ "runtime-secrets",
+ "secrecy",
+ "snafu",
+ "token_provider",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "connector-delta-lake"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-sdk-credential-bridge",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "connector-dremio"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-federation",
+ "flight_client",
+ "linkme",
+ "ns_lookup",
+ "paste",
+ "runtime",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-duckdb"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "duckdb",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+]
+
+[[package]]
+name = "connector-flightsql"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "flight_client",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+]
+
+[[package]]
+name = "connector-ftp"
+version = "2.0.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-graphql"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "token_provider",
+ "url",
+]
+
+[[package]]
+name = "connector-imap"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "imap",
+ "linkme",
+ "paste",
+ "regex",
+ "runtime",
+ "secrecy",
+ "snafu",
+]
+
+[[package]]
+name = "connector-mongodb"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-mssql"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tiberius",
+]
+
+[[package]]
+name = "connector-mysql"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "mysql_async",
+ "opentelemetry",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-nfs"
+version = "1.11.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-odbc"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "db_connection_pool",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-oracle"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "runtime-parameters",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-postgres"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+]
+
+[[package]]
+name = "connector-scylladb"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "db_connection_pool",
+ "linkme",
+ "ns_lookup",
+ "paste",
+ "runtime",
+ "runtime-parameters",
+ "scylla",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-sftp"
+version = "2.0.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-sharepoint"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "document_parse",
+ "graph-rs-sdk",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "url",
+]
+
+[[package]]
+name = "connector-smb"
+version = "2.0.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-snowflake"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "db_connection_pool",
+ "itertools 0.14.0",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "snowflake-api",
+]
+
+[[package]]
+name = "connector-spark"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "runtime-parameters",
+ "snafu",
+]
 
 [[package]]
 name = "console"
@@ -4607,7 +4943,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "data_components"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4701,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5220,7 +5556,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer-rules"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "async-stream",
@@ -5527,7 +5863,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -5861,6 +6197,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
 
 [[package]]
+name = "dialoguer"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "658bce805d770f407bc62102fca7c2c64ceef2fbcb2b8bd19d2765ce093980de"
+dependencies = [
+ "console 0.15.11",
+ "shell-words",
+ "tempfile",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5972,7 +6321,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -6109,7 +6458,7 @@ dependencies = [
 
 [[package]]
 name = "dynamodb-streams"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
@@ -6434,7 +6783,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "futures",
  "snafu",
@@ -6726,7 +7075,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6743,7 +7092,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6755,32 +7104,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "flightrepl"
-version = "1.11.0-unstable"
-dependencies = [
- "arrow-flight",
- "arrow-json",
- "clap 4.5.54",
- "datafusion",
- "flight_client",
- "futures",
- "insta",
- "llms",
- "prost 0.14.3",
- "regex",
- "reqwest",
- "rustyline 17.0.2",
- "serde_json",
- "tokio",
- "tonic",
- "tracing",
- "util",
- "winver",
-]
-
-[[package]]
 name = "flightsubscriber"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow-flight",
  "clap 4.5.54",
@@ -7386,7 +7711,7 @@ dependencies = [
 
 [[package]]
 name = "google-genai"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -7664,7 +7989,7 @@ dependencies = [
 
 [[package]]
 name = "hash-index"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -9552,7 +9877,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -10140,9 +10465,9 @@ dependencies = [
 
 [[package]]
 name = "minijinja"
-version = "2.14.0"
+version = "2.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12ea9ac0a51fb5112607099560fdf0f90366ab088a2a9e6e8ae176794e9806aa"
+checksum = "b479616bb6f0779fb0f3964246beda02d4b01144e1b0d5519616e012ccc2a245"
 dependencies = [
  "serde",
  "serde_json",
@@ -10150,9 +10475,9 @@ dependencies = [
 
 [[package]]
 name = "minijinja-contrib"
-version = "2.14.0"
+version = "2.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be6ad8bbc21c256d5f2f5494699d5d69d519b8510d672a0e43b7bfa3a56c388a"
+checksum = "7826089e6af7bc638f69a44b100ebe7f6c64b182cfde16558d5cd38ac8adde20"
 dependencies = [
  "minijinja",
  "serde",
@@ -10420,7 +10745,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10973,7 +11298,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "hickory-resolver",
  "snafu",
@@ -11582,9 +11907,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "oneshot"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ce66197e99546da6c6d991285f605192e794ceae69686c17163844a7bf8fcc2"
+checksum = "269bca4c2591a28585d6bf10d9ed0332b7d76900a1b02bec41bdc3a2cdcda107"
 
 [[package]]
 name = "onig"
@@ -11918,7 +12243,7 @@ checksum = "e2355d85b9a3786f481747ced0e0ff2ba35213a1f9bd406ed906554d7af805a1"
 
 [[package]]
 name = "otel-arrow"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -11929,7 +12254,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "clap 4.5.54",
  "opentelemetry-proto",
@@ -12046,7 +12371,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "bytes",
  "futures",
@@ -12170,7 +12495,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "bytes",
  "chunking",
@@ -13772,9 +14097,9 @@ dependencies = [
 
 [[package]]
 name = "rdkafka"
-version = "0.38.0"
+version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f1856d72dbbbea0d2a5b2eaf6af7fb3847ef2746e883b11781446a51dbc85c0"
+checksum = "d7956f9ac12b5712e50372d9749a3102f4810a8d42481c5eae3748d36d585bcf"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -13979,6 +14304,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fe3824f5629716b1589be05dacd749f6aa084c87e00e016714a8cdfccc997c"
 dependencies = [
  "bytecheck",
+]
+
+[[package]]
+name = "repl"
+version = "2.0.0-unstable"
+dependencies = [
+ "ansi_colors",
+ "arrow",
+ "arrow-flight",
+ "arrow-json",
+ "clap 4.5.54",
+ "dialoguer",
+ "dirs",
+ "flight_client",
+ "futures",
+ "insta",
+ "prost 0.14.3",
+ "regex",
+ "reqwest",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "winver",
 ]
 
 [[package]]
@@ -14362,7 +14714,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -14387,7 +14739,7 @@ dependencies = [
  "aws-sdk-sts",
  "axum",
  "axum-extra",
- "azure_core 0.30.1",
+ "azure_core 0.31.0",
  "azure_storage",
  "azure_storage_blobs",
  "ballista-core",
@@ -14403,7 +14755,26 @@ dependencies = [
  "chrono",
  "chunking",
  "clap 4.5.54",
- "clickhouse-rs",
+ "connector-clickhouse",
+ "connector-databricks",
+ "connector-delta-lake",
+ "connector-dremio",
+ "connector-duckdb",
+ "connector-flightsql",
+ "connector-ftp",
+ "connector-graphql",
+ "connector-imap",
+ "connector-mongodb",
+ "connector-mssql",
+ "connector-mysql",
+ "connector-oracle",
+ "connector-postgres",
+ "connector-scylladb",
+ "connector-sftp",
+ "connector-sharepoint",
+ "connector-smb",
+ "connector-snowflake",
+ "connector-spark",
  "criterion 0.7.0",
  "csv",
  "dashmap",
@@ -14424,13 +14795,11 @@ dependencies = [
  "dynamodb-streams",
  "event_stream",
  "flight_client",
- "flightrepl",
  "fundu",
  "futures",
  "gethostname",
  "globset",
  "governor",
- "graph-rs-sdk",
  "graphql-parser",
  "headers-accept",
  "hf-hub",
@@ -14443,7 +14812,6 @@ dependencies = [
  "iceberg-catalog-glue",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
- "imap",
  "indexmap 2.13.0",
  "insta",
  "itertools 0.14.0",
@@ -14478,10 +14846,12 @@ dependencies = [
  "rayon",
  "rdkafka",
  "regex",
+ "repl",
  "reqwest",
  "rmcp",
  "rstest 0.26.1",
  "runtime-acceleration",
+ "runtime-api-types",
  "runtime-async",
  "runtime-auth",
  "runtime-datafusion",
@@ -14501,14 +14871,12 @@ dependencies = [
  "scheduler",
  "schemars 1.2.0",
  "scopeguard",
- "scylla",
  "search",
  "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",
  "snafu",
- "snowflake-api",
  "spice-cloud",
  "spiceai",
  "spicepod",
@@ -14549,7 +14917,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "anyhow",
  "arrow",
@@ -14583,8 +14951,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-api-types"
+version = "2.0.0-unstable"
+dependencies = [
+ "serde",
+ "serde_json",
+ "utoipa",
+]
+
+[[package]]
 name = "runtime-async"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "futures",
  "libc",
@@ -14596,7 +14973,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "app",
  "axum",
@@ -14611,7 +14988,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow_tools",
@@ -14636,11 +15013,12 @@ dependencies = [
  "snafu",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -14653,7 +15031,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -14675,7 +15053,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-object-store"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -14704,7 +15082,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "itertools 0.14.0",
  "runtime-secrets",
@@ -14716,7 +15094,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-proto"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "datafusion",
  "datafusion-common",
@@ -14731,7 +15109,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-rate-control"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "futures",
  "governor",
@@ -14743,7 +15121,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "app",
  "async-trait",
@@ -14763,7 +15141,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-secrets"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -14790,7 +15168,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-table-partition"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -15102,28 +15480,6 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustyline"
-version = "15.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee1e066dc922e513bda599c6ccb5f3bb2b0ea5870a579448f2622993f0a9a2f"
-dependencies = [
- "bitflags 2.10.0",
- "cfg-if",
- "clipboard-win",
- "fd-lock",
- "home",
- "libc",
- "log",
- "memchr",
- "nix 0.29.0",
- "radix_trie",
- "unicode-segmentation",
- "unicode-width 0.2.2",
- "utf8parse",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "rustyline"
 version = "17.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e902948a25149d50edc1a8e0141aad50f54e22ba83ff988cf8f7c9ef07f50564"
@@ -15164,7 +15520,7 @@ checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
 name = "s3_vectors"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -15176,7 +15532,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -15278,7 +15634,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "chrono",
@@ -15484,7 +15840,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -15923,6 +16279,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16043,9 +16405,9 @@ dependencies = [
 
 [[package]]
 name = "siphasher"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
+checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "sketches-ddsketch"
@@ -16414,33 +16776,42 @@ dependencies = [
 
 [[package]]
 name = "spice"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
- "ansi_term",
+ "ansi_colors",
+ "arrow",
  "assert_cmd",
  "chrono",
  "clap 4.5.54",
  "comfy-table",
+ "dialoguer",
  "dirs",
  "dotenvy",
  "flate2",
- "flightrepl",
  "futures",
  "humantime",
+ "nix 0.29.0",
  "open",
+ "opentelemetry",
  "pem",
  "predicates",
  "rand 0.9.2",
  "rcgen",
+ "repl",
  "reqwest",
- "rustyline 15.0.0",
+ "rstest 0.26.1",
+ "runtime-api-types",
+ "rustyline",
  "semver",
  "serde",
  "serde_json",
  "serde_yaml",
  "snafu",
+ "spiceai",
+ "spicepod",
  "tar",
  "tempfile",
+ "test-framework",
  "time",
  "tokio",
  "tracing",
@@ -16451,7 +16822,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -16467,7 +16838,7 @@ dependencies = [
 [[package]]
 name = "spiceai"
 version = "3.2.0"
-source = "git+https://github.com/spiceai/spice-rs.git?tag=v3.1.0#0195105ec217dd4ee9701d8d1d69bedf3f812595"
+source = "git+https://github.com/spiceai/spice-rs.git?rev=7815fb062ba508636abeff85ade93f93edff5a7e#7815fb062ba508636abeff85ade93f93edff5a7e"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -16495,12 +16866,33 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "app",
  "clap 4.5.54",
+ "connector-clickhouse",
+ "connector-databricks",
+ "connector-delta-lake",
+ "connector-dremio",
+ "connector-duckdb",
+ "connector-flightsql",
+ "connector-ftp",
+ "connector-graphql",
+ "connector-imap",
+ "connector-mongodb",
+ "connector-mssql",
+ "connector-mysql",
+ "connector-nfs",
+ "connector-odbc",
+ "connector-oracle",
+ "connector-postgres",
+ "connector-scylladb",
+ "connector-sftp",
+ "connector-sharepoint",
+ "connector-smb",
+ "connector-snowflake",
+ "connector-spark",
  "event_stream",
- "flightrepl",
  "futures",
  "mimalloc",
  "opentelemetry",
@@ -16510,6 +16902,7 @@ dependencies = [
  "opentelemetry_sdk",
  "otel-arrow",
  "prometheus",
+ "repl",
  "reqwest",
  "runtime",
  "runtime-async",
@@ -16531,7 +16924,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -16554,7 +16947,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod-validator"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "app",
  "clap 4.5.54",
@@ -16564,8 +16957,27 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
+ "connector-clickhouse",
+ "connector-delta-lake",
+ "connector-dremio",
+ "connector-duckdb",
+ "connector-flightsql",
+ "connector-ftp",
+ "connector-graphql",
+ "connector-imap",
+ "connector-mongodb",
+ "connector-mssql",
+ "connector-mysql",
+ "connector-oracle",
+ "connector-postgres",
+ "connector-scylladb",
+ "connector-sftp",
+ "connector-sharepoint",
+ "connector-smb",
+ "connector-snowflake",
+ "connector-spark",
  "regex",
  "runtime",
  "runtime-parameters",
@@ -16577,7 +16989,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "clap 4.5.54",
  "runtime",
@@ -17431,7 +17843,7 @@ checksum = "b1dd07eb858a2067e2f3c7155d54e929265c264e6f37efe3ee7a8d1b5a1dd0ba"
 
 [[package]]
 name = "telemetry"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
@@ -17521,7 +17933,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-framework"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "anyhow",
  "app",
@@ -17594,7 +18006,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -17683,7 +18095,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.15.5",
+ "hashbrown 0.16.1",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",
@@ -17931,7 +18343,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "secrecy",
  "snafu",
@@ -18324,7 +18736,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -18401,7 +18813,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "duckdb",
@@ -18901,9 +19313,9 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
 name = "typespec"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44f91ea93fdd5fd4985fcc0a197ed8e8da18705912bef63c9b9b3148d6f35510"
+checksum = "4dd1eb4a538c1ab3d5c05437129bc16891296146b23c9b0bb3f5df99f5b3a18d"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -18915,9 +19327,9 @@ dependencies = [
 
 [[package]]
 name = "typespec_client_core"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a0f6f7345c3389663551a64fc4dca78fa9689ece758c5ca76e82d6da69349dc"
+checksum = "e632235c99ae896a3c451d1ead00cea11a2219aeda1b35a74027fe99ea3f3b72"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -18940,9 +19352,9 @@ dependencies = [
 
 [[package]]
 name = "typespec_macros"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ecee5b05c459ea4cd97df7685db58699c32e070465f88dc806d7c98a5088edc"
+checksum = "7048df3b053daa72e8ea91894ebcb2f0511ba52737379834524d82074a94a458"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -19253,7 +19665,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -21192,7 +21604,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "async-openai",
  "async-trait",
