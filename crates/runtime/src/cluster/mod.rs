@@ -113,6 +113,7 @@ fn spawn_scheduler_poll_loop(
     codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
     readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<Arc<Notify>>,
+    available_task_slots: Arc<tokio::sync::Semaphore>,
 ) -> SchedulerPollHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -229,6 +230,7 @@ fn spawn_scheduler_poll_loop(
                 codec.clone(),
                 Some(tx_ready),
                 poll_now_notify.clone(),
+                Some(Arc::clone(&available_task_slots)),
             );
 
             tokio::select! {
@@ -299,6 +301,7 @@ fn update_scheduler_pollers(
     codec: &BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
     readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<&Arc<Notify>>,
+    available_task_slots: &Arc<tokio::sync::Semaphore>,
 ) {
     let next_schedulers: HashSet<String> = addresses.into_iter().collect();
 
@@ -327,6 +330,7 @@ fn update_scheduler_pollers(
             codec.clone(),
             Arc::clone(readiness_sender),
             poll_now_notify.cloned(),
+            Arc::clone(available_task_slots),
         );
         pollers.insert(address, handle);
     }
@@ -976,11 +980,17 @@ pub async fn initialize_cluster_executor(
     let (tx_ready, rx_ready) = oneshot::channel::<String>();
     let readiness_sender = Arc::new(Mutex::new(Some(tx_ready)));
 
+    // Create the shared semaphore for task slot management across all scheduler poll loops.
+    // This semaphore will be passed to each poll loop so the busy state can be tracked
+    // and shared across nodes in the scheduler shared state location metadata.
+    let available_task_slots = Arc::new(tokio::sync::Semaphore::new(concurrent_tasks as usize));
+
     let scheduler_url_for_manager = scheduler_url.clone();
     let client_tls_config_for_manager = client_tls_config.clone();
     let executor_for_manager = Arc::clone(&executor);
     let codec_for_manager = codec;
     let initial_scheduler_addresses_for_manager = initial_scheduler_addresses.clone();
+    let available_task_slots_for_manager = Arc::clone(&available_task_slots);
 
     // Compute the executor's advertise address for control stream identification.
     let executor_advertise_id =
@@ -1031,6 +1041,7 @@ pub async fn initialize_cluster_executor(
             &codec_for_manager,
             &readiness_sender,
             Some(&poll_now_notify),
+            &available_task_slots_for_manager,
         );
 
         let mut refresh = tokio::time::interval(SCHEDULER_REFRESH_INTERVAL);
@@ -1060,6 +1071,7 @@ pub async fn initialize_cluster_executor(
                     &codec_for_manager,
                     &readiness_sender,
                     Some(&poll_now_notify),
+                    &available_task_slots_for_manager,
                 );
             }
         }
