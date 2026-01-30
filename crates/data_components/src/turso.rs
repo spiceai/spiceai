@@ -385,18 +385,19 @@ fn is_now_function(func: &Function) -> bool {
 ///
 /// ```rust,ignore
 /// // Create pool once and share it
-/// let pool = Arc::new(TursoConnectionPool::new(":memory:", false).await?);
+/// let pool = Arc::new(TursoConnectionPool::new(":memory:").await?);
 ///
 /// // Use pool.connect() for each operation
 /// let conn = pool.connect().await?;
 /// ```
+///
+/// Note: MVCC is always enabled in turso 0.4.x and later.
 ///
 /// For production workloads, prefer using `TursoAccelerator::get_shared_pool()` which
 /// caches pool instances per database file for even better performance.
 #[derive(Debug)]
 pub struct TursoConnectionPool {
     database: Arc<Database>,
-    mvcc_enabled: bool,
     db_path: String,
     timestamp_format: TimestampFormat,
 }
@@ -406,31 +407,28 @@ impl TursoConnectionPool {
     ///
     /// # Arguments
     /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
-    /// * `mvcc_enabled` - Whether to enable Multi-Version Concurrency Control
-    pub async fn new(path: &str, mvcc_enabled: bool) -> Result<Self> {
-        Self::new_with_timestamp_format(path, mvcc_enabled, TimestampFormat::default()).await
+    pub async fn new(path: &str) -> Result<Self> {
+        Self::new_with_timestamp_format(path, TimestampFormat::default()).await
     }
 
     /// Creates a new connection pool with specified timestamp format.
     ///
     /// # Arguments
     /// * `path` - Database path (":memory:" for in-memory, or file path for file-based)
-    /// * `mvcc_enabled` - Whether to enable Multi-Version Concurrency Control
     /// * `timestamp_format` - Format for storing timestamp values (RFC3339 or integer milliseconds)
+    ///
+    /// Note: MVCC is always enabled in turso 0.4.x.
     pub async fn new_with_timestamp_format(
         path: &str,
-        mvcc_enabled: bool,
         timestamp_format: TimestampFormat,
     ) -> Result<Self> {
         let database = Builder::new_local(path)
-            .with_mvcc(mvcc_enabled)
             .build()
             .await
             .context(TursoDatabaseSnafu)?;
 
         Ok(Self {
             database: Arc::new(database),
-            mvcc_enabled,
             db_path: path.to_string(),
             timestamp_format,
         })
@@ -444,12 +442,6 @@ impl TursoConnectionPool {
     #[expect(clippy::unused_async)]
     pub async fn connect(&self) -> Result<Connection> {
         self.database.connect().context(TursoDatabaseSnafu)
-    }
-
-    /// Returns true if MVCC (Multi-Version Concurrency Control) is enabled
-    #[must_use]
-    pub fn is_mvcc_enabled(&self) -> bool {
-        self.mvcc_enabled
     }
 
     /// Returns true if this is an in-memory database
@@ -1717,13 +1709,8 @@ impl TursoDataSink {
         );
 
         // Use a transaction to batch all inserts
-        // If MVCC is enabled, use BEGIN CONCURRENT for better concurrency
-        let begin_stmt = if self.pool.is_mvcc_enabled() {
-            "BEGIN CONCURRENT"
-        } else {
-            "BEGIN"
-        };
-        conn.execute(begin_stmt, ()).await?;
+        // MVCC is always enabled in turso 0.4.x, so use BEGIN CONCURRENT for better concurrency
+        conn.execute("BEGIN CONCURRENT", ()).await?;
 
         // Prepare the statement once
         let mut stmt = conn.prepare(&insert_sql).await?;

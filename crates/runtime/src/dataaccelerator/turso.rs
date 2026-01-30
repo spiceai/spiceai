@@ -225,29 +225,6 @@ impl TursoAccelerator {
         }
     }
 
-    /// Parses the `turso_mvcc` parameter from the acceleration configuration
-    /// Returns true if MVCC should be enabled, false otherwise (default: disabled)
-    fn parse_mvcc_enabled(source: &dyn AccelerationSource) -> Result<bool> {
-        if let Some(acceleration) = source.acceleration() {
-            if let Some(mvcc_value) = acceleration.params.get("turso_mvcc") {
-                match mvcc_value.as_str() {
-                    "enabled" => Ok(true),
-                    "disabled" => Ok(false),
-                    _ => Err(Error::InvalidConfiguration {
-                        detail: Arc::from(format!(
-                            "Invalid 'turso_mvcc' value: '{mvcc_value}'. Expected 'enabled' or 'disabled'."
-                        )),
-                    }),
-                }
-            } else {
-                // Default to disabled
-                Ok(false)
-            }
-        } else {
-            Ok(false)
-        }
-    }
-
     /// Parses the `internal_timestamp_format` parameter from the acceleration configuration
     /// Returns the timestamp format (default: Rfc3339)
     fn parse_timestamp_format(
@@ -339,7 +316,6 @@ impl TursoAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<Arc<TursoConnectionPool>> {
         let turso_file = self.turso_file_path(source)?;
-        let mvcc_enabled = Self::parse_mvcc_enabled(source)?;
         let timestamp_format = Self::parse_timestamp_format(source)?;
 
         let mut pools = self.pools.lock().await;
@@ -347,20 +323,16 @@ impl TursoAccelerator {
             Ok(Arc::clone(pool))
         } else {
             let pool = Arc::new(
-                TursoConnectionPool::new_with_timestamp_format(
-                    &turso_file,
-                    mvcc_enabled,
-                    timestamp_format,
-                )
-                .await
-                .map_err(|e| match e {
-                    data_components::turso::Error::TursoDatabaseError { source } => {
-                        Error::TursoDatabaseError { source }
-                    }
-                    _ => Error::AccelerationCreationFailed {
-                        source: Box::new(e),
-                    },
-                })?,
+                TursoConnectionPool::new_with_timestamp_format(&turso_file, timestamp_format)
+                    .await
+                    .map_err(|e| match e {
+                        data_components::turso::Error::TursoDatabaseError { source } => {
+                            Error::TursoDatabaseError { source }
+                        }
+                        _ => Error::AccelerationCreationFailed {
+                            source: Box::new(e),
+                        },
+                    })?,
             );
             pools.insert(turso_file, Arc::clone(&pool));
             Ok(pool)
@@ -371,10 +343,6 @@ impl TursoAccelerator {
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("turso_file")
         .description("Path to the Turso database file. If not specified, defaults to {spice_data_dir}/{dataset_name}.turso"),
-    ParameterSpec::component("turso_mvcc")
-        .description("Enable Multi-Version Concurrency Control (MVCC) for Turso database")
-        .default("disabled")
-        .one_of(&["enabled", "disabled"]),
     ParameterSpec::component("internal_timestamp_format")
         .description("Internal timestamp storage format: 'rfc3339' (default, preserves precision/timezone) or 'integer_millis' (performance, millisecond precision only)")
         .default("rfc3339")
@@ -384,6 +352,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     // Remote database support will be available when Turso is implemented as a data connector,
     // where remote access patterns are the primary use case and locally-cached acceleration
     // is not required.
+    // Note: MVCC is always enabled in turso 0.4.x, no configuration needed.
 ];
 
 #[async_trait]
@@ -543,20 +512,13 @@ impl DataAccelerator for TursoAccelerator {
             ":memory:".to_string()
         };
 
-        // Get MVCC setting
-        let mvcc_enabled = if let Some(source) = source {
-            Self::parse_mvcc_enabled(source)?
-        } else {
-            false // Default to disabled for external tables without source
-        };
-
         // Get or create connection pool
         let pool = {
             let mut pools = self.pools.lock().await;
             if let Some(pool) = pools.get(&db_path) {
                 Arc::clone(pool)
             } else {
-                let new_pool = Arc::new(TursoConnectionPool::new(&db_path, mvcc_enabled).await?);
+                let new_pool = Arc::new(TursoConnectionPool::new(&db_path).await?);
                 pools.insert(db_path.clone(), Arc::clone(&new_pool));
                 new_pool
             }
@@ -624,59 +586,52 @@ impl DataAccelerator for TursoAccelerator {
             })?;
 
         // Handle indexes if specified
+        // Note: MVCC is always enabled in turso 0.4.x and indexes are fully supported
         if let Some(indexes_str) = cmd.options.get("indexes") {
-            if mvcc_enabled {
-                // Indexes are not yet supported in MVCC mode
-                tracing::warn!(
-                    "Indexes are not yet supported in MVCC mode for Turso. Skipping index creation for table '{}'",
-                    table_name
+            // Parse the indexes option string
+            use datafusion_table_providers::util::hashmap_from_option_string;
+            let indexes = hashmap_from_option_string::<String, String>(indexes_str);
+
+            // Create indexes
+            for (column_ref_str, index_type_str) in indexes {
+                let index_type = crate::component::dataset::acceleration::IndexType::from(
+                    index_type_str.as_str(),
                 );
-            } else {
-                // Parse the indexes option string
-                use datafusion_table_providers::util::hashmap_from_option_string;
-                let indexes = hashmap_from_option_string::<String, String>(indexes_str);
+                let index_name = format!(
+                    "idx_{}_{}",
+                    table_name,
+                    column_ref_str.replace(['(', ')', ' ', ','], "_")
+                );
+                let quoted_index_name = sanitize_identifier(&index_name, "Index")?;
+                let unique_clause = match &index_type {
+                    crate::component::dataset::acceleration::IndexType::Unique => "UNIQUE ",
+                    crate::component::dataset::acceleration::IndexType::Enabled => "",
+                };
 
-                // Create indexes
-                for (column_ref_str, index_type_str) in indexes {
-                    let index_type = crate::component::dataset::acceleration::IndexType::from(
-                        index_type_str.as_str(),
-                    );
-                    let index_name = format!(
-                        "idx_{}_{}",
-                        table_name,
-                        column_ref_str.replace(['(', ')', ' ', ','], "_")
-                    );
-                    let quoted_index_name = sanitize_identifier(&index_name, "Index")?;
-                    let unique_clause = match &index_type {
-                        crate::component::dataset::acceleration::IndexType::Unique => "UNIQUE ",
-                        crate::component::dataset::acceleration::IndexType::Enabled => "",
-                    };
+                let sanitized_columns = sanitize_column_reference(&column_ref_str)?;
+                let column_list = format!("({})", sanitized_columns.join(", "));
 
-                    let sanitized_columns = sanitize_column_reference(&column_ref_str)?;
-                    let column_list = format!("({})", sanitized_columns.join(", "));
+                let create_index_sql = format!(
+                    "CREATE {unique_clause}INDEX IF NOT EXISTS {quoted_index_name} ON {quoted_table_name} {column_list}"
+                );
 
-                    let create_index_sql = format!(
-                        "CREATE {unique_clause}INDEX IF NOT EXISTS {quoted_index_name} ON {quoted_table_name} {column_list}"
-                    );
+                conn.execute(&create_index_sql, ()).await.map_err(|e| {
+                    Error::AccelerationCreationFailed {
+                        source: Box::new(e),
+                    }
+                })?;
 
-                    conn.execute(&create_index_sql, ()).await.map_err(|e| {
-                        Error::AccelerationCreationFailed {
-                            source: Box::new(e),
-                        }
-                    })?;
-
-                    tracing::debug!(
-                        "Created {}index '{}' on table '{}' for columns: {}",
-                        if unique_clause.is_empty() {
-                            ""
-                        } else {
-                            "unique "
-                        },
-                        index_name,
-                        table_name,
-                        column_ref_str
-                    );
-                }
+                tracing::debug!(
+                    "Created {}index '{}' on table '{}' for columns: {}",
+                    if unique_clause.is_empty() {
+                        ""
+                    } else {
+                        "unique "
+                    },
+                    index_name,
+                    table_name,
+                    column_ref_str
+                );
             }
         }
 
