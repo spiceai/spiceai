@@ -24,13 +24,14 @@ use anyhow::{Context, Result};
 
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 mod metrics;
-pub use metrics::{TextToSqlMetric, TextToSqlRunMetric};
+pub use metrics::{TextToSqlMetric, TextToSqlRunMetric, intersection_over_union};
 mod worker;
 pub use worker::{TextToSqlConfig, TextToSqlRequest};
 use worker::{TextToSqlWorker, TextToSqlWorkerResult};
 mod task_history;
+pub use task_history::{TaskHistoryMetrics, find_task_history_metrics};
 
-mod parse;
+pub mod parse;
 
 #[derive(Default)]
 pub struct NotStarted {
