@@ -342,7 +342,8 @@ mod tests {
         ) {
             Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
             Err(e) => assert!(
-                e.to_string().contains("Invalid format for row_id. Expected a string, or array of strings."),
+                e.to_string()
+                    .contains("Invalid format for row_id. Expected a string, or array of strings."),
                 "Expected row_id format error, got: {e}"
             ),
         }
@@ -355,7 +356,8 @@ mod tests {
         ) {
             Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
             Err(e) => assert!(
-                e.to_string().contains("Invalid format for row_id. Expected a string, or array of strings."),
+                e.to_string()
+                    .contains("Invalid format for row_id. Expected a string, or array of strings."),
                 "Expected row_id format error, got: {e}"
             ),
         }

@@ -45,9 +45,9 @@ pub use octocrab;
 pub use opentelemetry;
 pub use opentelemetry_sdk;
 pub use rustls;
-pub use yaml;
 pub use spicepod;
 pub use tokio_util;
+pub use yaml;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TestType {

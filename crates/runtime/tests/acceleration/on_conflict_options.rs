@@ -367,8 +367,7 @@ fn set_duckdb_acceleration(mut dataset: Dataset) -> Dataset {
                 engine: duckdb
                 mode: memory
             ";
-    let acceleration: Acceleration =
-        yaml::from_str(yaml).expect("Failed to parse Acceleration");
+    let acceleration: Acceleration = yaml::from_str(yaml).expect("Failed to parse Acceleration");
     dataset.acceleration = Some(acceleration);
     dataset
 }

@@ -40,7 +40,6 @@ use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
-use yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
@@ -48,6 +47,7 @@ use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
+use yaml::Value;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -610,8 +610,7 @@ fn apply_overrides(
     };
 
     for (path, value) in overrides {
-        let yaml_value =
-            yaml::from_str(value).unwrap_or_else(|_| Value::String(value.clone()));
+        let yaml_value = yaml::from_str(value).unwrap_or_else(|_| Value::String(value.clone()));
         match apply_override(&mut yaml, path, yaml_value) {
             Ok(()) => (),
             Err(e) => {

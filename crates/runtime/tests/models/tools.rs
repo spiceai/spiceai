@@ -42,8 +42,7 @@ params:
   mcp_args: run -i --rm mcp/fetch
 ";
         let http_base_url = start_spiced_with_tools(vec![
-            yaml::from_str(tool_yaml)
-                .expect("Tool spicepod component is not in expected format"),
+            yaml::from_str(tool_yaml).expect("Tool spicepod component is not in expected format"),
         ])
         .await
         .expect("Failed to start spiced with tools");

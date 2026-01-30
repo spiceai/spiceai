@@ -188,10 +188,9 @@ fn configure_dataset() -> Result<()> {
     };
 
     // Serialize to YAML
-    let dataset_yaml =
-        yaml::to_string(&dataset).map_err(|e| crate::error::Error::ConfigParse {
-            message: format!("Failed to serialize dataset to YAML: {e}"),
-        })?;
+    let dataset_yaml = yaml::to_string(&dataset).map_err(|e| crate::error::Error::ConfigParse {
+        message: format!("Failed to serialize dataset to YAML: {e}"),
+    })?;
 
     // Create dataset directory with secure permissions (0700)
     let dir_path = PathBuf::from("datasets").join(&dataset_name);

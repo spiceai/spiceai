@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,6 +29,10 @@ pub(crate) fn value_to_yaml(value: &Value) -> Yaml {
         Value::Null => Yaml::Null,
         Value::Bool(b) => Yaml::Boolean(*b),
         Value::Number(n) => match n {
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "YAML only supports i64, large u64 values are rare"
+            )]
             Number::PosInt(i) => Yaml::Integer(*i as i64),
             Number::NegInt(i) => Yaml::Integer(*i),
             Number::Float(f) => {
@@ -64,7 +68,10 @@ pub(crate) fn emit_yaml(value: &Value) -> Result<String> {
     let mut emitter = YamlEmitter::new(&mut out);
     emitter.dump(&yaml)?;
     // Remove the leading "---\n" that yaml-rust2 adds
-    let result = out.trim_start_matches("---").trim_start_matches('\n').to_string();
+    let result = out
+        .trim_start_matches("---")
+        .trim_start_matches('\n')
+        .to_string();
     Ok(result)
 }
 
@@ -136,9 +143,7 @@ impl ser::Serializer for Serializer {
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<Value> {
-        Ok(Value::Sequence(
-            v.iter().map(|b| Value::from(*b)).collect(),
-        ))
+        Ok(Value::Sequence(v.iter().map(|b| Value::from(*b)).collect()))
     }
 
     fn serialize_none(self) -> Result<Value> {
@@ -182,7 +187,10 @@ impl ser::Serializer for Serializer {
         value: &T,
     ) -> Result<Value> {
         let mut map = Mapping::new();
-        map.insert(Value::String(variant.to_owned()), value.serialize(Serializer)?);
+        map.insert(
+            Value::String(variant.to_owned()),
+            value.serialize(Serializer)?,
+        );
         Ok(Value::Mapping(map))
     }
 
@@ -304,10 +312,7 @@ impl SerializeTupleVariant for TupleVariantSerializer {
 
     fn end(self) -> Result<Value> {
         let mut map = Mapping::new();
-        map.insert(
-            Value::String(self.variant),
-            Value::Sequence(self.elements),
-        );
+        map.insert(Value::String(self.variant), Value::Sequence(self.elements));
         Ok(Value::Mapping(map))
     }
 }
@@ -444,15 +449,30 @@ mod tests {
     #[test]
     fn test_serialize_primitives() {
         assert_eq!(true.serialize(Serializer).unwrap(), Value::Bool(true));
-        assert_eq!(42u64.serialize(Serializer).unwrap(), Value::Number(Number::PosInt(42)));
-        assert_eq!((-10i64).serialize(Serializer).unwrap(), Value::Number(Number::NegInt(-10)));
-        assert_eq!("hello".serialize(Serializer).unwrap(), Value::String("hello".into()));
+        assert_eq!(
+            42u64.serialize(Serializer).unwrap(),
+            Value::Number(Number::PosInt(42))
+        );
+        assert_eq!(
+            (-10i64).serialize(Serializer).unwrap(),
+            Value::Number(Number::NegInt(-10))
+        );
+        assert_eq!(
+            "hello".serialize(Serializer).unwrap(),
+            Value::String("hello".into())
+        );
     }
 
     #[test]
     fn test_serialize_option() {
-        assert_eq!(Option::<i32>::None.serialize(Serializer).unwrap(), Value::Null);
-        assert_eq!(Some(42i64).serialize(Serializer).unwrap(), Value::Number(Number::PosInt(42)));
+        assert_eq!(
+            Option::<i32>::None.serialize(Serializer).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            Some(42i64).serialize(Serializer).unwrap(),
+            Value::Number(Number::PosInt(42))
+        );
     }
 
     #[test]
@@ -488,7 +508,7 @@ mod tests {
     #[test]
     fn test_serialize_enum() {
         #[derive(Serialize)]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         enum Color {
             Red,
             Green,
@@ -521,7 +541,10 @@ mod tests {
         assert!(value.is_mapping());
         assert!(value.get("inner").unwrap().is_mapping());
         assert_eq!(
-            value.get("inner").and_then(|v| v.get("value")).and_then(Value::as_i64),
+            value
+                .get("inner")
+                .and_then(|v| v.get("value"))
+                .and_then(Value::as_i64),
             Some(42)
         );
         assert_eq!(value.get("name").and_then(Value::as_str), Some("test"));

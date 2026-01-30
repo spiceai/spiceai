@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -65,7 +65,7 @@ impl Location {
 }
 
 impl Error {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) fn parse(msg: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Parse(msg.into()),
@@ -120,7 +120,11 @@ impl Display for Error {
         match &self.kind {
             ErrorKind::Parse(msg) => {
                 if let Some(loc) = &self.location {
-                    write!(f, "YAML parse error at line {}, column {}: {}", loc.line, loc.column, msg)
+                    write!(
+                        f,
+                        "YAML parse error at line {}, column {}: {}",
+                        loc.line, loc.column, msg
+                    )
                 } else {
                     write!(f, "YAML parse error: {msg}")
                 }
@@ -163,10 +167,7 @@ impl From<std::io::Error> for Error {
 impl From<yaml_rust2::ScanError> for Error {
     fn from(err: yaml_rust2::ScanError) -> Self {
         let marker = err.marker();
-        Error::parse_with_location(
-            err.to_string(),
-            Location::new(marker.line(), marker.col()),
-        )
+        Error::parse_with_location(err.to_string(), Location::new(marker.line(), marker.col()))
     }
 }
 

@@ -349,8 +349,8 @@ where
             });
 
             let component_rdr = std::io::Cursor::new(component_bytes);
-            let component: ComponentType = yaml::from_reader(component_rdr)
-                .context(UnableToParseSpicepodComponentSnafu)?;
+            let component: ComponentType =
+                yaml::from_reader(component_rdr).context(UnableToParseSpicepodComponentSnafu)?;
             linked_files.extend(extract_linked_files(&component)?);
         } else {
             linked_files.push(PathReference::YmlOrYaml {

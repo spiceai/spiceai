@@ -104,10 +104,9 @@ pub async fn execute_add_or_connect(
         spicepod.dependencies.push(pod_path.clone());
 
         // Write updated spicepod.yaml
-        let yaml =
-            yaml::to_string(&spicepod).map_err(|e| crate::error::Error::ConfigParse {
-                message: format!("Failed to serialize spicepod.yaml: {e}"),
-            })?;
+        let yaml = yaml::to_string(&spicepod).map_err(|e| crate::error::Error::ConfigParse {
+            message: format!("Failed to serialize spicepod.yaml: {e}"),
+        })?;
         std::fs::write(&spicepod_path, yaml).context(ConfigIoSnafu {
             operation: "write",
             path: spicepod_path,

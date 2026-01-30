@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,10 +30,10 @@ const MERGE_KEY: &str = "<<";
 /// Convert yaml-rust2's Yaml type to our Value type.
 pub(crate) fn yaml_to_value(yaml: Yaml) -> Value {
     match yaml {
-        Yaml::Null => Value::Null,
         Yaml::Boolean(b) => Value::Bool(b),
         Yaml::Integer(i) => {
             if i >= 0 {
+                #[expect(clippy::cast_sign_loss, reason = "checked non-negative above")]
                 Value::Number(Number::PosInt(i as u64))
             } else {
                 Value::Number(Number::NegInt(i))
@@ -56,8 +56,8 @@ pub(crate) fn yaml_to_value(yaml: Yaml) -> Value {
         Yaml::String(s) => Value::String(s),
         Yaml::Array(arr) => Value::Sequence(arr.into_iter().map(yaml_to_value).collect()),
         Yaml::Hash(hash) => yaml_hash_to_value(hash),
-        Yaml::Alias(_) => Value::Null, // Aliases should be resolved by yaml-rust2
-        Yaml::BadValue => Value::Null,
+        // Aliases should be resolved by yaml-rust2
+        Yaml::Null | Yaml::Alias(_) | Yaml::BadValue => Value::Null,
     }
 }
 
@@ -69,12 +69,12 @@ fn yaml_hash_to_value(hash: yaml_rust2::yaml::Hash) -> Value {
     // First pass: collect merge values and regular entries
     for (k, v) in hash {
         // Check if this is a merge key
-        if let Yaml::String(ref s) = k {
-            if s == MERGE_KEY {
-                // Handle merge key - value can be a mapping or array of mappings
-                collect_merge_values(&v, &mut merge_values);
-                continue;
-            }
+        if let Yaml::String(ref s) = k
+            && s == MERGE_KEY
+        {
+            // Handle merge key - value can be a mapping or array of mappings
+            collect_merge_values(&v, &mut merge_values);
+            continue;
         }
         // Regular key-value pair
         map.insert(yaml_to_value(k), yaml_to_value(v));
@@ -122,570 +122,6 @@ pub(crate) fn parse_yaml(s: &str) -> Result<Value> {
         Ok(Value::Null)
     } else {
         Ok(yaml_to_value(docs.into_iter().next().unwrap_or(Yaml::Null)))
-    }
-}
-
-/// A deserializer for YAML values.
-#[allow(dead_code)]
-pub struct Deserializer<'de> {
-    value: &'de Value,
-}
-
-impl<'de> Deserializer<'de> {
-    /// Create a new deserializer from a Value reference.
-    #[allow(dead_code)]
-    pub fn new(value: &'de Value) -> Self {
-        Self { value }
-    }
-}
-
-impl<'de> de::Deserializer<'de> for Deserializer<'de> {
-    type Error = Error;
-
-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::Null => visitor.visit_unit(),
-            Value::Bool(b) => visitor.visit_bool(*b),
-            Value::Number(n) => match n {
-                Number::PosInt(i) => visitor.visit_u64(*i),
-                Number::NegInt(i) => visitor.visit_i64(*i),
-                Number::Float(f) => visitor.visit_f64(*f),
-            },
-            Value::String(s) => visitor.visit_str(s),
-            Value::Sequence(seq) => {
-                let seq_access = SeqDeserializer::new(seq.iter());
-                visitor.visit_seq(seq_access)
-            }
-            Value::Mapping(map) => {
-                let map_access = MapDeserializer::new(map.iter());
-                visitor.visit_map(map_access)
-            }
-        }
-    }
-
-    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::Bool(b) => visitor.visit_bool(*b),
-            Value::String(s) => match s.to_lowercase().as_str() {
-                "true" | "yes" | "on" => visitor.visit_bool(true),
-                "false" | "no" | "off" => visitor.visit_bool(false),
-                _ => Err(Error::deserialize(format!("expected bool, found string: {s}"))),
-            },
-            _ => Err(Error::deserialize(format!(
-                "expected bool, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_i64(visitor)
-    }
-
-    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_i64(visitor)
-    }
-
-    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_i64(visitor)
-    }
-
-    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::Number(n) => match n.as_i64() {
-                Some(i) => visitor.visit_i64(i),
-                None => Err(Error::deserialize("number out of range for i64")),
-            },
-            Value::String(s) => match s.parse::<i64>() {
-                Ok(i) => visitor.visit_i64(i),
-                Err(_) => Err(Error::deserialize(format!(
-                    "expected integer, found string: {s}"
-                ))),
-            },
-            _ => Err(Error::deserialize(format!(
-                "expected integer, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_u64(visitor)
-    }
-
-    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_u64(visitor)
-    }
-
-    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_u64(visitor)
-    }
-
-    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::Number(n) => match n.as_u64() {
-                Some(i) => visitor.visit_u64(i),
-                None => Err(Error::deserialize("number out of range for u64")),
-            },
-            Value::String(s) => match s.parse::<u64>() {
-                Ok(i) => visitor.visit_u64(i),
-                Err(_) => Err(Error::deserialize(format!(
-                    "expected unsigned integer, found string: {s}"
-                ))),
-            },
-            _ => Err(Error::deserialize(format!(
-                "expected unsigned integer, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_f64(visitor)
-    }
-
-    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::Number(n) => visitor.visit_f64(n.as_f64()),
-            Value::String(s) => match s.parse::<f64>() {
-                Ok(f) => visitor.visit_f64(f),
-                Err(_) => {
-                    // Handle YAML special float values
-                    match s.to_lowercase().as_str() {
-                        ".inf" | "inf" => visitor.visit_f64(f64::INFINITY),
-                        "-.inf" | "-inf" => visitor.visit_f64(f64::NEG_INFINITY),
-                        ".nan" | "nan" => visitor.visit_f64(f64::NAN),
-                        _ => Err(Error::deserialize(format!(
-                            "expected float, found string: {s}"
-                        ))),
-                    }
-                }
-            },
-            _ => Err(Error::deserialize(format!(
-                "expected float, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::String(s) => {
-                let mut chars = s.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(c), None) => visitor.visit_char(c),
-                    _ => Err(Error::deserialize(format!(
-                        "expected single character, found string: {s}"
-                    ))),
-                }
-            }
-            _ => Err(Error::deserialize(format!(
-                "expected char, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::String(s) => visitor.visit_str(s),
-            _ => Err(Error::deserialize(format!(
-                "expected string, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_str(visitor)
-    }
-
-    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::String(s) => visitor.visit_bytes(s.as_bytes()),
-            Value::Sequence(seq) => {
-                let bytes: Result<Vec<u8>> = seq
-                    .iter()
-                    .map(|v| match v {
-                        Value::Number(n) => n
-                            .as_u64()
-                            .and_then(|n| u8::try_from(n).ok())
-                            .ok_or_else(|| Error::deserialize("expected byte value")),
-                        _ => Err(Error::deserialize("expected byte value")),
-                    })
-                    .collect();
-                visitor.visit_bytes(&bytes?)
-            }
-            _ => Err(Error::deserialize(format!(
-                "expected bytes, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_bytes(visitor)
-    }
-
-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::Null => visitor.visit_none(),
-            _ => visitor.visit_some(self),
-        }
-    }
-
-    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::Null => visitor.visit_unit(),
-            _ => Err(Error::deserialize(format!(
-                "expected null, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_unit(visitor)
-    }
-
-    fn deserialize_newtype_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_newtype_struct(self)
-    }
-
-    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::Sequence(seq) => {
-                let seq_access = SeqDeserializer::new(seq.iter());
-                visitor.visit_seq(seq_access)
-            }
-            _ => Err(Error::deserialize(format!(
-                "expected sequence, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_tuple_struct<V>(
-        self,
-        _name: &'static str,
-        _len: usize,
-        visitor: V,
-    ) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_seq(visitor)
-    }
-
-    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            Value::Mapping(map) => {
-                let map_access = MapDeserializer::new(map.iter());
-                visitor.visit_map(map_access)
-            }
-            _ => Err(Error::deserialize(format!(
-                "expected mapping, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_struct<V>(
-        self,
-        _name: &'static str,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        // Allow Null to be deserialized as an empty struct (for structs with all default fields)
-        match self.value {
-            Value::Null => {
-                let empty: std::iter::Empty<(&Value, &Value)> = std::iter::empty();
-                let map_access = MapDeserializer::new(empty);
-                visitor.visit_map(map_access)
-            }
-            Value::Mapping(map) => {
-                let map_access = MapDeserializer::new(map.iter());
-                visitor.visit_map(map_access)
-            }
-            _ => Err(Error::deserialize(format!(
-                "expected mapping, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_enum<V>(
-        self,
-        _name: &'static str,
-        _variants: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value {
-            // Simple string variant
-            Value::String(s) => visitor.visit_enum(s.as_str().into_deserializer()),
-            // Mapping variant: { VariantName: value }
-            Value::Mapping(map) => {
-                if map.len() != 1 {
-                    return Err(Error::deserialize(
-                        "expected enum with single variant as key",
-                    ));
-                }
-                let (key, value) = map.iter().next().unwrap();
-                let variant = match key {
-                    Value::String(s) => s.as_str(),
-                    _ => {
-                        return Err(Error::deserialize("expected string key for enum variant"));
-                    }
-                };
-                visitor.visit_enum(EnumDeserializer { variant, value })
-            }
-            _ => Err(Error::deserialize(format!(
-                "expected string or mapping for enum, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_str(visitor)
-    }
-
-    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        visitor.visit_unit()
-    }
-}
-
-/// Deserializer for sequences.
-#[allow(dead_code)]
-struct SeqDeserializer<'de, I> {
-    iter: I,
-    _marker: std::marker::PhantomData<&'de ()>,
-}
-
-impl<'de, I> SeqDeserializer<'de, I> {
-    #[allow(dead_code)]
-    fn new(iter: I) -> Self {
-        Self {
-            iter,
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<'de, I> SeqAccess<'de> for SeqDeserializer<'de, I>
-where
-    I: Iterator<Item = &'de Value>,
-{
-    type Error = Error;
-
-    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
-    where
-        T: DeserializeSeed<'de>,
-    {
-        match self.iter.next() {
-            Some(value) => seed.deserialize(Deserializer::new(value)).map(Some),
-            None => Ok(None),
-        }
-    }
-}
-
-/// Deserializer for mappings.
-#[allow(dead_code)]
-struct MapDeserializer<'de, I> {
-    iter: I,
-    current_value: Option<&'de Value>,
-    _marker: std::marker::PhantomData<&'de ()>,
-}
-
-impl<'de, I> MapDeserializer<'de, I> {
-    #[allow(dead_code)]
-    fn new(iter: I) -> Self {
-        Self {
-            iter,
-            current_value: None,
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<'de, I> MapAccess<'de> for MapDeserializer<'de, I>
-where
-    I: Iterator<Item = (&'de Value, &'de Value)>,
-{
-    type Error = Error;
-
-    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
-    where
-        K: DeserializeSeed<'de>,
-    {
-        match self.iter.next() {
-            Some((key, value)) => {
-                self.current_value = Some(value);
-                seed.deserialize(Deserializer::new(key)).map(Some)
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value>
-    where
-        V: DeserializeSeed<'de>,
-    {
-        match self.current_value.take() {
-            Some(value) => seed.deserialize(Deserializer::new(value)),
-            None => Err(Error::deserialize("expected map value")),
-        }
-    }
-}
-
-/// Deserializer for enum variants.
-#[allow(dead_code)]
-struct EnumDeserializer<'de> {
-    variant: &'de str,
-    value: &'de Value,
-}
-
-impl<'de> EnumAccess<'de> for EnumDeserializer<'de> {
-    type Error = Error;
-    type Variant = VariantDeserializer<'de>;
-
-    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant)>
-    where
-        V: DeserializeSeed<'de>,
-    {
-        use serde::de::value::StrDeserializer;
-        let deserializer: StrDeserializer<'_, Error> = self.variant.into_deserializer();
-        let variant = seed.deserialize(deserializer)?;
-        Ok((variant, VariantDeserializer { value: self.value }))
-    }
-}
-
-/// Deserializer for enum variant values.
-#[allow(dead_code)]
-struct VariantDeserializer<'de> {
-    value: &'de Value,
-}
-
-impl<'de> VariantAccess<'de> for VariantDeserializer<'de> {
-    type Error = Error;
-
-    fn unit_variant(self) -> Result<()> {
-        match self.value {
-            Value::Null => Ok(()),
-            _ => Err(Error::deserialize(format!(
-                "expected null for unit variant, found {:?}",
-                self.value
-            ))),
-        }
-    }
-
-    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value>
-    where
-        T: DeserializeSeed<'de>,
-    {
-        seed.deserialize(Deserializer::new(self.value))
-    }
-
-    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        de::Deserializer::deserialize_seq(Deserializer::new(self.value), visitor)
-    }
-
-    fn struct_variant<V>(self, _fields: &'static [&'static str], visitor: V) -> Result<V::Value>
-    where
-        V: Visitor<'de>,
-    {
-        de::Deserializer::deserialize_map(Deserializer::new(self.value), visitor)
     }
 }
 
@@ -818,7 +254,9 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer {
             Value::String(s) => match s.to_lowercase().as_str() {
                 "true" | "yes" | "on" => visitor.visit_bool(true),
                 "false" | "no" | "off" => visitor.visit_bool(false),
-                _ => Err(Error::deserialize(format!("expected bool, found string: {s}"))),
+                _ => Err(Error::deserialize(format!(
+                    "expected bool, found string: {s}"
+                ))),
             },
             _ => Err(Error::deserialize(format!(
                 "expected bool, found {:?}",
@@ -857,11 +295,8 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer {
                     ));
                 }
                 let (key, value) = map.pop().ok_or_else(|| Error::deserialize("empty map"))?;
-                let variant = match key {
-                    Value::String(s) => s,
-                    _ => {
-                        return Err(Error::deserialize("expected string key for enum variant"));
-                    }
+                let Value::String(variant) = key else {
+                    return Err(Error::deserialize("expected string key for enum variant"));
                 };
                 visitor.visit_enum(OwnedEnumDeserializer::WithValue { variant, value })
             }
@@ -1107,8 +542,7 @@ impl<'de> VariantAccess<'de> for OwnedVariantDeserializer {
                     Ok(())
                 } else {
                     Err(Error::deserialize(format!(
-                        "expected null for unit variant, found {:?}",
-                        value
+                        "expected null for unit variant, found {value:?}"
                     )))
                 }
             }
@@ -1166,34 +600,41 @@ mod tests {
     #[test]
     fn test_deserialize_primitives() {
         let value = Value::Bool(true);
-        let result: bool = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
+        let result: bool =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
         assert!(result);
 
         let value = Value::Number(Number::PosInt(42));
-        let result: u64 = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
+        let result: u64 =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
         assert_eq!(result, 42);
 
         let value = Value::Number(Number::NegInt(-10));
-        let result: i64 = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
+        let result: i64 =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
         assert_eq!(result, -10);
 
-        let value = Value::Number(Number::Float(3.14));
-        let result: f64 = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
-        assert!((result - 3.14).abs() < f64::EPSILON);
+        let value = Value::Number(Number::Float(3.15));
+        let result: f64 =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
+        assert!((result - 3.15).abs() < f64::EPSILON);
 
         let value = Value::String("hello".into());
-        let result: String = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
+        let result: String =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn test_deserialize_option() {
         let value = Value::Null;
-        let result: Option<i32> = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
+        let result: Option<i32> =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
         assert_eq!(result, None);
 
         let value = Value::Number(Number::PosInt(42));
-        let result: Option<u64> = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
+        let result: Option<u64> =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
         assert_eq!(result, Some(42));
     }
 
@@ -1204,7 +645,8 @@ mod tests {
             Value::Number(Number::PosInt(2)),
             Value::Number(Number::PosInt(3)),
         ]);
-        let result: Vec<u64> = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
+        let result: Vec<u64> =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
         assert_eq!(result, vec![1, 2, 3]);
     }
 
@@ -1218,11 +660,21 @@ mod tests {
 
         let mut map = Mapping::new();
         map.insert(Value::String("name".into()), Value::String("Alice".into()));
-        map.insert(Value::String("age".into()), Value::Number(Number::PosInt(30)));
+        map.insert(
+            Value::String("age".into()),
+            Value::Number(Number::PosInt(30)),
+        );
         let value = Value::Mapping(map);
 
-        let result: Person = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
-        assert_eq!(result, Person { name: "Alice".into(), age: 30 });
+        let result: Person =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
+        assert_eq!(
+            result,
+            Person {
+                name: "Alice".into(),
+                age: 30
+            }
+        );
     }
 
     #[test]
@@ -1235,7 +687,8 @@ mod tests {
         }
 
         let value = Value::String("Red".into());
-        let result: Color = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
+        let result: Color =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
         assert_eq!(result, Color::Red);
     }
 
@@ -1253,15 +706,25 @@ mod tests {
         }
 
         let mut inner_map = Mapping::new();
-        inner_map.insert(Value::String("value".into()), Value::Number(Number::PosInt(42)));
+        inner_map.insert(
+            Value::String("value".into()),
+            Value::Number(Number::PosInt(42)),
+        );
 
         let mut outer_map = Mapping::new();
         outer_map.insert(Value::String("inner".into()), Value::Mapping(inner_map));
         outer_map.insert(Value::String("name".into()), Value::String("test".into()));
 
         let value = Value::Mapping(outer_map);
-        let result: Outer = serde::Deserialize::deserialize(Deserializer::new(&value)).unwrap();
-        assert_eq!(result, Outer { inner: Inner { value: 42 }, name: "test".into() });
+        let result: Outer =
+            serde::Deserialize::deserialize(ValueDeserializer::new(value)).expect("deserialize");
+        assert_eq!(
+            result,
+            Outer {
+                inner: Inner { value: 42 },
+                name: "test".into()
+            }
+        );
     }
 
     #[test]

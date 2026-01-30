@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,9 +21,10 @@ use std::fmt;
 pub type Mapping = IndexMap<Value, Value>;
 
 /// Represents a YAML value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Value {
     /// Represents a YAML null value.
+    #[default]
     Null,
     /// Represents a YAML boolean.
     Bool(bool),
@@ -108,6 +109,12 @@ impl Number {
 
     /// If the number is a u64, returns it. Otherwise returns None.
     #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "explicit conversion with bounds checking"
+    )]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Number::PosInt(n) => Some(*n),
@@ -124,6 +131,11 @@ impl Number {
 
     /// If the number is representable as i64, returns it. Otherwise returns None.
     #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "explicit conversion with bounds checking"
+    )]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Number::PosInt(n) => (*n).try_into().ok(),
@@ -140,6 +152,7 @@ impl Number {
 
     /// Returns the number as f64.
     #[must_use]
+    #[expect(clippy::cast_precision_loss, reason = "intentional conversion to f64")]
     pub fn as_f64(&self) -> f64 {
         match self {
             Number::PosInt(n) => *n as f64,
@@ -336,12 +349,6 @@ impl Value {
     }
 }
 
-impl Default for Value {
-    fn default() -> Self {
-        Value::Null
-    }
-}
-
 impl From<bool> for Value {
     fn from(b: bool) -> Self {
         Value::Bool(b)
@@ -361,6 +368,7 @@ impl From<&str> for Value {
 }
 
 impl From<i8> for Value {
+    #[expect(clippy::cast_sign_loss, reason = "checked non-negative")]
     fn from(n: i8) -> Self {
         Value::Number(if n >= 0 {
             Number::PosInt(n as u64)
@@ -371,6 +379,7 @@ impl From<i8> for Value {
 }
 
 impl From<i16> for Value {
+    #[expect(clippy::cast_sign_loss, reason = "checked non-negative")]
     fn from(n: i16) -> Self {
         Value::Number(if n >= 0 {
             Number::PosInt(n as u64)
@@ -381,6 +390,7 @@ impl From<i16> for Value {
 }
 
 impl From<i32> for Value {
+    #[expect(clippy::cast_sign_loss, reason = "checked non-negative")]
     fn from(n: i32) -> Self {
         Value::Number(if n >= 0 {
             Number::PosInt(n as u64)
@@ -391,6 +401,7 @@ impl From<i32> for Value {
 }
 
 impl From<i64> for Value {
+    #[expect(clippy::cast_sign_loss, reason = "checked non-negative")]
     fn from(n: i64) -> Self {
         Value::Number(if n >= 0 {
             Number::PosInt(n as u64)
@@ -628,7 +639,10 @@ mod tests {
         assert_eq!(Value::Bool(true), Value::Bool(true));
         assert_ne!(Value::Bool(true), Value::Bool(false));
         assert_eq!(Value::String("test".into()), Value::String("test".into()));
-        assert_eq!(Value::Number(Number::PosInt(42)), Value::Number(Number::PosInt(42)));
+        assert_eq!(
+            Value::Number(Number::PosInt(42)),
+            Value::Number(Number::PosInt(42))
+        );
     }
 
     #[test]
