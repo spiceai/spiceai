@@ -104,6 +104,47 @@ impl Runtime {
             Ok(None)
         }
     }
+
+    pub fn get_shuffle_location(&self) -> Option<String> {
+        // Get shuffle_location from app params; if set to a path (not "memory"), use it as work_dir
+        // Otherwise fall back to temp_directory from query config or system temp dir
+        // Note: shuffle_memory_mode and object store config is set via the scheduler's override_session_builder
+        let shuffle_location = self.params.get("shuffle_location");
+
+        // Determine work_dir for executor:
+        // - For "memory" mode or object store paths (s3://, abfs://), use temp_directory as fallback
+        // - For local disk paths, use the specified path
+        match shuffle_location.map(String::as_str) {
+            Some("memory") => {
+                // Memory mode: use temp_directory as fallback for any local work
+                self.query.as_ref().and_then(|q| q.temp_directory.clone())
+            }
+            Some(loc)
+                if loc.starts_with("s3://")
+                    || loc.starts_with("abfs://")
+                    || loc.starts_with("az://") =>
+            {
+                // Object store mode: shuffle data goes to object store, but executor still needs local work_dir
+                self.query.as_ref().and_then(|q| q.temp_directory.clone())
+            }
+            Some(loc) => {
+                // Local disk mode with explicit path
+                // Validate the path exists or can be created
+                let path = std::path::Path::new(loc);
+                if !path.exists() {
+                    tracing::warn!(
+                        "shuffle_location '{}' does not exist. Ensure the directory exists and is writable by the executor process.",
+                        loc
+                    );
+                }
+                Some(loc.to_string())
+            }
+            None => {
+                // Default: use temp_directory
+                self.query.as_ref().and_then(|q| q.temp_directory.clone())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

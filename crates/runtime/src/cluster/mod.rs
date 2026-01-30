@@ -760,63 +760,16 @@ pub async fn initialize_cluster_executor(
 
     let app_json = response.into_inner().app_json;
 
-    let app_def: App = serde_json::from_str(&app_json)
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
+    let app_def = Arc::new(
+        serde_json::from_str::<App>(&app_json)
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?,
+    );
 
-    // Get shuffle_location from app params; if set to a path (not "memory"), use it as work_dir
-    // Otherwise fall back to temp_directory from query config or system temp dir
-    // Note: shuffle_memory_mode and object store config is set via the scheduler's override_session_builder
-    let shuffle_location = app_def.runtime.params.get("shuffle_location");
-
-    // Determine work_dir for executor:
-    // - For "memory" mode or object store paths (s3://, abfs://), use temp_directory as fallback
-    // - For local disk paths, use the specified path
-    let work_dir = match shuffle_location.map(String::as_str) {
-        Some("memory") => {
-            // Memory mode: use temp_directory as fallback for any local work
-            app_def
-                .runtime
-                .query
-                .as_ref()
-                .and_then(|q| q.temp_directory.clone())
-                .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
-        }
-        Some(loc)
-            if loc.starts_with("s3://")
-                || loc.starts_with("abfs://")
-                || loc.starts_with("az://") =>
-        {
-            // Object store mode: shuffle data goes to object store, but executor still needs local work_dir
-            app_def
-                .runtime
-                .query
-                .as_ref()
-                .and_then(|q| q.temp_directory.clone())
-                .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
-        }
-        Some(loc) => {
-            // Local disk mode with explicit path
-            // Validate the path exists or can be created
-            let path = std::path::Path::new(loc);
-            if !path.exists() {
-                tracing::warn!(
-                    "shuffle_location '{}' does not exist. Ensure the directory exists and is writable by the executor process.",
-                    loc
-                );
-            }
-            loc.to_string()
-        }
-        None => {
-            // Default: use temp_directory
-            app_def
-                .runtime
-                .query
-                .as_ref()
-                .and_then(|q| q.temp_directory.clone())
-                .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string())
-        }
-    };
+    let work_dir = app_def
+        .runtime
+        .get_shuffle_location()
+        .unwrap_or_else(|| env::temp_dir().to_string_lossy().to_string());
 
     // Log shuffle configuration
     // Normalize shuffle_format based on feature availability
@@ -840,15 +793,19 @@ pub async fn initialize_cluster_executor(
             raw_shuffle_format
         }
     };
-    let shuffle_location_display = shuffle_location.map_or("disk (temp_directory)", String::as_str);
+
+    let shuffle_location_display = app_def
+        .runtime
+        .params
+        .get("shuffle_location")
+        .map_or("disk (temp_directory)", String::as_str);
+
     tracing::info!(
         "Executor shuffle configuration: shuffle_format={}, shuffle_location={}, work_dir={}",
         shuffle_format,
         shuffle_location_display,
         work_dir
     );
-
-    let app_def = Arc::new(app_def);
 
     // Use the configured node_bind_address for the executor flight server.
     // Fall back to dynamic port assignment if binding fails (e.g., port already in use).
@@ -1410,6 +1367,7 @@ async fn executor_bind_app(
     *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
 
     Arc::clone(rt).load_catalogs().await;
+    Arc::clone(rt).load_datasets().await;
     rt.load_embeddings().await;
     Arc::clone(rt).load_models().await;
     Arc::clone(rt).load_tools().await;
