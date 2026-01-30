@@ -271,6 +271,110 @@ where
     T::deserialize(de::ValueDeserializer::new(value))
 }
 
+// ============================================================
+// Multi-document YAML support
+// ============================================================
+
+/// Deserialize multiple instances of type `T` from a multi-document YAML string.
+///
+/// YAML supports multiple documents separated by `---`. This function parses
+/// all documents and deserializes each one into the target type.
+///
+/// # Errors
+///
+/// Returns an error if the YAML string is invalid or any document cannot be
+/// deserialized into the target type.
+///
+/// # Example
+///
+/// ```
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize, Debug, PartialEq)]
+/// struct Config {
+///     name: String,
+/// }
+///
+/// let yaml = "---\nname: first\n---\nname: second";
+/// let configs: Vec<Config> = yaml::from_str_multi(yaml).unwrap();
+/// assert_eq!(configs.len(), 2);
+/// assert_eq!(configs[0].name, "first");
+/// assert_eq!(configs[1].name, "second");
+/// ```
+pub fn from_str_multi<'de, T>(s: &'de str) -> Result<Vec<T>>
+where
+    T: Deserialize<'de>,
+{
+    let values = de::parse_yaml_multi(s)?;
+    values
+        .into_iter()
+        .map(|v| T::deserialize(de::ValueDeserializer::new(v)))
+        .collect()
+}
+
+/// Deserialize multiple instances of type `T` from an I/O reader containing multi-document YAML.
+///
+/// # Errors
+///
+/// Returns an error if reading fails, the YAML is invalid, or any document cannot
+/// be deserialized into the target type.
+///
+/// # Example
+///
+/// ```
+/// use serde::Deserialize;
+/// use std::io::Cursor;
+///
+/// #[derive(Deserialize, Debug, PartialEq)]
+/// struct Config {
+///     name: String,
+/// }
+///
+/// let yaml = "---\nname: first\n---\nname: second";
+/// let reader = Cursor::new(yaml);
+/// let configs: Vec<Config> = yaml::from_reader_multi(reader).unwrap();
+/// assert_eq!(configs.len(), 2);
+/// ```
+pub fn from_reader_multi<R, T>(mut reader: R) -> Result<Vec<T>>
+where
+    R: Read,
+    T: for<'de> Deserialize<'de>,
+{
+    let mut s = String::new();
+    reader.read_to_string(&mut s)?;
+    from_str_multi(&s)
+}
+
+/// Deserialize multiple instances of type `T` from a byte slice containing multi-document YAML.
+///
+/// # Errors
+///
+/// Returns an error if the bytes are not valid UTF-8, the YAML is invalid,
+/// or any document cannot be deserialized into the target type.
+///
+/// # Example
+///
+/// ```
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize, Debug, PartialEq)]
+/// struct Config {
+///     name: String,
+/// }
+///
+/// let yaml = b"---\nname: first\n---\nname: second";
+/// let configs: Vec<Config> = yaml::from_slice_multi(yaml).unwrap();
+/// assert_eq!(configs.len(), 2);
+/// ```
+pub fn from_slice_multi<T>(slice: &[u8]) -> Result<Vec<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let s = std::str::from_utf8(slice)
+        .map_err(|e| Error::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    from_str_multi(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1690,8 +1794,480 @@ message: "key: value pair"
             .collect(),
         };
 
-        let yaml = to_string(&original).unwrap();
-        let parsed: ComplexConfig = from_str(&yaml).unwrap();
+        let yaml = to_string(&original).expect("serialization should work");
+        let parsed: ComplexConfig = from_str(&yaml).expect("deserialization should work");
         assert_eq!(original, parsed);
+    }
+
+    // ============================================================
+    // Multi-document YAML tests
+    // ============================================================
+
+    #[test]
+    fn test_from_str_multi_basic() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            name: String,
+        }
+
+        let yaml = "---\nname: first\n---\nname: second\n---\nname: third";
+        let docs: Vec<Doc> = from_str_multi(yaml).expect("valid multi-doc YAML");
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].name, "first");
+        assert_eq!(docs[1].name, "second");
+        assert_eq!(docs[2].name, "third");
+    }
+
+    #[test]
+    fn test_from_str_multi_single_doc() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            value: i32,
+        }
+
+        let yaml = "value: 42";
+        let docs: Vec<Doc> = from_str_multi(yaml).expect("valid YAML");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].value, 42);
+    }
+
+    #[test]
+    fn test_from_str_multi_empty() {
+        let yaml = "";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("empty YAML is valid");
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_from_str_multi_different_types() {
+        // Each document can have different structure
+        let yaml = "---\n42\n---\nhello\n---\n- a\n- b";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("valid multi-doc YAML");
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].as_i64(), Some(42));
+        assert_eq!(docs[1].as_str(), Some("hello"));
+        assert!(docs[2].is_sequence());
+    }
+
+    #[test]
+    fn test_from_str_multi_with_document_end() {
+        // YAML also supports `...` to end a document
+        let yaml = "---\nname: first\n...\n---\nname: second";
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            name: String,
+        }
+        let docs: Vec<Doc> = from_str_multi(yaml).expect("valid multi-doc YAML");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].name, "first");
+        assert_eq!(docs[1].name, "second");
+    }
+
+    #[test]
+    fn test_from_reader_multi() {
+        use std::io::Cursor;
+
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            id: u32,
+        }
+
+        let yaml = "---\nid: 1\n---\nid: 2";
+        let reader = Cursor::new(yaml);
+        let docs: Vec<Doc> = from_reader_multi(reader).expect("valid multi-doc YAML");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].id, 1);
+        assert_eq!(docs[1].id, 2);
+    }
+
+    #[test]
+    fn test_from_slice_multi() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            key: String,
+        }
+
+        let yaml = b"---\nkey: a\n---\nkey: b";
+        let docs: Vec<Doc> = from_slice_multi(yaml).expect("valid multi-doc YAML");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].key, "a");
+        assert_eq!(docs[1].key, "b");
+    }
+
+    #[test]
+    fn test_multi_doc_complex_structures() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Server {
+            name: String,
+            port: u16,
+            tags: Vec<String>,
+        }
+
+        let yaml = r"
+---
+name: server1
+port: 8080
+tags:
+  - production
+  - web
+---
+name: server2
+port: 9090
+tags:
+  - staging
+";
+        let servers: Vec<Server> = from_str_multi(yaml).expect("valid multi-doc YAML");
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "server1");
+        assert_eq!(servers[0].port, 8080);
+        assert_eq!(servers[0].tags, vec!["production", "web"]);
+        assert_eq!(servers[1].name, "server2");
+        assert_eq!(servers[1].port, 9090);
+        assert_eq!(servers[1].tags, vec!["staging"]);
+    }
+
+    #[test]
+    fn test_single_doc_error_on_multi() {
+        // The single-doc function should error on multi-doc input
+        let yaml = "---\nfirst: 1\n---\nsecond: 2";
+        let result: Result<Value> = from_str(yaml);
+        assert!(result.is_err());
+        let err = result.expect_err("should be an error");
+        assert!(
+            err.to_string().contains("multi-document"),
+            "Error should mention multi-document: {err}"
+        );
+    }
+
+    // ============================================================
+    // Comprehensive Single-document Tests
+    // ============================================================
+
+    #[test]
+    fn test_single_doc_with_explicit_start() {
+        // Single document with explicit document start marker
+        let yaml = "---\nkey: value";
+        let value: Value = from_str(yaml).expect("single doc with --- is valid");
+        assert_eq!(value.get("key").and_then(|v| v.as_str()), Some("value"));
+    }
+
+    #[test]
+    fn test_single_doc_with_explicit_end() {
+        // Single document with explicit document end marker
+        let yaml = "key: value\n...";
+        let value: Value = from_str(yaml).expect("single doc with ... is valid");
+        assert_eq!(value.get("key").and_then(|v| v.as_str()), Some("value"));
+    }
+
+    #[test]
+    fn test_single_doc_with_both_markers() {
+        // Single document with both start and end markers
+        let yaml = "---\nkey: value\n...";
+        let value: Value = from_str(yaml).expect("single doc with both markers is valid");
+        assert_eq!(value.get("key").and_then(|v| v.as_str()), Some("value"));
+    }
+
+    #[test]
+    fn test_single_doc_null() {
+        let yaml = "null";
+        let value: Value = from_str(yaml).expect("null is valid");
+        assert!(value.is_null());
+    }
+
+    #[test]
+    fn test_single_doc_scalar_types() {
+        // Integer
+        let yaml = "42";
+        let value: i64 = from_str(yaml).expect("integer is valid");
+        assert_eq!(value, 42);
+
+        // Negative integer
+        let yaml = "-42";
+        let value: i64 = from_str(yaml).expect("negative integer is valid");
+        assert_eq!(value, -42);
+
+        // Float
+        let yaml = "3.14";
+        let value: f64 = from_str(yaml).expect("float is valid");
+        assert!((value - 3.14).abs() < f64::EPSILON);
+
+        // Boolean true
+        let yaml = "true";
+        let value: bool = from_str(yaml).expect("bool is valid");
+        assert!(value);
+
+        // Boolean false
+        let yaml = "false";
+        let value: bool = from_str(yaml).expect("bool is valid");
+        assert!(!value);
+
+        // String
+        let yaml = "hello world";
+        let value: String = from_str(yaml).expect("string is valid");
+        assert_eq!(value, "hello world");
+    }
+
+    #[test]
+    fn test_single_doc_with_comments() {
+        let yaml = r"
+# This is a comment
+key: value  # inline comment
+# another comment
+other: stuff
+";
+        let value: Value = from_str(yaml).expect("comments are valid");
+        assert_eq!(value.get("key").and_then(|v| v.as_str()), Some("value"));
+        assert_eq!(value.get("other").and_then(|v| v.as_str()), Some("stuff"));
+    }
+
+    #[test]
+    fn test_single_doc_empty_mapping() {
+        let yaml = "{}";
+        let value: Value = from_str(yaml).expect("empty mapping is valid");
+        assert!(value.is_mapping());
+        assert_eq!(value.as_mapping().map(Mapping::len), Some(0));
+    }
+
+    #[test]
+    fn test_single_doc_empty_sequence() {
+        let yaml = "[]";
+        let value: Value = from_str(yaml).expect("empty sequence is valid");
+        assert!(value.is_sequence());
+        assert_eq!(value.as_sequence().map(Vec::len), Some(0));
+    }
+
+    // ============================================================
+    // Comprehensive Multi-document Tests
+    // ============================================================
+
+    #[test]
+    fn test_multi_doc_with_null_documents() {
+        // Multi-doc where some documents are null
+        let yaml = "---\nfirst: 1\n---\nnull\n---\nthird: 3";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("multi-doc with null is valid");
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].get("first").and_then(Value::as_i64), Some(1));
+        assert!(docs[1].is_null());
+        assert_eq!(docs[2].get("third").and_then(Value::as_i64), Some(3));
+    }
+
+    #[test]
+    fn test_multi_doc_with_empty_documents() {
+        // Multi-doc where some documents are empty (implicit null)
+        let yaml = "---\n---\nkey: value\n---\n";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("multi-doc with empty docs is valid");
+        // First doc is empty (null), second has key: value, third is empty (null)
+        assert_eq!(docs.len(), 3);
+        assert!(docs[0].is_null(), "first empty doc should be null");
+        assert_eq!(docs[1].get("key").and_then(Value::as_str), Some("value"));
+        assert!(docs[2].is_null(), "trailing empty doc should be null");
+    }
+
+    #[test]
+    fn test_multi_doc_with_comments_between() {
+        let yaml = r"
+---
+# First document
+first: 1
+---
+# Second document with comment
+second: 2
+---
+# Third
+third: 3
+";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("multi-doc with comments is valid");
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].get("first").and_then(Value::as_i64), Some(1));
+        assert_eq!(docs[1].get("second").and_then(Value::as_i64), Some(2));
+        assert_eq!(docs[2].get("third").and_then(Value::as_i64), Some(3));
+    }
+
+    #[test]
+    fn test_multi_doc_all_scalars() {
+        let yaml = "---\n42\n---\nhello\n---\ntrue\n---\n3.14";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("multi-doc scalars is valid");
+        assert_eq!(docs.len(), 4);
+        assert_eq!(docs[0].as_i64(), Some(42));
+        assert_eq!(docs[1].as_str(), Some("hello"));
+        assert_eq!(docs[2].as_bool(), Some(true));
+        assert!(docs[3].as_f64().is_some());
+    }
+
+    #[test]
+    fn test_multi_doc_all_sequences() {
+        let yaml = "---\n- a\n- b\n---\n- 1\n- 2\n- 3\n---\n- x";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("multi-doc sequences is valid");
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].as_sequence().map(Vec::len), Some(2));
+        assert_eq!(docs[1].as_sequence().map(Vec::len), Some(3));
+        assert_eq!(docs[2].as_sequence().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn test_multi_doc_mixed_explicit_markers() {
+        // Mix of --- and ... markers
+        let yaml = "---\nfirst: 1\n...\n---\nsecond: 2\n...\n---\nthird: 3";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("multi-doc with mixed markers is valid");
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].get("first").and_then(Value::as_i64), Some(1));
+        assert_eq!(docs[1].get("second").and_then(Value::as_i64), Some(2));
+        assert_eq!(docs[2].get("third").and_then(Value::as_i64), Some(3));
+    }
+
+    #[test]
+    fn test_multi_doc_with_anchors() {
+        // Each document can have its own anchors
+        let yaml = r"
+---
+name: &name first
+ref: *name
+---
+name: &name second
+ref: *name
+";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("multi-doc with anchors is valid");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].get("name").and_then(Value::as_str), Some("first"));
+        assert_eq!(docs[0].get("ref").and_then(Value::as_str), Some("first"));
+        assert_eq!(docs[1].get("name").and_then(Value::as_str), Some("second"));
+        assert_eq!(docs[1].get("ref").and_then(Value::as_str), Some("second"));
+    }
+
+    #[test]
+    fn test_multi_doc_deeply_nested() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Level3 {
+            value: i32,
+        }
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Level2 {
+            level3: Level3,
+        }
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Level1 {
+            level2: Level2,
+        }
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            level1: Level1,
+        }
+
+        let yaml = r"
+---
+level1:
+  level2:
+    level3:
+      value: 1
+---
+level1:
+  level2:
+    level3:
+      value: 2
+";
+        let docs: Vec<Doc> = from_str_multi(yaml).expect("multi-doc nested is valid");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].level1.level2.level3.value, 1);
+        assert_eq!(docs[1].level1.level2.level3.value, 2);
+    }
+
+    #[test]
+    fn test_multi_doc_large_number() {
+        // Test with more than a few documents
+        let yaml = (0..10)
+            .map(|i| format!("---\nid: {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            id: i32,
+        }
+
+        let docs: Vec<Doc> = from_str_multi(&yaml).expect("many docs is valid");
+        assert_eq!(docs.len(), 10);
+        for (i, doc) in docs.iter().enumerate() {
+            assert_eq!(doc.id, i32::try_from(i).expect("i fits in i32"));
+        }
+    }
+
+    #[test]
+    fn test_from_slice_multi_invalid_utf8() {
+        // Invalid UTF-8 should error
+        let invalid = b"\xff\xfe";
+        let result: Result<Vec<Value>> = from_slice_multi(invalid);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_doc_deserialization_error() {
+        // Valid YAML but wrong type for deserialization
+        #[derive(Debug, Deserialize)]
+        struct Doc {
+            required_field: String,
+        }
+
+        let yaml = "---\nrequired_field: ok\n---\nwrong_field: oops";
+        let result: Result<Vec<Doc>> = from_str_multi(yaml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_doc_whitespace_only_between() {
+        // Whitespace between documents
+        let yaml = "---\na: 1\n\n\n---\nb: 2";
+        let docs: Vec<Value> = from_str_multi(yaml).expect("whitespace between docs is valid");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].get("a").and_then(Value::as_i64), Some(1));
+        assert_eq!(docs[1].get("b").and_then(Value::as_i64), Some(2));
+    }
+
+    #[test]
+    fn test_single_doc_vs_multi_doc_same_result() {
+        // A single document should parse the same way with both functions
+        let yaml = "name: test\nvalue: 42";
+
+        let single: Value = from_str(yaml).expect("single-doc parse works");
+        let multi: Vec<Value> = from_str_multi(yaml).expect("multi-doc parse works");
+
+        assert_eq!(multi.len(), 1);
+        assert_eq!(single, multi[0]);
+    }
+
+    #[test]
+    fn test_multi_doc_reader_large_input() {
+        use std::io::Cursor;
+
+        // Build a larger multi-doc input
+        let yaml = (0..5)
+            .map(|i| {
+                format!(
+                    r"---
+id: {i}
+name: document_{i}
+items:
+  - item1
+  - item2
+  - item3
+"
+                )
+            })
+            .collect::<String>();
+
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            id: i32,
+            name: String,
+            items: Vec<String>,
+        }
+
+        let reader = Cursor::new(yaml);
+        let docs: Vec<Doc> = from_reader_multi(reader).expect("reader multi-doc works");
+        assert_eq!(docs.len(), 5);
+        for (i, doc) in docs.iter().enumerate() {
+            assert_eq!(doc.id, i32::try_from(i).expect("i fits in i32"));
+            assert_eq!(doc.name, format!("document_{i}"));
+            assert_eq!(doc.items.len(), 3);
+        }
     }
 }

@@ -121,6 +121,7 @@ fn collect_merge_values(yaml: &Yaml, merge_values: &mut Vec<Mapping>) {
 ///
 /// Returns an error if the YAML string contains multiple documents.
 /// Multi-document YAML is not supported to avoid silent data loss.
+/// Use `parse_yaml_multi` to parse multi-document YAML files.
 pub(crate) fn parse_yaml(s: &str) -> Result<Value> {
     let docs = YamlLoader::load_from_str(s)?;
     match docs.len() {
@@ -130,9 +131,22 @@ pub(crate) fn parse_yaml(s: &str) -> Result<Value> {
             Ok(yaml_to_value(docs.into_iter().next().unwrap_or(Yaml::Null)))
         }
         n => Err(Error::deserialize(format!(
-            "multi-document YAML is not supported (found {n} documents). Use `---` only at the start of a single document."
+            "multi-document YAML is not supported (found {n} documents). Use `from_str_multi` for multi-document YAML, or `---` only at the start of a single document."
         ))),
     }
+}
+
+/// Parse a YAML string that may contain multiple documents.
+///
+/// Returns a vector of Values, one for each document in the YAML string.
+/// An empty string returns an empty vector.
+///
+/// # Errors
+///
+/// Returns an error if the YAML string is invalid.
+pub(crate) fn parse_yaml_multi(s: &str) -> Result<Vec<Value>> {
+    let docs = YamlLoader::load_from_str(s)?;
+    Ok(docs.into_iter().map(yaml_to_value).collect())
 }
 
 /// Implement Deserialize for Value so it can deserialize into itself.
@@ -771,7 +785,7 @@ mod tests {
 
     #[test]
     fn test_parse_yaml_multi_document_error() {
-        // Multi-document YAML should return an error
+        // Multi-document YAML should return an error for single-doc parse
         let result = parse_yaml("---\nfirst: 1\n---\nsecond: 2");
         assert!(result.is_err());
         let err = result.expect_err("should be an error");
@@ -779,5 +793,199 @@ mod tests {
             err.to_string().contains("multi-document"),
             "Error should mention multi-document: {err}"
         );
+    }
+
+    #[test]
+    fn test_parse_yaml_multi() {
+        let values = parse_yaml_multi("---\nfirst: 1\n---\nsecond: 2")
+            .expect("valid multi-document YAML");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].get("first").and_then(Value::as_i64), Some(1));
+        assert_eq!(values[1].get("second").and_then(Value::as_i64), Some(2));
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_empty() {
+        let values = parse_yaml_multi("").expect("empty YAML is valid");
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_single() {
+        let values = parse_yaml_multi("key: value").expect("single-doc YAML is valid");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get("key").and_then(Value::as_str), Some("value"));
+    }
+
+    // ============================================================
+    // Additional parse_yaml tests for comprehensive coverage
+    // ============================================================
+
+    #[test]
+    fn test_parse_yaml_single_with_explicit_start() {
+        let value = parse_yaml("---\nkey: value").expect("explicit doc start is valid");
+        assert_eq!(value.get("key").and_then(Value::as_str), Some("value"));
+    }
+
+    #[test]
+    fn test_parse_yaml_single_with_explicit_end() {
+        let value = parse_yaml("key: value\n...").expect("explicit doc end is valid");
+        assert_eq!(value.get("key").and_then(Value::as_str), Some("value"));
+    }
+
+    #[test]
+    fn test_parse_yaml_single_scalar() {
+        let value = parse_yaml("42").expect("scalar is valid");
+        assert_eq!(value.as_i64(), Some(42));
+
+        let value = parse_yaml("hello").expect("string scalar is valid");
+        assert_eq!(value.as_str(), Some("hello"));
+
+        let value = parse_yaml("true").expect("bool scalar is valid");
+        assert_eq!(value.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_parse_yaml_single_sequence() {
+        let value = parse_yaml("- a\n- b\n- c").expect("sequence is valid");
+        let seq = value.as_sequence().expect("should be sequence");
+        assert_eq!(seq.len(), 3);
+        assert_eq!(seq[0].as_str(), Some("a"));
+        assert_eq!(seq[1].as_str(), Some("b"));
+        assert_eq!(seq[2].as_str(), Some("c"));
+    }
+
+    #[test]
+    fn test_parse_yaml_single_mapping() {
+        let value = parse_yaml("a: 1\nb: 2").expect("mapping is valid");
+        assert_eq!(value.get("a").and_then(Value::as_i64), Some(1));
+        assert_eq!(value.get("b").and_then(Value::as_i64), Some(2));
+    }
+
+    // ============================================================
+    // Additional parse_yaml_multi tests for comprehensive coverage
+    // ============================================================
+
+    #[test]
+    fn test_parse_yaml_multi_with_explicit_end_markers() {
+        let values = parse_yaml_multi("---\na: 1\n...\n---\nb: 2\n...")
+            .expect("explicit end markers are valid");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].get("a").and_then(Value::as_i64), Some(1));
+        assert_eq!(values[1].get("b").and_then(Value::as_i64), Some(2));
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_with_null_doc() {
+        let values = parse_yaml_multi("---\na: 1\n---\nnull\n---\nc: 3")
+            .expect("null doc is valid");
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].get("a").and_then(Value::as_i64), Some(1));
+        assert!(values[1].is_null());
+        assert_eq!(values[2].get("c").and_then(Value::as_i64), Some(3));
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_scalars_only() {
+        let values = parse_yaml_multi("---\n42\n---\nhello\n---\ntrue")
+            .expect("scalar docs are valid");
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].as_i64(), Some(42));
+        assert_eq!(values[1].as_str(), Some("hello"));
+        assert_eq!(values[2].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_sequences_only() {
+        let values = parse_yaml_multi("---\n- 1\n- 2\n---\n- a\n- b")
+            .expect("sequence docs are valid");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_sequence().map(Vec::len), Some(2));
+        assert_eq!(values[1].as_sequence().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_with_comments() {
+        let values = parse_yaml_multi("---\n# comment\na: 1\n---\n# another\nb: 2")
+            .expect("comments are valid");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].get("a").and_then(Value::as_i64), Some(1));
+        assert_eq!(values[1].get("b").and_then(Value::as_i64), Some(2));
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_with_anchors() {
+        // Anchors should be document-local
+        let values = parse_yaml_multi("---\nval: &v 1\nref: *v\n---\nval: &v 2\nref: *v")
+            .expect("anchors in multi-doc are valid");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].get("val").and_then(Value::as_i64), Some(1));
+        assert_eq!(values[0].get("ref").and_then(Value::as_i64), Some(1));
+        assert_eq!(values[1].get("val").and_then(Value::as_i64), Some(2));
+        assert_eq!(values[1].get("ref").and_then(Value::as_i64), Some(2));
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_many_documents() {
+        let yaml = (0..20)
+            .map(|i| format!("---\nid: {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let values = parse_yaml_multi(&yaml).expect("many documents are valid");
+        assert_eq!(values.len(), 20);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(
+                v.get("id").and_then(Value::as_i64),
+                Some(i64::try_from(i).expect("i fits in i64"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_deeply_nested() {
+        let yaml = r"
+---
+level1:
+  level2:
+    level3:
+      value: deep
+---
+simple: shallow
+";
+        let values = parse_yaml_multi(yaml).expect("nested doc is valid");
+        assert_eq!(values.len(), 2);
+        let deep_value = values[0]
+            .get("level1")
+            .and_then(|v| v.get("level2"))
+            .and_then(|v| v.get("level3"))
+            .and_then(|v| v.get("value"))
+            .and_then(Value::as_str);
+        assert_eq!(deep_value, Some("deep"));
+        assert_eq!(values[1].get("simple").and_then(Value::as_str), Some("shallow"));
+    }
+
+    #[test]
+    fn test_parse_yaml_invalid_syntax() {
+        let result = parse_yaml("key: [unclosed");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_invalid_syntax() {
+        let result = parse_yaml_multi("---\nvalid: ok\n---\nkey: [unclosed");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_yaml_whitespace_only() {
+        let value = parse_yaml("   \n\n  \t  ").expect("whitespace only is valid");
+        assert!(value.is_null());
+    }
+
+    #[test]
+    fn test_parse_yaml_multi_whitespace_between() {
+        let values = parse_yaml_multi("---\na: 1\n\n\n---\nb: 2")
+            .expect("whitespace between docs is valid");
+        assert_eq!(values.len(), 2);
     }
 }
