@@ -14871,6 +14871,7 @@ dependencies = [
  "scheduler",
  "schemars 1.2.0",
  "scopeguard",
+ "scylla",
  "search",
  "secrecy",
  "serde",

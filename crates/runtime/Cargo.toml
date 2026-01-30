@@ -221,14 +221,16 @@ connector-smb = { path = "../data-connectors/connector-smb" }
 connector-snowflake = { path = "../data-connectors/connector-snowflake" }
 connector-spark = { path = "../data-connectors/connector-spark" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-repl = { path = "../repl" }
 hf-hub = { workspace = true }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonpath-rust = "0.7.3"
+mongodb.workspace = true
+mysql_async.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
 pem.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"] }
+repl = { path = "../repl" }
 rstest = "0.26.1"
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
@@ -238,21 +240,15 @@ spiceai.workspace = true
 tar = "0.4"
 tempfile.workspace = true
 test-framework = { path = "../test-framework" }
+tiberius.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-tar = "0.4"
-mongodb.workspace = true
-mysql_async.workspace = true
-tiberius.workspace = true
 
 [features]
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 bedrock = []
-clickhouse = [
-    "db_connection_pool/clickhouse",
-    "data_components/clickhouse",
-]
+clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
@@ -300,7 +296,12 @@ mssql = ["data_components/mssql"]
 mysql = ["db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]
 odbc = []
-openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp", "runtime-api-types/openapi"]
+openapi = [
+    "dep:utoipa-swagger-ui",
+    "dep:utoipa",
+    "mcp",
+    "runtime-api-types/openapi",
+]
 oracle = ["data_components/oracle"]
 pingora = ["cache/pingora"]
 postgres = [
@@ -315,18 +316,12 @@ s3_vectors = [
     "dep:s3_vectors",
     "search/s3_vectors",
 ]
-scylladb = [
-    "db_connection_pool/scylladb",
-    "data_components/scylladb",
-]
+scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
 sftp = ["runtime-object-store/sftp"]
 sharepoint = ["data_components/sharepoint"]
 smb = ["runtime-object-store/smb"]
 snapshots = ["runtime-acceleration/snapshots"]
-snowflake = [
-    "db_connection_pool/snowflake",
-    "data_components/snowflake",
-]
+snowflake = ["db_connection_pool/snowflake", "data_components/snowflake"]
 spark = ["data_components/spark_connect"]
 sqlite = [
     "dep:tokio-rusqlite",
