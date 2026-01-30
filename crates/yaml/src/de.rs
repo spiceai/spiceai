@@ -797,8 +797,8 @@ mod tests {
 
     #[test]
     fn test_parse_yaml_multi() {
-        let values = parse_yaml_multi("---\nfirst: 1\n---\nsecond: 2")
-            .expect("valid multi-document YAML");
+        let values =
+            parse_yaml_multi("---\nfirst: 1\n---\nsecond: 2").expect("valid multi-document YAML");
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].get("first").and_then(Value::as_i64), Some(1));
         assert_eq!(values[1].get("second").and_then(Value::as_i64), Some(2));
@@ -877,8 +877,8 @@ mod tests {
 
     #[test]
     fn test_parse_yaml_multi_with_null_doc() {
-        let values = parse_yaml_multi("---\na: 1\n---\nnull\n---\nc: 3")
-            .expect("null doc is valid");
+        let values =
+            parse_yaml_multi("---\na: 1\n---\nnull\n---\nc: 3").expect("null doc is valid");
         assert_eq!(values.len(), 3);
         assert_eq!(values[0].get("a").and_then(Value::as_i64), Some(1));
         assert!(values[1].is_null());
@@ -887,8 +887,8 @@ mod tests {
 
     #[test]
     fn test_parse_yaml_multi_scalars_only() {
-        let values = parse_yaml_multi("---\n42\n---\nhello\n---\ntrue")
-            .expect("scalar docs are valid");
+        let values =
+            parse_yaml_multi("---\n42\n---\nhello\n---\ntrue").expect("scalar docs are valid");
         assert_eq!(values.len(), 3);
         assert_eq!(values[0].as_i64(), Some(42));
         assert_eq!(values[1].as_str(), Some("hello"));
@@ -897,8 +897,8 @@ mod tests {
 
     #[test]
     fn test_parse_yaml_multi_sequences_only() {
-        let values = parse_yaml_multi("---\n- 1\n- 2\n---\n- a\n- b")
-            .expect("sequence docs are valid");
+        let values =
+            parse_yaml_multi("---\n- 1\n- 2\n---\n- a\n- b").expect("sequence docs are valid");
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].as_sequence().map(Vec::len), Some(2));
         assert_eq!(values[1].as_sequence().map(Vec::len), Some(2));
@@ -961,7 +961,10 @@ simple: shallow
             .and_then(|v| v.get("value"))
             .and_then(Value::as_str);
         assert_eq!(deep_value, Some("deep"));
-        assert_eq!(values[1].get("simple").and_then(Value::as_str), Some("shallow"));
+        assert_eq!(
+            values[1].get("simple").and_then(Value::as_str),
+            Some("shallow")
+        );
     }
 
     #[test]
@@ -984,8 +987,8 @@ simple: shallow
 
     #[test]
     fn test_parse_yaml_multi_whitespace_between() {
-        let values = parse_yaml_multi("---\na: 1\n\n\n---\nb: 2")
-            .expect("whitespace between docs is valid");
+        let values =
+            parse_yaml_multi("---\na: 1\n\n\n---\nb: 2").expect("whitespace between docs is valid");
         assert_eq!(values.len(), 2);
     }
 }
