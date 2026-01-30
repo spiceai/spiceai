@@ -322,6 +322,7 @@ impl JobExecutor {
         ballista_job_id: &str,
         cancel: &CancellationToken,
     ) -> std::result::Result<Vec<PartitionLocation>, JobPollError> {
+        let mut missing_retry_count = 0;
         loop {
             // Check for cancellation
             if cancel.is_cancelled() {
@@ -360,10 +361,13 @@ impl JobExecutor {
                     }
                 },
                 None => {
-                    // Job not found - may have been cleaned up
-                    return Err(JobPollError::Failed(format!(
-                        "Ballista job {ballista_job_id} not found"
-                    )));
+                    missing_retry_count += 1;
+                    // If job status is missing for several polls, assume it was cleaned up, failed to submit, or some other issue
+                    if missing_retry_count >= 5 {
+                        return Err(JobPollError::Failed(format!(
+                            "Ballista job {ballista_job_id} not found after multiple polls"
+                        )));
+                    }
                 }
             }
 
@@ -411,7 +415,7 @@ impl JobExecutor {
             // Create Ballista client to connect to executor
             let mut client = ballista_core::client::BallistaClient::try_new(
                 &executor_meta.host,
-                executor_meta.grpc_port,
+                executor_meta.port,
                 MAX_MESSAGE_SIZE,
                 use_tls,
                 customize_endpoint.clone(),
@@ -420,7 +424,7 @@ impl JobExecutor {
             .map_err(|e| super::error::Error::QueryExecution {
                 message: format!(
                     "Failed to create Ballista client for executor {}:{}: {e}",
-                    executor_meta.host, executor_meta.grpc_port
+                    executor_meta.host, executor_meta.port
                 ),
             })?;
 

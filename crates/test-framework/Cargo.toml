@@ -17,6 +17,7 @@ arrow-schema = { workspace = true, features = ["serde"] }
 async-channel = "2.3"
 async-openai.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 dashmap = "6.1.0"
 datafusion.workspace = true
@@ -30,6 +31,7 @@ flight_client = { path = "../flight_client" }
 futures.workspace = true
 indicatif = "0.18.0"
 insta.workspace = true
+object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
 octocrab = "0.47.0"
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true

@@ -87,6 +87,165 @@ impl PkiConfig {
     pub fn client_key_path(&self, client_name: &str) -> PathBuf {
         self.pki_dir.join(format!("{client_name}.key"))
     }
+
+    /// Create a client certificate signed by the CA.
+    ///
+    /// Generates a new client certificate and private key signed by this CA.
+    /// The client certificate is suitable for both client authentication and
+    /// server authentication in mutual TLS configurations.
+    ///
+    /// The generated client certificate:
+    /// - Uses ECDSA P-256 for key generation
+    /// - Is valid for 1 year
+    /// - Has key usages: Digital Signature, Key Encipherment
+    /// - Has extended key usages: Client Auth, Server Auth
+    /// - Includes "localhost" and "127.0.0.1" as Subject Alternative Names (SANs)
+    ///
+    /// # Arguments
+    ///
+    /// * `client_name` - Name for the client certificate. Used as the Common Name (CN)
+    ///   and determines the output filenames (`{client_name}.crt`, `{client_name}.key`).
+    ///
+    /// # Returns
+    ///
+    /// Returns a [`ClientCertConfig`] containing paths to the generated certificate
+    /// and private key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The client name is empty or contains invalid characters
+    /// - CA certificate or key cannot be read
+    /// - Certificate generation fails
+    /// - File I/O fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use test_framework::pki::init_pki;
+    /// use tempfile::TempDir;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let temp_dir = TempDir::new()?;
+    /// let pki = init_pki(temp_dir.path())?;
+    ///
+    /// let client = pki.create_client_cert("node1")?;
+    /// assert!(client.cert_path.exists());
+    /// assert!(client.key_path.exists());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn create_client_cert(&self, client_name: &str) -> anyhow::Result<ClientCertConfig> {
+        self.create_client_cert_with_hosts(client_name, &[])
+    }
+
+    /// Create a client certificate with additional Subject Alternative Names.
+    ///
+    /// This is the same as [`Self::create_client_cert`] but allows specifying
+    /// additional hosts (DNS names or IP addresses) to include in the
+    /// certificate's SANs.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_name` - Name for the client certificate.
+    /// * `additional_hosts` - Additional hostnames or IP addresses to include in
+    ///   the certificate's Subject Alternative Names. Each entry is automatically
+    ///   detected as either an IP address or DNS name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The client name is empty or contains invalid characters
+    /// - CA certificate or key cannot be read
+    /// - Certificate generation fails
+    /// - File I/O fails
+    pub fn create_client_cert_with_hosts(
+        &self,
+        client_name: &str,
+        additional_hosts: &[&str],
+    ) -> anyhow::Result<ClientCertConfig> {
+        validate_client_name(client_name)?;
+
+        let client_cert_path = self.client_cert_path(client_name);
+        let client_key_path = self.client_key_path(client_name);
+
+        // Load CA certificate and key
+        let ca_cert_pem = fs::read_to_string(&self.ca_cert_path)?;
+        let ca_key_pem = fs::read_to_string(&self.ca_key_path)?;
+
+        let ca_key_pair = KeyPair::from_pem(&ca_key_pem)?;
+        let ca_params = CertificateParams::from_ca_cert_pem(&ca_cert_pem)?;
+        let ca_cert = ca_params.self_signed(&ca_key_pair)?;
+
+        // Generate client certificate
+        let not_before = OffsetDateTime::now_utc();
+        let not_after = not_before + Duration::days(CLIENT_VALIDITY_YEARS * 365);
+
+        // Build SANs - always include localhost and 127.0.0.1
+        let mut dns_names = vec!["localhost".to_string()];
+        let mut ip_addresses: Vec<IpAddr> = vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+
+        // Add additional hosts to SANs
+        for host in additional_hosts {
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                if !ip_addresses.contains(&ip) {
+                    ip_addresses.push(ip);
+                }
+            } else if !dns_names.contains(&(*host).to_string()) {
+                dns_names.push((*host).to_string());
+            }
+        }
+
+        let mut client_params = CertificateParams::default();
+        client_params
+            .distinguished_name
+            .push(DnType::CommonName, client_name);
+        client_params.not_before = not_before;
+        client_params.not_after = not_after;
+        client_params.is_ca = IsCa::NoCa;
+        client_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        client_params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+
+        // Add SANs
+        for dns in &dns_names {
+            client_params
+                .subject_alt_names
+                .push(SanType::DnsName(dns.clone().try_into()?));
+        }
+        for ip in &ip_addresses {
+            client_params
+                .subject_alt_names
+                .push(SanType::IpAddress(*ip));
+        }
+
+        let client_key_pair = KeyPair::generate()?;
+        let client_cert = client_params.signed_by(&client_key_pair, &ca_cert, &ca_key_pair)?;
+
+        // Write client certificate and key
+        fs::write(&client_cert_path, client_cert.pem())?;
+        fs::write(&client_key_path, client_key_pair.serialize_pem())?;
+
+        // Set secure permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_permissions = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&client_cert_path, file_permissions.clone())?;
+            fs::set_permissions(&client_key_path, file_permissions)?;
+        }
+
+        Ok(ClientCertConfig {
+            cert_path: client_cert_path,
+            key_path: client_key_path,
+            common_name: client_name.to_string(),
+        })
+    }
 }
 
 /// Result of client certificate creation.
@@ -215,170 +374,6 @@ pub fn init_pki_with_ou(output_dir: &Path, organizational_unit: &str) -> anyhow:
     })
 }
 
-/// Create a client certificate signed by the CA.
-///
-/// Generates a new client certificate and private key signed by the CA
-/// previously created with [`init_pki`]. The client certificate is suitable
-/// for both client authentication and server authentication in mutual TLS
-/// configurations.
-///
-/// The generated client certificate:
-/// - Uses ECDSA P-256 for key generation
-/// - Is valid for 1 year
-/// - Has key usages: Digital Signature, Key Encipherment
-/// - Has extended key usages: Client Auth, Server Auth
-/// - Includes "localhost" and "127.0.0.1" as Subject Alternative Names (SANs)
-///
-/// # Arguments
-///
-/// * `pki_config` - The PKI configuration returned from [`init_pki`].
-/// * `client_name` - Name for the client certificate. Used as the Common Name (CN)
-///   and determines the output filenames (`{client_name}.crt`, `{client_name}.key`).
-///
-/// # Returns
-///
-/// Returns a [`ClientCertConfig`] containing paths to the generated certificate
-/// and private key.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The client name is empty or contains invalid characters
-/// - CA certificate or key cannot be read
-/// - Certificate generation fails
-/// - File I/O fails
-///
-/// # Example
-///
-/// ```no_run
-/// use test_framework::pki::{init_pki, create_client_cert};
-/// use tempfile::TempDir;
-///
-/// # fn main() -> anyhow::Result<()> {
-/// let temp_dir = TempDir::new()?;
-/// let pki = init_pki(temp_dir.path())?;
-///
-/// let client = create_client_cert(&pki, "node1")?;
-/// assert!(client.cert_path.exists());
-/// assert!(client.key_path.exists());
-/// # Ok(())
-/// # }
-/// ```
-pub fn create_client_cert(
-    pki_config: &PkiConfig,
-    client_name: &str,
-) -> anyhow::Result<ClientCertConfig> {
-    create_client_cert_with_hosts(pki_config, client_name, &[])
-}
-
-/// Create a client certificate with additional Subject Alternative Names.
-///
-/// This is the same as [`create_client_cert`] but allows specifying additional
-/// hosts (DNS names or IP addresses) to include in the certificate's SANs.
-///
-/// # Arguments
-///
-/// * `pki_config` - The PKI configuration returned from [`init_pki`].
-/// * `client_name` - Name for the client certificate.
-/// * `additional_hosts` - Additional hostnames or IP addresses to include in
-///   the certificate's Subject Alternative Names. Each entry is automatically
-///   detected as either an IP address or DNS name.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The client name is empty or contains invalid characters
-/// - CA certificate or key cannot be read
-/// - Certificate generation fails
-/// - File I/O fails
-pub fn create_client_cert_with_hosts(
-    pki_config: &PkiConfig,
-    client_name: &str,
-    additional_hosts: &[&str],
-) -> anyhow::Result<ClientCertConfig> {
-    validate_client_name(client_name)?;
-
-    let client_cert_path = pki_config.client_cert_path(client_name);
-    let client_key_path = pki_config.client_key_path(client_name);
-
-    // Load CA certificate and key
-    let ca_cert_pem = fs::read_to_string(&pki_config.ca_cert_path)?;
-    let ca_key_pem = fs::read_to_string(&pki_config.ca_key_path)?;
-
-    let ca_key_pair = KeyPair::from_pem(&ca_key_pem)?;
-    let ca_params = CertificateParams::from_ca_cert_pem(&ca_cert_pem)?;
-    let ca_cert = ca_params.self_signed(&ca_key_pair)?;
-
-    // Generate client certificate
-    let not_before = OffsetDateTime::now_utc();
-    let not_after = not_before + Duration::days(CLIENT_VALIDITY_YEARS * 365);
-
-    // Build SANs - always include localhost and 127.0.0.1
-    let mut dns_names = vec!["localhost".to_string()];
-    let mut ip_addresses: Vec<IpAddr> = vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
-
-    // Add additional hosts to SANs
-    for host in additional_hosts {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            if !ip_addresses.contains(&ip) {
-                ip_addresses.push(ip);
-            }
-        } else if !dns_names.contains(&(*host).to_string()) {
-            dns_names.push((*host).to_string());
-        }
-    }
-
-    let mut client_params = CertificateParams::default();
-    client_params
-        .distinguished_name
-        .push(DnType::CommonName, client_name);
-    client_params.not_before = not_before;
-    client_params.not_after = not_after;
-    client_params.is_ca = IsCa::NoCa;
-    client_params.key_usages = vec![
-        KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::KeyEncipherment,
-    ];
-    client_params.extended_key_usages = vec![
-        ExtendedKeyUsagePurpose::ClientAuth,
-        ExtendedKeyUsagePurpose::ServerAuth,
-    ];
-
-    // Add SANs
-    for dns in &dns_names {
-        client_params
-            .subject_alt_names
-            .push(SanType::DnsName(dns.clone().try_into()?));
-    }
-    for ip in &ip_addresses {
-        client_params
-            .subject_alt_names
-            .push(SanType::IpAddress(*ip));
-    }
-
-    let client_key_pair = KeyPair::generate()?;
-    let client_cert = client_params.signed_by(&client_key_pair, &ca_cert, &ca_key_pair)?;
-
-    // Write client certificate and key
-    fs::write(&client_cert_path, client_cert.pem())?;
-    fs::write(&client_key_path, client_key_pair.serialize_pem())?;
-
-    // Set secure permissions on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let file_permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&client_cert_path, file_permissions.clone())?;
-        fs::set_permissions(&client_key_path, file_permissions)?;
-    }
-
-    Ok(ClientCertConfig {
-        cert_path: client_cert_path,
-        key_path: client_key_path,
-        common_name: client_name.to_string(),
-    })
-}
-
 /// Validate that a client name contains only allowed characters.
 ///
 /// Client names must be non-empty and contain only ASCII alphanumeric
@@ -434,7 +429,9 @@ mod tests {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let pki = init_pki(temp_dir.path()).expect("failed to init PKI");
 
-        let client = create_client_cert(&pki, "node1").expect("failed to create client cert");
+        let client = pki
+            .create_client_cert("node1")
+            .expect("failed to create client cert");
 
         assert!(client.cert_path.exists(), "client cert should exist");
         assert!(client.key_path.exists(), "client key should exist");
@@ -459,8 +456,12 @@ mod tests {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let pki = init_pki(temp_dir.path()).expect("failed to init PKI");
 
-        let client1 = create_client_cert(&pki, "node1").expect("failed to create client1 cert");
-        let client2 = create_client_cert(&pki, "node2").expect("failed to create client2 cert");
+        let client1 = pki
+            .create_client_cert("node1")
+            .expect("failed to create client1 cert");
+        let client2 = pki
+            .create_client_cert("node2")
+            .expect("failed to create client2 cert");
 
         assert!(client1.cert_path.exists());
         assert!(client2.cert_path.exists());
@@ -472,9 +473,9 @@ mod tests {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let pki = init_pki(temp_dir.path()).expect("failed to init PKI");
 
-        let client =
-            create_client_cert_with_hosts(&pki, "node1", &["192.168.1.100", "myhost.local"])
-                .expect("failed to create client cert with hosts");
+        let client = pki
+            .create_client_cert_with_hosts("node1", &["192.168.1.100", "myhost.local"])
+            .expect("failed to create client cert with hosts");
 
         assert!(client.cert_path.exists());
     }
