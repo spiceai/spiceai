@@ -3,13 +3,13 @@ source: crates/runtime-table-partition/tests/partition_table_provider.rs
 expression: explain_plan
 ---
 PartitionedUnionExec
-  PartitionMemTableExec: partition_value=0, filters=[value > Int32(45)]
-  PartitionMemTableExec: partition_value=1, filters=[value > Int32(45)]
-  PartitionMemTableExec: partition_value=2, filters=[value > Int32(45)]
-  PartitionMemTableExec: partition_value=3, filters=[value > Int32(45)]
-  PartitionMemTableExec: partition_value=4, filters=[value > Int32(45)]
-  PartitionMemTableExec: partition_value=5, filters=[value > Int32(45)]
-  PartitionMemTableExec: partition_value=6, filters=[value > Int32(45)]
-  PartitionMemTableExec: partition_value=7, filters=[value > Int32(45)]
-  PartitionMemTableExec: partition_value=8, filters=[value > Int32(45)]
-  PartitionMemTableExec: partition_value=9, filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(0)], filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(1)], filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(2)], filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(3)], filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(4)], filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(5)], filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(6)], filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(7)], filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(8)], filters=[value > Int32(45)]
+  PartitionMemTableExec: partition_values=[Int32(9)], filters=[value > Int32(45)]

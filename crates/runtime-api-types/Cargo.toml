@@ -1,0 +1,18 @@
+[package]
+name = "runtime-api-types"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Shared API types for Spice runtime HTTP endpoints and CLI"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+utoipa = { version = "5", optional = true }
+
+[features]
+default = []
+openapi = ["dep:utoipa"]

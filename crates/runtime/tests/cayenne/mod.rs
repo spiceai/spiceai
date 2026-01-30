@@ -19,7 +19,10 @@ use std::time::Duration;
 
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check_with_timeout;
-use crate::{RecordBatch, init_tracing, utils::test_request_context};
+use crate::{
+    RecordBatch, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 use app::AppBuilder;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -63,6 +66,7 @@ fn make_s3_tpch_dataset(name: &str, partition_by: Option<String>) -> Dataset {
 #[tokio::test]
 async fn test_cayenne_with_partitioned_tpch() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

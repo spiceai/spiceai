@@ -2,4 +2,4 @@
 source: crates/runtime-table-partition/tests/partition_table_provider.rs
 expression: explain_plan
 ---
-PartitionMemTableExec: partition_value=1736985600000000000, filters=[timestamp >= TimestampNanosecond(1736985600000000000, None), timestamp < TimestampNanosecond(1737072000000000000, None)]
+PartitionMemTableExec: partition_values=[TimestampNanosecond(1736985600000000000, None)], filters=[timestamp >= TimestampNanosecond(1736985600000000000, None), timestamp < TimestampNanosecond(1737072000000000000, None)]
