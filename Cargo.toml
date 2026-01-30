@@ -27,6 +27,7 @@ members = [
     "crates/runtime-object-store",
     "crates/package",
     "crates/runtime",
+    "crates/runtime-api-types",
     "crates/runtime-auth",
     "crates/runtime-async",
     "crates/runtime-datafusion",
@@ -72,7 +73,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.91"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 
 [workspace.dependencies]
 ahash = "0.8.12"

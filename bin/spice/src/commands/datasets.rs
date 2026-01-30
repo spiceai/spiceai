@@ -20,7 +20,7 @@ use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
 use crate::output::{TableRow, write_table};
 use clap::Args;
-use serde::Deserialize;
+use runtime_api_types::v1::DatasetInfo;
 
 /// Arguments for the datasets command.
 #[derive(Args, Debug)]
@@ -35,30 +35,20 @@ See more at: https://spiceai.org/docs/"#
 )]
 pub struct DatasetsArgs {}
 
-/// Dataset information from the runtime API.
-#[derive(Debug, Deserialize)]
-pub struct Dataset {
-    pub from: Option<String>,
-    pub name: Option<String>,
-    pub replication_enabled: Option<bool>,
-    pub acceleration_enabled: Option<bool>,
-    pub status: Option<String>,
-}
-
-impl TableRow for Dataset {
+impl TableRow for DatasetInfo {
     fn headers() -> Vec<&'static str> {
         vec!["NAME", "FROM", "REPLICATION", "ACCELERATION", "STATUS"]
     }
 
     fn values(&self) -> Vec<String> {
         vec![
-            self.name.clone().unwrap_or_default(),
-            self.from.clone().unwrap_or_default(),
-            self.replication_enabled
-                .map_or("false".to_string(), |v| v.to_string()),
-            self.acceleration_enabled
-                .map_or("false".to_string(), |v| v.to_string()),
-            self.status.clone().unwrap_or_default(),
+            self.name.clone(),
+            self.from.clone(),
+            self.replication_enabled.to_string(),
+            self.acceleration_enabled.to_string(),
+            self.status
+                .as_ref()
+                .map_or_else(String::new, ToString::to_string),
         ]
     }
 }
@@ -84,7 +74,7 @@ pub async fn execute(ctx: &RuntimeContext, _args: &DatasetsArgs) -> Result<()> {
         .build());
     }
 
-    let datasets: Vec<Dataset> = response.json().await.map_err(|e| {
+    let datasets: Vec<DatasetInfo> = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
             message: format!("Failed to parse datasets response: {e}"),
         }
