@@ -27,6 +27,7 @@ members = [
     "crates/runtime-object-store",
     "crates/package",
     "crates/runtime",
+    "crates/runtime-api-types",
     "crates/runtime-auth",
     "crates/runtime-async",
     "crates/runtime-datafusion",

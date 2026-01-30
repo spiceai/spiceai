@@ -14508,6 +14508,7 @@ dependencies = [
  "rmcp",
  "rstest 0.26.1",
  "runtime-acceleration",
+ "runtime-api-types",
  "runtime-async",
  "runtime-auth",
  "runtime-datafusion",
@@ -14606,6 +14607,15 @@ dependencies = [
  "url",
  "util",
  "uuid 1.20.0",
+]
+
+[[package]]
+name = "runtime-api-types"
+version = "1.11.0-unstable"
+dependencies = [
+ "serde",
+ "serde_json",
+ "utoipa",
 ]
 
 [[package]]
@@ -16448,6 +16458,7 @@ dependencies = [
  "repl",
  "reqwest",
  "rstest 0.26.1",
+ "runtime-api-types",
  "rustyline",
  "semver",
  "serde",

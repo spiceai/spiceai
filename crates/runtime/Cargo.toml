@@ -126,6 +126,7 @@ rmcp = { workspace = true, optional = true, features = [
     "transport-streamable-http-server",
 ] }
 runtime-acceleration = { path = "../runtime-acceleration" }
+runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-datafusion = { path = "../runtime-datafusion" }
@@ -277,7 +278,7 @@ mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
-openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
+openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp", "runtime-api-types/openapi"]
 oracle = ["data_components/oracle"]
 pingora = ["cache/pingora"]
 postgres = [

@@ -20,7 +20,7 @@ use crate::context::RuntimeContext;
 use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
 use crate::output::{TableRow, write_table};
 use clap::Args;
-use serde::Deserialize;
+use runtime_api_types::v1::{ModelInfo, ModelListResponse};
 
 /// Arguments for the models command.
 #[derive(Args, Debug)]
@@ -35,32 +35,18 @@ See more at: https://spiceai.org/docs/"#
 )]
 pub struct ModelsArgs {}
 
-/// Model information from the runtime API.
-#[derive(Debug, Deserialize)]
-pub struct Model {
-    pub id: Option<String>,
-    pub object: Option<String>,
-    pub owned_by: Option<String>,
-    pub status: Option<String>,
-}
-
-/// Response wrapper for models endpoint.
-#[derive(Debug, Deserialize)]
-pub struct ModelResponse {
-    pub object: Option<String>,
-    pub data: Vec<Model>,
-}
-
-impl TableRow for Model {
+impl TableRow for ModelInfo {
     fn headers() -> Vec<&'static str> {
         vec!["ID", "OWNED_BY", "STATUS"]
     }
 
     fn values(&self) -> Vec<String> {
         vec![
-            self.id.clone().unwrap_or_default(),
-            self.owned_by.clone().unwrap_or_default(),
-            self.status.clone().unwrap_or_default(),
+            self.id.clone(),
+            self.owned_by.clone(),
+            self.status
+                .as_ref()
+                .map_or_else(String::new, ToString::to_string),
         ]
     }
 }
@@ -81,7 +67,7 @@ pub async fn execute(ctx: &RuntimeContext, _args: &ModelsArgs) -> Result<()> {
         .build());
     }
 
-    let model_response: ModelResponse = response.json().await.map_err(|e| {
+    let model_response: ModelListResponse = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
             message: format!("Failed to parse models response: {e}"),
         }
