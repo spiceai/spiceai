@@ -38,6 +38,9 @@ use super::store::JobStore;
 /// Interval between job status polls when waiting for Ballista job completion.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+// Default max message size (16MB matches typical default)
+const MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 /// Tracks an active job's cancellation token and Ballista job ID (once submitted).
 struct ActiveJobInfo {
     cancel_token: CancellationToken,
@@ -339,8 +342,8 @@ impl JobExecutor {
                 .await
                 .map_err(|e| JobPollError::Failed(e.to_string()))?;
 
-            match status {
-                Some(job_status) => match job_status.status {
+            if let Some(job_status) = status {
+                match job_status.status {
                     Some(job_status::Status::Successful(success)) => {
                         // Convert protobuf partition locations to core types
                         let locations: Vec<PartitionLocation> = success
@@ -353,21 +356,17 @@ impl JobExecutor {
                     Some(job_status::Status::Failed(failed)) => {
                         return Err(JobPollError::Failed(failed.error));
                     }
-                    Some(job_status::Status::Queued(_) | job_status::Status::Running(_)) => {
-                        // Still in progress, continue polling
+                    Some(job_status::Status::Queued(_) | job_status::Status::Running(_)) | None => {
+                        // Still in progress or unknown status, continue polling
                     }
-                    None => {
-                        // Unknown status, continue polling
-                    }
-                },
-                None => {
-                    missing_retry_count += 1;
-                    // If job status is missing for several polls, assume it was cleaned up, failed to submit, or some other issue
-                    if missing_retry_count >= 5 {
-                        return Err(JobPollError::Failed(format!(
-                            "Ballista job {ballista_job_id} not found after multiple polls"
-                        )));
-                    }
+                }
+            } else {
+                missing_retry_count += 1;
+                // If job status is missing for several polls, assume it was cleaned up, failed to submit, or some other issue
+                if missing_retry_count >= 5 {
+                    return Err(JobPollError::Failed(format!(
+                        "Ballista job {ballista_job_id} not found after multiple polls"
+                    )));
                 }
             }
 
@@ -406,9 +405,6 @@ impl JobExecutor {
             None
         };
 
-        // Default max message size (16MB matches typical default)
-        const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-
         for location in locations {
             let executor_meta = &location.executor_meta;
 
@@ -416,7 +412,7 @@ impl JobExecutor {
             let mut client = ballista_core::client::BallistaClient::try_new(
                 &executor_meta.host,
                 executor_meta.port,
-                MAX_MESSAGE_SIZE,
+                MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE,
                 use_tls,
                 customize_endpoint.clone(),
             )

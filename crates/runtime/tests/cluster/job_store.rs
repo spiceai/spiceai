@@ -14,17 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::utils::wait_until_true;
 use app::AppBuilder;
 
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::reader::StreamReader;
-use datafusion::prelude::SessionContext;
 use futures::{StreamExt, TryStreamExt};
-use object_store::{
-    GetOptions, GetResult, GetResultPayload, ListResult, ObjectMeta, ObjectStore, PutMode,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion, path::Path,
-};
+use object_store::{ObjectStore, path::Path};
 use runtime::Runtime;
 use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::ClusterConfig;
@@ -78,7 +73,7 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
                             .path()
                             .join("test_simple_cluster_mode.csv")
                             .to_str()
-                            .unwrap()
+                            .expect("should have str")
                     )
                     .as_str(),
                     "names",
@@ -91,17 +86,17 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
 
             let scheduler_config = Config {
                 http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(127, 0, 0, 1),
+                    Ipv4Addr::LOCALHOST,
                     8290,
                 )),
                 flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(127, 0, 0, 1),
+                    Ipv4Addr::LOCALHOST,
                     50251,
                 )),
                 cluster: ClusterConfig {
                     role: Some(runtime::config::ClusterRole::Scheduler),
                     node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::new(127, 0, 0, 1),
+                        Ipv4Addr::LOCALHOST,
                         50252,
                     )),
                     node_advertise_address: Some("127.0.0.1".to_string()),
@@ -147,17 +142,17 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
 
             let executor_config = Config {
                 http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(127, 0, 0, 1),
+                    Ipv4Addr::LOCALHOST,
                     8291,
                 )),
                 flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(127, 0, 0, 1),
+                    Ipv4Addr::LOCALHOST,
                     50253,
                 )),
                 cluster: ClusterConfig {
                     role: Some(runtime::config::ClusterRole::Executor),
                     node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::new(127, 0, 0, 1),
+                        Ipv4Addr::LOCALHOST,
                         50254,
                     )),
                     scheduler_address: Some("127.0.0.1:50252".to_string()),
@@ -239,21 +234,14 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
 
-            let scheduler_server = scheduler_rt
-                .datafusion()
-                .scheduler_server
-                .try_read()
-                .expect("should read")
-                .clone()
-                .expect("should get scheduler server");
-
             let job_status = job_executor
                 .get_status(&result.job_id)
                 .await
                 .expect("should get job status");
-            if !job_status.succeeded() {
-                panic!("job did not succeed: {job_status:?}");
-            }
+            assert!(
+                job_status.succeeded(),
+                "job did not succeed: {job_status:?}"
+            );
 
             let job_results = job_executor
                 .get_chunk(&result.job_id, 0)

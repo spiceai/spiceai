@@ -494,10 +494,10 @@ mod tests {
 
     #[test]
     fn test_validate_client_name_valid() {
-        assert!(validate_client_name("node1").is_ok());
-        assert!(validate_client_name("node-1").is_ok());
-        assert!(validate_client_name("node_1").is_ok());
-        assert!(validate_client_name("Node-1_Test").is_ok());
+        validate_client_name("node1").expect("should be valid");
+        validate_client_name("node-1").expect("should be valid");
+        validate_client_name("node_1").expect("should be valid");
+        validate_client_name("Node-1_Test").expect("should be valid");
     }
 
     #[test]

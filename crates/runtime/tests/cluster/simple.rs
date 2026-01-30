@@ -14,31 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::utils::{time_till_second, wait_until_true};
 use app::AppBuilder;
 
 use arrow::array::RecordBatch;
-use ballista_core::extension::SessionConfigExt;
-use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::cluster::ResolvedClusterConfig;
-use runtime::cluster::datafusion::datafusion_scheduler_ext::DataFusionSchedulerExtensions;
 use runtime::config::ClusterConfig;
 use runtime::datafusion::query::QueryBuilder;
-use runtime::jobs::JobExecutor;
-use runtime::{auth::EndpointAuth, config::Config, podswatcher::PodsWatcher};
+use runtime::{auth::EndpointAuth, config::Config};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
-use spicepod::acceleration::Acceleration;
 use spicepod::component::dataset::Dataset;
-use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use test_framework::pki::init_pki;
 use tokio::time::{Instant, sleep_until};
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     configure_test_datafusion, init_tracing,
@@ -81,7 +72,7 @@ async fn snapshot_names_from_runtime(
         pretty.replace(
             temp_path
                 .as_str()
-                .split_once("/")
+                .split_once('/')
                 .expect("should have leading /")
                 .1,
             "<TEMP_PATH>"
@@ -144,7 +135,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                             .path()
                             .join("test_simple_cluster_mode.csv")
                             .to_str()
-                            .unwrap()
+                            .expect("should have str")
                     )
                     .as_str(),
                     "names",
@@ -157,17 +148,17 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
 
             let scheduler_config = Config {
                 http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(127, 0, 0, 1),
+                    Ipv4Addr::LOCALHOST,
                     8190,
                 )),
                 flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(127, 0, 0, 1),
+                    Ipv4Addr::LOCALHOST,
                     50151,
                 )),
                 cluster: ClusterConfig {
                     role: Some(runtime::config::ClusterRole::Scheduler),
                     node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::new(127, 0, 0, 1),
+                        Ipv4Addr::LOCALHOST,
                         50152,
                     )),
                     node_advertise_address: Some("127.0.0.1".to_string()),
@@ -213,17 +204,17 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
 
             let executor_config = Config {
                 http_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(127, 0, 0, 1),
+                    Ipv4Addr::LOCALHOST,
                     8191,
                 )),
                 flight_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(127, 0, 0, 1),
+                    Ipv4Addr::LOCALHOST,
                     50153,
                 )),
                 cluster: ClusterConfig {
                     role: Some(runtime::config::ClusterRole::Executor),
                     node_bind_address: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::new(127, 0, 0, 1),
+                        Ipv4Addr::LOCALHOST,
                         50154,
                     )),
                     scheduler_address: Some("127.0.0.1:50152".to_string()),
@@ -308,7 +299,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                     tempdir
                         .path()
                         .to_string_lossy()
-                        .split_once("/")
+                        .split_once('/')
                         .expect("should have leading /")
                         .1,
                     "<TEMP_PATH>"
