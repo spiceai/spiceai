@@ -62,7 +62,7 @@ pub enum WriteResult<T> {
 struct CachedEntry<T> {
     value: T,
     version: UpdateVersion,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     cached_at: Instant,
 }
 

@@ -30,8 +30,8 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use object_store_occ::{InsertResult, ObjectState, UpdateResult, WriteResult};
 use serde::{Deserialize, Serialize};
 
@@ -415,7 +415,11 @@ async fn test_concurrent_async_writers() {
                 data: format!("writer1 update {i}"),
             };
 
-            match state.update("counter", &update).await.expect("update call failed") {
+            match state
+                .update("counter", &update)
+                .await
+                .expect("update call failed")
+            {
                 UpdateResult::Ok => successes += 1,
                 UpdateResult::Conflict { .. } => conflicts += 1,
                 UpdateResult::NotFound => panic!("unexpected NotFound"),
@@ -446,7 +450,11 @@ async fn test_concurrent_async_writers() {
                 data: format!("writer2 update {i}"),
             };
 
-            match state.update("counter", &update).await.expect("update call failed") {
+            match state
+                .update("counter", &update)
+                .await
+                .expect("update call failed")
+            {
                 UpdateResult::Ok => successes += 1,
                 UpdateResult::Conflict { .. } => conflicts += 1,
                 UpdateResult::NotFound => panic!("unexpected NotFound"),
@@ -513,7 +521,11 @@ async fn write_with_retry(
             data: format!("{writer_name} increment {}", successful_increments + 1),
         };
 
-        match state.update("counter", &update).await.expect("update failed") {
+        match state
+            .update("counter", &update)
+            .await
+            .expect("update failed")
+        {
             UpdateResult::Ok => {
                 successful_increments += 1;
             }
@@ -555,13 +567,11 @@ async fn test_concurrent_async_writers_with_retry() {
     let prefix1 = prefix.clone();
     let prefix2 = prefix.clone();
 
-    let writer1 = tokio::spawn(async move {
-        write_with_retry(store1, prefix1, "Writer1", 5).await
-    });
+    let writer1 =
+        tokio::spawn(async move { write_with_retry(store1, prefix1, "Writer1", 5).await });
 
-    let writer2 = tokio::spawn(async move {
-        write_with_retry(store2, prefix2, "Writer2", 5).await
-    });
+    let writer2 =
+        tokio::spawn(async move { write_with_retry(store2, prefix2, "Writer2", 5).await });
 
     let (attempts1, attempts2) = tokio::join!(writer1, writer2);
     let attempts1 = attempts1.expect("writer1 panicked");
@@ -601,10 +611,7 @@ async fn test_update_races_with_external_write() {
     };
 
     // Insert and cache ETag
-    state
-        .insert("item", &initial)
-        .await
-        .expect("insert failed");
+    state.insert("item", &initial).await.expect("insert failed");
     let _ = state.get("item").await.expect("get failed"); // Cache ETag
 
     // External write directly to S3 (simulates another process bypassing ObjectState)

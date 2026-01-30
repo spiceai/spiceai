@@ -51,6 +51,7 @@ pub enum Error {
 impl Error {
     /// Convert this error into an `object_store::Error`, by either retrieving the internal
     /// `object_store::Error`, or providing a generic error.
+    #[must_use] 
     pub fn into_object_store(self, store: &'static str) -> object_store::Error {
         match self {
             Error::Serialization { source, .. } => object_store::Error::Generic {
