@@ -145,6 +145,16 @@ message BytesProcessedExecNode {}
 
 message CayenneAccelerationExecNode {}
 
+// Execution plan node for UDTFs.
+// This allows UDTF results to be distributed across a cluster by serializing
+// the UDTF arguments and re-invoking the UDTF on remote executors.
+message UdtfExecNode {
+    // The UDTF arguments needed to reconstruct the results.
+    UdtfArgs args = 1;
+    // The schema of the UDTF results (Arrow IPC-encoded Schema).
+    bytes schema = 2;
+}
+
 // UDTF (User-Defined Table Function) serialization for distributed execution.
 // These messages enable serializing UDTF-produced TableProviders so they can
 // be reconstructed on remote executors in a Ballista cluster.

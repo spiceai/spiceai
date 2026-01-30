@@ -84,7 +84,7 @@ impl SpiceLogicalCodec {
 
     /// Reconstructs a UDTF-produced `TableProvider` by re-invoking the UDTF with
     /// the serialized arguments.
-    fn invoke_udtf(udtf_args: UdtfArgs, runtime: &Arc<Runtime>) -> Result<Arc<dyn TableProvider>> {
+    pub fn invoke_udtf(udtf_args: UdtfArgs, runtime: &Arc<Runtime>) -> Result<Arc<dyn TableProvider>> {
         use datafusion::catalog::TableFunctionImpl;
 
         let Some(args) = udtf_args.args else {
