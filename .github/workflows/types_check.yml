@@ -51,9 +51,11 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced and spice CLI
-        run: |
-          make -C bin/spiced
-          cargo build --release -p spice
+        uses: ./.github/actions/build-spiced
+        with:
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
 
       - name: Update build cache (macOS)
         if: matrix.target_os == 'darwin'
@@ -75,27 +77,6 @@ jobs:
           if (Test-Path C:/spiceai/build/target) {
             Copy-Item -Recurse -Force target/* C:/spiceai/build/target
           }
-
-      - name: make spiced executable
-        if: matrix.target_os != 'windows'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: make spice executable
-        if: matrix.target_os != 'windows'
-        run: |
-          mv target/release/spice spice
-          chmod +x spice
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
-        if: matrix.target_os != 'windows'
-        with:
-          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: |
-            spice
-            spiced
 
   test_acceleration:
     name: '${{ matrix.acceleration.engine }} acceleration on ${{ matrix.target.name }}'

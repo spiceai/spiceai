@@ -31,6 +31,7 @@ mod catalog;
 mod cayenne;
 #[cfg(feature = "duckdb")]
 mod clickbench;
+mod cluster;
 mod cors;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;

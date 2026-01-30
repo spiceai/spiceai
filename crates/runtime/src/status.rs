@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    fmt::Display,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -28,45 +27,11 @@ use tokio::sync::watch;
 
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
-use serde::{Deserialize, Serialize};
 
 use crate::metrics;
 
-/// Represents the status of a component (e.g. dataset, model, etc).
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub enum ComponentStatus {
-    /// The component is initializing and not yet ready
-    Initializing = 0,
-
-    /// The component is ready to accept connections
-    Ready = 1,
-
-    /// The component is disabled and not running
-    Disabled = 2,
-
-    /// An error occurred in the component
-    Error = 3,
-
-    /// The component is in the process of refreshing its state
-    Refreshing = 4,
-
-    /// The component is in the process of shutting down
-    ShuttingDown = 5,
-}
-
-impl Display for ComponentStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ComponentStatus::Initializing => write!(f, "Initializing"),
-            ComponentStatus::Ready => write!(f, "Ready"),
-            ComponentStatus::Disabled => write!(f, "Disabled"),
-            ComponentStatus::Error => write!(f, "Error"),
-            ComponentStatus::Refreshing => write!(f, "Refreshing"),
-            ComponentStatus::ShuttingDown => write!(f, "ShuttingDown"),
-        }
-    }
-}
+// Re-export ComponentStatus from the shared API types crate
+pub use runtime_api_types::v1::ComponentStatus;
 
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeStatus {
