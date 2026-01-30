@@ -2394,26 +2394,6 @@ checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
 
 [[package]]
 name = "bindgen"
-version = "0.71.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
-dependencies = [
- "bitflags 2.10.0",
- "cexpr",
- "clang-sys",
- "itertools 0.13.0",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 2.1.1",
- "shlex",
- "syn 2.0.114",
-]
-
-[[package]]
-name = "bindgen"
 version = "0.69.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "271383c67ccabffb7381723dea0672a673f292304fcb45c01cc648c7a8d58088"
@@ -2433,6 +2413,26 @@ dependencies = [
  "shlex",
  "syn 2.0.114",
  "which",
+]
+
+[[package]]
+name = "bindgen"
+version = "0.71.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
+dependencies = [
+ "bitflags 2.10.0",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 2.1.1",
+ "shlex",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -9524,6 +9524,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazycell"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
+
+[[package]]
 name = "lebe"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9689,7 +9695,7 @@ dependencies = [
 name = "libnfs"
 version = "0.1.0"
 dependencies = [
- "bindgen",
+ "bindgen 0.71.1",
  "nix 0.30.1",
 ]
 
@@ -19227,7 +19233,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00ff5b2cadd6c8b749511648d50c95f69bfa52efc5d88cc2e2deedd0beeb6c89"
 dependencies = [
  "bindgen 0.69.5",
- "env_logger 0.11.8",
+ "env_logger",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -19275,7 +19281,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b669b19a5f4bfa7cfdf5045af36ca4a2087431c0d2844ec539ddcf951b5c9d2"
 dependencies = [
  "bindgen 0.69.5",
- "env_logger 0.11.8",
+ "env_logger",
  "genawaiter",
  "parking_lot 0.12.5",
  "tracing",
@@ -20949,6 +20955,18 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+
+[[package]]
+name = "which"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87ba24419a2078cd2b0f2ede2691b6c66d8e47836da3b6db8265ebad47afbfc7"
+dependencies = [
+ "either",
+ "home",
+ "once_cell",
+ "rustix 0.38.44",
+]
 
 [[package]]
 name = "whoami"
