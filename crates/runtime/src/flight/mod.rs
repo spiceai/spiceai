@@ -69,7 +69,7 @@ mod get_flight_info;
 mod get_schema;
 mod handshake;
 mod metrics;
-mod middleware;
+pub mod middleware;
 mod session;
 mod session_auth;
 mod util;
@@ -92,6 +92,12 @@ impl Service {
             basic_auth,
             session_store: SessionStore::new(),
         }
+    }
+
+    /// Returns a clone of the session store.
+    #[must_use]
+    pub fn session_store(&self) -> SessionStore {
+        self.session_store.clone()
     }
 }
 
