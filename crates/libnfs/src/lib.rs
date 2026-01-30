@@ -109,6 +109,15 @@ fn check_retcode(ctx: *mut sys::nfs_context, code: i32) -> Result<()> {
 }
 
 /// The main NFS client handle.
+///
+/// # Thread Safety
+///
+/// This type uses `Rc` for reference counting and is **not** thread-safe.
+/// It does not implement `Send` or `Sync`. All operations on an `Nfs` handle
+/// and its derived types (`NfsFile`, `NfsDirectory`) must occur on the same thread.
+///
+/// When using with async runtimes like Tokio, wrap NFS operations in
+/// `tokio::task::spawn_blocking` to confine them to a single blocking thread.
 #[derive(Clone)]
 pub struct Nfs {
     context: Rc<NfsPtr>,
@@ -169,6 +178,11 @@ pub struct DirEntry {
 }
 
 /// Handle to an open NFS directory for iteration.
+///
+/// # Thread Safety
+///
+/// This type uses `Rc` for reference counting and is **not** thread-safe.
+/// See [`Nfs`] documentation for details on thread safety constraints.
 #[derive(Clone)]
 pub struct NfsDirectory {
     nfs: Rc<NfsPtr>,
@@ -186,6 +200,11 @@ impl Drop for NfsDirectory {
 }
 
 /// Handle to an open NFS file.
+///
+/// # Thread Safety
+///
+/// This type uses `Rc` for reference counting and is **not** thread-safe.
+/// See [`Nfs`] documentation for details on thread safety constraints.
 #[derive(Clone)]
 pub struct NfsFile {
     nfs: Rc<NfsPtr>,
@@ -233,7 +252,8 @@ impl Nfs {
     /// Set the UID to use for NFS operations.
     ///
     /// # Errors
-    /// This function always succeeds and returns `Ok(())`.
+    ///
+    /// This function cannot fail and always returns `Ok(())`.
     pub fn set_uid(&self, uid: i32) -> Result<()> {
         unsafe {
             sys::nfs_set_uid(self.context.0, uid);
@@ -244,7 +264,8 @@ impl Nfs {
     /// Set the GID to use for NFS operations.
     ///
     /// # Errors
-    /// This function always succeeds and returns `Ok(())`.
+    ///
+    /// This function cannot fail and always returns `Ok(())`.
     pub fn set_gid(&self, gid: i32) -> Result<()> {
         unsafe {
             sys::nfs_set_gid(self.context.0, gid);
@@ -255,7 +276,8 @@ impl Nfs {
     /// Enable debug logging at the specified level.
     ///
     /// # Errors
-    /// This function always succeeds and returns `Ok(())`.
+    ///
+    /// This function cannot fail and always returns `Ok(())`.
     pub fn set_debug(&self, level: i32) -> Result<()> {
         unsafe {
             sys::nfs_set_debug(self.context.0, level);
@@ -266,7 +288,8 @@ impl Nfs {
     /// Set the number of TCP SYN retries.
     ///
     /// # Errors
-    /// This function always succeeds and returns `Ok(())`.
+    ///
+    /// This function cannot fail and always returns `Ok(())`.
     pub fn set_tcp_syncnt(&self, syncnt: i32) -> Result<()> {
         unsafe {
             sys::nfs_set_tcp_syncnt(self.context.0, syncnt);
@@ -277,7 +300,8 @@ impl Nfs {
     /// Set the authentication context.
     ///
     /// # Errors
-    /// This function always succeeds and returns `Ok(())`.
+    ///
+    /// This function cannot fail and always returns `Ok(())`.
     pub fn set_auth(&self, auth: &mut AUTH) -> Result<()> {
         unsafe {
             sys::nfs_set_auth(self.context.0, auth);
@@ -591,8 +615,11 @@ impl Nfs {
 
     /// Set the file creation mask.
     ///
+    /// Returns the previous umask value.
+    ///
     /// # Errors
-    /// This function cannot fail.
+    ///
+    /// This function cannot fail and always returns `Ok(mask)`.
     pub fn umask(&self, mask: u16) -> Result<u16> {
         unsafe {
             let mask = sys::nfs_umask(self.context.0, mask);
@@ -633,7 +660,8 @@ impl Nfs {
     /// Get the current working directory.
     ///
     /// # Errors
-    /// This function cannot fail.
+    ///
+    /// This function cannot fail and always returns `Ok(path)`.
     pub fn getcwd(&self) -> Result<PathBuf> {
         let mut cwd = ptr::null();
         unsafe {
@@ -661,7 +689,8 @@ impl Nfs {
     /// Get the maximum read size supported by the server.
     ///
     /// # Errors
-    /// This function always succeeds and returns `Ok(size)`.
+    ///
+    /// This function cannot fail and always returns `Ok(size)`.
     pub fn get_readmax(&self) -> Result<u64> {
         unsafe {
             let max = sys::nfs_get_readmax(self.context.0);
@@ -673,7 +702,8 @@ impl Nfs {
     /// Get the maximum write size supported by the server.
     ///
     /// # Errors
-    /// This function always succeeds and returns `Ok(size)`.
+    ///
+    /// This function cannot fail and always returns `Ok(size)`.
     pub fn get_writemax(&self) -> Result<u64> {
         unsafe {
             let max = sys::nfs_get_writemax(self.context.0);
@@ -810,6 +840,13 @@ impl Iterator for NfsDirectory {
     type Item = Result<DirEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // SAFETY: The nfs_readdir function returns a pointer to a statically-allocated
+        // nfsdirent structure that is valid until the next call to nfs_readdir or
+        // nfs_closedir on this directory handle. We immediately copy all needed data
+        // from the dirent structure before returning, so there's no use-after-free.
+        // The dirent pointer is checked for null before dereferencing.
+        // All fields accessed (name, type_, mode, size, etc.) are primitive types
+        // or pointers that the C library guarantees are valid when dirent is non-null.
         unsafe {
             let dirent = sys::nfs_readdir(self.nfs.0, self.handle);
             if dirent.is_null() {

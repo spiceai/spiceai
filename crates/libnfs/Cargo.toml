@@ -3,7 +3,7 @@ name = "libnfs"
 version = "0.1.0"
 edition = "2024"
 description = "Safe Rust bindings to libnfs C library for NFS client operations"
-license = "MIT"
+license = "Apache-2.0"
 
 [dependencies]
 nix = { workspace = true, features = ["fs"] }
