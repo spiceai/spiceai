@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: s3[parquet]-cayenne[file]
+name: s3[parquet]-duckdb[file]
 datasets:
   - from: s3://benchmarks/tpch_sf10/customer.parquet
     name: customer
@@ -13,7 +13,7 @@ datasets:
       s3_secret: ${secrets:S3_SECRET}
     acceleration: &acceleration
       enabled: true
-      engine: cayenne
+      engine: duckdb
       mode: file
   - from: s3://benchmarks/tpch_sf10/lineitem.parquet
     name: lineitem
