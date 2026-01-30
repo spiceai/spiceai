@@ -40,7 +40,7 @@ const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Maximum number of poll iterations before timing out a job.
 /// At 100ms poll interval, this allows ~1 hour of job execution time.
-/// Convert polling to notifiers: https://github.com/spiceai/spiceai/issues/9223
+/// Convert polling to notifiers: <https://github.com/spiceai/spiceai/issues/9223>
 const MAX_JOB_POLL_ITERATIONS: u64 = 36_000;
 
 /// Default max message size (16MB matches typical default).
