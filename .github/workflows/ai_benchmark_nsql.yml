@@ -13,7 +13,7 @@ on:
           - 'gpt-5.2'
           - 'o3-mini'
           - 'llama3-3B-Instruct'
-          - 'claude-haiku'
+          - 'claude-3-5-haiku'
           - 'grok-4-fast'
         default: 'all'
   schedule:
@@ -75,7 +75,7 @@ jobs:
               { name: "gpt-5.2" },
               { name: "o3-mini" },
               { name: "llama3-3B-Instruct" },
-              { name: "claude-haiku" },
+              { name: "claude-3-5-haiku" },
               { name: "grok-4-fast" },
             ];
 
