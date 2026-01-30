@@ -31,12 +31,13 @@ use crate::utils::test_request_context;
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common::{self, get_pg_params, get_random_port},
-    utils::runtime_ready_check,
+    utils::{register_test_connectors, runtime_ready_check},
 };
 
 #[tokio::test]
 async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
