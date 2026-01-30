@@ -36,7 +36,7 @@ use crate::{
         get_pg_params, get_postgres_connection_pool, get_random_port,
         start_postgres_docker_container,
     },
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 fn make_spiceai_dataset(path: &str, name: &str, engine: &str, retention_sql: &str) -> Dataset {
@@ -176,6 +176,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -241,6 +242,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_duckdb_append_refresh_preserves_timestamptz() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

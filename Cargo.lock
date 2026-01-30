@@ -3746,6 +3746,347 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
+name = "connector-clickhouse"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "clickhouse-rs",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "db_connection_pool",
+ "linkme",
+ "ns_lookup",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "url",
+]
+
+[[package]]
+name = "connector-databricks"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-sdk-credential-bridge",
+ "data_components",
+ "datafusion",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime",
+ "runtime-secrets",
+ "secrecy",
+ "snafu",
+ "token_provider",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "connector-delta-lake"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-sdk-credential-bridge",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "connector-dremio"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-federation",
+ "flight_client",
+ "linkme",
+ "ns_lookup",
+ "paste",
+ "runtime",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-duckdb"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "duckdb",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+]
+
+[[package]]
+name = "connector-flightsql"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "flight_client",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+]
+
+[[package]]
+name = "connector-ftp"
+version = "2.0.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-graphql"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "token_provider",
+ "url",
+]
+
+[[package]]
+name = "connector-imap"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "imap",
+ "linkme",
+ "paste",
+ "regex",
+ "runtime",
+ "secrecy",
+ "snafu",
+]
+
+[[package]]
+name = "connector-mongodb"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-mssql"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tiberius",
+]
+
+[[package]]
+name = "connector-mysql"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "mysql_async",
+ "opentelemetry",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-nfs"
+version = "1.11.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-odbc"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "db_connection_pool",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-oracle"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "runtime-parameters",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-postgres"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+]
+
+[[package]]
+name = "connector-scylladb"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "db_connection_pool",
+ "linkme",
+ "ns_lookup",
+ "paste",
+ "runtime",
+ "runtime-parameters",
+ "scylla",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
+name = "connector-sftp"
+version = "2.0.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-sharepoint"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "document_parse",
+ "graph-rs-sdk",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "url",
+]
+
+[[package]]
+name = "connector-smb"
+version = "2.0.0-unstable"
+dependencies = [
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "connector-snowflake"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "db_connection_pool",
+ "itertools 0.14.0",
+ "linkme",
+ "paste",
+ "runtime",
+ "snafu",
+ "snowflake-api",
+]
+
+[[package]]
+name = "connector-spark"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "linkme",
+ "paste",
+ "runtime",
+ "runtime-parameters",
+ "snafu",
+]
+
+[[package]]
 name = "console"
 version = "0.15.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14414,7 +14755,26 @@ dependencies = [
  "chrono",
  "chunking",
  "clap 4.5.54",
- "clickhouse-rs",
+ "connector-clickhouse",
+ "connector-databricks",
+ "connector-delta-lake",
+ "connector-dremio",
+ "connector-duckdb",
+ "connector-flightsql",
+ "connector-ftp",
+ "connector-graphql",
+ "connector-imap",
+ "connector-mongodb",
+ "connector-mssql",
+ "connector-mysql",
+ "connector-oracle",
+ "connector-postgres",
+ "connector-scylladb",
+ "connector-sftp",
+ "connector-sharepoint",
+ "connector-smb",
+ "connector-snowflake",
+ "connector-spark",
  "criterion 0.7.0",
  "csv",
  "dashmap",
@@ -14440,7 +14800,6 @@ dependencies = [
  "gethostname",
  "globset",
  "governor",
- "graph-rs-sdk",
  "graphql-parser",
  "headers-accept",
  "hf-hub",
@@ -14453,7 +14812,6 @@ dependencies = [
  "iceberg-catalog-glue",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
- "imap",
  "indexmap 2.13.0",
  "insta",
  "itertools 0.14.0",
@@ -14513,14 +14871,12 @@ dependencies = [
  "scheduler",
  "schemars 1.2.0",
  "scopeguard",
- "scylla",
  "search",
  "secrecy",
  "serde",
  "serde_json",
  "serde_yaml",
  "snafu",
- "snowflake-api",
  "spice-cloud",
  "spiceai",
  "spicepod",
@@ -14596,7 +14952,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-api-types"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "serde",
  "serde_json",
@@ -16512,6 +16868,28 @@ version = "2.0.0-unstable"
 dependencies = [
  "app",
  "clap 4.5.54",
+ "connector-clickhouse",
+ "connector-databricks",
+ "connector-delta-lake",
+ "connector-dremio",
+ "connector-duckdb",
+ "connector-flightsql",
+ "connector-ftp",
+ "connector-graphql",
+ "connector-imap",
+ "connector-mongodb",
+ "connector-mssql",
+ "connector-mysql",
+ "connector-nfs",
+ "connector-odbc",
+ "connector-oracle",
+ "connector-postgres",
+ "connector-scylladb",
+ "connector-sftp",
+ "connector-sharepoint",
+ "connector-smb",
+ "connector-snowflake",
+ "connector-spark",
  "event_stream",
  "futures",
  "mimalloc",
@@ -16579,6 +16957,25 @@ dependencies = [
 name = "spicepodschema"
 version = "2.0.0-unstable"
 dependencies = [
+ "connector-clickhouse",
+ "connector-delta-lake",
+ "connector-dremio",
+ "connector-duckdb",
+ "connector-flightsql",
+ "connector-ftp",
+ "connector-graphql",
+ "connector-imap",
+ "connector-mongodb",
+ "connector-mssql",
+ "connector-mysql",
+ "connector-oracle",
+ "connector-postgres",
+ "connector-scylladb",
+ "connector-sftp",
+ "connector-sharepoint",
+ "connector-smb",
+ "connector-snowflake",
+ "connector-spark",
  "regex",
  "runtime",
  "runtime-parameters",

@@ -1,0 +1,212 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Spark Connect data connector for Spice.ai runtime.
+//!
+//! This crate provides the Spark Connect connector implementation, allowing
+//! Spice.ai to connect to Apache Spark clusters as data sources.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds - changes to this connector only require rebuilding
+//! this crate, not the entire runtime.
+
+use async_trait::async_trait;
+use data_components::Read;
+use data_components::spark_connect::SparkConnect;
+use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult,
+};
+use runtime::parameters::ParameterSpec;
+use runtime_parameters::Parameters;
+use snafu::prelude::*;
+use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(
+        "Missing required Spark Remote, not available as secret or plaintext parameter"
+    ))]
+    MissingSparkRemote,
+
+    #[snafu(display("Endpoint {endpoint} is invalid: {source}"))]
+    InvalidEndpoint {
+        endpoint: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    UnableToConstructSparkConnect {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Spark Connect data connector.
+pub struct Spark {
+    read_provider: Arc<dyn Read>,
+}
+
+impl std::fmt::Debug for Spark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Spark").finish_non_exhaustive()
+    }
+}
+
+impl Spark {
+    async fn new(params: Parameters) -> Result<Self> {
+        let conn = params.get("remote").expose().ok();
+        let Some(conn) = conn else {
+            return MissingSparkRemoteSnafu.fail();
+        };
+        SparkConnect::validate_connection_string(conn)
+            .context(InvalidEndpointSnafu { endpoint: conn })?;
+        let spark = SparkConnect::from_connection(conn)
+            .await
+            .context(UnableToConstructSparkConnectSnafu)?;
+        Ok(Self {
+            read_provider: Arc::new(spark),
+        })
+    }
+}
+
+/// Factory for creating Spark connector instances.
+#[derive(Default, Copy, Clone)]
+pub struct SparkFactory {}
+
+impl SparkFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::component("remote").secret().required()];
+
+impl DataConnectorFactory for SparkFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn create(
+        &self,
+        params: ConnectorParams,
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        Box::pin(async move {
+            match Spark::new(params.parameters).await {
+                Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
+                Err(e) => match e {
+                    Error::MissingSparkRemote
+                    | Error::InvalidEndpoint {
+                        endpoint: _,
+                        source: _,
+                    } => Err(DataConnectorError::InvalidConfiguration {
+                        dataconnector: "spark".to_string(),
+                        connector_component: params.component.clone(),
+                        message: e.to_string(),
+                        source: e.into(),
+                    }
+                    .into()),
+                    Error::UnableToConstructSparkConnect { source } => {
+                        Err(DataConnectorError::UnableToConnectInternal {
+                            dataconnector: "spark".to_string(),
+                            connector_component: params.component.clone(),
+                            source,
+                        }
+                        .into())
+                    }
+                },
+            }
+        })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "spark"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS
+    }
+}
+
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "spark";
+
+/// Returns a new instance of the `Spark` connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    SparkFactory::new_arc()
+}
+
+#[derive(Debug, Snafu)]
+enum ReadProviderError {
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<ReadProviderError> for DataConnectorError {
+    fn from(err: ReadProviderError) -> Self {
+        match err {
+            ReadProviderError::UnableToGetReadProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl DataConnector for Spark {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        let table_reference = TableReference::from(dataset.path());
+        Ok(self
+            .read_provider
+            .table_provider(table_reference)
+            .await
+            .context(UnableToGetReadProviderSnafu {
+                dataconnector: "spark",
+                connector_component: ConnectorComponent::from(dataset),
+            })?)
+    }
+}
