@@ -235,30 +235,54 @@ pub async fn wait_for_all_marker_deletions(
     }
 }
 
-/// Poll the snapshots API until at least one snapshot exists.
-pub async fn poll_for_snapshots(timeout: Duration) -> Result<()> {
+/// Poll the snapshots API until at least one snapshot exists for ALL given datasets.
+pub async fn poll_for_all_snapshots(dataset_names: &[&str], timeout: Duration) -> Result<()> {
     let start = Instant::now();
     let poll_interval = Duration::from_millis(1000);
+    let client = reqwest::Client::new();
+
+    let mut pending: std::collections::HashSet<&str> = dataset_names.iter().copied().collect();
 
     loop {
         if start.elapsed() > timeout {
-            return Err(anyhow::anyhow!("Timeout waiting for snapshot creation"));
+            let missing: Vec<_> = pending.iter().copied().collect();
+            return Err(anyhow::anyhow!(
+                "Timeout waiting for snapshot creation. Missing: {missing:?}"
+            ));
         }
 
-        // Query the snapshots endpoint (hardcoded port as test-framework uses fixed ports)
-        let client = reqwest::Client::new();
-        let url = "http://localhost:8090/v1/snapshots";
+        // Check each pending dataset
+        let mut newly_completed = Vec::new();
+        for dataset_name in &pending {
+            let url = format!(
+                "http://localhost:8090/v1/datasets/{dataset_name}/acceleration/snapshots"
+            );
 
-        if let Ok(response) = client.get(url).send().await
-            && response.status().is_success()
-        {
-            if let Ok(body) = response.text().await {
-                // Check if there are any snapshots (non-empty response)
-                if !body.trim().is_empty() && body != "[]" {
-                    println!("Snapshot created");
-                    return Ok(());
+            if let Ok(response) = client.get(&url).send().await
+                && response.status().is_success()
+            {
+                if let Ok(body) = response.text().await {
+                    // Parse JSON response to check if snapshots array is non-empty
+                    // Response format: {"dataset_name":"...","snapshots":[...],...}
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(snapshots) = json.get("snapshots").and_then(|s| s.as_array()) {
+                            if !snapshots.is_empty() {
+                                println!("Snapshot created for {dataset_name}");
+                                newly_completed.push(*dataset_name);
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        for name in newly_completed {
+            pending.remove(name);
+        }
+
+        if pending.is_empty() {
+            println!("All snapshots created");
+            return Ok(());
         }
 
         tokio::time::sleep(poll_interval).await;
@@ -275,7 +299,6 @@ pub fn print_benchmark_summary(
     total_record_count: usize,
     total_insert_duration: Duration,
     results: &[BenchmarkResult],
-    mutation_summary: Option<&MutationSummary>,
 ) {
     println!("\n{}", "=".repeat(70));
     println!("{title}");
@@ -293,13 +316,6 @@ pub fn print_benchmark_summary(
     println!("Scale Factor:        {scale_factor}");
     println!("Total Records:       {total_record_count}");
     println!("Data Insertion Time: {total_insert_duration:?}");
-
-    if let Some(summary) = mutation_summary {
-        println!(
-            "Mutations:           {} update-path + {} delete-path + {} direct",
-            summary.update_path_rows, summary.delete_path_rows, summary.direct_insert_rows
-        );
-    }
 
     println!("\nConfiguration Comparison:");
     println!(

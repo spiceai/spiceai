@@ -14,29 +14,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! DynamoDB Streams ingestion benchmark runner.
+//! DynamoDB Streams dispatch for multi-config benchmarks.
 //!
-//! This module contains the DynamoDB-specific benchmark orchestration logic.
-//! It uses snapshot-based checkpoint capture to ensure fair benchmarking.
+//! This module orchestrates benchmarks across multiple spicepod configurations,
+//! ingesting data once and running each configuration sequentially.
+//!
+//! ## Flow
+//! 1. Create tables, insert first record (for schema inference)
+//! 2. For each config: capture checkpoint snapshot (sequential)
+//! 3. Insert remaining data
+//! 4. For each config: trigger GitHub workflow OR run benchmark locally (sequential)
+//! 5. Report results
 //!
 //! ## Modes
 //!
-//! ### Full Mode (`run_dynamodb`)
-//! Complete benchmark for a single spicepod configuration:
-//! 1. Create tables, insert first record (for schema inference)
-//! 2. Capture checkpoint snapshot
-//! 3. Insert remaining data
-//! 4. Start benchmark Spice from snapshot, insert marker, wait for marker
-//! 5. Report results
+//! ### GitHub Workflow Mode (`--workflow`)
+//! When `--workflow` is specified, dispatch triggers GitHub Actions workflows
+//! for each config instead of running benchmarks locally. This is useful for
+//! running benchmarks in CI/CD environments.
 //!
-//! ### Snapshot Mode (`run_benchmark_from_snapshot`)
-//! Run benchmark from an existing snapshot (used by dispatch):
-//! 1. Start Spice from snapshot
-//! 2. Insert marker, wait for marker
-//! 3. Return results
+//! ### Local Mode (default)
+//! When `--workflow` is not specified, benchmarks run locally (sequential).
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,6 +48,7 @@ use test_framework::anyhow::{self, Result};
 use test_framework::spiced::{SpicedInstance, StartRequest};
 
 use super::datasets::DatasetType;
+use super::dynamodb_runner::build_snapshot_config;
 use super::mutations;
 use super::traits::{DynamoDBStreamingSource, SnapshotConfig, StreamingDataset};
 use super::utils::{
@@ -54,32 +57,24 @@ use super::utils::{
     BenchmarkResult, DatasetInfo,
 };
 use super::verification;
-use crate::args::StreamingDynamodbTestArgs;
+use crate::args::DispatchDynamodbArgs;
 
-/// Run the DynamoDB streaming ingestion benchmark.
+/// Run the DynamoDB streaming dispatch (multi-config benchmarks).
 ///
-/// Supports two modes:
-/// - **Full mode** (default): Creates tables, inserts data, captures snapshot, runs benchmark
-/// - **Snapshot mode** (`--from-snapshot --run-id <id>`): Runs benchmark from existing snapshot
-pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
-    // Check for snapshot mode
-    if args.from_snapshot {
-        return run_dynamodb_from_snapshot(args).await;
-    }
-
-    let spicepod_path = &args.spicepod_path;
+/// This ingests data once and runs benchmarks for multiple configurations.
+pub async fn run_dispatch(args: &DispatchDynamodbArgs) -> Result<()> {
+    let spicepod_paths = args.all_spicepod_paths();
     let datasets = args.queryset.get_datasets();
 
-    let config_name = spicepod_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    if spicepod_paths.len() < 2 {
+        println!("Warning: dispatch-dynamodb is designed for multiple configs.");
+        println!("Consider using streaming-dynamodb for single config benchmarks.");
+    }
 
-    println!("Starting DynamoDB streaming ingestion benchmark (full mode)");
+    println!("Starting DynamoDB streaming dispatch");
     println!("Source: {}", args.source);
     println!("Query set: {}", args.queryset);
-    println!("Config: {config_name}");
+    println!("Configs: {}", spicepod_paths.len());
     println!(
         "Datasets: {}",
         datasets
@@ -95,7 +90,7 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     println!("Generated run ID: {run_id}");
 
     // Create source and set table prefix
-    let mut source = create_dynamodb_source(args)?;
+    let mut source = args.source.create_dynamodb()?;
     source.set_table_prefix(run_id.clone());
 
     // Check if snapshots are configured (required for DynamoDB)
@@ -158,164 +153,237 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         }
     }
 
+    // Phase 5: Capture checkpoints for ALL configs (sequential due to fixed port)
+    let config_names: Vec<String> = spicepod_paths
+        .iter()
+        .map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        })
+        .collect();
+
     // Collect dataset names for snapshot polling
     let dataset_names: Vec<&str> = dataset_infos
         .iter()
         .map(|info| info.dataset.table_name())
         .collect();
 
-    // Phase 5: Checkpoint capture
-    println!("Phase 5: Capturing checkpoint for {config_name}");
-    capture_checkpoint_snapshot(
-        &source,
-        spicepod_path,
-        &run_id,
-        &config_name,
-        &snapshot_config,
-        args,
-        &dataset_names,
-    )
-    .await?;
-    println!("Checkpoint snapshot captured");
+    println!("Phase 5: Capturing checkpoints for all configs (sequential)");
+
+    for (path, config_name) in spicepod_paths.iter().zip(config_names.iter()) {
+        capture_checkpoint_snapshot(
+            &source,
+            path,
+            &run_id,
+            config_name,
+            &snapshot_config,
+            args,
+            &dataset_names,
+        )
+        .await?;
+    }
+
+    println!("All checkpoint snapshots captured");
 
     // Phase 6: Insert remaining data
     println!("Phase 6: Inserting remaining data");
     let data_insertion_start = Instant::now();
     let mut total_insert_duration = Duration::ZERO;
 
+    let mutation_summary = if args.mutation_ratio > 0.0 {
+        println!("  Executing mutation sequences for CDC testing");
+        println!(
+            "  Seed: {}, Mutation ratio: {:.1}%",
+            args.mutation_seed,
+            args.mutation_ratio * 100.0
+        );
+
+        let config = mutations::MutationConfig {
+            seed: args.mutation_seed,
+            mutation_ratio: args.mutation_ratio,
+        };
+
+        let datasets_for_mutation: Vec<Box<dyn StreamingDataset>> = dataset_infos
+            .iter()
+            .map(|info| info.dataset.dataset_type().create_dataset())
+            .collect();
+
+        // Skip first row (already inserted)
+        let original_data: Vec<(DatasetType, Vec<RecordBatch>)> = dataset_infos
+            .iter()
+            .map(|info| {
+                let batches = skip_first_row(&info.generated_data);
+                (info.dataset.dataset_type(), batches)
+            })
+            .collect();
+
+        let insert_start = Instant::now();
+        let summary = mutations::execute_mutation_sequences(
+            source.as_ref(),
+            &datasets_for_mutation,
+            &original_data,
+            config,
+        )
+        .await?;
+        total_insert_duration = insert_start.elapsed();
+        summary.print();
+        Some(summary)
+    } else {
+        for info in &dataset_infos {
+            let dataset_type = info.dataset.dataset_type();
+            let table_name = source.get_table_name(info.dataset.table_name());
+            println!("  Inserting data for {dataset_type}");
+
+            // Skip first row (already inserted)
+            let remaining_data = skip_first_row(&info.generated_data);
+
+            let insert_start = Instant::now();
+            source.insert(&table_name, &remaining_data).await?;
+            total_insert_duration += insert_start.elapsed();
+        }
+        None
+    };
+
     println!("Data insertion completed in {total_insert_duration:?}");
 
-    // Phase 7: Run benchmark
-    println!("Phase 7: Running benchmark for {config_name}");
+    // Phase 7: Trigger benchmarks for ALL configs (sequential)
+    if let Some(ref workflow) = args.workflow {
+        // GitHub workflow dispatch mode
+        println!("Phase 7: Triggering GitHub workflows for all configs (sequential)");
 
-    let dataset_markers: Vec<_> = dataset_infos
-        .iter()
-        .map(|info| (info.dataset.dataset_type(), info.marker.clone()))
-        .collect();
+        for (path, config_name) in spicepod_paths.iter().zip(config_names.iter()) {
+            trigger_workflow(
+                workflow,
+                args.repo.as_deref(),
+                args.git_ref.as_deref(),
+                &run_id,
+                config_name,
+                path,
+                args,
+            )?;
 
-    let result = run_benchmark_from_snapshot(
-        &source,
-        spicepod_path,
-        &run_id,
-        &config_name,
-        &snapshot_config,
-        args,
-        &dataset_markers,
-        data_insertion_start,
-    )
-    .await?;
+            if args.wait_for_workflows {
+                // Wait for workflow to complete before triggering next
+                wait_for_workflow_completion(workflow, args.repo.as_deref())?;
+            }
+        }
 
-    // Phase 8: Report results
-    println!("\nPhase 8: Reporting results");
+        println!("\nPhase 8: Workflow dispatch complete");
+        println!("Run ID: {run_id}");
+        println!("Configs dispatched: {}", config_names.join(", "));
+        println!("\nMonitor workflows at: https://github.com/{}/actions",
+            args.repo.as_deref().unwrap_or("spiceai/spiceai"));
 
-    let total_record_count: usize = dataset_infos.iter().map(|info| info.record_count).sum();
-    print_benchmark_summary(
-        "DynamoDB Streaming Ingestion Benchmark Results",
-        &args.source.to_string(),
-        &args.queryset.to_string(),
-        &dataset_infos,
-        args.scale_factor,
-        total_record_count,
-        total_insert_duration,
-        &[result],
-    );
-
-    // Cleanup
-    source.cleanup().await?;
+        // Don't cleanup - tables need to remain for workflows to use
+        println!("\nNote: DynamoDB tables preserved for workflow execution");
+        println!("Run cleanup manually after workflows complete");
+    }
 
     Ok(())
 }
 
-/// Run benchmark from an existing snapshot (snapshot mode).
-///
-/// This mode is used when dispatch-dynamodb has already:
-/// 1. Created tables and inserted data
-/// 2. Captured checkpoint snapshots for all configs
-///
-/// This function skips data preparation and runs the benchmark directly.
-async fn run_dynamodb_from_snapshot(args: &StreamingDynamodbTestArgs) -> Result<()> {
-    let run_id = args.run_id.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("--run-id is required when using --from-snapshot")
-    })?;
+/// Trigger a GitHub workflow for a specific config.
+fn trigger_workflow(
+    workflow: &str,
+    repo: Option<&str>,
+    git_ref: Option<&str>,
+    run_id: &str,
+    config_name: &str,
+    spicepod_path: &Path,
+    args: &DispatchDynamodbArgs,
+) -> Result<()> {
+    println!("  Triggering workflow for {config_name}");
 
-    let spicepod_path = &args.spicepod_path;
-    let datasets = args.queryset.get_datasets();
+    let mut cmd = Command::new("gh");
+    cmd.args(["workflow", "run", workflow]);
 
-    let config_name = spicepod_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    println!("Starting DynamoDB streaming ingestion benchmark (snapshot mode)");
-    println!("Source: {}", args.source);
-    println!("Query set: {}", args.queryset);
-    println!("Config: {config_name}");
-    println!("Run ID: {run_id}");
-    println!(
-        "Datasets: {}",
-        datasets
-            .iter()
-            .map(|d| d.dataset_type().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    // Create source and set table prefix (for marker operations)
-    let mut source = create_dynamodb_source(args)?;
-    source.set_table_prefix(run_id.clone());
-
-    let snapshot_config = build_snapshot_config().ok_or_else(|| {
-        anyhow::anyhow!("DynamoDB benchmarks require SNAPSHOT_S3_LOCATION environment variable")
-    })?;
-
-    // Prepare source (connects to DynamoDB)
-    source.prepare().await?;
-
-    let source: Arc<dyn DynamoDBStreamingSource> = Arc::from(source);
-
-    // Generate markers for each dataset
-    let mut dataset_markers = Vec::new();
-    for dataset in datasets {
-        let marker = dataset.marker_record()?;
-        dataset_markers.push((dataset.dataset_type(), marker));
+    if let Some(repo) = repo {
+        cmd.args(["--repo", repo]);
     }
 
-    // Use current time as data insertion start (for timing purposes)
-    // In snapshot mode, the actual data was inserted earlier by dispatch
-    let data_insertion_start = Instant::now();
+    if let Some(git_ref) = git_ref {
+        cmd.args(["--ref", git_ref]);
+    }
 
-    // Run benchmark from snapshot
-    let result = run_benchmark_from_snapshot(
-        &source,
-        spicepod_path,
-        run_id,
-        &config_name,
-        &snapshot_config,
-        args,
-        &dataset_markers,
-        data_insertion_start,
-    )
-    .await?;
+    // Pass workflow inputs
+    cmd.args(["-f", &format!("run_id={run_id}")]);
+    cmd.args(["-f", &format!("config_name={config_name}")]);
+    cmd.args(["-f", &format!("spicepod_path={}", spicepod_path.display())]);
+    cmd.args(["-f", &format!("source={}", args.source)]);
+    cmd.args(["-f", &format!("queryset={}", args.queryset)]);
+    cmd.args(["-f", &format!("scale_factor={}", args.scale_factor)]);
+    cmd.args(["-f", &format!("ingestion_timeout={}", args.ingestion_timeout)]);
 
-    // Report result
-    println!("\nBenchmark Result:");
-    println!("  Config: {}", result.config_name);
-    println!("  Stream Lag: {:.2}s", result.stream_lag.as_secs_f64());
-    println!("  Verification: {}", if result.verification_passed { "PASS" } else { "FAIL" });
+    if args.verify {
+        cmd.args(["-f", "verify=true"]);
+    }
 
+    let output = cmd.output().map_err(|e| {
+        anyhow::anyhow!("Failed to run gh workflow command: {e}. Is GitHub CLI installed?")
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "Failed to trigger workflow for {config_name}: {stderr}"
+        ));
+    }
+
+    println!("  Workflow triggered for {config_name}");
+    Ok(())
+}
+
+/// Wait for a workflow run to complete.
+fn wait_for_workflow_completion(workflow: &str, repo: Option<&str>) -> Result<()> {
+    println!("  Waiting for workflow to complete...");
+
+    let mut cmd = Command::new("gh");
+    cmd.args(["run", "watch", "--exit-status"]);
+
+    if let Some(repo) = repo {
+        cmd.args(["--repo", repo]);
+    }
+
+    // Get the most recent run of this workflow
+    let mut list_cmd = Command::new("gh");
+    list_cmd.args(["run", "list", "--workflow", workflow, "--limit", "1", "--json", "databaseId", "--jq", ".[0].databaseId"]);
+
+    if let Some(repo) = repo {
+        list_cmd.args(["--repo", repo]);
+    }
+
+    let list_output = list_cmd.output()?;
+    if !list_output.status.success() {
+        return Err(anyhow::anyhow!("Failed to get workflow run ID"));
+    }
+
+    let run_id = String::from_utf8_lossy(&list_output.stdout).trim().to_string();
+    if run_id.is_empty() {
+        return Err(anyhow::anyhow!("No workflow runs found"));
+    }
+
+    cmd.arg(&run_id);
+
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("Workflow failed"));
+    }
+
+    println!("  Workflow completed successfully");
     Ok(())
 }
 
 /// Capture a checkpoint snapshot for a single configuration.
 #[expect(clippy::too_many_arguments)]
-pub async fn capture_checkpoint_snapshot(
+async fn capture_checkpoint_snapshot(
     source: &Arc<dyn DynamoDBStreamingSource>,
     spicepod_path: &Path,
     run_id: &str,
     config_name: &str,
     snapshot_config: &SnapshotConfig,
-    args: &StreamingDynamodbTestArgs,
+    args: &DispatchDynamodbArgs,
     dataset_names: &[&str],
 ) -> Result<()> {
     println!("  Capturing checkpoint for {config_name}");
@@ -327,6 +395,7 @@ pub async fn capture_checkpoint_snapshot(
 
     // Write transformed spicepod to temp file
     let temp_path = write_temp_spicepod(&transformed, run_id, config_name, "checkpoint")?;
+    println!("  Wrote transformed spicepod to capture checkpoints to {temp_path:?}");
 
     // Start temp Spice
     let mut start_request = StartRequest::new(args.spiced_path_buf(), transformed)?;
@@ -354,18 +423,15 @@ pub async fn capture_checkpoint_snapshot(
     Ok(())
 }
 
-/// Run a benchmark from an existing snapshot (snapshot mode).
-///
-/// This is used by both the full mode (after capturing its own snapshot)
-/// and by the dispatch command (using pre-captured snapshots).
+/// Run a benchmark from an existing snapshot.
 #[expect(clippy::too_many_arguments)]
-pub async fn run_benchmark_from_snapshot(
+async fn run_benchmark_from_snapshot(
     source: &Arc<dyn DynamoDBStreamingSource>,
     spicepod_path: &Path,
     run_id: &str,
     config_name: &str,
     snapshot_config: &SnapshotConfig,
-    args: &StreamingDynamodbTestArgs,
+    args: &DispatchDynamodbArgs,
     dataset_markers: &[(DatasetType, RecordBatch)],
     data_insertion_start: Instant,
 ) -> Result<BenchmarkResult> {
@@ -378,6 +444,7 @@ pub async fn run_benchmark_from_snapshot(
 
     // Write transformed spicepod to temp file
     let temp_path = write_temp_spicepod(&transformed, run_id, config_name, "benchmark")?;
+    println!("  Wrote transformed spicepod to {temp_path:?}");
 
     // Start Spice
     let mut start_request = StartRequest::new(args.spiced_path_buf(), transformed)?;
@@ -463,30 +530,5 @@ pub async fn run_benchmark_from_snapshot(
         throughput,
         record_count,
         verification_passed,
-    })
-}
-
-/// Create a DynamoDB streaming source based on the arguments.
-fn create_dynamodb_source(
-    args: &StreamingDynamodbTestArgs,
-) -> Result<Box<dyn DynamoDBStreamingSource>> {
-    args.source.create_dynamodb()
-}
-
-/// Build snapshot configuration from environment variables.
-///
-/// Environment variables:
-/// - `SNAPSHOT_S3_LOCATION`: S3 location for snapshots (e.g., `s3://bucket/snapshots/`)
-/// - `SNAPSHOT_S3_ACCESS_KEY_ID`: S3 access key ID (optional)
-/// - `SNAPSHOT_S3_SECRET_ACCESS_KEY`: S3 secret access key (optional)
-/// - `SNAPSHOT_S3_REGION`: S3 region (optional)
-pub fn build_snapshot_config() -> Option<SnapshotConfig> {
-    let location = std::env::var("SNAPSHOT_S3_LOCATION").ok()?;
-
-    Some(SnapshotConfig {
-        location,
-        access_key_id: std::env::var("SNAPSHOT_S3_ACCESS_KEY_ID").ok(),
-        secret_access_key: std::env::var("SNAPSHOT_S3_SECRET_ACCESS_KEY").ok(),
-        region: std::env::var("SNAPSHOT_S3_REGION").ok(),
     })
 }

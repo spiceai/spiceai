@@ -364,6 +364,14 @@ pub struct StreamingArgs {
     /// Time in seconds to wait for Spiced to be ready
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_wait: Option<u64>,
+
+    /// Run benchmark from an existing snapshot (set by dispatch-dynamodb)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_snapshot: Option<bool>,
+
+    /// Run ID for snapshot mode (identifies DynamoDB tables and snapshot location)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Streaming source types for dispatch configuration.

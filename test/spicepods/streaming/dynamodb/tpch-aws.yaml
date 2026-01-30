@@ -6,6 +6,7 @@ common_config:
   acceleration: &common_acceleration
     enabled: true
     engine: duckdb
+    mode: file
     refresh_mode: changes
 
 datasets:

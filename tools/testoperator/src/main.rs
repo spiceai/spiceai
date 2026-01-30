@@ -24,8 +24,8 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs,
-    StreamingDynamodbTestArgs, TestCommands, TextToSqlArgs,
+    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, TestCommands,
+    TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -96,10 +96,18 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(TestCommands::StreamingDynamodb(args)) => {
             commands::streaming::run_dynamodb(&args).await?;
         }
-        Commands::Export(TestCommands::StreamingDynamodb(StreamingDynamodbTestArgs {
-            common, ..
-        })) => {
-            commands::env_export(&common).await?;
+        Commands::Export(TestCommands::StreamingDynamodb(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for streaming-dynamodb (spicepods are transformed at runtime)"
+            ));
+        }
+        Commands::Run(TestCommands::DispatchDynamodb(args)) => {
+            commands::streaming::run_dispatch(&args).await?;
+        }
+        Commands::Export(TestCommands::DispatchDynamodb(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for dispatch-dynamodb (spicepods are transformed at runtime)"
+            ));
         }
         _ => {
             return Err(anyhow::anyhow!("Unsupported command"));

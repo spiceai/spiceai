@@ -17,10 +17,14 @@ limitations under the License.
 //! Streaming ingestion benchmark commands.
 //!
 //! This module contains benchmark runners for different streaming sources.
-//! Currently supported:
-//! - DynamoDB Streams (`streaming-dynamodb` command)
+//!
+//! ## Commands
+//!
+//! - `streaming-dynamodb`: Run a single DynamoDB streaming benchmark
+//! - `dispatch-dynamodb`: Run multi-config DynamoDB benchmarks (ingest once, benchmark many)
 
 pub mod datasets;
+pub mod dynamodb_dispatch;
 pub mod dynamodb_runner;
 pub mod mutations;
 pub mod querysets;
@@ -29,9 +33,9 @@ mod traits;
 mod utils;
 pub mod verification;
 
-// Re-export the DynamoDB runner as the main entry point
+// Re-export the runner and dispatch entry points
+pub use dynamodb_dispatch::run_dispatch;
 pub use dynamodb_runner::run_dynamodb;
 
 // Re-export types needed by args
 pub use sources::SourceType;
-

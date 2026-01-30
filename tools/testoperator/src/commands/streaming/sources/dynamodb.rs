@@ -1113,9 +1113,10 @@ impl DynamoDBStreamingSource for DynamoDbStreamsSource {
 /// Transform a spicepod for DynamoDB streaming benchmarks.
 ///
 /// This function:
-/// 1. Renames all datasets with `{run_id}_` prefix
+/// 1. Prefixes the table name in `from` field (e.g., `dynamodb:lineitem` -> `dynamodb:{run_id}_lineitem`)
 /// 2. Sets `acceleration.snapshots` to the specified behavior
-/// 3. Configures runtime snapshots with unique location per config
+/// 3. Adds `duckdb_file` and `cayenne_file_path` configs for each dataset
+/// 4. Configures runtime snapshots with unique location per config
 fn transform_spicepod(
     mut spicepod: SpicepodDefinition,
     run_id: &str,
@@ -1123,15 +1124,33 @@ fn transform_spicepod(
     snapshot_config: &SnapshotConfig,
     snapshot_behavior: SnapshotBehavior,
 ) -> SpicepodDefinition {
-    // 1. Rename datasets and set acceleration snapshot behavior
+    // 1. Update dataset `from` field with prefixed table name, keep `name` unchanged
     for dataset in &mut spicepod.datasets {
         if let ComponentOrReference::Component(d) = dataset {
-            // Prefix dataset name
-            d.name = format!("{run_id}_{}", d.name);
+            // Prefix the table name in the `from` field (e.g., dynamodb:lineitem -> dynamodb:abc123_lineitem)
+            // The `name` field stays unchanged so SQL queries work as expected
+            if let Some(table_name) = d.from.strip_prefix("dynamodb:") {
+                d.from = format!("dynamodb:{run_id}_{table_name}");
+            }
 
-            // Set acceleration snapshot behavior
+            // Set acceleration snapshot behavior and add file paths
             if let Some(ref mut accel) = d.acceleration {
                 accel.snapshots = snapshot_behavior.clone();
+
+                // Add duckdb_file and cayenne_file_path configs
+                let dataset_name = &d.name;
+                let duckdb_file = format!("/tmp/{run_id}_{config_name}_{dataset_name}.db");
+                let cayenne_dir = format!("/tmp/{run_id}_{config_name}_{dataset_name}_cayenne/");
+
+                let params = accel.params.get_or_insert_with(Params::default);
+                params.data.insert(
+                    "duckdb_file".to_string(),
+                    ParamValue::String(duckdb_file),
+                );
+                params.data.insert(
+                    "cayenne_file_path".to_string(),
+                    ParamValue::String(cayenne_dir),
+                );
             }
         }
     }
@@ -1146,13 +1165,22 @@ fn transform_spicepod(
 
     let mut params = Params::default();
     if let Some(ref key) = snapshot_config.access_key_id {
-        params.data.insert("aws_access_key_id".to_string(), ParamValue::String(key.clone()));
+        params
+            .data
+            .insert("s3_auth".to_string(), ParamValue::String("key".to_string()));
+        params
+            .data
+            .insert("s3_key".to_string(), ParamValue::String(key.clone()));
     }
     if let Some(ref secret) = snapshot_config.secret_access_key {
-        params.data.insert("aws_secret_access_key".to_string(), ParamValue::String(secret.clone()));
+        params
+            .data
+            .insert("s3_secret".to_string(), ParamValue::String(secret.clone()));
     }
     if let Some(ref region) = snapshot_config.region {
-        params.data.insert("aws_region".to_string(), ParamValue::String(region.clone()));
+        params
+            .data
+            .insert("s3_region".to_string(), ParamValue::String(region.clone()));
     }
 
     spicepod.snapshots = Some(Snapshots {

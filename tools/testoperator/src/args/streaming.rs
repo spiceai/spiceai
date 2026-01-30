@@ -14,42 +14,145 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::PathBuf;
+
 use clap::Parser;
 
-use crate::commands::streaming::SourceType;
 use crate::commands::streaming::querysets::QuerySetType;
+use crate::commands::streaming::SourceType;
 
-use super::CommonArgs;
-
-/// Arguments for DynamoDB streaming ingestion benchmarks.
+/// Arguments for DynamoDB streaming ingestion benchmarks (single config).
 ///
-/// Source and dataset configuration is done via environment variables:
+/// This command runs a complete benchmark for a single spicepod configuration:
+/// 1. Creates tables and inserts initial data
+/// 2. Captures checkpoint snapshot
+/// 3. Inserts remaining data
+/// 4. Runs benchmark from snapshot
 ///
-/// ## DynamoDB Local (`--source dynamodb-streams-local`)
+/// For multi-config benchmarks (comparing multiple acceleration configs),
+/// use the `dispatch-dynamodb` command instead.
+///
+/// ## Environment Variables
+///
+/// ### DynamoDB Local (`--source dynamodb-streams-local`)
 /// - `DYNAMODB_LOCAL_PORT`: Port for DynamoDB local (optional, default: 8000)
 ///
-/// ## AWS DynamoDB (`--source dynamodb-streams`)
+/// ### AWS DynamoDB (`--source dynamodb-streams`)
 /// - `DYNAMODB_AWS_REGION`: AWS region (required)
 /// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
 /// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
 /// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for LocalStack)
 ///
-/// ## Snapshot Storage (required for DynamoDB benchmarks)
+/// ### Snapshot Storage (required)
 /// - `SNAPSHOT_S3_LOCATION`: S3 location for snapshots (e.g., `s3://bucket/snapshots/`)
 /// - `SNAPSHOT_S3_ACCESS_KEY_ID`: S3 access key ID (optional)
 /// - `SNAPSHOT_S3_SECRET_ACCESS_KEY`: S3 secret access key (optional)
 /// - `SNAPSHOT_S3_REGION`: S3 region (optional)
-///
-/// ## ClickBench data (`--queryset clickbench`)
-/// - `CLICKBENCH_S3_URI`: S3 URI to hits.parquet (e.g., `s3://bucket/path/hits.parquet`)
-/// - `CLICKBENCH_S3_ENDPOINT`: S3/MinIO endpoint (optional, for MinIO)
-/// - `CLICKBENCH_S3_ACCESS_KEY_ID`: S3 access key ID (required when using S3)
-/// - `CLICKBENCH_S3_SECRET_ACCESS_KEY`: S3 secret access key (required when using S3)
 #[derive(Parser, Debug, Clone)]
 #[expect(clippy::struct_excessive_bools)]
 pub struct StreamingDynamodbTestArgs {
-    #[command(flatten)]
-    pub common: CommonArgs,
+    /// Path to the spicepod.yaml file
+    #[arg(short('p'), long, default_value = "spicepod.yaml")]
+    pub spicepod_path: PathBuf,
+
+    /// Path to the spiced binary
+    #[arg(short, long, default_value = "spiced")]
+    pub spiced_path: String,
+
+    /// The number of seconds to wait for the spiced instance to become ready
+    #[arg(long, default_value = "30")]
+    pub ready_wait: u64,
+
+    /// An optional data directory, to symlink into the spiced instance
+    #[arg(short, long)]
+    pub data_dir: Option<PathBuf>,
+
+    /// Streaming source type (e.g., dynamodb-streams-local, dynamodb-streams)
+    #[arg(long, value_enum)]
+    pub source: SourceType,
+
+    /// Query set type (e.g., tpch-lineitem). Determines which datasets to load.
+    #[arg(long, value_enum)]
+    pub queryset: QuerySetType,
+
+    /// Scale factor for data generation (e.g., 0.01, 0.1, 1.0)
+    #[arg(long, default_value = "0.01")]
+    pub scale_factor: f64,
+
+    /// Timeout in seconds to wait for ingestion to complete
+    #[arg(long, default_value = "300")]
+    pub ingestion_timeout: u64,
+
+    /// Enable health monitoring during ingestion (tracks latency and failures)
+    #[arg(long)]
+    pub enable_liveness: bool,
+
+    /// Run TPCH queries to verify data integrity after ingestion
+    #[arg(long)]
+    pub verify: bool,
+
+    // Query liveness monitoring arguments
+    /// Enable query liveness monitoring (runs COUNT(*) queries and tracks latency)
+    #[arg(long)]
+    pub enable_query_liveness: bool,
+
+    /// Poll interval for query liveness checks in milliseconds
+    #[arg(long, default_value = "500")]
+    pub query_liveness_interval_ms: u64,
+
+    // Snapshot mode arguments (for running benchmark from existing snapshot)
+    /// Run benchmark from an existing snapshot instead of doing full ingestion.
+    /// Requires --run-id to be set.
+    #[arg(long)]
+    pub from_snapshot: bool,
+
+    /// Run ID to use for snapshot mode. This identifies the DynamoDB tables
+    /// and snapshot location created by a previous dispatch-dynamodb run.
+    #[arg(long, requires = "from_snapshot")]
+    pub run_id: Option<String>,
+}
+
+impl StreamingDynamodbTestArgs {
+    /// Get the spiced path as a `PathBuf`.
+    #[must_use]
+    pub fn spiced_path_buf(&self) -> PathBuf {
+        PathBuf::from(&self.spiced_path)
+    }
+}
+
+/// Arguments for DynamoDB streaming dispatch (multi-config benchmarks).
+///
+/// This command ingests data once and runs multiple benchmark configurations:
+/// 1. Creates tables and inserts initial data
+/// 2. Captures checkpoint snapshots for ALL configs (sequential)
+/// 3. Inserts remaining data
+/// 4. Runs benchmark for EACH config from its snapshot (sequential)
+/// 5. Reports comparison results
+///
+/// This is more cost-effective than running separate `streaming-dynamodb`
+/// commands when comparing multiple acceleration configurations.
+///
+/// ## Environment Variables
+///
+/// Same as `streaming-dynamodb` command.
+#[derive(Parser, Debug, Clone)]
+#[expect(clippy::struct_excessive_bools)]
+pub struct DispatchDynamodbArgs {
+    /// Path to the first spicepod.yaml file
+    #[arg(short('p'), long, default_value = "spicepod.yaml")]
+    pub spicepod_path: PathBuf,
+
+    /// Path to the spiced binary
+    #[arg(short, long, default_value = "spiced")]
+    pub spiced_path: String,
+
+    /// The number of seconds to wait for the spiced instance to become ready
+    #[arg(long, default_value = "30")]
+    pub ready_wait: u64,
+
+    /// An optional data directory, to symlink into the spiced instance
+    #[arg(short, long)]
+    pub data_dir: Option<PathBuf>,
 
     /// Streaming source type (e.g., dynamodb-streams-local, dynamodb-streams)
     #[arg(long, value_enum)]
@@ -96,18 +199,44 @@ pub struct StreamingDynamodbTestArgs {
     #[arg(long, default_value = "42")]
     pub mutation_seed: u64,
 
-    // Multi-config benchmark arguments
     /// Additional spicepod paths for multi-config benchmarks.
-    /// When multiple configs are provided, each is benchmarked against the same data.
-    #[arg(long = "spicepod-path", value_name = "PATH")]
-    pub additional_spicepod_paths: Vec<std::path::PathBuf>,
+    /// The first config comes from --spicepod-path.
+    /// Additional configs are specified here. Can be repeated.
+    #[arg(long = "config", value_name = "PATH")]
+    pub additional_spicepod_paths: Vec<PathBuf>,
+
+    // GitHub workflow dispatch arguments
+    /// GitHub workflow file name (e.g., "streaming-benchmark.yml").
+    /// If set, dispatch will trigger GitHub workflows instead of running benchmarks locally.
+    #[arg(long)]
+    pub workflow: Option<String>,
+
+    /// GitHub repository (e.g., "spiceai/spiceai"). Defaults to current repository.
+    #[arg(long)]
+    pub repo: Option<String>,
+
+    /// Git ref to run workflow on. Defaults to current branch.
+    #[arg(long, name = "ref")]
+    pub git_ref: Option<String>,
+
+    /// Wait for each workflow to complete before starting the next.
+    /// If false, workflows are dispatched sequentially but without waiting for completion.
+    #[arg(long)]
+    pub wait_for_workflows: bool,
 }
 
-impl StreamingDynamodbTestArgs {
-    /// Get all spicepod paths (common + additional).
-    pub fn all_spicepod_paths(&self) -> Vec<std::path::PathBuf> {
-        let mut paths = vec![self.common.spicepod_path.clone()];
+impl DispatchDynamodbArgs {
+    /// Get all spicepod paths (first + additional).
+    #[must_use]
+    pub fn all_spicepod_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.spicepod_path.clone()];
         paths.extend(self.additional_spicepod_paths.clone());
         paths
+    }
+
+    /// Get the spiced path as a `PathBuf`.
+    #[must_use]
+    pub fn spiced_path_buf(&self) -> PathBuf {
+        PathBuf::from(&self.spiced_path)
     }
 }
