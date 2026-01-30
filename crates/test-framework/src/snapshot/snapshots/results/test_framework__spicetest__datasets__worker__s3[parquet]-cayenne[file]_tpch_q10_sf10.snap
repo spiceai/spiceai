@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q10"
+---
++-----------+--------------------+-------------+-----------+--------------+-------------------------------------+-----------------+---------------------------------------------------------------------------------------------------------------------+
+| c_custkey | c_name             | revenue     | c_acctbal | n_name       | c_address                           | c_phone         | c_comment                                                                                                           |
++-----------+--------------------+-------------+-----------+--------------+-------------------------------------+-----------------+---------------------------------------------------------------------------------------------------------------------+
+| 1237537   | Customer#001237537 | 884989.6657 | 7840.17   | RUSSIA       | FNG6WgB1mopyyY,ajQTU qUPW5o         | 32-367-120-4327 | nag carefully about the regular packages. carefully reg                                                             |
+| 1116802   | Customer#001116802 | 830214.1117 | 772.17    | JORDAN       | JpGQT3IHoogqB3ZMrSrzhBrVFObr        | 23-199-655-3770 | ests. quickly ironic deposits along the special requests a                                                          |
+| 508954    | Customer#000508954 | 826167.5138 | 3072.07   | ETHIOPIA     | zgafElAXecB3I7Ee1a9B                | 15-880-510-9487 | ickly regular deposits. carefully regular instructions engage deposits. foxes are caref                             |
+| 1487503   | Customer#001487503 | 825996.5903 | 5398.11   | IRAN         | orychjo, O6c                        | 20-271-234-4401 | ccounts sleep carefully. furiously pending packages boost slyly after the quickly regular requests. pinto beans fro |
+| 1461247   | Customer#001461247 | 775992.0820 | 3205.93   | SAUDI ARABIA | jQZKjwNqttmC0BohJoGA4U              | 30-137-949-5375 | atterns sleep blithely. fluffily pending accounts sleep furiously from the ironic deposits! blithely even i         |
+| 1316338   | Customer#001316338 | 765063.7003 | 8682.95   | INDIA        | bfz3FH  qaULsV7oiCn66z6ezkZBpcl     | 18-793-610-3832 | equests. regular, even excuses doze slyly against the blithely even accounts. slyly regular dinos                   |
+| 817849    | Customer#000817849 | 737664.7232 | -380.30   | MOROCCO      | 7gz7HbNoVNSbv23trx                  | 25-111-847-3201 | fully special accounts wake slyly among the sheaves. permanently brave requests use furiously amon                  |
+| 1335394   | Customer#001335394 | 731259.8675 | 3978.53   | VIETNAM      | mdNmISybrVNaIPSp                    | 31-760-271-2302 |  slyly even instructions. carefully silent ideas                                                                    |
+| 102358    | Customer#000102358 | 715001.8825 | 3564.90   | BRAZIL       | YpDpv0sP14F5xMUQbkDV,XGcMJypFV6jH   | 12-941-212-8350 | y slyly regular multipliers. furiously regular deposits nag final excuses. slyly special accounts haggle re         |
+| 1432624   | Customer#001432624 | 713512.6431 | 205.08    | FRANCE       | NTCV7qvJ0PgcULFci,VdAB,0ZbSEZRdnnz, | 16-550-232-2774 | ctions use regular requests. quickly bold somas cajole at the c                                                     |
++-----------+--------------------+-------------+-----------+--------------+-------------------------------------+-----------------+---------------------------------------------------------------------------------------------------------------------+
