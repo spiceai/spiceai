@@ -45,6 +45,8 @@ use std::time::{Duration, Instant};
 use arrow::array::RecordBatch;
 use futures::future::try_join_all;
 use test_framework::anyhow::{self, Result};
+use test_framework::metrics::QueryStatus;
+use test_framework::opentelemetry::KeyValue;
 use test_framework::spiced::{SpicedInstance, StartRequest};
 
 use super::datasets::DatasetType;
@@ -499,11 +501,33 @@ async fn run_benchmark_from_snapshot(
         .await?;
 
     // Run verification if requested
-    let verification_passed = if args.verify {
-        let report = verification::verify_tpch_queries(&spiced_instance).await?;
-        report.all_passed()
+    let (mut spiced_instance, verification_passed) = if args.verify {
+        let verification_result =
+            verification::run_verification(spiced_instance, 1, args.scale_factor).await?;
+
+        // Emit per-query metrics
+        for query in &verification_result.metrics.metrics {
+            let query_name = &query.query_name;
+            let row_count = verification_result.row_counts.get(query_name).unwrap_or(&0);
+            let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
+
+            let status: u64 = u64::from(matches!(&query.query_status, QueryStatus::Passed));
+
+            crate::metrics::QUERY_STATUS.record(status, &attributes);
+            crate::metrics::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
+            crate::metrics::MIN_DURATION.record(query.min_duration_ms, &attributes);
+            crate::metrics::MAX_DURATION.record(query.max_duration_ms, &attributes);
+            crate::metrics::ITERATIONS
+                .record(query.iterations.try_into().unwrap_or(u64::MAX), &attributes);
+            crate::metrics::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
+            crate::metrics::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
+            crate::metrics::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
+            crate::metrics::ROW_COUNT.record((*row_count).try_into().unwrap_or(u64::MAX), &attributes);
+        }
+
+        (verification_result.spiced_instance, verification_result.all_passed)
     } else {
-        true
+        (spiced_instance, true)
     };
 
     // Calculate throughput
