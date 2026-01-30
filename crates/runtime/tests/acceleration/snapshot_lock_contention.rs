@@ -20,6 +20,16 @@ limitations under the License.
 //! These tests measure the lock contention effects when snapshots are created
 //! while queries and inserts are running concurrently.
 
+// Allow test-specific lint exceptions for metrics calculations
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::unused_self)]
+#![allow(clippy::wrong_self_convention)]
+#![allow(clippy::trivially_copy_pass_by_ref)]
+
 use std::{
     path::PathBuf,
     sync::{
@@ -463,7 +473,7 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
     let baseline_results: Vec<ContentionMetrics> = join_all(baseline_handles)
         .await
         .into_iter()
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
 
     let mut query_baseline = ContentionMetrics::new();
@@ -518,7 +528,7 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
     let load_results: Vec<ContentionMetrics> = join_all(load_handles)
         .await
         .into_iter()
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
 
     let snapshot_metrics = snapshot_handle.await?;
