@@ -59,6 +59,7 @@ pub mod spice_sys;
 pub mod upsert_dedup;
 
 pub(crate) use snapshots::validate_snapshot_paths;
+pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
 
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {

@@ -23,6 +23,8 @@ use runtime::{
 use spicepod::component::dataset::CheckAvailability;
 use std::sync::Arc;
 
+use crate::utils::register_test_connectors;
+
 async fn get_test_dataset_with_check_availability_disabled() -> Result<Dataset, anyhow::Error> {
     let file_path = if std::fs::exists("./tests/file/datatypes.parquet")? {
         "./tests/file/datatypes.parquet"
@@ -79,6 +81,8 @@ async fn get_test_dataset_with_acceleration() -> Result<Dataset, anyhow::Error> 
 
 #[tokio::test]
 async fn dataset_check_availability_register_skipped_when_disabled() -> Result<(), anyhow::Error> {
+    register_test_connectors().await;
+
     // Create a test runtime to get DataFusion instance
     let app = AppBuilder::new("dataset_check_availability_test").build();
     let rt = Runtime::builder().with_app(app).build().await;
@@ -103,6 +107,8 @@ async fn dataset_check_availability_register_skipped_when_disabled() -> Result<(
 #[tokio::test]
 async fn dataset_check_availability_register_skipped_when_accelerated() -> Result<(), anyhow::Error>
 {
+    register_test_connectors().await;
+
     // Create a test runtime to get DataFusion instance
     let app = AppBuilder::new("dataset_check_availability_test").build();
     let rt = Runtime::builder().with_app(app).build().await;

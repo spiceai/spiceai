@@ -42,7 +42,7 @@ use tonic::transport::Channel;
 
 use crate::{
     configure_test_datafusion,
-    utils::{runtime_ready_check, wait_until_true},
+    utils::{register_test_connectors, runtime_ready_check, wait_until_true},
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -62,6 +62,8 @@ async fn start_spice_test_app(
     let metrics_port: u16 = http_port + 2;
 
     tracing::debug!("Ports: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}");
+
+    register_test_connectors().await;
 
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))

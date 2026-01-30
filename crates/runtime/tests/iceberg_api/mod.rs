@@ -26,7 +26,7 @@ use spicepod::component::dataset::Dataset;
 
 use crate::{
     init_tracing,
-    utils::{test_request_context, wait_until_true},
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -44,6 +44,7 @@ async fn test_iceberg_api_get_table_schema() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

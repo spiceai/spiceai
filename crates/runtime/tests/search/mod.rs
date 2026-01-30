@@ -33,7 +33,6 @@ limitations under the License.
 
 use anyhow::Context;
 use app::{App, AppBuilder};
-use arrow::array::RecordBatch;
 use futures::TryStreamExt;
 use http::{
     HeaderValue,
@@ -65,7 +64,10 @@ use crate::{
     DEFAULT_TRACING_MODELS, configure_test_datafusion, init_tracing,
     models::{create_api_bindings_config, http_post, search::replace_s3_vector_index_names},
     search::tables::{SearchTable, enrich_table},
-    utils::{init_tracing_with_task_history, runtime_ready_check, test_request_context},
+    utils::{
+        init_tracing_with_task_history, register_test_connectors, runtime_ready_check,
+        test_request_context,
+    },
 };
 
 pub mod megascience;
@@ -515,6 +517,7 @@ fn normalize_search_response(mut json: Value) -> String {
 }
 
 pub async fn start_app(app: App) -> Result<Config, anyhow::Error> {
+    register_test_connectors().await;
     configure_test_datafusion();
     let api_config = create_api_bindings_config();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -553,6 +556,7 @@ pub(crate) async fn run_search(
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             let client = spiceai::ClientBuilder::new()
                 .flight_url(format!("http://{}", api_config.flight_bind_address).as_str())
+                .http_url(http_base_url.as_str())
                 .build()
                 .await
                 .unwrap_or_else(|_| {
@@ -610,9 +614,11 @@ pub(crate) async fn run_search(
                         // This is okay to fail. Some times SQL plans cannot be prepared (e.g. FTS on a vector index).
                         // Do not return error, but make a snapshot to ensure if this changes in future, we can track it.
                         let mut disp =
-                            if let Ok(c) = client.query(format!("EXPLAIN {sql}").as_str()).await {
-                                let z = c.try_collect::<Vec<RecordBatch>>().await?;
-                                arrow::util::pretty::pretty_format_batches(&z)?.to_string()
+                            if let Ok(stream) = client.sql(format!("EXPLAIN {sql}").as_str()).await {
+                                match stream.try_collect::<Vec<arrow::record_batch::RecordBatch>>().await {
+                                    Ok(c) => arrow::util::pretty::pretty_format_batches(&c)?.to_string(),
+                                    Err(e) => format!("Could not prepare EXPLAIN plan: {e}")
+                                }
                             } else {
                                 format!("Could not prepare EXPLAIN plan. SQL error: {resp}")
                             };

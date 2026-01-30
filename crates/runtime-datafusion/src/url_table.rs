@@ -70,9 +70,13 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion_catalog::UrlTableFactory;
 use parking_lot::RwLock;
+use url::Url;
 
 /// Supported URL schemes for direct object store queries.
 const SUPPORTED_SCHEMES: &[&str] = &["s3", "abfs", "abfss", "http", "https", "gs", "gcs"];
+
+/// Azure URL schemes that require an account name.
+const AZURE_SCHEMES: &[&str] = &["abfs", "abfss"];
 
 /// Checks if a table name looks like a URL that can be resolved to an object store table.
 ///
@@ -88,6 +92,49 @@ fn is_url_like(name: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Validates that an Azure URL contains the required account name.
+///
+/// Azure URLs must include the storage account in one of these formats:
+/// - `abfss://container@account.dfs.core.windows.net/path/`
+/// - `abfss://container/#account=myaccount` (via URL fragment)
+///
+/// Returns an error if the URL is missing the account name.
+fn validate_azure_url(url_str: &str) -> DFResult<()> {
+    let Ok(url) = Url::parse(url_str) else {
+        return Ok(());
+    };
+
+    if !AZURE_SCHEMES.contains(&url.scheme()) {
+        return Ok(());
+    }
+
+    // Check if account is provided via URL fragment parameter
+    // Fragment format: #account=myaccount or #key1=value1&account=myaccount
+    if url.fragment().is_some_and(|fragment| {
+        fragment.split('&').any(|param| {
+            param
+                .split_once('=')
+                .is_some_and(|(key, _)| key == "account")
+        })
+    }) {
+        return Ok(());
+    }
+
+    // Check if account is in the host part of the URL
+    // Format: abfss://container@account.dfs.core.windows.net/path/
+    // In this format, the container is the "username" and the host contains the account
+    if let Some(host) = url.host_str() {
+        // If there's a username (container@host format), the host contains the account
+        if !url.username().is_empty() && !host.is_empty() {
+            return Ok(());
+        }
+    }
+
+    Err(DataFusionError::Plan(format!(
+        "Azure URL '{url_str}' is missing the storage account name. Valid formats: abfss://container@account.dfs.core.windows.net/path/ or abfss://container/#account=myaccount. Alternatively, set the AZURE_STORAGE_ACCOUNT environment variable."
+    )))
 }
 
 /// A factory that creates [`ListingTable`] providers from object store URLs.
@@ -148,11 +195,13 @@ impl UrlTableFactory for SpiceUrlTableFactory {
             return Ok(None);
         }
 
+        // Validate Azure URLs have the required account name
+        validate_azure_url(url)?;
+
         // Parse the URL
-        let Ok(table_url) = ListingTableUrl::parse(url) else {
-            tracing::debug!("Failed to parse URL as ListingTableUrl: {url}");
-            return Ok(None);
-        };
+        let table_url = ListingTableUrl::parse(url).map_err(|e| {
+            DataFusionError::Plan(format!("Failed to parse URL table '{url}': {e}"))
+        })?;
 
         // Get the session state for schema inference
         // We need to clone it because we can't hold RwLockReadGuard across await points
@@ -173,46 +222,39 @@ impl UrlTableFactory for SpiceUrlTableFactory {
         }; // Lock is dropped here
 
         // Infer options and schema from the URL
-        let config = match ListingTableConfig::new(table_url)
+        let config = ListingTableConfig::new(table_url)
             .infer_options(&state)
             .await
-        {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                tracing::debug!("Failed to infer options for URL {url}: {e}");
-                return Ok(None);
-            }
-        };
+            .map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "Failed to access URL table '{url}': {e}. Verify the path exists and credentials are configured."
+                ))
+            })?;
 
         // Infer partitions from the path (e.g., year=2023/month=01/)
-        let config = match config.infer_partitions_from_path(&state).await {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                tracing::debug!("Failed to infer partitions for URL {url}: {e}");
-                return Ok(None);
-            }
-        };
+        let config = config
+            .infer_partitions_from_path(&state)
+            .await
+            .map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "Failed to infer partitions for URL table '{url}': {e}"
+                ))
+            })?;
 
         // Infer schema from the files
-        let config = match config.infer_schema(&state).await {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                tracing::debug!("Failed to infer schema for URL {url}: {e}");
-                return Ok(None);
-            }
-        };
+        let config = config.infer_schema(&state).await.map_err(|e| {
+            DataFusionError::Plan(format!(
+                "Failed to infer schema for URL table '{url}': {e}. Verify the path contains valid data files."
+            ))
+        })?;
 
         // Create the listing table
-        match ListingTable::try_new(config) {
-            Ok(table) => {
-                tracing::debug!("Created ListingTable for URL: {url}");
-                Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
-            }
-            Err(e) => {
-                tracing::debug!("Failed to create ListingTable for URL {url}: {e}");
-                Ok(None)
-            }
-        }
+        let table = ListingTable::try_new(config).map_err(|e| {
+            DataFusionError::Plan(format!("Failed to create table for URL '{url}': {e}"))
+        })?;
+
+        tracing::debug!("Created ListingTable for URL: {url}");
+        Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
     }
 }
 
@@ -546,5 +588,99 @@ mod tests {
 
         let result = factory.try_new("/local/path/file.parquet").await;
         assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn test_validate_azure_url_valid_formats() {
+        // Valid Azure URLs with account in host
+        validate_azure_url("abfss://container@account.dfs.core.windows.net/path/file.parquet")
+            .expect("should accept valid Azure URL with account in host");
+        validate_azure_url("abfss://container@myaccount.dfs.core.windows.net/")
+            .expect("should accept valid Azure URL with account in host");
+        validate_azure_url("abfs://container@account.dfs.core.windows.net/")
+            .expect("should accept valid Azure URL with account in host");
+        validate_azure_url("abfss://container@storageaccount/path/")
+            .expect("should accept valid Azure URL with account in host");
+
+        // Valid Azure URLs with account in fragment
+        validate_azure_url("abfss://container/#account=myaccount")
+            .expect("should accept Azure URL with account in fragment");
+        validate_azure_url("abfss://container/path/#account=myaccount")
+            .expect("should accept Azure URL with account in fragment");
+        validate_azure_url("abfss://container/#account=myaccount&other=value")
+            .expect("should accept Azure URL with account in fragment");
+        validate_azure_url("abfss://container/#other=value&account=myaccount")
+            .expect("should accept Azure URL with account in fragment");
+
+        // Non-Azure URLs should always pass (they have different validation)
+        validate_azure_url("s3://bucket/path/").expect("should accept non-Azure URL");
+        validate_azure_url("gs://bucket/path/").expect("should accept non-Azure URL");
+        validate_azure_url("https://example.com/data.parquet")
+            .expect("should accept non-Azure URL");
+    }
+
+    #[test]
+    fn test_validate_azure_url_missing_account() {
+        // Azure URLs without account should fail
+        let result = validate_azure_url("abfss://container/path/file.parquet");
+        assert!(result.is_err());
+        let err = result.expect_err("should fail");
+        assert!(
+            err.to_string().contains("missing the storage account name"),
+            "Error should mention missing account: {err}"
+        );
+
+        let result = validate_azure_url("abfs://container/");
+        assert!(result.is_err());
+
+        let result = validate_azure_url("abfss://mycontainer/data/");
+        assert!(result.is_err());
+
+        // Empty fragment should still fail
+        let result = validate_azure_url("abfss://container/#");
+        assert!(result.is_err());
+
+        // Fragment without account key should fail
+        let result = validate_azure_url("abfss://container/#other=value");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_azure_url_error_message_contains_guidance() {
+        let result = validate_azure_url("abfss://container/path/");
+        let err = result.expect_err("should fail");
+        let err_msg = err.to_string();
+
+        // Error message should contain helpful guidance
+        assert!(
+            err_msg.contains("abfss://container@account.dfs.core.windows.net"),
+            "Should show full URL format example: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("#account="),
+            "Should show fragment format: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("AZURE_STORAGE_ACCOUNT"),
+            "Should mention environment variable: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_factory_try_new_azure_missing_account_returns_error() {
+        let factory = SpiceUrlTableFactory::new();
+
+        // Azure URL without account should return an error (not Ok(None))
+        let result = factory.try_new("abfss://container/path/file.parquet").await;
+        assert!(
+            result.is_err(),
+            "Should return error for Azure URL missing account"
+        );
+
+        let err = result.expect_err("should be an error");
+        assert!(
+            err.to_string().contains("missing the storage account name"),
+            "Error should mention missing account: {err}"
+        );
     }
 }

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::acceleration::get_params;
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 #[cfg(feature = "duckdb")]
@@ -41,6 +41,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
     use duckdb::AccessMode;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -91,9 +92,16 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
             let view = ViewBuilder::try_from(view_copy).expect("to parse view")
                 .build_with(Arc::clone(&rt), Arc::new(app_copy));
 
-            // Ensure Checkpoint is created after initial view load
+            // Ensure Checkpoint is created after initial view load (poll since checkpoint creation is async)
             let checkpoint = DatasetCheckpoint::try_new(&view, OpenOption::OpenExisting).await.expect("Failed to create view checkpoint");
-            assert!(checkpoint.exists().await, "Checkpoint does not exist");
+            let checkpoint_timeout = std::time::Duration::from_secs(30);
+            let checkpoint_start = std::time::Instant::now();
+            while !checkpoint.exists().await {
+                if checkpoint_start.elapsed() > checkpoint_timeout {
+                    return Err(anyhow::anyhow!("Timed out waiting for checkpoint to exist"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             let last_checkpoint_time = checkpoint
                 .last_checkpoint_time()
                 .await
@@ -181,6 +189,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_view_dependency_ordering() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -291,6 +300,7 @@ async fn test_view_dependency_ordering() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_view_depending_on_dataset() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -387,6 +397,7 @@ async fn test_view_depending_on_dataset() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_multiple_views_same_dataset() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -478,6 +489,7 @@ async fn test_multiple_views_same_dataset() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

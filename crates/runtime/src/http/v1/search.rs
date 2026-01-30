@@ -50,7 +50,7 @@ struct SearchResponse {
     post,
     path = "/v1/search",
     operation_id = "post_search",
-    tag = "SQL",
+    tag = "Search",
     request_body(
         description = "Search request parameters",
         content((

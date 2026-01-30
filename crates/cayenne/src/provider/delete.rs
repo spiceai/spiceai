@@ -58,6 +58,60 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+// ============================================================================
+// PK Visibility Helpers
+// ============================================================================
+//
+// These helper functions determine whether a row is visible (not deleted) based on
+// the deletion and insert caches. A row is visible if:
+// - It was never deleted (not in deletion cache), OR
+// - It was deleted but re-inserted with a higher sequence number (upsert)
+//
+// The sequence-based ordering follows Iceberg semantics where:
+// - `delete_sequence` records when a PK was marked for deletion
+// - `insert_sequence` records when a PK was re-inserted (upsert)
+// - If `insert_sequence > delete_sequence`, the row is visible (re-inserted after delete)
+
+/// Check if a row with the given Int64 PK is visible (not deleted or re-inserted after deletion).
+///
+/// Returns `true` if the row should be visible in queries.
+#[inline]
+pub(crate) fn is_pk_visible_i64(
+    pk: i64,
+    deleted_pks: &HashMap<i64, i64>,
+    insert_records: Option<&HashMap<i64, i64>>,
+) -> bool {
+    match deleted_pks.get(&pk) {
+        None => true, // Not deleted, row is visible
+        Some(&delete_seq) => {
+            // Deleted - check if re-inserted with higher sequence
+            insert_records
+                .and_then(|cache| cache.get(&pk))
+                .is_some_and(|&insert_seq| insert_seq > delete_seq)
+        }
+    }
+}
+
+/// Check if a row with the given byte key is visible (not deleted or re-inserted after deletion).
+///
+/// Returns `true` if the row should be visible in queries.
+#[inline]
+pub(crate) fn is_pk_visible_row_key(
+    key: &[u8],
+    deleted_keys: &HashMap<Box<[u8]>, i64>,
+    insert_records: Option<&HashMap<Box<[u8]>, i64>>,
+) -> bool {
+    match deleted_keys.get(key) {
+        None => true, // Not deleted, row is visible
+        Some(&delete_seq) => {
+            // Deleted - check if re-inserted with higher sequence
+            insert_records
+                .and_then(|cache| cache.get(key))
+                .is_some_and(|&insert_seq| insert_seq > delete_seq)
+        }
+    }
+}
+
 /// Execution plan that filters out deleted rows based on deletion vectors.
 ///
 /// This wraps another execution plan and removes rows whose positions
@@ -515,26 +569,14 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     };
 
                     // Build keep mask by checking each row's key against deleted map
-                    // A row is deleted only if:
-                    // 1. Key is in deleted map, AND
-                    // 2. Either key is not in insert_records, OR insert_seq < delete_seq
                     let mut keep_mask = Vec::with_capacity(batch_size);
                     for row in &rows {
                         let key: &[u8] = row.as_ref();
-                        let keep = if let Some(&delete_seq) = self.deleted_row_keys.get(key) {
-                            // Key is in deletions - check if it was re-inserted with higher sequence
-                            if let Some(&insert_seq) = self.insert_records.get(key) {
-                                // Keep if insert happened after delete
-                                insert_seq > delete_seq
-                            } else {
-                                // No re-insert, row is deleted
-                                false
-                            }
-                        } else {
-                            // Not in deletions, keep the row
-                            true
-                        };
-                        keep_mask.push(keep);
+                        keep_mask.push(is_pk_visible_row_key(
+                            key,
+                            &self.deleted_row_keys,
+                            Some(&self.insert_records),
+                        ));
                     }
 
                     // Count how many rows we're keeping
@@ -773,27 +815,14 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                             })?;
 
                     // Build keep mask by checking each row's PK value against deleted map
-                    // A row is deleted only if:
-                    // 1. PK is in deleted map, AND
-                    // 2. Either PK is not in insert_records, OR insert_seq < delete_seq
                     let mut keep_mask = Vec::with_capacity(batch_size);
                     for i in 0..batch_size {
                         let pk_value = pk_array.value(i);
-                        let keep = if let Some(&delete_seq) = self.deleted_pk_values.get(&pk_value)
-                        {
-                            // PK is in deletions - check if it was re-inserted with higher sequence
-                            if let Some(&insert_seq) = self.insert_records.get(&pk_value) {
-                                // Keep if insert happened after delete
-                                insert_seq > delete_seq
-                            } else {
-                                // No re-insert, row is deleted
-                                false
-                            }
-                        } else {
-                            // Not in deletions, keep the row
-                            true
-                        };
-                        keep_mask.push(keep);
+                        keep_mask.push(is_pk_visible_i64(
+                            pk_value,
+                            &self.deleted_pk_values,
+                            Some(&self.insert_records),
+                        ));
                     }
 
                     // Count how many rows we're keeping

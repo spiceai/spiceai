@@ -99,7 +99,7 @@ enum Commands {
     /// Refresh a dataset
     Refresh(refresh::RefreshArgs),
 
-    /// Upgrades the Spice runtime to the latest or specified version
+    /// Upgrades the Spice CLI and runtime to the latest or specified version
     Upgrade(upgrade::UpgradeArgs),
 
     /// Lists workers loaded by the Spice runtime
@@ -176,7 +176,9 @@ fn run_cli(cli: Cli) -> Result<()> {
     // Execute the command
     match cli.command {
         Commands::Version(args) => {
-            version::execute(&ctx, &args)?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
+            rt.block_on(version::execute(&ctx, &args))?;
         }
         Commands::Status(args) => {
             let rt = tokio::runtime::Runtime::new()

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::configure_test_datafusion;
 use crate::{
     RecordBatch, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
@@ -63,6 +63,7 @@ fn make_test_query(table_name: &str) -> String {
 #[tokio::test]
 async fn duckdb_from_functions() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -163,6 +164,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
 #[tokio::test]
 async fn duckdb_order_by_special_cases() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -239,6 +241,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
 #[tokio::test]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -366,6 +369,7 @@ async fn test_duckdb_settings_persist() -> Result<(), String> {
     use std::collections::HashMap;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -510,6 +514,7 @@ async fn test_duckdb_all_settings() -> Result<(), String> {
     use std::collections::HashMap;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     Box::pin(test_request_context()
         .scope(async {

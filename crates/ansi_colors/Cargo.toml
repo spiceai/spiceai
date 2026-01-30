@@ -1,0 +1,11 @@
+[package]
+description = "ANSI Colors Library"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "ansi_colors"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

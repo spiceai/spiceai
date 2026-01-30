@@ -51,7 +51,7 @@ use tokio::sync::RwLock;
 use crate::{
     Partition,
     creator::PartitionCreator,
-    creator::filename::encode_key,
+    creator::filename::encode_composite_key,
     expression::{PartitionedBy, validate_scalar_compatibility},
     insert::{DefaultInsertStrategy, InsertStrategy, PartitionContext},
 };
@@ -60,10 +60,8 @@ pub mod pruning;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(
-        "Only a single 'partition_by' expression is supported, but {num_partition_by} were given."
-    ))]
-    PartitionByViolation { num_partition_by: usize },
+    #[snafu(display("At least one 'partition_by' expression is required, but none were given."))]
+    PartitionByRequired,
     #[snafu(display("Creating partition failed: {source}"))]
     CreatingPartition { source: super::creator::Error },
     #[snafu(display("Validating expressions failed: {source}"))]
@@ -72,59 +70,68 @@ pub enum Error {
     SchemaConversion { source: DataFusionError },
     #[snafu(display("Expected array from partition expression, got scalar"))]
     InvalidPartitionExpression,
+    #[snafu(display(
+        "Partition has {actual} values but expected {expected} (one per partition_by expression)"
+    ))]
+    PartitionValueCountMismatch { expected: usize, actual: usize },
 }
 
-pub(crate) type ScalarValueString = String;
+/// Composite partition key string, used as `HashMap` key.
+/// For a single partition expression, this is just the encoded value (e.g., "us-east-1").
+/// For multiple partition expressions, this is a path-like string (e.g., "2025/10/15").
+pub(crate) type CompositePartitionKey = String;
 
 #[derive(Debug)]
 pub struct PartitionTableProvider {
     creator: Arc<dyn PartitionCreator>,
-    partition_by: PartitionedBy,
-    partitions: Arc<RwLock<HashMap<ScalarValueString, Partition>>>,
+    /// The partition expressions. For hierarchical partitions like
+    /// `partition_by: [year, month]`, this contains all expressions in order.
+    partition_by: Vec<PartitionedBy>,
+    partitions: Arc<RwLock<HashMap<CompositePartitionKey, Partition>>>,
     schema: SchemaRef,
     insert_strategy: Arc<dyn InsertStrategy>,
 }
 
 impl PartitionTableProvider {
-    /// Checks if a filter expression contains or references the partition expression.
+    /// Checks if a filter expression contains or references any of the partition expressions.
     /// This is used to identify filters that can be used for partition pruning.
-    fn filter_contains_partition_expr(filter: &Expr, partition_expr: &Expr) -> bool {
+    fn filter_contains_any_partition_expr(
+        filter: &Expr,
+        partition_exprs: &[PartitionedBy],
+    ) -> bool {
         use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 
-        // Check if filter contains the partition expression
         let mut contains = false;
         let _ = filter.apply(|expr| {
-            if expr == partition_expr {
-                contains = true;
-                Ok(TreeNodeRecursion::Stop)
-            } else {
-                Ok(TreeNodeRecursion::Continue)
+            for p in partition_exprs {
+                if expr == &p.expression {
+                    contains = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
             }
+            Ok(TreeNodeRecursion::Continue)
         });
         contains
     }
 
     /// Creates a new [`PartitionTableProvider`] that partitions the data using
-    /// the first expression in `partition_by`.
+    /// the given partition expressions.
+    ///
+    /// For hierarchical partitioning (e.g., year/month/day), pass multiple expressions
+    /// in the order they should be applied.
     ///
     /// # Errors
-    /// This function will return an Error when the `partition_by` expression
-    /// validation fails.
+    /// This function will return an Error when:
+    /// - No partition expressions are provided
+    /// - Partition expression validation fails
+    /// - Existing partitions have incompatible values
     pub async fn new(
         creator: Arc<dyn PartitionCreator>,
-        mut partition_by: Vec<PartitionedBy>,
+        partition_by: Vec<PartitionedBy>,
         schema: SchemaRef,
     ) -> Result<Self, Error> {
-        let num_partition_by = partition_by.len();
-        if num_partition_by > 1 {
-            tracing::warn!(
-                "Multiple 'partition_by' expressions are not yet supported. Only the last expression will be used for partitioning."
-            );
-        }
+        ensure!(!partition_by.is_empty(), PartitionByRequiredSnafu);
 
-        let partition_by = partition_by
-            .pop()
-            .context(PartitionByViolationSnafu { num_partition_by })?;
         let df_schema = DFSchema::try_from(Arc::clone(&schema)).context(SchemaConversionSnafu)?;
 
         let partitions = creator
@@ -135,24 +142,33 @@ impl PartitionTableProvider {
         let partitions: Result<HashMap<_, _>, Error> = partitions
             .into_iter()
             .map(|p| {
-                validate_scalar_compatibility(
-                    &partition_by.expression,
-                    &p.partition_value,
-                    &df_schema,
-                )
-                .context(ValidatingExpressionsSnafu)?;
-                let key = encode_key(&p.partition_value).map_err(|e| Error::CreatingPartition {
-                    source: crate::creator::Error::CreatePartition {
-                        source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                    },
+                // Validate that partition has the correct number of values
+                ensure!(
+                    p.partition_values.len() == partition_by.len(),
+                    PartitionValueCountMismatchSnafu {
+                        expected: partition_by.len(),
+                        actual: p.partition_values.len(),
+                    }
+                );
+
+                // Validate each partition value is compatible with its expression
+                for (expr, value) in partition_by.iter().zip(p.partition_values.iter()) {
+                    validate_scalar_compatibility(&expr.expression, value, &df_schema)
+                        .context(ValidatingExpressionsSnafu)?;
+                }
+
+                let key = encode_composite_key(&p.partition_values).map_err(|e| {
+                    Error::CreatingPartition {
+                        source: crate::creator::Error::CreatePartition {
+                            source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                        },
+                    }
                 })?;
                 Ok((key, p))
             })
             .collect();
 
-        let partitions = partitions?;
-
-        let partitions = Arc::new(RwLock::new(partitions));
+        let partitions = Arc::new(RwLock::new(partitions?));
 
         Ok(Self {
             creator,
@@ -168,6 +184,14 @@ impl PartitionTableProvider {
     pub fn with_insert_strategy(mut self, insert_strategy: Arc<dyn InsertStrategy>) -> Self {
         self.insert_strategy = insert_strategy;
         self
+    }
+
+    /// Collects all partition column references from all partition expressions.
+    fn all_partition_columns(&self) -> std::collections::HashSet<&datafusion::common::Column> {
+        self.partition_by
+            .iter()
+            .flat_map(|p| p.expression.column_refs())
+            .collect()
     }
 }
 
@@ -205,13 +229,14 @@ impl TableProvider for PartitionTableProvider {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         // Split filters into partition filters (for pruning) and data filters (for partition scans)
         // NOTE: Filters can be BOTH partition filters AND data filters for transform partitions
-        let partition_columns = self.partition_by.expression.column_refs();
+        let partition_columns = self.all_partition_columns();
 
         // Pre-compute column references for all filters to avoid repeated expression tree traversals
         let filter_columns_cache: Vec<_> =
             filters.iter().map(|filter| filter.column_refs()).collect();
 
         // Collect partition filters (used for pruning)
+        // A filter can prune partitions if it involves ANY of the partition columns
         let partition_filters: Vec<_> = filters
             .iter()
             .cloned()
@@ -220,7 +245,7 @@ impl TableProvider for PartitionTableProvider {
                 // A filter is a partition filter (for pruning) if:
                 // 1. It has no column references (constant expression like WHERE true), OR
                 // 2. All its column references are in the partition expression columns, OR
-                // 3. The filter directly involves the partition expression itself
+                // 3. The filter directly involves any partition expression itself
                 if filter_columns.is_empty() {
                     return Some(filter);
                 }
@@ -232,8 +257,8 @@ impl TableProvider for PartitionTableProvider {
                     return Some(filter);
                 }
 
-                // Check if the filter contains the partition expression
-                if Self::filter_contains_partition_expr(&filter, &self.partition_by.expression) {
+                // Check if the filter contains any partition expression
+                if Self::filter_contains_any_partition_expr(&filter, &self.partition_by) {
                     return Some(filter);
                 }
 
@@ -242,22 +267,33 @@ impl TableProvider for PartitionTableProvider {
             .collect();
 
         // Collect data filters (applied to partition scans)
-        // Exclude filters that are simple column filters matching the partition expression exactly
+        // Exclude filters that are simple column filters matching a simple partition expression exactly
         // For example, with partition_by region:
         //   - WHERE region = 'us-east-1' should NOT be a data filter (partition handles it)
         // But with partition_by bucket(3, user_id):
         //   - WHERE user_id = 100 SHOULD be a data filter (partition only determines bucket)
+        let simple_partition_cols: std::collections::HashSet<_> = self
+            .partition_by
+            .iter()
+            .filter_map(|p| {
+                if let Expr::Column(col) = &p.expression {
+                    Some(col)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let data_filters: Vec<_> = filters
             .iter()
             .zip(filter_columns_cache.iter())
             .filter(|(_filter, filter_cols)| {
-                // If the partition expression is just a simple column reference,
-                // and this filter is on that exact column, exclude it from data filters
-                if let Expr::Column(partition_col) = &self.partition_by.expression {
-                    // Check if this filter references only the partition column
-                    if filter_cols.len() == 1 && filter_cols.iter().next() == Some(&partition_col) {
-                        return false; // Exclude from data filters
-                    }
+                // If this filter references only a simple partition column, exclude it
+                if filter_cols.len() == 1
+                    && let Some(col) = filter_cols.iter().next()
+                    && simple_partition_cols.contains(col)
+                {
+                    return false; // Exclude from data filters
                 }
                 // For all other cases (transform expressions, multiple columns, etc.), keep as data filter
                 true
@@ -268,14 +304,29 @@ impl TableProvider for PartitionTableProvider {
         let partitions = self.partitions.read().await;
         let mut plans = Vec::with_capacity(partitions.len());
         for partition in partitions.values() {
-            if prune_partition(
-                &partition_filters,
-                &self.partition_by.expression,
-                &partition.partition_value,
-                &self.schema,
-            )? {
+            // Check if this partition should be pruned based on ANY partition expression
+            let mut should_prune = false;
+            for (idx, partition_expr) in self.partition_by.iter().enumerate() {
+                // Get the partition value for this expression
+                let partition_value = partition.partition_values.get(idx).ok_or_else(|| {
+                    DataFusionError::Internal(format!("Partition missing value at index {idx}"))
+                })?;
+
+                if prune_partition(
+                    &partition_filters,
+                    &partition_expr.expression,
+                    partition_value,
+                    &self.schema,
+                )? {
+                    should_prune = true;
+                    break;
+                }
+            }
+
+            if should_prune {
                 continue;
             }
+
             let plan = partition
                 .table_provider
                 .scan(state, projection, &data_filters, limit)
@@ -400,7 +451,7 @@ impl DeletionSink for PartitionedDeletionSink {
                 }
             } else {
                 tracing::warn!(
-                    partition_value = %partition.partition_value,
+                    partition_values = ?partition.partition_values,
                     "Partition table provider does not support deletion. Skipping."
                 );
             }
@@ -602,7 +653,7 @@ mod tests {
     impl PartitionCreator for MockCreator {
         async fn create_partition(
             &self,
-            _partition_value: ScalarValue,
+            _partition_values: Vec<ScalarValue>,
         ) -> Result<Partition, super::super::creator::Error> {
             unreachable!("create_partition not needed for scan tests")
         }
@@ -614,7 +665,7 @@ mod tests {
             Ok(data
                 .iter()
                 .map(|(val, provider)| Partition {
-                    partition_value: val.clone(),
+                    partition_values: vec![val.clone()],
                     table_provider: Arc::clone(provider),
                 })
                 .collect())
