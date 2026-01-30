@@ -35,7 +35,8 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::flight::Service as SpiceFlightService;
 
-type BoxedFlightStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
+type BoxedFlightStream<T> =
+    Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 /// A composite Flight service that routes between Ballista and Spice Flight services.
 ///
@@ -75,11 +76,11 @@ impl FlightService for CompositeFlightService {
     type ListActionsStream = BoxedFlightStream<ActionType>;
     type DoExchangeStream = BoxedFlightStream<FlightData>;
 
+    // These methods are unimplemented by `BallistaFlightService`.
     async fn handshake(
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        // Route to Spice for handshake (supports session management)
         self.spice.handshake(request).await
     }
 
@@ -87,7 +88,6 @@ impl FlightService for CompositeFlightService {
         &self,
         request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        // Route to Spice (Ballista returns unimplemented)
         self.spice.list_flights(request).await
     }
 
@@ -95,7 +95,6 @@ impl FlightService for CompositeFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        // Route to Spice (Ballista returns unimplemented)
         self.spice.get_flight_info(request).await
     }
 
@@ -103,7 +102,6 @@ impl FlightService for CompositeFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<PollInfo>, Status> {
-        // Route to Spice (Ballista returns unimplemented)
         self.spice.poll_flight_info(request).await
     }
 
@@ -111,10 +109,24 @@ impl FlightService for CompositeFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        // Route to Spice (Ballista returns unimplemented)
         self.spice.get_schema(request).await
     }
 
+    async fn do_put(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoPutStream>, Status> {
+        self.spice.do_put(request).await
+    }
+
+    async fn do_exchange(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        self.spice.do_exchange(request).await
+    }
+
+    // These methods are implemented by both `BallistaFlightService` and `SpiceFlightService`.
     async fn do_get(
         &self,
         request: Request<Ticket>,
@@ -127,29 +139,12 @@ impl FlightService for CompositeFlightService {
         self.spice.do_get(request).await
     }
 
-    async fn do_put(
-        &self,
-        request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoPutStream>, Status> {
-        // Route to Spice (Ballista returns unimplemented)
-        self.spice.do_put(request).await
-    }
-
-    async fn do_exchange(
-        &self,
-        request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        // Route to Spice (Ballista returns unimplemented)
-        self.spice.do_exchange(request).await
-    }
-
     async fn do_action(
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        // Route based on action type
-        let action = request.get_ref();
-        if action.r#type == "IO_BLOCK_TRANSPORT" {
+        // Route based. BallistaFlightService only handles IO_BLOCK_TRANSPORT actions.
+        if request.get_ref().r#type == "IO_BLOCK_TRANSPORT" {
             return self.ballista.do_action(request).await;
         }
         // All other actions go to Spice
@@ -160,8 +155,12 @@ impl FlightService for CompositeFlightService {
         &self,
         request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        // Return Spice actions (which include Ballista's IO_BLOCK_TRANSPORT would need merging,
-        // but for simplicity we route to Spice since it has the richer action set)
-        self.spice.list_actions(request).await
+        let spice = self.spice.list_actions(Request::new(Empty {})).await?;
+        let ballista = self.ballista.list_actions(request).await?;
+
+        Ok(Response::new(Box::pin(futures::stream::select(
+            spice.into_inner(),
+            ballista.into_inner(),
+        )) as Self::ListActionsStream))
     }
 }
