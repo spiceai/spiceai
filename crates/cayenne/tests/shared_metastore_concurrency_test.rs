@@ -233,21 +233,21 @@ async fn test_shared_metastore_concurrent_inserts(backend: BackendType) -> TestR
         .expect("insert2 failed");
 
     // Verify data in both tables
-    let results1 = ctx
+    let batches1 = ctx
         .sql("SELECT id, name, value FROM customer1 ORDER BY id")
         .await?
         .collect()
         .await?;
-    assert_eq!(results1.len(), 1);
-    assert_eq!(results1[0].num_rows(), 2);
+    assert_eq!(batches1.len(), 1);
+    assert_eq!(batches1[0].num_rows(), 2);
 
-    let results2 = ctx
+    let batches2 = ctx
         .sql("SELECT id, name, value FROM customer2 ORDER BY id")
         .await?
         .collect()
         .await?;
-    assert_eq!(results2.len(), 1);
-    assert_eq!(results2[0].num_rows(), 2);
+    assert_eq!(batches2.len(), 1);
+    assert_eq!(batches2[0].num_rows(), 2);
 
     Ok(())
 }
@@ -464,19 +464,19 @@ async fn test_separate_sessions(backend: BackendType) -> TestResult<()> {
     verify_ctx.register_table("products1", table1 as Arc<dyn TableProvider>)?;
     verify_ctx.register_table("products2", table2 as Arc<dyn TableProvider>)?;
 
-    let results1 = verify_ctx
+    let batches1 = verify_ctx
         .sql("SELECT * FROM products1 ORDER BY id")
         .await?
         .collect()
         .await?;
-    assert_eq!(results1[0].num_rows(), 2);
+    assert_eq!(batches1[0].num_rows(), 2);
 
-    let results2 = verify_ctx
+    let batches2 = verify_ctx
         .sql("SELECT * FROM products2 ORDER BY id")
         .await?
         .collect()
         .await?;
-    assert_eq!(results2[0].num_rows(), 2);
+    assert_eq!(batches2[0].num_rows(), 2);
 
     Ok(())
 }
@@ -568,19 +568,19 @@ async fn test_separate_catalog_instances_same_db(backend: BackendType) -> TestRe
     verify_ctx.register_table("dataset1", table1 as Arc<dyn TableProvider>)?;
     verify_ctx.register_table("dataset2", table2 as Arc<dyn TableProvider>)?;
 
-    let results1 = verify_ctx
+    let batches1 = verify_ctx
         .sql("SELECT * FROM dataset1 ORDER BY id")
         .await?
         .collect()
         .await?;
-    assert_eq!(results1[0].num_rows(), 2);
+    assert_eq!(batches1[0].num_rows(), 2);
 
-    let results2 = verify_ctx
+    let batches2 = verify_ctx
         .sql("SELECT * FROM dataset2 ORDER BY id")
         .await?
         .collect()
         .await?;
-    assert_eq!(results2[0].num_rows(), 2);
+    assert_eq!(batches2[0].num_rows(), 2);
 
     Ok(())
 }
@@ -716,6 +716,8 @@ async fn test_separate_catalogs_stress(backend: BackendType) -> TestResult<()> {
 
 test_with_backends_multithreaded!(test_highly_concurrent_inserts, workers = 8);
 
+const NUM_CONCURRENT_OPS: usize = 10;
+
 /// Most aggressive concurrency test: launches many parallel insert operations at once.
 async fn test_highly_concurrent_inserts(backend: BackendType) -> TestResult<()> {
     let (_temp_dir, catalog1, catalog2, data_path) = create_separate_catalogs(backend).await?;
@@ -759,7 +761,6 @@ async fn test_highly_concurrent_inserts(backend: BackendType) -> TestResult<()> 
     ctx.register_table("highconc2", Arc::clone(&table2) as Arc<dyn TableProvider>)?;
 
     // Use a single barrier to synchronize ALL concurrent operations at once.
-    const NUM_CONCURRENT_OPS: usize = 10;
     let barrier = Arc::new(Barrier::new(NUM_CONCURRENT_OPS * 2));
 
     let mut handles = Vec::with_capacity(NUM_CONCURRENT_OPS * 2);
