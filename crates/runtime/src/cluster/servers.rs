@@ -161,8 +161,8 @@ pub async fn start_internal_cluster_server(
 /// Starts the executor Flight server for both Ballista shuffle data and Spice SQL queries.
 ///
 /// This server uses a composite Flight service that routes:
-/// - Ballista-format requests (FetchPartition, IO_BLOCK_TRANSPORT) to BallistaFlightService
-/// - SQL and FlightSQL requests to Spice's Flight service
+/// - Ballista-format requests (`FetchPartition`, `IO_BLOCK_TRANSPORT`) to `BallistaFlightService`
+/// - SQL and `FlightSQL` requests to Spice's Flight service
 ///
 /// mTLS is optional when `--allow-insecure-connections` is used.
 pub async fn start_executor_flight_server(

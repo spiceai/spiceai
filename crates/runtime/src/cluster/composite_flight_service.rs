@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! On executor nodes in distributed mode, we need to serve both:
 //! - Ballista Flight protocol for shuffle data transfer between executors
-//! - Spice Flight protocol for SQL queries and FlightSQL
+//! - Spice Flight protocol for SQL queries and `FlightSQL`
 //!
 //! This composite service inspects incoming requests and routes them to the appropriate
 //! underlying service based on the message format.
@@ -42,7 +42,7 @@ type BoxedFlightStream<T> =
 ///
 /// Request routing logic:
 /// - `do_get`: If ticket decodes as Ballista protobuf → Ballista, otherwise → Spice
-/// - `do_action`: If action type is "IO_BLOCK_TRANSPORT" → Ballista, otherwise → Spice
+/// - `do_action`: If action type is "`IO_BLOCK_TRANSPORT`" → Ballista, otherwise → Spice
 /// - `list_actions`: Combined from both services
 /// - All other methods → Spice (Ballista returns unimplemented for most)
 pub struct CompositeFlightService {
