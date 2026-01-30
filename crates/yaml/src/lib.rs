@@ -425,6 +425,26 @@ three: 3
     }
 
     #[test]
+    fn test_to_string_ends_with_newline() {
+        #[derive(Serialize)]
+        struct Config {
+            name: String,
+            value: i32,
+        }
+
+        let config = Config {
+            name: "test".into(),
+            value: 42,
+        };
+        let yaml = to_string(&config).expect("test");
+        eprintln!("YAML repr: {yaml:?}");
+        assert!(
+            yaml.ends_with('\n'),
+            "YAML output should end with newline for safe file appending"
+        );
+    }
+
+    #[test]
     fn test_to_string_sequence() {
         let vec = vec![1, 2, 3];
         let yaml = to_string(&vec).expect("should serialize vec");
@@ -488,6 +508,69 @@ three: 3
         let yaml = to_string(&original).expect("should serialize");
         let parsed: Config = from_str(&yaml).expect("should parse back");
         assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_nested_struct_with_optional_fields() {
+        // Test struct layout similar to dataset configuration
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct AccelerationSpec {
+            enabled: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refresh_check_interval: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refresh_mode: Option<String>,
+        }
+
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct DatasetSpec {
+            from: String,
+            name: String,
+            #[serde(skip_serializing_if = "String::is_empty")]
+            description: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            acceleration: Option<AccelerationSpec>,
+        }
+
+        let dataset = DatasetSpec {
+            from: "duckdb:customer".to_string(),
+            name: "tpch_customer".to_string(),
+            description: "TPC-H customer table".to_string(),
+            acceleration: Some(AccelerationSpec {
+                enabled: true,
+                refresh_check_interval: Some("10s".to_string()),
+                refresh_mode: Some("full".to_string()),
+            }),
+        };
+
+        let yaml = to_string(&dataset).expect("test: serialize dataset");
+        eprintln!("YAML output:\n{yaml}");
+
+        // Verify proper line separation (no concatenated lines)
+        assert!(
+            !yaml.contains("customerfrom:"),
+            "Lines are concatenated: found 'customerfrom:' in output"
+        );
+        assert!(
+            !yaml.contains("fullacceleration:"),
+            "Lines are concatenated: found 'fullacceleration:' in output"
+        );
+
+        // Verify each field is on its own line
+        assert!(yaml.contains("from:"), "Missing 'from:' field");
+        assert!(yaml.contains("name:"), "Missing 'name:' field");
+        assert!(
+            yaml.contains("description:"),
+            "Missing 'description:' field"
+        );
+        assert!(
+            yaml.contains("acceleration:"),
+            "Missing 'acceleration:' field"
+        );
+
+        // Roundtrip test
+        let parsed: DatasetSpec = from_str(&yaml).expect("test: parse dataset");
+        assert_eq!(dataset, parsed);
     }
 
     #[test]

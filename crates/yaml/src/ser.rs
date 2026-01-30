@@ -62,16 +62,22 @@ pub(crate) fn value_to_yaml(value: &Value) -> Yaml {
 }
 
 /// Emit a Value as a YAML string.
+///
+/// The output always ends with a newline to ensure safe file concatenation.
 pub(crate) fn emit_yaml(value: &Value) -> Result<String> {
     let yaml = value_to_yaml(value);
     let mut out = String::new();
     let mut emitter = YamlEmitter::new(&mut out);
     emitter.dump(&yaml)?;
     // Remove the leading "---\n" that yaml-rust2 adds
-    let result = out
+    let mut result = out
         .trim_start_matches("---")
         .trim_start_matches('\n')
         .to_string();
+    // Ensure output ends with a newline for safe file appending
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
     Ok(result)
 }
 
