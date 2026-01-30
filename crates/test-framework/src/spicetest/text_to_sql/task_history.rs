@@ -192,8 +192,7 @@ WHERE tc.trace_exists = true
         .unwrap_or_default();
 
     // Get all candidate SQL queries (those after first ai_completion)
-    let attempted_sql =
-        fetch_attempted_sql(spice_client, trace_id, Duration::from_secs(5)).await;
+    let attempted_sql = fetch_attempted_sql(spice_client, trace_id, Duration::from_secs(5)).await;
 
     let metrics = TaskHistoryMetrics {
         sql_duration_ms,

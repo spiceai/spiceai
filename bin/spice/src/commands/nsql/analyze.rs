@@ -277,7 +277,8 @@ async fn run_analysis(
         let (generated_tables, generated_projections) =
             test_framework::spicetest::text_to_sql::parse::extract_tables_and_projection(gen_plan);
 
-        result.metrics.correct_tables = intersection_over_union(&expected_tables, &generated_tables);
+        result.metrics.correct_tables =
+            intersection_over_union(&expected_tables, &generated_tables);
         result.metrics.correct_projections =
             intersection_over_union(&expected_projections, &generated_projections);
     } else if let Ok((exp_tables, exp_proj)) = attempt_parse_table_and_projection(expected)
