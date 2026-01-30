@@ -348,11 +348,10 @@ async fn run_snapshot_workload(
                 .register_table("snapshot_table", Arc::clone(accelerator))
                 .is_ok()
             {
-                ctx.table("snapshot_table")
-                    .await
-                    .ok()
-                    .and_then(|df| futures::executor::block_on(df.count()).ok())
-                    .map(|c| c as u64)
+                match ctx.table("snapshot_table").await {
+                    Ok(df) => df.count().await.ok().map(|c| c as u64),
+                    Err(_) => None,
+                }
             } else {
                 None
             }
