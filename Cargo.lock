@@ -14596,7 +14596,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-api-types"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 dependencies = [
  "serde",
  "serde_json",

@@ -1388,9 +1388,7 @@ impl DataFusion {
             && (acceleration_settings
                 .params
                 .get("cayenne_file_path")
-                .is_some_and(|path| {
-                    crate::dataaccelerator::cayenne::CayenneAccelerator::is_s3_express_path(path)
-                })
+                .is_some_and(|path| crate::dataaccelerator::cayenne::s3::is_s3_express_path(path))
                 || acceleration_settings
                     .params
                     .contains_key("cayenne_s3_zone_ids"));

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod s3;
+pub(crate) mod s3;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -244,15 +244,6 @@ impl CayenneAccelerator {
         Self {
             catalog: Arc::new(OnceCell::new()),
         }
-    }
-
-    /// Returns true if the path is an S3 Express One Zone path.
-    ///
-    /// S3 Express One Zone buckets have the naming convention: `{base-name}--{zone-id}--x-s3`
-    /// Example: `s3://mybucket--usw2-az1--x-s3/prefix/`
-    #[must_use]
-    pub fn is_s3_express_path(path: &str) -> bool {
-        s3::is_s3_express_path(path)
     }
 
     /// Returns the `Cayenne` data directory path that would be used for a file-based `Cayenne` accelerator from this dataset.
