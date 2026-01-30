@@ -144,14 +144,8 @@ where
             Some(v) => v,
             None => {
                 // Fetch current value to get ETag
-                match self.get(key).await? {
-                    Some(_) => {
-                        // Now we have it in cache
-                        self.get_cached_version(key).unwrap_or(UpdateVersion {
-                            e_tag: None,
-                            version: None,
-                        })
-                    }
+                match self.get_with_version(key).await? {
+                    Some((_, v)) => v,
                     None => return Ok(UpdateResult::NotFound),
                 }
             }
@@ -224,6 +218,12 @@ where
     ///
     /// Returns an error if the object store operation fails or deserialization fails.
     pub async fn get(&self, key: &str) -> Result<Option<T>> {
+        self.get_with_version(key)
+            .await
+            .map(|opt| opt.map(|(v, _)| v))
+    }
+
+    async fn get_with_version(&self, key: &str) -> Result<Option<(T, UpdateVersion)>> {
         let path = self.path(key);
 
         let result = match self.store.get(&path).await {
@@ -248,8 +248,8 @@ where
         let bytes = result.bytes().await.context(ObjectStoreSnafu { key })?;
         let value: T = serde_json::from_slice(&bytes).context(DeserializationSnafu { key })?;
 
-        self.update_cache(key, value.clone(), version);
-        Ok(Some(value))
+        self.update_cache(key, value.clone(), version.clone());
+        Ok(Some((value, version)))
     }
 
     /// Get object from local cache (fast, may be stale).

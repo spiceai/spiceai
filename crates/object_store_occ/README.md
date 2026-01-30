@@ -78,9 +78,6 @@ let state: ObjectState<T> = ObjectState::new(store);
 
 // With key prefix (recommended for namespacing)
 let state = ObjectState::new(store).with_prefix("v1/mytype/");
-
-// With custom serialization format (default: JSON)
-let state = ObjectState::new(store).with_format(Format::Json);
 ```
 
 #### Writing
