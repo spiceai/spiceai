@@ -17,6 +17,7 @@ arrow-schema = { workspace = true, features = ["serde"] }
 async-channel = "2.3"
 async-openai.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 dashmap = "6.1.0"
 datafusion.workspace = true
@@ -30,12 +31,14 @@ flight_client = { path = "../flight_client" }
 futures.workspace = true
 indicatif = "0.18.0"
 insta.workspace = true
+object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
 octocrab = "0.47.0"
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 rand.workspace = true
+rcgen = { version = "0.13", features = ["x509-parser"] }
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
@@ -48,6 +51,7 @@ spicepod = { path = "../spicepod" }
 sysinfo = "0.37.2"
 telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
+time = "0.3"
 tokio.workspace = true
 tokio-util.workspace = true
 tonic.workspace = true
