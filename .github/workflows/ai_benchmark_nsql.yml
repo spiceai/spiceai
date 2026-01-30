@@ -54,19 +54,10 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced
-        run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
-
-      - name: make spiced executable
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: ./.github/actions/build-spiced
         with:
-          name: spiced
-          path: spiced
+          features: 'models'
+          upload_artifact: 'true'
 
   setup-matrix:
     name: Setup matrix
