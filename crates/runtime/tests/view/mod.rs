@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::acceleration::get_params;
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 #[cfg(feature = "duckdb")]
@@ -41,6 +41,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
     use duckdb::AccessMode;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -188,6 +189,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_view_dependency_ordering() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -298,6 +300,7 @@ async fn test_view_dependency_ordering() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_view_depending_on_dataset() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -394,6 +397,7 @@ async fn test_view_depending_on_dataset() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_multiple_views_same_dataset() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -485,6 +489,7 @@ async fn test_multiple_views_same_dataset() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn test_view_sql_validation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

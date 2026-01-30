@@ -1,0 +1,19 @@
+[package]
+name = "connector-flightsql"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlightSQL data connector for Spice.ai runtime"
+
+[dependencies]
+arrow.workspace = true
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+async-trait.workspace = true
+data_components = { path = "../../data_components", features = ["flightsql"] }
+datafusion.workspace = true
+flight_client = { path = "../../flight_client" }
+linkme.workspace = true
+paste.workspace = true
+runtime = { path = "../../runtime" }
+snafu.workspace = true

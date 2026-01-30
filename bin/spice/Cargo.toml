@@ -90,9 +90,14 @@ time = "0.3"
 
 # Internal crates
 repl = { path = "../../crates/repl" }
+runtime-api-types = { path = "../../crates/runtime-api-types" }
 spicepod = { path = "../../crates/spicepod", default-features = false }
 spiceai = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
+test-framework = { path = "../../crates/test-framework" }
+
+# Tracing/opentelemetry for trace ID handling
+opentelemetry.workspace = true
 
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]
@@ -100,6 +105,9 @@ nix = { version = "0.29", features = ["signal", "process"] }
 
 [build-dependencies]
 # None needed - we use include_str! for version
+
+[features]
+release = []
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -52,7 +52,7 @@ models:
       hf_token: ${ secrets:SPICE_HF_TOKEN }
       spice_tools: auto
       system_prompt: *system_prompt
-  - name: claude-haiku
+  - name: claude-3-5-haiku
     from: anthropic:claude-haiku-4-5-20251001
     params:
       spice_tools: auto

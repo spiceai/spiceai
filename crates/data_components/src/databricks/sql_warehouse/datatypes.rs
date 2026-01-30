@@ -256,12 +256,45 @@ impl<'input> Parser<'input> {
         Ok(ArrowDataType::Struct(fields.into()))
     }
 
+    fn token_is_identifier(token: &Token<'input>) -> bool {
+        matches!(
+            token,
+            Token::BigInt
+                | Token::Binary
+                | Token::Boolean
+                | Token::Date
+                | Token::Decimal
+                | Token::Double
+                | Token::Float
+                | Token::Int
+                | Token::Void
+                | Token::SmallInt
+                | Token::String
+                | Token::Timestamp
+                | Token::TimestampNtz
+                | Token::TinyInt
+                | Token::Array
+                | Token::Map
+                | Token::Struct
+                | Token::Variant
+                | Token::Not
+                | Token::Null
+                | Token::Comment
+        )
+    }
+
     fn parse_field(&mut self) -> Result<ArrowField, String> {
-        let name = if let Some(Ok(Token::Identifier(name))) = self.current.clone() {
-            self.advance();
-            name.to_string()
-        } else {
-            return Err("Expected identifier for field name".to_string());
+        let name = match self.current.clone() {
+            Some(Ok(Token::Identifier(name))) => {
+                self.advance();
+                name.to_string()
+            }
+            Some(Ok(token)) if Self::token_is_identifier(&token) => {
+                let name = self.lexer.slice().to_string();
+                self.advance();
+                name
+            }
+            _ => return Err("Expected identifier for field name".to_string()),
         };
         self.expect(&Token::Colon)?;
         let data_type = self.parse_data_type()?;
@@ -387,6 +420,23 @@ mod tests {
             let result = parser.parse().expect("parse success");
             assert_eq!(result, expected, "Failed for input: {input}");
         }
+    }
+
+    #[test]
+    fn test_struct_reserved_field_names() {
+        let input = "STRUCT<date: STRING, value: INT>";
+
+        let expected = ArrowDataType::Struct(
+            vec![
+                ArrowField::new("date", ArrowDataType::Utf8, true),
+                ArrowField::new("value", ArrowDataType::Int32, true),
+            ]
+            .into(),
+        );
+
+        let mut parser = Parser::new(input);
+        let result = parser.parse().expect("parse success");
+        assert_eq!(result, expected, "Failed for input: {input}");
     }
 
     #[test]

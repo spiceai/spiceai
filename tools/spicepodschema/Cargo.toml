@@ -33,10 +33,13 @@ runtime = { path = "../../crates/runtime", features = [
     "mongodb",
     "mssql",
     "mysql",
+    # "nfs",  # requires system libnfs library
     # "odbc",
     "oracle",
     "postgres",
     "postgres-accel",
+    "scylladb",
+    "sftp",
     "sharepoint",
     "snowflake",
     "spark",
@@ -45,5 +48,27 @@ runtime = { path = "../../crates/runtime", features = [
     # Models for model source parameters
     "models",
 ] }
+
+# Extracted connector crates (for linkme registration)
+connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse" }
+connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake" }
+connector-dremio = { path = "../../crates/data-connectors/connector-dremio" }
+connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb" }
+connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql" }
+connector-ftp = { path = "../../crates/data-connectors/connector-ftp" }
+connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
+connector-imap = { path = "../../crates/data-connectors/connector-imap" }
+connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb" }
+connector-mssql = { path = "../../crates/data-connectors/connector-mssql" }
+connector-mysql = { path = "../../crates/data-connectors/connector-mysql" }
+# connector-nfs requires system libnfs library
+connector-oracle = { path = "../../crates/data-connectors/connector-oracle" }
+connector-postgres = { path = "../../crates/data-connectors/connector-postgres" }
+connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb" }
+connector-sftp = { path = "../../crates/data-connectors/connector-sftp" }
+connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint" }
+connector-smb = { path = "../../crates/data-connectors/connector-smb" }
+connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake" }
+connector-spark = { path = "../../crates/data-connectors/connector-spark" }
 
 runtime-parameters = { path = "../../crates/runtime-parameters" }

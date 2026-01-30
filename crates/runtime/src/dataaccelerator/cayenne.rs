@@ -1996,7 +1996,18 @@ impl DataAccelerator for CayenneAccelerator {
 
             Ok(table_provider as Arc<dyn TableProvider>)
         } else {
-            let partition_by_last = partition_by.last().cloned().ok_or_else(|| {
+            // Cayenne currently only supports single-column partitioning due to catalog schema limitations
+            if partition_by.len() > 1 {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Cayenne partitioning supports exactly one partition column, but {} were provided. Multi-column partitioning is not yet supported for Cayenne.",
+                        partition_by.len()
+                    )),
+                })
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+
+            let partition_by_single = partition_by.first().cloned().ok_or_else(|| {
                 Box::new(Error::PartitionByRequired) as Box<dyn std::error::Error + Send + Sync>
             })?;
 
@@ -2090,7 +2101,7 @@ impl DataAccelerator for CayenneAccelerator {
             let creator = Arc::new(CayennePartitionCreator::new(
                 table_name,
                 PathBuf::from(&dir_path),
-                partition_by_last,
+                partition_by_single,
                 Arc::clone(&arrow_schema),
                 catalog,
                 table_metadata.table_id,
@@ -2266,8 +2277,30 @@ impl CayennePartitionCreator {
 impl PartitionCreator for CayennePartitionCreator {
     async fn create_partition(
         &self,
-        partition_value: ScalarValue,
+        partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
+        // Cayenne only supports single-column partitions
+        if partition_values.is_empty() {
+            return Err(creator::Error::CreatePartition {
+                source: "At least one partition value is required".into(),
+            });
+        }
+
+        if partition_values.len() > 1 {
+            return Err(creator::Error::CreatePartition {
+                source: format!(
+                    "Cayenne partitioning supports exactly one partition column, but {} values were provided",
+                    partition_values.len()
+                )
+                .into(),
+            });
+        }
+
+        // SAFETY: We verified partition_values.len() == 1 above, so first() will always succeed
+        let Some(partition_value) = partition_values.into_iter().next() else {
+            unreachable!("partition_values length was verified to be exactly 1")
+        };
+
         let partition_dir = self.partition_dir(&partition_value)?;
         let partition_path = partition_dir.to_string_lossy().to_string();
 
@@ -2331,7 +2364,7 @@ impl PartitionCreator for CayennePartitionCreator {
                 })?;
 
         Ok(Partition {
-            partition_value,
+            partition_values: vec![partition_value],
             table_provider: Arc::new(cayenne_table),
         })
     }
@@ -2383,7 +2416,7 @@ impl PartitionCreator for CayennePartitionCreator {
             })?;
 
             result.push(Partition {
-                partition_value,
+                partition_values: vec![partition_value],
                 table_provider: Arc::new(cayenne_table),
             });
         }

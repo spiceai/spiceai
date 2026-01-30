@@ -13,11 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{
     LogErrors, Runtime, accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
-    datafusion::request_context_extension::get_current_datafusion, status::ComponentStatus,
+    datafusion::request_context_extension::get_current_datafusion,
 };
 use app::App;
 use axum::{
@@ -56,34 +57,11 @@ pub struct DatasetQueryParams {
     format: Format,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "lowercase")]
-pub struct DatasetResponseItem {
-    /// The source where the dataset is located
-    pub from: String,
-
-    /// The name of the dataset
-    pub name: String,
-
-    /// Whether replication is enabled for the dataset
-    pub replication_enabled: bool,
-
-    /// Whether acceleration is enabled for the dataset
-    pub acceleration_enabled: bool,
-
-    /// The current status of the dataset. Only included when `status=true` query parameter is specified.
-    /// Possible values: `initializing`, `ready`, `disabled`, `error`, `refreshing`, `shuttingdown`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<ComponentStatus>,
-
-    /// Custom properties for the dataset
-    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-    pub properties: HashMap<String, serde_json::Value>,
-}
+// Re-export the shared type for backwards compatibility
+pub use runtime_api_types::v1::DatasetInfo as DatasetResponseItem;
 
 #[expect(dead_code)]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct Property {
     pub key: String,

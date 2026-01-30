@@ -1,5 +1,6 @@
 [workspace]
 default-members = ["bin/spiced"]
+exclude = ["crates/data-connectors/connector-nfs"]
 members = [
     "bin/spice/",
     "bin/spiced/",
@@ -9,6 +10,7 @@ members = [
     "crates/arrow_tools",
     "crates/aws-sdk-credential-bridge",
     "crates/chunking",
+    "crates/data-connectors/*",
     "crates/datafusion-optimizer-rules",
     "crates/data_components",
     "crates/dataformat-json",
@@ -22,11 +24,13 @@ members = [
     "crates/llms",
     "crates/model_components",
     "crates/ns_lookup",
+    "crates/object_store_occ",
     "crates/otel-arrow",
     "crates/cayenne",
     "crates/runtime-object-store",
     "crates/package",
     "crates/runtime",
+    "crates/runtime-api-types",
     "crates/runtime-auth",
     "crates/runtime-async",
     "crates/runtime-datafusion",
@@ -72,7 +76,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.91"
-version = "1.11.0-unstable"
+version = "2.0.0-unstable"
 
 [workspace.dependencies]
 ahash = "0.8.12"
@@ -296,7 +300,7 @@ tracing = "0.1.43"
 tracing-futures = { version = "0.2.5", features = ["futures-03"] }
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-turso = { version = "0.3.2", default-features = false, features = ["experimental_indexes"] }
+turso = { version = "0.4.4", default-features = false }
 twox-hash = "2.1.2"
 url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util" }
@@ -352,9 +356,9 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "1de
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "8cff5241923989720f86687bdf7d0b3c9c7dad2f" } # spiceai-51
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "2abc199e4b23f0881a4520e2749412dd35514050" } # branch: spiceai-51
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "2abc199e4b23f0881a4520e2749412dd35514050" } # branch: spiceai-51
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "2abc199e4b23f0881a4520e2749412dd35514050" } # branch: spiceai-51
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "20ef1eb38c0ca526f96507e1f32632672b868116" } # branch: spiceai-51
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "20ef1eb38c0ca526f96507e1f32632672b868116" } # branch: spiceai-51
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "20ef1eb38c0ca526f96507e1f32632672b868116" } # branch: spiceai-51
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers

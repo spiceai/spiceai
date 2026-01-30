@@ -354,7 +354,7 @@ impl DuckDBPartitionCreator {
 impl PartitionCreator for DuckDBPartitionCreator {
     async fn create_partition(
         &self,
-        _partition_value: ScalarValue,
+        _partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
         Err(creator::Error::CreatePartition {
             source: "Table-based partitions must not be manually created".into(),
@@ -409,7 +409,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
             partitions.push(Partition {
-                partition_value,
+                partition_values: vec![partition_value],
                 table_provider,
             });
         }

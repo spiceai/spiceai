@@ -99,7 +99,7 @@ enum Commands {
     /// Refresh a dataset
     Refresh(refresh::RefreshArgs),
 
-    /// Upgrades the Spice runtime to the latest or specified version
+    /// Upgrades the Spice CLI and runtime to the latest or specified version
     Upgrade(upgrade::UpgradeArgs),
 
     /// Lists workers loaded by the Spice runtime
