@@ -103,7 +103,7 @@ impl ChangeEnvelope {
         }
     }
 
-    pub fn commit(self) -> Result<(), CommitError> {
+    pub fn commit(&self) -> Result<(), CommitError> {
         self.change_committer.commit()
     }
 

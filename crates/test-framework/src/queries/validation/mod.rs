@@ -183,6 +183,59 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         .all(|(f1, f2)| datatype_equivalent(f1.data_type(), f2.data_type()))
 }
 
+/// Format schema mismatch showing only the columns that differ
+fn format_schema_mismatch(expected_schema: &SchemaRef, actual_schema: &SchemaRef) -> String {
+    use std::fmt::Write;
+    let mut output = String::new();
+
+    let expected_fields = expected_schema.fields();
+    let actual_fields = actual_schema.fields();
+
+    if expected_fields.len() != actual_fields.len() {
+        writeln!(
+            output,
+            "  Column count mismatch: expected {}, got {}",
+            expected_fields.len(),
+            actual_fields.len()
+        )
+        .ok();
+    }
+
+    let max_len = expected_fields.len().max(actual_fields.len());
+    let mut differences = Vec::new();
+
+    for i in 0..max_len {
+        match (expected_fields.get(i), actual_fields.get(i)) {
+            (Some(exp), Some(act)) => {
+                if !datatype_equivalent(exp.data_type(), act.data_type()) {
+                    differences.push(format!(
+                        "    {}: expected {:?}, got {:?}",
+                        exp.name(),
+                        exp.data_type(),
+                        act.data_type()
+                    ));
+                }
+            }
+            (Some(exp), None) => {
+                differences.push(format!("    {}: expected {:?}, missing", exp.name(), exp.data_type()));
+            }
+            (None, Some(act)) => {
+                differences.push(format!("    {}: unexpected column {:?}", act.name(), act.data_type()));
+            }
+            (None, None) => {}
+        }
+    }
+
+    if !differences.is_empty() {
+        writeln!(output, "  Type mismatches:").ok();
+        for diff in differences {
+            writeln!(output, "{diff}").ok();
+        }
+    }
+
+    output
+}
+
 macro_rules! downcast_and_stringify {
     ($array:expr, $index:expr, $t:ty) => {{
         Ok(Some(
@@ -494,8 +547,7 @@ pub fn validate_tpch_query(
     };
 
     if !equivalent_schemas(&expected_schema, &actual_schema) {
-        println!("expected_schema: {expected_schema:?}");
-        println!("actual_schema: {actual_schema:?}");
+        print!("{}", format_schema_mismatch(&expected_schema, &actual_schema));
 
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::SchemaMismatch,
@@ -563,8 +615,7 @@ pub fn validate_with_expected_batches(
 
     if !equivalent_schemas(&expected_schema, &actual_schema) {
         println!("Query '{query_name}' schema mismatch:");
-        println!("  expected_schema: {expected_schema:?}");
-        println!("  actual_schema: {actual_schema:?}");
+        print!("{}", format_schema_mismatch(&expected_schema, &actual_schema));
 
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::SchemaMismatch,

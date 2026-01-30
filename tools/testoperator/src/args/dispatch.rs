@@ -337,57 +337,21 @@ pub enum BenchmarkQueryset {
     BirdBenchSmallToxicology,
 }
 
-/// Payload sent to the GitHub Actions workflow request for streaming ingestion benchmarks.
-/// Should match inputs in `.github/workflows/testoperator_run_streaming.yml`.
+/// Streaming benchmark workflow arguments, defined in the test files
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StreamingArgs {
     pub spicepod_path: PathBuf,
+    pub source: String,
+    pub queryset: String,
     pub runner_type: RunnerType,
-
-    /// Streaming source type (e.g., dynamodb-streams, kafka)
-    pub source: StreamingSourceType,
-
-    /// Query set type (e.g., tpch-lineitem). Determines which datasets to load.
-    pub queryset: StreamingQuerySetType,
-
-    /// Scale factor for data generation (e.g., 0.01, 0.1, 1.0)
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_scale_factor"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scale_factor: Option<f64>,
-
-    /// Timeout in seconds to wait for ingestion to complete
+    /// Run ID that identifies DynamoDB tables and snapshots (required)
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingestion_timeout: Option<u64>,
-
-    /// Time in seconds to wait for Spiced to be ready
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ready_wait: Option<u64>,
-
-    /// Run benchmark from an existing snapshot (set by dispatch-dynamodb)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from_snapshot: Option<bool>,
-
-    /// Run ID for snapshot mode (identifies DynamoDB tables and snapshot location)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-}
-
-/// Streaming source types for dispatch configuration.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum StreamingSourceType {
-    DynamodbStreams,
-    // Future: Kafka, Debezium, etc.
-}
-
-/// Query set types for streaming benchmarks in dispatch configuration.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum StreamingQuerySetType {
-    TpchLineitem,
-    // Future: TpchFull, Clickbench, etc.
 }
 
 /// A wrapper around input arguments, from a test file, to use in a GitHub Actions workflow, that also expects

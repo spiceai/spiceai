@@ -92,6 +92,14 @@ impl RefreshTask {
                         .await
                     {
                         Ok(()) => {
+                            let _lock_guard = self.accelerator_write_mutex.lock().await;
+                            if let Err(e) = change_envelope.commit()
+                                && !self.runtime_status.is_shutdown()
+                            {
+                                tracing::error!("Failed to commit CDC change envelope: {e}");
+                            }
+                            drop(_lock_guard);
+
                             // Mark the dataset as ready if possible
                             if change_envelope.is_dataset_ready() {
                                 initial_load_completed.store(true, Ordering::Relaxed);
@@ -100,12 +108,6 @@ impl RefreshTask {
                                 }
                                 self.update_component_status(status::ComponentStatus::Ready)
                                     .await;
-                            }
-
-                            if let Err(e) = change_envelope.commit()
-                                && !self.runtime_status.is_shutdown()
-                            {
-                                tracing::error!("Failed to commit CDC change envelope: {e}");
                             }
 
                             if let Some(cache_provider_ref) = caching.as_ref()

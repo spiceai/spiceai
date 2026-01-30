@@ -53,7 +53,7 @@ use super::mutations;
 use super::traits::{DynamoDBStreamingSource, SnapshotConfig, StreamingDataset};
 use super::utils::{
     generate_run_id, load_spicepod_definition, poll_for_all_markers, poll_for_all_snapshots,
-    print_benchmark_summary, skip_first_row, wait_for_all_marker_deletions, write_temp_spicepod,
+    skip_first_row, wait_for_all_marker_deletions, write_temp_spicepod,
     BenchmarkResult, DatasetInfo,
 };
 use super::verification;
@@ -192,7 +192,7 @@ pub async fn run_dispatch(args: &DispatchDynamodbArgs) -> Result<()> {
     let data_insertion_start = Instant::now();
     let mut total_insert_duration = Duration::ZERO;
 
-    let mutation_summary = if args.mutation_ratio > 0.0 {
+    if args.mutation_ratio > 0.0 {
         println!("  Executing mutation sequences for CDC testing");
         println!(
             "  Seed: {}, Mutation ratio: {:.1}%",
@@ -229,7 +229,6 @@ pub async fn run_dispatch(args: &DispatchDynamodbArgs) -> Result<()> {
         .await?;
         total_insert_duration = insert_start.elapsed();
         summary.print();
-        Some(summary)
     } else {
         for info in &dataset_infos {
             let dataset_type = info.dataset.dataset_type();
@@ -243,7 +242,7 @@ pub async fn run_dispatch(args: &DispatchDynamodbArgs) -> Result<()> {
             source.insert(&table_name, &remaining_data).await?;
             total_insert_duration += insert_start.elapsed();
         }
-        None
+
     };
 
     println!("Data insertion completed in {total_insert_duration:?}");

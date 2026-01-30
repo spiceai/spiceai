@@ -109,6 +109,10 @@ impl VerificationReport {
 /// Uses the test-framework's `validate_tpch_query` function to compare
 /// actual results against expected TPCH answers at SF=1.
 pub async fn verify_tpch_queries(spiced: &SpicedInstance) -> Result<VerificationReport> {
+    println!("\n{}", "=".repeat(60));
+    println!("Starting TPCH Query Verification");
+    println!("{}", "=".repeat(60));
+
     // Get TPCH queries with DynamoDB overrides (removes unsupported queries like q6)
     let queries = get_tpch_test_queries(Some(QueryOverrides::DynamoDB));
 
@@ -118,11 +122,33 @@ pub async fn verify_tpch_queries(spiced: &SpicedInstance) -> Result<Verification
         .filter(|q| q.name.starts_with("tpch_q") && !q.name.contains("simple"))
         .collect();
 
+    println!("Running {} TPCH queries...\n", queries.len());
+
     let mut results = Vec::with_capacity(queries.len());
     let spice_client = spiced.spice_client(None, false).await?;
 
-    for query in &queries {
+    for (idx, query) in queries.iter().enumerate() {
+        print!("[{:2}/{}] {:<20} ... ", idx + 1, queries.len(), query.name);
         let result = verify_single_query(&spice_client, query).await;
+
+        // Print inline result
+        match &result.status {
+            VerificationStatus::Pass => {
+                println!(
+                    "PASS ({} rows, {}ms)",
+                    result.row_count, result.duration_ms
+                );
+            }
+            VerificationStatus::Failed(reason) => {
+                println!("FAIL ({}ms)", result.duration_ms);
+                println!("       Reason: {reason}");
+            }
+            VerificationStatus::Skipped(reason) => {
+                println!("SKIP");
+                println!("       Reason: {reason}");
+            }
+        }
+
         results.push(result);
     }
 
@@ -138,6 +164,17 @@ pub async fn verify_tpch_queries(spiced: &SpicedInstance) -> Result<Verification
         .iter()
         .filter(|r| matches!(r.status, VerificationStatus::Skipped(_)))
         .count();
+
+    // Print summary
+    println!("\n{}", "-".repeat(60));
+    println!(
+        "Verification complete: {} passed, {} failed, {} skipped",
+        passed, failed, skipped
+    );
+    if failed > 0 {
+        println!("WARNING: {} queries failed verification!", failed);
+    }
+    println!("{}", "=".repeat(60));
 
     Ok(VerificationReport {
         total: results.len(),
