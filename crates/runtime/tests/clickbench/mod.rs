@@ -23,7 +23,7 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{acceleration::Acceleration, component::dataset::Dataset};
 
-use crate::utils::runtime_ready_check;
+use crate::utils::{register_test_connectors, runtime_ready_check};
 use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
 
 mod q8;
@@ -44,6 +44,7 @@ fn get_hits_small_accelerated_dataset() -> Dataset {
 
 async fn test_clickbench_query(query: &str) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

@@ -32,7 +32,10 @@ use spicepod::{
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common,
-    utils::{run_query, runtime_ready_check, test_request_context, to_pretty_display},
+    utils::{
+        register_test_connectors, run_query, runtime_ready_check, test_request_context,
+        to_pretty_display,
+    },
 };
 
 const DUCKDB_FILE_PATH: &str = "./schema_evolution.duckdb";
@@ -40,6 +43,7 @@ const DUCKDB_FILE_PATH: &str = "./schema_evolution.duckdb";
 #[tokio::test]
 async fn test_schema_evolution() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     if std::fs::metadata(DUCKDB_FILE_PATH).is_ok() {
         std::fs::remove_file(DUCKDB_FILE_PATH).expect("should remove local database");
@@ -163,6 +167,9 @@ async fn execute_pg_statement(db_conn: &PostgresConnection, sql: &str) {
 }
 
 async fn initialize_runtime(port: usize) -> Result<Runtime, anyhow::Error> {
+    // Re-register connectors in case a previous runtime shutdown cleared them
+    register_test_connectors().await;
+
     let mut ds = Dataset::new("postgres:chameleon", "cham");
 
     let params = Params::from_string_map(

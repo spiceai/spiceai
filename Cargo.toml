@@ -1,5 +1,6 @@
 [workspace]
 default-members = ["bin/spiced"]
+exclude = ["crates/data-connectors/connector-nfs"]
 members = [
     "bin/spice/",
     "bin/spiced/",
@@ -9,6 +10,7 @@ members = [
     "crates/arrow_tools",
     "crates/aws-sdk-credential-bridge",
     "crates/chunking",
+    "crates/data-connectors/*",
     "crates/datafusion-optimizer-rules",
     "crates/data_components",
     "crates/dataformat-json",

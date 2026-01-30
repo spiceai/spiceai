@@ -64,7 +64,7 @@ pub(crate) mod search {
 
     use crate::DEFAULT_TRACING_MODELS;
     use crate::models::s3_vectors::get_package_delivery_dataset;
-    use crate::utils::runtime_ready_check;
+    use crate::utils::{register_test_connectors, runtime_ready_check};
 
     async fn add_mega_science_view_from_ds(
         mut app: AppBuilder,
@@ -932,6 +932,7 @@ pub(crate) mod search {
     }
 
     async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
+        register_test_connectors().await;
         configure_test_datafusion();
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
