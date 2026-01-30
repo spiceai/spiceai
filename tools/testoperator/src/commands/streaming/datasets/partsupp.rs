@@ -70,7 +70,9 @@ impl StreamingDataset for PartsuppDataset {
 
         let mut stmt = conn
             .prepare(
-                "SELECT ps_partkey, ps_suppkey, ps_availqty, ps_supplycost, ps_comment
+                "SELECT ps_partkey, ps_suppkey, ps_availqty,
+                        CAST(ps_supplycost AS DOUBLE) as ps_supplycost,
+                        ps_comment
                 FROM partsupp
                 ORDER BY ps_partkey, ps_suppkey",
             )

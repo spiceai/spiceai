@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    Array, Date32Array, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
+    Array, Date32Array, Decimal128Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use aws_config::{BehaviorVersion, Region, SdkConfig, retry::RetryConfig};
@@ -168,6 +168,25 @@ impl DynamoDbStreamsSource {
         Client::new(&sdk_config)
     }
 
+    /// Format a Decimal128 value as a string with proper decimal places.
+    ///
+    /// Decimal128 stores values as integers scaled by 10^scale.
+    /// For example, 12345 with scale=2 represents 123.45
+    fn format_decimal128(value: i128, _precision: u8, scale: i8) -> String {
+        if scale <= 0 {
+            // No decimal places needed
+            let multiplier = 10_i128.pow((-scale) as u32);
+            return (value * multiplier).to_string();
+        }
+
+        let scale = scale as u32;
+        let divisor = 10_i128.pow(scale);
+        let integer_part = value / divisor;
+        let fractional_part = (value % divisor).abs();
+
+        format!("{integer_part}.{fractional_part:0>width$}", width = scale as usize)
+    }
+
     /// Convert an Arrow array value to a `DynamoDB` `AttributeValue`.
     fn array_to_attribute(array: &Arc<dyn Array>, row: usize) -> Result<AttributeValue> {
         match array.data_type() {
@@ -197,7 +216,24 @@ impl DynamoDbStreamsSource {
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| anyhow::anyhow!("Failed to downcast to Float64Array"))?;
-                Ok(AttributeValue::N(arr.value(row).to_string()))
+                let value = arr.value(row);
+                // Ensure decimal point is always present for proper DynamoDB number handling
+                let str_value = if value.fract() == 0.0 {
+                    format!("{value:.1}")
+                } else {
+                    value.to_string()
+                };
+                Ok(AttributeValue::N(str_value))
+            }
+            DataType::Decimal128(precision, scale) => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to downcast to Decimal128Array"))?;
+                let value = arr.value(row);
+                // Convert Decimal128 to string with proper scale
+                let str_value = Self::format_decimal128(value, *precision, *scale);
+                Ok(AttributeValue::N(str_value))
             }
             DataType::Utf8 => {
                 let arr = array

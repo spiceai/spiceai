@@ -83,7 +83,10 @@ impl StreamingDataset for LineitemDataset {
             .prepare(
                 "SELECT
                     l_orderkey, l_partkey, l_suppkey, l_linenumber,
-                    l_quantity, l_extendedprice, l_discount, l_tax,
+                    CAST(l_quantity AS DOUBLE) as l_quantity,
+                    CAST(l_extendedprice AS DOUBLE) as l_extendedprice,
+                    CAST(l_discount AS DOUBLE) as l_discount,
+                    CAST(l_tax AS DOUBLE) as l_tax,
                     l_returnflag, l_linestatus,
                     l_shipdate::VARCHAR, l_commitdate::VARCHAR, l_receiptdate::VARCHAR,
                     l_shipinstruct, l_shipmode, l_comment

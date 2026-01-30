@@ -73,7 +73,9 @@ impl StreamingDataset for PartDataset {
 
         let mut stmt = conn
             .prepare(
-                "SELECT p_partkey, p_name, p_mfgr, p_brand, p_type, p_size, p_container, p_retailprice, p_comment
+                "SELECT p_partkey, p_name, p_mfgr, p_brand, p_type, p_size, p_container,
+                        CAST(p_retailprice AS DOUBLE) as p_retailprice,
+                        p_comment
                 FROM part
                 ORDER BY p_partkey",
             )

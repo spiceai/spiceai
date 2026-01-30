@@ -73,7 +73,8 @@ impl StreamingDataset for OrdersDataset {
 
         let mut stmt = conn
             .prepare(
-                "SELECT o_orderkey, o_custkey, o_orderstatus, o_totalprice,
+                "SELECT o_orderkey, o_custkey, o_orderstatus,
+                        CAST(o_totalprice AS DOUBLE) as o_totalprice,
                         o_orderdate::VARCHAR, o_orderpriority, o_clerk, o_shippriority, o_comment
                 FROM orders
                 ORDER BY o_orderkey",
