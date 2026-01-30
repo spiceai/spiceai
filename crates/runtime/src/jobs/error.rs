@@ -72,6 +72,9 @@ pub enum Error {
         left_value: usize,
         right_value: usize,
     },
+
+    #[snafu(display("Failed to read batch from result stream: {message}"))]
+    StreamRead { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

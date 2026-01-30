@@ -18,8 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
+use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore};
@@ -222,6 +224,133 @@ impl JobStore {
         let mut chunk_index = 0usize;
 
         for batch in batches {
+            let batch_rows = batch.num_rows();
+            total_rows = total_rows.checked_add(batch_rows).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "total_row_count".to_string(),
+                    left_value: total_rows,
+                    right_value: batch_rows,
+                }
+            })?;
+
+            current_chunk_batches.push(batch);
+            current_chunk_rows = current_chunk_rows.checked_add(batch_rows).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "chunk_row_count".to_string(),
+                    left_value: current_chunk_rows,
+                    right_value: batch_rows,
+                }
+            })?;
+
+            // Flush chunk if we've reached the chunk size
+            if current_chunk_rows >= self.chunk_size {
+                let bytes = self
+                    .write_chunk(job_id, chunk_index, &current_chunk_batches)
+                    .await?;
+                total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                    super::error::Error::IntegerOverflow {
+                        field: "total_byte_count".to_string(),
+                        left_value: total_bytes,
+                        right_value: bytes,
+                    }
+                })?;
+                chunk_indices.push(chunk_index);
+                chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                    super::error::Error::IntegerOverflow {
+                        field: "chunk_index".to_string(),
+                        left_value: chunk_index,
+                        right_value: 1,
+                    }
+                })?;
+                current_chunk_batches.clear();
+                current_chunk_rows = 0;
+            }
+        }
+
+        // Flush remaining batches
+        if !current_chunk_batches.is_empty() {
+            let bytes = self
+                .write_chunk(job_id, chunk_index, &current_chunk_batches)
+                .await?;
+            total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "total_byte_count".to_string(),
+                    left_value: total_bytes,
+                    right_value: bytes,
+                }
+            })?;
+            chunk_indices.push(chunk_index);
+        }
+
+        // Build schema info - use Display instead of Debug for stable type names
+        let columns: Vec<ColumnSchema> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                // Extract precision and scale for decimal types
+                let (type_precision, type_scale) = match field.data_type() {
+                    arrow::datatypes::DataType::Decimal128(precision, scale)
+                    | arrow::datatypes::DataType::Decimal256(precision, scale) => {
+                        (Some(u32::from(*precision)), Some(i32::from(*scale)))
+                    }
+                    _ => (None, None),
+                };
+                ColumnSchema {
+                    name: field.name().clone(),
+                    type_name: field.data_type().to_string(),
+                    type_precision,
+                    type_scale,
+                    nullable: field.is_nullable(),
+                    position: i,
+                }
+            })
+            .collect();
+
+        Ok(JobResult {
+            manifest: JobResultManifest {
+                format: "ARROW_IPC".to_string(),
+                schema: JobSchema {
+                    column_count: columns.len(),
+                    columns,
+                },
+                total_row_count: total_rows,
+                total_chunk_count: chunk_indices.len(),
+                truncated: false,
+                total_byte_count: Some(total_bytes),
+            },
+            chunk_indices,
+        })
+    }
+
+    /// Writes result chunks for a completed job from a stream of record batches.
+    ///
+    /// Streams `RecordBatch`es and writes them as Arrow IPC chunks as they arrive,
+    /// avoiding loading all results into memory at once. Chunks are flushed when
+    /// the configured `chunk_size` row threshold is reached.
+    ///
+    /// Returns the job result manifest.
+    pub async fn write_result_chunks_from_stream(
+        &self,
+        job_id: &str,
+        mut stream: SendableRecordBatchStream,
+    ) -> Result<JobResult> {
+        let schema: SchemaRef = stream.schema();
+
+        let mut total_rows = 0usize;
+        let mut total_bytes = 0usize;
+        let mut chunk_indices = Vec::new();
+
+        // Buffer for accumulating batches until we reach chunk_size
+        let mut current_chunk_batches: Vec<RecordBatch> = Vec::new();
+        let mut current_chunk_rows = 0usize;
+        let mut chunk_index = 0usize;
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.map_err(|e| super::error::Error::StreamRead {
+                message: e.to_string(),
+            })?;
+
             let batch_rows = batch.num_rows();
             total_rows = total_rows.checked_add(batch_rows).ok_or_else(|| {
                 super::error::Error::IntegerOverflow {
