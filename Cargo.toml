@@ -24,6 +24,7 @@ members = [
     "crates/llms",
     "crates/model_components",
     "crates/ns_lookup",
+    "crates/object_store_occ",
     "crates/otel-arrow",
     "crates/cayenne",
     "crates/runtime-object-store",
