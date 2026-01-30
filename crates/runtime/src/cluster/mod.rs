@@ -347,6 +347,7 @@ fn update_scheduler_pollers(
     *known_schedulers = next_schedulers;
 }
 
+mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
 mod executor_registry;
