@@ -19,7 +19,7 @@ limitations under the License.
 use crate::error::{
     ConfigIoSnafu, CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, InvalidArgumentSnafu, Result,
 };
-use ansi_term::Colour;
+use ansi_colors::Color;
 use clap::{Args, Subcommand};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -257,9 +257,7 @@ fn execute_tls_init() -> Result<()> {
     println!();
     println!(
         "{}",
-        Colour::Green
-            .bold()
-            .paint("Test PKI infrastructure initialized successfully!")
+        Color::Green.paint("Test PKI infrastructure initialized successfully!")
     );
     println!();
     println!("CA Certificate: {}", ca_cert_path.display());
@@ -272,21 +270,17 @@ fn execute_tls_init() -> Result<()> {
     println!();
     println!(
         "{}",
-        Colour::Yellow
-            .bold()
-            .paint("WARNING: This CA is for development and testing only.")
+        Color::Yellow.paint("WARNING: This CA is for development and testing only.")
     );
     println!(
         "{}",
-        Colour::Yellow
-            .bold()
-            .paint("         DO NOT use these certificates in production!")
+        Color::Yellow.paint("         DO NOT use these certificates in production!")
     );
     println!();
     println!("Next steps:");
     println!(
         "  Run {} to create a certificate for a cluster member.",
-        Colour::Cyan.paint("spice cluster tls add <client-name>")
+        Color::Cyan.paint("spice cluster tls add <client-name>")
     );
 
     Ok(())
@@ -443,7 +437,7 @@ fn execute_tls_add(client_name: &str, host: Option<&str>) -> Result<()> {
     println!();
     println!(
         "{}",
-        Colour::Green.bold().paint(format!(
+        Color::Green.paint(format!(
             "Certificate for '{client_name}' created successfully!"
         ))
     );

@@ -62,7 +62,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
@@ -112,6 +112,8 @@ fn spawn_scheduler_poll_loop(
     executor: Arc<Executor>,
     codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
     readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    poll_now_notify: Option<Arc<Notify>>,
+    available_task_slots: Arc<tokio::sync::Semaphore>,
 ) -> SchedulerPollHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -227,6 +229,8 @@ fn spawn_scheduler_poll_loop(
                 Arc::clone(&executor),
                 codec.clone(),
                 Some(tx_ready),
+                poll_now_notify.clone(),
+                Some(Arc::clone(&available_task_slots)),
             );
 
             tokio::select! {
@@ -287,6 +291,7 @@ async fn fetch_scheduler_membership(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 fn update_scheduler_pollers(
     pollers: &mut HashMap<String, SchedulerPollHandle>,
     known_schedulers: &mut HashSet<String>,
@@ -295,6 +300,8 @@ fn update_scheduler_pollers(
     executor: &Arc<Executor>,
     codec: &BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
     readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    poll_now_notify: Option<&Arc<Notify>>,
+    available_task_slots: &Arc<tokio::sync::Semaphore>,
 ) {
     let next_schedulers: HashSet<String> = addresses.into_iter().collect();
 
@@ -322,6 +329,8 @@ fn update_scheduler_pollers(
             Arc::clone(executor),
             codec.clone(),
             Arc::clone(readiness_sender),
+            poll_now_notify.cloned(),
+            Arc::clone(available_task_slots),
         );
         pollers.insert(address, handle);
     }
@@ -338,6 +347,7 @@ fn update_scheduler_pollers(
     *known_schedulers = next_schedulers;
 }
 
+mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
 mod executor_registry;
@@ -351,7 +361,7 @@ pub use executor_registry::ExecutorRegistry;
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
-pub use service::ClusterServiceImpl;
+pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
 /// mTLS configuration for cluster communications.
 ///
@@ -674,10 +684,16 @@ impl ResolvedClusterConfig {
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
 pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()> {
-    let scheduler = create_scheduler_server(rt).await?;
+    let (scheduler, executor_stream_registry) = create_scheduler_server(rt).await?;
 
     rt.df
         .bind_scheduler_server(Arc::new(scheduler))
+        .map_err(|e| FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+
+    rt.df
+        .bind_executor_stream_registry(executor_stream_registry)
         .map_err(|e| FailedToStartClusterScheduler {
             source: Box::new(e),
         })?;
@@ -965,11 +981,17 @@ pub async fn initialize_cluster_executor(
     let (tx_ready, rx_ready) = oneshot::channel::<String>();
     let readiness_sender = Arc::new(Mutex::new(Some(tx_ready)));
 
+    // Create the shared semaphore for task slot management across all scheduler poll loops.
+    // This semaphore will be passed to each poll loop so the busy state can be tracked
+    // and shared across nodes in the scheduler shared state location metadata.
+    let available_task_slots = Arc::new(tokio::sync::Semaphore::new(concurrent_tasks as usize));
+
     let scheduler_url_for_manager = scheduler_url.clone();
     let client_tls_config_for_manager = client_tls_config.clone();
     let executor_for_manager = Arc::clone(&executor);
     let codec_for_manager = codec;
     let initial_scheduler_addresses_for_manager = initial_scheduler_addresses.clone();
+    let available_task_slots_for_manager = Arc::clone(&available_task_slots);
 
     // Compute the executor's advertise address for control stream identification.
     let executor_advertise_id =
@@ -995,6 +1017,10 @@ pub async fn initialize_cluster_executor(
             control_stream_metrics_reader,
         );
 
+        // Get the shared poll_now notify handle from the control stream manager.
+        // When any scheduler sends a PollNow command, this will wake the poll loops.
+        let poll_now_notify = control_stream_manager.poll_now_notify();
+
         let mut current_addresses = initial_scheduler_addresses_for_manager;
         if current_addresses.is_empty() {
             current_addresses.push(scheduler_url_for_manager.to_string());
@@ -1015,6 +1041,8 @@ pub async fn initialize_cluster_executor(
             &executor_for_manager,
             &codec_for_manager,
             &readiness_sender,
+            Some(&poll_now_notify),
+            &available_task_slots_for_manager,
         );
 
         let mut refresh = tokio::time::interval(SCHEDULER_REFRESH_INTERVAL);
@@ -1043,6 +1071,8 @@ pub async fn initialize_cluster_executor(
                     &executor_for_manager,
                     &codec_for_manager,
                     &readiness_sender,
+                    Some(&poll_now_notify),
+                    &available_task_slots_for_manager,
                 );
             }
         }
@@ -1070,7 +1100,10 @@ pub async fn initialize_cluster_executor(
 
 async fn create_scheduler_server(
     rt: &Arc<Runtime>,
-) -> crate::Result<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>> {
+) -> crate::Result<(
+    SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
+    ExecutorControlStreamRegistry,
+)> {
     let bind_addr = rt.df.cluster_config.node_bind_address();
 
     // Bind Spice Datafusion configuration incl SpiceQueryPlanner as bound in `DataFusionBuilder`
@@ -1148,6 +1181,15 @@ async fn create_scheduler_server(
     let scheduler_metrics_collector = Arc::new(
         metrics_collector::OtelSchedulerMetricsCollector::new(metrics_node_id.clone()),
     );
+
+    // Create the executor stream registry for PollNow broadcasts.
+    // This registry will be shared with the ClusterServiceImpl.
+    let executor_stream_registry = ExecutorControlStreamRegistry::new();
+
+    // Create callback that broadcasts PollNow to all connected executors when work is available.
+    let registry_for_callback = executor_stream_registry.clone();
+    let on_work_available: Arc<dyn Fn(&str) + Send + Sync> =
+        Arc::new(move |reason: &str| registry_for_callback.broadcast_poll_now(reason));
 
     // Create InMemoryClusterState first so we can reference it in the config_producer
     let cluster_state: Arc<dyn ClusterState> = Arc::new(InMemoryClusterState::default());
@@ -1264,6 +1306,7 @@ async fn create_scheduler_server(
 
         override_create_grpc_client_endpoint,
         override_metrics_collector: Some(scheduler_metrics_collector),
+        on_work_available: Some(on_work_available),
         ..Default::default()
     };
 
@@ -1280,13 +1323,15 @@ async fn create_scheduler_server(
         shuffle_location_display
     );
 
-    scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
+    let scheduler = scheduler_process::create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(
         cluster,
         scheduler_config.into(),
     )
     .await
     .boxed()
-    .context(FailedToStartClusterSchedulerSnafu)
+    .context(FailedToStartClusterSchedulerSnafu)?;
+
+    Ok((scheduler, executor_stream_registry))
 }
 
 /// Creates a gRPC client for the scheduler's internal cluster service.

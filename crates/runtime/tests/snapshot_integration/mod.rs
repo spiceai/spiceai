@@ -44,7 +44,7 @@ use object_store::{
 };
 use runtime::{Runtime, status::ComponentStatus};
 use runtime_acceleration::snapshot::{
-    AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
+    AccelerationEngine, ForceCreate, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
 use serde_json::{Value, json};
 use spicepod::acceleration::{
@@ -991,7 +991,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                     let mutex = Arc::new(Mutex::new(()));
                     let lock_guard = mutex.lock_owned().await;
                     manager_clone
-                        .create_snapshot(&schema, lock_guard, None)
+                        .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
                         .await
                         .map(|opt| opt.expect("snapshot should be created"))
                 }
@@ -1104,7 +1104,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let lock_guard = mutex.lock_owned().await;
 
             manager
-                .create_snapshot(&schema, lock_guard, None)
+                .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
                 .await
                 .context("Creating modified snapshot after deleting data")?
                 .context("Snapshot should be created")?;
@@ -1314,7 +1314,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             let lock_guard = mutex.lock_owned().await;
 
             let compacted_location = manager_with_compaction
-                .create_snapshot(&schema, lock_guard, None)
+                .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
                 .await
                 .context("Creating snapshot with compaction enabled")?
                 .context("Snapshot should be created")?;
@@ -1494,7 +1494,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             let lock_guard = Arc::clone(&mutex).lock_owned().await;
 
             let first_result = manager
-                .create_snapshot(&schema, lock_guard, last_updated_at)
+                .create_snapshot(&schema, lock_guard, last_updated_at, ForceCreate(false))
                 .await
                 .context("Creating first snapshot with OnChange policy")?;
 
@@ -1538,7 +1538,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             // Try to create another snapshot with the SAME last_updated_at
             let lock_guard = Arc::clone(&mutex).lock_owned().await;
             let second_result = manager
-                .create_snapshot(&schema, lock_guard, last_updated_at)
+                .create_snapshot(&schema, lock_guard, last_updated_at, ForceCreate(false))
                 .await
                 .context("Attempting second snapshot with same last_updated_at")?;
 
@@ -1564,7 +1564,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             let new_last_updated_at = Some(99999i64);
             let lock_guard = Arc::clone(&mutex).lock_owned().await;
             let third_result = manager
-                .create_snapshot(&schema, lock_guard, new_last_updated_at)
+                .create_snapshot(&schema, lock_guard, new_last_updated_at, ForceCreate(false))
                 .await
                 .context("Creating snapshot with new last_updated_at")?;
 
@@ -1949,14 +1949,17 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime(Arc::clone(&runtime)).await?;
 
-            // Verify no snapshots exist yet
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // Verify initial snapshot exists
             let initial_snapshots = context
                 .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
                 .await
                 .unwrap_or_default();
-            assert!(
-                initial_snapshots.is_empty(),
-                "Should start with no snapshots in this fresh context"
+            assert_eq!(
+                initial_snapshots.len(),
+                1,
+                "Exactly one snapshot should be created"
             );
 
             runtime
@@ -1993,7 +1996,389 @@ async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
             assert_eq!(
                 snapshots_after.len(),
                 4,
-                "Exactly one snapshot should be created"
+                "Exactly fours snapshots should be created"
+            );
+
+            runtime.shutdown().await;
+            context.cleanup().await
+        })
+        .await
+}
+
+/// Test that Cayenne datasets with inconsistent snapshot settings are rejected.
+///
+/// When multiple Cayenne datasets share the same metadata directory, they must all have
+/// the same snapshot configuration (either all enabled or all disabled). This test verifies
+/// that the runtime correctly detects and rejects inconsistent configurations - the datasets
+/// with inconsistent settings will not be loaded.
+#[tokio::test]
+async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<()> {
+    let _guard = init_tracing(Some(
+        "integration=debug,runtime::dataaccelerator=trace,info",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let temp_dir =
+                TempDir::new().context("Creating temporary directory for Cayenne files")?;
+
+            // Create sample CSV files for two datasets
+            let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+            let sample_source_path1 = temp_dir.path().join("taxi_sample1.csv");
+            let sample_source_path2 = temp_dir.path().join("taxi_sample2.csv");
+            fs::write(&sample_source_path1, sample_csv_contents)
+                .await
+                .context("Writing sample CSV for dataset 1")?;
+            fs::write(&sample_source_path2, sample_csv_contents)
+                .await
+                .context("Writing sample CSV for dataset 2")?;
+
+            let dataset_from1 = format!("file://{}", sample_source_path1.display());
+            let dataset_from2 = format!("file://{}", sample_source_path2.display());
+
+            // Create data directories for cayenne (separate data dirs, but shared metadata dir)
+            let data_dir1 = temp_dir.path().join("cayenne_data1");
+            let data_dir2 = temp_dir.path().join("cayenne_data2");
+            let metadata_dir = temp_dir.path().join("cayenne_metadata");
+
+            fs::create_dir_all(&data_dir1)
+                .await
+                .context("Creating data directory 1")?;
+            fs::create_dir_all(&data_dir2)
+                .await
+                .context("Creating data directory 2")?;
+            fs::create_dir_all(&metadata_dir)
+                .await
+                .context("Creating metadata directory")?;
+
+            let dataset_params = HashMap::from([
+                ("file_format".to_string(), "csv".to_string()),
+                ("csv_has_header".to_string(), "true".to_string()),
+            ]);
+
+            // Build dataset 1 WITH snapshots enabled
+            let mut dataset1 = Dataset::new(&dataset_from1, "taxi_trips_1");
+            dataset1.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset1.acceleration = Some(Acceleration {
+                mode: Mode::File,
+                engine: Some("cayenne".to_string()),
+                params: Some(Params::from_string_map(HashMap::from([
+                    (
+                        "cayenne_file_path".to_string(),
+                        data_dir1.to_string_lossy().to_string(),
+                    ),
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        metadata_dir.to_string_lossy().to_string(),
+                    ),
+                ]))),
+                refresh_on_startup: RefreshOnStartup::Auto,
+                snapshots: DatasetSnapshotBehavior::Enabled, // ENABLED
+                ..Default::default()
+            });
+
+            // Build dataset 2 WITHOUT snapshots (disabled)
+            let mut dataset2 = Dataset::new(&dataset_from2, "taxi_trips_2");
+            dataset2.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset2.acceleration = Some(Acceleration {
+                mode: Mode::File,
+                engine: Some("cayenne".to_string()),
+                params: Some(Params::from_string_map(HashMap::from([
+                    (
+                        "cayenne_file_path".to_string(),
+                        data_dir2.to_string_lossy().to_string(),
+                    ),
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        metadata_dir.to_string_lossy().to_string(),
+                    ),
+                ]))),
+                refresh_on_startup: RefreshOnStartup::Auto,
+                snapshots: DatasetSnapshotBehavior::Disabled, // DISABLED - inconsistent!
+                ..Default::default()
+            });
+
+            // Parse the datasets to create acceleration sources
+            let app = AppBuilder::new("snapshot_inconsistent_test")
+                .with_dataset(dataset1)
+                .with_dataset(dataset2)
+                .build();
+
+            configure_test_datafusion();
+
+            // Build the runtime - the validation happens during dataset loading
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            // Give the runtime time to attempt dataset loading
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // The datasets should NOT be registered because validation failed
+            // Check that neither dataset is available (the validation rejects all datasets
+            // with inconsistent configuration)
+            let taxi_trips_1_result = runtime
+                .datafusion()
+                .query_builder("SELECT COUNT(*) FROM taxi_trips_1")
+                .build()
+                .run()
+                .await;
+            let taxi_trips_2_result = runtime
+                .datafusion()
+                .query_builder("SELECT COUNT(*) FROM taxi_trips_2")
+                .build()
+                .run()
+                .await;
+
+            // Both queries should fail because the datasets were not loaded
+            // due to the validation error
+            assert!(
+                taxi_trips_1_result.is_err() || taxi_trips_2_result.is_err(),
+                "Expected at least one dataset to be unavailable due to validation failure. \
+                 taxi_trips_1: {:?}, taxi_trips_2: {:?}",
+                taxi_trips_1_result.is_ok(),
+                taxi_trips_2_result.is_ok()
+            );
+
+            runtime.shutdown().await;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Test for issue #9060: Snapshots bootstrapping fails with multiple cayenne accelerations.
+///
+/// When having multiple cayenne accelerations with snapshots enabled, bootstrapping fails
+/// because all datasets share the same metadata directory. When extracting the tar archive
+/// for the second dataset, it tries to unpack the metadata files (e.g. `cayenne.db-wal`)
+/// which already exist from the first dataset's extraction.
+///
+/// This test verifies that multiple cayenne datasets can bootstrap from snapshots
+/// without conflicting on shared metadata files.
+#[tokio::test]
+async fn snapshot_int_test11_cayenne_multiple_datasets_bootstrap() -> Result<()> {
+    let _guard = init_tracing(Some(
+        "integration=debug,runtime_acceleration::snapshot=debug,info",
+    ));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+    test_request_context()
+        .scope(async {
+            // Create S3 context for snapshots
+            let context = SnapshotS3Context::new("snapshot_int_test11_cayenne").await?;
+            let temp_dir =
+                TempDir::new().context("Creating temporary directory for Cayenne files")?;
+
+            // Create sample CSV files for two datasets
+            let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+            let sample_source_path1 = temp_dir.path().join("taxi_sample1.csv");
+            let sample_source_path2 = temp_dir.path().join("taxi_sample2.csv");
+            fs::write(&sample_source_path1, sample_csv_contents)
+                .await
+                .context("Writing sample CSV for dataset 1")?;
+            fs::write(&sample_source_path2, sample_csv_contents)
+                .await
+                .context("Writing sample CSV for dataset 2")?;
+
+            let dataset_from1 = format!("file://{}", sample_source_path1.display());
+            let dataset_from2 = format!("file://{}", sample_source_path2.display());
+
+            // Create data directories for cayenne (separate data dirs, but shared metadata dir)
+            let data_dir1 = temp_dir.path().join("cayenne_data1");
+            let data_dir2 = temp_dir.path().join("cayenne_data2");
+            let metadata_dir = temp_dir.path().join("cayenne_metadata");
+
+            fs::create_dir_all(&data_dir1)
+                .await
+                .context("Creating data directory 1")?;
+            fs::create_dir_all(&data_dir2)
+                .await
+                .context("Creating data directory 2")?;
+            fs::create_dir_all(&metadata_dir)
+                .await
+                .context("Creating metadata directory")?;
+
+            let dataset_params = HashMap::from([
+                ("file_format".to_string(), "csv".to_string()),
+                ("csv_has_header".to_string(), "true".to_string()),
+            ]);
+
+            // Build dataset 1
+            let mut dataset1 = Dataset::new(&dataset_from1, "taxi_trips_1");
+            dataset1.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset1.acceleration = Some(Acceleration {
+                mode: Mode::File,
+                engine: Some("cayenne".to_string()),
+                params: Some(Params::from_string_map(HashMap::from([
+                    (
+                        "cayenne_file_path".to_string(),
+                        data_dir1.to_string_lossy().to_string(),
+                    ),
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        metadata_dir.to_string_lossy().to_string(),
+                    ),
+                ]))),
+                refresh_on_startup: RefreshOnStartup::Auto,
+                snapshots: DatasetSnapshotBehavior::Enabled,
+                snapshots_trigger: Some(SnapshotsTrigger::RefreshComplete),
+                snapshots_creation_policy: SnapshotsCreationPolicy::Always,
+                ..Default::default()
+            });
+
+            // Build dataset 2
+            let mut dataset2 = Dataset::new(&dataset_from2, "taxi_trips_2");
+            dataset2.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset2.acceleration = Some(Acceleration {
+                mode: Mode::File,
+                engine: Some("cayenne".to_string()),
+                params: Some(Params::from_string_map(HashMap::from([
+                    (
+                        "cayenne_file_path".to_string(),
+                        data_dir2.to_string_lossy().to_string(),
+                    ),
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        metadata_dir.to_string_lossy().to_string(),
+                    ),
+                ]))),
+                refresh_on_startup: RefreshOnStartup::Auto,
+                snapshots: DatasetSnapshotBehavior::Enabled,
+                snapshots_trigger: Some(SnapshotsTrigger::RefreshComplete),
+                snapshots_creation_policy: SnapshotsCreationPolicy::Always,
+                ..Default::default()
+            });
+
+            let snapshots = build_snapshots_config(&context, BootstrapOnFailureBehavior::Fallback);
+
+            // First run: create snapshots for both datasets
+            let app = AppBuilder::new("snapshot_int_test11_cayenne_create")
+                .with_snapshots(snapshots.clone())
+                .with_dataset(dataset1.clone())
+                .with_dataset(dataset2.clone())
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            // Capture baseline results for both datasets
+            let baseline1 = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips_1 ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Executing baseline query for dataset 1")?;
+
+            let baseline2 = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips_2 ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Executing baseline query for dataset 2")?;
+
+            let schema = run_query(&runtime, "SELECT * FROM taxi_trips_1 LIMIT 1")
+                .await
+                .context("Retrieving schema")?
+                .first()
+                .map(RecordBatch::schema)
+                .ok_or_else(|| anyhow!("Failed to retrieve schema"))?;
+
+            runtime.shutdown().await;
+
+            // Wait for snapshots to be created for both datasets
+            let snapshot_objects1 = context
+                .wait_for_snapshot_objects("taxi_trips_1", 1, Duration::from_secs(60))
+                .await
+                .context("Waiting for dataset 1 snapshots")?;
+            let snapshot_objects2 = context
+                .wait_for_snapshot_objects("taxi_trips_2", 1, Duration::from_secs(60))
+                .await
+                .context("Waiting for dataset 2 snapshots")?;
+
+            // Build metadata for both datasets
+            let metadata1 =
+                build_metadata_document(&context, "taxi_trips_1", &snapshot_objects1, &schema);
+            let metadata2 =
+                build_metadata_document(&context, "taxi_trips_2", &snapshot_objects2, &schema);
+
+            // Merge both metadata documents
+            let mut combined_metadata = metadata1;
+            if let (Some(combined_obj), Some(meta2_obj)) =
+                (combined_metadata.as_object_mut(), metadata2.as_object())
+            {
+                for (key, value) in meta2_obj {
+                    if key != "format-version"
+                        && key != "location"
+                        && key != "last-updated-ms"
+                    {
+                        combined_obj.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+
+            context
+                .write_metadata(&combined_metadata)
+                .await
+                .context("Writing combined snapshot metadata")?;
+
+            // Clean up local files to force bootstrap from snapshots
+            fs::remove_dir_all(&data_dir1)
+                .await
+                .context("Removing data directory 1")?;
+            fs::remove_dir_all(&data_dir2)
+                .await
+                .context("Removing data directory 2")?;
+            fs::remove_dir_all(&metadata_dir)
+                .await
+                .context("Removing metadata directory")?;
+
+            // Second run: bootstrap from snapshots
+            // This is where the bug manifests - the second dataset fails to bootstrap
+            // because the metadata files from the first dataset's tar extraction conflict
+            let app = AppBuilder::new("snapshot_int_test11_cayenne_bootstrap")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset1)
+                .with_dataset(dataset2)
+                .build();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            // Verify both datasets bootstrapped correctly
+            let bootstrap_results1 = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips_1 ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Querying dataset 1 after bootstrap")?;
+
+            let bootstrap_results2 = run_query(
+                &runtime,
+                "SELECT * FROM taxi_trips_2 ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime LIMIT 1",
+            )
+            .await
+            .context("Querying dataset 2 after bootstrap")?;
+
+            let expected1 = pretty_format_batches(&baseline1)
+                .map(|fmt| fmt.to_string())
+                .context("Formatting baseline 1")?;
+            let actual1 = pretty_format_batches(&bootstrap_results1)
+                .map(|fmt| fmt.to_string())
+                .context("Formatting bootstrap result 1")?;
+            assert_eq!(
+                expected1, actual1,
+                "Dataset 1 bootstrap results should match baseline"
+            );
+
+            let expected2 = pretty_format_batches(&baseline2)
+                .map(|fmt| fmt.to_string())
+                .context("Formatting baseline 2")?;
+            let actual2 = pretty_format_batches(&bootstrap_results2)
+                .map(|fmt| fmt.to_string())
+                .context("Formatting bootstrap result 2")?;
+            assert_eq!(
+                expected2, actual2,
+                "Dataset 2 bootstrap results should match baseline"
             );
 
             runtime.shutdown().await;

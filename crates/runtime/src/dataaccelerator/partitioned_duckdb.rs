@@ -287,10 +287,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         self.is_initialized.store(false, Ordering::Release);
 
-        let partition_by_last = partition_by
-            .last()
-            .context(PartitionByRequiredSnafu)?
-            .clone();
+        ensure!(!partition_by.is_empty(), PartitionByRequiredSnafu);
 
         let source = source.context(ExpectedAccelerationSourceSnafu)?;
 
@@ -302,7 +299,7 @@ impl DataAccelerator for PartitionedDuckDBAccelerator {
         let creator = Arc::new(DuckDBPartitionCreator::new(
             partition_dir(source),
             cmd,
-            partition_by_last,
+            partition_by.clone(),
             Arc::clone(&schema),
         ));
         let table_provider =
@@ -328,7 +325,7 @@ pub(crate) struct DuckDBPartitionCreator {
     cmd: CreateExternalTable,
     duckdb_factory: DuckDBTableProviderFactory,
     partition_dir: PathBuf,
-    partition_by: PartitionedBy,
+    partition_by: Vec<PartitionedBy>,
     schema: SchemaRef,
 }
 
@@ -336,7 +333,7 @@ impl DuckDBPartitionCreator {
     pub(crate) fn new(
         partition_dir: PathBuf,
         cmd: CreateExternalTable,
-        partition_by: PartitionedBy,
+        partition_by: Vec<PartitionedBy>,
         schema: SchemaRef,
     ) -> Self {
         let duckdb_factory = create_factory();
@@ -357,11 +354,16 @@ impl DuckDBPartitionCreator {
     fn add_open(
         &self,
         cmd: &mut CreateExternalTable,
-        partition_value: &ScalarValue,
+        partition_values: &[ScalarValue],
     ) -> Result<String, creator::Error> {
-        let hive_path =
-            to_hive_partition_dir(&[(self.partition_by.clone(), partition_value.clone())])
-                .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
+        let pairings: Vec<(PartitionedBy, ScalarValue)> = self
+            .partition_by
+            .iter()
+            .cloned()
+            .zip(partition_values.iter().cloned())
+            .collect();
+        let hive_path = to_hive_partition_dir(&pairings)
+            .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
         let duckdb_path = self.partition_dir.join(&hive_path);
         if !duckdb_path.is_dir() {
             std::fs::create_dir_all(&duckdb_path)
@@ -379,11 +381,28 @@ impl DuckDBPartitionCreator {
 impl PartitionCreator for DuckDBPartitionCreator {
     async fn create_partition(
         &self,
-        partition_value: ScalarValue,
+        partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
+        if partition_values.is_empty() {
+            return Err(creator::Error::CreatePartition {
+                source: "At least one partition value is required".into(),
+            });
+        }
+
+        if partition_values.len() != self.partition_by.len() {
+            return Err(creator::Error::CreatePartition {
+                source: format!(
+                    "Expected {} partition values but got {}",
+                    self.partition_by.len(),
+                    partition_values.len()
+                )
+                .into(),
+            });
+        }
+
         let mut cmd = self.cmd.clone();
         let duckdb_path = self
-            .add_open(&mut cmd, &partition_value)
+            .add_open(&mut cmd, &partition_values)
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
         tracing::debug!("creating partition at {duckdb_path}");
@@ -393,7 +412,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
             .map_err(|e| creator::Error::CreatePartition { source: e })?;
 
         let partition = Partition {
-            partition_value,
+            partition_values,
             table_provider,
         };
 
@@ -410,25 +429,19 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
         let schema = DFSchema::try_from(Arc::clone(&self.schema))
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
-        let hive_partitions = discover_hive_partitions(
-            &schema,
-            &self.partition_dir,
-            std::slice::from_ref(&self.partition_by),
-        )
-        .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
+        let hive_partitions =
+            discover_hive_partitions(&schema, &self.partition_dir, &self.partition_by)
+                .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
         let mut partitions = Vec::with_capacity(hive_partitions.len());
-        for (mut keys, path) in hive_partitions {
-            if keys.len() != 1 {
+        for (partition_values, path) in hive_partitions {
+            // Only include partitions that have all expected partition columns
+            if partition_values.len() != self.partition_by.len() {
                 continue;
             }
 
-            let Some(partition_value) = keys.pop() else {
-                continue;
-            };
-
             let mut cmd = self.cmd.clone();
-            self.add_open(&mut cmd, &partition_value)
+            self.add_open(&mut cmd, &partition_values)
                 .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
             let duckdb_path = path.display().to_string();
@@ -441,7 +454,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
             partitions.push(Partition {
-                partition_value,
+                partition_values,
                 table_provider,
             });
         }

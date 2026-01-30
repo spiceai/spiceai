@@ -21,12 +21,11 @@ use crate::models::s3_vectors::basic_vector_search_tests;
 use crate::models::{
     create_api_bindings_config, get_mega_science_dataset, get_mega_science_view, http_post,
 };
-use crate::utils::{runtime_ready_check, test_request_context};
+use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 use crate::{DEFAULT_TRACING_MODELS, configure_test_datafusion};
 use crate::{init_tracing, utils::init_tracing_with_task_history};
 use anyhow::Context;
 use app::{App, AppBuilder};
-use arrow::array::RecordBatch;
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use http::HeaderValue;
@@ -293,6 +292,7 @@ pub(crate) fn catalog_page_tpcds_dataset_w_embeddings(
 }
 
 pub async fn start_app(app: App) -> Result<Config, anyhow::Error> {
+    register_test_connectors().await;
     configure_test_datafusion();
     let api_config = create_api_bindings_config();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -338,6 +338,7 @@ pub(crate) async fn run_search_w_explain(
             let http_base_url = format!("http://{}", api_config.http_bind_address);
             let client = spiceai::ClientBuilder::new()
                 .flight_url(format!("http://{}", api_config.flight_bind_address).as_str())
+                .http_url(http_base_url.as_str())
                 .build()
                 .await
                 .unwrap_or_else(|_| {
@@ -378,10 +379,10 @@ pub(crate) async fn run_search_w_explain(
                         insta::assert_json_snapshot!(test_name.clone(), resp?);
 
                         if explain_sql {
-                            let c = client
-                                .query(format!("EXPLAIN {sql}").as_str())
+                            let c: Vec<arrow::record_batch::RecordBatch> = client
+                                .sql(format!("EXPLAIN {sql}").as_str())
                                 .await?
-                                .try_collect::<Vec<RecordBatch>>()
+                                .try_collect()
                                 .await?;
 
                             let mut disp =

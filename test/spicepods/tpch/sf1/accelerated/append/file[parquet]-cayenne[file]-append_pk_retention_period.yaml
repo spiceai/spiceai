@@ -1,0 +1,129 @@
+version: v1
+kind: Spicepod
+name: file[parquet]-cayenne[file]-append_pk_retention_period
+
+refresh_check_interval: &refresh_check_interval 30s
+retention_check_interval: &retention_check_interval 30s
+retention_period: &retention_period 1d
+
+datasets:
+  - from: file:customer.parquet
+    name: customer
+    time_format: timestamptz
+    time_column: c_created_at
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
+      primary_key: c_custkey
+
+  - from: file:lineitem.parquet
+    name: lineitem
+    time_column: l_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
+      primary_key: '(l_orderkey, l_linenumber)'
+
+  - from: file:nation.parquet
+    name: nation
+    time_column: n_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
+      primary_key: n_nationkey
+
+  - from: file:orders.parquet
+    name: orders
+    time_column: o_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
+      primary_key: o_orderkey
+
+  - from: file:part.parquet
+    name: part
+    time_column: p_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
+      primary_key: p_partkey
+
+  - from: file:partsupp.parquet
+    name: partsupp
+    time_column: ps_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
+      primary_key: '(ps_partkey, ps_suppkey)'
+
+  - from: file:region.parquet
+    name: region
+    time_column: r_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
+      primary_key: r_regionkey
+
+  - from: file:supplier.parquet
+    name: supplier
+    time_column: s_created_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: *refresh_check_interval
+      retention_check_enabled: true
+      retention_check_interval: *retention_check_interval
+      retention_period: *retention_period
+      primary_key: s_suppkey
+
