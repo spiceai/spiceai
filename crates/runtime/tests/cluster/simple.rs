@@ -17,7 +17,6 @@ limitations under the License.
 use app::AppBuilder;
 
 use arrow::array::RecordBatch;
-use ballista_scheduler::state::executor_manager::ExecutorManager;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::cluster::ResolvedClusterConfig;
@@ -30,7 +29,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 use test_framework::pki::init_pki;
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::time::{Instant, sleep_until};
 
 use crate::{
     configure_test_datafusion, init_tracing,
@@ -102,30 +101,6 @@ async fn snapshot_names_from_runtime(
         .map_err(|e| anyhow::Error::msg(e.to_string()))
         .expect("Should format batches");
     insta::assert_snapshot!(name, pretty);
-}
-
-async fn wait_for_executor_count(
-    executor_manager: &ExecutorManager,
-    expected: usize,
-    timeout: Duration,
-) -> Result<(), anyhow::Error> {
-    let start = Instant::now();
-    loop {
-        let count = executor_manager
-            .get_executor_state()
-            .await
-            .map_err(|err| anyhow::Error::msg(err.to_string()))?
-            .len();
-        if count == expected {
-            return Ok(());
-        }
-        if start.elapsed() > timeout {
-            return Err(anyhow::Error::msg(format!(
-                "Timed out waiting for {expected} executors; found {count}"
-            )));
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -286,17 +261,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
 
             runtime_ready_check(&scheduler_rt).await;
 
-            let scheduler_server = scheduler_rt
-                .datafusion()
-                .scheduler_server
-                .read()
-                .expect("scheduler server lock")
-                .clone()
-                .expect("scheduler server should be available");
-            let executor_manager = scheduler_server.state.executor_manager.clone();
-
             sleep_until(Instant::now() + Duration::from_secs(1)).await; // let executor connect
-            wait_for_executor_count(&executor_manager, 1, Duration::from_secs(10)).await?;
 
             // Datafusion query will run directly on the scheduler node without any clustering
             snapshot_names_from_runtime(
@@ -313,14 +278,13 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                 scheduler_rt.datafusion(),
             );
 
-            let query_handle = query
+            let query_result = query
                 .build()
-                .submit_distributed("testing_explain")
+                .run_distributed()
                 .await
-                .expect("should submit distributed query");
-
-            let query_result = query_handle.into_stream().await.expect("should get stream");
+                .expect("should run distributed query");
             let results = query_result
+                .data
                 .try_collect::<Vec<RecordBatch>>()
                 .await
                 .expect("should collect results");
@@ -347,14 +311,14 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                 scheduler_rt.datafusion(),
             );
 
-            let query_handle = query
+            let query_result = query
                 .build()
-                .submit_distributed("testing")
+                .run_distributed()
                 .await
-                .expect("should submit distributed query");
+                .expect("should run distributed query");
 
-            let query_result = query_handle.into_stream().await.expect("should get stream");
             let results = query_result
+                .data
                 .try_collect::<Vec<RecordBatch>>()
                 .await
                 .expect("should collect results");
@@ -367,8 +331,6 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
             executor_rt.shutdown().await;
             drop(executor_rt);
             executor_server_thread.abort();
-
-            wait_for_executor_count(&executor_manager, 0, Duration::from_secs(5)).await?;
 
             scheduler_rt.shutdown().await;
             drop(scheduler_rt);

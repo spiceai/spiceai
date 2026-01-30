@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use object_store::UpdateVersion;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Version for job state schema, incremented on breaking changes
@@ -30,7 +30,6 @@ pub const DEFAULT_CHUNK_SIZE: usize = 10_000;
 /// The current status of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum JobStatus {
     /// Job is queued but not yet running
     Pending,
@@ -59,26 +58,11 @@ impl std::fmt::Display for JobStatus {
     }
 }
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub enum JobErrorCode {
-    SchedulerUnavailable,
-    SubmissionFailed,
-    ExecutionFailed,
-    FetchingResultsFailed,
-    Cancelled,
-    ParameterBindingFailed,
-    NotFound,
-    Internal,
-    Timeout,
-}
-
 /// Error details when a job fails.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobError {
     /// Error code categorizing the failure
-    pub error_code: JobErrorCode,
+    pub error_code: String,
     /// Human-readable error message
     pub message: String,
     /// SQL state code if applicable
@@ -125,8 +109,11 @@ pub struct JobResultManifest {
     pub total_row_count: usize,
     /// Total number of chunks
     pub total_chunk_count: usize,
+    /// Whether results were truncated due to limits
+    pub truncated: bool,
     /// Total size in bytes (approximate)
-    pub total_byte_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_byte_count: Option<usize>,
 }
 
 /// Result information for a completed job.
@@ -152,9 +139,9 @@ pub struct JobState {
     /// Query parameters if any
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
-    /// Node that is scheduling this job
+    /// Node that is executing this job
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub scheduler_node: Option<String>,
+    pub executor_node: Option<String>,
     /// Error details if status is Failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JobError>,
@@ -172,16 +159,9 @@ pub struct JobState {
     /// When results will expire (Unix timestamp ms)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
-    /// Optional timeout for the job in seconds
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<u64>,
-    /// Optional maximum size of results for the job in bytes
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maximum_size: Option<u64>,
-    /// Object store version for conditional writes (e-tag tracking).
-    /// This is not serialized - it's set after reading from object store.
-    #[serde(skip)]
-    pub version: Option<UpdateVersion>,
+    /// Custom labels/metadata
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
 }
 
 impl JobState {
@@ -195,23 +175,21 @@ impl JobState {
             status: JobStatus::Pending,
             sql,
             parameters,
-            scheduler_node: None,
+            executor_node: None,
             error: None,
             result: None,
             created_at_ms: now_ms,
             started_at_ms: None,
             completed_at_ms: None,
             expires_at_ms: None,
-            timeout_seconds: None,
-            maximum_size: None,
-            version: None,
+            labels: HashMap::new(),
         }
     }
 
     /// Transitions job to running state.
     pub fn set_running(&mut self, executor_node: String) {
         self.status = JobStatus::Running;
-        self.scheduler_node = Some(executor_node);
+        self.executor_node = Some(executor_node);
         self.started_at_ms = Some(now_ms_or_zero());
     }
 
@@ -263,18 +241,6 @@ impl JobState {
     #[must_use]
     pub fn succeeded(&self) -> bool {
         self.status == JobStatus::Succeeded
-    }
-
-    #[must_use]
-    pub(crate) fn with_timeout_seconds(mut self, timeout_seconds: Option<u64>) -> Self {
-        self.timeout_seconds = timeout_seconds;
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_maximum_size(mut self, maximum_size: Option<u64>) -> Self {
-        self.maximum_size = maximum_size;
-        self
     }
 }
 
