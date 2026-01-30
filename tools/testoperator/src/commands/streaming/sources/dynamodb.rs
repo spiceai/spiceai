@@ -1151,8 +1151,9 @@ impl DynamoDBStreamingSource for DynamoDbStreamsSource {
 /// This function:
 /// 1. Prefixes the table name in `from` field (e.g., `dynamodb:lineitem` -> `dynamodb:{run_id}_lineitem`)
 /// 2. Sets `acceleration.snapshots` to the specified behavior
-/// 3. Adds `duckdb_file` and `cayenne_file_path` configs for each dataset
+/// 3. Adds engine-specific file path configs (duckdb_file or cayenne_file_path) based on acceleration.engine
 /// 4. Configures runtime snapshots with unique location per config
+/// 5. Uses different paths for checkpoint vs benchmark phases
 fn transform_spicepod(
     mut spicepod: SpicepodDefinition,
     run_id: &str,
@@ -1160,6 +1161,13 @@ fn transform_spicepod(
     snapshot_config: &SnapshotConfig,
     snapshot_behavior: SnapshotBehavior,
 ) -> SpicepodDefinition {
+    // Determine phase suffix for file paths
+    let phase_suffix = match snapshot_behavior {
+        SnapshotBehavior::CreateOnly => "checkpoint",
+        SnapshotBehavior::BootstrapOnly => "benchmark",
+        _ => "unknown",
+    };
+
     // 1. Update dataset `from` field with prefixed table name, keep `name` unchanged
     for dataset in &mut spicepod.datasets {
         if let ComponentOrReference::Component(d) = dataset {
@@ -1169,24 +1177,44 @@ fn transform_spicepod(
                 d.from = format!("dynamodb:{run_id}_{table_name}");
             }
 
-            // Set acceleration snapshot behavior and add file paths
+            // Set acceleration snapshot behavior and add engine-specific file paths
             if let Some(ref mut accel) = d.acceleration {
                 accel.snapshots = snapshot_behavior.clone();
 
-                // Add duckdb_file and cayenne_file_path configs
                 let dataset_name = &d.name;
-                let duckdb_file = format!("/tmp/{run_id}_{config_name}_{dataset_name}.db");
-                let cayenne_dir = format!("/tmp/{run_id}_{config_name}_{dataset_name}_cayenne/");
-
                 let params = accel.params.get_or_insert_with(Params::default);
-                params.data.insert(
-                    "duckdb_file".to_string(),
-                    ParamValue::String(duckdb_file),
-                );
-                params.data.insert(
-                    "cayenne_file_path".to_string(),
-                    ParamValue::String(cayenne_dir),
-                );
+
+                // Check acceleration.engine to determine which path to set
+                // engine: None or "duckdb" -> set duckdb_file
+                // engine: "cayenne" -> set cayenne_file_path
+                let engine = accel.engine.as_deref();
+
+                match engine {
+                    None | Some("duckdb") => {
+                        let duckdb_file = format!(
+                            "/tmp/{run_id}_{config_name}_{dataset_name}_{phase_suffix}.db"
+                        );
+                        params.data.insert(
+                            "duckdb_file".to_string(),
+                            ParamValue::String(duckdb_file),
+                        );
+                    }
+                    Some("cayenne") => {
+                        let cayenne_dir = format!(
+                            "/tmp/{run_id}_{config_name}_{dataset_name}_{phase_suffix}_cayenne/"
+                        );
+                        params.data.insert(
+                            "cayenne_file_path".to_string(),
+                            ParamValue::String(cayenne_dir),
+                        );
+                    }
+                    Some(other) => {
+                        // Unknown engine, log and skip
+                        eprintln!(
+                            "Warning: Unknown acceleration engine '{other}' for dataset {dataset_name}, skipping path configuration"
+                        );
+                    }
+                }
             }
         }
     }

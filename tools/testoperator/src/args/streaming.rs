@@ -20,7 +20,6 @@ use clap::Parser;
 
 use super::CommonArgs;
 use crate::commands::streaming::querysets::QuerySetType;
-use crate::commands::streaming::SourceType;
 
 /// Arguments for DynamoDB streaming ingestion benchmarks (single config).
 ///
@@ -35,10 +34,7 @@ use crate::commands::streaming::SourceType;
 ///
 /// ## Environment Variables
 ///
-/// ### DynamoDB Local (`--source dynamodb-streams-local`)
-/// - `DYNAMODB_LOCAL_PORT`: Port for DynamoDB local (optional, default: 8000)
-///
-/// ### AWS DynamoDB (`--source dynamodb-streams`)
+/// ### AWS DynamoDB
 /// - `DYNAMODB_AWS_REGION`: AWS region (required)
 /// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
 /// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
@@ -56,20 +52,16 @@ pub struct StreamingDynamodbTestArgs {
     #[command(flatten)]
     pub common: CommonArgs,
 
-    /// Streaming source type (e.g., dynamodb-streams-local, dynamodb-streams)
-    #[arg(long, value_enum)]
-    pub source: SourceType,
-
     /// Query set type (e.g., tpch-lineitem). Determines which datasets to load.
     #[arg(long, value_enum)]
     pub queryset: QuerySetType,
 
     /// Scale factor for data generation (e.g., 0.01, 0.1, 1.0)
-    #[arg(long, default_value = "0.01")]
+    #[arg(long, default_value = "1")]
     pub scale_factor: f64,
 
     /// Timeout in seconds to wait for ingestion to complete
-    #[arg(long, default_value = "300")]
+    #[arg(long, default_value = "600")]
     pub ingestion_timeout: u64,
 
     /// Enable health monitoring during ingestion (tracks latency and failures)
@@ -109,7 +101,17 @@ pub struct StreamingDynamodbTestArgs {
 ///
 /// ## Environment Variables
 ///
-/// Same as `streaming-dynamodb` command.
+/// ### AWS DynamoDB
+/// - `DYNAMODB_AWS_REGION`: AWS region (required)
+/// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
+/// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
+/// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for LocalStack)
+///
+/// ### Snapshot Storage (required)
+/// - `SNAPSHOT_S3_LOCATION`: S3 location for snapshots (e.g., `s3://bucket/snapshots/`)
+/// - `SNAPSHOT_S3_ACCESS_KEY_ID`: S3 access key ID (optional)
+/// - `SNAPSHOT_S3_SECRET_ACCESS_KEY`: S3 secret access key (optional)
+/// - `SNAPSHOT_S3_REGION`: S3 region (optional)
 #[derive(Parser, Debug, Clone)]
 #[expect(clippy::struct_excessive_bools)]
 pub struct DispatchDynamodbArgs {
@@ -128,10 +130,6 @@ pub struct DispatchDynamodbArgs {
     /// An optional data directory, to symlink into the spiced instance
     #[arg(short, long)]
     pub data_dir: Option<PathBuf>,
-
-    /// Streaming source type (e.g., dynamodb-streams-local, dynamodb-streams)
-    #[arg(long, value_enum)]
-    pub source: SourceType,
 
     /// Query set type (e.g., tpch-lineitem). Determines which datasets to load.
     #[arg(long, value_enum)]

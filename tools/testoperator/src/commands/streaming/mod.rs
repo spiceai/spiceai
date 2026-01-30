@@ -36,6 +36,3 @@ pub mod verification;
 // Re-export the runner and dispatch entry points
 pub use dynamodb_dispatch::run_dispatch;
 pub use dynamodb_runner::run_dynamodb;
-
-// Re-export types needed by args
-pub use sources::SourceType;

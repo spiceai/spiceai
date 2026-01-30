@@ -45,7 +45,8 @@ use test_framework::opentelemetry_sdk::Resource;
 use test_framework::spiced::{SpicedInstance, StartRequest};
 
 use super::datasets::DatasetType;
-use super::traits::{DynamoDBStreamingSource, SnapshotConfig};
+use super::sources::{DynamoDbConfig, DynamoDbStreamsSource};
+use super::traits::{DynamoDBStreamingSource, SnapshotConfig, StreamingSource};
 use super::utils::{
     load_spicepod_definition, poll_for_all_markers, wait_for_all_marker_deletions,
     write_temp_spicepod, BenchmarkResult,
@@ -77,7 +78,6 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         .to_string();
 
     println!("Starting DynamoDB streaming ingestion benchmark");
-    println!("Source: {}", args.source);
     println!("Query set: {}", args.queryset);
     println!("Config: {config_name}");
     println!("Run ID: {run_id}");
@@ -91,7 +91,8 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     );
 
     // Create source and set table prefix (for marker operations)
-    let mut source = create_dynamodb_source(args)?;
+    let config = DynamoDbConfig::from_env()?;
+    let mut source = DynamoDbStreamsSource::new(config);
     source.set_table_prefix(run_id.clone());
 
     let snapshot_config = build_snapshot_config().ok_or_else(|| {
@@ -150,7 +151,6 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
             KeyValue::new("type", "streaming_benchmark"),
             KeyValue::new("config_name", config_name.clone()),
             KeyValue::new("run_id", run_id.clone()),
-            KeyValue::new("source", args.source.to_string()),
             KeyValue::new("queryset", args.queryset.to_string()),
             KeyValue::new("scale_factor", args.scale_factor.to_string()),
             KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
@@ -284,13 +284,6 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     );
 
     Ok(())
-}
-
-/// Create a DynamoDB streaming source based on the arguments.
-fn create_dynamodb_source(
-    args: &StreamingDynamodbTestArgs,
-) -> Result<Box<dyn DynamoDBStreamingSource>> {
-    args.source.create_dynamodb()
 }
 
 /// Build snapshot configuration from environment variables.

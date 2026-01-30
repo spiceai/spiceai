@@ -52,7 +52,8 @@ use test_framework::spiced::{SpicedInstance, StartRequest};
 use super::datasets::DatasetType;
 use super::dynamodb_runner::build_snapshot_config;
 use super::mutations;
-use super::traits::{DynamoDBStreamingSource, SnapshotConfig, StreamingDataset};
+use super::sources::{DynamoDbConfig, DynamoDbStreamsSource};
+use super::traits::{DynamoDBStreamingSource, SnapshotConfig, StreamingDataset, StreamingSource};
 use super::utils::{
     generate_run_id, load_spicepod_definition, poll_for_all_markers, poll_for_all_snapshots,
     skip_first_row, wait_for_all_marker_deletions, write_temp_spicepod,
@@ -74,7 +75,6 @@ pub async fn run_dispatch(args: &DispatchDynamodbArgs) -> Result<()> {
     }
 
     println!("Starting DynamoDB streaming dispatch");
-    println!("Source: {}", args.source);
     println!("Query set: {}", args.queryset);
     println!("Configs: {}", spicepod_paths.len());
     println!(
@@ -91,8 +91,9 @@ pub async fn run_dispatch(args: &DispatchDynamodbArgs) -> Result<()> {
     let run_id = generate_run_id();
     println!("Generated run ID: {run_id}");
 
-    // Create source and set table prefix
-    let mut source = args.source.create_dynamodb()?;
+    // Create DynamoDB source from environment variables
+    let config = DynamoDbConfig::from_env()?;
+    let mut source = DynamoDbStreamsSource::new(config);
     source.set_table_prefix(run_id.clone());
 
     // Check if snapshots are configured (required for DynamoDB)
@@ -312,7 +313,6 @@ fn trigger_workflow(
     cmd.args(["-f", &format!("run_id={run_id}")]);
     cmd.args(["-f", &format!("config_name={config_name}")]);
     cmd.args(["-f", &format!("spicepod_path={}", spicepod_path.display())]);
-    cmd.args(["-f", &format!("source={}", args.source)]);
     cmd.args(["-f", &format!("queryset={}", args.queryset)]);
     cmd.args(["-f", &format!("scale_factor={}", args.scale_factor)]);
     cmd.args(["-f", &format!("ingestion_timeout={}", args.ingestion_timeout)]);
