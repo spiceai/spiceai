@@ -554,7 +554,10 @@ mod tests {
         assert_eq!(Value::String("hello".into()).as_str(), Some("hello"));
         assert_eq!(Value::Number(Number::PosInt(42)).as_u64(), Some(42));
         assert_eq!(Value::Number(Number::NegInt(-5)).as_i64(), Some(-5));
-        assert!((Value::Number(Number::Float(3.14)).as_f64().unwrap() - 3.14).abs() < f64::EPSILON);
+        let float_val = Value::Number(Number::Float(3.125))
+            .as_f64()
+            .expect("should be f64");
+        assert!((float_val - 3.125).abs() < f64::EPSILON);
     }
 
     #[test]

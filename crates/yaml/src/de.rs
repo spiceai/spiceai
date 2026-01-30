@@ -970,13 +970,13 @@ simple: shallow
     #[test]
     fn test_parse_yaml_invalid_syntax() {
         let result = parse_yaml("key: [unclosed");
-        assert!(result.is_err());
+        let _ = result.expect_err("should fail on invalid YAML");
     }
 
     #[test]
     fn test_parse_yaml_multi_invalid_syntax() {
         let result = parse_yaml_multi("---\nvalid: ok\n---\nkey: [unclosed");
-        assert!(result.is_err());
+        let _ = result.expect_err("should fail on invalid YAML");
     }
 
     #[test]

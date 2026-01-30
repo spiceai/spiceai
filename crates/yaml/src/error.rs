@@ -65,7 +65,7 @@ impl Location {
 }
 
 impl Error {
-    #[expect(dead_code)]
+    #[expect(dead_code, reason = "may be used in the future")]
     pub(crate) fn parse(msg: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Parse(msg.into()),

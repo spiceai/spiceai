@@ -448,17 +448,17 @@ mod tests {
 
     #[test]
     fn test_serialize_primitives() {
-        assert_eq!(true.serialize(Serializer).unwrap(), Value::Bool(true));
+        assert_eq!(true.serialize(Serializer).expect("test"), Value::Bool(true));
         assert_eq!(
-            42u64.serialize(Serializer).unwrap(),
+            42u64.serialize(Serializer).expect("test"),
             Value::Number(Number::PosInt(42))
         );
         assert_eq!(
-            (-10i64).serialize(Serializer).unwrap(),
+            (-10i64).serialize(Serializer).expect("test"),
             Value::Number(Number::NegInt(-10))
         );
         assert_eq!(
-            "hello".serialize(Serializer).unwrap(),
+            "hello".serialize(Serializer).expect("test"),
             Value::String("hello".into())
         );
     }
@@ -466,11 +466,11 @@ mod tests {
     #[test]
     fn test_serialize_option() {
         assert_eq!(
-            Option::<i32>::None.serialize(Serializer).unwrap(),
+            Option::<i32>::None.serialize(Serializer).expect("test"),
             Value::Null
         );
         assert_eq!(
-            Some(42i64).serialize(Serializer).unwrap(),
+            Some(42i64).serialize(Serializer).expect("test"),
             Value::Number(Number::PosInt(42))
         );
     }
@@ -478,9 +478,9 @@ mod tests {
     #[test]
     fn test_serialize_sequence() {
         let vec = vec![1u64, 2, 3];
-        let value = vec.serialize(Serializer).unwrap();
+        let value = vec.serialize(Serializer).expect("test");
         assert!(value.is_sequence());
-        let seq = value.as_sequence().unwrap();
+        let seq = value.as_sequence().expect("test");
         assert_eq!(seq.len(), 3);
         assert_eq!(seq[0].as_u64(), Some(1));
         assert_eq!(seq[1].as_u64(), Some(2));
@@ -499,7 +499,7 @@ mod tests {
             name: "Alice".into(),
             age: 30,
         };
-        let value = person.serialize(Serializer).unwrap();
+        let value = person.serialize(Serializer).expect("test");
         assert!(value.is_mapping());
         assert_eq!(value.get("name").and_then(Value::as_str), Some("Alice"));
         assert_eq!(value.get("age").and_then(Value::as_u64), Some(30));
@@ -516,7 +516,7 @@ mod tests {
         }
 
         let color = Color::Red;
-        let value = color.serialize(Serializer).unwrap();
+        let value = color.serialize(Serializer).expect("test");
         assert_eq!(value.as_str(), Some("Red"));
     }
 
@@ -537,9 +537,9 @@ mod tests {
             inner: Inner { value: 42 },
             name: "test".into(),
         };
-        let value = outer.serialize(Serializer).unwrap();
+        let value = outer.serialize(Serializer).expect("test");
         assert!(value.is_mapping());
-        assert!(value.get("inner").unwrap().is_mapping());
+        assert!(value.get("inner").expect("test").is_mapping());
         assert_eq!(
             value
                 .get("inner")
@@ -555,7 +555,7 @@ mod tests {
         let mut map = Mapping::new();
         map.insert(Value::String("key".into()), Value::String("value".into()));
         let value = Value::Mapping(map);
-        let yaml = emit_yaml(&value).unwrap();
+        let yaml = emit_yaml(&value).expect("test");
         assert!(yaml.contains("key:"));
         assert!(yaml.contains("value"));
     }
@@ -582,16 +582,16 @@ mod tests {
         map.insert("one".into(), 1);
         map.insert("two".into(), 2);
 
-        let value = map.serialize(Serializer).unwrap();
+        let value = map.serialize(Serializer).expect("test");
         assert!(value.is_mapping());
     }
 
     #[test]
     fn test_serialize_tuple() {
         let tuple = (1u64, "hello", true);
-        let value = tuple.serialize(Serializer).unwrap();
+        let value = tuple.serialize(Serializer).expect("test");
         assert!(value.is_sequence());
-        let seq = value.as_sequence().unwrap();
+        let seq = value.as_sequence().expect("test");
         assert_eq!(seq.len(), 3);
     }
 }
