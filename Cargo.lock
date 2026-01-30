@@ -11793,6 +11793,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "object_store_occ"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "object_store",
+ "parking_lot 0.12.5",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "octocrab"
 version = "0.47.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14827,6 +14841,7 @@ dependencies = [
  "notify",
  "ns_lookup",
  "object_store",
+ "object_store_occ",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
