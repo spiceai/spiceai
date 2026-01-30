@@ -14483,6 +14483,7 @@ dependencies = [
  "notify",
  "ns_lookup",
  "object_store",
+ "object_store_occ",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",

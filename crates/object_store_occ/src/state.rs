@@ -269,6 +269,16 @@ where
         self.cache.read().get(key).map(|entry| entry.value.clone())
     }
 
+    /// Returns all cached key-value pairs.
+    #[must_use]
+    pub fn cached_entries(&self) -> HashMap<String, T> {
+        self.cache
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.value.clone()))
+            .collect()
+    }
+
     /// List all keys with the configured prefix.
     ///
     /// # Errors

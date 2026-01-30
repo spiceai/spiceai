@@ -48,4 +48,22 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Convert this error into an `object_store::Error`, by either retrieving the internal
+    /// `object_store::Error`, or providing a generic error.
+    pub fn into_object_store(self, store: &'static str) -> object_store::Error {
+        match self {
+            Error::Serialization { source, .. } => object_store::Error::Generic {
+                store,
+                source: Box::new(source),
+            },
+            Error::Deserialization { source, .. } => object_store::Error::Generic {
+                store,
+                source: Box::new(source),
+            },
+            Error::ObjectStore { source, .. } => source,
+        }
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;

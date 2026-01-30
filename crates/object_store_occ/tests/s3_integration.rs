@@ -582,3 +582,60 @@ async fn test_concurrent_async_writers_with_retry() {
         "Should have at least 10 total attempts"
     );
 }
+
+/// Tests that an update fails with `Conflict` when an external process modifies the object
+/// between our `get()` (which caches the ETag) and `update()` calls.
+/// This verifies S3's conditional write mechanism (If-Match headers) at the protocol level.
+#[tokio::test]
+async fn test_update_races_with_external_write() {
+    let store = create_store();
+    let prefix = get_test_prefix();
+
+    let state: ObjectState<TestRecord> =
+        ObjectState::new(Arc::clone(&store)).with_prefix(format!("{prefix}race/"));
+
+    let initial = TestRecord {
+        id: "item".to_string(),
+        version: 1,
+        data: "initial".to_string(),
+    };
+
+    // Insert and cache ETag
+    state
+        .insert("item", &initial)
+        .await
+        .expect("insert failed");
+    let _ = state.get("item").await.expect("get failed"); // Cache ETag
+
+    // External write directly to S3 (simulates another process bypassing ObjectState)
+    let path = object_store::path::Path::from(format!("{prefix}race/item.json"));
+    let external_record = TestRecord {
+        id: "item".to_string(),
+        version: 99,
+        data: "external modification".to_string(),
+    };
+    let payload = serde_json::to_vec(&external_record).expect("serialize failed");
+    store
+        .put(&path, payload.into())
+        .await
+        .expect("external put failed");
+
+    // Our update should fail with Conflict (ETag mismatch from external write)
+    let our_update = TestRecord {
+        id: "item".to_string(),
+        version: 2,
+        data: "our update".to_string(),
+    };
+    let result = state
+        .update("item", &our_update)
+        .await
+        .expect("update call failed");
+
+    match result {
+        UpdateResult::Conflict { current } => {
+            assert_eq!(current.version, 99, "Should see external modification");
+            assert_eq!(current.data, "external modification");
+        }
+        other => panic!("Expected Conflict due to external write, got {other:?}"),
+    }
+}
