@@ -144,6 +144,7 @@ pub(crate) fn parse_yaml(s: &str) -> Result<Value> {
 /// # Errors
 ///
 /// Returns an error if the YAML string is invalid.
+#[cfg(test)]
 pub(crate) fn parse_yaml_multi(s: &str) -> Result<Vec<Value>> {
     let docs = YamlLoader::load_from_str(s)?;
     Ok(docs.into_iter().map(yaml_to_value).collect())

@@ -448,17 +448,20 @@ mod tests {
 
     #[test]
     fn test_serialize_primitives() {
-        assert_eq!(true.serialize(Serializer).expect("test"), Value::Bool(true));
         assert_eq!(
-            42u64.serialize(Serializer).expect("test"),
+            true.serialize(Serializer).expect("serialize bool"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            42u64.serialize(Serializer).expect("serialize u64"),
             Value::Number(Number::PosInt(42))
         );
         assert_eq!(
-            (-10i64).serialize(Serializer).expect("test"),
+            (-10i64).serialize(Serializer).expect("serialize i64"),
             Value::Number(Number::NegInt(-10))
         );
         assert_eq!(
-            "hello".serialize(Serializer).expect("test"),
+            "hello".serialize(Serializer).expect("serialize str"),
             Value::String("hello".into())
         );
     }
@@ -466,11 +469,13 @@ mod tests {
     #[test]
     fn test_serialize_option() {
         assert_eq!(
-            Option::<i32>::None.serialize(Serializer).expect("test"),
+            Option::<i32>::None
+                .serialize(Serializer)
+                .expect("serialize None"),
             Value::Null
         );
         assert_eq!(
-            Some(42i64).serialize(Serializer).expect("test"),
+            Some(42i64).serialize(Serializer).expect("serialize Some"),
             Value::Number(Number::PosInt(42))
         );
     }
@@ -478,9 +483,9 @@ mod tests {
     #[test]
     fn test_serialize_sequence() {
         let vec = vec![1u64, 2, 3];
-        let value = vec.serialize(Serializer).expect("test");
+        let value = vec.serialize(Serializer).expect("serialize vec");
         assert!(value.is_sequence());
-        let seq = value.as_sequence().expect("test");
+        let seq = value.as_sequence().expect("should be sequence");
         assert_eq!(seq.len(), 3);
         assert_eq!(seq[0].as_u64(), Some(1));
         assert_eq!(seq[1].as_u64(), Some(2));
@@ -499,7 +504,7 @@ mod tests {
             name: "Alice".into(),
             age: 30,
         };
-        let value = person.serialize(Serializer).expect("test");
+        let value = person.serialize(Serializer).expect("serialize struct");
         assert!(value.is_mapping());
         assert_eq!(value.get("name").and_then(Value::as_str), Some("Alice"));
         assert_eq!(value.get("age").and_then(Value::as_u64), Some(30));
@@ -516,7 +521,7 @@ mod tests {
         }
 
         let color = Color::Red;
-        let value = color.serialize(Serializer).expect("test");
+        let value = color.serialize(Serializer).expect("serialize enum");
         assert_eq!(value.as_str(), Some("Red"));
     }
 
@@ -537,9 +542,9 @@ mod tests {
             inner: Inner { value: 42 },
             name: "test".into(),
         };
-        let value = outer.serialize(Serializer).expect("test");
+        let value = outer.serialize(Serializer).expect("serialize nested");
         assert!(value.is_mapping());
-        assert!(value.get("inner").expect("test").is_mapping());
+        assert!(value.get("inner").expect("should have inner").is_mapping());
         assert_eq!(
             value
                 .get("inner")
@@ -555,7 +560,7 @@ mod tests {
         let mut map = Mapping::new();
         map.insert(Value::String("key".into()), Value::String("value".into()));
         let value = Value::Mapping(map);
-        let yaml = emit_yaml(&value).expect("test");
+        let yaml = emit_yaml(&value).expect("emit yaml");
         assert!(yaml.contains("key:"));
         assert!(yaml.contains("value"));
     }
@@ -582,16 +587,16 @@ mod tests {
         map.insert("one".into(), 1);
         map.insert("two".into(), 2);
 
-        let value = map.serialize(Serializer).expect("test");
+        let value = map.serialize(Serializer).expect("serialize map");
         assert!(value.is_mapping());
     }
 
     #[test]
     fn test_serialize_tuple() {
         let tuple = (1u64, "hello", true);
-        let value = tuple.serialize(Serializer).expect("test");
+        let value = tuple.serialize(Serializer).expect("serialize tuple");
         assert!(value.is_sequence());
-        let seq = value.as_sequence().expect("test");
+        let seq = value.as_sequence().expect("should be sequence");
         assert_eq!(seq.len(), 3);
     }
 }
