@@ -25,7 +25,9 @@ use crate::accelerated_table::{
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::{Acceleration, Engine, RefreshMode};
+use crate::component::dataset::acceleration::{
+    Acceleration, Engine, RefreshMode as RuntimeRefreshMode,
+};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
@@ -35,7 +37,7 @@ use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout}
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
-use crate::dataconnector::{DataConnector, DataConnectorError};
+use crate::dataconnector::{ConnectorFederatedTable, DataConnector, DataConnectorError};
 use crate::datafusion::query::Query;
 use crate::dataupdate::{
     DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
@@ -46,6 +48,7 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use connector_traits::RefreshMode as ConnectorRefreshMode;
 
 use {
     crate::cluster::{ExecutorControlStreamRegistry, ResolvedClusterConfig},
@@ -505,6 +508,7 @@ impl DataFusion {
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
     ///
     /// This method is generally used for tables that are created by the Spice runtime.
+    #[expect(clippy::result_large_err)]
     pub fn register_table_as_writable_and_with_schema(
         &self,
         table_name: TableReference,
@@ -657,6 +661,7 @@ impl DataFusion {
         }
     }
 
+    #[expect(clippy::result_large_err)]
     pub fn mark_catalog_writable(&self, catalog_name: &str) -> Result<()> {
         tracing::warn!(
             "Access mode 'read_write' is enabled for catalog {catalog_name}. This feature is currently in preview."
@@ -668,6 +673,7 @@ impl DataFusion {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err)]
     pub fn mark_dataset_writable(&self, dataset_name: &TableReference) -> Result<()> {
         tracing::warn!(
             "Access mode 'read_write' is enabled for dataset {dataset_name}. This feature is currently in preview."
@@ -764,7 +770,7 @@ impl DataFusion {
         if let Some(deferred_registration) = deferred_tables.get(&table_reference.to_string()) {
             let read_provider = deferred_registration
                 .connector
-                .read_provider(&deferred_registration.dataset)
+                .read_provider(deferred_registration.dataset.as_ref())
                 .await
                 .context(UnableToResolveTableProviderSnafu)?;
 
@@ -825,7 +831,7 @@ impl DataFusion {
 
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
         let read_provider = sink_connector
-            .read_provider(&pending_registration.dataset)
+            .read_provider(pending_registration.dataset.as_ref())
             .await
             .context(UnableToResolveTableProviderSnafu)?;
         let federated_table = FederatedTable::new_unchecked(read_provider);
@@ -1093,8 +1099,9 @@ impl DataFusion {
             source_schema
         };
 
-        let refresh_mode = source.resolve_refresh_mode(acceleration_settings.refresh_mode);
-        if refresh_mode == RefreshMode::Caching {
+        let refresh_mode =
+            source.resolve_refresh_mode(acceleration_settings.refresh_mode.map(Into::into));
+        if refresh_mode == ConnectorRefreshMode::Caching {
             let connector = dataset.source();
             let is_http_connector =
                 connector.eq_ignore_ascii_case("http") || connector.eq_ignore_ascii_case("https");
@@ -1142,7 +1149,7 @@ impl DataFusion {
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         // For caching mode, we always start ready since it fetches data on-demand.
-        let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching);
+        let mut initial_load_complete = matches!(refresh_mode, ConnectorRefreshMode::Caching);
         if initial_load_complete {
             // Caching mode datasets are always ready immediately
             self.runtime_status
@@ -1154,7 +1161,7 @@ impl DataFusion {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
             // snapshotting enabled, we delay readiness until the first refresh completes so that
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
-            let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
+            let delay_initial_ready = matches!(refresh_mode, ConnectorRefreshMode::Append)
                 && dataset.time_column.is_some()
                 && acceleration_settings.snapshot_behavior.bootstrap_enabled();
 
@@ -1165,7 +1172,7 @@ impl DataFusion {
             }
         }
 
-        let mut refresh = Refresh::new(refresh_mode).with_retry(
+        let mut refresh = Refresh::new(refresh_mode.into()).with_retry(
             dataset.refresh_retry_enabled(),
             dataset.refresh_retry_max_attempts(),
         );
@@ -1256,7 +1263,7 @@ impl DataFusion {
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
         // For caching mode, set the TTL (max_age) and stale_while_revalidate from params
-        if refresh_mode == RefreshMode::Caching {
+        if refresh_mode == ConnectorRefreshMode::Caching {
             // Check for conflicting stale_while_revalidate configuration
             if acceleration_settings
                 .caching_stale_while_revalidate_ttl
@@ -1288,7 +1295,7 @@ impl DataFusion {
                     if let Some(snapshot_config) = build_snapshot_creation_config(
                         dataset,
                         &acceleration_settings,
-                        refresh_mode,
+                        refresh_mode.into(),
                         layout.clone(),
                     )
                     .await?
@@ -1329,7 +1336,8 @@ impl DataFusion {
 
         // Caching mode requires federation to be disabled so that queries go through
         // AcceleratedTable::scan to trigger the cache miss/hit logic
-        if acceleration_settings.disable_federation || matches!(refresh_mode, RefreshMode::Caching)
+        if acceleration_settings.disable_federation
+            || matches!(refresh_mode, ConnectorRefreshMode::Caching)
         {
             accelerated_table_builder.disable_federation();
         }
@@ -1346,8 +1354,11 @@ impl DataFusion {
             accelerated_table_builder.metrics(metrics.clone());
         }
 
-        if refresh_mode == RefreshMode::Changes {
-            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
+        if refresh_mode == ConnectorRefreshMode::Changes {
+            let changes_stream = source.changes_stream(
+                Arc::clone(&source_table_provider) as Arc<dyn ConnectorFederatedTable>,
+                dataset,
+            );
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
@@ -1356,7 +1367,7 @@ impl DataFusion {
 
         // For append mode without time_column, check if source provides append_stream
         // Skip this check for Cayenne which has its own validation (supports primary_key or time_column)
-        if refresh_mode == RefreshMode::Append
+        if refresh_mode == ConnectorRefreshMode::Append
             && dataset.time_column.is_none()
             && acceleration_settings.engine != Engine::Cayenne
         {
@@ -1504,7 +1515,7 @@ impl DataFusion {
         let notifier = accelerated_table.refresher().on_complete_notification();
 
         source
-            .on_accelerated_table_registration(&dataset, &mut accelerated_table)
+            .on_accelerated_table_registration(dataset.as_ref(), &mut accelerated_table)
             .await
             .context(AccelerationRegistrationSnafu)?;
 
@@ -1685,6 +1696,7 @@ impl DataFusion {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err)]
     pub(crate) fn register_view(
         self: &Arc<Self>,
         view: Arc<View>,
@@ -1848,7 +1860,7 @@ impl DataFusion {
             initial_load_complete = true;
         }
 
-        let mut refresh = Refresh::new(RefreshMode::Full).with_retry(
+        let mut refresh = Refresh::new(RuntimeRefreshMode::Full).with_retry(
             view.refresh_retry_enabled(),
             view.refresh_retry_max_attempts(),
         );
@@ -1974,6 +1986,7 @@ impl DataFusion {
             .collect_vec()
     }
 
+    #[expect(clippy::result_large_err)]
     pub fn get_public_table_names(&self) -> Result<Vec<String>> {
         Ok(self
             .ctx
@@ -2072,6 +2085,7 @@ impl DataFusion {
         }
     }
 
+    #[expect(clippy::result_large_err)]
     pub fn bind_scheduler_server(
         &self,
         server: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
@@ -2084,6 +2098,7 @@ impl DataFusion {
         Ok(())
     }
 
+    #[expect(clippy::result_large_err)]
     pub fn bind_executor_stream_registry(
         &self,
         registry: ExecutorControlStreamRegistry,
@@ -2104,6 +2119,7 @@ impl DataFusion {
         self.executor_stream_registry.read().ok()?.clone()
     }
 
+    #[expect(clippy::result_large_err)]
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {
         let mut executor_handle = self
             .executor
@@ -2194,11 +2210,11 @@ async fn wait_until_dependent_tables_are_ready(
 async fn build_snapshot_creation_config(
     dataset: &Dataset,
     acceleration_settings: &Acceleration,
-    refresh_mode: RefreshMode,
+    refresh_mode: RuntimeRefreshMode,
     acceleration_layout: AccelerationLayout,
 ) -> Result<Option<SnapshotCreationConfig>> {
-    let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
-        || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
+    let is_streaming_refresh = matches!(refresh_mode, RuntimeRefreshMode::Changes)
+        || (matches!(refresh_mode, RuntimeRefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
     let snapshot_threshold: Option<String> =
         acceleration_settings.snapshots_trigger_threshold.clone();
@@ -2237,7 +2253,7 @@ async fn build_snapshot_creation_config(
     };
 
     // Caching mode only supports time_interval - no "refresh complete" or "stream_batches" events.
-    let is_caching = matches!(refresh_mode, RefreshMode::Caching);
+    let is_caching = matches!(refresh_mode, RuntimeRefreshMode::Caching);
 
     let snapshot_creation_trigger = if is_caching {
         match snapshot_trigger {
@@ -2396,7 +2412,9 @@ mod tests {
     mod build_snapshot_creation_config_tests {
         use super::*;
         use crate::component::dataset::Dataset;
-        use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
+        use crate::component::dataset::acceleration::{
+            Acceleration, RefreshMode as RuntimeRefreshMode,
+        };
         use runtime_acceleration::snapshot::SnapshotBehavior;
         use spicepod::acceleration::{SnapshotsCompaction, SnapshotsTrigger};
         use spicepod::component::snapshot::Snapshots;
@@ -2478,7 +2496,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Full,
+                RuntimeRefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;
@@ -2502,7 +2520,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Append,
+                RuntimeRefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;
@@ -2539,7 +2557,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Changes,
+                RuntimeRefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;
@@ -2576,7 +2594,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Full,
+                RuntimeRefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;
@@ -2608,7 +2626,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Append,
+                RuntimeRefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;
@@ -2640,7 +2658,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Append,
+                RuntimeRefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;
@@ -2672,7 +2690,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Append,
+                RuntimeRefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;
@@ -2700,7 +2718,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Append,
+                RuntimeRefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;
@@ -2728,7 +2746,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Full,
+                RuntimeRefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;
@@ -2759,7 +2777,7 @@ mod tests {
             let result = build_snapshot_creation_config(
                 &dataset,
                 &acceleration,
-                RefreshMode::Changes,
+                RuntimeRefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
             )
             .await;

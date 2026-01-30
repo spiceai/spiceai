@@ -85,7 +85,9 @@ fn acceleration_info(
     }
 
     let refresh_mode = if let Some(data_connector) = data_connector {
-        data_connector.resolve_refresh_mode(acceleration.refresh_mode)
+        let resolved =
+            data_connector.resolve_refresh_mode(acceleration.refresh_mode.map(Into::into));
+        RefreshMode::from(resolved)
     } else {
         acceleration.refresh_mode.unwrap_or(RefreshMode::Disabled)
     };
@@ -135,7 +137,7 @@ mod tests {
     use super::*;
     use crate::component::dataset::acceleration::Engine;
     use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::DataConnectorResult;
+    use crate::dataconnector::{ConnectorDataset, DataConnectorResult};
     use async_trait::async_trait;
     use datafusion::datasource::TableProvider;
     use std::any::Any;
@@ -153,7 +155,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &dyn ConnectorDataset,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!()
         }

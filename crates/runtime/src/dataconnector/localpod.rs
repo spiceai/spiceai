@@ -25,11 +25,13 @@ use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
 
-use crate::DataConnector;
 use crate::datafusion::DataFusion;
-use crate::{component::dataset::Dataset, parameters::ParameterSpec, register_data_connector};
+use crate::parameters::ParameterSpec;
 
-use super::{ConnectorComponent, ConnectorParams, DataConnectorFactory};
+use super::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorFactory,
+    register_data_connector,
+};
 
 pub const LOCALPOD_DATACONNECTOR: &str = "localpod";
 
@@ -96,7 +98,7 @@ impl DataConnector for LocalPodConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let path_table_ref = TableReference::parse_str(path);

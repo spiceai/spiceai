@@ -19,9 +19,9 @@ use crate::{
     Runtime,
     component::catalog::Catalog,
     dataconnector::{
-        ConnectorComponent,
+        ConnectorComponent, ConnectorParams,
         parameters::{
-            self, ConnectorParams, Validator,
+            self, Validator,
             aws::{AuthValidator, RegionValidator},
         },
     },

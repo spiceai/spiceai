@@ -289,7 +289,7 @@ async fn get_spiceai_table_provider(
 
     dataset.access = AccessMode::ReadWrite;
 
-    let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
+    let params = ConnectorParamsBuilder::new("spice.ai".into(), Arc::new(dataset.clone()))
         .build(secrets, tokio_io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;

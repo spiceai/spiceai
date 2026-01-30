@@ -15,15 +15,13 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec, Parameters,
+};
 use data_components::Read;
 use data_components::delta_lake::DeltaTableFactory;
 use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::parameters::{ParameterSpec, Parameters};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -152,7 +150,7 @@ impl DataConnector for DeltaLake {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match Read::table_provider(&self.delta_table_factory, dataset.path().into()).await {
             Ok(provider) => Ok(provider),

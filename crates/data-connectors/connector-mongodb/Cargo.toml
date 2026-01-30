@@ -24,12 +24,12 @@ description = "MongoDB data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+connector-traits = { path = "../../connector-traits" }
 data_components = { path = "../../data_components", features = ["mongodb"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["mongodb"] }
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true
 tracing.workspace = true

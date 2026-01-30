@@ -8,12 +8,12 @@ description = "IMAP data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+connector-traits = { path = "../../connector-traits" }
 data_components = { path = "../../data_components", features = ["imap"] }
 datafusion.workspace = true
 imap.workspace = true
 linkme.workspace = true
 paste.workspace = true
 regex.workspace = true
-runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true

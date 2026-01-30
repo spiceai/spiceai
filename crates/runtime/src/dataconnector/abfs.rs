@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::listing::{ListingTableConnector, build_fragments};
+use super::listing::{ListingConnector, ListingTableConnector, build_fragments};
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorDataset, ConnectorParams, ConnectorRuntime, DataConnector,
+    DataConnectorError, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
     parameters::{
         Validator,
         azure::{
@@ -27,10 +27,7 @@ use super::{
     },
 };
 
-use crate::{
-    Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
-    register_data_connector,
-};
+use crate::{dataconnector::listing::LISTING_TABLE_PARAMETERS, register_data_connector};
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use snafu::prelude::*;
 use std::any::Any;
@@ -89,7 +86,7 @@ pub enum Error {
 
 pub struct AzureBlobFS {
     params: Parameters,
-    runtime: Option<Runtime>,
+    runtime: Option<Arc<dyn ConnectorRuntime>>,
     tokio_io_runtime: Handle,
 }
 
@@ -229,10 +226,10 @@ impl DataConnectorFactory for AzureBlobFSFactory {
 
             let azure = AzureBlobFS {
                 params: params.parameters,
-                runtime: params.runtime.map(Arc::unwrap_or_clone),
+                runtime: params.runtime,
                 tokio_io_runtime: params.io_runtime,
             };
-            Ok(Arc::new(azure) as Arc<dyn DataConnector>)
+            Ok(Arc::new(ListingConnector::new(azure)) as Arc<dyn DataConnector>)
         })
     }
 
@@ -274,10 +271,10 @@ impl ListingTableConnector for AzureBlobFS {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
-        let url = url.unwrap_or(dataset.from.as_str());
+        let url = url.unwrap_or(dataset.from());
 
         let mut azure_url =
             Url::parse(url)
@@ -324,13 +321,13 @@ impl ListingTableConnector for AzureBlobFS {
         Ok(azure_url)
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_runtime(&self) -> Option<Arc<dyn ConnectorRuntime>> {
+        self.runtime.as_ref().map(Arc::clone)
     }
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {

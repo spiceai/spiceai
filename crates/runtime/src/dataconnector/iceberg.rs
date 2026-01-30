@@ -34,10 +34,9 @@ use crate::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
         parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
     },
-    component::dataset::Dataset,
     dataconnector::{
-        ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
-        parameters::aws::initiate_config_with_credentials,
+        ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector,
+        DataConnectorError as Error, parameters::aws::initiate_config_with_credentials,
     },
     parameters::{ParameterSpec, Parameters},
     register_data_connector,
@@ -116,7 +115,7 @@ impl IcebergDataConnector {
 
     async fn create_iceberg_table_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let source = dataset.path();
 
@@ -252,7 +251,7 @@ impl IcebergDataConnector {
     async fn load_hadoop_catalog(
         props: HashMap<String, String>,
         custom_credential_loader: Option<CustomAwsCredentialLoader>,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         source: &str,
         metadata_mode: MetadataMode,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
@@ -311,7 +310,7 @@ impl DataConnector for IcebergDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         self.create_iceberg_table_provider(dataset).await
     }
@@ -319,7 +318,7 @@ impl DataConnector for IcebergDataConnector {
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         // IcebergTableProvider supports both read and write operations
         Some(self.create_iceberg_table_provider(dataset).await)

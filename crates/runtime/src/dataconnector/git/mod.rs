@@ -14,12 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
 use crate::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters, register_data_connector,
 };
-use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::git::{
     DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILES, GitTableConfig, GitTableProvider,
@@ -81,7 +79,7 @@ impl Git {
     /// Create a `GitTableProvider` from dataset configuration
     async fn create_table_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let component = ConnectorComponent::from(dataset);
@@ -100,7 +98,7 @@ impl Git {
         );
 
         // Parse include patterns if provided
-        let include_patterns = dataset.params.get("git_include").cloned().or_else(|| {
+        let include_patterns = dataset.params().get("git_include").cloned().or_else(|| {
             self.params
                 .get("include")
                 .expose()
@@ -121,7 +119,7 @@ impl Git {
 
         // Check if content fetching is enabled
         let fetch_content = dataset
-            .params
+            .params()
             .get("git_fetch_content")
             .and_then(|v| v.parse::<bool>().ok())
             .or_else(|| {
@@ -135,7 +133,7 @@ impl Git {
 
         // Get cache path if specified
         let cache_path = dataset
-            .params
+            .params()
             .get("git_cache_path")
             .cloned()
             .or_else(|| {
@@ -148,7 +146,7 @@ impl Git {
             .map(PathBuf::from);
 
         let max_files = dataset
-            .params
+            .params()
             .get("git_max_files")
             .and_then(|v| v.parse::<usize>().ok())
             .or_else(|| {
@@ -161,7 +159,7 @@ impl Git {
             .unwrap_or(DEFAULT_MAX_FILES);
 
         let max_file_bytes = dataset
-            .params
+            .params()
             .get("git_max_file_bytes")
             .and_then(|v| v.parse::<usize>().ok())
             .or_else(|| {
@@ -205,7 +203,7 @@ impl DataConnector for Git {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         self.create_table_provider(dataset).await
     }

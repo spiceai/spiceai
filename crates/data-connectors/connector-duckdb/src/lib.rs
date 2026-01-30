@@ -24,6 +24,12 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
+use connector_dialects::new_duckdb_dialect;
+use connector_traits::{
+    AnyErrorResult, ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector,
+    DataConnectorError, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
+    ParameterSpec,
+};
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -32,13 +38,6 @@ use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory, DataConnectorResult,
-};
-use runtime::datafusion::dialect::new_duckdb_dialect;
-use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -140,7 +139,7 @@ impl DataConnectorFactory for DuckDBFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let duckdb_factory =
                 if let Some(db_path) = params.parameters.clone().get("open").expose().ok() {
@@ -209,11 +208,11 @@ impl DataConnector for DuckDB {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path: TableReference = dataset.path().into();
 
-        if !(is_table_function(&path) || dataset.params.contains_key("duckdb_open")) {
+        if !(is_table_function(&path) || dataset.params().contains_key("duckdb_open")) {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "duckdb".to_string(),
                 source: Box::new(Error::MissingDuckDBFile {}),

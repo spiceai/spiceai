@@ -21,15 +21,13 @@ use snafu::ResultExt;
 
 use std::{any::Any, pin::Pin, sync::Arc};
 
-use crate::{
-    component::dataset::Dataset, register_data_connector, tools::memory::MEMORY_TABLE_SCHEMA,
-};
+use crate::{register_data_connector, tools::memory::MEMORY_TABLE_SCHEMA};
 use datafusion::datasource::TableProvider;
 use futures::Future;
 
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec,
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, ParameterSpec,
 };
 
 /// A connector that wraps a [`MemTable`] initialised without data, that can be
@@ -90,7 +88,7 @@ impl DataConnector for MemoryConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let Some(schema) = Self::schema_from_path(path) else {
@@ -115,7 +113,7 @@ impl DataConnector for MemoryConnector {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let path = dataset.path();
         let Some(schema) = Self::schema_from_path(path) else {

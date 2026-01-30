@@ -20,14 +20,12 @@ use runtime_datafusion_index::IndexedTableProvider;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::accelerated_table::AcceleratedTable;
 use crate::changes::{Indexes, index_change_envelope};
-use crate::component::{
-    ComponentInitialization,
-    dataset::{Dataset, acceleration::RefreshMode},
-    metrics::MetricsProvider,
+use crate::dataconnector::{
+    ComponentInitialization, ConnectorAcceleratedTable, ConnectorComponent, ConnectorDataset,
+    ConnectorFederatedTable, DataConnector, DataConnectorError, DataConnectorResult,
+    MetricsProvider, RefreshMode,
 };
-use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::util::find_concrete_table_provider;
@@ -47,20 +45,22 @@ impl FullTextConnector {
     #[expect(clippy::needless_pass_by_value)]
     fn with_indexed_stream<F>(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn ConnectorFederatedTable>,
         f: F,
     ) -> Option<ChangesStream>
     where
-        F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
+        F: Fn(&Arc<dyn DataConnector>, Arc<dyn ConnectorFederatedTable>) -> Option<ChangesStream>,
     {
-        let table_provider = federated_table.try_table_provider_sync()?;
+        let federated_table_ref = federated_table.as_any().downcast_ref::<FederatedTable>()?;
+        let table_provider = federated_table_ref.try_table_provider_sync()?;
         let indexed_table = find_concrete_table_provider::<IndexedTableProvider>(&table_provider)?;
 
         // This will process all `Index`s, including vector indexes if provided (i.e. from `EmbeddingConnector`).
         // This is required so that [`IndexedTableProvider`] can be unwrapped (i.e. [`IndexedTableProvider::get_underlying`])
         //  in both cases there is and isn't a `EmbeddingConnector` underneath.
         let indexes = Indexes::new(indexed_table.get_all_indexes());
-        let ft = Arc::new(FederatedTable::Immediate(indexed_table.get_underlying()));
+        let ft = Arc::new(FederatedTable::Immediate(indexed_table.get_underlying()))
+            as Arc<dyn ConnectorFederatedTable>;
 
         let stream = f(&self.inner_connector, ft)?;
         Some(
@@ -79,34 +79,34 @@ impl DataConnector for FullTextConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         add_full_text_search_to_table(
             self.inner_connector.read_provider(dataset).await?,
-            &dataset.columns,
-            &dataset.name,
+            dataset.columns(),
+            dataset.name(),
         )
         .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
-            dataconnector: dataset.source().to_string(),
+            dataconnector: dataset.from().to_string(),
             message: e.to_string(),
-            connector_component: dataset.into(),
+            connector_component: ConnectorComponent::from(dataset),
             source: e,
         })
     }
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(
-                add_full_text_search_to_table(inner, &dataset.columns, &dataset.name)
+                add_full_text_search_to_table(inner, dataset.columns(), dataset.name())
                     .map(|idx| Arc::new(idx) as Arc<dyn TableProvider>)
                     .map_err(|e| DataConnectorError::InvalidConfiguration {
-                        dataconnector: dataset.source().to_string(),
+                        dataconnector: dataset.from().to_string(),
                         message: e.to_string(),
-                        connector_component: dataset.into(),
+                        connector_component: ConnectorComponent::from(dataset),
                         source: e,
                     }),
             ),
@@ -117,7 +117,7 @@ impl DataConnector for FullTextConnector {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
     }
@@ -132,8 +132,8 @@ impl DataConnector for FullTextConnector {
 
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        dataset: &dyn ConnectorDataset,
+        accelerated_table: &mut dyn ConnectorAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
@@ -150,8 +150,8 @@ impl DataConnector for FullTextConnector {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
-        dataset: &Dataset,
+        federated_table: Arc<dyn ConnectorFederatedTable>,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
             inner.changes_stream(ft, dataset)
@@ -162,7 +162,10 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.supports_append_stream()
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn ConnectorFederatedTable>,
+    ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| inner.append_stream(ft))
     }
 }

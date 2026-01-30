@@ -24,12 +24,12 @@ description = "ODBC data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+connector-traits = { path = "../../connector-traits" }
 datafusion.workspace = true
 data_components = { path = "../../data_components", features = ["odbc"] }
 db_connection_pool = { path = "../../db_connection_pool", features = ["odbc"] }
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 snafu.workspace = true
 tracing.workspace = true
 

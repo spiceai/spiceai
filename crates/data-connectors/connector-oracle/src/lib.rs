@@ -26,17 +26,15 @@ limitations under the License.
 use async_trait::async_trait;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec, Parameters,
+};
 use data_components::oracle::OracleTableProvider;
 use data_components::oracle::connection::{
     OracleConnectionParams, OracleConnectionPool, OracleDirectConnectionParamsBuilder,
 };
 use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
-};
-use runtime::parameters::ParameterSpec;
-use runtime_parameters::Parameters;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::fs;
@@ -276,7 +274,7 @@ impl DataConnectorFactory for OracleFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(Oracle::new(&params.parameters).await?) as Arc<dyn DataConnector>)
         })
@@ -310,14 +308,14 @@ enum ReadProviderError {
     },
 }
 
-impl From<ReadProviderError> for runtime::dataconnector::DataConnectorError {
+impl From<ReadProviderError> for DataConnectorError {
     fn from(err: ReadProviderError) -> Self {
         match err {
             ReadProviderError::UnableToGetReadProvider {
                 dataconnector,
                 connector_component,
                 source,
-            } => runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+            } => DataConnectorError::UnableToGetReadProvider {
                 dataconnector: dataconnector.to_string(),
                 connector_component,
                 source,
@@ -334,7 +332,7 @@ impl DataConnector for Oracle {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let provider = OracleTableProvider::new(Arc::clone(&self.conn), &dataset.path().into())
             .await

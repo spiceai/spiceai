@@ -84,10 +84,11 @@ impl Runtime {
         let catalog = catalog.clone();
 
         let source = catalog.provider.clone();
-        let params = ConnectorParamsBuilder::new(source.clone().into(), (&catalog).into())
-            .build(self.secrets(), self.tokio_io_runtime())
-            .await
-            .context(UnableToInitializeCatalogConnectorSnafu)?;
+        let params =
+            ConnectorParamsBuilder::new_catalog(source.clone().into(), Arc::new(catalog.clone()))
+                .build(self.secrets(), self.tokio_io_runtime())
+                .await
+                .context(UnableToInitializeCatalogConnectorSnafu)?;
 
         let Some(catalog_connector) = catalogconnector::create_new_connector(&source, params).await
         else {

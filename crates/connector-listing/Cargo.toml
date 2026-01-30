@@ -1,0 +1,53 @@
+##
+## Copyright 2026 The Spice.ai OSS Authors
+##
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+##
+##      https://www.apache.org/licenses/LICENSE-2.0
+##
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+##
+
+[package]
+name = "connector-listing"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Listing connector helpers for Spice.ai connectors"
+
+[dependencies]
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+async-trait.workspace = true
+connector-traits = { path = "../connector-traits" }
+data_components = { path = "../data_components" }
+dataformat-json = { path = "../dataformat-json" }
+datafusion.workspace = true
+datafusion-datasource.workspace = true
+datafusion-expr.workspace = true
+datafusion-table-providers.workspace = true
+document_parse = { path = "../document_parse" }
+futures.workspace = true
+itertools.workspace = true
+object_store.workspace = true
+runtime-object-store = { path = "../runtime-object-store" }
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+vortex-datafusion.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+
+[features]
+default = []
+runtime-tests = []

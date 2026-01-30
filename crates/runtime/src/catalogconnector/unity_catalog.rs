@@ -20,7 +20,7 @@ use super::ParameterSpec;
 use super::Parameters;
 use crate::Runtime;
 use crate::component::catalog::Catalog;
-use crate::dataconnector::parameters::ConnectorParams;
+use crate::dataconnector::ConnectorParams;
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;

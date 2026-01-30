@@ -24,17 +24,14 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec, Parameters,
+};
 use data_components::Read;
 use data_components::spark_connect::SparkConnect;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult,
-};
-use runtime::parameters::ParameterSpec;
-use runtime_parameters::Parameters;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -116,7 +113,7 @@ impl DataConnectorFactory for SparkFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match Spark::new(params.parameters).await {
                 Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
@@ -197,7 +194,7 @@ impl DataConnector for Spark {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = TableReference::from(dataset.path());
         Ok(self

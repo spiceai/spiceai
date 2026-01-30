@@ -16,19 +16,17 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use app::App;
 use async_trait::async_trait;
 use datafusion_table_providers::UnsupportedTypeAction;
 use tokio::{runtime::Handle, sync::RwLock};
 
-use crate::{
-    Runtime, catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY, parameters::Parameters,
-};
+use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
+use crate::connector_traits_impl::RuntimeConnectorApp;
+use crate::parameters::Parameters;
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
-use super::{
-    ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError, ODBC_DATACONNECTOR,
-};
+use super::{DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError, ODBC_DATACONNECTOR};
+use connector_traits::{ConnectorComponent, ConnectorParams};
 
 pub(crate) mod aws;
 pub(crate) mod azure;
@@ -42,27 +40,34 @@ pub(crate) trait Validator {
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Self::Error>;
 }
 
-#[derive(Clone)]
-pub struct ConnectorParams {
-    pub parameters: Parameters,
-    pub unsupported_type_action: Option<UnsupportedTypeAction>,
-    pub component: ConnectorComponent,
-    pub app: Option<Arc<App>>,
-    pub runtime: Option<Arc<Runtime>>,
-    pub io_runtime: Handle,
-}
-
 pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
-    component: ConnectorComponent,
+    source: ConnectorParamsSource,
+}
+
+#[derive(Clone)]
+pub enum ConnectorParamsSource {
+    Catalog(Arc<crate::component::catalog::Catalog>),
+    Dataset(Arc<crate::component::dataset::Dataset>),
 }
 
 impl ConnectorParamsBuilder {
     #[must_use]
-    pub fn new(connector: Arc<str>, component: ConnectorComponent) -> Self {
+    pub fn new(connector: Arc<str>, source: Arc<crate::component::dataset::Dataset>) -> Self {
         Self {
             connector,
-            component,
+            source: ConnectorParamsSource::Dataset(source),
+        }
+    }
+
+    #[must_use]
+    pub fn new_catalog(
+        connector: Arc<str>,
+        source: Arc<crate::component::catalog::Catalog>,
+    ) -> Self {
+        Self {
+            connector,
+            source: ConnectorParamsSource::Catalog(source),
         }
     }
 
@@ -73,15 +78,16 @@ impl ConnectorParamsBuilder {
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
         let mut unsupported_type_action = None;
-        let (params, prefix, parameters, app, runtime) = match &self.component {
-            ConnectorComponent::Catalog(catalog) => {
+        let (params, prefix, parameters, app, runtime, component) = match &self.source {
+            ConnectorParamsSource::Catalog(catalog) => {
+                let component = ConnectorComponent::from(catalog.as_ref());
                 let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
                 let connector_factory = guard.get(&name);
 
                 let factory =
                     connector_factory.ok_or_else(|| DataConnectorError::InvalidConnectorType {
                         dataconnector: name.clone(),
-                        connector_component: self.component.clone(),
+                        connector_component: component.clone(),
                     })?;
 
                 (
@@ -90,9 +96,11 @@ impl ConnectorParamsBuilder {
                     factory.parameters(),
                     Some(catalog.app()),
                     Some(catalog.runtime()),
+                    component,
                 )
             }
-            ConnectorComponent::Dataset(dataset) => {
+            ConnectorParamsSource::Dataset(dataset) => {
+                let component = ConnectorComponent::from(dataset.as_ref());
                 let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
                 let connector_factory = guard.get(&name);
 
@@ -101,12 +109,12 @@ impl ConnectorParamsBuilder {
                 let factory = connector_factory.ok_or_else(|| {
                     if name == ODBC_DATACONNECTOR {
                         DataConnectorError::OdbcNotInstalled {
-                            connector_component: self.component.clone(),
+                            connector_component: component.clone(),
                         }
                     } else {
                         DataConnectorError::InvalidConnectorType {
                             dataconnector: name.clone(),
-                            connector_component: self.component.clone(),
+                            connector_component: component.clone(),
                         }
                     }
                 })?;
@@ -119,6 +127,7 @@ impl ConnectorParamsBuilder {
                     factory.parameters(),
                     Some(dataset.app()),
                     Some(dataset.runtime()),
+                    component,
                 )
             }
         };
@@ -132,10 +141,15 @@ impl ConnectorParamsBuilder {
         )
         .await?;
 
+        let app = app.map(|app| {
+            Arc::new(RuntimeConnectorApp::new(app)) as Arc<dyn connector_traits::ConnectorApp>
+        });
+        let runtime = runtime.map(|runtime| runtime as Arc<dyn connector_traits::ConnectorRuntime>);
+
         Ok(ConnectorParams {
             parameters,
             unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
-            component: self.component,
+            component,
             app,
             runtime,
             io_runtime,

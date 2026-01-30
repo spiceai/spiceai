@@ -23,9 +23,10 @@ license.workspace = true
 description = "SMB data connector for Spice.ai runtime"
 
 [dependencies]
+connector-listing = { path = "../../connector-listing" }
+connector-traits = { path = "../../connector-traits" }
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime", features = ["smb"] }
 snafu.workspace = true
 tokio.workspace = true
 url.workspace = true

@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::listing::{self, LISTING_TABLE_PARAMETERS, ListingTableConnector};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
-    NewDataConnectorResult,
+use connector_listing::{
+    self as listing, LISTING_TABLE_PARAMETERS, ListingConnector, ListingTableConnector,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec, Parameters,
+};
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -90,7 +90,7 @@ impl DataConnectorFactory for SMBFactory {
             let smb = SMB {
                 params: params.parameters,
             };
-            Ok(Arc::new(smb) as Arc<dyn DataConnector>)
+            Ok(Arc::new(ListingConnector::new(smb)) as Arc<dyn DataConnector>)
         })
     }
 
@@ -118,12 +118,12 @@ impl ListingTableConnector for SMB {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
-        let url = url.unwrap_or(dataset.from.as_str());
+        let url = url.unwrap_or(dataset.from());
         let mut smb_url = Url::parse(url).boxed().map_err(|source| {
-            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
+            DataConnectorError::InvalidConfiguration {
                 dataconnector: format!("{self}"),
                 message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/smb"),
                 connector_component: ConnectorComponent::from(dataset),

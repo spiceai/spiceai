@@ -8,12 +8,12 @@ description = "SharePoint data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+connector-traits = { path = "../../connector-traits" }
 data_components = { path = "../../data_components", features = ["sharepoint"] }
 datafusion.workspace = true
 document_parse = { path = "../../document_parse" }
 graph-rs-sdk.workspace = true
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 snafu.workspace = true
 url.workspace = true

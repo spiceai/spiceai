@@ -24,7 +24,7 @@ use std::{
 use crate::{
     Runtime,
     component::{ComponentInitialization, catalog::Catalog},
-    dataconnector::{ConnectorComponent, parameters::ConnectorParams},
+    dataconnector::{ConnectorComponent, ConnectorParams},
     parameters::{ParameterSpec, Parameters},
 };
 use async_trait::async_trait;
@@ -261,6 +261,7 @@ impl RefreshingCatalogProvider {
         }
     }
 
+    #[expect(clippy::result_large_err)]
     fn start_refresh(mut self, interval: Option<Duration>) -> Result<Self> {
         if self.refresh_task.is_some() {
             return Err(Error::RefreshTaskAlreadyStarted {});

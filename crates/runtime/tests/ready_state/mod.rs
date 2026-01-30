@@ -52,10 +52,9 @@ use futures::{Stream, TryStreamExt};
 
 use runtime::{
     Runtime,
-    component::dataset::Dataset,
     dataconnector::{
-        self, DataConnector, DataConnectorError, DataConnectorFactory, NewDataConnectorResult,
-        parameters::ConnectorParams,
+        self, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+        DataConnectorFactory, NewDataConnectorResult,
     },
     parameters::ParameterSpec,
 };
@@ -132,7 +131,7 @@ impl DataConnector for SlowNativeDataConnector {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &dyn ConnectorDataset,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         // Create wrapper table provider that delays the stream
         let delayed_provider = DelayedNativeTableProvider {
@@ -167,19 +166,19 @@ impl DataConnector for SlowFederatedDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         // Create SQLExecutor implementation
         let executor = Arc::new(MockSQLExecutor {
             schema: Arc::clone(&self.schema),
-            table_name: dataset.name.to_string(),
+            table_name: dataset.name().to_string(),
         });
 
         // Create federation provider
         let federation_provider = Arc::new(SQLFederationProvider::new(executor));
 
         // Create table source
-        let table_reference = MultiPartTableReference::TableReference(dataset.name.clone());
+        let table_reference = MultiPartTableReference::TableReference(dataset.name().clone());
 
         let source = SQLTableSource::new_with_schema(
             federation_provider,

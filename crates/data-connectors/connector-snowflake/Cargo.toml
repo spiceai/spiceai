@@ -24,6 +24,7 @@ description = "Snowflake data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+connector-traits = { path = "../../connector-traits" }
 data_components = { path = "../../data_components", features = ["snowflake"] }
 datafusion.workspace = true
 datafusion-table-providers.workspace = true
@@ -31,7 +32,6 @@ db_connection_pool = { path = "../../db_connection_pool", features = ["snowflake
 itertools.workspace = true
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 snowflake-api.workspace = true
 snafu.workspace = true
 

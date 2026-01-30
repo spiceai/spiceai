@@ -24,12 +24,11 @@ description = "Spark Connect data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+connector-traits = { path = "../../connector-traits" }
 data_components = { path = "../../data_components", features = ["spark_connect"] }
 datafusion.workspace = true
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
-runtime-parameters = { path = "../../runtime-parameters" }
 snafu.workspace = true
 
 [features]

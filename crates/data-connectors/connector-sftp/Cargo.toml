@@ -7,9 +7,10 @@ license.workspace = true
 description = "SFTP data connector for Spice.ai runtime"
 
 [dependencies]
+connector-listing = { path = "../../connector-listing" }
+connector-traits = { path = "../../connector-traits" }
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 snafu.workspace = true
 tokio.workspace = true
 url.workspace = true

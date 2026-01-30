@@ -15,6 +15,11 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use connector_traits::{
+    ComponentType, ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector,
+    DataConnectorError, DataConnectorFactory, DataConnectorResult, MetricSpec, MetricType,
+    MetricsProvider, NewDataConnectorResult, ObserveMetricCallback, ParameterSpec,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
@@ -24,14 +29,6 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use mysql_async::Metrics;
 use opentelemetry::KeyValue;
-use runtime::component::ComponentType;
-use runtime::component::dataset::Dataset;
-use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::parameters::ParameterSpec;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -232,11 +229,10 @@ impl DataConnector for MySQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let tbl = dataset
             .parse_path(true, Some(&MySqlDialect {}))
-            .boxed()
             .map_err(|e| DataConnectorError::InvalidConfiguration {
                 dataconnector: "mysql".to_string(),
                 source: e,

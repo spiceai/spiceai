@@ -9,9 +9,10 @@ license = "Apache-2.0"
 description = "NFS data connector for Spice.ai runtime"
 
 [dependencies]
+connector-listing = { path = "../../connector-listing" }
+connector-traits = { path = "../../connector-traits" }
 linkme = "0.3.35"
 paste = "1.0.15"
-runtime = { path = "../../runtime" }
 snafu = "0.8.6"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "test-util", "time"] }
 url = "2.5"

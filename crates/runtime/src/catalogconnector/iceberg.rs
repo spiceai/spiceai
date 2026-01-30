@@ -18,7 +18,7 @@ use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
     Runtime,
     component::catalog::Catalog,
-    dataconnector::parameters::{ConnectorParams, aws::initiate_config_with_credentials},
+    dataconnector::{ConnectorParams, parameters::aws::initiate_config_with_credentials},
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
 use async_trait::async_trait;

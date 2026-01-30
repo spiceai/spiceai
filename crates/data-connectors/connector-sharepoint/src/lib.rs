@@ -15,16 +15,14 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec, Parameters,
+};
 use data_components::sharepoint::{client::SharepointClient, table::SharepointTableProvider};
 use datafusion::datasource::TableProvider;
 use document_parse::DocumentParser;
 use graph_rs_sdk::{GraphClient, identity::ConfidentialClientApplication};
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::parameters::{ParameterSpec, Parameters};
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::future::Future;
@@ -99,8 +97,11 @@ impl Sharepoint {
         })
     }
 
-    async fn get_formatter(&self, dataset: &Dataset) -> Option<Arc<dyn DocumentParser>> {
-        let file_format = dataset.params.get("file_format")?;
+    async fn get_formatter(
+        &self,
+        dataset: &dyn ConnectorDataset,
+    ) -> Option<Arc<dyn DocumentParser>> {
+        let file_format = dataset.params().get("file_format")?;
 
         document_parse::get_parser_factory(file_format)
             .await
@@ -165,9 +166,9 @@ impl DataConnector for Sharepoint {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from)
+        let client = SharepointClient::new(Arc::clone(&self.client), dataset.from())
             .await
             .boxed()
             .map_err(|e| DataConnectorError::UnableToGetReadProvider {
@@ -184,13 +185,13 @@ impl DataConnector for Sharepoint {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        if !dataset.has_metadata_table {
+        if !dataset.has_metadata_table() {
             return None;
         }
 
-        match SharepointClient::new(Arc::clone(&self.client), &dataset.from)
+        match SharepointClient::new(Arc::clone(&self.client), dataset.from())
             .await
             .boxed()
             .map_err(|e| DataConnectorError::UnableToGetReadProvider {

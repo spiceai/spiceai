@@ -1440,7 +1440,7 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
         });
     };
     for dataset in Arc::clone(&rt).get_valid_datasets(app, LogErrors(true)) {
-        let mut params = ConnectorParamsBuilder::new(dataset.source().into(), (&dataset).into())
+        let mut params = ConnectorParamsBuilder::new(dataset.source().into(), Arc::clone(&dataset))
             .build(Arc::clone(&rt.secrets), rt.tokio_io_runtime())
             .await
             .context(FailedToStartClusterExecutorSnafu)?;

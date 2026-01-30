@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::dataconnector::ConnectorDataset;
 use async_trait::async_trait;
 use data_components::github::GithubRestClient;
 use datafusion::{
@@ -202,7 +202,7 @@ impl WorkflowRunsTableProvider {
         repo: &str,
         workflow_id: &str,
         fetch_logs: bool,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> crate::dataconnector::DataConnectorResult<Self> {
         let mut fields = vec![
             Field::new("id", DataType::Int64, false),

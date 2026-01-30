@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::borrow::Borrow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,12 +34,11 @@ use snafu::prelude::*;
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue, errors::InvalidMetadataValue};
 
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec,
+    ConnectorComponent, ConnectorDataset, ConnectorFederatedTable, ConnectorParams, DataConnector,
+    DataConnectorError, DataConnectorFactory, ParameterSpec,
 };
-use crate::{
-    component::dataset::Dataset, federated_table::FederatedTable, register_data_connector,
-};
+use crate::{federated_table::FederatedTable, register_data_connector};
+use connector_traits::UnableToGetReadWriteProviderSnafu;
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
@@ -224,10 +222,8 @@ fn configure_max_message_size(
     params: &ConnectorParams,
 ) -> Result<FlightClient> {
     if let Some(app) = params.app.as_ref()
-        && let Some(flight) = app.runtime.flight.as_ref()
         && let Some(max_message_size) =
-            flight
-                .max_message_size_bytes()
+            app.flight_max_message_size_bytes()
                 .map_err(|err| Error::InvalidParameterValue {
                     parameter: "max_message_size".to_string(),
                     source: err,
@@ -246,7 +242,7 @@ impl DataConnector for SpiceAI {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
@@ -288,7 +284,7 @@ impl DataConnector for SpiceAI {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
@@ -312,7 +308,7 @@ impl DataConnector for SpiceAI {
 
         let read_write_result = ReadWrite::table_provider(&flight_factory, table_reference)
             .await
-            .context(super::UnableToGetReadWriteProviderSnafu {
+            .context(UnableToGetReadWriteProviderSnafu {
                 dataconnector: "spice.ai",
                 connector_component: ConnectorComponent::from(dataset),
             });
@@ -324,8 +320,17 @@ impl DataConnector for SpiceAI {
         true
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn ConnectorFederatedTable>,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
+            let Some(federated_table) = federated_table
+                .as_any()
+                .downcast_ref::<FederatedTable>() else {
+                return;
+            };
+
             let table_provider = federated_table.table_provider().await;
             let Some(federated_table_provider_adaptor) = table_provider
             .as_any()
@@ -370,8 +375,7 @@ impl SpiceAI {
     ///
     /// Spice AI datasets have the following format for `dataset.path()`:
     /// `<org>/<app>/datasets/<dataset_name>`.
-    fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> Result<SpiceAIDatasetPath> {
-        let dataset = dataset.borrow();
+    fn spice_dataset_path(dataset: &dyn ConnectorDataset) -> Result<SpiceAIDatasetPath> {
         let path = dataset.path();
         let path_parts: Vec<&str> = path.split('/').collect();
 

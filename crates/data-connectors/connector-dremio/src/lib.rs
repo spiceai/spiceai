@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec,
+};
 use data_components::ReadWrite;
 use data_components::flight::FlightFactory;
 use datafusion::datasource::TableProvider;
@@ -27,12 +31,6 @@ use datafusion_federation::sql::RemoteTableRef;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -191,7 +189,7 @@ impl DataConnector for Dremio {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = match RemoteTableRef::parse_with_default_dialect(dataset.path()) {
             Ok(table_reference) => table_reference.table_ref,
@@ -230,7 +228,7 @@ impl DataConnector for Dremio {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let read_write_result =
             ReadWrite::table_provider(&self.flight_factory, dataset.path().into())

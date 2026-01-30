@@ -13,13 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::accelerated_table::AcceleratedTable;
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
-use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
-use crate::component::metrics::MetricsProvider;
-use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
+use crate::dataconnector::{
+    ComponentInitialization, ConnectorAcceleratedTable, ConnectorComponent, ConnectorDataset,
+    ConnectorFederatedTable, DataConnector, DataConnectorError, DataConnectorResult,
+    MetricsProvider,
+};
 use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
@@ -144,6 +145,17 @@ impl EmbeddingConnector {
         })
     }
 
+    #[expect(clippy::result_large_err)]
+    fn dataset_from_connector(dataset: &dyn ConnectorDataset) -> DataConnectorResult<&Dataset> {
+        dataset.as_any().downcast_ref::<Dataset>().ok_or_else(|| {
+            DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "embeddings".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "Embedding connector requires runtime dataset configuration".to_string(),
+            }
+        })
+    }
+
     async fn embed_change_envelope(
         maybe_envelope: Result<ChangeEnvelope, StreamError>,
         embedding_table: Arc<EmbeddingTable>,
@@ -197,18 +209,27 @@ impl DataConnector for EmbeddingConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        self.wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
-            .await
+        let dataset_ref = Self::dataset_from_connector(dataset)?;
+        self.wrap_table(
+            self.inner_connector.read_provider(dataset).await?,
+            dataset_ref,
+        )
+        .await
     }
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
+        let dataset_ref = match Self::dataset_from_connector(dataset) {
+            Ok(dataset_ref) => dataset_ref,
+            Err(err) => return Some(Err(err)),
+        };
+
         match self.inner_connector.read_write_provider(dataset).await {
-            Some(Ok(inner)) => Some(self.wrap_table(inner, dataset).await),
+            Some(Ok(inner)) => Some(self.wrap_table(inner, dataset_ref).await),
             Some(Err(e)) => Some(Err(e)),
             None => None,
         }
@@ -216,7 +237,7 @@ impl DataConnector for EmbeddingConnector {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
     }
@@ -231,8 +252,8 @@ impl DataConnector for EmbeddingConnector {
 
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        dataset: &dyn ConnectorDataset,
+        accelerated_table: &mut dyn ConnectorAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
@@ -245,10 +266,11 @@ impl DataConnector for EmbeddingConnector {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
-        dataset: &Dataset,
+        federated_table: Arc<dyn ConnectorFederatedTable>,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<ChangesStream> {
-        let table_provider = federated_table.try_table_provider_sync()?;
+        let federated_table_ref = federated_table.as_any().downcast_ref::<FederatedTable>()?;
+        let table_provider = federated_table_ref.try_table_provider_sync()?;
         if let Some(indexed_table) = table_provider
             .as_any()
             .downcast_ref::<IndexedTableProvider>()
@@ -261,6 +283,9 @@ impl DataConnector for EmbeddingConnector {
                     .inner_connector
                     .changes_stream(federated_table, dataset);
             };
+
+            let underlying_federated_table =
+                underlying_federated_table as Arc<dyn ConnectorFederatedTable>;
 
             // Avoid reindexing full-text indexes.
             let indexes = Indexes::new(
@@ -291,7 +316,7 @@ impl DataConnector for EmbeddingConnector {
             self.inner_connector.changes_stream(
                 Arc::new(FederatedTable::Immediate(Arc::clone(
                     &vector_scan.table_provider,
-                ))),
+                ))) as Arc<dyn ConnectorFederatedTable>,
                 dataset,
             )
         } else if let Some(embedding_table) =
@@ -299,7 +324,8 @@ impl DataConnector for EmbeddingConnector {
         {
             let embedding_table = Arc::new(embedding_table.clone());
             let underlying_table = Arc::clone(&embedding_table.base_table);
-            let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
+            let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table))
+                as Arc<dyn ConnectorFederatedTable>;
 
             Some(
                 self.inner_connector
@@ -318,8 +344,12 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.supports_append_stream()
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        let table_provider = federated_table.try_table_provider_sync()?;
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn ConnectorFederatedTable>,
+    ) -> Option<ChangesStream> {
+        let federated_table_ref = federated_table.as_any().downcast_ref::<FederatedTable>()?;
+        let table_provider = federated_table_ref.try_table_provider_sync()?;
 
         if let Some(indexed_table) = table_provider
             .as_any()
@@ -328,7 +358,8 @@ impl DataConnector for EmbeddingConnector {
         {
             let indexed_table = Arc::new(indexed_table);
             let underlying_federated_table =
-                underlying_federated_table_for_indexed_table(&table_provider)?;
+                underlying_federated_table_for_indexed_table(&table_provider)?
+                    as Arc<dyn ConnectorFederatedTable>;
 
             let indexes = Indexes::new(indexed_table.get_all_indexes());
 
@@ -348,7 +379,8 @@ impl DataConnector for EmbeddingConnector {
                 .clone(),
         );
         let underlying_table = Arc::clone(&embedding_table.base_table);
-        let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
+        let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table))
+            as Arc<dyn ConnectorFederatedTable>;
 
         let stream = self
             .inner_connector

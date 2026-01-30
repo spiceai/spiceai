@@ -3777,6 +3777,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "clickhouse-rs",
+ "connector-traits",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -3784,7 +3785,6 @@ dependencies = [
  "linkme",
  "ns_lookup",
  "paste",
- "runtime",
  "secrecy",
  "snafu",
  "url",
@@ -3796,6 +3796,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
+ "connector-traits",
  "data_components",
  "datafusion",
  "futures",
@@ -3816,14 +3817,24 @@ version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
+ "connector-traits",
  "data_components",
  "datafusion",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "connector-dialects"
+version = "2.0.0-unstable"
+dependencies = [
+ "datafusion",
+ "datafusion-expr",
+ "itertools 0.14.0",
+ "runtime-datafusion-udfs",
 ]
 
 [[package]]
@@ -3832,6 +3843,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "datafusion-federation",
@@ -3839,7 +3851,6 @@ dependencies = [
  "linkme",
  "ns_lookup",
  "paste",
- "runtime",
  "snafu",
  "tracing",
 ]
@@ -3849,13 +3860,14 @@ name = "connector-duckdb"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-dialects",
+ "connector-traits",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
  "duckdb",
  "linkme",
  "paste",
- "runtime",
  "snafu",
 ]
 
@@ -3866,12 +3878,12 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "flight_client",
  "linkme",
  "paste",
- "runtime",
  "snafu",
 ]
 
@@ -3879,9 +3891,10 @@ dependencies = [
 name = "connector-ftp"
 version = "2.0.0-unstable"
 dependencies = [
+ "connector-listing",
+ "connector-traits",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "tokio",
  "url",
@@ -3892,11 +3905,11 @@ name = "connector-graphql"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "token_provider",
  "url",
@@ -3907,15 +3920,43 @@ name = "connector-imap"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "imap",
  "linkme",
  "paste",
  "regex",
- "runtime",
  "secrecy",
  "snafu",
+]
+
+[[package]]
+name = "connector-listing"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "chrono",
+ "connector-traits",
+ "data_components",
+ "dataformat-json",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-expr",
+ "datafusion-table-providers",
+ "document_parse",
+ "futures",
+ "itertools 0.14.0",
+ "object_store",
+ "runtime-object-store",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+ "vortex-datafusion",
 ]
 
 [[package]]
@@ -3923,12 +3964,12 @@ name = "connector-mongodb"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
  "linkme",
  "paste",
- "runtime",
  "secrecy",
  "snafu",
  "tracing",
@@ -3939,11 +3980,11 @@ name = "connector-mssql"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "tiberius",
 ]
@@ -3954,13 +3995,13 @@ version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "chrono",
+ "connector-traits",
  "datafusion",
  "datafusion-table-providers",
  "linkme",
  "mysql_async",
  "opentelemetry",
  "paste",
- "runtime",
  "secrecy",
  "snafu",
  "tracing",
@@ -3970,9 +4011,10 @@ dependencies = [
 name = "connector-nfs"
 version = "1.11.0-unstable"
 dependencies = [
+ "connector-listing",
+ "connector-traits",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "tokio",
  "url",
@@ -3983,12 +4025,12 @@ name = "connector-odbc"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "db_connection_pool",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "tracing",
 ]
@@ -3999,12 +4041,11 @@ version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "connector-traits",
  "data_components",
  "datafusion",
  "linkme",
  "paste",
- "runtime",
- "runtime-parameters",
  "snafu",
  "tracing",
 ]
@@ -4014,11 +4055,11 @@ name = "connector-postgres"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "datafusion",
  "datafusion-table-providers",
  "linkme",
  "paste",
- "runtime",
  "secrecy",
  "snafu",
 ]
@@ -4028,14 +4069,13 @@ name = "connector-scylladb"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "db_connection_pool",
  "linkme",
  "ns_lookup",
  "paste",
- "runtime",
- "runtime-parameters",
  "scylla",
  "snafu",
  "tracing",
@@ -4045,9 +4085,10 @@ dependencies = [
 name = "connector-sftp"
 version = "2.0.0-unstable"
 dependencies = [
+ "connector-listing",
+ "connector-traits",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "tokio",
  "url",
@@ -4058,13 +4099,13 @@ name = "connector-sharepoint"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "document_parse",
  "graph-rs-sdk",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "url",
 ]
@@ -4073,9 +4114,10 @@ dependencies = [
 name = "connector-smb"
 version = "2.0.0-unstable"
 dependencies = [
+ "connector-listing",
+ "connector-traits",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "tokio",
  "url",
@@ -4086,6 +4128,7 @@ name = "connector-snowflake"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4093,7 +4136,6 @@ dependencies = [
  "itertools 0.14.0",
  "linkme",
  "paste",
- "runtime",
  "snafu",
  "snowflake-api",
 ]
@@ -4103,13 +4145,35 @@ name = "connector-spark"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "connector-traits",
  "data_components",
  "datafusion",
  "linkme",
  "paste",
- "runtime",
- "runtime-parameters",
  "snafu",
+]
+
+[[package]]
+name = "connector-traits"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow-schema",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-table-providers",
+ "globset",
+ "linkme",
+ "opentelemetry",
+ "reqwest",
+ "runtime-parameters",
+ "runtime-secrets",
+ "snafu",
+ "spicepod",
+ "token_provider",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -14814,6 +14878,7 @@ dependencies = [
  "connector-ftp",
  "connector-graphql",
  "connector-imap",
+ "connector-listing",
  "connector-mongodb",
  "connector-mssql",
  "connector-mysql",
@@ -14825,6 +14890,7 @@ dependencies = [
  "connector-smb",
  "connector-snowflake",
  "connector-spark",
+ "connector-traits",
  "criterion 0.7.0",
  "csv",
  "dashmap",

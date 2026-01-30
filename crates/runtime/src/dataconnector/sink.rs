@@ -20,10 +20,7 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::{
-    component::dataset::{Dataset, acceleration::RefreshMode},
-    register_data_connector,
-};
+use crate::register_data_connector;
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints, project_schema},
@@ -36,7 +33,10 @@ use datafusion::{
 };
 use futures::Future;
 
-use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec};
+use super::{
+    ConnectorDataset, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
+    RefreshMode,
+};
 
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
@@ -122,14 +122,14 @@ impl DataConnector for SinkConnector {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
     }
 
     async fn read_write_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &dyn ConnectorDataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         Some(Ok(Arc::new(self.clone())))
     }

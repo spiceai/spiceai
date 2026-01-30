@@ -25,12 +25,13 @@ description = "Databricks data and catalog connector for Spice.ai runtime"
 [dependencies]
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../../aws-sdk-credential-bridge" }
+connector-traits = { path = "../../connector-traits" }
 data_components = { path = "../../data_components", features = ["databricks"] }
+runtime = { path = "../../runtime", features = ["databricks"] }
 datafusion.workspace = true
 futures.workspace = true
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime", features = ["databricks"] }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 secrecy.workspace = true
 snafu.workspace = true

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use connector_traits::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use opentelemetry::{KeyValue, metrics::UpDownCounter};
 use snafu::prelude::*;
 

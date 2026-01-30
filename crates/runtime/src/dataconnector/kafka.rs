@@ -30,14 +30,12 @@ use std::{any::Any, pin::Pin, sync::Arc};
 use tonic::async_trait;
 
 use crate::{
-    component::{
-        ComponentType,
-        dataset::{Dataset, acceleration::RefreshMode},
-        metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
-    },
+    component::dataset::Dataset,
     dataaccelerator::spice_sys::{self, OpenOption, kafka::KafkaSys},
     dataconnector::{
-        ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
+        ComponentType, ConnectorComponent, ConnectorDataset, ConnectorFederatedTable,
+        ConnectorParams, DataConnector, DataConnectorFactory, MetricSpec, MetricType,
+        MetricsProvider, ObserveMetricCallback, RefreshMode,
     },
     datafusion::refresh_sql,
     federated_table::FederatedTable,
@@ -282,8 +280,17 @@ impl DataConnector for Kafka {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let dataset = dataset.as_any().downcast_ref::<Dataset>().ok_or_else(|| {
+            super::DataConnectorError::Internal {
+                dataconnector: "kafka".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "KAFKA-DATASET-TYPE".to_string(),
+                source: Box::new(std::io::Error::other("Expected runtime dataset")),
+            }
+        })?;
+
         ensure!(
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
@@ -295,8 +302,9 @@ impl DataConnector for Kafka {
         let Some(ref acceleration) = dataset.acceleration else {
             unreachable!("Dataset acceleration already verified. This should never be None here.");
         };
+        let refresh_mode = acceleration.refresh_mode.map(Into::into);
         ensure!(
-            acceleration.refresh_mode == Some(RefreshMode::Append),
+            refresh_mode == Some(RefreshMode::Append),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "kafka",
                 message: "The Kafka connector is only compatible with refresh mode 'append'. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
@@ -342,8 +350,17 @@ impl DataConnector for Kafka {
         true
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn ConnectorFederatedTable>,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
+            let Some(federated_table) = federated_table
+                .as_any()
+                .downcast_ref::<FederatedTable>() else {
+                return;
+            };
+
             let table_provider = federated_table.table_provider().await;
             let Some(kafka) = table_provider.as_any().downcast_ref::<data_components::kafka::Kafka>() else {
                 return;

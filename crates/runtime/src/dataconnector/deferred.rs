@@ -16,8 +16,7 @@ limitations under the License.
 
 use std::{any::Any, sync::Arc};
 
-use super::DataConnector;
-use crate::component::{ComponentInitialization, dataset::Dataset};
+use super::{ComponentInitialization, ConnectorDataset, DataConnector};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -60,7 +59,7 @@ impl DataConnector for DeferredConnector {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
     }

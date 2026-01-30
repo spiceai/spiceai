@@ -25,12 +25,11 @@ description = "Oracle data connector for Spice.ai runtime"
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+connector-traits = { path = "../../connector-traits" }
 data_components = { path = "../../data_components", features = ["oracle"] }
 datafusion.workspace = true
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
-runtime-parameters = { path = "../../runtime-parameters" }
 snafu.workspace = true
 tracing.workspace = true
 

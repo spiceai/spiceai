@@ -25,13 +25,13 @@ description = "MySQL data connector for Spice.ai runtime"
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+connector-traits = { path = "../../connector-traits" }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["mysql", "mysql-federation"] }
 linkme.workspace = true
 mysql_async.workspace = true
 opentelemetry.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true
 tracing.workspace = true

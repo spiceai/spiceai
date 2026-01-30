@@ -23,8 +23,8 @@ use crate::{
     App, Runtime,
     component::{catalog::Catalog, dataset::Dataset},
     dataconnector::{
-        DataConnector, DataConnectorFactory,
-        parameters::{ConnectorParams, ConnectorParamsBuilder},
+        ConnectorParams, DataConnector, DataConnectorFactory,
+        parameters::ConnectorParamsBuilder,
         spiceai::{SpiceAI, SpiceAIDatasetPath, SpiceAIFactory},
     },
     parameters::ExposedParamLookup,
@@ -91,6 +91,7 @@ impl SpiceCloudPlatformCatalog {
         Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
     }
 
+    #[expect(clippy::result_large_err)]
     fn parse_and_validate_catalog_id(catalog: &Catalog) -> super::Result<(String, String, String)> {
         let Some(catalog_id) = catalog.catalog_id.clone() else {
             return Err(
@@ -218,18 +219,15 @@ impl SpiceCloudPlatformCatalog {
     ) -> super::Result<Arc<dyn DataConnector>> {
         SpiceAIFactory::new()
             .create(
-                ConnectorParamsBuilder::new(
-                    "spice.ai".into(),
-                    ConnectorComponent::Dataset(Arc::new(template_dataset)),
-                )
-                .build(runtime.secrets(), runtime.tokio_io_runtime())
-                .await
-                .map_err(|e| super::Error::InvalidConfiguration {
-                    connector: "spice.ai".into(),
-                    connector_component: ConnectorComponent::from(catalog),
-                    message: e.to_string(),
-                    source: e,
-                })?,
+                ConnectorParamsBuilder::new("spice.ai".into(), Arc::new(template_dataset))
+                    .build(runtime.secrets(), runtime.tokio_io_runtime())
+                    .await
+                    .map_err(|e| super::Error::InvalidConfiguration {
+                        connector: "spice.ai".into(),
+                        connector_component: ConnectorComponent::from(catalog),
+                        message: e.to_string(),
+                        source: e,
+                    })?,
             )
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -239,6 +237,7 @@ impl SpiceCloudPlatformCatalog {
             })
     }
 
+    #[expect(clippy::result_large_err)]
     fn create_metadata_value(
         value: &str,
         catalog: &Catalog,

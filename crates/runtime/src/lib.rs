@@ -38,8 +38,7 @@ use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
 use crate::{
-    auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
-    internal_table::Error as InternalTableError,
+    auth::EndpointAuth, datafusion::DataFusion, internal_table::Error as InternalTableError,
 };
 
 use ::datafusion::error::DataFusionError;
@@ -86,8 +85,10 @@ pub mod catalogconnector;
 mod changes;
 pub mod component;
 pub mod config;
+mod connector_traits_impl;
 pub mod dataaccelerator;
 pub mod dataconnector;
+pub(crate) use dataconnector::register_data_connector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;

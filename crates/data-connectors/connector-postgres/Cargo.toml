@@ -24,11 +24,11 @@ description = "PostgreSQL data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+connector-traits = { path = "../../connector-traits" }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["postgres", "postgres-federation"] }
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true
 

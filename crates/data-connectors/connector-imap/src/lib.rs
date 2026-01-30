@@ -15,18 +15,16 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec,
+};
 use data_components::imap::{
     ImapTableProvider,
     session::{ImapAuthMode, ImapAuthModeParameter, ImapSSLMode, ImapSession},
 };
 use datafusion::datasource::TableProvider;
 use regex::Regex;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::parameters::ParameterSpec;
 use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{
@@ -286,7 +284,7 @@ impl DataConnector for Imap {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(ImapTableProvider::new(
             self.session.clone(),

@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec, Parameters,
+};
 use data_components::Read;
 use data_components::odbc::ODBCTableFactory;
 use datafusion::datasource::TableProvider;
@@ -24,12 +28,6 @@ use datafusion::sql::unparser::dialect::{
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
-    NewDataConnectorResult,
-};
-use runtime::parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -299,17 +297,15 @@ where
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.odbc_factory, dataset.path().into())
                 .await
-                .map_err(|source| {
-                    runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
-                        dataconnector: "odbc".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source,
-                    }
+                .map_err(|source| DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "odbc".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source,
                 })?,
         )
     }

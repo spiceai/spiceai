@@ -37,11 +37,11 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use runtime::Runtime;
 use runtime::catalogconnector::{CatalogConnector, Error as CatalogError, Result as CatalogResult};
-use runtime::component::ComponentInitialization;
+use runtime::component::ComponentInitialization as RuntimeComponentInitialization;
 use runtime::component::catalog::Catalog;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ComponentInitialization as ConnectorComponentInitialization, ConnectorComponent,
+    ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
@@ -193,7 +193,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 /// Databricks data connector.
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
-    initialization: ComponentInitialization,
+    initialization: ConnectorComponentInitialization,
 }
 
 impl std::fmt::Debug for Databricks {
@@ -222,8 +222,8 @@ impl Databricks {
 
         let auth_credentials = Self::build_auth_credentials(&params)?;
         let initialization = match auth_credentials {
-            AuthCredentials::U2M(_) => ComponentInitialization::OnTrigger,
-            _ => ComponentInitialization::default(),
+            AuthCredentials::U2M(_) => ConnectorComponentInitialization::OnTrigger,
+            _ => ConnectorComponentInitialization::default(),
         };
 
         match mode {
@@ -447,7 +447,7 @@ impl Databricks {
             read_provider,
 
             // Databricks spark connect doesn't support U2M, so no deferred loading
-            initialization: ComponentInitialization::default(),
+            initialization: ConnectorComponentInitialization::default(),
         })
     }
 
@@ -586,7 +586,7 @@ impl DataConnector for Databricks {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = TableReference::from(dataset.path());
         self.read_provider
@@ -599,7 +599,7 @@ impl DataConnector for Databricks {
             })
     }
 
-    fn initialization(&self) -> ComponentInitialization {
+    fn initialization(&self) -> ConnectorComponentInitialization {
         self.initialization
     }
 }
@@ -684,7 +684,7 @@ pub const CATALOG_PARAMETERS: &[ParameterSpec] = &[
 #[derive(Clone)]
 pub struct DatabricksCatalog {
     params: Parameters,
-    initialization: ComponentInitialization,
+    initialization: RuntimeComponentInitialization,
 }
 
 impl DatabricksCatalog {
@@ -692,8 +692,8 @@ impl DatabricksCatalog {
     pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
         let component_initialization = match Databricks::build_auth_credentials(&params.parameters)
         {
-            Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
-            _ => ComponentInitialization::default(),
+            Ok(AuthCredentials::U2M(_)) => RuntimeComponentInitialization::OnTrigger,
+            _ => RuntimeComponentInitialization::default(),
         };
 
         Arc::new(Self {
@@ -848,7 +848,7 @@ impl CatalogConnector for DatabricksCatalog {
         Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
     }
 
-    fn initialization(&self) -> ComponentInitialization {
+    fn initialization(&self) -> RuntimeComponentInitialization {
         self.initialization
     }
 }

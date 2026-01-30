@@ -15,19 +15,17 @@ limitations under the License.
 */
 
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
-    listing::{self, ListingTableConnector},
+    ConnectorComponent, ConnectorDataset, ConnectorParams, ConnectorRuntime, DataConnector,
+    DataConnectorError, DataConnectorFactory, DataConnectorResult, ParameterSpec, Parameters,
+    listing::{self, ListingConnector, ListingTableConnector},
     parameters::{
         self, Validator,
         aws::{AuthValidator, RegionValidator, S3EndpointValidator},
     },
 };
 
-use crate::{
-    Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
-    register_data_connector,
-};
+use crate::{dataconnector::listing::LISTING_TABLE_PARAMETERS, register_data_connector};
+use connector_traits::InvalidConfigurationSnafu;
 
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use snafu::prelude::*;
@@ -103,7 +101,7 @@ pub enum Error {
 
 pub struct S3 {
     pub(crate) params: Parameters,
-    pub(crate) runtime: Option<Runtime>,
+    pub(crate) runtime: Option<Arc<dyn ConnectorRuntime>>,
     pub(crate) tokio_io_runtime: tokio::runtime::Handle,
 }
 
@@ -212,10 +210,10 @@ impl DataConnectorFactory for S3Factory {
 
             let s3 = S3 {
                 params: params.parameters,
-                runtime: params.runtime.map(Arc::unwrap_or_clone),
+                runtime: params.runtime,
                 tokio_io_runtime: params.io_runtime,
             };
-            Ok(Arc::new(s3) as Arc<dyn DataConnector>)
+            Ok(Arc::new(ListingConnector::new(s3)) as Arc<dyn DataConnector>)
         })
     }
 
@@ -243,6 +241,10 @@ impl ListingTableConnector for S3 {
         Some(ObjectVersionType::Version)
     }
 
+    fn supports_single_file_etag_cache(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -257,14 +259,14 @@ impl ListingTableConnector for S3 {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
-        let url = url.unwrap_or(dataset.from.as_str());
+        let url = url.unwrap_or(dataset.from());
         let mut s3_url =
             Url::parse(url)
                 .boxed()
-                .context(super::InvalidConfigurationSnafu {
+                .context(InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
@@ -287,13 +289,13 @@ impl ListingTableConnector for S3 {
         Ok(s3_url)
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_runtime(&self) -> Option<Arc<dyn ConnectorRuntime>> {
+        self.runtime.as_ref().map(Arc::clone)
     }
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {

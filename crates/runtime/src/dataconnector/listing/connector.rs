@@ -52,11 +52,9 @@ use {
     datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
 };
 
-use crate::Runtime;
-use crate::accelerated_table::AcceleratedTable;
-use crate::component::dataset::Dataset;
 use crate::dataconnector::{
-    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
+    ConnectorAcceleratedTable, ConnectorComponent, ConnectorDataset, ConnectorRuntime,
+    DataConnector, DataConnectorError, DataConnectorResult,
     listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
 };
 use crate::parameters::{ExposedParamLookup, Parameters};
@@ -411,7 +409,7 @@ pub trait ListingTableConnector: DataConnector {
     ///
     /// # Arguments
     ///
-    /// * `dataset` - A reference to the [`Dataset`] for which the object store URL is being retrieved.
+    /// * `dataset` - A reference to the connector dataset for which the object store URL is being retrieved.
     /// * `url` - An optional reference to a string representing a specific Path or URL to use.
     ///
     /// # Returns
@@ -419,7 +417,7 @@ pub trait ListingTableConnector: DataConnector {
     /// A [`DataConnectorResult`] containing the resolved [`Url`] of the object store.
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         url: Option<&str>,
     ) -> DataConnectorResult<Url>;
 
@@ -436,7 +434,10 @@ pub trait ListingTableConnector: DataConnector {
         )
     }
 
-    fn get_object_store(&self, dataset: &Dataset) -> DataConnectorResult<Arc<dyn ObjectStore>>
+    fn get_object_store(
+        &self,
+        dataset: &dyn ConnectorDataset,
+    ) -> DataConnectorResult<Arc<dyn ObjectStore>>
     where
         Self: Display,
     {
@@ -457,7 +458,7 @@ pub trait ListingTableConnector: DataConnector {
             })
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
+    fn get_runtime(&self) -> Option<Arc<dyn ConnectorRuntime>> {
         None
     }
 
@@ -467,7 +468,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn construct_metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
     where
         Self: Display,
@@ -481,7 +482,7 @@ pub trait ListingTableConnector: DataConnector {
             dataconnector: format!("{self}"),
             message: format!(
                 "Invalid file extension ({extension}) for source ({})",
-                dataset.name
+                dataset.name()
             ),
             connector_component: ConnectorComponent::from(dataset),
         })?;
@@ -502,7 +503,7 @@ pub trait ListingTableConnector: DataConnector {
     /// responses, are always of the format `Ok((None, String))`. The data must be UTF8 compatible.
     async fn get_file_format_and_extension(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)>
     where
         Self: Display,
@@ -563,7 +564,7 @@ pub trait ListingTableConnector: DataConnector {
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
     fn get_jsonl_format(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         params: &Parameters,
     ) -> DataConnectorResult<Arc<JsonFormat>>
     where
@@ -603,7 +604,7 @@ pub trait ListingTableConnector: DataConnector {
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
     fn get_json_format(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         params: &Parameters,
     ) -> DataConnectorResult<Arc<SpiceJsonFormat>>
     where
@@ -659,7 +660,7 @@ pub trait ListingTableConnector: DataConnector {
     /// Uses the appropriate parameters based on the [`DelimitedFormat`] provided.
     fn delimiter_separated_format(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         params: &Parameters,
         delimiter: DelimitedFormat,
     ) -> DataConnectorResult<Arc<CsvFormat>>
@@ -729,7 +730,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn get_table_parquet_options(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<TableParquetOptions>
     where
         Self: Display,
@@ -746,7 +747,7 @@ pub trait ListingTableConnector: DataConnector {
             )?;
 
         if let Some(runtime) = self.get_runtime() {
-            let page_index_options = parquet_page_index_options(&runtime).await;
+            let page_index_options = parquet_page_index_options(runtime.as_ref()).await;
 
             table_parquet_options
                 .set(
@@ -776,15 +777,15 @@ pub trait ListingTableConnector: DataConnector {
     /// the table when the file is updated.
     async fn on_accelerated_table_registration(
         &self,
-        _dataset: &Dataset,
-        _accelerated_table: &mut AcceleratedTable,
+        _dataset: &dyn ConnectorDataset,
+        _accelerated_table: &mut dyn ConnectorAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         error: object_store::Error,
     ) -> DataConnectorError
     where
@@ -799,7 +800,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn create_text_table(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         url: &Url,
         extension: &str,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
@@ -832,7 +833,7 @@ pub trait ListingTableConnector: DataConnector {
                 connector_component: ConnectorComponent::from(dataset),
                 message: format!(
                     "Invalid file extension ({extension}) for source ({})",
-                    dataset.name
+                    dataset.name()
                 ),
             })?,
         ))
@@ -840,7 +841,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn create_listing_table(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         url: &Url,
         extension: &str,
         file_format: Arc<dyn FileFormat>,
@@ -862,7 +863,7 @@ pub trait ListingTableConnector: DataConnector {
         let ctx: SessionContext = self.get_session_context();
 
         let (schema_infer_url, schema_infer_meta) =
-            if let Some(url) = dataset.params.get("schema_source_path") {
+            if let Some(url) = dataset.params().get("schema_source_path") {
                 let url = self.get_object_store_url(dataset, Some(url))?;
                 let schema_infer_url = ListingTableUrl::parse(&url).boxed().context(
                     crate::dataconnector::UnableToGetSchemaInternalSnafu {
@@ -909,7 +910,7 @@ pub trait ListingTableConnector: DataConnector {
 
         tracing::debug!(
             "Dataset '{name}' schema will be resolved based on {sanitized_url}",
-            name = dataset.name,
+            name = dataset.name(),
             sanitized_url = schema_infer_url.sanitized_url(),
         );
 
@@ -937,8 +938,12 @@ pub trait ListingTableConnector: DataConnector {
 
         options = add_metadata_columns_if_required(options, url, &expanded_schema, dataset);
 
+        let hive_partitioning_enabled = dataset
+            .get_param("hive_partitioning_enabled")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+
         // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
-        if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
+        if hive_partitioning_enabled && table_path.is_collection() {
             let inferred_partitions = match schema_infer_meta {
                 Some(meta) => infer_partitions_with_types_from_files(&table_path, &[meta]),
                 None => {
@@ -964,9 +969,7 @@ pub trait ListingTableConnector: DataConnector {
             }
         }
 
-        let final_schema = if dataset.get_param("hive_partitioning_enabled", false)
-            && table_path.is_collection()
-        {
+        let final_schema = if hive_partitioning_enabled && table_path.is_collection() {
             self.deduplicate_partition_columns_expressed_in_file(
                 dataset,
                 expanded_schema,
@@ -1002,17 +1005,17 @@ pub trait ListingTableConnector: DataConnector {
         if is_s3_connector
             && refresh_skip_enabled(dataset)
             && !table_path.is_collection()
-            && dataset.acceleration.is_some()
+            && dataset.acceleration_configured()
             && let Some(cached_table) =
                 data_components::s3_single_file_cached::S3SingleFileCached::try_new(
                     Arc::clone(&table_arc),
                     Arc::clone(&object_store),
-                    dataset.name.to_string(),
+                    dataset.name().to_string(),
                 )
         {
             tracing::debug!(
                 "Enabled S3 single-file ETag/Version caching for {}",
-                dataset.name
+                dataset.name()
             );
             return Ok(Arc::new(cached_table));
         }
@@ -1038,7 +1041,7 @@ pub trait ListingTableConnector: DataConnector {
 
     fn deduplicate_partition_columns_expressed_in_file(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         schema: SchemaRef,
         partition_cols: &[(String, DataType)],
     ) -> DataConnectorResult<SchemaRef> {
@@ -1061,7 +1064,7 @@ pub trait ListingTableConnector: DataConnector {
 
                 if !types_match {
                     return Err(SchemaMismatch {
-                        dataset_name: dataset.name.to_string(),
+                        dataset_name: dataset.name().to_string(),
                         differences: format!(
                             "Field {name} cannot be deduplicated as its field types differ:\
                             (partition column): {}, (file column): {}",
@@ -1094,9 +1097,9 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        if !dataset.has_metadata_table {
+        if !dataset.has_metadata_table() {
             return None;
         }
 
@@ -1105,7 +1108,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let url = self.get_object_store_url(dataset, None)?;
 
@@ -1131,21 +1134,21 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     /// the table when the file is updated.
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        dataset: &dyn ConnectorDataset,
+        accelerated_table: &mut dyn ConnectorAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
             .await
     }
 }
 
-fn refresh_skip_enabled(dataset: &Dataset) -> bool {
-    match dataset.params.get("refresh_skip").map(String::as_str) {
+fn refresh_skip_enabled(dataset: &dyn ConnectorDataset) -> bool {
+    match dataset.params().get("refresh_skip").map(String::as_str) {
         None | Some("enabled") => true,
         Some("disabled") => false,
         Some(other) => {
             tracing::warn!(
-                dataset = %dataset.name,
+                dataset = %dataset.name(),
                 value = other,
                 "Invalid refresh_skip value; expected 'enabled' or 'disabled'. Defaulting to 'enabled'."
             );
@@ -1158,13 +1161,13 @@ fn add_metadata_columns_if_required(
     options: ListingOptions,
     table_url: &Url,
     schema: &Schema,
-    dataset: &Dataset,
+    dataset: &dyn ConnectorDataset,
 ) -> ListingOptions {
     let url_prefix = get_url_prefix(table_url);
     if let Some(columns) = dataset.listing_table_metadata_columns(url_prefix, schema) {
         tracing::debug!(
             "Enabling metadata columns for '{}': {:?}",
-            dataset.name,
+            dataset.name(),
             columns
         );
         return options.with_metadata_cols(columns);
@@ -1190,7 +1193,7 @@ const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 /// - If no files with the specified extension are found
 async fn get_last_modified(
     dataconnector: String,
-    dataset: &Dataset,
+    dataset: &dyn ConnectorDataset,
     extension: &str,
     table_path: ListingTableUrl,
     ctx: &SessionContext,
@@ -1281,7 +1284,7 @@ async fn get_last_modified(
 
 async fn verify_schema_source_path(
     dataconnector: String,
-    dataset: &Dataset,
+    dataset: &dyn ConnectorDataset,
     extension: &str,
     schema_source_path: ListingTableUrl,
     ctx: &SessionContext,
@@ -1289,7 +1292,7 @@ async fn verify_schema_source_path(
 ) -> DataConnectorResult<Option<ObjectMeta>> {
     tracing::debug!(
         "Verifying dataset {table_name} schema source path is valid: {schema_source_path}",
-        table_name = dataset.name
+        table_name = dataset.name()
     );
 
     let state = ctx.state();
@@ -1345,7 +1348,7 @@ async fn verify_schema_source_path(
 fn to_listing_table_url(
     original_url: &Url,
     path: &Path,
-    dataset: &Dataset,
+    dataset: &dyn ConnectorDataset,
     dataconnector: &str,
 ) -> DataConnectorResult<SensitiveListingTableUrl> {
     let mut new_url = original_url.clone();
@@ -1411,11 +1414,17 @@ impl Default for ParquetPageIndexOptions {
 ///   params:
 ///     parquet_page_index: required # skip, auto
 /// ```
-async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOptions {
-    let runtime_app = runtime.app();
-    let app = runtime_app.read().await;
-    let parquet_page_index_param =
-        app::App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
+async fn parquet_page_index_options(runtime: &dyn ConnectorRuntime) -> ParquetPageIndexOptions {
+    let parquet_page_index_param = match runtime.runtime_param("parquet_page_index").await {
+        Ok(Some(value)) => value,
+        Ok(None) => "required".to_string(),
+        Err(err) => {
+            tracing::warn!(
+                "Failed to read runtime.params.parquet_page_index ({err}). Using 'required'."
+            );
+            "required".to_string()
+        }
+    };
 
     match parquet_page_index_param.as_str() {
         // Note: "auto" and "required" both enable page index now. The difference was that "auto"
@@ -1508,7 +1517,7 @@ mod tests {
 
         fn get_object_store_url(
             &self,
-            dataset: &Dataset,
+            dataset: &dyn ConnectorDataset,
             _url: Option<&str>,
         ) -> DataConnectorResult<Url> {
             Url::parse("test")

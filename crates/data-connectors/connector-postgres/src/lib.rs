@@ -24,6 +24,10 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec,
+};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
@@ -31,12 +35,6 @@ use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError,
     postgrespool::{self, PostgresConnectionPool},
 };
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::parameters::ParameterSpec;
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;
@@ -175,7 +173,7 @@ impl DataConnector for Postgres {
     #[cfg(feature = "postgres-write")]
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self
             .postgres_factory
@@ -222,7 +220,7 @@ impl DataConnector for Postgres {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match self
             .postgres_factory

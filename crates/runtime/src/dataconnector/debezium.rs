@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use super::{
+    ConnectorComponent, ConnectorDataset, ConnectorFederatedTable, ConnectorParams, DataConnector,
+    DataConnectorFactory, MetricsProvider, ParameterSpec, Parameters, RefreshMode,
+};
 use crate::component::dataset::Dataset;
-use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::component::metrics::MetricsProvider;
+use crate::component::dataset::acceleration::Engine;
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
-use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
 use crate::register_data_connector;
@@ -270,8 +271,17 @@ impl DataConnector for Debezium {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let runtime_dataset = dataset.as_any().downcast_ref::<Dataset>().ok_or_else(|| {
+            super::DataConnectorError::Internal {
+                dataconnector: "debezium".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "DEBEZIUM-DATASET-TYPE".to_string(),
+                source: Box::new(std::io::Error::other("Expected runtime dataset")),
+            }
+        })?;
+
         ensure!(
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
@@ -280,7 +290,7 @@ impl DataConnector for Debezium {
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
-        let Some(ref acceleration) = dataset.acceleration else {
+        let Some(ref acceleration) = runtime_dataset.acceleration else {
             unreachable!("Dataset acceleration already verified. This should never be None here.");
         };
         ensure!(
@@ -292,7 +302,7 @@ impl DataConnector for Debezium {
             }
         );
         ensure!(
-            self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
+            self.resolve_refresh_mode(dataset.refresh_mode()) == RefreshMode::Changes,
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
                 message: "The Debezium connector is only compatible with refresh mode 'changes'. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
@@ -300,7 +310,7 @@ impl DataConnector for Debezium {
             }
         );
 
-        let dataset_name = dataset.name.to_string();
+        let dataset_name = dataset.name().to_string();
 
         if !dataset.is_file_accelerated() {
             tracing::warn!(
@@ -310,7 +320,10 @@ impl DataConnector for Debezium {
 
         let topic = dataset.path();
 
-        let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
+        let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(
+            runtime_dataset,
+        )
+        .await
         {
             Some(metadata) => {
                 if let Some(config_consumer_group_id) = &self.kafka_config.consumer_group_id {
@@ -367,12 +380,12 @@ impl DataConnector for Debezium {
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
-            None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
+            None => get_metadata_from_kafka(runtime_dataset, topic, &self.kafka_config).await?,
         };
 
         let refresh_sql = dataset.refresh_sql();
         let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+            refresh_sql::validate_refresh_sql(dataset.name().clone(), refresh_sql.as_str(), schema)
                 .boxed()
                 .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                     dataconnector: "debezium".to_string(),
@@ -400,10 +413,16 @@ impl DataConnector for Debezium {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
-        _dataset: &Dataset,
+        federated_table: Arc<dyn ConnectorFederatedTable>,
+        _dataset: &dyn ConnectorDataset,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
+            let Some(federated_table) = federated_table
+                .as_any()
+                .downcast_ref::<FederatedTable>() else {
+                return;
+            };
+
             let table_provider = federated_table.table_provider().await;
             let Some(debezium_kafka) = table_provider.as_any().downcast_ref::<DebeziumKafka>() else {
                 return;

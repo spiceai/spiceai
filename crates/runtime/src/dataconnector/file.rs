@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::component::dataset::Dataset;
 use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use crate::register_data_connector;
@@ -37,8 +36,10 @@ use url::Url;
 
 use super::ConnectorParams;
 use super::{
-    DataConnector, DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu,
-    ParameterSpec, Parameters, listing::ListingTableConnector,
+    ConnectorAcceleratedTable, ConnectorDataset, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu, ParameterSpec,
+    Parameters,
+    listing::{ListingConnector, ListingTableConnector},
 };
 
 #[derive(Debug)]
@@ -78,10 +79,10 @@ impl DataConnectorFactory for FileFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            Ok(Arc::new(File {
+            Ok(Arc::new(ListingConnector::new(File {
                 params: params.parameters,
                 tokio_io_runtime: params.io_runtime,
-            }) as Arc<dyn DataConnector>)
+            })) as Arc<dyn DataConnector>)
         })
     }
 
@@ -113,7 +114,7 @@ impl ListingTableConnector for File {
     ///   2. Datasets prefixed with `file://` (not just `file:/`). This is to mirror the UX of [`Url::parse`].
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         path: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let path = match path {
@@ -156,19 +157,28 @@ impl ListingTableConnector for File {
     /// watcher is aborted.
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        dataset: &dyn ConnectorDataset,
+        accelerated_table: &mut dyn ConnectorAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let accelerated_table = accelerated_table
+            .as_any_mut()
+            .downcast_mut::<AcceleratedTable>()
+            .ok_or_else(|| {
+                Box::new(DataConnectorError::Internal {
+                    dataconnector: "file".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    code: "FILE-ACCELERATED-TABLE-TYPE".to_string(),
+                    source: Box::new(std::io::Error::other("Expected accelerated table")),
+                }) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+
         // Only enable the file watcher if the acceleration has the file_watcher parameter set to "enabled"
-        let enabled = dataset.acceleration.as_ref().is_some_and(|acceleration| {
-            acceleration
-                .params
-                .get("file_watcher")
-                .is_some_and(|v| v == "enabled")
-        });
+        let enabled = dataset
+            .acceleration_params()
+            .is_some_and(|params| params.get("file_watcher").is_some_and(|v| v == "enabled"));
 
         if !enabled {
-            tracing::debug!("File watcher disabled for dataset {}", dataset.name);
+            tracing::debug!("File watcher disabled for dataset {}", dataset.name());
             return Ok(());
         }
 
@@ -238,7 +248,7 @@ impl ListingTableConnector for File {
 
 register_data_connector!("file", FileFactory);
 
-fn get_path(dataset: &Dataset) -> PathBuf {
+fn get_path(dataset: &dyn ConnectorDataset) -> PathBuf {
     PathBuf::from(dataset.path())
 }
 

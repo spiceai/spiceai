@@ -17,18 +17,16 @@ limitations under the License.
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec,
+};
 use data_components::Read;
 use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
 use datafusion::datasource::TableProvider;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::tls::new_tls_flight_channel;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -120,20 +118,15 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .context(UnableToConstructTlsChannelSnafu)?;
             let flight_channel = CookieService::new(flight_channel, Arc::clone(&cookie_store));
 
-            let max_message_size =
-                match params
-                    .app
-                    .as_ref()
-                    .and_then(|app| app.runtime.flight.as_ref())
-                {
-                    Some(flight) => flight.max_message_size_bytes().map_err(|err| {
-                        Error::InvalidParameterValue {
-                            parameter: "max_message_size".to_string(),
-                            source: err,
-                        }
-                    })?,
-                    None => None,
-                };
+            let max_message_size = match params.app.as_ref() {
+                Some(app) => app.flight_max_message_size_bytes().map_err(|err| {
+                    Error::InvalidParameterValue {
+                        parameter: "max_message_size".to_string(),
+                        source: err,
+                    }
+                })?,
+                None => None,
+            };
 
             let flight_client = FlightServiceClient::new(flight_channel)
                 .max_encoding_message_size(max_message_size.unwrap_or(MAX_ENCODING_MESSAGE_SIZE))
@@ -171,7 +164,7 @@ impl DataConnector for FlightSQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match Read::table_provider(&self.flightsql_factory, dataset.path().into()).await {
             Ok(provider) => Ok(provider),

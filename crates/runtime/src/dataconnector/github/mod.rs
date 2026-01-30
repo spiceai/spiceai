@@ -16,10 +16,7 @@ limitations under the License.
 
 use crate::dataconnector::github::pull_requests::PullRequestCommentType;
 use crate::token_providers::github_app_token::GitHubAppTokenProvider;
-use crate::{
-    component::dataset::Dataset, dataconnector::github::members::MembersTableArgs,
-    register_data_connector,
-};
+use crate::{dataconnector::github::members::MembersTableArgs, register_data_connector};
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -66,8 +63,8 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
 
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, default_spice_client,
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, ParameterSpec, Parameters, default_spice_client,
 };
 
 mod commits;
@@ -478,7 +475,7 @@ impl Github {
         owner: &str,
         repo: &str,
         tree_sha: Option<&str>,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(tree_sha) = tree_sha.filter(|s| !s.is_empty()) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
@@ -501,7 +498,7 @@ impl Github {
         };
 
         let include_commits = dataset
-            .params
+            .params()
             .get("github_include_commits")
             .is_some_and(|value| value.as_str() == "true");
 
@@ -683,18 +680,21 @@ impl DataConnectorFactory for GithubFactory {
             .ok()
             .map(ToString::to_string);
 
-        let max_concurrent_connections = params
-            .app
-            .and_then(|app| {
-                app.runtime
-                    .params
-                    .get("github_max_concurrent_connections")
-                    .cloned()
-            })
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS);
+        let runtime = params.runtime.clone();
 
         Box::pin(async move {
+            let max_concurrent_connections = if let Some(runtime) = runtime {
+                runtime
+                    .runtime_param("github_max_concurrent_connections")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS)
+            } else {
+                GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS
+            };
+
             let (token_provider, semaphore_key): (Option<Arc<dyn TokenProvider>>, Option<String>) =
                 match (token, client_id, private_key, installation_id) {
                     (Some(token), _, _, _) => {
@@ -857,7 +857,7 @@ impl DataConnector for Github {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path().to_string();
 
@@ -873,7 +873,7 @@ impl DataConnector for Github {
         }
 
         let query_mode = dataset
-            .params
+            .params()
             .get("github_query_mode")
             .map_or("auto", |v| v);
 
@@ -886,7 +886,7 @@ impl DataConnector for Github {
         })?;
 
         let include_comments = dataset
-            .params
+            .params()
             .get("github_include_comments")
             .map(|value| {
                 PullRequestCommentType::try_from(value.as_str()).map_err(|e| {
@@ -900,7 +900,7 @@ impl DataConnector for Github {
             .transpose()?;
 
         let max_comments_fetched = dataset
-            .params
+            .params()
             .get("github_max_comments_fetched")
             .map(|value| {
                 value
@@ -1024,7 +1024,7 @@ impl DataConnector for Github {
                         // No workflow ID specified - list all workflows
                         // Warn if github_workflow_logs is set since it's not applicable
                         if dataset
-                            .params
+                            .params()
                             .get("github_workflow_logs")
                             .is_some_and(|value| value.as_str() == "enabled")
                         {
@@ -1059,7 +1059,7 @@ impl DataConnector for Github {
                         let workflow_id = parts[0];
 
                         let fetch_logs = dataset
-                            .params
+                            .params()
                             .get("github_workflow_logs")
                             .is_some_and(|value| value.as_str() == "enabled");
 
@@ -1129,6 +1129,7 @@ impl DataConnector for Github {
     }
 }
 
+#[expect(clippy::result_large_err)]
 pub fn parse_globs(
     component: &ConnectorComponent,
     input: &str,

@@ -24,11 +24,11 @@ description = "GraphQL data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+connector-traits = { path = "../../connector-traits" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 snafu.workspace = true
 token_provider = { path = "../../token_provider" }
 url.workspace = true

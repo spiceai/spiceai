@@ -14,11 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
-use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::listing::{
-    LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
+    LISTING_TABLE_PARAMETERS, ListingConnector, ListingTableConnector, build_fragments,
 };
 use crate::register_data_connector;
 
@@ -30,10 +27,10 @@ use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
 use url::Url;
 
-use super::{ConnectorComponent, ConnectorParams};
 use super::{
-    DataConnector, DataConnectorError, DataConnectorFactory, DataConnectorResult, ParameterSpec,
-    Parameters,
+    ComponentInitialization, ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector,
+    DataConnectorError, DataConnectorFactory, DataConnectorResult, DatasetHealthMonitor,
+    ParameterSpec, Parameters, RefreshMode, StartupOptions,
 };
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -59,7 +56,7 @@ impl std::fmt::Display for Https {
 impl Https {
     /// Determines if the dataset uses a structured file format (parquet, csv, etc.)
     /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
-    fn is_structured_format(&self, dataset: &Dataset) -> bool {
+    fn is_structured_format(&self, dataset: &dyn ConnectorDataset) -> bool {
         let file_format = self
             .params
             .get("file_format")
@@ -77,7 +74,7 @@ impl Https {
 
         // If file_format is "auto", try to detect from URL extension
         if file_format == "auto"
-            && let Ok(url) = Url::parse(&dataset.from)
+            && let Ok(url) = Url::parse(dataset.from())
             && let Some(mut path) = url.path_segments()
             && let Some(last_segment) = path.next_back()
         {
@@ -114,7 +111,7 @@ struct HttpProviderParams {
 }
 
 impl Https {
-    fn resolve_http_provider_params(&self, dataset: &Dataset) -> HttpProviderParams {
+    fn resolve_http_provider_params(&self, dataset: &dyn ConnectorDataset) -> HttpProviderParams {
         let file_format = self
             .params
             .get("file_format")
@@ -153,7 +150,7 @@ impl Https {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.3);
 
-        let custom_headers = self.parse_custom_headers(&dataset.name.to_string());
+        let custom_headers = self.parse_custom_headers(&dataset.name().to_string());
 
         let allowed_paths = self
             .params
@@ -223,8 +220,9 @@ impl Https {
         }
     }
 
+    #[expect(clippy::result_large_err)]
     fn apply_allowed_paths(
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         provider: data_components::http::provider::HttpTableProvider,
         allowed_paths: Vec<String>,
     ) -> DataConnectorResult<data_components::http::provider::HttpTableProvider> {
@@ -293,7 +291,8 @@ impl Https {
     }
 
     /// Build HTTP client with configured timeouts and connection pool settings
-    fn build_http_client(&self, dataset: &Dataset) -> DataConnectorResult<Client> {
+    #[expect(clippy::result_large_err)]
+    fn build_http_client(&self, dataset: &dyn ConnectorDataset) -> DataConnectorResult<Client> {
         let timeout_secs = self
             .params
             .get("client_timeout")
@@ -342,14 +341,15 @@ impl Https {
     }
 
     /// Create HTTP table provider for JSON API endpoints
+    #[expect(clippy::result_large_err)]
     fn create_http_table_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
+        let base_url = Url::parse(dataset.from()).boxed().map_err(|e| {
             DataConnectorError::InvalidConfiguration {
                 dataconnector: "https".to_string(),
-                message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https", dataset.from),
+                message: format!("{} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/https", dataset.from()),
                 connector_component: ConnectorComponent::from(dataset),
                 source: e,
             }
@@ -396,7 +396,7 @@ impl Https {
 
         tracing::trace!(
             "HTTP provider configuration for {}: allow_query_filters={}, allow_body_filters={}",
-            dataset.name,
+            dataset.name(),
             allow_query_filters,
             allow_body_filters
         );
@@ -415,7 +415,7 @@ impl Https {
         }
 
         let provider = Arc::new(provider);
-        Self::spawn_endpoint_validation(Arc::clone(&provider), dataset.name.to_string());
+        Self::spawn_endpoint_validation(Arc::clone(&provider), dataset.name().to_string());
 
         Ok(provider)
     }
@@ -429,23 +429,23 @@ impl DataConnector for Https {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
             // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
             // which properly handles file parsing with correct schemas
-            let listing_connector =
-                HttpListingConnector::new(self.params.clone(), Handle::current());
+            let listing_connector = ListingConnector::new(HttpListingConnector::new(
+                self.params.clone(),
+                Handle::current(),
+            ));
             return listing_connector.read_provider(dataset).await;
         }
 
         // Validate acceleration mode for HTTP connector (JSON API endpoints only)
         // Structured file formats (parquet, csv, etc.) are handled by ListingTableConnector above
         // and support full refresh mode without refresh_sql
-        if let Some(acceleration) = &dataset.acceleration
-            && acceleration.enabled
-        {
-            let refresh_mode = self.resolve_refresh_mode(acceleration.refresh_mode);
+        if dataset.is_accelerated() {
+            let refresh_mode = self.resolve_refresh_mode(dataset.refresh_mode());
 
             // HTTP connector only supports append or caching mode unless refresh_sql is provided
             if matches!(refresh_mode, RefreshMode::Full) && dataset.refresh_sql().is_none() {
@@ -461,7 +461,10 @@ impl DataConnector for Https {
         self.create_http_table_provider(dataset)
     }
 
-    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(
+        &self,
+        dataset: &dyn ConnectorDataset,
+    ) -> ComponentInitialization {
         // Non-structured HTTP endpoints (using HttpTableProvider) are dynamic datasets
         // that require filters to work properly, so skip health monitoring for them.
         if self.is_structured_format(dataset) {
@@ -594,10 +597,10 @@ impl ListingTableConnector for HttpListingConnector {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
-        let url = url.unwrap_or(dataset.from.as_str());
+        let url = url.unwrap_or(dataset.from());
         let mut u = Url::parse(url).boxed().map_err(|e| {
             DataConnectorError::InvalidConfiguration {
                 dataconnector: "https".to_string(),

@@ -14,17 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::ConnectorComponent;
-use super::ConnectorParams;
-use super::DataConnector;
-use super::DataConnectorFactory;
-use super::ParameterSpec;
+use super::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorFactory,
+    ParameterSpec,
+};
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::snowflake::SnowflakeTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
-use crate::{component::dataset::Dataset, register_data_connector};
+use crate::register_data_connector;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use itertools::Itertools;
@@ -132,7 +131,7 @@ impl DataConnector for Snowflake {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset
             .path()

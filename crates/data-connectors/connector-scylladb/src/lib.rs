@@ -24,18 +24,15 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec, Parameters,
+};
 use data_components::Read;
 use data_components::scylladb::ScyllaDbTableFactory;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::scylladbpool::ScyllaDbConnectionPool;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult,
-};
-use runtime::parameters::ParameterSpec;
-use runtime_parameters::Parameters;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use snafu::prelude::*;
@@ -206,7 +203,7 @@ impl DataConnectorFactory for ScyllaDbFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match create_scylladb_connector(params.parameters).await {
                 Ok((session, keyspace, compute_context)) => {
@@ -305,7 +302,7 @@ impl DataConnector for ScyllaDb {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.scylladb_factory, dataset.path().into())

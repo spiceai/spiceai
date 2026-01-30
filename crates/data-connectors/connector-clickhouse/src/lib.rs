@@ -25,18 +25,17 @@ limitations under the License.
 
 use async_trait::async_trait;
 use clickhouse_rs::Options;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParamLookup, ParameterSpec,
+    Parameters,
+};
 use data_components::Read;
 use data_components::clickhouse::ClickhouseTableFactory;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use db_connection_pool::clickhousepool::ClickhouseConnectionPool;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::parameters::{ParamLookup, ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -251,7 +250,7 @@ impl DataConnector for Clickhouse {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.clickhouse_factory, dataset.path().into())

@@ -24,18 +24,16 @@ limitations under the License.
 //! this crate, not the entire runtime.
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec,
+};
 use data_components::Read;
 use data_components::snowflake::SnowflakeTableFactory;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use itertools::Itertools;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;
@@ -176,7 +174,7 @@ impl DataConnector for Snowflake {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset
             .path()

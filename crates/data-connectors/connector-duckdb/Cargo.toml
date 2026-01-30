@@ -24,13 +24,14 @@ description = "DuckDB data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+connector-dialects = { path = "../../connector-dialects" }
+connector-traits = { path = "../../connector-traits" }
 data_components = { path = "../../data_components", features = ["duckdb"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["duckdb"] }
 duckdb.workspace = true
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime", features = ["duckdb"] }
 snafu.workspace = true
 
 [features]

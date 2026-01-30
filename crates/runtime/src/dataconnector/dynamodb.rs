@@ -15,13 +15,12 @@ limitations under the License.
 */
 
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
+    ComponentType, ConnectorComponent, ConnectorDataset, ConnectorFederatedTable, ConnectorParams,
+    DataConnector, DataConnectorError, DataConnectorFactory, MetricSpec, MetricType,
+    MetricsProvider, ObserveMetricCallback, ParameterSpec, Parameters, RefreshMode,
+    parameters::aws::initiate_config_with_auth_method,
 };
-use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
-use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::dynamodb::{DynamoDBCheckpointMetadata, DynamoDBSys};
 use crate::federated_table::FederatedTable;
@@ -139,12 +138,13 @@ impl DataConnectorFactory for DynamoDBFactory {
     }
 }
 
+#[expect(clippy::result_large_err)]
 fn parse_json_nesting_static_fields(
-    dataset: &Dataset,
+    dataset: &dyn ConnectorDataset,
 ) -> Result<Option<JsonNesting>, DataConnectorError> {
     // Find all columns that have json_object metadata defined
     let json_object_columns: Vec<&Column> = dataset
-        .columns
+        .columns()
         .iter()
         .filter(|col| col.metadata.contains_key("json_object"))
         .collect();
@@ -194,7 +194,7 @@ fn parse_json_nesting_static_fields(
 
     // Collect all other columns as static fields
     let static_fields: HashSet<String> = dataset
-        .columns
+        .columns()
         .iter()
         .filter(|col| col.name != json_column.name)
         .map(|col| col.name.clone())
@@ -214,16 +214,12 @@ impl DataConnector for DynamoDB {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
-        if let Some(acceleration) = &dataset.acceleration
-            && let Some(refresh_mode) = acceleration.refresh_mode
-            && matches!(refresh_mode, RefreshMode::Changes)
-            && !acceleration.enabled
-        {
+        if dataset.refresh_mode() == Some(RefreshMode::Changes) && !dataset.is_accelerated() {
             tracing::warn!(
                 "DynamoDB dataset {} is configured for changes stream, but acceleration is disabled. Enable acceleration to use DynamoDB Streams",
-                dataset.name
+                dataset.name()
             );
         }
 
@@ -365,13 +361,17 @@ impl DataConnector for DynamoDB {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
-        dataset: &Dataset,
+        federated_table: Arc<dyn ConnectorFederatedTable>,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<ChangesStream> {
-        let dataset = dataset.clone();
+        let dataset = dataset.as_any().downcast_ref::<Dataset>()?.clone();
 
         Some(Box::pin(
             stream::once(async move {
+                let federated_table = federated_table
+                    .as_any()
+                    .downcast_ref::<FederatedTable>()?;
+
                 let table_provider = federated_table.table_provider().await;
 
                 let dynamodb_ref = table_provider

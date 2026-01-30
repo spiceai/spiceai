@@ -31,7 +31,7 @@ use crate::{
         access::AccessMode,
         dataset::{
             Dataset,
-            acceleration::{Acceleration, RefreshMode},
+            acceleration::{Acceleration, RefreshMode as RuntimeRefreshMode},
             builder::DatasetBuilder,
         },
     },
@@ -258,13 +258,20 @@ impl Runtime {
                 return Ok(data_connector);
             };
             for metric in enabled_metrics {
-                if let Some(metric) = metrics_provider.get_metric(&metric) {
-                    if let Err(e) =
-                        register_component_metric(&metrics_provider, *metric, &ds.name.to_string())
-                    {
+                let metric_spec = metrics_provider
+                    .available_metrics()
+                    .iter()
+                    .find(|spec| spec.name == metric);
+
+                if let Some(metric_spec) = metric_spec {
+                    if let Err(e) = register_component_metric(
+                        &metrics_provider,
+                        *metric_spec,
+                        &ds.name.to_string(),
+                    ) {
                         tracing::error!(
                             "Unable to register component metric {}: {}",
-                            metric.name,
+                            metric_spec.name,
                             e
                         );
                     }
@@ -341,8 +348,8 @@ impl Runtime {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         if let Some(acceleration) = &ds.acceleration
-            && data_connector.resolve_refresh_mode(acceleration.refresh_mode)
-                == RefreshMode::Changes
+            && data_connector.resolve_refresh_mode(acceleration.refresh_mode.map(Into::into))
+                == dataconnector::RefreshMode::Changes
             && !data_connector.supports_changes_stream()
         {
             let err = AcceleratedTableInvalidChangesSnafu {
@@ -354,7 +361,7 @@ impl Runtime {
         }
 
         // Test dataset connectivity by attempting to get a read provider.
-        let federated_table = match data_connector.read_provider(&ds).await {
+        let federated_table = match data_connector.read_provider(ds.as_ref()).await {
             Ok(provider) => {
                 FederatedTable::new(Arc::clone(&ds), provider, Arc::clone(&data_connector)).await
             }
@@ -421,7 +428,7 @@ impl Runtime {
                     )
                 );
                 if data_connector
-                    .initialization_for_dataset(&ds)
+                    .initialization_for_dataset(ds.as_ref())
                     .is_dataset_health_monitor_enabled()
                     && let Some(datasets_health_monitor) = &self.datasets_health_monitor
                     && let Err(err) = datasets_health_monitor.register_dataset(&ds).await
@@ -580,7 +587,8 @@ impl Runtime {
         // Thus we don't need to "hot reload" them to try to keep their data intact.
         if connector.supports_changes_stream()
             && ds.is_file_accelerated()
-            && connector.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes
+            && connector.resolve_refresh_mode(acceleration.refresh_mode.map(Into::into))
+                == dataconnector::RefreshMode::Changes
         {
             return false;
         }
@@ -598,7 +606,7 @@ impl Runtime {
         ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let read_table = connector.read_provider(&ds).await.map_err(|_| {
+        let read_table = connector.read_provider(ds.as_ref()).await.map_err(|_| {
             UnableToLoadDatasetConnectorSnafu {
                 dataset: ds.name.clone(),
             }
@@ -660,7 +668,7 @@ impl Runtime {
     ) -> Result<Arc<dyn DataConnector>> {
         let source = ds.source();
 
-        let params = ConnectorParamsBuilder::new(source.into(), (&ds).into())
+        let params = ConnectorParamsBuilder::new(source.into(), Arc::clone(&ds))
             .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeDataConnectorSnafu)?;
@@ -731,7 +739,7 @@ impl Runtime {
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source.clone(),
-                    connector_component: ConnectorComponent::from(&ds),
+                    connector_component: ConnectorComponent::from(ds.as_ref()),
                 })?;
 
             self.status
@@ -789,7 +797,7 @@ impl Runtime {
             .await
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source.clone(),
-                connector_component: ConnectorComponent::from(&ds),
+                connector_component: ConnectorComponent::from(ds.as_ref()),
             })?;
 
         if let Some(notifier) = notifier {
@@ -1023,7 +1031,7 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         .acceleration
         .as_ref()
         .and_then(|acc| acc.refresh_mode)
-        .is_some_and(|mode| matches!(mode, RefreshMode::Caching));
+        .is_some_and(|mode| matches!(mode, RuntimeRefreshMode::Caching));
 
     if !is_caching_mode {
         return;

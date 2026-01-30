@@ -212,7 +212,7 @@ impl FederatedTable {
             let tracer = OnceTracer::new();
             let data_connector = Arc::clone(&data_connector);
             let table_provider_result = retry(retry_strategy, || async {
-                match data_connector.read_provider(&dataset).await {
+                match data_connector.read_provider(dataset.as_ref()).await {
                     Ok(table_provider) => {
                         let federated_schema = table_provider.schema();
 

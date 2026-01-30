@@ -15,16 +15,15 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use connector_traits::{
+    ConnectorComponent, ConnectorDataset, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult, ParameterSpec, Parameters,
+    default_spice_client,
+};
 use data_components::graphql::{
     self, client::GraphQLClient, provider::GraphQLTableProviderBuilder,
 };
 use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, default_spice_client,
-};
-use runtime::parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use token_provider::{StaticTokenProvider, TokenProvider};
@@ -99,7 +98,8 @@ impl DataConnectorFactory for GraphQLFactory {
 }
 
 impl GraphQL {
-    fn get_client(&self, dataset: &Dataset) -> DataConnectorResult<GraphQLClient> {
+    #[expect(clippy::result_large_err)]
+    fn get_client(&self, dataset: &dyn ConnectorDataset) -> DataConnectorResult<GraphQLClient> {
         let token = self.params.get("auth_token").ok().map(|token| {
             Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
@@ -181,7 +181,7 @@ impl DataConnector for GraphQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.get_client(dataset)?;
 

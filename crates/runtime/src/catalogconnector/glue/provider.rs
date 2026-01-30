@@ -21,7 +21,7 @@ use crate::dataconnector::{DataConnector, parameters};
 use crate::{
     Runtime,
     component::{catalog::Catalog, dataset::builder::DatasetBuilder},
-    dataconnector::parameters::ConnectorParams,
+    dataconnector::ConnectorParams,
 };
 use app::App;
 use async_trait::async_trait;

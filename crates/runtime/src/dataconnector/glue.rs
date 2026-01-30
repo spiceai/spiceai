@@ -34,18 +34,15 @@ use snafu::prelude::*;
 use std::sync::LazyLock;
 use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 
-use crate::{
-    component::dataset::Dataset,
-    parameters::{ParameterSpec, Parameters},
-    register_data_connector,
-};
+use crate::component::dataset::Dataset;
+use crate::parameters::{ParameterSpec, Parameters};
 
 use super::{
-    DataConnector, DataConnectorFactory,
-    parameters::{
-        ConnectorParams,
-        aws::{self, initiate_config_with_credentials},
-    },
+    ConnectorComponent, ConnectorDataset, ConnectorParams, ConnectorRuntime, DataConnector,
+    DataConnectorFactory,
+    listing::ListingConnector,
+    parameters::aws::{self, initiate_config_with_credentials},
+    register_data_connector,
     s3::S3,
 };
 
@@ -275,17 +272,34 @@ impl DataConnector for GlueDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let dataset = dataset.as_any().downcast_ref::<Dataset>().ok_or_else(|| {
+            super::DataConnectorError::Internal {
+                dataconnector: PREFIX.to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "GLUE-DATASET-TYPE".to_string(),
+                source: Box::new(std::io::Error::other("Expected runtime dataset")),
+            }
+        })?;
+
         self.create_table_provider(dataset).await
     }
 
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &dyn ConnectorDataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        // Iceberg supports read and write operations through the same TableProvider interface.
+        let Some(dataset) = dataset.as_any().downcast_ref::<Dataset>() else {
+            return Some(Err(super::DataConnectorError::Internal {
+                dataconnector: PREFIX.to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "GLUE-DATASET-TYPE".to_string(),
+                source: Box::new(std::io::Error::other("Expected runtime dataset")),
+            }));
+        };
+
         Some(self.create_table_provider(dataset).await)
     }
 }
@@ -448,7 +462,7 @@ async fn create_iceberg_provider(
             super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
+                message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name()),
                 source: e.into(),
             }
     })?;
@@ -464,7 +478,7 @@ async fn create_iceberg_provider(
     .map_err(|e| super::DataConnectorError::InvalidConfiguration {
         dataconnector: PREFIX.to_string(),
         connector_component: dataset.into(),
-        message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+        message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name()),
         source: e.into(),
     })?;
 
@@ -525,11 +539,11 @@ async fn create_s3_provider(
 
     // Add required file_format parameter for S3
     params.insert("file_format".into(), input_format.file_format().into());
-    let s3 = S3 {
+    let s3 = ListingConnector::new(S3 {
         params,
-        runtime: Some(Arc::unwrap_or_clone(dataset.runtime())),
+        runtime: Some(dataset.runtime() as Arc<dyn ConnectorRuntime>),
         tokio_io_runtime,
-    };
+    });
 
     dataset.from = from;
 

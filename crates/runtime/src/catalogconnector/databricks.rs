@@ -21,7 +21,7 @@ use super::Parameters;
 use crate::Runtime;
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
-use crate::dataconnector::parameters::ConnectorParams;
+use crate::dataconnector::ConnectorParams;
 use crate::token_providers::databricks::{
     AuthCredentials, build_auth_credentials, get_m2m_token_provider, get_u2m_token_provider,
 };
