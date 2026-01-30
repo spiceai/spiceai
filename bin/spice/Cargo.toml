@@ -94,6 +94,10 @@ runtime-api-types = { path = "../../crates/runtime-api-types" }
 spicepod = { path = "../../crates/spicepod", default-features = false }
 spiceai = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
+test-framework = { path = "../../crates/test-framework" }
+
+# Tracing/opentelemetry for trace ID handling
+opentelemetry.workspace = true
 
 # Unix signal handling
 [target.'cfg(unix)'.dependencies]

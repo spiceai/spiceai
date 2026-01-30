@@ -427,6 +427,7 @@ fn extract_columns_from_expr(
     }
 }
 
+#[must_use]
 pub fn extract_tables_and_projection(
     logical_plan: &Value,
 ) -> (HashSet<ResolvedTableReference>, HashSet<Column>) {
