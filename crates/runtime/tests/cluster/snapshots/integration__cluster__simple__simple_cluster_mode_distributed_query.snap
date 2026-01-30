@@ -1,5 +1,5 @@
 ---
-source: crates/runtime/tests/cluster/mod.rs
+source: crates/runtime/tests/cluster/simple.rs
 expression: pretty
 ---
 +----+--------------+-----+--------------+-------+

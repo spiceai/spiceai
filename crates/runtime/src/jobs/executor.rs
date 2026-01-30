@@ -38,8 +38,17 @@ use super::store::JobStore;
 /// Interval between job status polls when waiting for Ballista job completion.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-// Default max message size (16MB matches typical default)
+/// Maximum number of poll iterations before timing out a job.
+/// At 100ms poll interval, this allows ~1 hour of job execution time.
+/// Convert polling to notifiers: https://github.com/spiceai/spiceai/issues/9223
+const MAX_JOB_POLL_ITERATIONS: u64 = 36_000;
+
+/// Default max message size (16MB matches typical default).
 const MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Use block transfer mode instead of Arrow Flight for partition retrieval.
+/// Block transfer is more efficient for large result sets within a cluster.
+const USE_FLIGHT_TRANSFER: bool = false;
 
 /// Tracks an active job's cancellation token and Ballista job ID (once submitted).
 struct ActiveJobInfo {
@@ -326,7 +335,16 @@ impl JobExecutor {
         cancel: &CancellationToken,
     ) -> std::result::Result<Vec<PartitionLocation>, JobPollError> {
         let mut missing_retry_count = 0;
+        let mut poll_count: u64 = 0;
         loop {
+            poll_count += 1;
+            if poll_count > MAX_JOB_POLL_ITERATIONS {
+                let _ = scheduler.cancel_job(ballista_job_id.to_string()).await;
+                return Err(JobPollError::Failed(format!(
+                    "Job {ballista_job_id} timed out after {poll_count} poll iterations"
+                )));
+            }
+
             // Check for cancellation
             if cancel.is_cancelled() {
                 // Try to cancel in Ballista
@@ -345,12 +363,20 @@ impl JobExecutor {
             if let Some(job_status) = status {
                 match job_status.status {
                     Some(job_status::Status::Successful(success)) => {
-                        // Convert protobuf partition locations to core types
-                        let locations: Vec<PartitionLocation> = success
-                            .partition_location
-                            .into_iter()
-                            .filter_map(|loc| loc.try_into().ok())
-                            .collect();
+                        // Convert protobuf partition locations to core types.
+                        // All partition locations must convert successfully to ensure
+                        // complete results are returned (data correctness requirement).
+                        let mut locations = Vec::with_capacity(success.partition_location.len());
+                        for (i, loc) in success.partition_location.into_iter().enumerate() {
+                            match loc.try_into() {
+                                Ok(partition_loc) => locations.push(partition_loc),
+                                Err(e) => {
+                                    return Err(JobPollError::Failed(format!(
+                                        "Failed to convert partition location {i}: {e}"
+                                    )));
+                                }
+                            }
+                        }
                         return Ok(locations);
                     }
                     Some(job_status::Status::Failed(failed)) => {
@@ -431,7 +457,7 @@ impl JobExecutor {
                     &location.path,
                     &executor_meta.host,
                     executor_meta.port,
-                    false, // Use block transfer, not flight
+                    USE_FLIGHT_TRANSFER,
                 )
                 .await
                 .map_err(|e| super::error::Error::QueryExecution {

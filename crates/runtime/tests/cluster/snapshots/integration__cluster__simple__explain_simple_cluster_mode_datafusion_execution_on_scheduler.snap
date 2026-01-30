@@ -1,6 +1,6 @@
 ---
-source: crates/runtime/tests/cluster/mod.rs
-expression: "pretty.replace(temp_path.as_str().split_once(\"/\").expect(\"should have leading /\").1,\n\"<TEMP_PATH>\")"
+source: crates/runtime/tests/cluster/simple.rs
+expression: "pretty.replace(temp_path.as_str().split_once('/').expect(\"should have leading /\").1,\n\"<TEMP_PATH>\")"
 ---
 +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                |
