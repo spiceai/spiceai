@@ -1,6 +1,6 @@
 use crate::postgres::common;
 use crate::postgres::common::get_pg_params;
-use crate::utils::runtime_ready_check;
+use crate::utils::{register_test_connectors, runtime_ready_check};
 use crate::{configure_test_datafusion, configure_test_datafusion_request_context};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
@@ -208,6 +208,8 @@ async fn start_test_runtime_with_dataset(
     acceleration: Acceleration,
     mut dataset: Dataset,
 ) -> Result<Arc<Runtime>, anyhow::Error> {
+    register_test_connectors().await;
+
     dataset.acceleration = Some(acceleration);
     let app = AppBuilder::new("test_acceleration_refresh")
         .with_dataset(dataset)

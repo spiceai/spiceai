@@ -154,38 +154,21 @@ jobs:
 
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
-        run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,postgres-accel"
-          cargo build --release -p spice
+        uses: ./.github/actions/build-spiced
+        with:
+          features: 'tpc-extension,models,postgres-accel'
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
       - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
-        env:
-          MISTRALRS_METAL_PRECOMPILE: 0
-        run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension,models,postgres-accel,metal"
-          cargo build --release -p spice
-
-      - name: make spiced executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: make spice executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spice spice
-          chmod +x spice
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
-        if: matrix.target.target_os != 'windows'
+        uses: ./.github/actions/build-spiced
         with:
-          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: |
-            spice
-            spiced
+          features: 'tpc-extension,models,postgres-accel,metal'
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'

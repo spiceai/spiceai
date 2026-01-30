@@ -619,3 +619,113 @@ impl Default for ModelVerificationBuilder {
         Self::new()
     }
 }
+
+/// Registers all external data connectors for integration tests.
+///
+/// This function must be called before creating a runtime in tests that use
+/// connectors from the extracted crates (e.g., duckdb, postgres, mysql, etc.).
+/// Without this, the runtime won't be able to find connectors like "duckdb".
+///
+/// This function is idempotent - calling it multiple times is safe and efficient
+/// as the registration only happens once.
+///
+/// # Example
+///
+/// ```ignore
+/// #[tokio::test]
+/// async fn test_duckdb_connector() {
+///     register_test_connectors().await;
+///     let rt = Runtime::builder().build().await;
+///     // Now duckdb connector is available
+/// }
+/// ```
+pub(crate) async fn register_test_connectors() {
+    // Simply register all connectors. This is idempotent since the registry
+    // is a HashMap and duplicate inserts just overwrite with the same value.
+    // We avoid using OnceCell to prevent any potential async synchronization issues.
+    do_register_test_connectors().await;
+}
+
+async fn do_register_test_connectors() {
+    use runtime::dataconnector::register_connector_factory;
+
+    tracing::debug!("Starting connector registration for tests");
+
+    // Register all connectors - dev-dependencies are always compiled regardless of features
+    register_connector_factory(
+        connector_clickhouse::CONNECTOR_NAME,
+        connector_clickhouse::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_databricks::CONNECTOR_NAME,
+        connector_databricks::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_delta_lake::CONNECTOR_NAME,
+        connector_delta_lake::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_dremio::CONNECTOR_NAME,
+        connector_dremio::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_duckdb::CONNECTOR_NAME,
+        connector_duckdb::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_flightsql::CONNECTOR_NAME,
+        connector_flightsql::factory(),
+    )
+    .await;
+    register_connector_factory(connector_ftp::CONNECTOR_NAME, connector_ftp::factory()).await;
+    register_connector_factory(
+        connector_graphql::CONNECTOR_NAME,
+        connector_graphql::factory(),
+    )
+    .await;
+    register_connector_factory(connector_imap::CONNECTOR_NAME, connector_imap::factory()).await;
+    register_connector_factory(
+        connector_mongodb::CONNECTOR_NAME,
+        connector_mongodb::factory(),
+    )
+    .await;
+    register_connector_factory(connector_mssql::CONNECTOR_NAME, connector_mssql::factory()).await;
+    register_connector_factory(connector_mysql::CONNECTOR_NAME, connector_mysql::factory()).await;
+    // Note: connector-odbc is not registered here because it requires the unixODBC system library
+    // ODBC tests should use feature gates and run in environments with ODBC installed
+    register_connector_factory(
+        connector_oracle::CONNECTOR_NAME,
+        connector_oracle::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_postgres::CONNECTOR_NAME,
+        connector_postgres::factory(),
+    )
+    .await;
+    register_connector_factory(
+        connector_scylladb::CONNECTOR_NAME,
+        connector_scylladb::factory(),
+    )
+    .await;
+    register_connector_factory(connector_sftp::CONNECTOR_NAME, connector_sftp::factory()).await;
+    register_connector_factory(
+        connector_sharepoint::CONNECTOR_NAME,
+        connector_sharepoint::factory(),
+    )
+    .await;
+    register_connector_factory(connector_smb::CONNECTOR_NAME, connector_smb::factory()).await;
+    register_connector_factory(
+        connector_snowflake::CONNECTOR_NAME,
+        connector_snowflake::factory(),
+    )
+    .await;
+    register_connector_factory(connector_spark::CONNECTOR_NAME, connector_spark::factory()).await;
+
+    tracing::debug!("Completed connector registration for tests");
+}

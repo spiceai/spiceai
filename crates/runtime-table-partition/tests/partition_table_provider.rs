@@ -50,7 +50,7 @@ use runtime_table_partition::{Partition, creator::PartitionCreator};
 #[derive(Debug)]
 struct PartitionMemTable {
     mem_table: Arc<MemTable>,
-    partition_value: ScalarValue,
+    partition_values: Vec<ScalarValue>,
 }
 
 #[async_trait]
@@ -87,7 +87,7 @@ impl TableProvider for PartitionMemTable {
             .await?;
         Ok(Arc::new(PartitionMemTableExec {
             mem_table_exec,
-            partition_value: self.partition_value.clone(),
+            partition_values: self.partition_values.clone(),
             filters: filters.to_vec(),
             limit,
         }))
@@ -106,7 +106,7 @@ impl TableProvider for PartitionMemTable {
 #[derive(Debug)]
 struct PartitionMemTableExec {
     mem_table_exec: Arc<dyn ExecutionPlan>,
-    partition_value: ScalarValue,
+    partition_values: Vec<ScalarValue>,
     filters: Vec<Expr>,
     limit: Option<usize>,
 }
@@ -132,13 +132,13 @@ impl ExecutionPlan for PartitionMemTableExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let partition_value = self.partition_value.clone();
+        let partition_values = self.partition_values.clone();
         let filters = self.filters.clone();
         let limit = self.limit;
         let new_mem_table_exec = Arc::clone(&self.mem_table_exec).with_new_children(children)?;
         Ok(Arc::new(PartitionMemTableExec {
             mem_table_exec: new_mem_table_exec,
-            partition_value,
+            partition_values,
             filters,
             limit,
         }))
@@ -165,9 +165,9 @@ impl DisplayAs for PartitionMemTableExec {
     ) -> std::fmt::Result {
         write!(
             f,
-            "{}: partition_value={}",
+            "{}: partition_values={:?}",
             self.name(),
-            self.partition_value
+            self.partition_values
         )?;
 
         if !self.filters.is_empty() {
@@ -212,8 +212,16 @@ impl TestPartitionCreator {
 impl PartitionCreator for TestPartitionCreator {
     async fn create_partition(
         &self,
-        partition_value: ScalarValue,
+        partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
+        // For test purposes, we only use single-value partitions
+        let partition_value = partition_values
+            .first()
+            .ok_or_else(|| creator::Error::CreatePartition {
+                source: "At least one partition value is required".into(),
+            })?
+            .clone();
+
         let empty_columns: Vec<ArrayRef> = self
             .schema
             .fields()
@@ -230,14 +238,14 @@ impl PartitionCreator for TestPartitionCreator {
         );
         let partition_mem_table = Arc::new(PartitionMemTable {
             mem_table,
-            partition_value: partition_value.clone(),
+            partition_values: vec![partition_value.clone()],
         });
         self.partitions.write().await.insert(
             partition_value.to_string(),
             Arc::clone(&partition_mem_table),
         );
         Ok(Partition {
-            partition_value,
+            partition_values: vec![partition_value],
             table_provider: partition_mem_table,
         })
     }
@@ -258,7 +266,10 @@ impl PartitionCreator for TestPartitionCreator {
 fn collect_partition_values(plan: &Arc<dyn ExecutionPlan>) -> Vec<ScalarValue> {
     let mut values = Vec::new();
     if let Some(partition_exec) = plan.as_any().downcast_ref::<PartitionMemTableExec>() {
-        values.push(partition_exec.partition_value.clone());
+        // For single-column partitions in tests, just take the first value
+        if let Some(first) = partition_exec.partition_values.first() {
+            values.push(first.clone());
+        }
     }
     for child in plan.children() {
         values.extend(collect_partition_values(child));
@@ -1575,8 +1586,15 @@ impl DeletableTestPartitionCreator {
 impl PartitionCreator for DeletableTestPartitionCreator {
     async fn create_partition(
         &self,
-        partition_value: ScalarValue,
+        partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
+        let partition_value = partition_values
+            .first()
+            .ok_or_else(|| creator::Error::CreatePartition {
+                source: "At least one partition value is required".into(),
+            })?
+            .clone();
+
         let empty_columns: Vec<ArrayRef> = self
             .schema
             .fields()
@@ -1603,7 +1621,7 @@ impl PartitionCreator for DeletableTestPartitionCreator {
         let adapted_table: Arc<dyn TableProvider> =
             Arc::new(DeletionTableProviderAdapter::new(deletable_mem_table));
         Ok(Partition {
-            partition_value,
+            partition_values: vec![partition_value],
             table_provider: adapted_table,
         })
     }
@@ -1910,8 +1928,15 @@ impl NonDeletablePartitionCreator {
 impl PartitionCreator for NonDeletablePartitionCreator {
     async fn create_partition(
         &self,
-        partition_value: ScalarValue,
+        partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
+        let partition_value = partition_values
+            .first()
+            .ok_or_else(|| creator::Error::CreatePartition {
+                source: "At least one partition value is required".into(),
+            })?
+            .clone();
+
         let empty_columns: Vec<ArrayRef> = self
             .schema
             .fields()
@@ -1928,7 +1953,7 @@ impl PartitionCreator for NonDeletablePartitionCreator {
         );
         // Return MemTable directly without wrapping - doesn't support deletion
         Ok(Partition {
-            partition_value,
+            partition_values: vec![partition_value],
             table_provider: mem_table,
         })
     }
