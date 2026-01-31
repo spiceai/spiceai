@@ -20,7 +20,7 @@ fundu.workspace = true
 
 futures.workspace = true
 http.workspace = true
-libnfs = { workspace = true, optional = true }
+libnfs = { path = "../libnfs", optional = true }
 nix = { workspace = true, features = ["fs"], optional = true }
 object_store.workspace = true
 reqwest.workspace = true

@@ -21,7 +21,6 @@ members = [
     "crates/repl",
     "crates/google-genai",
     "crates/hash-index",
-    "crates/libnfs",
     "crates/llms",
     "crates/model_components",
     "crates/ns_lookup",
@@ -192,7 +191,6 @@ imap = { git = "https://github.com/jonhoo/rust-imap", rev = "6fe22ed11a1ccffe179
 indexmap = "2"
 insta = { version = "1.46.1", features = ["filters"] }
 itertools = "0.14"
-libnfs = { path = "crates/libnfs" }
 linkme = "0.3.35"
 logos = "0.16.0"
 mailparse = "0.16.1"
