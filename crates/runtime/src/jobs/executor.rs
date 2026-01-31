@@ -296,8 +296,7 @@ impl JobExecutor {
                 let schema: SchemaRef = Arc::new(logical_plan.schema().as_arrow().clone());
 
                 // Create a stream that lazily fetches results from partition locations
-                let result_stream =
-                    Self::fetch_results_stream(Arc::clone(&df), output_locations, schema);
+                let result_stream = Self::fetch_results_stream(&df, output_locations, schema);
 
                 // Write result chunks as batches arrive from the stream
                 let job_result = match job_store
@@ -424,7 +423,7 @@ impl JobExecutor {
     /// Returns a `SendableRecordBatchStream` that lazily fetches batches from
     /// partition locations, avoiding loading all results into memory at once.
     fn fetch_results_stream(
-        df: Arc<DataFusion>,
+        df: &Arc<DataFusion>,
         locations: Vec<PartitionLocation>,
         schema: SchemaRef,
     ) -> SendableRecordBatchStream {
@@ -467,7 +466,7 @@ type NextPartitionResultStream = Pin<
 /// Connects to partition executors one at a time and streams their batches,
 /// avoiding loading all results into memory at once.
 ///
-/// Partitions already return a SendableRecordBatchStream, so when we connect to a partition we pull its stream and return the items from it until it is exhausted.
+/// Partitions already return a `SendableRecordBatchStream`, so when we connect to a partition we pull its stream and return the items from it until it is exhausted.
 ///
 /// The next partition is then connected to and its stream consumed, until all partitions are processed.
 struct PartitionResultStream {
@@ -537,8 +536,7 @@ impl PartitionResultStream {
                 )
                 .await
                 .map_err(|e| {
-                    datafusion::error::DataFusionError::External(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    datafusion::error::DataFusionError::External(Box::new(std::io::Error::other(
                         format!(
                             "Failed to fetch partition {}: {e}",
                             location.partition_id.partition_id
