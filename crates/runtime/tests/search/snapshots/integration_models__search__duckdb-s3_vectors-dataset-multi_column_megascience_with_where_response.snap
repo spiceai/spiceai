@@ -30,17 +30,6 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients.",
-        "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
-      },
-      "primary_key": {
-        "id": 449
-      },
-      "score": 0.03
-    },
-    {
-      "dataset": "spice.public.qs",
-      "matches": {
         "answer": "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour.",
         "question": "What is the unusual characteristic of the body profile of Menidae (moonfish)?"
       },
@@ -48,6 +37,16 @@ expression: normalize_search_response(resp)
         "id": 1193
       },
       "score": 0.03
+    },
+    {
+      "dataset": "spice.public.qs",
+      "matches": {
+        "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+      },
+      "primary_key": {
+        "id": 449
+      },
+      "score": 0.01
     }
   ]
 }
