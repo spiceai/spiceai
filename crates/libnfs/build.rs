@@ -19,7 +19,6 @@ limitations under the License.
 
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn main() {
     // Link to libnfs system library
@@ -63,6 +62,7 @@ fn main() {
         // On macOS with Homebrew, find the include path automatically
         #[cfg(target_os = "macos")]
         {
+            use std::process::Command;
             if let Ok(output) = Command::new("brew").args(["--prefix", "libnfs"]).output()
                 && output.status.success()
             {
