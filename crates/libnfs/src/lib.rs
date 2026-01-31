@@ -125,7 +125,12 @@ fn check_retcode(ctx: *mut sys::nfs_context, code: i32) -> Result<()> {
     if code < 0 {
         unsafe {
             let err_str = sys::nfs_get_error(ctx);
-            let message = CStr::from_ptr(err_str).to_string_lossy().into_owned();
+            let message = if err_str.is_null() {
+                // Defensive fallback: avoid undefined behavior if libnfs ever returns null
+                "Unknown NFS error (libnfs returned null error string)".to_string()
+            } else {
+                CStr::from_ptr(err_str).to_string_lossy().into_owned()
+            };
             NfsOperationFailedSnafu { message }.fail()
         }
     } else {
@@ -355,7 +360,7 @@ impl Nfs {
     ///
     /// # Errors
     /// Returns an error if the directory cannot be opened.
-    pub fn opendir(&mut self, path: &Path) -> Result<NfsDirectory> {
+    pub fn opendir(&self, path: &Path) -> Result<NfsDirectory> {
         let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut dir_handle: *mut sys::nfsdir = ptr::null_mut();
@@ -382,7 +387,7 @@ impl Nfs {
     ///
     /// # Errors
     /// Returns an error if the file cannot be opened.
-    pub fn open(&mut self, path: &Path, flags: OFlag) -> Result<NfsFile> {
+    pub fn open(&self, path: &Path, flags: OFlag) -> Result<NfsFile> {
         let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut file_handle: *mut sys::nfsfh = ptr::null_mut();
@@ -404,9 +409,14 @@ impl Nfs {
 
     /// Create a new file with the specified mode.
     ///
+    /// This is a thin wrapper around the `libnfs` `nfs_creat` call, which only
+    /// accepts a POSIX mode and does not support `OFlag`-style open flags. If you
+    /// need to control flags such as `O_TRUNC`, `O_EXCL`, or `O_SYNC`, use
+    /// [`Nfs::open`] with the desired [`OFlag`]s instead of this method.
+    ///
     /// # Errors
     /// Returns an error if the file cannot be created.
-    pub fn create(&mut self, path: &Path, _flags: OFlag, mode: Mode) -> Result<NfsFile> {
+    pub fn create(&self, path: &Path, mode: Mode) -> Result<NfsFile> {
         let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut file_handle: *mut sys::nfsfh = ptr::null_mut();
@@ -579,9 +589,10 @@ impl Nfs {
     /// Returns an error if the readlink operation fails.
     pub fn readlink(&self, path: &Path, buf: &mut [u8]) -> Result<()> {
         let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
-        // SAFETY: We target 64-bit platforms; buffer size is reasonably small for symlinks
+        // SAFETY: We target 64-bit minimum platforms; buffer size is reasonably small for symlinks.
+        // Clamp to i32::MAX to avoid truncation on platforms where usize could exceed i32 range.
         #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let buf_len = buf.len() as i32;
+        let buf_len = buf.len().min(i32::MAX as usize) as i32;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -727,7 +738,7 @@ impl Nfs {
     pub fn get_readmax(&self) -> u64 {
         unsafe {
             let max = sys::nfs_get_readmax(self.context.0);
-            // SAFETY: usize to u64 conversion is safe since we target 64-bit platforms
+            // SAFETY: usize to u64 conversion is safe since we target 64-bit minimum platforms
             max as u64
         }
     }
@@ -739,7 +750,7 @@ impl Nfs {
     pub fn get_writemax(&self) -> u64 {
         unsafe {
             let max = sys::nfs_get_writemax(self.context.0);
-            // SAFETY: usize to u64 conversion is safe since we target 64-bit platforms
+            // SAFETY: usize to u64 conversion is safe since we target 64-bit minimum platforms
             max as u64
         }
     }
@@ -749,11 +760,13 @@ impl NfsFile {
     /// Read data from the file at a specific offset.
     ///
     /// # Errors
-    /// Returns an error if the read operation fails.
+    /// Returns an error if the read operation fails or if count exceeds platform limits.
     pub fn pread(&self, count: u64, offset: u64) -> Result<Vec<u8>> {
-        // SAFETY: We target 64-bit platforms only, so u64 -> usize is safe
-        #[expect(clippy::cast_possible_truncation)]
-        let capacity = count as usize;
+        // SAFETY: We target 64-bit minimum platforms. On 64-bit systems, u64 fits in usize.
+        // Check for truncation to handle potential future 128-bit platforms gracefully.
+        let capacity = usize::try_from(count).map_err(|_| Error::NfsOperationFailed {
+            message: format!("Read count {count} exceeds platform usize limit"),
+        })?;
         // Allocate and initialize the buffer to avoid exposing uninitialized memory
         let mut buffer: Vec<u8> = vec![0u8; capacity];
 
@@ -805,7 +818,7 @@ impl NfsFile {
         // - New API (>= 4.0): nfs_pwrite(nfs, fh, offset, count, buf)
         #[cfg(libnfs_new_api)]
         let write_size = {
-            // SAFETY: We target 64-bit platforms only, so usize -> u64 is safe
+            // SAFETY: We target 64-bit minimum platforms, so usize -> u64 is safe
             #[expect(clippy::cast_possible_truncation)]
             let count = buffer.len() as u64;
             unsafe {
@@ -921,7 +934,13 @@ impl Iterator for NfsDirectory {
                 return None;
             }
 
-            let file_name = CStr::from_ptr((*dirent).name);
+            // Defensive: check for null name pointer to avoid undefined behavior
+            let name_ptr = (*dirent).name;
+            if name_ptr.is_null() {
+                return None;
+            }
+
+            let file_name = CStr::from_ptr(name_ptr);
             let d_type = match EntryType::from_ftype3((*dirent).type_) {
                 Ok(ty) => ty,
                 Err(e) => {

@@ -91,7 +91,7 @@ impl NFSObjectStore {
     }
 
     /// List a single directory and return its entries (blocking).
-    fn list_directory_blocking(nfs: &mut Nfs, dir_path: &str) -> Vec<DirEntry> {
+    fn list_directory_blocking(nfs: &Nfs, dir_path: &str) -> Vec<DirEntry> {
         let path = if dir_path.is_empty() {
             "/".to_string()
         } else if dir_path.starts_with('/') {
@@ -146,13 +146,13 @@ impl NFSObjectStore {
         let prefix = prefix.unwrap_or_default();
 
         tokio::task::spawn_blocking(move || {
-            let mut nfs = config.connect()?;
+            let nfs = config.connect()?;
             let mut results = Vec::new();
             let mut queue = vec![prefix];
 
             // Process directories sequentially within this blocking task
             while let Some(current_path) = queue.pop() {
-                let entries = Self::list_directory_blocking(&mut nfs, &current_path);
+                let entries = Self::list_directory_blocking(&nfs, &current_path);
                 let (files, dirs) = process_directory_entries(&current_path, entries);
                 results.extend(files);
                 queue.extend(dirs);
@@ -173,8 +173,8 @@ impl NFSObjectStore {
         let prefix_str = prefix.map_or(String::new(), Path::to_string);
 
         tokio::task::spawn_blocking(move || {
-            let mut nfs = config.connect()?;
-            let entries = Self::list_directory_blocking(&mut nfs, &prefix_str);
+            let nfs = config.connect()?;
+            let entries = Self::list_directory_blocking(&nfs, &prefix_str);
             Ok(process_directory_entries_shallow(&prefix_str, entries))
         })
         .await
@@ -246,7 +246,7 @@ impl ObjectStore for NFSObjectStore {
             let location = location.clone();
             let config = Arc::clone(&config);
             move || -> object_store::Result<(ObjectMeta, u64, u64, Vec<u8>)> {
-                let mut nfs = config.connect()?;
+                let nfs = config.connect()?;
                 let location_string = format!("/{location}");
 
                 let file_stat = nfs.stat64(StdPath::new(&location_string)).map_err(|e| {
