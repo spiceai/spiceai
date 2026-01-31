@@ -41,12 +41,12 @@ use crate::{
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
 };
-use retry_client::S3VectorRetryClientBuilder;
 use runtime_secrets::{Secrets, get_params_with_secrets};
 mod client;
 mod metrics;
-use client::S3VectorClient;
+use client::S3VectorsTelemetryMiddleware;
 mod retry_client;
+use retry_client::S3VectorsRetryMiddlewareBuilder;
 
 const DEFAULT_BATCH_WRITE_ROWS: usize = 100_000;
 
@@ -258,11 +258,14 @@ async fn try_vector_table(
 
     let config = config_bldr.load().await;
 
-    let s3_vector_client = S3VectorClient::new(Arc::new(Client::new(&config)), index_poll_interval);
-
-    let s3_vector_client =
-        Arc::new(S3VectorRetryClientBuilder::new(Arc::new(s3_vector_client)).build())
-            as Arc<dyn S3Vectors + Send + Sync>;
+    // Build S3Vectors middleware: retry(metrics_cache(base_client))
+    let base_client = Arc::new(Client::new(&config));
+    let with_metrics_cache = Arc::new(S3VectorsTelemetryMiddleware::new(
+        base_client,
+        index_poll_interval,
+    ));
+    let s3_vector_client: Arc<dyn S3Vectors + Send + Sync> =
+        Arc::new(S3VectorsRetryMiddlewareBuilder::new(with_metrics_cache).build());
 
     let Some(dimension) = embedding_vector_size(embedding_models, model_name).await else {
         return Err(Box::from(

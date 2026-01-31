@@ -19,8 +19,8 @@ limitations under the License.
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::output::TableOutput;
-use arrow::util::pretty::pretty_format_batches;
 use clap::{Args, Subcommand};
+use repl::pretty::format_batches_with_types;
 use rustyline::error::ReadlineError;
 use rustyline::{Config, Editor};
 use spiceai::query::{QueryInfo, QueryStatus};
@@ -783,9 +783,9 @@ async fn display_results(client: &Arc<Client>, query_id: &str, elapsed: Duration
         return Ok(());
     }
 
-    // Use Arrow's pretty formatting to display results
+    // Use pretty formatting with types to display results
     let formatted =
-        pretty_format_batches(&batches).map_err(|e| crate::error::Error::InvalidResponse {
+        format_batches_with_types(&batches).map_err(|e| crate::error::Error::InvalidResponse {
             message: format!("formatting results: {e}"),
         })?;
 

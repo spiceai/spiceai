@@ -218,15 +218,15 @@ catalogs:
       env: production
     access: read
     include:
-      - "schema1.*"
-      - "schema2.table*"
+      - 'schema1.*'
+      - 'schema2.table*'
     params:
       databricks_endpoint: https://my-workspace.databricks.com
       databricks_token: dapi123
       mode: spark_connect # spark_connect, delta_lake, sql_warehouse
       client_timeout: 60s
       databricks_cluster_id: cluster-123
-      databricks_use_ssl: "true"
+      databricks_use_ssl: 'true'
       databricks_sql_warehouse_id: warehouse-id
       databricks_client_id: client-id
       databricks_client_secret: client-secret
@@ -282,7 +282,7 @@ catalogs:
       iceberg_oauth2_token_url: https://auth.example.com/token
       iceberg_oauth2_scope: catalog
       iceberg_oauth2_server_url: https://auth.example.com
-      iceberg_sigv4_enabled: "true"
+      iceberg_sigv4_enabled: 'true'
       iceberg_signing_region: us-east-1
       iceberg_signing_name: execute-api
       iceberg_warehouse: warehouse
@@ -353,14 +353,14 @@ datasets:
     params:
       pg_connection_string: postgresql://user:pass@localhost:5432/db
       pg_host: localhost
-      pg_port: "5432"
+      pg_port: '5432'
       pg_db: testdb
       pg_user: postgres
       pg_pass: secret
       pg_sslmode: prefer
       pg_sslrootcert: /path/to/ca.pem
-      pg_connection_pool_min_idle: "2"
-      connection_pool_size: "10"
+      pg_connection_pool_min_idle: '2'
+      connection_pool_size: '10'
     embeddings:
       - column: content
         use: openai_embeddings
@@ -387,7 +387,7 @@ datasets:
       refresh_on_startup: auto # always, auto
       refresh_mode: full # full, append, changes, caching
       refresh_check_interval: 10s
-      refresh_cron: "0 */6 * * *"
+      refresh_cron: '0 */6 * * *'
       refresh_sql: SELECT * FROM source WHERE updated_at > $last_refresh
       refresh_data_window: 7d
       refresh_append_overlap: 1h
@@ -412,12 +412,12 @@ datasets:
       snapshots: enabled # disabled, enabled, bootstrap_only, create_only
       params:
         duckdb_file: ./data/postgres.duckdb
-        file_watcher: "true"
+        file_watcher: 'true'
         partition_mode: auto
-        connection_pool_size: "5"
-        on_refresh_recompute_statistics: "true"
-        partitioned_write_buffer: "1000"
-        optimizer_duckdb_aggregate_pushdown: "true"
+        connection_pool_size: '5'
+        on_refresh_recompute_statistics: 'true'
+        partitioned_write_buffer: '1000'
+        optimizer_duckdb_aggregate_pushdown: 'true'
       metrics:
         metrics:
           - name: acceleration.refresh_duration_ms
@@ -439,12 +439,12 @@ datasets:
       mysql_user: root
       mysql_pass: secret
       mysql_host: localhost
-      mysql_tcp_port: "3306"
+      mysql_tcp_port: '3306'
       mysql_db: testdb
       mysql_sslmode: REQUIRED
       mysql_sslrootcert: /path/to/ca.pem
-      mysql_pool_min: "1"
-      mysql_pool_max: "10"
+      mysql_pool_min: '1'
+      mysql_pool_max: '10'
       mysql_time_zone: UTC
 
   # ---------------------------------------------------------------------------
@@ -462,7 +462,7 @@ datasets:
     from: postgres:public.data
     params:
       pg_host: localhost
-      pg_port: "5432"
+      pg_port: '5432'
       pg_db: db
       pg_user: user
       pg_pass: pass
@@ -472,8 +472,8 @@ datasets:
       mode: file
       params:
         sqlite_file: ./data/accel.sqlite
-        busy_timeout: "5000"
-        file_watcher: "true"
+        busy_timeout: '5000'
+        file_watcher: 'true'
 
   # ---------------------------------------------------------------------------
   # Arrow accelerator test
@@ -482,7 +482,7 @@ datasets:
     from: postgres:public.small
     params:
       pg_host: localhost
-      pg_port: "5432"
+      pg_port: '5432'
       pg_db: db
       pg_user: user
       pg_pass: pass
@@ -490,7 +490,7 @@ datasets:
       enabled: true
       engine: arrow
       params:
-        file_watcher: "true"
+        file_watcher: 'true'
         arrow_sort_columns: id,created_at
 
   # ---------------------------------------------------------------------------
@@ -505,15 +505,15 @@ datasets:
       engine: postgres
       params:
         pg_host: localhost
-        pg_port: "5432"
+        pg_port: '5432'
         pg_db: accel_db
         pg_user: postgres
         pg_pass: secret
         pg_sslmode: prefer
         pg_sslrootcert: /path/to/ca.pem
-        pg_connection_pool_min: "2"
-        file_watcher: "false"
-        connection_pool_size: "15"
+        pg_connection_pool_min: '2'
+        file_watcher: 'false'
+        connection_pool_size: '15'
 
   # ---------------------------------------------------------------------------
   # Turso accelerator test
@@ -522,7 +522,7 @@ datasets:
     from: postgres:public.data
     params:
       pg_host: localhost
-      pg_port: "5432"
+      pg_port: '5432'
       pg_db: db
       pg_user: user
       pg_pass: pass
@@ -532,7 +532,6 @@ datasets:
       mode: file
       params:
         turso_turso_file: ./data/accel.turso
-        turso_turso_mvcc: enabled
         turso_internal_timestamp_format: integer_millis # rfc3339, integer_millis
 
   # ---------------------------------------------------------------------------
@@ -542,7 +541,7 @@ datasets:
     from: postgres:public.large
     params:
       pg_host: localhost
-      pg_port: "5432"
+      pg_port: '5432'
       pg_db: db
       pg_user: user
       pg_pass: pass
@@ -553,7 +552,7 @@ datasets:
       params:
         cayenne_file_path: ./data/accel.cayenne
         cayenne_metastore: sqlite
-        file_watcher: "true"
+        file_watcher: 'true'
         cayenne_unsupported_type_action: warn
         cayenne_cayenne_s3_region: us-east-1
         cayenne_cayenne_s3_endpoint: https://s3.amazonaws.com
@@ -562,11 +561,11 @@ datasets:
         cayenne_cayenne_s3_session_token: token
         cayenne_cayenne_s3_auth: iam_role
         cayenne_cayenne_s3_client_timeout: 30s
-        cayenne_cayenne_s3_allow_http: "false"
+        cayenne_cayenne_s3_allow_http: 'false'
         cayenne_cayenne_s3_zone_ids: zone1,zone2
-        cayenne_footer_cache_mb: "256"
-        cayenne_segment_cache_mb: "512"
-        cayenne_cayenne_target_file_size_mb: "128"
+        cayenne_footer_cache_mb: '256'
+        cayenne_segment_cache_mb: '512'
+        cayenne_cayenne_target_file_size_mb: '128'
         cayenne_sort_columns: id,timestamp
         cayenne_compression_strategy: zstd
 
@@ -582,24 +581,24 @@ datasets:
       s3_secret: secret
       s3_session_token: token
       s3_auth: public # public, iam_role, key_secret
-      s3_versioning: "true"
+      s3_versioning: 'true'
       client_timeout: 30s
-      allow_http: "false"
+      allow_http: 'false'
       file_format: parquet
       file_extension: .parquet
-      schema_infer_max_records: "1000"
-      hive_partitioning_enabled: "true"
+      schema_infer_max_records: '1000'
+      hive_partitioning_enabled: 'true'
       schema_source_path: s3://bucket/schema.parquet
       json_format: jsonl # json, jsonl
-      flatten_json: "true"
+      flatten_json: 'true'
       refresh_skip: enabled # enabled, disabled
       # CSV params
-      csv_has_header: "true"
+      csv_has_header: 'true'
       csv_quote: '"'
       csv_escape: "\\"
-      csv_delimiter: ","
+      csv_delimiter: ','
       # TSV params
-      tsv_has_header: "true"
+      tsv_has_header: 'true'
       tsv_quote: '"'
       tsv_escape: "\\"
       file_compression_type: GZIP # UNCOMPRESSED, GZIP, BZIP2, BROTLI, LZ4, LZ4_RAW, SNAPPY, ZSTD, XZ
@@ -619,23 +618,23 @@ datasets:
       abfs_tenant_id: tenant-id
       abfs_sas_string: sas
       abfs_endpoint: https://account.dfs.core.windows.net
-      abfs_use_emulator: "false"
-      abfs_use_fabric_endpoint: "false"
-      allow_http: "false"
+      abfs_use_emulator: 'false'
+      abfs_use_fabric_endpoint: 'false'
+      allow_http: 'false'
       abfs_authority_host: https://login.microsoftonline.com
-      abfs_max_retries: "3"
+      abfs_max_retries: '3'
       abfs_retry_timeout: 30s
       abfs_backoff_initial_duration: 1s
       abfs_backoff_max_duration: 30s
-      abfs_backoff_base: "2"
+      abfs_backoff_base: '2'
       abfs_proxy_url: http://proxy:8080
       abfs_proxy_ca_certificate: /path/to/ca.pem
       abfs_proxy_excludes: localhost,127.0.0.1
       abfs_msi_endpoint: http://169.254.169.254/metadata/identity/oauth2/token
       abfs_federated_token_file: /var/run/secrets/token
-      abfs_use_cli: "false"
-      abfs_skip_signature: "false"
-      abfs_disable_tagging: "false"
+      abfs_use_cli: 'false'
+      abfs_skip_signature: 'false'
+      abfs_disable_tagging: 'false'
       file_format: parquet
 
   # ---------------------------------------------------------------------------
@@ -650,7 +649,7 @@ datasets:
       delta_lake_aws_secret_access_key: secret
       delta_lake_aws_session_token: token
       delta_lake_aws_endpoint: https://s3.amazonaws.com
-      delta_lake_aws_allow_http: "false"
+      delta_lake_aws_allow_http: 'false'
       # Azure params
       delta_lake_azure_storage_account_name: account
       delta_lake_azure_storage_account_key: key
@@ -673,7 +672,7 @@ datasets:
       mode: spark_connect # spark_connect, delta_lake, sql_warehouse
       client_timeout: 120s
       databricks_cluster_id: cluster-123
-      databricks_use_ssl: "true"
+      databricks_use_ssl: 'true'
       databricks_client_id: client-id
       databricks_client_secret: secret
       # AWS storage
@@ -681,7 +680,7 @@ datasets:
       databricks_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
       databricks_aws_secret_access_key: secret
       databricks_aws_endpoint: https://s3.amazonaws.com
-      databricks_aws_allow_http: "false"
+      databricks_aws_allow_http: 'false'
       # Azure storage
       databricks_azure_storage_account_name: account
       databricks_azure_storage_account_key: key
@@ -716,7 +715,7 @@ datasets:
       oracle_username: user
       oracle_password: password
       oracle_host: localhost
-      oracle_port: "1521"
+      oracle_port: '1521'
       oracle_service_name: ORCL
       oracle_connection_string: user/pass@localhost:1521/ORCL
       oracle_wallet_sso_cert: /path/to/cert.pem
@@ -732,10 +731,10 @@ datasets:
       mssql_username: sa
       mssql_password: password
       mssql_host: localhost
-      mssql_port: "1433"
+      mssql_port: '1433'
       mssql_database: testdb
-      mssql_encrypt: "true"
-      mssql_trust_server_certificate: "false"
+      mssql_encrypt: 'true'
+      mssql_trust_server_certificate: 'false'
 
   # ---------------------------------------------------------------------------
   # ClickHouse connector
@@ -747,10 +746,10 @@ datasets:
       clickhouse_user: default
       clickhouse_pass: password
       clickhouse_host: localhost
-      clickhouse_tcp_port: "9000"
+      clickhouse_tcp_port: '9000'
       clickhouse_db: default
-      clickhouse_secure: "true"
-      connection_timeout: "30000"
+      clickhouse_secure: 'true'
+      connection_timeout: '30000'
 
   # ---------------------------------------------------------------------------
   # MongoDB connector
@@ -762,17 +761,17 @@ datasets:
       mongodb_user: user
       mongodb_pass: password
       mongodb_host: localhost
-      mongodb_port: "27017"
+      mongodb_port: '27017'
       mongodb_db: testdb
       mongodb_sslmode: disabled
       mongodb_sslrootcert: /path/to/ca.pem
       mongodb_auth_source: admin
-      mongodb_direct_connection: "false"
+      mongodb_direct_connection: 'false'
       mongodb_time_zone: UTC
-      mongodb_unnest_depth: "3"
-      mongodb_num_docs_to_infer_schema: "100"
-      mongodb_pool_min: "1"
-      mongodb_pool_max: "10"
+      mongodb_unnest_depth: '3'
+      mongodb_num_docs_to_infer_schema: '100'
+      mongodb_pool_min: '1'
+      mongodb_pool_max: '10'
 
   # ---------------------------------------------------------------------------
   # GitHub connector
@@ -783,14 +782,14 @@ datasets:
       github_token: ghp_xxx
       github_client_id: client-id
       github_private_key: private-key
-      github_installation_id: "123456"
+      github_installation_id: '123456'
       github_query_mode: search # search, rest
       github_endpoint: https://api.github.com
-      github_include_comments: "true"
-      github_max_comments_fetched: "100"
-      github_include_commits: "true"
-      github_workflow_logs: "true"
-      include: "*.md"
+      github_include_comments: 'true'
+      github_max_comments_fetched: '100'
+      github_include_commits: 'true'
+      github_workflow_logs: 'true'
+      include: '*.md'
 
   # ---------------------------------------------------------------------------
   # Git connector
@@ -798,11 +797,11 @@ datasets:
   - name: git_dataset
     from: git:https://github.com/spiceai/spiceai.git
     params:
-      include: "*.rs;*.md"
-      fetch_content: "true"
+      include: '*.rs;*.md'
+      fetch_content: 'true'
       cache_path: /tmp/git-cache
-      max_files: "1000"
-      max_file_bytes: "524288"
+      max_files: '1000'
+      max_file_bytes: '524288'
 
   # ---------------------------------------------------------------------------
   # GraphQL connector
@@ -813,9 +812,9 @@ datasets:
       graphql_auth_token: Bearer token123
       graphql_auth_user: user
       graphql_auth_pass: password
-      graphql_query: "query { users { id name } }"
+      graphql_query: 'query { users { id name } }'
       json_pointer: /data/users
-      unnest_depth: "2"
+      unnest_depth: '2'
 
   # ---------------------------------------------------------------------------
   # HTTP/HTTPS connector
@@ -825,21 +824,21 @@ datasets:
     params:
       http_username: user
       http_password: password
-      http_port: "443"
-      client_timeout: "30"
-      connect_timeout: "10"
-      pool_max_idle_per_host: "10"
-      pool_idle_timeout: "90"
-      http_headers: "Authorization: Bearer token, X-Custom: value"
-      max_retries: "3"
+      http_port: '443'
+      client_timeout: '30'
+      connect_timeout: '10'
+      pool_max_idle_per_host: '10'
+      pool_idle_timeout: '90'
+      http_headers: 'Authorization: Bearer token, X-Custom: value'
+      max_retries: '3'
       retry_backoff_method: fibonacci
-      retry_max_duration: "60s"
-      retry_jitter: "0.3"
-      allowed_request_paths: "/api/v1,/api/v2"
+      retry_max_duration: '60s'
+      retry_jitter: '0.3'
+      allowed_request_paths: '/api/v1,/api/v2'
       request_query_filters: enabled # enabled, disabled
-      max_request_query_length: "2048"
+      max_request_query_length: '2048'
       request_body_filters: enabled
-      max_request_body_bytes: "32768"
+      max_request_body_bytes: '32768'
       health_probe: /health
       file_format: json
 
@@ -855,7 +854,7 @@ datasets:
       iceberg_oauth2_token_url: https://auth.example.com/token
       iceberg_oauth2_scope: catalog
       iceberg_oauth2_server_url: https://auth.example.com
-      iceberg_sigv4_enabled: "true"
+      iceberg_sigv4_enabled: 'true'
       iceberg_signing_region: us-east-1
       iceberg_signing_name: execute-api
       iceberg_warehouse: warehouse
@@ -874,16 +873,16 @@ datasets:
   - name: glue_dataset
     from: glue:database.table
     params:
-      glue_catalog_id: "123456789012"
+      glue_catalog_id: '123456789012'
       glue_region: us-east-1
       glue_endpoint: https://glue.us-east-1.amazonaws.com
       glue_key: AKIAIOSFODNN7EXAMPLE
       glue_secret: secret
       glue_session_token: token
       glue_auth: iam_role
-      glue_versioning: "true"
+      glue_versioning: 'true'
       client_timeout: 30s
-      allow_http: "false"
+      allow_http: 'false'
       file_format: parquet
 
   # ---------------------------------------------------------------------------
@@ -898,12 +897,12 @@ datasets:
       kafka_sasl_username: user
       kafka_sasl_password: password
       kafka_ssl_ca_location: /path/to/ca.pem
-      kafka_enable_ssl_certificate_verification: "true"
+      kafka_enable_ssl_certificate_verification: 'true'
       kafka_ssl_endpoint_identification_algorithm: https
       kafka_consumer_group_id: spice-consumer
-      schema_infer_max_records: "10"
-      flatten_json: "true"
-      batch_max_size: "1000"
+      schema_infer_max_records: '10'
+      flatten_json: 'true'
+      batch_max_size: '1000'
       batch_max_duration: 5s
 
   # ---------------------------------------------------------------------------
@@ -920,10 +919,10 @@ datasets:
       kafka_sasl_username: debezium
       kafka_sasl_password: secret
       kafka_ssl_ca_location: /path/to/ca.pem
-      kafka_enable_ssl_certificate_verification: "true"
+      kafka_enable_ssl_certificate_verification: 'true'
       kafka_ssl_endpoint_identification_algorithm: https
       kafka_consumer_group_id: spice-debezium
-      batch_max_size: "500"
+      batch_max_size: '500'
       batch_max_duration: 10s
 
   # ---------------------------------------------------------------------------
@@ -936,11 +935,11 @@ datasets:
       dynamodb_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
       dynamodb_aws_secret_access_key: secret
       dynamodb_aws_session_token: token
-      unnest_depth: "3"
-      schema_infer_max_records: "100"
+      unnest_depth: '3'
+      schema_infer_max_records: '100'
       scan_segments: auto
       scan_interval: 1s
-      time_format: "2006-01-02T15:04:05Z07:00"
+      time_format: '2006-01-02T15:04:05Z07:00'
       ready_lag: 5s
       endpoint_url: http://localhost:8000
 
@@ -980,7 +979,7 @@ datasets:
     params:
       ftp_user: anonymous
       ftp_pass: guest
-      ftp_port: "21"
+      ftp_port: '21'
       client_timeout: 30s
       file_format: csv
 
@@ -992,7 +991,7 @@ datasets:
     params:
       sftp_user: user
       sftp_pass: password
-      sftp_port: "22"
+      sftp_port: '22'
       client_timeout: 30s
       file_format: parquet
 
@@ -1006,7 +1005,7 @@ datasets:
       imap_password: password
       imap_host: mail.example.com
       imap_mailbox: INBOX
-      imap_port: "993"
+      imap_port: '993'
       imap_ssl_mode: required
 
   # ---------------------------------------------------------------------------
@@ -1029,13 +1028,13 @@ datasets:
     params:
       file_format: csv
       file_extension: .csv
-      schema_infer_max_records: "1000"
-      csv_has_header: "true"
+      schema_infer_max_records: '1000'
+      csv_has_header: 'true'
       csv_quote: '"'
       csv_escape: "\\"
-      csv_delimiter: ","
+      csv_delimiter: ','
       file_compression_type: UNCOMPRESSED
-      hive_partitioning_enabled: "false"
+      hive_partitioning_enabled: 'false'
       schema_source_path: data/schema.csv
 
   # ---------------------------------------------------------------------------
@@ -1127,7 +1126,7 @@ models:
     from: openai:gpt-4o
     description: OpenAI GPT-4o model
     metadata:
-      version: "2024"
+      version: '2024'
     files:
       - path: ./prompts/system.txt
         name: system_prompt
@@ -1142,30 +1141,30 @@ models:
       openai_project_id: proj-123
       openai_usage_tier: tier5
       responses_api: enabled # enabled, disabled
-      openai_responses_tools: "true"
+      openai_responses_tools: 'true'
       tools: auto
       system_prompt: You are a helpful assistant.
-      parameterized_prompt: "Answer the question: {question}"
-      openai_frequency_penalty: "0.5"
+      parameterized_prompt: 'Answer the question: {question}'
+      openai_frequency_penalty: '0.5'
       openai_logit_bias: '{"50256": -100}'
-      openai_logprobs: "true"
-      openai_top_logprobs: "5"
-      openai_max_completion_tokens: "4096"
+      openai_logprobs: 'true'
+      openai_top_logprobs: '5'
+      openai_max_completion_tokens: '4096'
       openai_reasoning_effort: medium
-      openai_store: "true"
+      openai_store: 'true'
       openai_metadata: '{"user": "test"}'
-      openai_n: "1"
-      openai_presence_penalty: "0.5"
+      openai_n: '1'
+      openai_presence_penalty: '0.5'
       openai_response_format: '{"type": "json_object"}'
-      openai_seed: "42"
+      openai_seed: '42'
       openai_stop: '["END", "STOP"]'
-      openai_stream: "true"
+      openai_stream: 'true'
       openai_stream_options: '{"include_usage": true}'
-      openai_temperature: "0.7"
-      openai_top_p: "0.9"
+      openai_temperature: '0.7'
+      openai_top_p: '0.9'
       openai_tools: '[{"type": "function", "function": {"name": "search"}}]'
       openai_tool_choice: auto
-      openai_parallel_tool_calls: "true"
+      openai_parallel_tool_calls: 'true'
       openai_user: user-123
     dependsOn:
       - openai_embeddings
@@ -1181,17 +1180,17 @@ models:
     from: azure:gpt-4
     params:
       endpoint: https://myresource.openai.azure.com
-      azure_api_version: "2024-02-15-preview"
+      azure_api_version: '2024-02-15-preview'
       azure_deployment_name: gpt4-deployment
       azure_api_key: azure-key
       azure_entra_token: entra-token
-      azure_openai_responses_tools: "true"
+      azure_openai_responses_tools: 'true'
       responses_api: enabled
       tools: auto
       system_prompt: You are a helpful AI assistant.
-      azure_frequency_penalty: "0.5"
-      azure_temperature: "0.7"
-      azure_max_completion_tokens: "4096"
+      azure_frequency_penalty: '0.5'
+      azure_temperature: '0.7'
+      azure_max_completion_tokens: '4096'
 
   # ---------------------------------------------------------------------------
   # Anthropic model
@@ -1204,8 +1203,8 @@ models:
       anthropic_auth_token: auth-token
       tools: auto
       system_prompt: You are Claude, an AI assistant.
-      anthropic_temperature: "0.7"
-      anthropic_max_completion_tokens: "4096"
+      anthropic_temperature: '0.7'
+      anthropic_max_completion_tokens: '4096'
 
   # ---------------------------------------------------------------------------
   # AWS Bedrock model
@@ -1218,11 +1217,11 @@ models:
       aws_session_token: token
       aws_region: us-east-1
       bedrock_guardrail_identifier: guardrail-123
-      bedrock_guardrail_version: "1"
+      bedrock_guardrail_version: '1'
       bedrock_trace: enabled # enabled, disabled
       tools: auto
       system_prompt: You are a helpful assistant.
-      bedrock_temperature: "0.7"
+      bedrock_temperature: '0.7'
 
   # ---------------------------------------------------------------------------
   # Google model
@@ -1233,7 +1232,7 @@ models:
       google_api_key: google-api-key
       tools: auto
       system_prompt: You are Gemini.
-      google_temperature: "0.7"
+      google_temperature: '0.7'
 
   # ---------------------------------------------------------------------------
   # Databricks model
@@ -1255,8 +1254,8 @@ models:
     from: perplexity:llama-3.1-sonar-large-128k-online
     params:
       perplexity_auth_token: pplx-token
-      perplexity_return_images: "true"
-      perplexity_return_related_questions: "true"
+      perplexity_return_images: 'true'
+      perplexity_return_related_questions: 'true'
       perplexity_search_domain_filter: '["example.com"]'
       perplexity_search_recency_filter: week
       tools: auto
@@ -1292,7 +1291,7 @@ models:
       chat_template: chatml
       tools: auto
       system_prompt: You are a local AI.
-      file_temperature: "0.7"
+      file_temperature: '0.7'
 
 # =============================================================================
 # EMBEDDINGS
@@ -1326,7 +1325,7 @@ embeddings:
     from: azure:text-embedding-ada-002
     params:
       azure_api_key: azure-key
-      azure_api_version: "2024-02-15-preview"
+      azure_api_version: '2024-02-15-preview'
       azure_deployment_name: ada-embedding
       endpoint: https://myresource.openai.azure.com
 
@@ -1427,7 +1426,7 @@ workers:
       SELECT DATE(created_at) as day, COUNT(*) as count
       FROM postgres_full
       GROUP BY 1
-    cron: "0 0 * * *"
+    cron: '0 0 * * *'
     params:
       timeout: 300s
       retry_count: 3
