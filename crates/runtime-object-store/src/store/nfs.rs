@@ -128,14 +128,7 @@ impl NFSObjectStore {
                         entry.mtime.tv_sec,
                         u32::try_from(entry.mtime.tv_usec).unwrap_or(0) * 1000,
                     )
-                    .unwrap_or_else(|| {
-                        tracing::warn!(
-                            file = %name,
-                            tv_sec = entry.mtime.tv_sec,
-                            "Invalid NFS timestamp, using epoch as fallback"
-                        );
-                        DateTime::UNIX_EPOCH
-                    });
+                    .unwrap_or(DateTime::UNIX_EPOCH);
                     Some(DirEntry::file(name, entry.size, last_modified))
                 }
                 _ => None,
@@ -177,7 +170,7 @@ impl NFSObjectStore {
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
         let config = Arc::clone(&self.config);
-        let prefix_str = prefix.map_or(String::new(), |p| p.to_string());
+        let prefix_str = prefix.map_or(String::new(), Path::to_string);
 
         tokio::task::spawn_blocking(move || {
             let mut nfs = config.connect()?;
@@ -209,14 +202,7 @@ impl NFSObjectStore {
                 let mtime = stat.nfs_mtime as i64;
                 #[expect(clippy::cast_possible_truncation)]
                 let mtime_nsec = stat.nfs_mtime_nsec as u32;
-                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec).unwrap_or_else(|| {
-                    tracing::warn!(
-                        path = %location_string,
-                        mtime,
-                        "Invalid NFS timestamp, using epoch as fallback"
-                    );
-                    DateTime::UNIX_EPOCH
-                })
+                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec).unwrap_or(DateTime::UNIX_EPOCH)
             };
             Ok(build_object_meta(location, stat.nfs_size, last_modified))
         })
@@ -276,14 +262,8 @@ impl ObjectStore for NFSObjectStore {
                     let mtime = file_stat.nfs_mtime as i64;
                     #[expect(clippy::cast_possible_truncation)]
                     let mtime_nsec = file_stat.nfs_mtime_nsec as u32;
-                    DateTime::<Utc>::from_timestamp(mtime, mtime_nsec).unwrap_or_else(|| {
-                        tracing::warn!(
-                            path = %location_string,
-                            mtime,
-                            "Invalid NFS timestamp, using epoch as fallback"
-                        );
-                        DateTime::UNIX_EPOCH
-                    })
+                    DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
+                        .unwrap_or(DateTime::UNIX_EPOCH)
                 };
                 let object_meta = build_object_meta(location.clone(), size, last_modified);
 

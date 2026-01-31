@@ -410,12 +410,18 @@ impl Nfs {
         let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut file_handle: *mut sys::nfsfh = ptr::null_mut();
+            // mode_t is u16 on macOS, u32 on Linux; convert to i32 for the C API
+            #[cfg(target_os = "macos")]
+            let mode_i32 = i32::from(mode.bits());
+            #[cfg(not(target_os = "macos"))]
+            #[expect(clippy::cast_possible_wrap)]
+            let mode_i32 = mode.bits() as i32;
             check_retcode(
                 self.context.0,
                 sys::nfs_creat(
                     self.context.0,
                     path.as_ptr(),
-                    i32::from(mode.bits()),
+                    mode_i32,
                     &raw mut file_handle,
                 ),
             )?;
@@ -596,10 +602,16 @@ impl Nfs {
     /// Returns an error if the chmod operation fails.
     pub fn chmod(&self, path: &Path, mode: Mode) -> Result<()> {
         let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
+        // mode_t is u16 on macOS, u32 on Linux; convert to i32 for the C API
+        #[cfg(target_os = "macos")]
+        let mode_i32 = i32::from(mode.bits());
+        #[cfg(not(target_os = "macos"))]
+        #[expect(clippy::cast_possible_wrap)]
+        let mode_i32 = mode.bits() as i32;
         unsafe {
             check_retcode(
                 self.context.0,
-                sys::nfs_chmod(self.context.0, path.as_ptr(), i32::from(mode.bits())),
+                sys::nfs_chmod(self.context.0, path.as_ptr(), mode_i32),
             )?;
             Ok(())
         }
@@ -744,6 +756,21 @@ impl NfsFile {
         let capacity = count as usize;
         // Allocate and initialize the buffer to avoid exposing uninitialized memory
         let mut buffer: Vec<u8> = vec![0u8; capacity];
+
+        // The libnfs API changed between versions:
+        // - Old API (< 4.0): nfs_pread(nfs, fh, buf, count, offset)
+        // - New API (>= 4.0): nfs_pread(nfs, fh, offset, count, buf)
+        #[cfg(libnfs_new_api)]
+        let read_size = unsafe {
+            sys::nfs_pread(
+                self.nfs.0,
+                self.handle,
+                offset,
+                count,
+                buffer.as_mut_ptr().cast(),
+            )
+        };
+        #[cfg(not(libnfs_new_api))]
         let read_size = unsafe {
             sys::nfs_pread(
                 self.nfs.0,
@@ -753,6 +780,7 @@ impl NfsFile {
                 offset,
             )
         };
+
         check_retcode(self.nfs.0, read_size)?;
         #[expect(clippy::cast_sign_loss)]
         buffer.truncate(read_size as usize);
@@ -772,17 +800,37 @@ impl NfsFile {
     /// # Errors
     /// Returns an error if the write operation fails.
     pub fn pwrite(&self, buffer: &[u8], offset: u64) -> Result<i32> {
-        unsafe {
-            let write_size = sys::nfs_pwrite(
+        // The libnfs API changed between versions:
+        // - Old API (< 4.0): nfs_pwrite(nfs, fh, buf, count, offset)
+        // - New API (>= 4.0): nfs_pwrite(nfs, fh, offset, count, buf)
+        #[cfg(libnfs_new_api)]
+        let write_size = {
+            // SAFETY: We target 64-bit platforms only, so usize -> u64 is safe
+            #[expect(clippy::cast_possible_truncation)]
+            let count = buffer.len() as u64;
+            unsafe {
+                sys::nfs_pwrite(
+                    self.nfs.0,
+                    self.handle,
+                    offset,
+                    count,
+                    buffer.as_ptr().cast(),
+                )
+            }
+        };
+        #[cfg(not(libnfs_new_api))]
+        let write_size = unsafe {
+            sys::nfs_pwrite(
                 self.nfs.0,
                 self.handle,
                 buffer.as_ptr() as *mut _,
                 buffer.len(),
                 offset,
-            );
-            check_retcode(self.nfs.0, write_size)?;
-            Ok(write_size)
-        }
+            )
+        };
+
+        check_retcode(self.nfs.0, write_size)?;
+        Ok(write_size)
     }
 
     /// Write data to the beginning of the file.
@@ -880,9 +928,15 @@ impl Iterator for NfsDirectory {
                     return Some(Err(e));
                 }
             };
-            // On macOS mode_t is u16, but libnfs uses u32. Truncate safely.
+            // nfsdirent.mode is always u32 in libnfs, but Mode expects mode_t which is:
+            // - u16 on macOS
+            // - u32 on Linux
+            // Cast to the appropriate type for the platform.
+            #[cfg(target_os = "macos")]
             #[expect(clippy::cast_possible_truncation)]
             let mode = Mode::from_bits_truncate((*dirent).mode as u16);
+            #[cfg(not(target_os = "macos"))]
+            let mode = Mode::from_bits_truncate((*dirent).mode);
             Some(Ok(DirEntry {
                 path: PathBuf::from(file_name.to_string_lossy().into_owned()),
                 inode: (*dirent).inode,

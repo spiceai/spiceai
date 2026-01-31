@@ -21,6 +21,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // Declare the libnfs_new_api cfg for conditional compilation
+    println!("cargo::rustc-check-cfg=cfg(libnfs_new_api)");
+
     // Link to libnfs system library
     let link_static_env = env::var("LIBNFS_LINK_STATIC");
     match link_static_env {
@@ -100,7 +103,35 @@ compile_error!("libnfs bindings not available: install libnfs-dev to enable NFS 
     };
 
     let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let bindings_path = out_path.join("bindings.rs");
     bindings
-        .write_to_file(out_path.join("bindings.rs"))
+        .write_to_file(&bindings_path)
         .expect("Failed to write libnfs bindings");
+
+    // Detect libnfs API version by inspecting the generated bindings.
+    // The new API (libnfs >= 4.0) has nfs_pread(nfs, fh, offset, count, buf)
+    // The old API (libnfs < 4.0) has nfs_pread(nfs, fh, buf, count, offset)
+    // We detect this by looking for "offset: u64" appearing before "buf:" in the signature.
+    let bindings_content =
+        std::fs::read_to_string(&bindings_path).expect("Failed to read generated bindings");
+
+    // Find the nfs_pread function signature and check if offset comes before buf
+    // New API pattern: "nfs_pread" followed by "offset:" before "buf:"
+    // Old API pattern: "nfs_pread" followed by "buf:" before "offset:"
+    if let Some(pread_pos) = bindings_content.find("pub fn nfs_pread(") {
+        let signature_section =
+            &bindings_content[pread_pos..pread_pos + 500.min(bindings_content.len() - pread_pos)];
+        let offset_pos = signature_section.find("offset:");
+        let buf_pos = signature_section.find("buf:");
+
+        match (offset_pos, buf_pos) {
+            (Some(o), Some(b)) if o < b => {
+                // New API: offset comes before buf
+                println!("cargo:rustc-cfg=libnfs_new_api");
+            }
+            _ => {
+                // Old API: buf comes before offset (or couldn't determine)
+            }
+        }
+    }
 }
