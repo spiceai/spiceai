@@ -118,10 +118,13 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 
             // Get the execution plan from the TableProvider using the runtime's session state
             let session_state = runtime.df.ctx.state();
+            // NOTE: The codec deserialization API is synchronous, but DataFusion's
+            // TableProvider::scan is async. To reconstruct the physical plan we must
+            // synchronously wait for the scan to complete. This path is only taken during
+            // plan deserialization on executor startup, so the blocking cost is acceptable.
             let inner_plan = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    table_provider.scan(&session_state, None, &[], None).await
-                })
+                tokio::runtime::Handle::current()
+                    .block_on(async { table_provider.scan(&session_state, None, &[], None).await })
             })?;
 
             Ok(Arc::new(UdtfExec::new(args, inner_plan)))

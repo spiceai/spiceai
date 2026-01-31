@@ -105,7 +105,7 @@ impl PhysicalOptimizerRule for EnsureSupportedFileScan {
 /// A visitor that collects `DataSourceExec` nodes for validation, skipping
 /// those that are children of `UdtfExec` nodes.
 struct DataSourceExecValidator {
-    /// Tracks how deep we are inside UdtfExec nodes (can be nested).
+    /// Tracks how deep we are inside `UdtfExec` nodes (can be nested).
     udtf_depth: usize,
     /// Accumulated validation result.
     result: Result<()>,
@@ -130,11 +130,12 @@ impl TreeNodeVisitor<'_> for DataSourceExecValidator {
         }
 
         // Only validate DataSourceExec nodes that are NOT inside a UdtfExec
-        if self.udtf_depth == 0 && concrete!(node, DataSourceExec).is_some() {
-            if let Err(e) = EnsureSupportedFileScan::validate(node) {
-                self.result = Err(e);
-                return Ok(TreeNodeRecursion::Stop);
-            }
+        if self.udtf_depth == 0
+            && concrete!(node, DataSourceExec).is_some()
+            && let Err(e) = EnsureSupportedFileScan::validate(node)
+        {
+            self.result = Err(e);
+            return Ok(TreeNodeRecursion::Stop);
         }
 
         Ok(TreeNodeRecursion::Continue)
@@ -168,7 +169,7 @@ mod tests {
     use std::any::Any;
     use std::fmt;
 
-    /// A mock execution plan that pretends to be UdtfExec for testing purposes.
+    /// A mock execution plan that pretends to be `UdtfExec` for testing purposes.
     #[derive(Debug)]
     struct MockUdtfExec {
         inner: Arc<dyn ExecutionPlan>,
@@ -295,7 +296,9 @@ mod tests {
             None
         }
 
-        fn cardinality_effect(&self) -> datafusion::physical_plan::execution_plan::CardinalityEffect {
+        fn cardinality_effect(
+            &self,
+        ) -> datafusion::physical_plan::execution_plan::CardinalityEffect {
             datafusion::physical_plan::execution_plan::CardinalityEffect::Equal
         }
 
@@ -324,10 +327,12 @@ mod tests {
 
         let result = optimizer.optimize(data_source_exec, &config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("MemorySourceConfig cannot be distributed"));
+        assert!(
+            result
+                .expect_err("expected error for MemorySourceConfig")
+                .to_string()
+                .contains("MemorySourceConfig cannot be distributed")
+        );
     }
 
     #[test]

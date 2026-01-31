@@ -56,7 +56,7 @@ use std::sync::Arc;
 pub struct UdtfExec {
     /// The UDTF arguments (serializable via protobuf).
     args: UdtfArgs,
-    /// The inner execution plan from the UDTF's TableProvider.
+    /// The inner execution plan from the UDTF's `TableProvider`.
     inner: Arc<dyn ExecutionPlan>,
     /// Cached plan properties.
     properties: PlanProperties,
@@ -88,6 +88,9 @@ impl UdtfExec {
     ///
     /// This is used when decoding a serialized plan - the inner plan will be
     /// reconstructed by re-invoking the UDTF.
+    ///
+    /// # Note
+    /// This method is currently unused but reserved for future serialization enhancements.
     #[must_use]
     pub fn placeholder(args: UdtfArgs, schema: SchemaRef) -> Self {
         let eq_properties = EquivalenceProperties::new(Arc::clone(&schema));
@@ -125,10 +128,9 @@ impl UdtfExec {
 impl DisplayAs for UdtfExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "UdtfExec")
-            }
-            DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "UdtfExec")
             }
         }
@@ -190,7 +192,10 @@ impl ExecutionPlan for UdtfExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
-            Ok(Arc::new(Self::new(self.args.clone(), Arc::clone(&children[0]))))
+            Ok(Arc::new(Self::new(
+                self.args.clone(),
+                Arc::clone(&children[0]),
+            )))
         } else {
             Err(DataFusionError::Execution(
                 "UdtfExec expects exactly one child".to_string(),

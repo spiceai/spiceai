@@ -84,7 +84,10 @@ impl SpiceLogicalCodec {
 
     /// Reconstructs a UDTF-produced `TableProvider` by re-invoking the UDTF with
     /// the serialized arguments.
-    pub fn invoke_udtf(udtf_args: UdtfArgs, runtime: &Arc<Runtime>) -> Result<Arc<dyn TableProvider>> {
+    pub(crate) fn invoke_udtf(
+        udtf_args: UdtfArgs,
+        runtime: &Arc<Runtime>,
+    ) -> Result<Arc<dyn TableProvider>> {
         use datafusion::catalog::TableFunctionImpl;
 
         let Some(args) = udtf_args.args else {
@@ -138,7 +141,7 @@ impl SpiceLogicalCodec {
         // Convert nested queries to expressions
         for nested in &rrf_args.queries {
             let Some(query) = &nested.query else {
-                continue;
+                return exec_err!("RRF nested query missing query field");
             };
 
             let (search_exprs, rank_weight) = match query {
@@ -355,12 +358,13 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
 
         // Check for VectorSearchUDTFProvider (vector_search without index)
         if let Some(vector_provider) = any.downcast_ref::<VectorSearchUDTFProvider>() {
+            let provider_args = vector_provider.args();
             let args = UdtfArgs::vector_search(VectorSearchArgs {
-                table: vector_provider.args.tbl.to_string(),
-                query: vector_provider.args.query.clone(),
-                column: vector_provider.args.column.clone(),
-                limit: vector_provider.args.limit.map(|l| l as u64),
-                include_score: vector_provider.args.include_score,
+                table: provider_args.tbl.to_string(),
+                query: provider_args.query.clone(),
+                column: provider_args.column.clone(),
+                limit: provider_args.limit.map(|l| l as u64),
+                include_score: provider_args.include_score,
             });
             buf.extend_from_slice(&args.encode_to_vec());
             return Ok(());

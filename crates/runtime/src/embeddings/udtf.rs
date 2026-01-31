@@ -529,13 +529,19 @@ impl ScalarUDFImpl for VectorSearchTableFunc {
 /// without relying on a pre-built vector index.
 #[derive(Debug, Clone)]
 pub struct VectorSearchUDTFProvider {
-    pub args: VectorSearchTableFuncArgs,
+    args: VectorSearchTableFuncArgs,
     underlying: Arc<dyn TableProvider>,
     embedded_columns: HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
 impl VectorSearchUDTFProvider {
+    /// Returns the arguments used to create this provider.
+    #[must_use]
+    pub fn args(&self) -> &VectorSearchTableFuncArgs {
+        &self.args
+    }
+
     /// Embed the query argument and convert to [`Float32Array`].
     async fn vector(
         &self,
