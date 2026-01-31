@@ -664,7 +664,8 @@ async fn test_multi_partition_stress_impl(
         .expect("count")
         .value(0);
     assert_eq!(
-        count, total_expected as i64,
+        count,
+        i64::from(total_expected),
         "Expected {total_expected} total rows"
     );
     println!("✓ Total row count verified: {count}");
@@ -684,7 +685,8 @@ async fn test_multi_partition_stress_impl(
             .expect("count")
             .value(0);
         assert_eq!(
-            count, rows_per_partition as i64,
+            count,
+            i64::from(rows_per_partition),
             "Partition {partition} should have {rows_per_partition} rows"
         );
     }
@@ -701,7 +703,8 @@ async fn test_multi_partition_stress_impl(
         .downcast_ref::<Int64Array>()
         .expect("count")
         .value(0);
-    let expected_range = (5..num_partitions).count() as i64 * rows_per_partition as i64;
+    let expected_range = i64::try_from((5..num_partitions).count()).expect("should fit into i64")
+        * i64::from(rows_per_partition);
     assert_eq!(
         count, expected_range,
         "Expected {expected_range} rows for partition_key >= 5"

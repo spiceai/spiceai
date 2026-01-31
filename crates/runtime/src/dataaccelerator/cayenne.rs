@@ -2313,7 +2313,7 @@ impl PartitionCreator for CayennePartitionCreator {
         // Encode partition values as strings for metadata storage
         let partition_value_strings: Vec<String> = partition_values
             .iter()
-            .map(|v| encode_key(v))
+            .map(encode_key)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| creator::Error::CreatePartition {
                 source: Box::new(e),
