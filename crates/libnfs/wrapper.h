@@ -1,6 +1,6 @@
 /*
  * Wrapper header for libnfs bindgen.
- * Copyright 2026, Spice AI, Inc.
+ * Copyright 2026 The Spice.ai OSS Authors
  */
 
 /* Define __arm64__ for aarch64 targets if not already defined */

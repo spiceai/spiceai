@@ -7,6 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 nix = { workspace = true, features = ["fs"] }
+snafu.workspace = true
 
 [build-dependencies]
 bindgen = "0.71"

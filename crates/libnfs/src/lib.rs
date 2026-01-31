@@ -1,5 +1,5 @@
 /*
-Copyright 2026, Spice AI, Inc.
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -61,9 +61,9 @@ mod sys {
 
 use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
+use snafu::{ResultExt, Snafu};
 
-use std::ffi::{CStr, CString, c_char};
-use std::io::{Error, ErrorKind, Result};
+use std::ffi::{CStr, CString, NulError, c_char};
 use std::mem::zeroed;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -71,6 +71,30 @@ use std::ptr;
 use std::rc::Rc;
 
 pub use sys::{AUTH, nfs_stat_64, statvfs, timeval};
+
+/// Error type for NFS operations.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum Error {
+    /// Failed to initialize NFS context.
+    #[snafu(display("Failed to initialize NFS context"))]
+    ContextInitFailed,
+
+    /// NFS operation failed with an error from the server.
+    #[snafu(display("NFS operation failed: {message}"))]
+    NfsOperationFailed { message: String },
+
+    /// Path contains invalid characters (interior NUL byte).
+    #[snafu(display("Invalid path: contains NUL byte"))]
+    InvalidPath { source: NulError },
+
+    /// Unknown or unsupported file type encountered.
+    #[snafu(display("Unknown file type: {file_type}"))]
+    UnknownFileType { file_type: u32 },
+}
+
+/// Result type for NFS operations.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Smart pointer wrapper for the NFS context that handles cleanup on drop.
 #[derive(Clone)]
@@ -89,7 +113,7 @@ impl Drop for NfsPtr {
 /// Check if a pointer is null and return an appropriate error.
 fn check_mut_ptr<T>(ptr: *mut T) -> Result<*mut T> {
     if ptr.is_null() {
-        Err(Error::last_os_error())
+        ContextInitFailedSnafu.fail()
     } else {
         Ok(ptr)
     }
@@ -100,8 +124,8 @@ fn check_retcode(ctx: *mut sys::nfs_context, code: i32) -> Result<()> {
     if code < 0 {
         unsafe {
             let err_str = sys::nfs_get_error(ctx);
-            let e = CStr::from_ptr(err_str).to_string_lossy().into_owned();
-            Err(Error::other(e))
+            let message = CStr::from_ptr(err_str).to_string_lossy().into_owned();
+            NfsOperationFailedSnafu { message }.fail()
         }
     } else {
         Ok(())
@@ -145,10 +169,7 @@ impl EntryType {
             sys::ftype3_NF3FIFO => Ok(Self::NamedPipe),
             sys::ftype3_NF3LNK => Ok(Self::Symlink),
             sys::ftype3_NF3SOCK => Ok(Self::Socket),
-            _ => Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("Unknown file type: {t}"),
-            )),
+            _ => UnknownFileTypeSnafu { file_type: t }.fail(),
         }
     }
 }
@@ -253,7 +274,7 @@ impl Nfs {
     ///
     /// # Errors
     ///
-    /// This function cannot fail and always returns `Ok(())`.
+    /// This function always succeeds. The `Result` return type is used for API consistency.
     pub fn set_uid(&self, uid: i32) -> Result<()> {
         unsafe {
             sys::nfs_set_uid(self.context.0, uid);
@@ -265,7 +286,7 @@ impl Nfs {
     ///
     /// # Errors
     ///
-    /// This function cannot fail and always returns `Ok(())`.
+    /// This function always succeeds. The `Result` return type is used for API consistency.
     pub fn set_gid(&self, gid: i32) -> Result<()> {
         unsafe {
             sys::nfs_set_gid(self.context.0, gid);
@@ -277,7 +298,7 @@ impl Nfs {
     ///
     /// # Errors
     ///
-    /// This function cannot fail and always returns `Ok(())`.
+    /// This function always succeeds. The `Result` return type is used for API consistency.
     pub fn set_debug(&self, level: i32) -> Result<()> {
         unsafe {
             sys::nfs_set_debug(self.context.0, level);
@@ -289,7 +310,7 @@ impl Nfs {
     ///
     /// # Errors
     ///
-    /// This function cannot fail and always returns `Ok(())`.
+    /// This function always succeeds. The `Result` return type is used for API consistency.
     pub fn set_tcp_syncnt(&self, syncnt: i32) -> Result<()> {
         unsafe {
             sys::nfs_set_tcp_syncnt(self.context.0, syncnt);
@@ -301,7 +322,7 @@ impl Nfs {
     ///
     /// # Errors
     ///
-    /// This function cannot fail and always returns `Ok(())`.
+    /// This function always succeeds. The `Result` return type is used for API consistency.
     pub fn set_auth(&self, auth: &mut AUTH) -> Result<()> {
         unsafe {
             sys::nfs_set_auth(self.context.0, auth);
@@ -318,8 +339,8 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the mount operation fails.
     pub fn mount(&self, server: &str, export_name: &str) -> Result<()> {
-        let server = CString::new(server.as_bytes())?;
-        let export = CString::new(export_name.as_bytes())?;
+        let server = CString::new(server.as_bytes()).context(InvalidPathSnafu)?;
+        let export = CString::new(export_name.as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -334,7 +355,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the directory cannot be opened.
     pub fn opendir(&mut self, path: &Path) -> Result<NfsDirectory> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut dir_handle: *mut sys::nfsdir = ptr::null_mut();
             check_retcode(
@@ -361,7 +382,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the file cannot be opened.
     pub fn open(&mut self, path: &Path, flags: OFlag) -> Result<NfsFile> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut file_handle: *mut sys::nfsfh = ptr::null_mut();
             check_retcode(
@@ -385,7 +406,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the file cannot be created.
     pub fn create(&mut self, path: &Path, _flags: OFlag, mode: Mode) -> Result<NfsFile> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut file_handle: *mut sys::nfsfh = ptr::null_mut();
             check_retcode(
@@ -409,7 +430,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the stat operation fails.
     pub fn stat64(&self, path: &Path) -> Result<nfs_stat_64> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut stat_buf: nfs_stat_64 = zeroed();
             check_retcode(
@@ -425,7 +446,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the lstat operation fails.
     pub fn lstat64(&self, path: &Path) -> Result<nfs_stat_64> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut stat_buf: nfs_stat_64 = zeroed();
             check_retcode(
@@ -441,7 +462,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the statvfs operation fails.
     pub fn statvfs(&self, path: &Path) -> Result<statvfs> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             let mut stat_buf: statvfs = zeroed();
             check_retcode(
@@ -457,7 +478,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the directory cannot be created.
     pub fn mkdir(&self, path: &Path) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -472,7 +493,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the directory cannot be removed.
     pub fn rmdir(&self, path: &Path) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -487,7 +508,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the file cannot be removed.
     pub fn unlink(&self, path: &Path) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -502,8 +523,8 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the rename operation fails.
     pub fn rename(&self, oldpath: &Path, newpath: &Path) -> Result<()> {
-        let old_path = CString::new(oldpath.as_os_str().as_bytes())?;
-        let new_path = CString::new(newpath.as_os_str().as_bytes())?;
+        let old_path = CString::new(oldpath.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
+        let new_path = CString::new(newpath.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -518,8 +539,8 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the symlink cannot be created.
     pub fn symlink(&self, oldpath: &Path, newpath: &Path) -> Result<()> {
-        let old_path = CString::new(oldpath.as_os_str().as_bytes())?;
-        let new_path = CString::new(newpath.as_os_str().as_bytes())?;
+        let old_path = CString::new(oldpath.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
+        let new_path = CString::new(newpath.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -534,8 +555,8 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the link cannot be created.
     pub fn link(&self, oldpath: &Path, newpath: &Path) -> Result<()> {
-        let old_path = CString::new(oldpath.as_os_str().as_bytes())?;
-        let new_path = CString::new(newpath.as_os_str().as_bytes())?;
+        let old_path = CString::new(oldpath.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
+        let new_path = CString::new(newpath.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -550,7 +571,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the readlink operation fails.
     pub fn readlink(&self, path: &Path, buf: &mut [u8]) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         // SAFETY: We target 64-bit platforms; buffer size is reasonably small for symlinks
         #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let buf_len = buf.len() as i32;
@@ -573,7 +594,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the chmod operation fails.
     pub fn chmod(&self, path: &Path, mode: Mode) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -588,7 +609,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the chown operation fails.
     pub fn chown(&self, path: &Path, uid: i32, gid: i32) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -603,7 +624,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the truncate operation fails.
     pub fn truncate(&self, path: &Path, len: u64) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -619,7 +640,7 @@ impl Nfs {
     ///
     /// # Errors
     ///
-    /// This function cannot fail and always returns `Ok(mask)`.
+    /// This function always succeeds. The `Result` return type is used for API consistency.
     pub fn umask(&self, mask: u16) -> Result<u16> {
         unsafe {
             let mask = sys::nfs_umask(self.context.0, mask);
@@ -632,7 +653,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the utimes operation fails.
     pub fn utimes(&self, path: &Path, times: &mut [timeval; 2]) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -647,7 +668,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if access is denied or the check fails.
     pub fn access(&self, path: &Path, mode: i32) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -661,7 +682,7 @@ impl Nfs {
     ///
     /// # Errors
     ///
-    /// This function cannot fail and always returns `Ok(path)`.
+    /// This function always succeeds. The `Result` return type is used for API consistency.
     pub fn getcwd(&self) -> Result<PathBuf> {
         let mut cwd = ptr::null();
         unsafe {
@@ -676,7 +697,7 @@ impl Nfs {
     /// # Errors
     /// Returns an error if the directory change fails.
     pub fn chdir(&self, path: &Path) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_bytes())?;
+        let path = CString::new(path.as_os_str().as_bytes()).context(InvalidPathSnafu)?;
         unsafe {
             check_retcode(
                 self.context.0,
@@ -690,7 +711,7 @@ impl Nfs {
     ///
     /// # Errors
     ///
-    /// This function cannot fail and always returns `Ok(size)`.
+    /// This function always succeeds. The `Result` return type is used for API consistency.
     pub fn get_readmax(&self) -> Result<u64> {
         unsafe {
             let max = sys::nfs_get_readmax(self.context.0);
@@ -703,7 +724,7 @@ impl Nfs {
     ///
     /// # Errors
     ///
-    /// This function cannot fail and always returns `Ok(size)`.
+    /// This function always succeeds. The `Result` return type is used for API consistency.
     pub fn get_writemax(&self) -> Result<u64> {
         unsafe {
             let max = sys::nfs_get_writemax(self.context.0);

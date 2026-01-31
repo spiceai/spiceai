@@ -9697,6 +9697,7 @@ version = "0.1.0"
 dependencies = [
  "bindgen 0.71.1",
  "nix 0.30.1",
+ "snafu",
 ]
 
 [[package]]
