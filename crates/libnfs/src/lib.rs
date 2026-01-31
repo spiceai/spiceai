@@ -709,27 +709,25 @@ impl Nfs {
 
     /// Get the maximum read size supported by the server.
     ///
-    /// # Errors
-    ///
-    /// This function always succeeds. The `Result` return type is used for API consistency.
-    pub fn get_readmax(&self) -> Result<u64> {
+    /// Returns the maximum number of bytes that can be read in a single operation.
+    #[must_use]
+    pub fn get_readmax(&self) -> u64 {
         unsafe {
             let max = sys::nfs_get_readmax(self.context.0);
             // SAFETY: usize to u64 conversion is safe since we target 64-bit platforms
-            Ok(max as u64)
+            max as u64
         }
     }
 
     /// Get the maximum write size supported by the server.
     ///
-    /// # Errors
-    ///
-    /// This function always succeeds. The `Result` return type is used for API consistency.
-    pub fn get_writemax(&self) -> Result<u64> {
+    /// Returns the maximum number of bytes that can be written in a single operation.
+    #[must_use]
+    pub fn get_writemax(&self) -> u64 {
         unsafe {
             let max = sys::nfs_get_writemax(self.context.0);
             // SAFETY: usize to u64 conversion is safe since we target 64-bit platforms
-            Ok(max as u64)
+            max as u64
         }
     }
 }
