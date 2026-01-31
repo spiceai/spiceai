@@ -455,11 +455,7 @@ impl JobStore {
 
     /// Lists all jobs, optionally filtered by status.
     ///
-    /// This method is best-effort for individual job state retrieval. If the listing
-    /// stream returns an error, that error is propagated. However, if individual job
-    /// state files fail to read or deserialize (e.g., due to concurrent deletion or
-    /// corruption), those jobs are skipped with a warning log to provide a partial
-    /// list rather than failing the entire operation.
+    /// Returns an error if any job state file fails to be read or deserialized.
     pub async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
         let jobs_prefix = self.jobs_prefix();
         let mut stream = self.store.list(Some(&jobs_prefix));
@@ -476,45 +472,13 @@ impl JobStore {
                 continue;
             }
 
-            // Best-effort retrieval: if a job state file was deleted between listing
-            // and fetching, or is corrupted, skip it rather than failing the entire list.
-            let result = match self.store.get(&meta.location).await {
-                Ok(r) => r,
-                Err(ObjectStoreError::NotFound { .. }) => {
-                    // Job was deleted between list and get - this is expected in concurrent scenarios
-                    tracing::debug!(path = %meta.location, "Job state file not found during listing (likely deleted during list operation), skipping");
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read distributed job state at path '{path}' during listing: {e}. This job will be skipped.",
-                        path = meta.location
-                    );
-                    continue;
-                }
-            };
-
-            let bytes = match result.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read distributed job state bytes at path '{path}' during listing: {e}. This job will be skipped.",
-                        path = meta.location
-                    );
-                    continue;
-                }
-            };
-
-            let state = match serde_json::from_slice::<JobState>(&bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read distributed job state at path '{path}' during listing: {e}. This job will be skipped.",
-                        path = meta.location
-                    );
-                    continue;
-                }
-            };
+            let result = self
+                .store
+                .get(&meta.location)
+                .await
+                .context(ObjectStoreReadSnafu)?;
+            let bytes = result.bytes().await.context(ObjectStoreReadSnafu)?;
+            let state: JobState = serde_json::from_slice(&bytes).context(DeserializeStateSnafu)?;
 
             // Apply status filter
             if status_filter.is_some_and(|filter| state.status != filter) {

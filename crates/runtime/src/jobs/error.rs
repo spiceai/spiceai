@@ -54,12 +54,6 @@ pub enum Error {
     #[snafu(display("Failed to deserialize job state: {source}"))]
     DeserializeState { source: serde_json::Error },
 
-    #[snafu(display("Failed to deserialize job state for job {job_id}: {source}"))]
-    DeserializeJobState {
-        job_id: String,
-        source: serde_json::Error,
-    },
-
     #[snafu(display("Failed to serialize result chunk: {source}"))]
     SerializeChunk { source: ArrowError },
 
