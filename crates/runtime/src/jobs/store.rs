@@ -486,7 +486,10 @@ impl JobStore {
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to read distributed job state at path '{path}' during listing: {e}. This job will be skipped.", path = %meta.location, error = %e);
+                    tracing::warn!(
+                        "Failed to read distributed job state at path '{path}' during listing: {e}. This job will be skipped.",
+                        path = meta.location
+                    );
                     continue;
                 }
             };
@@ -494,7 +497,10 @@ impl JobStore {
             let bytes = match result.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!("Failed to read distributed job state bytes at path '{path}' during listing: {e}. This job will be skipped.", path = %meta.location, error = %e);
+                    tracing::warn!(
+                        "Failed to read distributed job state bytes at path '{path}' during listing: {e}. This job will be skipped.",
+                        path = meta.location
+                    );
                     continue;
                 }
             };
@@ -502,7 +508,10 @@ impl JobStore {
             let state = match serde_json::from_slice::<JobState>(&bytes) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("Failed to read distributed job state at path '{path}' during listing: {e}. This job will be skipped.", path = %meta.location, error = %e);
+                    tracing::warn!(
+                        "Failed to read distributed job state at path '{path}' during listing: {e}. This job will be skipped.",
+                        path = meta.location
+                    );
                     continue;
                 }
             };
@@ -542,7 +551,9 @@ impl JobStore {
                 Ok(m) => m,
                 Err(e) => {
                     // Log and continue to process remaining entries in the stream
-                    tracing::warn!("Failed to list distributed job during expired job cleanup: {e}. This job will be skipped.", error = %e);
+                    tracing::warn!(
+                        "Failed to list distributed job during expired job cleanup: {e}. This job will be skipped."
+                    );
                     continue;
                 }
             };
@@ -563,7 +574,10 @@ impl JobStore {
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to read distributed job state at path '{path}' during cleanup: {e}. This job will be skipped.", path = %meta.location, error = %e);
+                    tracing::warn!(
+                        "Failed to read distributed job state at path '{path}' during cleanup: {e}. This job will be skipped.",
+                        path = meta.location
+                    );
                     continue;
                 }
             };
@@ -571,7 +585,10 @@ impl JobStore {
             let bytes = match result.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!("Failed to read distributed job state bytes at path '{path}' during cleanup: {e}. This job will be skipped.", path = %meta.location, error = %e);
+                    tracing::warn!(
+                        "Failed to read distributed job state bytes at path '{path}' during cleanup: {e}. This job will be skipped.",
+                        path = meta.location
+                    );
                     continue;
                 }
             };
@@ -579,7 +596,10 @@ impl JobStore {
             let state = match serde_json::from_slice::<JobState>(&bytes) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("Failed to read distributed job state at path '{path}' during cleanup: {e}. This job will be skipped.", path = %meta.location, error = %e);
+                    tracing::warn!(
+                        "Failed to read distributed job state at path '{path}' during cleanup: {e}. This job will be skipped.",
+                        path = meta.location
+                    );
                     continue;
                 }
             };
@@ -591,7 +611,10 @@ impl JobStore {
                         deleted_count = deleted_count.saturating_add(1);
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to delete expired distributed job '{job_id}' during cleanup: {e}", job_id = %state.job_id, error = %e);
+                        tracing::warn!(
+                            "Failed to delete expired distributed job '{job_id}' during cleanup: {e}",
+                            job_id = state.job_id
+                        );
                     }
                 }
             }
