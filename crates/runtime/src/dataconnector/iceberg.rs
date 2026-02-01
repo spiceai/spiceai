@@ -26,6 +26,7 @@ use datafusion::catalog::TableProvider;
 use iceberg::{Catalog, TableIdent, io::CustomAwsCredentialLoader};
 use iceberg_datafusion::IcebergTableProvider;
 use secrecy::ExposeSecret;
+use util::concat_arrays;
 
 use super::DataConnectorFactory;
 use crate::{
@@ -38,7 +39,6 @@ use crate::{
         ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
         parameters::aws::initiate_config_with_credentials,
     },
-    model::params::concat_arrays,
     parameters::{ParameterSpec, Parameters},
     register_data_connector,
 };
