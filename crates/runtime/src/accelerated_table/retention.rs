@@ -20,8 +20,8 @@ use crate::{
     accelerated_table::{DataRetentionFilter, Retention, refresh},
     component::dataset::TimeFormat,
     datafusion::{
-        builder::get_df_default_config, filter_converter::TimestampFilterConvert,
-        is_spice_internal_dataset,
+        builder::get_df_default_config, expr_utils::simplify_expr,
+        filter_converter::TimestampFilterConvert, is_spice_internal_dataset,
     },
 };
 use arrow::array::UInt64Array;
@@ -117,7 +117,19 @@ impl super::AcceleratedTable {
                     continue;
                 };
 
-                tracing::trace!("[retention] Expr {expr:?}");
+                tracing::trace!("[retention] Expr before simplification: {expr:?}");
+
+                let expr = match simplify_expr(expr, &accelerator.schema()) {
+                    Ok(simplified) => simplified,
+                    Err(e) => {
+                        tracing::error!(
+                            "[retention] Failed to simplify retention filter for {dataset_name}: {e}"
+                        );
+                        continue;
+                    }
+                };
+
+                tracing::debug!("[retention] Expr: {expr:?}");
 
                 let ctx = SessionContext::new_with_config_rt(
                     get_df_default_config(),

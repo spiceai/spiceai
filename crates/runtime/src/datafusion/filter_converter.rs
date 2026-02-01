@@ -124,7 +124,7 @@ fn convert_to_expr(
         ExprTimeFormat::Timestamptz(tz) => binary_expr(
             cast(
                 col(time_column),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, tz.clone()),
             ),
             op,
             Expr::Literal(

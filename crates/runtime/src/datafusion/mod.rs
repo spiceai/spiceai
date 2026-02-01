@@ -114,6 +114,7 @@ pub mod app_context_extension;
 pub mod builder;
 pub mod dialect;
 pub mod error;
+pub(crate) mod expr_utils;
 pub mod filter_converter;
 pub mod flight_session_extension;
 pub mod job_executor_context_extension;
