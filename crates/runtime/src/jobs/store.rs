@@ -501,10 +501,11 @@ impl JobStore {
 
     /// Cleans up expired jobs and their results.
     ///
-    /// This method is best-effort cleanup. If the listing stream returns an error,
-    /// that error is propagated. For individual job state retrieval and deletion
-    /// errors, the operation logs warnings and continues to clean up as many expired
-    /// jobs as possible. Returns the count of successfully deleted jobs.
+    /// This method uses best-effort cleanup. For listing errors, individual job state
+    /// retrieval errors, and deletion errors, the operation logs warnings and continues
+    /// to clean up as many expired jobs as possible.
+    ///
+    /// Returns the count of successfully deleted jobs.
     pub async fn cleanup_expired_jobs(&self) -> Result<usize> {
         let jobs_prefix = self.jobs_prefix();
         let mut stream = self.store.list(Some(&jobs_prefix));
