@@ -87,11 +87,15 @@ impl super::AcceleratedTable {
                             };
 
                             let start = SystemTime::now() - *period;
-                            let timestamp = refresh::get_timestamp(start);
-                            let expr = converter.convert(timestamp, Operator::Lt);
+                            let timestamp_nanos = refresh::get_timestamp(start);
+                            // Truncate to milliseconds - retention periods don't need sub-millisecond precision
+                            // and this avoids timestamp casting which some accelerator engines don't support.
+                            let timestamp_millis_aligned =
+                                (timestamp_nanos / 1_000_000) * 1_000_000;
+                            let expr = converter.convert(timestamp_millis_aligned, Operator::Lt);
 
                             let timestamp = if let Some(value) = chrono::DateTime::from_timestamp(
-                                (timestamp / 1_000_000_000) as i64,
+                                (timestamp_nanos / 1_000_000_000) as i64,
                                 0,
                             ) {
                                 value.to_rfc3339()
@@ -117,7 +121,7 @@ impl super::AcceleratedTable {
                     continue;
                 };
 
-                tracing::trace!("[retention] Expr {expr:?}");
+                tracing::debug!("[retention] Expr {expr:?}");
 
                 let ctx = SessionContext::new_with_config_rt(
                     get_df_default_config(),

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::component::dataset::TimeFormat;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::{
     logical_expr::{Expr, Operator, binary_expr, cast, col, lit},
     prelude::and,
@@ -27,8 +27,15 @@ use std::sync::Arc;
 enum ExprTimeFormat {
     ISO8601,
     UnixTimestamp(ExprUnixTimestamp),
-    Timestamp,
-    Timestamptz(Option<Arc<str>>),
+    /// Timestamp without timezone. If `unit` is `None` (unknown), a cast to nanosecond is required
+    /// (e.g., for Date64, Time32, Time64 types that need conversion).
+    Timestamp {
+        unit: Option<TimeUnit>,
+    },
+    Timestamptz {
+        unit: TimeUnit,
+        tz: Arc<str>,
+    },
     Date,
 }
 
@@ -106,13 +113,15 @@ fn convert_to_expr(
             op,
             lit((timestamp_in_nanos / format.scale) as u64),
         ),
-        ExprTimeFormat::Date | ExprTimeFormat::Timestamp | ExprTimeFormat::ISO8601 => {
+        ExprTimeFormat::Date
+        | ExprTimeFormat::ISO8601
+        | ExprTimeFormat::Timestamp { unit: None } => {
+            // Cast to nanosecond for types where we don't have precise unit info
+            // (ISO8601 strings, Date32, Date64, Time32, Time64)
             binary_expr(
-                // The time unit of timestamp is unknown before filtering
-                // Convert the left and right expr to same unit for safe comparison
                 cast(
                     col(time_column),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
                 ),
                 op,
                 Expr::Literal(
@@ -121,17 +130,77 @@ fn convert_to_expr(
                 ),
             )
         }
-        ExprTimeFormat::Timestamptz(tz) => binary_expr(
+        ExprTimeFormat::Timestamp { unit: Some(unit) } => {
+            timestamp_filter_expr(timestamp_in_nanos, time_column, *unit, None, op)
+        }
+        ExprTimeFormat::Timestamptz { unit, tz } => {
+            timestamp_filter_expr(timestamp_in_nanos, time_column, *unit, Some(tz), op)
+        }
+    }
+}
+
+/// Creates a timestamp filter expression using the column's native time unit when possible.
+///
+/// Skips casting if `timestamp_in_nanos` is aligned to the column's unit (no precision loss).
+/// Falls back to casting the column to nanoseconds if the value has higher precision (for safety).
+/// The timestamp is converted without additional cast for:
+/// 1. Refresh: `timestamp_in_nanos` is based on data values which can't have higher precision than the column's unit
+/// 2. Retention period: `timestamp_in_nanos` has millisecond precision (truncated in retention.rs) and will be converted without cast for millisecond, microsecond, and nanosecond columns (second precision is rare and will still cast)
+#[expect(clippy::cast_possible_truncation)]
+fn timestamp_filter_expr(
+    timestamp_in_nanos: u128,
+    time_column: &str,
+    unit: TimeUnit,
+    tz: Option<&Arc<str>>,
+    op: Operator,
+) -> Expr {
+    let tz_owned = tz.map(Arc::clone);
+    if is_aligned_to_unit(timestamp_in_nanos, unit) {
+        let literal = timestamp_scalar(timestamp_in_nanos, unit, tz_owned);
+        binary_expr(col(time_column), op, Expr::Literal(literal, None))
+    } else {
+        binary_expr(
             cast(
                 col(time_column),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Nanosecond, tz_owned.clone()),
             ),
             op,
             Expr::Literal(
-                ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), tz.to_owned()),
+                ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), tz_owned),
                 None,
             ),
-        ),
+        )
+    }
+}
+
+/// Checks if the nanosecond timestamp is aligned to the given time unit (no precision loss).
+fn is_aligned_to_unit(timestamp_in_nanos: u128, unit: TimeUnit) -> bool {
+    let divisor = match unit {
+        TimeUnit::Nanosecond => 1,
+        TimeUnit::Microsecond => 1_000,
+        TimeUnit::Millisecond => 1_000_000,
+        TimeUnit::Second => 1_000_000_000,
+    };
+    timestamp_in_nanos.is_multiple_of(divisor)
+}
+
+/// Creates a `ScalarValue` timestamp literal with the specified time unit and optional timezone.
+/// Converts from nanoseconds to the target unit.
+#[expect(clippy::cast_possible_truncation)]
+fn timestamp_scalar(timestamp_in_nanos: u128, unit: TimeUnit, tz: Option<Arc<str>>) -> ScalarValue {
+    match unit {
+        TimeUnit::Nanosecond => {
+            ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), tz)
+        }
+        TimeUnit::Microsecond => {
+            ScalarValue::TimestampMicrosecond(Some((timestamp_in_nanos / 1_000) as i64), tz)
+        }
+        TimeUnit::Millisecond => {
+            ScalarValue::TimestampMillisecond(Some((timestamp_in_nanos / 1_000_000) as i64), tz)
+        }
+        TimeUnit::Second => {
+            ScalarValue::TimestampSecond(Some((timestamp_in_nanos / 1_000_000_000) as i64), tz)
+        }
     }
 }
 
@@ -160,9 +229,13 @@ fn data_type_to_time_format(
             Some(ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale }))
         }
         DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) => {
-            Some(ExprTimeFormat::Timestamp)
+            Some(ExprTimeFormat::Timestamp { unit: None })
         }
-        DataType::Timestamp(_, tz) => Some(ExprTimeFormat::Timestamptz(tz.to_owned())),
+        DataType::Timestamp(unit, None) => Some(ExprTimeFormat::Timestamp { unit: Some(*unit) }),
+        DataType::Timestamp(unit, Some(tz)) => Some(ExprTimeFormat::Timestamptz {
+            unit: *unit,
+            tz: Arc::clone(tz),
+        }),
         DataType::Utf8 | DataType::LargeUtf8 => Some(ExprTimeFormat::ISO8601),
         DataType::Date32 => Some(ExprTimeFormat::Date),
         _ => {
@@ -199,7 +272,7 @@ mod test {
             ),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+            "timestamp > TimestampSecond(1620000000, None)",
         );
         test(
             Field::new("timestamp", DataType::Utf8, false),
@@ -258,7 +331,7 @@ mod test {
 
         assert_eq!(
             result.to_string(),
-            "timestamp > UInt64(1620000000000) AND CAST(partition_ts AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)"
+            "timestamp > UInt64(1620000000000) AND partition_ts > TimestampSecond(1620000000, None)"
         );
     }
 
@@ -286,8 +359,169 @@ mod test {
 
         assert_eq!(
             result.to_string(),
-            r#"CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
+            r#"timestamp > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
         );
+    }
+
+    #[test]
+    fn test_aligned_timestamp_skips_cast() {
+        // Aligned to microseconds (divisible by 1000) - should skip cast
+        test(
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000_000_000_000, // Aligned to microseconds
+            "timestamp > TimestampMicrosecond(1620000000000000, None)",
+        );
+
+        // Aligned to milliseconds (divisible by 1_000_000) - should skip cast
+        test(
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000_000_000_000, // Aligned to milliseconds
+            "timestamp > TimestampMillisecond(1620000000000, None)",
+        );
+
+        // Aligned to seconds (divisible by 1_000_000_000) - should skip cast
+        test(
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000_000_000_000, // Aligned to seconds
+            "timestamp > TimestampSecond(1620000000, None)",
+        );
+    }
+
+    #[test]
+    fn test_unaligned_timestamp_uses_cast() {
+        // Not aligned to microseconds - should cast
+        test(
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000_000_000_001, // Has sub-microsecond precision
+            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000001, None)",
+        );
+
+        // Not aligned to milliseconds - should cast
+        test(
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000_000_000_500, // Has sub-millisecond precision
+            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000500, None)",
+        );
+
+        // Not aligned to seconds - should cast
+        test(
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000_500_000_000, // Has sub-second precision
+            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000500000000, None)",
+        );
+    }
+
+    #[test]
+    fn test_aligned_timestamptz_skips_cast() {
+        // Aligned to microseconds with timezone - should skip cast
+        let time_field = Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        );
+
+        let converter = TimestampFilterConvert::create(
+            Some(time_field),
+            Some("timestamp".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let result = match converter {
+            Some(c) => c.convert(1_620_000_000_000_000_000, Operator::Gt),
+            None => panic!("Failed to create converter"),
+        };
+
+        assert_eq!(
+            result.to_string(),
+            r#"timestamp > TimestampMicrosecond(1620000000000000, Some("UTC"))"#
+        );
+    }
+
+    #[test]
+    fn test_unaligned_timestamptz_uses_cast() {
+        // Not aligned to microseconds with timezone - should cast
+        let time_field = Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        );
+
+        let converter = TimestampFilterConvert::create(
+            Some(time_field),
+            Some("timestamp".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let result = match converter {
+            Some(c) => c.convert(1_620_000_000_000_000_001, Operator::Gt), // Sub-microsecond
+            None => panic!("Failed to create converter"),
+        };
+
+        assert_eq!(
+            result.to_string(),
+            r#"CAST(timestamp AS Timestamp(ns, "UTC")) > TimestampNanosecond(1620000000000000001, Some("UTC"))"#
+        );
+    }
+
+    #[test]
+    fn test_is_aligned_to_unit() {
+        // Nanosecond - always aligned
+        assert!(is_aligned_to_unit(1, TimeUnit::Nanosecond));
+        assert!(is_aligned_to_unit(999, TimeUnit::Nanosecond));
+
+        // Microsecond - aligned if divisible by 1000
+        assert!(is_aligned_to_unit(1_000, TimeUnit::Microsecond));
+        assert!(is_aligned_to_unit(1_000_000, TimeUnit::Microsecond));
+        assert!(!is_aligned_to_unit(1_001, TimeUnit::Microsecond));
+        assert!(!is_aligned_to_unit(999, TimeUnit::Microsecond));
+
+        // Millisecond - aligned if divisible by 1_000_000
+        assert!(is_aligned_to_unit(1_000_000, TimeUnit::Millisecond));
+        assert!(is_aligned_to_unit(1_000_000_000, TimeUnit::Millisecond));
+        assert!(!is_aligned_to_unit(1_000_001, TimeUnit::Millisecond));
+        assert!(!is_aligned_to_unit(999_999, TimeUnit::Millisecond));
+
+        // Second - aligned if divisible by 1_000_000_000
+        assert!(is_aligned_to_unit(1_000_000_000, TimeUnit::Second));
+        assert!(is_aligned_to_unit(2_000_000_000, TimeUnit::Second));
+        assert!(!is_aligned_to_unit(1_000_000_001, TimeUnit::Second));
+        assert!(!is_aligned_to_unit(999_999_999, TimeUnit::Second));
     }
 
     fn test(field: Field, time_format: TimeFormat, timestamp: u128, expected: &str) {
