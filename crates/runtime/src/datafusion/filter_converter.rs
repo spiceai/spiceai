@@ -286,7 +286,7 @@ mod test {
 
         assert_eq!(
             result.to_string(),
-            r#"CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
+            r#"CAST(timestamp AS Timestamp(ns, "UTC")) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
         );
     }
 

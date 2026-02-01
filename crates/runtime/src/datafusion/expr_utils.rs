@@ -127,7 +127,7 @@ mod tests {
 
         let simplified = simplify_expr(expr, &schema).expect("simplification should succeed");
 
-        // Datafusion behavior: truncates nanoseconds to microseconds
+        // DataFusion behavior: truncates nanoseconds to microseconds
         // Truncation: 1_620_000_000_000_000_001 ns -> 1_620_000_000_000_000 µs
         assert_eq!(
             simplified.to_string(),
