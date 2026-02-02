@@ -105,6 +105,10 @@ pub async fn start_kafka_docker_container(
     // Verify broker is ready to accept connections by fetching metadata
     verify_broker_ready(&producer, topics).await?;
 
+    // Additional stabilization delay to ensure broker is fully ready for message production
+    // This helps avoid race conditions in CI environments with resource contention
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     Ok((running_container, producer))
 }
 
@@ -116,7 +120,7 @@ pub fn create_kafka_producer(
     let mut config = ClientConfig::new();
     config
         .set("bootstrap.servers", broker)
-        .set("message.timeout.ms", "5000");
+        .set("message.timeout.ms", "30000");
 
     if let (Some(user), Some(pass)) = (username, password) {
         config
@@ -201,8 +205,8 @@ where
     T: serde::Serialize,
 {
     const MAX_RETRIES: u32 = 5;
-    const DELAY_S: u64 = 1;
-    const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+    const DELAY_S: u64 = 2;
+    const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 
     for message in messages {
         let message_str = serde_json::to_string(message)?;
