@@ -1,0 +1,18 @@
+[package]
+name = "object_store_occ"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Type-safe object storage with optimistic concurrency control"
+
+[dependencies]
+futures.workspace = true
+object_store.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

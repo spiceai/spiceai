@@ -64,6 +64,7 @@ impl EndCondition {
 }
 
 #[derive(Default)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct NotStarted {
     query_set: Vec<Query>,
     end_condition: EndCondition,
@@ -73,6 +74,7 @@ pub struct NotStarted {
     disable_caching: bool,
     scale_factor: f64,
     http_client: bool,
+    distributed_mode: bool,
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
     reference_schema: Option<String>,
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
@@ -127,6 +129,12 @@ impl NotStarted {
     #[must_use]
     pub fn with_http_client(mut self, http_client: bool) -> Self {
         self.http_client = http_client;
+        self
+    }
+
+    #[must_use]
+    pub fn with_distributed_mode(mut self, distributed_mode: bool) -> Self {
+        self.distributed_mode = distributed_mode;
         self
     }
 
@@ -276,7 +284,12 @@ impl SpiceTest<NotStarted> {
                 worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
             }
 
-            if self.state.http_client {
+            if self.state.distributed_mode {
+                // Distributed mode uses the /v1/queries async API
+                worker = worker
+                    .with_http_client(http_client.clone())
+                    .with_distributed_mode(true);
+            } else if self.state.http_client {
                 worker = worker.with_http_client(http_client.clone());
             } else {
                 let spice_client = self
