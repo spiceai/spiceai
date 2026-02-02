@@ -61,6 +61,24 @@ Vortex files work with any object store:
 
 ## Who's Using Vortex?
 
+### NVIDIA
+
+NVIDIA is an official backer of the Vortex Linux Foundation project. Their strategic interest centers on **GPU-direct decompression**—loading training data straight from object storage into GPU memory without CPU bottlenecks.
+
+The Vortex repository has active CUDA development:
+
+- `vortex-cuda` — CUDA integration crate
+- `vortex-gpu` — GPU acceleration infrastructure
+- `vortex-gpu-kernels` — CUDA kernel code generation
+
+Implemented GPU kernels include Frame of Reference (FoR), BitPacking, and RLE decompression—with fused kernel composition for optimized decode paths. Integration with NVIDIA's RAPIDS cuDF is on the roadmap.
+
+As Spiral notes: *"Modern GPUs can consume terabits per second, but legacy storage formats require CPUs to decompress data first. Vortex supports decoding data directly from S3 to GPU, skipping the CPU bottleneck entirely."*
+
+### LangChain
+
+LangChain uses Vortex internally for observability in LangSmith and their cloud products. When you're processing millions of LLM traces and spans, fast columnar decode matters. Vortex's compression ratios and query performance make it well-suited for the high-cardinality, append-heavy workloads typical of observability systems.
+
 ### DuckDB
 
 [DuckDB announced native Vortex support](https://duckdb.org/2026/01/23/duckdb-vortex-extension) in January 2026, making Vortex a first-class citizen alongside Parquet, CSV, and JSON. The SpiralDB team built the extension, partnering with DuckDB Labs to deliver it as a core extension.
@@ -175,8 +193,9 @@ Based on public discussions and commits, Vortex development focuses on:
 **Long-term:**
 
 - Learned compression (ML-based encoding selection)
-- GPU decode acceleration
+- GPU decode acceleration (NVIDIA partnership)
 - Cross-language specification
+- cuDF integration (RAPIDS ecosystem)
 
 ## Getting Involved
 
@@ -272,7 +291,15 @@ Vortex isn't replacing Parquet everywhere. It's the right choice for:
 
 For archival storage or maximum interoperability, Parquet remains the safe choice. But for hot data acceleration? The ecosystem has shifted.
 
-We've built Spice Cayenne on Vortex and contribute improvements upstream. The combination of research-grade algorithms, production-quality code, and sustainable governance is rare.
+The adopter list speaks volumes:
+
+🟢 NVIDIA — Official LF project backer, actively developing CUDA kernels for GPU-direct decompression. Their vision: load training data straight from S3 to GPU memory, bypassing CPU bottlenecks entirely.
+
+🟢 LangChain — Uses Vortex internally for LangSmith observability and their cloud products. Millions of LLM traces need fast columnar decode.
+
+🟢 Spice AI — Vortex powers Cayenne, our data accelerator.
+
+Plus academic groups, Arrow-ecosystem startups, and the growing community of contributors. We've built Spice Cayenne on Vortex and contribute improvements upstream. The combination of research-grade algorithms, production-quality code, and sustainable governance is rare.
 
 What columnar formats are you building on?
 
@@ -300,11 +327,21 @@ References:
 - Spiral: <https://spiraldb.com>
 - Linux Foundation Announcement: <https://www.linuxfoundation.org/press/lf-ai-data-foundation-hosts-vortex-project-to-power-high-performance-data-access-for-ai-and-analytics>
 - DuckDB Vortex Extension: <https://duckdb.org/2026/01/23/duckdb-vortex-extension>
+- Spiral Blog - Vortex LF Project: <https://spiraldb.com/post/vortex-a-linux-foundation-project>
 - Spice Cayenne: <https://spice.ai/blog/introducing-spice-cayenne-data-accelerator>
 - Polar Signals Vortex: <https://www.polarsignals.com/blog/posts/2025/11/25/interface-parquet-vortex>
 - Vortex CUDA (nvCOMP): <https://github.com/vortex-data/vortex/tree/develop/vortex-cuda>
 - Vortex Benchmarks: <https://bench.vortex.dev>
 - Spice AI Vortex fork: <https://github.com/spiceai/vortex>
+- Apache Arrow: <https://arrow.apache.org>
+- Apache DataFusion: <https://datafusion.apache.org>
+- Polars: <https://pola.rs>
+- DuckDB: <https://duckdb.org>
+- LangChain: <https://www.langchain.com>
+- LangSmith: <https://www.langchain.com/langsmith>
+- NVIDIA RAPIDS cuDF: <https://github.com/rapidsai/cudf>
+- FastLanes Paper: <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>
+- FastLanes on GPU: <https://dbdbd2023.ugent.be/abstracts/felius_fastlanes.pdf>
 
 Previous posts in this series:
 
@@ -314,3 +351,9 @@ Previous posts in this series:
 Related:
 
 - Vortex at Spice AI: <https://www.linkedin.com/posts/lukekim_datafusion-developers-ai-activity-7417649503291498496-TD5_>
+- Spiral Blog - Announcing Spiral: <https://spiraldb.com/post/announcing-spiral>
+- Linux Foundation: <https://www.linuxfoundation.org>
+- LF AI & Data Foundation: <https://lfaidata.foundation>
+- Apache Parquet: <https://parquet.apache.org>
+- Apache Iceberg: <https://iceberg.apache.org>
+- Spice AI: <https://spiceai.org>
