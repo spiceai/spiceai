@@ -117,35 +117,29 @@ impl CayenneDeletionSink {
             // Scan files in parallel with bounded concurrency using buffer_unordered
             let vortex_session = VortexSession::default();
 
-            // Collect file paths for two reasons:
-            // 1. FileGroup::iter() returns `impl Iterator` (opaque type), and flat_map can't unify
-            //    opaque types across different closure invocations.
-            // 2. The async futures passed to buffer_unordered must be 'static, but a lazy iterator
-            //    would tie them to the file_groups lifetime. Collecting breaks this dependency by
-            //    giving us owned Strings that can move into the async blocks.
-            #[expect(clippy::needless_collect)]
-            let file_paths: Vec<String> = file_groups
-                .iter()
-                .map(|fg| fg.iter().map(|pf| pf.path().to_string()).collect::<Vec<_>>())
-                .flatten()
-                .collect();
-
-            let scan_futures = file_paths.into_iter().map(|file_path| {
-                let vortex_session = vortex_session.clone();
-                let object_store = Arc::clone(&object_store);
-                let vortex_filter = vortex_filter.clone();
-                async move {
-                    let result = self
-                        .scan_file_for_deletions(
-                            &file_path,
-                            &vortex_session,
-                            &object_store,
-                            vortex_filter.as_ref(),
-                        )
-                        .await;
-                    (file_path, result)
+            // Build futures directly using a for loop to avoid iterator lifetime issues:
+            // 1. FileGroup::iter() returns `impl Iterator` (opaque type) - flat_map can't unify these
+            // 2. Async futures for buffer_unordered must be 'static, requiring owned data
+            let mut scan_futures = Vec::new();
+            for fg in &file_groups {
+                for pf in fg.iter() {
+                    let file_path = pf.path().to_string();
+                    let vortex_session = vortex_session.clone();
+                    let object_store = Arc::clone(&object_store);
+                    let vortex_filter = vortex_filter.clone();
+                    scan_futures.push(async move {
+                        let result = self
+                            .scan_file_for_deletions(
+                                &file_path,
+                                &vortex_session,
+                                &object_store,
+                                vortex_filter.as_ref(),
+                            )
+                            .await;
+                        (file_path, result)
+                    });
                 }
-            });
+            }
 
             let mut stream =
                 futures::stream::iter(scan_futures).buffer_unordered(*MAX_CONCURRENT_FILE_SCANS);
