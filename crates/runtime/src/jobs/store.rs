@@ -18,8 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
+use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore};
@@ -186,32 +188,21 @@ impl JobStore {
 
     /// Writes result chunks for a completed job.
     ///
-    /// Takes an iterator of `RecordBatch`es and writes them as Arrow IPC chunks.
+    /// Takes a schema and an iterator of `RecordBatch`es and writes them as Arrow IPC chunks.
+    /// The schema is used for the result manifest even if no batches are provided,
+    /// ensuring empty result sets still have valid schema information.
+    ///
     /// Returns the job result manifest.
     pub async fn write_result_chunks(
         &self,
         job_id: &str,
+        schema: SchemaRef,
         batches: Vec<RecordBatch>,
     ) -> Result<JobResult> {
         if batches.is_empty() {
-            // Empty result set
-            return Ok(JobResult {
-                manifest: JobResultManifest {
-                    format: "ARROW_IPC".to_string(),
-                    schema: JobSchema {
-                        column_count: 0,
-                        columns: vec![],
-                    },
-                    total_row_count: 0,
-                    total_chunk_count: 0,
-                    truncated: false,
-                    total_byte_count: Some(0),
-                },
-                chunk_indices: vec![],
-            });
+            // Empty result set - still include the schema
+            return Ok(Self::build_job_result(&schema, 0, 0, 0, vec![]));
         }
-
-        let schema = batches[0].schema();
         let mut total_rows = 0usize;
         let mut total_bytes = 0usize;
         let mut chunk_indices = Vec::new();
@@ -280,6 +271,118 @@ impl JobStore {
             chunk_indices.push(chunk_index);
         }
 
+        Ok(Self::build_job_result(
+            &schema,
+            total_rows,
+            total_bytes,
+            chunk_indices.len(),
+            chunk_indices,
+        ))
+    }
+
+    /// Writes result chunks for a completed job from a stream of record batches.
+    ///
+    /// Streams `RecordBatch`es and writes them as Arrow IPC chunks as they arrive,
+    /// avoiding loading all results into memory at once. Chunks are flushed when
+    /// the configured `chunk_size` row threshold is reached.
+    ///
+    /// Returns the job result manifest.
+    pub async fn write_result_chunks_from_stream(
+        &self,
+        job_id: &str,
+        mut stream: SendableRecordBatchStream,
+    ) -> Result<JobResult> {
+        let schema: SchemaRef = stream.schema();
+
+        let mut total_rows = 0usize;
+        let mut total_bytes = 0usize;
+        let mut chunk_indices = Vec::new();
+
+        // Buffer for accumulating batches until we reach chunk_size
+        let mut current_chunk_batches: Vec<RecordBatch> = Vec::new();
+        let mut current_chunk_rows = 0usize;
+        let mut chunk_index = 0usize;
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result.map_err(|e| super::error::Error::StreamRead {
+                source: Box::new(e),
+            })?;
+
+            let batch_rows = batch.num_rows();
+            total_rows = total_rows.checked_add(batch_rows).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "total_row_count".to_string(),
+                    left_value: total_rows,
+                    right_value: batch_rows,
+                }
+            })?;
+
+            current_chunk_batches.push(batch);
+            current_chunk_rows = current_chunk_rows.checked_add(batch_rows).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "chunk_row_count".to_string(),
+                    left_value: current_chunk_rows,
+                    right_value: batch_rows,
+                }
+            })?;
+
+            // Flush chunk if we've reached the chunk size
+            if current_chunk_rows >= self.chunk_size {
+                let bytes = self
+                    .write_chunk(job_id, chunk_index, &current_chunk_batches)
+                    .await?;
+                total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                    super::error::Error::IntegerOverflow {
+                        field: "total_byte_count".to_string(),
+                        left_value: total_bytes,
+                        right_value: bytes,
+                    }
+                })?;
+                chunk_indices.push(chunk_index);
+                chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                    super::error::Error::IntegerOverflow {
+                        field: "chunk_index".to_string(),
+                        left_value: chunk_index,
+                        right_value: 1,
+                    }
+                })?;
+                current_chunk_batches.clear();
+                current_chunk_rows = 0;
+            }
+        }
+
+        // Flush remaining batches
+        if !current_chunk_batches.is_empty() {
+            let bytes = self
+                .write_chunk(job_id, chunk_index, &current_chunk_batches)
+                .await?;
+            total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
+                super::error::Error::IntegerOverflow {
+                    field: "total_byte_count".to_string(),
+                    left_value: total_bytes,
+                    right_value: bytes,
+                }
+            })?;
+            chunk_indices.push(chunk_index);
+        }
+
+        Ok(Self::build_job_result(
+            &schema,
+            total_rows,
+            total_bytes,
+            chunk_indices.len(),
+            chunk_indices,
+        ))
+    }
+
+    /// Builds a `JobResult` from the given schema and result statistics.
+    fn build_job_result(
+        schema: &SchemaRef,
+        total_rows: usize,
+        total_bytes: usize,
+        total_chunks: usize,
+        chunk_indices: Vec<usize>,
+    ) -> JobResult {
         // Build schema info - use Display instead of Debug for stable type names
         let columns: Vec<ColumnSchema> = schema
             .fields()
@@ -305,7 +408,7 @@ impl JobStore {
             })
             .collect();
 
-        Ok(JobResult {
+        JobResult {
             manifest: JobResultManifest {
                 format: "ARROW_IPC".to_string(),
                 schema: JobSchema {
@@ -313,12 +416,12 @@ impl JobStore {
                     columns,
                 },
                 total_row_count: total_rows,
-                total_chunk_count: chunk_indices.len(),
+                total_chunk_count: total_chunks,
                 truncated: false,
                 total_byte_count: Some(total_bytes),
             },
             chunk_indices,
-        })
+        }
     }
 
     /// Writes a single chunk to the object store.
@@ -669,7 +772,7 @@ mod tests {
         .expect("to create batch");
 
         let result = job_store
-            .write_result_chunks(&state.job_id, vec![batch1, batch2])
+            .write_result_chunks(&state.job_id, Arc::clone(&schema), vec![batch1, batch2])
             .await
             .expect("to write chunks");
 
@@ -721,6 +824,283 @@ mod tests {
         for id in &ids {
             assert_eq!(id.len(), 20, "Job ID should be 20 characters"); // 5 + 1 + 3 + 1 + 3 + 1 + 6
             assert_eq!(id.matches('-').count(), 3, "Job ID should have 3 dashes");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_result_chunks_empty_with_schema() {
+        let store = Arc::new(InMemory::new());
+        let job_store = JobStore::new(store, "test", "node-1");
+
+        let state = job_store
+            .create_job("SELECT * FROM test WHERE 1=0".to_string(), None)
+            .await
+            .expect("to create job");
+
+        // Create a schema but no batches - simulating an empty result set
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let result = job_store
+            .write_result_chunks(&state.job_id, Arc::clone(&schema), vec![])
+            .await
+            .expect("to write empty result with schema");
+
+        // Should have 0 rows but valid schema
+        assert_eq!(result.manifest.total_row_count, 0);
+        assert_eq!(result.manifest.total_chunk_count, 0);
+        assert!(result.chunk_indices.is_empty());
+
+        // Schema should be preserved even with no rows
+        assert_eq!(result.manifest.schema.column_count, 2);
+        assert_eq!(result.manifest.schema.columns.len(), 2);
+        assert_eq!(result.manifest.schema.columns[0].name, "id");
+        assert_eq!(result.manifest.schema.columns[0].type_name, "Int32");
+        assert!(!result.manifest.schema.columns[0].nullable);
+        assert_eq!(result.manifest.schema.columns[1].name, "name");
+        assert_eq!(result.manifest.schema.columns[1].type_name, "Utf8");
+        assert!(result.manifest.schema.columns[1].nullable);
+    }
+
+    mod write_result_chunks_from_stream {
+        use super::*;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::stream;
+
+        fn create_test_stream(
+            schema: SchemaRef,
+            batches: Vec<RecordBatch>,
+        ) -> SendableRecordBatchStream {
+            let batch_stream = stream::iter(batches.into_iter().map(Ok));
+            Box::pin(RecordBatchStreamAdapter::new(schema, batch_stream))
+        }
+
+        #[tokio::test]
+        async fn test_empty_stream() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1");
+
+            let state = job_store
+                .create_job("SELECT * FROM test WHERE 1=0".to_string(), None)
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("value", DataType::Float64, true),
+            ]));
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![]);
+
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await
+                .expect("to write empty stream");
+
+            assert_eq!(result.manifest.total_row_count, 0);
+            assert_eq!(result.manifest.total_chunk_count, 0);
+            assert!(result.chunk_indices.is_empty());
+
+            // Schema should be preserved even with empty stream
+            assert_eq!(result.manifest.schema.column_count, 2);
+            assert_eq!(result.manifest.schema.columns[0].name, "id");
+            assert_eq!(result.manifest.schema.columns[1].name, "value");
+        }
+
+        #[tokio::test]
+        async fn test_single_batch() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(100);
+
+            let state = job_store
+                .create_job("SELECT * FROM test".to_string(), None)
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .expect("to create batch");
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![batch]);
+
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await
+                .expect("to write single batch stream");
+
+            assert_eq!(result.manifest.total_row_count, 3);
+            assert_eq!(result.manifest.total_chunk_count, 1);
+            assert_eq!(result.chunk_indices, vec![0]);
+
+            // Verify chunk can be read back
+            let chunks = job_store
+                .read_chunk(&state.job_id, 0)
+                .await
+                .expect("to read chunk");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].num_rows(), 3);
+        }
+
+        #[tokio::test]
+        async fn test_multiple_batches_single_chunk() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(100);
+
+            let state = job_store
+                .create_job("SELECT * FROM test".to_string(), None)
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let batch1 = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            )
+            .expect("to create batch1");
+
+            let batch2 = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![3, 4, 5]))],
+            )
+            .expect("to create batch2");
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![batch1, batch2]);
+
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await
+                .expect("to write stream");
+
+            assert_eq!(result.manifest.total_row_count, 5);
+            // All batches fit in one chunk since chunk_size is 100
+            assert_eq!(result.manifest.total_chunk_count, 1);
+            assert_eq!(result.chunk_indices, vec![0]);
+        }
+
+        #[tokio::test]
+        async fn test_multiple_chunks() {
+            let store = Arc::new(InMemory::new());
+            // Set chunk size to 2 rows to force multiple chunks
+            let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
+
+            let state = job_store
+                .create_job("SELECT * FROM test".to_string(), None)
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let batch1 = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            )
+            .expect("to create batch1");
+
+            let batch2 = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![3, 4]))],
+            )
+            .expect("to create batch2");
+
+            let batch3 = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![5]))],
+            )
+            .expect("to create batch3");
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![batch1, batch2, batch3]);
+
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await
+                .expect("to write stream");
+
+            assert_eq!(result.manifest.total_row_count, 5);
+            // chunk_size=2, so:
+            // - chunk 0: batch1 (2 rows) -> flushed
+            // - chunk 1: batch2 (2 rows) -> flushed
+            // - chunk 2: batch3 (1 row) -> flushed at end
+            assert_eq!(result.manifest.total_chunk_count, 3);
+            assert_eq!(result.chunk_indices, vec![0, 1, 2]);
+
+            // Verify all chunks can be read
+            for i in 0..3 {
+                let chunks = job_store
+                    .read_chunk(&state.job_id, i)
+                    .await
+                    .expect("to read chunk");
+                assert!(!chunks.is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn test_schema_with_decimal_types() {
+            use arrow::datatypes::DataType;
+
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1");
+
+            let state = job_store
+                .create_job("SELECT * FROM test".to_string(), None)
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("amount", DataType::Decimal128(10, 2), false),
+                Field::new("rate", DataType::Decimal256(20, 5), true),
+            ]));
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![]);
+
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await
+                .expect("to write stream");
+
+            // Verify decimal precision and scale are captured
+            assert_eq!(result.manifest.schema.columns[0].type_precision, Some(10));
+            assert_eq!(result.manifest.schema.columns[0].type_scale, Some(2));
+            assert_eq!(result.manifest.schema.columns[1].type_precision, Some(20));
+            assert_eq!(result.manifest.schema.columns[1].type_scale, Some(5));
+        }
+
+        #[tokio::test]
+        async fn test_total_byte_count() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1");
+
+            let state = job_store
+                .create_job("SELECT * FROM test".to_string(), None)
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+            )
+            .expect("to create batch");
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![batch]);
+
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await
+                .expect("to write stream");
+
+            // Verify byte count is tracked
+            assert!(
+                result.manifest.total_byte_count.is_some_and(|b| b > 0),
+                "Expected non-zero byte count"
+            );
         }
     }
 }
