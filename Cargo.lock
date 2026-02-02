@@ -3502,7 +3502,7 @@ dependencies = [
  "criterion 0.7.0",
  "snafu",
  "text-splitter",
- "tiktoken-rs",
+ "tiktoken-rs 0.9.1",
  "tokenizers",
  "tracing",
 ]
@@ -12592,7 +12592,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spicepod",
- "tiktoken-rs",
+ "tiktoken-rs 0.9.1",
  "tokenizers",
 ]
 
@@ -18203,7 +18203,7 @@ dependencies = [
  "rustls 0.23.36",
  "strum 0.26.3",
  "thiserror 2.0.18",
- "tiktoken-rs",
+ "tiktoken-rs 0.6.0",
  "tokenizers",
  "unicode-segmentation",
 ]
@@ -18339,6 +18339,21 @@ dependencies = [
  "fancy-regex 0.13.0",
  "lazy_static",
  "parking_lot 0.12.5",
+ "regex",
+ "rustc-hash 1.1.0",
+]
+
+[[package]]
+name = "tiktoken-rs"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a19830747d9034cd9da43a60eaa8e552dfda7712424aebf187b7a60126bae0d"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bstr",
+ "fancy-regex 0.13.0",
+ "lazy_static",
  "regex",
  "rustc-hash 1.1.0",
 ]
