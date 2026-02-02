@@ -18,7 +18,7 @@ use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
     AsTableRefs, get_logical_plan_input_tables,
-    key::CacheKey,
+    key::{CacheKey, RawCacheKey},
     result::{CacheStatus, query::QueryResult},
 };
 use arrow::{array::RecordBatch, datatypes::Schema};
@@ -43,17 +43,21 @@ pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
 pub mod error_code;
+mod handle;
 mod metrics;
 mod tracker;
+
+pub use handle::{DistributedJobStatus, QueryHandle, QueryHandleError};
 
 use {
     crate::config::ClusterRole,
     crate::datafusion::builder::default_extension_planners,
     ballista_core::extension::{SessionConfigExt, SessionStateExt},
     ballista_core::planner::BallistaQueryPlanner,
+    ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion::execution::SessionStateBuilder,
     datafusion::physical_planner::DefaultPhysicalPlanner,
-    datafusion_proto::protobuf::LogicalPlanNode,
+    datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
 
 use datafusion::execution::SessionState;
@@ -109,6 +113,15 @@ pub enum Error {
         Either remove 'stale-while-revalidate' from the Cache-Control header or change cache_key_type to 'sql'."
     ))]
     UnsupportedStaleWhileRevalidate { cache_key_type: String },
+
+    #[snafu(display("Distributed query scheduler is not available"))]
+    SchedulerUnavailable,
+
+    #[snafu(display("Failed to create session for distributed query: {message}"))]
+    SessionCreationFailed { message: String },
+
+    #[snafu(display("Failed to submit job to distributed scheduler: {message}"))]
+    JobSubmissionFailed { message: String },
 }
 
 impl Error {
@@ -276,6 +289,234 @@ impl Query {
         }
 
         self.run_distributed_internal(request_context).await
+    }
+
+    /// Submit a query for distributed execution via Ballista and return a handle.
+    ///
+    /// This method submits a job to the Ballista scheduler and returns a `QueryHandle`
+    /// that can be used to poll for status and retrieve results. Unlike `run_distributed()`,
+    /// this method returns immediately after job submission without waiting for completion.
+    ///
+    /// The returned `QueryHandle` provides methods for:
+    /// - Polling job status (`poll_status`)
+    /// - Cancelling the job (`cancel`)
+    /// - Waiting for completion and retrieving results (`into_stream`)
+    ///
+    /// Results are cached based on the input cache key when retrieved.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_id` - A unique identifier for this job, used as the Ballista session/job ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The scheduler server is not available
+    /// - Session creation fails
+    /// - The query plan cannot be created
+    /// - Job submission fails
+    pub async fn submit_distributed(self, job_id: &str) -> Result<QueryHandle> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        self.submit_distributed_internal(job_id, request_context)
+            .await
+    }
+
+    /// Internal implementation for submitting a distributed query.
+    async fn submit_distributed_internal(
+        self,
+        job_id: &str,
+        request_context: Arc<RequestContext>,
+    ) -> Result<QueryHandle> {
+        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
+
+        let span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "sql_query_submit",
+            input = %self.sql,
+            runtime_query = false,
+            distributed = true,
+            job_id = %job_id
+        );
+
+        if let Some(traceparent) = request_context.trace_parent() {
+            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+        }
+
+        let _span_guard = span.enter();
+
+        // Get the scheduler server
+        let scheduler = Self::get_scheduler_server(&self.df)?;
+
+        // Create session for this job
+        let session_config = datafusion::prelude::SessionConfig::new_with_ballista();
+        let session_ctx = scheduler
+            .state
+            .session_manager
+            .create_or_update_session(job_id, &session_config)
+            .await
+            .map_err(|e| Error::SessionCreationFailed {
+                message: e.to_string(),
+            })?;
+
+        // Get the session state for planning
+        let session = session_ctx.state();
+
+        // Get logical plan and cache key
+        let (plan, cache_key) = match &self.sql {
+            QueryMethod::Text {
+                sql, parameters, ..
+            } => {
+                let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
+                let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(&self.df));
+
+                // Get or create the logical plan
+                let plan = match Query::get_plan(
+                    &self.df,
+                    &session,
+                    sql,
+                    &sql_raw_cache_key,
+                    parameters.clone(),
+                )
+                .await
+                {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        if let Some(t) = self.tracker {
+                            if let Error::UnableToExecuteQuery { ref source } = e {
+                                let code = ErrorCode::from(source);
+                                t.finish_with_error(&request_context, e.to_string(), code);
+                            } else {
+                                t.finish_with_error(
+                                    &request_context,
+                                    e.to_string(),
+                                    ErrorCode::QueryPlanningError,
+                                );
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+
+                // Use plan-based cache key for results caching
+                let plan_cache_key =
+                    CacheKey::LogicalPlan(&plan).as_raw_key(Self::plan_hasher(&self.df));
+                (plan, Some(plan_cache_key))
+            }
+            QueryMethod::Plan(logical_plan) => {
+                let plan_cache_key =
+                    CacheKey::LogicalPlan(logical_plan).as_raw_key(Self::plan_hasher(&self.df));
+                (logical_plan.as_ref().clone(), Some(plan_cache_key))
+            }
+        };
+
+        // Validate query operations
+        if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
+            let e = find_datafusion_root(e);
+            let code = ErrorCode::from(&e);
+            if let Some(t) = self.tracker {
+                t.finish_with_error(&request_context, e.to_string(), code);
+            }
+            return Err(Error::UnableToExecuteQuery { source: e });
+        }
+
+        // Check for cached results before submitting the job
+        if let Some(ref cache_key) = cache_key {
+            if let Some(cached_result) =
+                Self::try_get_cached_for_distributed(&self.df, cache_key).await
+            {
+                tracing::debug!(
+                    job_id,
+                    cache_key = cache_key.as_u64(),
+                    "Returning cached result for distributed query"
+                );
+                // Return a QueryHandle with cached results
+                // The schema from the cached result matches the plan schema
+                let schema = Arc::new(plan.schema().as_arrow().clone());
+                return Ok(QueryHandle::new_with_cached_result(
+                    job_id.to_string(),
+                    schema,
+                    Arc::clone(&self.df),
+                    Some(cache_key.clone()),
+                    cached_result,
+                ));
+            }
+        }
+
+        // Get the schema from the logical plan
+        let schema = Arc::new(plan.schema().as_arrow().clone());
+
+        // Submit the job to the Ballista scheduler
+        let ballista_job_id = scheduler
+            .submit_job(job_id, session_ctx, &plan)
+            .await
+            .map_err(|e| Error::JobSubmissionFailed {
+                message: e.to_string(),
+            })?;
+
+        tracing::debug!(
+            job_id,
+            ballista_job_id = %ballista_job_id,
+            "Job submitted to Ballista scheduler"
+        );
+
+        Ok(QueryHandle::new(
+            ballista_job_id,
+            scheduler,
+            schema,
+            Arc::clone(&self.df),
+            cache_key,
+        ))
+    }
+
+    /// Returns the scheduler server if available.
+    fn get_scheduler_server(
+        df: &DataFusion,
+    ) -> Result<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>> {
+        df.scheduler_server
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or(Error::SchedulerUnavailable)
+    }
+
+    /// Tries to get a cached result for a distributed query.
+    ///
+    /// Returns `Some(stream)` if a cached result exists and is valid.
+    async fn try_get_cached_for_distributed(
+        df: &DataFusion,
+        cache_key: &RawCacheKey,
+    ) -> Option<SendableRecordBatchStream> {
+        let cache_provider = df.results_cache_provider()?;
+
+        let cached_result = cache_provider.get_raw_key(cache_key).await.ok()??;
+
+        // Check if the cached result is stale
+        let ttl = cache_provider.ttl();
+        let now = std::time::Instant::now();
+        if cached_result.is_stale(ttl, now) {
+            tracing::debug!(
+                cache_key = cache_key.as_u64(),
+                "Cached result for distributed query is stale"
+            );
+            return None;
+        }
+
+        // Convert cached result to a stream
+        let records = match cached_result.records().await {
+            Ok(records) => Arc::new(records),
+            Err(e) => {
+                tracing::warn!(
+                    cache_key = cache_key.as_u64(),
+                    error = %e,
+                    "Failed to decode cached query result for distributed query"
+                );
+                return None;
+            }
+        };
+
+        let stream = ::cache::result::query::CachedStream::new(records, cached_result.schema);
+        Some(Box::pin(stream))
     }
 
     async fn run_distributed_with_managed_runtime(
