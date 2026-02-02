@@ -21,11 +21,19 @@ limitations under the License.
 //! registry to request metrics from executors on-demand.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 
+use arrow::datatypes::SchemaRef;
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use data_components::flightsql::FlightSQLTable;
+use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion_expr::Expr;
+use flight_client::FlightClient;
+use runtime_datafusion::analyzer_rule::FlightSQLPartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc, oneshot};
+use tonic::transport::Channel;
 use uuid::Uuid;
 
 /// Error type for executor registry operations.
@@ -44,6 +52,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Represents a single executor's control stream connection.
+#[derive(Debug)]
 pub struct ExecutorConnection {
     /// Channel to send control messages to this executor
     request_tx: mpsc::Sender<SchedulerControlMessage>,
@@ -112,10 +121,17 @@ impl ExecutorConnection {
 /// - Register executors when they connect via control stream
 /// - Unregister executors when they disconnect
 /// - Request metrics from all connected executors
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
+
+    /// Map of `executor_id` -> FlightSqlClient
+    /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
+    pub flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlServiceClient<Channel>>>>,
+
+    /// Map of `executor_id` -> HashMap<TableReference, Vec<Expr>>
+    pub partitions: Arc<RwLock<HashMap<String, HashMap<TableReference, Vec<Expr>>>>>,
 }
 
 impl ExecutorRegistry {
@@ -124,6 +140,8 @@ impl ExecutorRegistry {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
+            partitions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -218,6 +236,67 @@ impl ExecutorRegistry {
             Err(Error::PartialFailure {
                 failed_executors: failures.join(", "),
             })
+        }
+    }
+}
+
+impl FlightSQLPartitionProvider for ExecutorRegistry {
+    fn get_partitions(
+        &self,
+        table: &TableReference,
+        schema: SchemaRef,
+    ) -> Option<Vec<(Arc<dyn TableProvider>, Vec<Expr>)>> {
+        let partitions = self.partitions.try_read().ok()?;
+        let flight_sql_clients = self.flight_sql_clients.try_read().ok()?;
+
+        let mut result = Vec::new();
+
+        for (executor_id, table_map) in partitions.iter() {
+            if let Some(parts) = table_map.get(table) {
+                if let Some(client) = flight_sql_clients.get(executor_id) {
+                    let table_provider = Arc::new(FlightSQLTable::create_with_schema(
+                        "flightsql",
+                        executor_id,
+                        client.clone(),
+                        table.clone(),
+                        schema.clone(),
+                    )) as Arc<dyn TableProvider>;
+
+                    result.push((table_provider, parts.clone()));
+                }
+            }
+        }
+
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FlightSQLPartitionProviderProxy {
+    registry: Arc<StdRwLock<Option<Arc<ExecutorRegistry>>>>,
+}
+
+impl FlightSQLPartitionProviderProxy {
+    pub fn new(registry: Arc<StdRwLock<Option<Arc<ExecutorRegistry>>>>) -> Self {
+        Self { registry }
+    }
+}
+
+impl FlightSQLPartitionProvider for FlightSQLPartitionProviderProxy {
+    fn get_partitions(
+        &self,
+        table: &TableReference,
+        schema: SchemaRef,
+    ) -> Option<Vec<(Arc<dyn TableProvider>, Vec<Expr>)>> {
+        let registry_guard = self.registry.read().ok()?;
+        if let Some(registry) = registry_guard.as_ref() {
+            registry.get_partitions(table, schema)
+        } else {
+            None
         }
     }
 }

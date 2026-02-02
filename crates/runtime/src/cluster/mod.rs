@@ -22,9 +22,12 @@ use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::status::ComponentStatus;
 use crate::{
     FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
+    UnableToStartClusterServerSnafu,
 };
+use ::datafusion::error::DataFusionError;
 use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::prelude::SessionConfig;
+use ::datafusion::sql::TableReference;
 use app::App;
 use ballista_core::config::ShuffleFormat as BallistaShuffleFormat;
 use ballista_core::extension::SessionConfigExt;
@@ -47,17 +50,22 @@ use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
+use datafusion_expr::Expr;
+use datafusion_proto::bytes::Serializeable;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
-use runtime_proto::{GetAppDefinitionRequest, GetSchedulersRequest};
+use runtime_proto::{
+    AllocateInitialPartitionsRequest, GetAppDefinitionRequest, GetSchedulersRequest,
+};
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,7 +77,6 @@ use url::Url;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 use uuid::Uuid;
 use x509_certificate::CapturedX509Certificate;
-
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
@@ -357,7 +364,7 @@ mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
-pub use executor_registry::ExecutorRegistry;
+pub use executor_registry::{ExecutorRegistry, FlightSQLPartitionProviderProxy};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -680,6 +687,14 @@ impl ResolvedClusterConfig {
     pub fn client_tls_config(&self) -> Option<&ClientTlsConfig> {
         self.tls_config.as_ref().map(|t| &t.client_tls_config)
     }
+
+    /// Get the node's advertise address for node identification
+    pub fn node_id(&self) -> String {
+        self.scheduler_url_string()
+            .or_else(|| self.node_advertise_address())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.node_bind_address().to_string())
+    }
 }
 
 /// Creates & binds a Ballista scheduler to the Runtime handle, then updates status
@@ -702,6 +717,84 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
         .update_cluster("scheduler", ComponentStatus::Ready);
 
     Ok(())
+}
+
+pub(crate) async fn initialize_cluster_scheduler_future(
+    rt: &Arc<Runtime>,
+    scheduler_executor_registry: Arc<ExecutorRegistry>,
+) -> crate::Result<Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'static>>>> {
+    initialize_cluster_scheduler(rt).await?;
+    rt.df
+        .bind_executor_registry(Arc::clone(&scheduler_executor_registry))
+        .map_err(|e| FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+
+    // Start internal cluster server for scheduler on separate port
+    let internal_server_shutdown = CancellationToken::new();
+    let cloned_shutdown = internal_server_shutdown.clone();
+
+    let internal_server_fut = {
+        let rt = Arc::clone(&rt);
+        async move {
+            start_internal_cluster_server(
+                Arc::clone(&rt),
+                Some(cloned_shutdown),
+                scheduler_executor_registry,
+            )
+            .await
+            .context(UnableToStartClusterServerSnafu)
+        }
+    };
+
+    let internal_server_future = Arc::clone(&rt)
+        .start_runtime_task(
+            crate::CLUSTER_INTERNAL_SERVER,
+            Some(internal_server_shutdown),
+            internal_server_fut,
+        )
+        .await;
+
+    let scheduler_registry_future = {
+        let app = rt.app.read().await;
+        match app.as_ref().and_then(|app| app.runtime.scheduler.clone()) {
+            None => None,
+            Some(config) => {
+                let registry_shutdown = CancellationToken::new();
+                let rt = Arc::clone(&rt);
+                let peers = rt.scheduler_peers();
+                Some(
+                    Arc::clone(&rt)
+                        .start_runtime_task(
+                            crate::CLUSTER_SCHEDULER_REGISTRY,
+                            Some(registry_shutdown.clone()),
+                            async move {
+                                start_scheduler_registry(
+                                    rt,
+                                    &config,
+                                    registry_shutdown.clone(),
+                                    peers,
+                                )
+                                .await
+                                .boxed()
+                                .context(crate::FailedToRegisterSchedulerSnafu)
+                            },
+                        )
+                        .await,
+                )
+            }
+        }
+    };
+
+    let cluster_future = async move {
+        if let Some(registry_future) = scheduler_registry_future {
+            tokio::try_join!(internal_server_future, registry_future).map(|_| ())
+        } else {
+            internal_server_future.await
+        }
+    };
+
+    Ok(Some(Box::pin(cluster_future)))
 }
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
@@ -765,6 +858,33 @@ pub async fn initialize_cluster_executor(
     let app_json = response.into_inner().app_json;
 
     let app_def: App = serde_json::from_str(&app_json)
+        .boxed()
+        .context(FailedToStartClusterExecutorSnafu)?;
+
+    // Get initial allocation of Accelerated table partitions.
+    // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
+    let _ = cluster_client
+        .allocate_initial_partitions(AllocateInitialPartitionsRequest {
+            executor_id: executor_id.clone(),
+        })
+        .await
+        .map_err(|status| FailedToStartClusterExecutor {
+            source: format!("Failed to get app definition from scheduler: {status}").into(),
+        })?
+        .into_inner()
+        .table_partitions
+        .into_iter()
+        .map(|(table_id, partitions)| {
+            Ok((
+                TableReference::parse_str(&table_id),
+                partitions
+                    .items
+                    .into_iter()
+                    .map(|e| Expr::from_bytes(&e.into_bytes()))
+                    .collect::<Result<Vec<Expr>, _>>()?,
+            ))
+        })
+        .collect::<Result<HashMap<TableReference, Vec<Expr>>, DataFusionError>>()
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
@@ -1006,6 +1126,10 @@ pub async fn initialize_cluster_executor(
     let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
     let control_stream_metrics_reader = rt.metrics_reader().cloned();
 
+    // Thread to handle:
+    //  - periodic refresh of scheduler membership
+    //  - spawning/stopping scheduler poll loops as membership changes
+    //  - managing control streams for metrics and PollNow commands
     let poll_manager = tokio::spawn(async move {
         let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
         let mut known_schedulers: HashSet<String> = HashSet::new();
@@ -1078,6 +1202,7 @@ pub async fn initialize_cluster_executor(
         }
     });
 
+    //
     Ok(async move {
         let _ = rx_ready
             .await

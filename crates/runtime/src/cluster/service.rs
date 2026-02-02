@@ -26,20 +26,27 @@ use std::sync::Arc;
 
 use app::App;
 use arrow::array::RecordBatch;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
 use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
+use flight_client::tls::new_tls_flight_channel;
+use flight_client::{
+    Credentials, FlightClient, MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use runtime_proto::cluster_service_server::ClusterService;
 use runtime_proto::executor_control_message::Message as ExecutorMessage;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
-    ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
-    GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
-    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand,
-    SchedulerControlMessage, SchedulerInstance,
+    AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, ExecutorControlMessage,
+    ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
+    GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest, GetSchedulersResponse,
+    GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand, SchedulerControlMessage,
+    SchedulerInstance,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -472,27 +479,27 @@ impl ClusterService for ClusterServiceImpl {
                     }
                     result = inbound.next() => {
                         match result {
-                            Some(Ok(msg)) => {
-                                if let Some(message) = msg.message {
-                                    // Handle metrics responses by completing pending requests.
-                                    if let ExecutorMessage::Metrics(response) = &message {
-                                        let mut pending = pending_requests.write().await;
-                                        if let Some(sender) = pending.remove(&response.request_id) {
-                                            let _ = sender.send(response.clone());
-                                        } else {
-                                            tracing::warn!(
-                                                "Received metrics response for unknown request_id: {}",
-                                                response.request_id
-                                            );
-                                        }
-                                    } else {
-                                        handle_executor_message(
-                                            &executor_id,
-                                            &message,
-                                            &executor_registry,
-                                        );
-                                    }
+                            Some(Ok(ExecutorControlMessage { message: None,.. })) => {
+                                tracing::debug!("Received empty executor control message from {executor_id}");
+                            }
+                            Some(Ok(ExecutorControlMessage { message: Some(ExecutorMessage::Metrics(response)),..})) => {
+                                // Handle metrics responses by completing pending requests.
+                                let mut pending = pending_requests.write().await;
+                                if let Some(sender) = pending.remove(&response.request_id) {
+                                    let _ = sender.send(response.clone());
+                                } else {
+                                    tracing::warn!(
+                                        "Received metrics response for unknown request_id: {}",
+                                        response.request_id
+                                    );
                                 }
+                            }
+                            Some(Ok(ExecutorControlMessage { executor_id, message: Some(ExecutorMessage::Heartbeat(response))})) => {
+                                handle_executor_message(
+                                    &executor_id,
+                                    &ExecutorMessage::Heartbeat(response),
+                                    &executor_registry,
+                                );
                             }
                             Some(Err(e)) => {
                                 tracing::debug!("Executor control stream error for {executor_id}: {e}");
@@ -524,6 +531,36 @@ impl ClusterService for ClusterServiceImpl {
         };
 
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn allocate_initial_partitions(
+        &self,
+        request: Request<AllocateInitialPartitionsRequest>,
+    ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
+        let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
+        tracing::error!("ClusterService::allocate_initial_partitions for executor {executor_id}");
+
+        let flight_channel = new_tls_flight_channel(&format!("http://{executor_id}"), None)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to create Flight client for executor {executor_id}: {e}"
+                ))
+            })?;
+
+        let client = FlightServiceClient::new(flight_channel)
+            .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
+
+        let mut flight_client_registry = self.executor_registry.flight_sql_clients.write().await;
+        flight_client_registry.insert(
+            executor_id.clone(),
+            FlightSqlServiceClient::new_from_inner(client),
+        );
+
+        Ok(Response::new(AllocateInitialPartitionsResponse {
+            table_partitions: HashMap::default(),
+        }))
     }
 }
 
