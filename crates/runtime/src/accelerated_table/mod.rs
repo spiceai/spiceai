@@ -719,7 +719,6 @@ impl Builder {
         );
         refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
         refresher.with_last_updated_at(Arc::clone(&last_updated_at));
-        refresher.set_initial_load_completed(true);
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
