@@ -21,12 +21,14 @@ use super::Parameters;
 use crate::Runtime;
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
-use crate::dataconnector::databricks::Databricks as DatabricksDataConnector;
 use crate::dataconnector::parameters::ConnectorParams;
-use crate::token_providers::databricks::AuthCredentials;
+use crate::token_providers::databricks::{
+    AuthCredentials, build_auth_credentials, get_m2m_token_provider, get_u2m_token_provider,
+};
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
+use data_components::databricks::{DatabricksSparkConnect, DatabricksSqlWarehouse};
 use data_components::delta_lake::DeltaTableFactory;
 use data_components::unity_catalog::CatalogId;
 use data_components::unity_catalog::Endpoint;
@@ -35,7 +37,7 @@ use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
 use data_components::unity_catalog::provider::UnityCatalogProvider;
 use datafusion::sql::TableReference;
 use runtime_secrets::get_params_with_secrets;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
 use std::any::Any;
 use std::collections::HashMap;
@@ -51,11 +53,10 @@ pub struct Databricks {
 impl Databricks {
     #[must_use]
     pub fn new_connector(params: ConnectorParams) -> Arc<dyn CatalogConnector> {
-        let component_initialization =
-            match DatabricksDataConnector::build_auth_credentials(&params.parameters) {
-                Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
-                _ => ComponentInitialization::default(),
-            };
+        let component_initialization = match build_auth_credentials(&params.parameters) {
+            Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
+            _ => ComponentInitialization::default(),
+        };
 
         Arc::new(Self {
             params: params.parameters,
@@ -154,32 +155,20 @@ impl CatalogConnector for Databricks {
             }
         })?;
 
-        let auth_credentials = DatabricksDataConnector::build_auth_credentials(&self.params)
-            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+        let auth_credentials = build_auth_credentials(&self.params).map_err(|source| {
+            super::Error::UnableToGetCatalogProvider {
                 connector: "databricks".to_string(),
                 source: source.into(),
                 connector_component: ConnectorComponent::from(catalog),
-            })?;
+            }
+        })?;
 
         let token_provider = match auth_credentials {
             AuthCredentials::Token(token) => Arc::new(StaticTokenProvider::new(token.clone())),
-            AuthCredentials::ServicePrincipal(client_id, client_secret) => {
-                DatabricksDataConnector::get_m2m_token_provider(
-                    endpoint,
-                    client_id,
-                    client_secret,
-                    &runtime.token_provider_registry,
-                )
-                .await
-                .map_err(|source| super::Error::UnableToGetCatalogProvider {
-                    connector: "databricks".to_string(),
-                    source: source.into(),
-                    connector_component: ConnectorComponent::from(catalog),
-                })?
-            }
-            AuthCredentials::U2M(client_id) => DatabricksDataConnector::get_u2m_token_provider(
+            AuthCredentials::ServicePrincipal(client_id, client_secret) => get_m2m_token_provider(
                 endpoint,
                 client_id,
+                client_secret,
                 &runtime.token_provider_registry,
             )
             .await
@@ -188,6 +177,15 @@ impl CatalogConnector for Databricks {
                 source: source.into(),
                 connector_component: ConnectorComponent::from(catalog),
             })?,
+            AuthCredentials::U2M(client_id) => {
+                get_u2m_token_provider(endpoint, client_id, &runtime.token_provider_registry)
+                    .await
+                    .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                        connector: "databricks".to_string(),
+                        source: source.into(),
+                        connector_component: ConnectorComponent::from(catalog),
+                    })?
+            }
         };
 
         let unity_catalog =
@@ -233,24 +231,71 @@ impl CatalogConnector for Databricks {
                 )) as Arc<dyn Read>,
                 table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
             )
+        } else if mode == Some("sql_warehouse") {
+            let sql_warehouse_id = params.get("sql_warehouse_id").expose().ok_or_else(|p| {
+                super::Error::InvalidConfigurationNoSource {
+                    connector: "databricks".into(),
+                    message: format!("Missing required parameter: {}", p.0),
+                    connector_component: ConnectorComponent::from(catalog),
+                }
+            })?;
+
+            let token_provider = create_token_provider_for_catalog(
+                endpoint,
+                &params,
+                Arc::clone(&runtime.token_provider_registry),
+                catalog,
+            )
+            .await?;
+
+            let read_provider =
+                DatabricksSqlWarehouse::new(endpoint, sql_warehouse_id, token_provider).map_err(
+                    |source| super::Error::UnableToGetCatalogProvider {
+                        connector: "databricks".to_string(),
+                        source: source.into(),
+                        connector_component: ConnectorComponent::from(catalog),
+                    },
+                )?;
+
+            (
+                Arc::new(read_provider) as Arc<dyn Read>,
+                table_reference_creator_spark as fn(&UCTable) -> Option<TableReference>,
+            )
         } else {
-            let dataset_databricks = match DatabricksDataConnector::new(
-                params,
-                runtime.tokio_io_runtime(),
-                runtime.token_provider_registry(),
+            // Default to spark_connect
+            let cluster_id = params.get("cluster_id").ok_or_else(|p| {
+                super::Error::InvalidConfigurationNoSource {
+                    connector: "databricks".into(),
+                    message: format!("Missing required parameter: {}", p.0),
+                    connector_component: ConnectorComponent::from(catalog),
+                }
+            })?;
+
+            let use_ssl = !matches!(params.get("use_ssl").expose().ok(), Some("false"));
+
+            let token_provider = create_token_provider_for_catalog(
+                endpoint,
+                &params,
+                Arc::clone(&runtime.token_provider_registry),
+                catalog,
+            )
+            .await?;
+
+            let read_provider = DatabricksSparkConnect::from_token_provider(
+                endpoint.to_string(),
+                cluster_id.expose_secret().to_string(),
+                use_ssl,
+                token_provider,
             )
             .await
             .map_err(|source| super::Error::UnableToGetCatalogProvider {
                 connector: "databricks".to_string(),
-                source: source.into(),
+                source,
                 connector_component: ConnectorComponent::from(catalog),
-            }) {
-                Ok(dataset_databricks) => dataset_databricks,
-                Err(e) => return Err(e),
-            };
+            })?;
 
             (
-                dataset_databricks.read_provider(),
+                Arc::new(read_provider) as Arc<dyn Read>,
                 table_reference_creator_spark as fn(&UCTable) -> Option<TableReference>,
             )
         };
@@ -295,4 +340,44 @@ fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
 fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReference> {
     let storage_location = uc_table.storage_location.as_deref()?;
     Some(TableReference::bare(format!("{storage_location}/")))
+}
+
+use token_provider::TokenProvider;
+use token_provider::registry::TokenProviderRegistry;
+
+async fn create_token_provider_for_catalog(
+    endpoint: &str,
+    params: &Parameters,
+    token_provider_registry: Arc<TokenProviderRegistry>,
+    catalog: &Catalog,
+) -> super::Result<Arc<dyn TokenProvider>> {
+    let auth_credentials = build_auth_credentials(params).map_err(|source| {
+        super::Error::UnableToGetCatalogProvider {
+            connector: "databricks".to_string(),
+            source: source.into(),
+            connector_component: ConnectorComponent::from(catalog),
+        }
+    })?;
+
+    match auth_credentials {
+        AuthCredentials::Token(token) => Ok(Arc::new(StaticTokenProvider::new(token.clone()))),
+        AuthCredentials::ServicePrincipal(client_id, client_secret) => {
+            get_m2m_token_provider(endpoint, client_id, client_secret, &token_provider_registry)
+                .await
+                .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                    connector: "databricks".to_string(),
+                    source: source.into(),
+                    connector_component: ConnectorComponent::from(catalog),
+                })
+        }
+        AuthCredentials::U2M(client_id) => {
+            get_u2m_token_provider(endpoint, client_id, &token_provider_registry)
+                .await
+                .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                    connector: "databricks".to_string(),
+                    source: source.into(),
+                    connector_component: ConnectorComponent::from(catalog),
+                })
+        }
+    }
 }

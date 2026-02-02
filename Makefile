@@ -85,8 +85,8 @@ lint: lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
-	## All except metal, cuda
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude connector-nfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -101,7 +101,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude connector-nfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -120,8 +120,8 @@ lint-rust:
 
 lint-rust-fix:
 	cargo fmt --all
-	## All except metal, cuda
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude connector-nfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -136,7 +136,7 @@ lint-rust-fix:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude connector-nfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \

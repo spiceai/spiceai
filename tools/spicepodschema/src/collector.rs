@@ -30,72 +30,30 @@ use runtime_parameters::ParameterSpec;
 // Force linkage of all data connector modules by referencing their factory types.
 // Without these references, the linker may not include the modules and their
 // `register_data_connector!` registrations won't appear in DATA_CONNECTOR_REGISTRATIONS.
-#[expect(unused_imports)]
-use runtime::dataconnector::abfs as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::clickhouse as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::databricks as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::debezium as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::delta_lake as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::dremio as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::duckdb as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::dynamodb as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::file as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::flightsql as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::ftp as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::git as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::github as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::glue as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::graphql as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::https as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::iceberg as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::imap as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::kafka as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::localpod as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::memory as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::mongodb as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::mssql as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::mysql as _;
+use connector_clickhouse as _;
+use connector_delta_lake as _;
+use connector_dremio as _;
+use connector_duckdb as _;
+use connector_flightsql as _;
+use connector_ftp as _;
+use connector_graphql as _;
+use connector_imap as _;
+use connector_mongodb as _;
+use connector_mssql as _;
+use connector_mysql as _;
+// connector-nfs requires system libnfs library
+use connector_oracle as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::oracle as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::postgres as _;
+use connector_postgres as _;
+use connector_scylladb as _;
+use connector_sftp as _;
+use connector_sharepoint as _;
+use connector_smb as _;
+use connector_snowflake as _;
+use connector_spark as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::s3 as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::sftp as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::sharepoint as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::sink as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::snowflake as _;
-#[expect(unused_imports)]
-use runtime::dataconnector::spark as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::spiceai as _;
 

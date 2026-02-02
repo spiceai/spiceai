@@ -91,7 +91,7 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: spiceai-dev-runners
+    runs-on: ubuntu-22.04
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       CARGO_TERM_COLOR: always
@@ -376,7 +376,7 @@ jobs:
     needs: [check_commits, setup, build-linux-x64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: spiceai-dev-runners
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6

@@ -81,7 +81,6 @@ impl TursoMetastore {
         }
 
         let db = Builder::new_local(db_path)
-            .with_mvcc(false) // Enable MVCC when Turso supports it with indexes: https://github.com/spiceai/spiceai/issues/8526
             .build()
             .await
             .map_err(|e| CatalogError::Database {
@@ -95,9 +94,18 @@ impl TursoMetastore {
     /// Get a connection from the database.
     async fn get_conn(&self) -> CatalogResult<Connection> {
         let db = self.get_db().await?;
-        db.connect().map_err(|e| CatalogError::Database {
+        let conn = db.connect().map_err(|e| CatalogError::Database {
             message: format!("Failed to connect to Turso database: {e}"),
-        })
+        })?;
+
+        // Set busy timeout to wait for locks instead of immediately returning SQLITE_BUSY.
+        // This fixes issue #8826 where concurrent transactions to the same database fail.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to set busy timeout: {e}"),
+            })?;
+
+        Ok(conn)
     }
 
     /// Schema for the `cayenne_table` table.
@@ -279,26 +287,14 @@ fn to_turso_value(value: &MetastoreValue) -> TursoValue {
 /// Convert Turso errors to `CatalogError`, distinguishing constraint violations.
 fn convert_turso_error(e: turso::Error) -> CatalogError {
     match e {
-        turso::Error::SqlExecutionFailure(ref msg) if is_constraint_violation(msg) => {
-            CatalogError::ConstraintViolation {
-                message: msg.clone(),
-            }
-        }
+        // turso 0.4.x uses dedicated Constraint variant for constraint violations
+        turso::Error::Constraint(ref msg) => CatalogError::ConstraintViolation {
+            message: msg.clone(),
+        },
         other => CatalogError::Database {
             message: format!("Failed to execute statement: {other}"),
         },
     }
-}
-
-/// Check if an error message indicates a constraint violation.
-/// Turso/libSQL returns constraint violations as `SqlExecutionFailure` with a message
-/// containing keywords like "UNIQUE constraint".
-fn is_constraint_violation(msg: &str) -> bool {
-    let msg_lower = msg.to_lowercase();
-    msg_lower.contains("unique constraint")
-        || msg_lower.contains("constraint failed")
-        || msg_lower.contains("primary key constraint")
-        || msg_lower.contains("foreign key constraint")
 }
 
 #[async_trait]

@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2025-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::Runtime;
+use crate::execution_plan::UdtfExec;
 use crate::metrics::telemetry::track_bytes_processed;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
@@ -29,9 +30,13 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use prost::Message;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
-use runtime_proto::{BytesProcessedExecNode, CayenneAccelerationExecNode, SchemaCastScanExecNode};
+use runtime_proto::{
+    BytesProcessedExecNode, CayenneAccelerationExecNode, SchemaCastScanExecNode, UdtfExecNode,
+};
 use std::fmt::Debug;
 use std::sync::Arc;
+
+use super::spice_logical_codec::SpiceLogicalCodec;
 
 /// Serialization support for custom Spice execution nodes
 pub struct SpicePhysicalCodec {
@@ -101,6 +106,28 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             {
                 exec_err!("CayenneAccelerationExec is not supported on Windows")
             }
+        } else if let Ok(node) = UdtfExecNode::decode(buf) {
+            // Decode the UdtfExec by re-invoking the UDTF
+            let runtime = self.runtime()?;
+            let Some(args) = node.args else {
+                return exec_err!("UdtfExecNode missing args");
+            };
+
+            // Re-invoke the UDTF to get the TableProvider
+            let table_provider = SpiceLogicalCodec::invoke_udtf(args.clone(), &runtime)?;
+
+            // Get the execution plan from the TableProvider using the runtime's session state
+            let session_state = runtime.df.ctx.state();
+            // NOTE: The codec deserialization API is synchronous, but DataFusion's
+            // TableProvider::scan is async. To reconstruct the physical plan we must
+            // synchronously wait for the scan to complete. This path is only taken during
+            // plan deserialization on executor startup, so the blocking cost is acceptable.
+            let inner_plan = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async { table_provider.scan(&session_state, None, &[], None).await })
+            })?;
+
+            Ok(Arc::new(UdtfExec::new(args, inner_plan)))
         } else {
             exec_err!("Cannot deserialize unknown execution plan")
         }
@@ -119,6 +146,20 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
         } else if node.as_any().downcast_ref::<BytesProcessedExec>().is_some() {
             let node = BytesProcessedExecNode {};
+            node.encode(buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        } else if let Some(udtf_exec) = node.as_any().downcast_ref::<UdtfExec>() {
+            // Serialize the UdtfExec with its args and schema
+            let mut schema_buf = vec![];
+            let serialized_schema = datafusion_common::Schema::try_from(udtf_exec.schema())?;
+            serialized_schema
+                .encode(&mut schema_buf)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let node = UdtfExecNode {
+                args: Some(udtf_exec.args().clone()),
+                schema: schema_buf,
+            };
             node.encode(buf)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
         } else {

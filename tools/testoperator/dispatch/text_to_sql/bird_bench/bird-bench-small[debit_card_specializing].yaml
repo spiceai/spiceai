@@ -5,7 +5,7 @@ tests:
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: debit_card_specializing
-    - model_name: claude-sonnet-4-5
+    - model_name: claude-haiku-3-5
       benchmark_queryset: bird-bench-small[debit_card_specializing]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
@@ -16,7 +16,7 @@ tests:
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: debit_card_specializing-evidence
       use_evidence: true
-    - model_name: claude-sonnet-4-5
+    - model_name: claude-haiku-3-5
       benchmark_queryset: bird-bench-small[debit_card_specializing]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml

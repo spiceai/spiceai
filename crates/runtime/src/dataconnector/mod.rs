@@ -55,8 +55,28 @@ use tokio::sync::Mutex;
 use tracing::Level;
 
 use std::future::Future;
+use std::time::Duration;
 
 pub mod listing;
+
+/// Creates a default reqwest client with standard Spice settings.
+///
+/// # Errors
+///
+/// Returns an error if the client cannot be built.
+pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
+    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
+
+    reqwest::Client::builder()
+        .user_agent("spice")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .default_headers(headers)
+        .build()
+}
 
 #[derive(Clone, Copy)]
 pub struct DataConnectorRegistration {
@@ -128,69 +148,28 @@ macro_rules! register_data_connector {
 }
 
 pub mod abfs;
-#[cfg(feature = "clickhouse")]
-pub mod clickhouse;
-#[cfg(feature = "databricks")]
-pub mod databricks;
 #[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "delta_lake")]
-pub mod delta_lake;
-#[cfg(feature = "dremio")]
-pub mod dremio;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
-#[cfg(feature = "flightsql")]
-pub mod flightsql;
-#[cfg(feature = "ftp")]
-pub mod ftp;
+
 pub mod git;
 pub mod github;
-pub mod graphql;
 pub mod https;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod localpod;
 pub mod memory;
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
-#[cfg(feature = "mssql")]
-pub mod mssql;
-#[cfg(feature = "mysql")]
-pub mod mysql;
-#[cfg(feature = "nfs")]
-pub mod nfs;
-#[cfg(feature = "odbc")]
-pub mod odbc;
-#[cfg(feature = "oracle")]
-pub mod oracle;
+
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
 pub mod gcs;
 pub mod glue;
 pub mod iceberg;
-#[cfg(feature = "imap")]
-pub mod imap;
 pub mod parameters;
-#[cfg(feature = "postgres")]
-pub mod postgres;
 pub mod s3;
-#[cfg(feature = "scylladb")]
-pub mod scylladb;
-#[cfg(feature = "ftp")]
-pub mod sftp;
-#[cfg(feature = "sharepoint")]
-pub mod sharepoint;
 pub mod sink;
-#[cfg(feature = "smb")]
-pub mod smb;
-#[cfg(feature = "snowflake")]
-pub mod snowflake;
-#[cfg(feature = "spark")]
-pub mod spark;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]

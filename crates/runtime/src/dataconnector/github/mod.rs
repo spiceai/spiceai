@@ -67,7 +67,7 @@ use url::Url;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, graphql::default_spice_client,
+    ParameterSpec, Parameters, default_spice_client,
 };
 
 mod commits;
