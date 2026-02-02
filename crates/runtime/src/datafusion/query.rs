@@ -332,7 +332,7 @@ impl Query {
         let span = tracing::span!(
             target: "task_history",
             tracing::Level::INFO,
-            "sql_query_submit",
+            "sql_query",
             input = %self.sql,
             runtime_query = false,
             distributed = true,
@@ -343,10 +343,9 @@ impl Query {
             crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
         }
 
-        let _span_guard = span.enter();
-
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
+        let tracker = self.tracker;
 
         // Create session for this job
         let session_config = datafusion::prelude::SessionConfig::new_with_ballista();
@@ -363,7 +362,7 @@ impl Query {
         let session = session_ctx.state();
 
         // Get logical plan and cache key, reusing existing cache infrastructure
-        let (plan, cache_key) = match &self.sql {
+        let (plan, mut tracker, cache_key) = match &self.sql {
             QueryMethod::Text {
                 sql, parameters, ..
             } => {
@@ -375,7 +374,7 @@ impl Query {
                     Arc::clone(&request_context),
                     sql,
                     parameters.clone(),
-                    self.tracker,
+                    tracker,
                 )
                 .await?
                 {
@@ -389,16 +388,17 @@ impl Query {
                             Arc::clone(&self.df),
                             None, // Cache key already used for lookup
                             cached_result.data,
+                            Arc::clone(&request_context),
                         ));
                     }
-                    cache::PlanOrCached::Plan(plan, _tracker, cache_manager) => {
+                    cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
                         // Plan needs execution - cache_manager contains the raw cache key for storing results
                         let cache_key = if cache_manager.should_cache_results() {
                             Some(cache_manager.raw_cache_key)
                         } else {
                             None
                         };
-                        (*plan, cache_key)
+                        (*plan, tracker, cache_key)
                     }
                 }
             }
@@ -431,13 +431,14 @@ impl Query {
                                     Arc::clone(&self.df),
                                     None,
                                     Box::pin(stream),
+                                    Arc::clone(&request_context),
                                 ));
                             }
                         }
                     }
                 }
 
-                (logical_plan.as_ref().clone(), Some(plan_cache_key))
+                (logical_plan.as_ref().clone(), tracker, Some(plan_cache_key))
             }
         };
 
@@ -449,6 +450,38 @@ impl Query {
 
         // Get the schema from the logical plan
         let schema = Arc::new(plan.schema().as_arrow().clone());
+
+        let input_tables = get_logical_plan_input_tables(&plan);
+        if input_tables
+            .iter()
+            .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
+        {
+            span.record("runtime_query", true);
+        }
+
+        // If any of the input tables are accelerated, mark the query as accelerated
+        let mut is_accelerated = false;
+        for tr in &input_tables {
+            if self.df.is_accelerated(tr).await {
+                is_accelerated = true;
+                break;
+            }
+        }
+        if is_accelerated {
+            tracker = tracker.map(|mut t| {
+                t.is_accelerated = Some(true);
+                t
+            });
+        }
+
+        let datasets = Arc::new(input_tables);
+        let tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));
+
+        // Start the timer for the query execution
+        let tracker = tracker.map(|mut t| {
+            t.query_execution_duration_timer = Instant::now();
+            t
+        });
 
         // Submit the job to the Ballista scheduler
         let ballista_job_id = scheduler
@@ -468,8 +501,11 @@ impl Query {
             ballista_job_id,
             scheduler,
             schema,
+            datasets,
             Arc::clone(&self.df),
             cache_key,
+            tracker,
+            request_context,
         ))
     }
 

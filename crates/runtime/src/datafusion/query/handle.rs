@@ -20,12 +20,15 @@ limitations under the License.
 //! It encapsulates the Ballista job ID, scheduler reference, and methods for polling
 //! job status and retrieving results.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::datafusion::DataFusion;
+use crate::datafusion::query::QueryTracker;
+use crate::datafusion::query::error_code::ErrorCode;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use ballista_core::extension::BallistaConfigGrpcEndpoint;
@@ -34,13 +37,13 @@ use ballista_core::serde::scheduler::PartitionLocation;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use cache::key::RawCacheKey;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::sql::TableReference;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
+use runtime_request_context::RequestContext;
 use snafu::Snafu;
 use tokio_util::sync::CancellationToken;
-
-use crate::datafusion::DataFusion;
 
 /// Interval between job status polls when waiting for Ballista job completion.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -105,6 +108,7 @@ pub enum QueryHandleError {
 pub type Result<T, E = QueryHandleError> = std::result::Result<T, E>;
 
 /// Internal state of a query handle.
+#[derive(Clone)]
 enum QueryHandleState {
     /// Query was submitted to Ballista and is being executed.
     Running {
@@ -114,7 +118,7 @@ enum QueryHandleState {
     /// Query results were retrieved from cache.
     Cached {
         /// The cached result stream (wrapped in Mutex for interior mutability).
-        cached_stream: Mutex<Option<SendableRecordBatchStream>>,
+        cached_stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     },
 }
 
@@ -130,6 +134,7 @@ enum QueryHandleState {
 /// A `QueryHandle` can represent either:
 /// - An actively running Ballista job (status can be polled)
 /// - A cache hit where results are immediately available
+#[derive(Clone)]
 pub struct QueryHandle {
     /// The Ballista scheduler job ID (or a synthetic ID for cached results).
     ballista_job_id: String,
@@ -137,12 +142,18 @@ pub struct QueryHandle {
     state: QueryHandleState,
     /// Result schema from the logical plan.
     schema: SchemaRef,
+    /// Input datasets for the query.
+    datasets: Option<Arc<HashSet<TableReference>>>,
     /// Reference to DataFusion for TLS config and caching.
     df: Arc<DataFusion>,
     /// Cache key for the query results (if caching is enabled).
     cache_key: Option<RawCacheKey>,
     /// Cancellation token for the job.
     cancel_token: CancellationToken,
+    /// Optional query tracker for monitoring query execution.
+    tracker: Arc<Mutex<Option<QueryTracker>>>,
+    /// Request context for tracking and metrics.
+    request_context: Arc<RequestContext>,
 }
 
 impl std::fmt::Debug for QueryHandle {
@@ -165,16 +176,22 @@ impl QueryHandle {
         ballista_job_id: String,
         scheduler: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
         schema: SchemaRef,
+        datasets: Arc<HashSet<TableReference>>,
         df: Arc<DataFusion>,
         cache_key: Option<RawCacheKey>,
+        tracker: Option<QueryTracker>,
+        request_context: Arc<RequestContext>,
     ) -> Self {
         Self {
             ballista_job_id,
             state: QueryHandleState::Running { scheduler },
             schema,
+            datasets: Some(datasets),
             df,
             cache_key,
             cancel_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(tracker)),
+            request_context,
         }
     }
 
@@ -189,16 +206,20 @@ impl QueryHandle {
         df: Arc<DataFusion>,
         cache_key: Option<RawCacheKey>,
         cached_stream: SendableRecordBatchStream,
+        request_context: Arc<RequestContext>,
     ) -> Self {
         Self {
             ballista_job_id: job_id,
             state: QueryHandleState::Cached {
-                cached_stream: Mutex::new(Some(cached_stream)),
+                cached_stream: Arc::new(Mutex::new(Some(cached_stream))),
             },
+            datasets: None,
             schema,
             df,
             cache_key,
             cancel_token: CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(None)),
+            request_context,
         }
     }
 
@@ -317,16 +338,20 @@ impl QueryHandle {
             poll_count += 1;
             if poll_count > MAX_JOB_POLL_ITERATIONS {
                 let _ = scheduler.cancel_job(self.ballista_job_id.clone()).await;
-                return Err(QueryHandleError::JobTimeout {
+                let err = QueryHandleError::JobTimeout {
                     ballista_job_id: self.ballista_job_id.clone(),
                     poll_count,
-                });
+                };
+                self.finish_tracker_with_error(&err);
+                return Err(err);
             }
 
             // Check for cancellation
             if cancel.is_cancelled() {
                 let _ = scheduler.cancel_job(self.ballista_job_id.clone()).await;
-                return Err(QueryHandleError::JobCancelled);
+                let err = QueryHandleError::JobCancelled;
+                self.finish_tracker_with_error(&err);
+                return Err(err);
             }
 
             // Get job status from scheduler
@@ -335,8 +360,12 @@ impl QueryHandle {
                 .task_manager
                 .get_job_status(&self.ballista_job_id)
                 .await
-                .map_err(|e| QueryHandleError::StatusError {
-                    message: e.to_string(),
+                .map_err(|e| {
+                    let err = QueryHandleError::StatusError {
+                        message: e.to_string(),
+                    };
+                    self.finish_tracker_with_error(&err);
+                    err
                 })?;
 
             if let Some(job_status) = status {
@@ -349,20 +378,27 @@ impl QueryHandle {
                         for (i, loc) in success.partition_location.into_iter().enumerate() {
                             let partition_loc: PartitionLocation = loc.try_into().map_err(
                                 |e: ballista_core::error::BallistaError| {
-                                    QueryHandleError::PartitionLocationError {
+                                    let err = QueryHandleError::PartitionLocationError {
                                         index: i,
                                         message: e.to_string(),
-                                    }
+                                    };
+                                    self.finish_tracker_with_error(&err);
+                                    err
                                 },
                             )?;
                             locations.push(partition_loc);
                         }
+
+                        // Finish the tracker successfully
+                        self.finish_tracker_success();
                         return Ok(locations);
                     }
                     Some(job_status::Status::Failed(failed)) => {
-                        return Err(QueryHandleError::JobFailed {
+                        let err = QueryHandleError::JobFailed {
                             message: failed.error,
-                        });
+                        };
+                        self.finish_tracker_with_error(&err);
+                        return Err(err);
                     }
                     Some(job_status::Status::Queued(_) | job_status::Status::Running(_)) | None => {
                         // Still in progress, continue polling
@@ -371,9 +407,11 @@ impl QueryHandle {
             } else {
                 missing_retry_count += 1;
                 if missing_retry_count >= 5 {
-                    return Err(QueryHandleError::JobNotFound {
+                    let err = QueryHandleError::JobNotFound {
                         ballista_job_id: self.ballista_job_id.clone(),
-                    });
+                    };
+                    self.finish_tracker_with_error(&err);
+                    return Err(err);
                 }
             }
 
@@ -382,9 +420,33 @@ impl QueryHandle {
                 () = tokio::time::sleep(JOB_POLL_INTERVAL) => {}
                 () = cancel.cancelled() => {
                     let _ = scheduler.cancel_job(self.ballista_job_id.clone()).await;
-                    return Err(QueryHandleError::JobCancelled);
+                    let err = QueryHandleError::JobCancelled;
+                    self.finish_tracker_with_error(&err);
+                    return Err(err);
                 }
             }
+        }
+    }
+
+    /// Finishes the query tracker with an error.
+    fn finish_tracker_with_error(&self, error: &QueryHandleError) {
+        if let Some(tracker) = self.tracker.lock().take() {
+            let error_code = match error {
+                QueryHandleError::JobTimeout { .. } => ErrorCode::QueryExecutionError,
+                QueryHandleError::JobCancelled => ErrorCode::QueryExecutionError,
+                QueryHandleError::JobFailed { .. } => ErrorCode::QueryExecutionError,
+                QueryHandleError::StatusError { .. } => ErrorCode::InternalError,
+                QueryHandleError::PartitionLocationError { .. } => ErrorCode::InternalError,
+                QueryHandleError::JobNotFound { .. } => ErrorCode::InternalError,
+            };
+            tracker.finish_with_error(&self.request_context, error.to_string(), error_code);
+        }
+    }
+
+    /// Finishes the query tracker successfully.
+    fn finish_tracker_success(&self) {
+        if let Some(tracker) = self.tracker.lock().take() {
+            tracker.finish(&self.request_context, &Arc::from(""));
         }
     }
 
@@ -397,8 +459,8 @@ impl QueryHandle {
     /// as they are streamed.
     ///
     /// For cached results, returns the cached stream directly.
-    pub async fn into_stream(self) -> Result<SendableRecordBatchStream> {
-        match self.state {
+    pub async fn into_stream(&self) -> Result<SendableRecordBatchStream> {
+        match &self.state {
             QueryHandleState::Cached { cached_stream } => {
                 // Return the cached stream directly
                 let stream =
@@ -410,7 +472,7 @@ impl QueryHandle {
                         })?;
                 Ok(stream)
             }
-            QueryHandleState::Running { ref scheduler } => {
+            QueryHandleState::Running { scheduler } => {
                 // Wait for job completion and fetch results
                 let locations = self
                     .poll_until_complete(scheduler, &self.cancel_token)
@@ -445,13 +507,13 @@ impl QueryHandle {
         // Wrap with cache if cache key is provided
         if let (Some(cache_key), Some(cache_provider)) =
             (self.cache_key.clone(), self.df.results_cache_provider())
+            && let Some(datasets) = &self.datasets
         {
-            let datasets = Arc::new(std::collections::HashSet::new());
             cache::to_cached_record_batch_stream(
                 cache_provider,
                 Box::pin(stream),
                 cache_key,
-                datasets,
+                Arc::clone(&datasets),
             )
         } else {
             Box::pin(stream)

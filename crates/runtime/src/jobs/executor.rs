@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::datafusion::DataFusion;
-use crate::datafusion::query::{QueryBuilder, QueryHandleError};
+use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
 
 use super::Result;
 use super::state::{JobState, JobStatus};
@@ -32,7 +32,7 @@ use super::store::JobStore;
 struct ActiveJobInfo {
     cancel_token: CancellationToken,
     /// The Ballista scheduler job ID, set once submitted to the scheduler.
-    ballista_job_id: Option<String>,
+    query_handle: Option<QueryHandle>,
 }
 
 /// Manages background execution of async query jobs.
@@ -87,7 +87,7 @@ impl JobExecutor {
                 job_id.clone(),
                 ActiveJobInfo {
                     cancel_token: cancel_token.clone(),
-                    ballista_job_id: None,
+                    query_handle: None,
                 },
             );
         }
@@ -122,36 +122,10 @@ impl JobExecutor {
 
     /// Requests cancellation of a running job.
     pub async fn cancel(&self, job_id: &str) -> Result<JobState> {
-        // Signal cancellation and get Ballista job ID if available
-        let ballista_job_id = {
-            let active = self.active_jobs.read().await;
-            if let Some(info) = active.get(job_id) {
-                info.cancel_token.cancel();
-                info.ballista_job_id.clone()
-            } else {
-                None
-            }
-        };
-
-        // Try to cancel in Ballista if we have a Ballista job ID and scheduler is available.
-        // Clone the scheduler Arc to avoid holding the lock across the await.
-        if let Some(ballista_id) = ballista_job_id {
-            let scheduler_opt = self
-                .df
-                .scheduler_server
-                .try_read()
-                .ok()
-                .and_then(|guard| guard.clone());
-            if let Some(scheduler) = scheduler_opt {
-                if let Err(e) = scheduler.cancel_job(ballista_id.clone()).await {
-                    tracing::warn!(
-                        job_id,
-                        ballista_job_id = %ballista_id,
-                        error = %e,
-                        "Failed to cancel job in Ballista scheduler"
-                    );
-                }
-            }
+        // Signal cancellation to the running task
+        let active = self.active_jobs.read().await;
+        if let Some(info) = active.get(job_id) {
+            info.cancel_token.cancel();
         }
 
         // Update job state
@@ -238,52 +212,51 @@ impl JobExecutor {
         );
 
         // Store the Ballista job ID for cancellation
-        {
-            let mut active = active_jobs.write().await;
-            if let Some(info) = active.get_mut(job_id) {
-                info.ballista_job_id = Some(query_handle.ballista_job_id().to_string());
-            }
+        let mut active = active_jobs.write().await;
+        if let Some(info) = active.get_mut(job_id) {
+            info.query_handle = Some(query_handle.clone());
         }
 
-        // Link the cancellation token to the query handle
-        let handle_cancel = query_handle.cancel_token();
-        let _cancel_guard = cancel.clone().drop_guard();
-
-        // Spawn a task to forward cancellation
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            cancel_clone.cancelled().await;
-            handle_cancel.cancel();
-        });
-
-        // Wait for completion and get the result stream
-        let result_stream = match query_handle.into_stream().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                let (error_code, error_msg) = Self::handle_error_to_code_and_msg(&e);
-                job_store.fail_job(job_id, error_code, error_msg).await?;
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!(job_id = %job_id, "Job cancelled before completion");
+                if let Err(e) = query_handle.cancel().await {
+                    tracing::error!("Failed to cancel the distributed query '{job_id}': {e}");
+                }
+                job_store.cancel_job(job_id).await?;
                 return Ok(());
+            },
+            result_stream = query_handle.into_stream() => {
+                // Wait for completion and get the result stream
+                let result_stream = match result_stream {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let (error_code, error_msg) = Self::handle_error_to_code_and_msg(&e);
+                        job_store.fail_job(job_id, error_code, error_msg).await?;
+                        return Ok(());
+                    }
+                };
+
+                // Write result chunks as batches arrive from the stream
+                let job_result = match job_store
+                    .write_result_chunks_from_stream(job_id, result_stream)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        job_store
+                            .fail_job(job_id, "RESULT_FETCH", e.to_string())
+                            .await?;
+                        return Ok(());
+                    }
+                };
+
+                // Mark job as succeeded
+                job_store.complete_job(job_id, job_result).await?;
+
+                Ok(())
             }
-        };
-
-        // Write result chunks as batches arrive from the stream
-        let job_result = match job_store
-            .write_result_chunks_from_stream(job_id, result_stream)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                job_store
-                    .fail_job(job_id, "RESULT_FETCH", e.to_string())
-                    .await?;
-                return Ok(());
-            }
-        };
-
-        // Mark job as succeeded
-        job_store.complete_job(job_id, job_result).await?;
-
-        Ok(())
+        }
     }
 
     /// Converts a `Query::Error` to an error code string.
