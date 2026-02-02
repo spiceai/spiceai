@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,8 +23,8 @@ use ::arrow::{
 };
 use async_trait::async_trait;
 use datafusion::{
-    catalog::Session,
-    common::Constraints,
+    catalog::{ScanArgs, ScanResult, Session},
+    common::{Constraints, Statistics},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -186,6 +186,7 @@ pub fn get_deletion_provider(
 }
 
 #[async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl TableProvider for DeletionTableProviderAdapter {
     fn as_any(&self) -> &dyn Any {
         self
@@ -202,8 +203,15 @@ impl TableProvider for DeletionTableProviderAdapter {
     fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         self.source.get_logical_plan()
     }
+    fn get_table_definition(&self) -> Option<&str> {
+        self.source.get_table_definition()
+    }
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.source.get_column_default(column)
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.source.statistics()
     }
 
     fn supports_filters_pushdown(
@@ -221,6 +229,14 @@ impl TableProvider for DeletionTableProviderAdapter {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.source.scan(state, projection, filters, limit).await
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DataFusionResult<ScanResult> {
+        self.source.scan_with_args(state, args).await
     }
 
     async fn insert_into(
