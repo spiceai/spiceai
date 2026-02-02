@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::constants::{HTTP_BASE_URL, SQL_ENDPOINT};
+use crate::constants::{HTTP_BASE_URL, QUERIES_ENDPOINT, SQL_ENDPOINT};
 use crate::telemetry::streaming::QueryMetricEvent;
 
 use crate::{
@@ -42,6 +42,12 @@ use crate::{
 
 use super::EndCondition;
 
+/// Maximum interval between status polls for distributed queries (caps exponential backoff)
+const MAX_POLL_INTERVAL: Duration = Duration::from_millis(5000);
+/// Maximum time to wait for a distributed query to complete (1 hour)
+const POLL_TIMEOUT: Duration = Duration::from_secs(3600);
+
+#[expect(clippy::struct_excessive_bools)]
 pub(crate) struct SpiceTestQueryWorker {
     id: usize,
     query_set: Vec<Query>,
@@ -54,6 +60,8 @@ pub(crate) struct SpiceTestQueryWorker {
     scale_factor: f64,
     spice_client: Option<Arc<SpiceClient>>,
     http_client: Option<reqwest::Client>,
+    /// Whether to use distributed query mode via /v1/queries API
+    distributed_mode: bool,
     /// Optional custom validation data for scenario queries
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
     /// Optional reference schema for validating against known good tables
@@ -124,6 +132,7 @@ impl SpiceTestQueryWorker {
             validate: false,
             scale_factor: 1.0,
             http_client: None,
+            distributed_mode: false,
             validation_data: None,
             reference_schema: None,
             skip_row_count_validation: default_row_count_validation_skip_queries(),
@@ -136,6 +145,11 @@ impl SpiceTestQueryWorker {
 
     pub fn with_http_client(mut self, http_client: reqwest::Client) -> Self {
         self.http_client = Some(http_client);
+        self
+    }
+
+    pub fn with_distributed_mode(mut self, distributed_mode: bool) -> Self {
+        self.distributed_mode = distributed_mode;
         self
     }
 
@@ -835,6 +849,209 @@ impl SpiceTestQueryWorker {
         Ok(())
     }
 
+    /// Execute a query using the distributed query API (`/v1/queries`).
+    ///
+    /// This method:
+    /// 1. Submits the query via `POST /v1/queries`
+    /// 2. Polls `/v1/queries/{query_id}/status` until completion
+    /// 3. Fetches results from `/v1/queries/{query_id}/results`
+    ///
+    /// The distributed query API is only available when spiced is running in cluster mode
+    /// with the scheduler role.
+    async fn execute_distributed(
+        &self,
+        query: &Query,
+        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
+        row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
+    ) -> Result<()> {
+        let Some(http_client) = self.http_client.as_ref() else {
+            return Err(anyhow::anyhow!(
+                "Failed to execute distributed query '{}': HTTP client is not configured. Ensure distributed mode is only enabled when an HTTP client is available",
+                query.name
+            ));
+        };
+
+        let query_start = Instant::now();
+        let sql_text = query.to_sql_with_inlined_params();
+        let queries_url = format!("{HTTP_BASE_URL}{QUERIES_ENDPOINT}");
+
+        // Step 1: Submit the query
+        let submit_body = serde_json::json!({
+            "sql": sql_text,
+        });
+
+        let submit_response = http_client
+            .post(&queries_url)
+            .header("Content-Type", "application/json")
+            .json(&submit_body)
+            .send()
+            .await?;
+
+        let submit_status = submit_response.status();
+        if !submit_status.is_success() {
+            let error_text = submit_response.text().await.unwrap_or_default();
+            let duration = query_start.elapsed();
+            self.send_streaming_metric(&query.name, duration, false);
+            eprintln!(
+                "{} FAIL - Worker {} - Query '{}' distributed submit failed: {submit_status} - {error_text}",
+                chrono::Utc::now(),
+                self.id,
+                query.name,
+            );
+            return Err(anyhow::anyhow!(
+                "Query distributed submit failed: {submit_status}"
+            ));
+        }
+
+        let submit_json: serde_json::Value = submit_response.json().await?;
+        let query_id = submit_json
+            .get("query_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("No query_id in submit response"))?;
+
+        // Step 2: Poll for completion
+        let status_url = format!("{queries_url}/{query_id}/status");
+        let mut poll_interval = Duration::from_millis(100);
+
+        let poll_start = Instant::now();
+        loop {
+            if poll_start.elapsed() > POLL_TIMEOUT {
+                let duration = query_start.elapsed();
+                self.send_streaming_metric(&query.name, duration, false);
+                return Err(anyhow::anyhow!(
+                    "Query '{}' timed out waiting for distributed execution",
+                    query.name
+                ));
+            }
+
+            let status_response = http_client.get(&status_url).send().await?;
+
+            if !status_response.status().is_success() {
+                let error_text = status_response.text().await.unwrap_or_default();
+                let duration = query_start.elapsed();
+                self.send_streaming_metric(&query.name, duration, false);
+                return Err(anyhow::anyhow!(
+                    "Query '{}' status check failed: {error_text}",
+                    query.name
+                ));
+            }
+
+            let status_json: serde_json::Value = status_response.json().await?;
+            let state = status_json
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+
+            match state {
+                "succeeded" => break,
+                "failed" => {
+                    let error_msg = status_json
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Unknown error");
+                    let duration = query_start.elapsed();
+                    self.send_streaming_metric(&query.name, duration, false);
+                    eprintln!(
+                        "{} FAIL - Worker {} - Query '{}' distributed execution failed: {error_msg}",
+                        chrono::Utc::now(),
+                        self.id,
+                        query.name,
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Query distributed execution failed: {error_msg}"
+                    ));
+                }
+                "cancelled" => {
+                    let duration = query_start.elapsed();
+                    self.send_streaming_metric(&query.name, duration, false);
+                    return Err(anyhow::anyhow!("Query '{}' was cancelled", query.name));
+                }
+                "closed" => {
+                    let duration = query_start.elapsed();
+                    self.send_streaming_metric(&query.name, duration, false);
+                    return Err(anyhow::anyhow!(
+                        "Query '{}' results expired before retrieval",
+                        query.name
+                    ));
+                }
+                "pending" | "running" => {
+                    // Continue polling with exponential backoff
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = std::cmp::min(poll_interval * 2, MAX_POLL_INTERVAL);
+                }
+                _ => {
+                    // Unknown state, continue polling
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = std::cmp::min(poll_interval * 2, MAX_POLL_INTERVAL);
+                }
+            }
+        }
+
+        // Step 3: Fetch results (first chunk to get row count)
+        let results_url = format!("{queries_url}/{query_id}/results");
+        let results_response = http_client.get(&results_url).send().await?;
+
+        let results_status = results_response.status();
+        if !results_status.is_success() {
+            let error_text = results_response.text().await.unwrap_or_default();
+            let duration = query_start.elapsed();
+            self.send_streaming_metric(&query.name, duration, false);
+            return Err(anyhow::anyhow!(
+                "Query '{}' results fetch failed: {results_status} - {error_text}",
+                query.name
+            ));
+        }
+
+        let results_json: serde_json::Value = results_response.json().await?;
+
+        // Get total row count from manifest; treat missing or invalid values as errors
+        let manifest = results_json.get("manifest").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Query '{}' results response missing 'manifest' field",
+                query.name
+            )
+        })?;
+
+        let total_row_count_value = manifest.get("total_row_count").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Query '{}' results manifest missing 'total_row_count' field",
+                query.name
+            )
+        })?;
+
+        let total_row_count_u64 = total_row_count_value.as_u64().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Query '{}' results manifest 'total_row_count' field is not a valid u64",
+                query.name
+            )
+        })?;
+
+        #[expect(clippy::cast_possible_truncation)]
+        let row_count = total_row_count_u64 as usize;
+
+        let duration = query_start.elapsed();
+
+        // Send streaming metric for successful distributed query
+        self.send_streaming_metric(&query.name, duration, true);
+
+        query_durations
+            .entry(Arc::clone(&query.name))
+            .or_default()
+            .push(duration);
+
+        row_counts
+            .entry(Arc::clone(&query.name))
+            .or_default()
+            .push(row_count);
+
+        if let Some(pb) = self.progress_bar.as_ref() {
+            pb.inc(1);
+        }
+
+        Ok(())
+    }
+
     async fn execute_query(
         &self,
         query: &Query,
@@ -843,6 +1060,13 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
+        // Use distributed mode if enabled
+        if self.distributed_mode {
+            return self
+                .execute_distributed(query, query_durations, row_counts)
+                .await;
+        }
+
         let mut http_row_counts: BTreeMap<Arc<str>, Vec<usize>> = BTreeMap::new();
 
         futures::future::try_join(
