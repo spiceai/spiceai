@@ -285,7 +285,7 @@ async fn list_vector_segment(
             ..
         } = client
             .list_vectors(
-                ListVectorsInput::builder()
+                &ListVectorsInput::builder()
                     .set_vector_bucket_name(bucket_name.clone())
                     .set_index_arn(arn.clone())
                     .set_index_name(index_name.clone())
