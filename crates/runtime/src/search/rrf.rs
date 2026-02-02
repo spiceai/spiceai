@@ -39,6 +39,14 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
+use crate::cluster::datafusion::codec::udtf_args::{
+    RrfArgs as SerializableRrfArgs, RrfNestedQuery, RrfNestedQueryExt, TextSearchArgs,
+    VectorSearchArgs,
+};
+use crate::embeddings::udtf::VECTOR_SEARCH_UDTF_NAME;
+use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
+use crate::search::util::table_ref_from_column_expr;
+
 pub static RRF_UDF_NAME: &str = "rrf";
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
@@ -204,6 +212,8 @@ struct ReciprocalRankFusionArgs {
     pub decay_window_secs: Option<f64>,
 }
 
+type SearchUdtfArgs = (String, String, Option<String>, Option<usize>, Option<bool>);
+
 impl ReciprocalRankFusionArgs {
     /// Constructs `ReciprocalRankFusionArgs` from an rrf UDTF invocation, which is a `TableScan` node
     /// that looks like this...
@@ -270,6 +280,150 @@ impl ReciprocalRankFusionArgs {
             decay_window_secs: extract_f64!(rrf_args, "decay_window_secs"),
         })
     }
+
+    /// Converts the internal RRF arguments to a serializable form for distributed execution.
+    ///
+    /// This extracts the nested search UDTF invocations and converts them to `RrfNestedQuery`
+    /// variants that can be serialized and sent to remote executors.
+    fn to_serializable(&self) -> Result<SerializableRrfArgs> {
+        let queries = self
+            .search_udtf_exprs
+            .iter()
+            .zip(self.rrf_subquery_arguments.iter())
+            .map(|(expr, subquery_args)| {
+                Self::expr_to_nested_query(expr, subquery_args.rank_weight)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(SerializableRrfArgs {
+            queries,
+            k: Some(self.k),
+            join_key: self.join_key.as_ref().map(|e| e.qualified_name().1),
+            time_column: self.time_column.as_ref().map(|e| e.qualified_name().1),
+            recency_decay: self.recency_decay.as_ref().map(|rd| match rd {
+                RecencyDecay::Linear => "linear".to_string(),
+                RecencyDecay::Exponential => "exponential".to_string(),
+            }),
+            decay_constant: self.decay_constant,
+            decay_scale_secs: self.decay_scale_secs,
+            decay_window_secs: self.decay_window_secs,
+        })
+    }
+
+    /// Converts a scalar function expression to an `RrfNestedQuery`.
+    fn expr_to_nested_query(expr: &Expr, rank_weight: Option<f64>) -> Result<RrfNestedQuery> {
+        let Expr::ScalarFunction(ScalarFunction { func, args }) = expr else {
+            return exec_err!("Expected scalar function expression for nested RRF query");
+        };
+
+        let func_name = func.name();
+        match func_name {
+            name if name == TEXT_SEARCH_UDTF_NAME => {
+                let search_args = Self::parse_search_args(args)?;
+                Ok(RrfNestedQuery::text_search(
+                    TextSearchArgs {
+                        table: search_args.0,
+                        query: search_args.1,
+                        column: search_args.2,
+                        limit: search_args.3.map(|l| l as u64),
+                        include_score: search_args.4,
+                    },
+                    rank_weight,
+                ))
+            }
+            name if name == VECTOR_SEARCH_UDTF_NAME => {
+                let search_args = Self::parse_search_args(args)?;
+                Ok(RrfNestedQuery::vector_search(
+                    VectorSearchArgs {
+                        table: search_args.0,
+                        query: search_args.1,
+                        column: search_args.2,
+                        limit: search_args.3.map(|l| l as u64),
+                        include_score: search_args.4,
+                    },
+                    rank_weight,
+                ))
+            }
+            _ => exec_err!(
+                "{RRF_UDF_NAME} only supports {TEXT_SEARCH_UDTF_NAME} and {VECTOR_SEARCH_UDTF_NAME} nested queries, got: {func_name}"
+            ),
+        }
+    }
+
+    fn parse_limit_u64(value: u64) -> Result<usize> {
+        usize::try_from(value).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "{RRF_UDF_NAME} limit value {value} exceeds usize range."
+            ))
+        })
+    }
+
+    fn parse_limit_i64(value: i64) -> Result<usize> {
+        if value < 0 {
+            return exec_err!("{RRF_UDF_NAME} limit value {value} must be non-negative");
+        }
+
+        let value = u64::try_from(value).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "{RRF_UDF_NAME} limit value {value} exceeds usize range."
+            ))
+        })?;
+        Self::parse_limit_u64(value)
+    }
+
+    /// Parses common search UDTF arguments from expressions.
+    ///
+    /// Returns: (table, query, column, limit, `include_score`)
+    fn parse_search_args(args: &[Expr]) -> Result<SearchUdtfArgs> {
+        // Filter out passthrough parameters (those with spice.parameter_name metadata)
+        let args: Vec<_> = args
+            .iter()
+            .filter(|arg| {
+                !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
+            })
+            .collect();
+
+        // Extract table reference from first arg
+        let table = match args.first() {
+            Some(Expr::Column(c)) => table_ref_from_column_expr(c).to_quoted_string(),
+            _ => {
+                return exec_err!("First argument to search UDTF must be a table reference");
+            }
+        };
+
+        // Extract query string from second arg
+        let query = match args.get(1) {
+            Some(Expr::Literal(ScalarValue::Utf8(Some(q)), _)) => q.clone(),
+            _ => {
+                return exec_err!("Second argument to search UDTF must be a query string");
+            }
+        };
+
+        // Extract optional column, limit, include_score from remaining args
+        let mut column = None;
+        let mut limit = None;
+        let mut include_score = None;
+
+        for arg in args.iter().skip(2) {
+            match arg {
+                Expr::Column(Column { name, .. }) => {
+                    column = Some(name.clone());
+                }
+                Expr::Literal(ScalarValue::UInt64(Some(l)), _) => {
+                    limit = Some(Self::parse_limit_u64(*l)?);
+                }
+                Expr::Literal(ScalarValue::Int64(Some(l)), _) => {
+                    limit = Some(Self::parse_limit_i64(*l)?);
+                }
+                Expr::Literal(ScalarValue::Boolean(Some(b)), _) => {
+                    include_score = Some(*b);
+                }
+                _ => {}
+            }
+        }
+
+        Ok((table, query, column, limit, include_score))
+    }
 }
 
 impl Debug for ReciprocalRankFusion {
@@ -283,6 +437,11 @@ pub struct ReciprocalRankFusion {
     // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `SessionContext` implement them.
     session_ptr: u64,
     df: Option<DataFrame>,
+    /// Stores the original RRF arguments for distributed serialization.
+    ///
+    /// This is set when the provider is created via the `rrf()` UDTF and enables
+    /// `SpiceLogicalCodec` to serialize and reconstruct this provider on remote executors.
+    pub rrf_source: Option<SerializableRrfArgs>,
 }
 
 impl PartialEq for ReciprocalRankFusion {
@@ -309,6 +468,7 @@ impl ReciprocalRankFusion {
             session_context: Arc::clone(session_context),
             session_ptr: ptr,
             df: None,
+            rrf_source: None,
         }
     }
 
@@ -320,6 +480,13 @@ impl ReciprocalRankFusion {
     #[must_use]
     pub fn with_df(mut self, df: DataFrame) -> Self {
         self.df = Some(df);
+        self
+    }
+
+    /// Sets the RRF source for distributed serialization.
+    #[must_use]
+    pub fn with_rrf_source(mut self, source: SerializableRrfArgs) -> Self {
+        self.rrf_source = Some(source);
         self
     }
 
@@ -652,9 +819,12 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
 impl TableFunctionImpl for ReciprocalRankFusion {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
         let rrf_args = ReciprocalRankFusionArgs::from_udtf_exprs(args)?;
+        let serializable_args = rrf_args.to_serializable()?;
         let rerank_and_fuse_df = self.rerank_and_fuse_df(&rrf_args)?;
         Ok(Arc::new(
-            ReciprocalRankFusion::from_ctx(&self.session_context).with_df(rerank_and_fuse_df),
+            ReciprocalRankFusion::from_ctx(&self.session_context)
+                .with_df(rerank_and_fuse_df)
+                .with_rrf_source(serializable_args),
         ))
     }
 }

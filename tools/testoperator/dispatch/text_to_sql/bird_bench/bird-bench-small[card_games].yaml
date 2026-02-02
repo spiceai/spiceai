@@ -5,7 +5,7 @@ tests:
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: card_games
-    - model_name: claude-sonnet-4-5
+    - model_name: claude-3-5-haiku-20241022
       benchmark_queryset: bird-bench-small[card_games]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml
@@ -16,7 +16,7 @@ tests:
       spicepod_path: test/spicepods/models/text-to-sql.yaml
       configuration_name: card_games-evidence
       use_evidence: true
-    - model_name: claude-sonnet-4-5
+    - model_name: claude-3-5-haiku-20241022
       benchmark_queryset: bird-bench-small[card_games]
       runner_type: spiceai-dev-runners
       spicepod_path: test/spicepods/models/text-to-sql.yaml

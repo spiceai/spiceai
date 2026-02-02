@@ -352,7 +352,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     // Remote database support will be available when Turso is implemented as a data connector,
     // where remote access patterns are the primary use case and locally-cached acceleration
     // is not required.
-    // Note: MVCC is always enabled in turso 0.4.x, no configuration needed.
+    // Note: MVCC is enabled via PRAGMA in TursoConnectionPool::new_with_timestamp_format().
 ];
 
 #[async_trait]
@@ -586,7 +586,6 @@ impl DataAccelerator for TursoAccelerator {
             })?;
 
         // Handle indexes if specified
-        // Note: MVCC is always enabled in turso 0.4.x and indexes are fully supported
         if let Some(indexes_str) = cmd.options.get("indexes") {
             // Parse the indexes option string
             use datafusion_table_providers::util::hashmap_from_option_string;

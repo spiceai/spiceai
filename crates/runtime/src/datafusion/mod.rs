@@ -114,6 +114,7 @@ pub mod app_context_extension;
 pub mod builder;
 pub mod dialect;
 pub mod error;
+pub(crate) mod expr_utils;
 pub mod filter_converter;
 pub mod flight_session_extension;
 pub mod job_executor_context_extension;
@@ -1388,9 +1389,7 @@ impl DataFusion {
             && (acceleration_settings
                 .params
                 .get("cayenne_file_path")
-                .is_some_and(|path| {
-                    crate::dataaccelerator::cayenne::CayenneAccelerator::is_s3_express_path(path)
-                })
+                .is_some_and(|path| crate::dataaccelerator::cayenne::s3::is_s3_express_path(path))
                 || acceleration_settings
                     .params
                     .contains_key("cayenne_s3_zone_ids"));
