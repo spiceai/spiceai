@@ -74,7 +74,7 @@ impl CayenneDeletionSink {
             return Err("Method requires a WHERE clause filter. No filter was specified.".into());
         }
 
-        let mut per_file_row_ids: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut per_file_row_ids: HashMap<String, Vec<u64>> = HashMap::new();
 
         // Build Vortex filter once - all tables share the same schema
         let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
@@ -196,7 +196,7 @@ impl CayenneDeletionSink {
         vortex_session: &VortexSession,
         object_store: &Arc<dyn ObjectStore>,
         vortex_filter: Option<&vortex::expr::Expression>,
-    ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
         // Get existing deletions for this file to exclude from scan
         let already_deleted = {
             let guard = self
@@ -237,7 +237,7 @@ impl CayenneDeletionSink {
         // Execute the scan and collect row indices
         // All returned rows are NEW deletions (already-deleted rows were excluded by selection)
         let mut stream = scan_builder.into_stream()?;
-        let mut new_row_ids: Vec<i64> = Vec::new();
+        let mut new_row_ids: Vec<u64> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk =
@@ -259,9 +259,7 @@ impl CayenneDeletionSink {
                 .downcast_ref::<arrow::array::UInt64Array>()
                 .ok_or_else(|| "row_idx() did not return UInt64Array".to_string())?;
 
-            #[expect(clippy::cast_possible_wrap)]
-            // row_idx values fit in i64 for practical file sizes
-            new_row_ids.extend(row_indices.values().iter().map(|&idx| idx as i64));
+            new_row_ids.extend_from_slice(row_indices.values());
         }
 
         Ok(new_row_ids)
@@ -288,7 +286,7 @@ impl CayenneDeletionSink {
     /// The total number of **newly** deleted rows (not counting already-deleted).
     pub(super) async fn persist_per_file_position_based_deletions(
         &self,
-        per_file_row_ids: HashMap<String, Vec<i64>>,
+        per_file_row_ids: HashMap<String, Vec<u64>>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         if per_file_row_ids.is_empty() {
             return Ok(0);
@@ -315,9 +313,9 @@ impl CayenneDeletionSink {
             .filter(|(_, row_ids)| !row_ids.is_empty())
             .map(|(file_path, new_row_ids)| {
                 // Start with existing deletions for this file (if any)
-                let mut combined_ids: Vec<i64> =
+                let mut combined_ids: Vec<u64> =
                     if let Some(existing_bitmap) = existing_deletions.get(file_path) {
-                        existing_bitmap.iter().map(i64::from).collect()
+                        existing_bitmap.iter().map(u64::from).collect()
                     } else {
                         Vec::new()
                     };

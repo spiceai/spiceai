@@ -24,7 +24,7 @@ limitations under the License.
 //! Deletion vectors are stored as Arrow IPC files with one of two schemas:
 //!
 //! - **Position-based** (for tables without primary key):
-//!   - `row_id: Int64` - File-local row position (0-indexed)
+//!   - `row_id: UInt64` - File-local row position (0-indexed)
 //!   - `deleted_at: Int64` - Deletion timestamp (microseconds)
 //!
 //! - **Key-based** (for tables with primary key):
@@ -36,8 +36,10 @@ use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryArray, Int64Array};
+use arrow::array::{Array, BinaryArray, Int64Array, UInt64Array};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use arrow_ipc::reader::FileReader;
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use roaring::RoaringBitmap;
@@ -70,7 +72,7 @@ pub enum DeletionIdentifier {
     /// The file path identifies which data file these row positions belong to.
     PositionBased {
         file_path: String,
-        row_ids: Vec<i64>,
+        row_ids: Vec<u64>,
     },
     /// Primary key-based row keys (for tables with primary key).
     KeyBased(Vec<Box<[u8]>>),
@@ -102,7 +104,7 @@ impl DeletionVectorWriteSpec {
     ///
     /// The row IDs should be file-local positions (0 to N-1 within the specified file).
     #[must_use]
-    pub fn new_position_based(file_path: String, row_ids: Vec<i64>) -> Self {
+    pub fn new_position_based(file_path: String, row_ids: Vec<u64>) -> Self {
         Self {
             identifiers: DeletionIdentifier::PositionBased { file_path, row_ids },
         }
@@ -184,19 +186,6 @@ impl<'a> DeletionVectorWriter<'a> {
                     file_path: source_file,
                     mut row_ids,
                 } => {
-                    // Validate no negative row IDs
-                    if row_ids.iter().any(|row_id| *row_id < 0) {
-                        return Err(CatalogError::NegativeRowId {
-                            row_ids: format!(
-                                "{:?}",
-                                row_ids
-                                    .iter()
-                                    .filter(|row_id| **row_id < 0)
-                                    .copied()
-                                    .collect::<Vec<_>>()
-                            ),
-                        });
-                    }
                     row_ids.sort_unstable();
                     row_ids.dedup();
                     let count = row_ids.len();
@@ -295,9 +284,6 @@ impl<'a> DeletionVectorWriter<'a> {
 pub fn read_deletion_vectors(
     delete_files: Vec<DeleteFile>,
 ) -> datafusion_common::Result<RoaringBitmap> {
-    use arrow::array::Array;
-    use arrow::ipc::reader::FileReader;
-
     let mut deleted_row_ids = RoaringBitmap::new();
     let file_count = delete_files.len();
 
@@ -308,7 +294,7 @@ pub fn read_deletion_vectors(
 
     // Track overflow occurrences to log once at the end instead of per-row
     let mut overflow_count: u64 = 0;
-    let mut first_overflow_id: Option<i64> = None;
+    let mut first_overflow_id: Option<u64> = None;
 
     for delete_file in delete_files {
         let path = std::path::Path::new(&delete_file.path);
@@ -341,10 +327,10 @@ pub fn read_deletion_vectors(
             let row_id_array = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<Int64Array>()
+                .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| {
                     datafusion_common::DataFusionError::Execution(
-                        "Expected Int64Array for row_id column".to_string(),
+                        "Expected UInt64Array for row_id column".to_string(),
                     )
                 })?;
 
@@ -425,10 +411,6 @@ pub fn read_deletion_vectors(
 pub fn detect_deletion_type_and_read(
     delete_files: Vec<DeleteFile>,
 ) -> datafusion_common::Result<(HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>)> {
-    use arrow::array::Array;
-    use arrow::datatypes::DataType;
-    use arrow::ipc::reader::FileReader;
-
     let mut per_file_row_ids: HashMap<String, RoaringBitmap> = HashMap::new();
     let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
     let file_count = delete_files.len();
@@ -440,7 +422,7 @@ pub fn detect_deletion_type_and_read(
 
     // Track overflow occurrences to log once at the end
     let mut overflow_count: u64 = 0;
-    let mut first_overflow_id: Option<i64> = None;
+    let mut first_overflow_id: Option<u64> = None;
 
     for delete_file in delete_files {
         let path = std::path::Path::new(&delete_file.path);
@@ -512,10 +494,10 @@ pub fn detect_deletion_type_and_read(
                 let row_id_array = batch
                     .column(0)
                     .as_any()
-                    .downcast_ref::<Int64Array>()
+                    .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| {
                         datafusion_common::DataFusionError::Execution(
-                            "Expected Int64Array for row_id column".to_string(),
+                            "Expected UInt64Array for row_id column".to_string(),
                         )
                     })?;
 
@@ -576,10 +558,10 @@ pub fn detect_deletion_type_and_read(
 // ============================================================================
 
 /// Build a deletion batch for position-based row IDs.
-fn build_position_based_batch(schema: &SchemaRef, row_ids: &[i64]) -> CatalogResult<RecordBatch> {
+fn build_position_based_batch(schema: &SchemaRef, row_ids: &[u64]) -> CatalogResult<RecordBatch> {
     let deleted_at = Utc::now().timestamp_micros();
 
-    let row_id_array = Int64Array::from(row_ids.to_vec());
+    let row_id_array = UInt64Array::from(row_ids.to_vec());
     let deleted_at_array = Int64Array::from(vec![deleted_at; row_ids.len()]);
 
     RecordBatch::try_new(
@@ -698,7 +680,7 @@ fn position_based_deletion_schema() -> SchemaRef {
     use arrow::datatypes::{DataType, Field, Schema};
 
     Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::Int64, false),
+        Field::new("row_id", DataType::UInt64, false),
         Field::new("deleted_at", DataType::Int64, false),
     ]))
 }
@@ -782,7 +764,7 @@ mod tests {
         let row_ids_col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<UInt64Array>()
             .expect("row_id column");
         let read_row_ids: Vec<_> = (0..row_ids_col.len())
             .map(|idx| row_ids_col.value(idx))
@@ -805,22 +787,5 @@ mod tests {
             .expect("write deletion vector");
 
         assert_eq!(results.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn rejects_negative_row_ids() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let table_metadata = build_table_metadata(&temp_dir);
-        let writer = DeletionVectorWriter::new(&table_metadata);
-
-        let err = writer
-            .write(vec![DeletionVectorWriteSpec::new_position_based(
-                "test.vortex".to_string(),
-                vec![1, -5],
-            )])
-            .await
-            .expect_err("negative row ids should fail");
-
-        matches!(err, CatalogError::InvalidOperation { .. });
     }
 }
