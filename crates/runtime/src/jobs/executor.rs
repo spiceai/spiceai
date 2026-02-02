@@ -14,17 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use ballista_core::extension::SessionConfigExt;
 use ballista_core::serde::protobuf::job_status;
 use ballista_core::serde::scheduler::PartitionLocation;
 use ballista_scheduler::scheduler_server::SchedulerServer;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -287,9 +292,18 @@ impl JobExecutor {
 
         match poll_result {
             Ok(output_locations) => {
-                // Fetch results from partition locations
-                let batches = match Self::fetch_results(&df, &output_locations).await {
-                    Ok(b) => b,
+                // Get the schema from the logical plan for the result stream
+                let schema: SchemaRef = Arc::new(logical_plan.schema().as_arrow().clone());
+
+                // Create a stream that lazily fetches results from partition locations
+                let result_stream = Self::fetch_results_stream(&df, output_locations, schema);
+
+                // Write result chunks as batches arrive from the stream
+                let job_result = match job_store
+                    .write_result_chunks_from_stream(job_id, result_stream)
+                    .await
+                {
+                    Ok(result) => result,
                     Err(e) => {
                         job_store
                             .fail_job(job_id, "RESULT_FETCH", e.to_string())
@@ -297,9 +311,6 @@ impl JobExecutor {
                         return Ok(());
                     }
                 };
-
-                // Write result chunks
-                let job_result = job_store.write_result_chunks(job_id, batches).await?;
 
                 // Mark job as succeeded
                 job_store.complete_job(job_id, job_result).await?;
@@ -407,12 +418,15 @@ impl JobExecutor {
         }
     }
 
-    /// Fetches results from the output partition locations.
-    async fn fetch_results(
-        df: &DataFusion,
-        locations: &[PartitionLocation],
-    ) -> std::result::Result<Vec<RecordBatch>, super::error::Error> {
-        let mut all_batches = Vec::new();
+    /// Fetches results from the output partition locations as a stream.
+    ///
+    /// Returns a `SendableRecordBatchStream` that lazily fetches batches from
+    /// partition locations, avoiding loading all results into memory at once.
+    fn fetch_results_stream(
+        df: &Arc<DataFusion>,
+        locations: Vec<PartitionLocation>,
+        schema: SchemaRef,
+    ) -> SendableRecordBatchStream {
         let use_tls = df.cluster_config.client_tls_config().is_some();
 
         // If TLS is configured, create a custom endpoint override function
@@ -431,7 +445,65 @@ impl JobExecutor {
             None
         };
 
-        for location in locations {
+        let stream = PartitionResultStream::new(locations, use_tls, customize_endpoint);
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+    }
+}
+
+type NextPartitionResultStream = Pin<
+    Box<
+        dyn std::future::Future<
+                Output = std::result::Result<
+                    SendableRecordBatchStream,
+                    datafusion::error::DataFusionError,
+                >,
+            > + Send,
+    >,
+>;
+
+/// A stream that lazily fetches `RecordBatch`es from multiple partition locations.
+///
+/// Connects to partition executors one at a time and streams their batches,
+/// avoiding loading all results into memory at once.
+///
+/// Partitions already return a `SendableRecordBatchStream`, so when we connect to a partition we pull its stream and return the items from it until it is exhausted.
+///
+/// The next partition is then connected to and its stream consumed, until all partitions are processed.
+struct PartitionResultStream {
+    /// Remaining partition locations to fetch from
+    locations: std::collections::VecDeque<PartitionLocation>,
+    /// Whether to use TLS for connections
+    use_tls: bool,
+    /// Optional endpoint customization for TLS
+    customize_endpoint: Option<Arc<ballista_core::extension::BallistaConfigGrpcEndpoint>>,
+    /// Current record batch stream being consumed (lazily initialized)
+    current_record_batch_stream: Option<SendableRecordBatchStream>,
+    /// Future for establishing the next partition stream (when transitioning between partitions)
+    next_partition_stream: Option<NextPartitionResultStream>,
+}
+
+impl PartitionResultStream {
+    fn new(
+        locations: Vec<PartitionLocation>,
+        use_tls: bool,
+        customize_endpoint: Option<Arc<ballista_core::extension::BallistaConfigGrpcEndpoint>>,
+    ) -> Self {
+        Self {
+            locations: locations.into(),
+            use_tls,
+            customize_endpoint,
+            current_record_batch_stream: None,
+            next_partition_stream: None,
+        }
+    }
+
+    /// Creates a future that connects to a partition location and returns its stream.
+    fn connect_to_partition(
+        location: PartitionLocation,
+        use_tls: bool,
+        customize_endpoint: Option<Arc<ballista_core::extension::BallistaConfigGrpcEndpoint>>,
+    ) -> NextPartitionResultStream {
+        Box::pin(async move {
             let executor_meta = &location.executor_meta;
 
             // Create Ballista client to connect to executor
@@ -440,14 +512,17 @@ impl JobExecutor {
                 executor_meta.port,
                 MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE,
                 use_tls,
-                customize_endpoint.clone(),
+                customize_endpoint,
             )
             .await
-            .map_err(|e| super::error::Error::QueryExecution {
-                message: format!(
-                    "Failed to create Ballista client for executor {}:{}: {e}",
-                    executor_meta.host, executor_meta.port
-                ),
+            .map_err(|e| {
+                datafusion::error::DataFusionError::External(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!(
+                        "Failed to create Ballista client for executor {}:{}: {e}",
+                        executor_meta.host, executor_meta.port
+                    ),
+                )))
             })?;
 
             let stream = client
@@ -460,26 +535,66 @@ impl JobExecutor {
                     USE_FLIGHT_TRANSFER,
                 )
                 .await
-                .map_err(|e| super::error::Error::QueryExecution {
-                    message: format!("Failed to fetch partition: {e}"),
-                })?;
-
-            // Collect batches from the stream
-            let batches: Vec<RecordBatch> =
-                stream
-                    .try_collect()
-                    .await
-                    .map_err(|e| super::error::Error::QueryExecution {
-                        message: format!(
-                            "Failed to collect batches from partition {}: {e}",
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::External(Box::new(std::io::Error::other(
+                        format!(
+                            "Failed to fetch partition {}: {e}",
                             location.partition_id.partition_id
                         ),
-                    })?;
+                    )))
+                })?;
 
-            all_batches.extend(batches);
+            Ok(stream)
+        })
+    }
+}
+
+impl Stream for PartitionResultStream {
+    type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            // If we have a pending stream, poll it first
+            if let Some(ref mut pending) = self.next_partition_stream {
+                match pending.as_mut().poll(cx) {
+                    Poll::Ready(Ok(stream)) => {
+                        self.current_record_batch_stream = Some(stream);
+                        self.next_partition_stream = None;
+                        // Continue to poll the new stream
+                    }
+                    Poll::Ready(Err(e)) => {
+                        self.next_partition_stream = None;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            // If we have a current stream, poll it
+            if let Some(ref mut stream) = self.current_record_batch_stream {
+                match stream.poll_next_unpin(cx) {
+                    Poll::Ready(Some(batch)) => return Poll::Ready(Some(batch)),
+                    Poll::Ready(None) => {
+                        // Current stream exhausted, move to next partition
+                        self.current_record_batch_stream = None;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            // No current stream, try to start the next partition
+            if let Some(location) = self.locations.pop_front() {
+                self.next_partition_stream = Some(Self::connect_to_partition(
+                    location,
+                    self.use_tls,
+                    self.customize_endpoint.clone(),
+                ));
+                // Loop back to poll the pending connection
+            } else {
+                // No more partitions, stream is complete
+                return Poll::Ready(None);
+            }
         }
-
-        Ok(all_batches)
     }
 }
 
