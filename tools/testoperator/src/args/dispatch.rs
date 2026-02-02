@@ -195,6 +195,8 @@ pub struct LoadArgs {
     pub random_param_set_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_clients: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distributed: Option<bool>,
 }
 
 /// Append workflow arguments, defined in the test files
@@ -229,6 +231,7 @@ impl<'de> Deserialize<'de> for LoadArgs {
             concurrency: Option<u64>,
             random_param_set_count: Option<usize>,
             http_clients: Option<bool>,
+            distributed: Option<bool>,
         }
 
         let mut helper = LoadArgsHelper::deserialize(deserializer)?;
@@ -253,6 +256,7 @@ impl<'de> Deserialize<'de> for LoadArgs {
             concurrency: helper.concurrency,
             random_param_set_count: helper.random_param_set_count,
             http_clients: helper.http_clients,
+            distributed: helper.distributed,
         })
     }
 }

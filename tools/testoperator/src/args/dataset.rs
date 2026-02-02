@@ -23,6 +23,7 @@ use test_framework::queries::{QueryOverrides, QuerySet};
 use super::CommonArgs;
 
 #[derive(Parser, Debug, Clone)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct QueryArgs {
     /// The expected scale factor for the test, used in metrics calculation
     #[arg(long)]
@@ -53,9 +54,14 @@ pub struct QueryArgs {
     /// Whether to add HTTP clients for the test
     #[arg(long)]
     pub(crate) http_clients: bool,
+
+    /// Use distributed query mode via /v1/queries API (requires cluster mode with scheduler role)
+    #[arg(long)]
+    pub(crate) distributed: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct DatasetTestArgs {
     #[command(flatten)]
     pub(crate) common: CommonArgs,
@@ -89,6 +95,10 @@ pub struct DatasetTestArgs {
     /// Whether to add HTTP clients for the test
     #[arg(long)]
     pub(crate) http_clients: bool,
+
+    /// Use distributed query mode via /v1/queries API (requires cluster mode with scheduler role)
+    #[arg(long)]
+    pub(crate) distributed: bool,
 
     /// Random parameter set count for parameterized queries (tests with different random parameters each run).
     /// If not specified or 0, fixed parameters are used (no randomization).

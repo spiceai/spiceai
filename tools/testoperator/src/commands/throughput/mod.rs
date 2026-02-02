@@ -54,7 +54,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(6))
             .with_disable_caching(args.disable_caching)
-            .with_http_client(args.http_clients),
+            .with_http_client(args.http_clients)
+            .with_distributed_mode(args.distributed),
     )
     .await?;
 
@@ -78,7 +79,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
             .with_parallel_count(args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(2))
             .with_disable_caching(args.disable_caching)
-            .with_http_client(args.http_clients),
+            .with_http_client(args.http_clients)
+            .with_distributed_mode(args.distributed),
     )
     .await?;
 

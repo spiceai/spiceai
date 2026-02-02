@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod spice_logical_codec;
-pub mod spice_physical_codec;
-pub mod udtf_args;
+//! Custom execution plans for the Spice runtime.
+
+pub mod udtf_exec;
+
+pub use udtf_exec::UdtfExec;
