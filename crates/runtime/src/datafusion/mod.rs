@@ -419,6 +419,9 @@ pub struct DataFusion {
     /// Registry of connected executor control streams for `PollNow` broadcasts.
     /// Only used in scheduler mode.
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
+    /// Registry of connected executors for FlightSQL.
+    /// Only used in scheduler mode.
+    pub executor_registry: Arc<RwLock<Option<Arc<crate::cluster::ExecutorRegistry>>>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -2092,6 +2095,18 @@ impl DataFusion {
             .try_write()
             .map_err(|_| Error::UnableToLockWritableExecutorStreamRegistry {})?;
         *executor_stream_registry = Some(registry);
+        Ok(())
+    }
+
+    pub fn bind_executor_registry(
+        &self,
+        registry: Arc<crate::cluster::ExecutorRegistry>,
+    ) -> Result<()> {
+        let mut executor_registry = self
+            .executor_registry
+            .try_write()
+            .map_err(|_| Error::UnableToLockWritableExecutorStreamRegistry {})?;
+        *executor_registry = Some(registry);
         Ok(())
     }
 

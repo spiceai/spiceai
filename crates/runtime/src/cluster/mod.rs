@@ -365,7 +365,7 @@ mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
-pub use executor_registry::ExecutorRegistry;
+pub use executor_registry::{ExecutorRegistry, FlightSQLPartitionProviderProxy};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -725,6 +725,12 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     scheduler_executor_registry: Arc<ExecutorRegistry>,
 ) -> crate::Result<Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'static>>>> {
     initialize_cluster_scheduler(rt).await?;
+    rt.df
+        .bind_executor_registry(Arc::clone(&scheduler_executor_registry))
+        .map_err(|e| FailedToStartClusterScheduler {
+            source: Box::new(e),
+        })?;
+
     // Start internal cluster server for scheduler on separate port
     let internal_server_shutdown = CancellationToken::new();
     let cloned_shutdown = internal_server_shutdown.clone();

@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use datafusion::{
+    arrow::datatypes::SchemaRef,
     common::{
         Result,
         tree_node::{Transformed, TransformedResult, TreeNode},
@@ -29,6 +30,26 @@ use datafusion::{
     sql::TableReference,
 };
 use itertools::concat;
+
+pub trait FlightSQLPartitionProvider: Send + Sync + Debug {
+    fn get_partitions(
+        &self,
+        table: &TableReference,
+        schema: SchemaRef,
+    ) -> Option<Vec<(Arc<dyn TableProvider>, Vec<Expr>)>>;
+}
+
+impl FlightSQLPartitionProvider
+    for HashMap<TableReference, Vec<(Arc<dyn TableProvider>, Vec<Expr>)>>
+{
+    fn get_partitions(
+        &self,
+        table: &TableReference,
+        _schema: SchemaRef,
+    ) -> Option<Vec<(Arc<dyn TableProvider>, Vec<Expr>)>> {
+        self.get(table).cloned()
+    }
+}
 
 /// An [`AnalyzerRule`] that rewrites local table scans as the UNION ALL of one or more remote FlightSQL table scans.
 /// For example, suppose we want to do it on `sales`. The we go from this
@@ -58,34 +79,27 @@ use itertools::concat;
 // |        ]                                                                                                            |
 // ```
 pub struct PartitionedFlightSQLTableScan {
-    table_partitions: HashMap<TableReference, Vec<(Arc<dyn TableProvider>, Vec<Expr>)>>,
+    partition_provider: Arc<dyn FlightSQLPartitionProvider>,
 }
 
 impl PartitionedFlightSQLTableScan {
-    pub fn new(
-        table_partitions: HashMap<TableReference, Vec<(Arc<dyn TableProvider>, Vec<Expr>)>>,
-    ) -> Self {
-        Self { table_partitions }
+    pub fn new(partition_provider: Arc<dyn FlightSQLPartitionProvider>) -> Self {
+        Self { partition_provider }
     }
 
-    pub fn with_partition(
-        mut self,
-        table: TableReference,
-        provider: Arc<dyn TableProvider>,
-        partition_filters: Vec<Expr>,
+    pub fn with_map(
+        table_partitions: HashMap<TableReference, Vec<(Arc<dyn TableProvider>, Vec<Expr>)>>,
     ) -> Self {
-        self.table_partitions
-            .entry(table)
-            .or_default()
-            .push((provider, partition_filters));
-        self
+        Self {
+            partition_provider: Arc::new(table_partitions),
+        }
     }
 }
 
 impl Debug for PartitionedFlightSQLTableScan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PartitionedFlightSQLTableScan")
-            .field("table_partitions_count", &self.table_partitions.len())
+            .field("partition_provider", &self.partition_provider)
             .finish()
     }
 }
@@ -98,16 +112,19 @@ impl AnalyzerRule for PartitionedFlightSQLTableScan {
     ) -> Result<LogicalPlan, DataFusionError> {
         plan.transform_up(|plan| {
             if let LogicalPlan::TableScan(scan) = &plan {
-                if let Some(providers) = self.table_partitions.get(&scan.table_name) {
+                if let Some(providers) = self
+                    .partition_provider
+                    .get_partitions(&scan.table_name, scan.source.schema())
+                {
                     if providers.is_empty() {
                         return Ok(Transformed::no(plan));
                     }
 
                     let mut sub_scans = Vec::with_capacity(providers.len());
                     for (provider, partition_filters) in providers {
-                        let source = DefaultTableSource::new(Arc::clone(provider));
+                        let source = DefaultTableSource::new(Arc::clone(&provider));
                         let mut filters = scan.filters.clone();
-                        filters.extend_from_slice(partition_filters);
+                        filters.extend_from_slice(&partition_filters);
                         let plan = LogicalPlanBuilder::scan_with_filters(
                             scan.table_name.clone(),
                             Arc::new(source),
