@@ -151,8 +151,11 @@ async fn verify_broker_ready(
         match producer.client().fetch_metadata(None, METADATA_TIMEOUT) {
             Ok(metadata) => {
                 // Verify that all expected topics exist
-                let available_topics: Vec<&str> =
-                    metadata.topics().iter().map(|t| t.name()).collect();
+                let available_topics: Vec<&str> = metadata
+                    .topics()
+                    .iter()
+                    .map(rdkafka::metadata::MetadataTopic::name)
+                    .collect();
                 let missing_topics: Vec<&str> = topics
                     .iter()
                     .filter(|t| !available_topics.contains(t))
@@ -191,8 +194,7 @@ async fn verify_broker_ready(
     }
 
     Err(anyhow::anyhow!(
-        "Failed to verify broker readiness after {} attempts",
-        MAX_RETRIES
+        "Failed to verify broker readiness after {MAX_RETRIES} attempts"
     ))
 }
 
