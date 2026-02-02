@@ -29,8 +29,8 @@ use snafu::prelude::*;
 use uuid::Uuid;
 
 use super::error::{
-    DeserializeChunkSnafu, DeserializeStateSnafu, ObjectStoreDeleteSnafu, ObjectStoreReadSnafu,
-    ObjectStoreWriteSnafu, Result, SerializeChunkSnafu, SerializeStateSnafu,
+    DeserializeChunkSnafu, DeserializeStateSnafu, ObjectStoreDeleteSnafu, ObjectStoreListSnafu,
+    ObjectStoreReadSnafu, ObjectStoreWriteSnafu, Result, SerializeChunkSnafu, SerializeStateSnafu,
 };
 use super::state::{
     ColumnSchema, DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobResult, JobResultManifest, JobSchema,
@@ -510,31 +510,40 @@ impl JobStore {
     }
 
     /// Deletes a job and all its result chunks.
+    ///
+    /// This method attempts to delete all chunks before deleting the job state.
+    /// If any chunk deletions fail, the operation returns an error without
+    /// deleting the job state to avoid orphaning chunks.
     pub async fn delete_job(&self, job_id: &str) -> Result<()> {
         // Delete all chunks first
         let chunks_prefix = self.job_chunks_prefix(job_id);
         let mut stream = self.store.list(Some(&chunks_prefix));
 
+        let mut total_chunks = 0usize;
+        let mut failed_deletions = 0usize;
+
         while let Some(entry) = stream.next().await {
-            match entry {
-                Ok(meta) => {
-                    if let Err(err) = self.store.delete(&meta.location).await {
-                        tracing::warn!(
-                            job_id,
-                            path = %meta.location,
-                            error = %err,
-                            "Failed to delete job chunk from object store"
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        job_id,
-                        error = %err,
-                        "Failed to list job chunks from object store"
-                    );
-                }
+            let meta = entry.context(ObjectStoreListSnafu)?;
+            total_chunks = total_chunks.saturating_add(1);
+
+            if let Err(err) = self.store.delete(&meta.location).await {
+                tracing::warn!(
+                    job_id,
+                    path = %meta.location,
+                    error = %err,
+                    "Failed to delete job chunk from object store"
+                );
+                failed_deletions = failed_deletions.saturating_add(1);
             }
+        }
+
+        // If any chunks failed to delete, return an error to avoid orphaning data
+        if failed_deletions > 0 {
+            return Err(super::error::Error::PartialChunkDeletion {
+                job_id: job_id.to_string(),
+                failed_deletions,
+                total_chunks,
+            });
         }
 
         // Delete job state
@@ -548,13 +557,15 @@ impl JobStore {
     }
 
     /// Lists all jobs, optionally filtered by status.
+    ///
+    /// Returns an error if any job state file fails to be read or deserialized.
     pub async fn list_jobs(&self, status_filter: Option<JobStatus>) -> Result<Vec<JobState>> {
         let jobs_prefix = self.jobs_prefix();
         let mut stream = self.store.list(Some(&jobs_prefix));
         let mut jobs = Vec::new();
 
         while let Some(entry) = stream.next().await {
-            let meta = entry.context(ObjectStoreReadSnafu)?;
+            let meta = entry.context(ObjectStoreListSnafu)?;
 
             // Only process .json files (job state, not chunks)
             if !std::path::Path::new(meta.location.as_ref())
@@ -564,18 +575,13 @@ impl JobStore {
                 continue;
             }
 
-            let result = self.store.get(&meta.location).await;
-            let Ok(get_result) = result else {
-                continue;
-            };
-
-            let Ok(bytes) = get_result.bytes().await else {
-                continue;
-            };
-
-            let Ok(state) = serde_json::from_slice::<JobState>(&bytes) else {
-                continue;
-            };
+            let result = self
+                .store
+                .get(&meta.location)
+                .await
+                .context(ObjectStoreReadSnafu)?;
+            let bytes = result.bytes().await.context(ObjectStoreReadSnafu)?;
+            let state: JobState = serde_json::from_slice(&bytes).context(DeserializeStateSnafu)?;
 
             // Apply status filter
             if status_filter.is_some_and(|filter| state.status != filter) {
@@ -597,14 +603,27 @@ impl JobStore {
     }
 
     /// Cleans up expired jobs and their results.
+    ///
+    /// This method uses best-effort cleanup. For listing errors, individual job state
+    /// retrieval errors, and deletion errors, the operation logs warnings and continues
+    /// to clean up as many expired jobs as possible.
+    ///
+    /// Returns the count of successfully deleted jobs.
     pub async fn cleanup_expired_jobs(&self) -> Result<usize> {
         let jobs_prefix = self.jobs_prefix();
         let mut stream = self.store.list(Some(&jobs_prefix));
         let mut deleted_count = 0usize;
 
         while let Some(entry) = stream.next().await {
-            let Ok(meta) = entry else {
-                continue;
+            let meta = match entry {
+                Ok(m) => m,
+                Err(e) => {
+                    // Log and continue to process remaining entries in the stream
+                    tracing::warn!(
+                        "Failed to list distributed job during expired job cleanup: {e}. This job will be skipped."
+                    );
+                    continue;
+                }
             };
 
             // Only process .json files
@@ -615,21 +634,57 @@ impl JobStore {
                 continue;
             }
 
-            let Ok(result) = self.store.get(&meta.location).await else {
-                continue;
+            let result = match self.store.get(&meta.location).await {
+                Ok(r) => r,
+                Err(ObjectStoreError::NotFound { .. }) => {
+                    // Job was deleted between list and get - this is expected
+                    tracing::debug!(path = %meta.location, "Job state file not found during cleanup (likely deleted during list operation), skipping");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read distributed job state at path '{path}' during cleanup: {e}. This job will be skipped.",
+                        path = meta.location
+                    );
+                    continue;
+                }
             };
 
-            let Ok(bytes) = result.bytes().await else {
-                continue;
+            let bytes = match result.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read distributed job state bytes at path '{path}' during cleanup: {e}. This job will be skipped.",
+                        path = meta.location
+                    );
+                    continue;
+                }
             };
 
-            let Ok(state) = serde_json::from_slice::<JobState>(&bytes) else {
-                continue;
+            let state = match serde_json::from_slice::<JobState>(&bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read distributed job state at path '{path}' during cleanup: {e}. This job will be skipped.",
+                        path = meta.location
+                    );
+                    continue;
+                }
             };
 
-            if state.is_expired() && self.delete_job(&state.job_id).await.is_ok() {
-                // Saturate at MAX on overflow - cleanup count is informational only
-                deleted_count = deleted_count.saturating_add(1);
+            if state.is_expired() {
+                match self.delete_job(&state.job_id).await {
+                    Ok(()) => {
+                        // Saturate at MAX on overflow - cleanup count is informational only
+                        deleted_count = deleted_count.saturating_add(1);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to delete expired distributed job '{job_id}' during cleanup: {e}",
+                            job_id = state.job_id
+                        );
+                    }
+                }
             }
         }
 
