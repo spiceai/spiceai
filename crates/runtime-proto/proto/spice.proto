@@ -144,3 +144,98 @@ message SchemaCastScanExecNode {
 message BytesProcessedExecNode {}
 
 message CayenneAccelerationExecNode {}
+
+// Execution plan node for UDTFs.
+// This allows UDTF results to be distributed across a cluster by serializing
+// the UDTF arguments and re-invoking the UDTF on remote executors.
+message UdtfExecNode {
+    // The UDTF arguments needed to reconstruct the results.
+    UdtfArgs args = 1;
+    // The schema of the UDTF results (Arrow IPC-encoded Schema).
+    bytes schema = 2;
+}
+
+// UDTF (User-Defined Table Function) serialization for distributed execution.
+// These messages enable serializing UDTF-produced TableProviders so they can
+// be reconstructed on remote executors in a Ballista cluster.
+
+// Top-level enum for all supported UDTF argument types.
+message UdtfArgs {
+    oneof args {
+        ListUdfsArgs list_udfs = 1;
+        TextSearchArgs text_search = 2;
+        VectorSearchArgs vector_search = 3;
+        RrfArgs rrf = 4;
+    }
+}
+
+// Arguments for list_udfs() - no arguments needed, marker message only.
+message ListUdfsArgs {}
+
+// Arguments for text_search(tbl, query, [col], [limit], [include_score]).
+message TextSearchArgs {
+    // The table reference as a string (e.g., "catalog.schema.table" or just "table").
+    string table = 1;
+    // The search query string.
+    string query = 2;
+    // Optional column to search on (if table has multiple searchable columns).
+    optional string column = 3;
+    // Optional limit on number of results.
+    optional uint64 limit = 4;
+    // Whether to include the score column in results (default: true).
+    optional bool include_score = 5;
+}
+
+// Arguments for vector_search(tbl, query, [col], [limit], [include_score]).
+message VectorSearchArgs {
+    // The table reference as a string.
+    string table = 1;
+    // The search query string (will be embedded).
+    string query = 2;
+    // Optional column containing embeddings to search.
+    optional string column = 3;
+    // Optional limit on number of results.
+    optional uint64 limit = 4;
+    // Whether to include the score column in results (default: true).
+    optional bool include_score = 5;
+}
+
+// Arguments for rrf(query1, query2, ..., [k], [join_key], [time_column], ...).
+message RrfArgs {
+    // Nested UDTF invocations (text_search or vector_search only).
+    repeated RrfNestedQuery queries = 1;
+    // RRF smoothing parameter (default: 60.0).
+    optional double k = 2;
+    // Column name to use for joining results instead of auto-generated row ID.
+    optional string join_key = 3;
+    // Column name containing timestamps for recency boosting.
+    optional string time_column = 4;
+    // Type of decay function: "linear" or "exponential" (default: "exponential").
+    optional string recency_decay = 5;
+    // Decay rate constant for exponential decay (default: 0.01).
+    optional double decay_constant = 6;
+    // Time scale in seconds for decay calculation (default: 86400).
+    optional double decay_scale_secs = 7;
+    // Window size for linear decay function (default: 86400).
+    optional double decay_window_secs = 8;
+}
+
+// A nested query within an RRF invocation.
+message RrfNestedQuery {
+    oneof query {
+        RrfTextSearchQuery text_search = 1;
+        RrfVectorSearchQuery vector_search = 2;
+    }
+}
+
+// A nested text_search invocation with optional rank weight.
+message RrfTextSearchQuery {
+    TextSearchArgs args = 1;
+    optional double rank_weight = 2;
+}
+
+// A nested vector_search invocation with optional rank weight.
+message RrfVectorSearchQuery {
+    VectorSearchArgs args = 1;
+    optional double rank_weight = 2;
+}
