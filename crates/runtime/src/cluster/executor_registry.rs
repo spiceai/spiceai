@@ -23,9 +23,15 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use data_components::flightsql::FlightSQLTable;
+use datafusion::{catalog::TableProvider, sql::TableReference};
+use datafusion_expr::Expr;
+use flight_client::FlightClient;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc, oneshot};
+use tonic::transport::Channel;
 use uuid::Uuid;
 
 /// Error type for executor registry operations.
@@ -116,6 +122,13 @@ impl ExecutorConnection {
 pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
+
+    /// Map of `executor_id` -> FlightSqlClient
+    /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
+    pub flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlServiceClient<Channel>>>>,
+
+    /// Map of `executor_id` -> HashMap<TableReference, Vec<Expr>>
+    pub partitions: Arc<RwLock<HashMap<String, HashMap<TableReference, Vec<Expr>>>>>,
 }
 
 impl ExecutorRegistry {
@@ -124,7 +137,45 @@ impl ExecutorRegistry {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
+            partitions: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Jeadie: temporary. This is the kind of data we need for `PartitionedFlightSQLTableScan`. But we need to refactor `PartitionedFlightSQLTableScan` so that it can get updated data. We also need to add `PartitionedFlightSQLTableScan` into `DataFusionBuilder::build`.
+    pub async fn into_rule_data(
+        &self,
+    ) -> HashMap<TableReference, Vec<(Arc<dyn TableProvider>, Vec<Expr>)>> {
+        let tables: HashMap<TableReference, Vec<(Arc<dyn TableProvider>, Vec<Expr>)>> =
+            HashMap::new();
+
+        let partitions = *self
+            .partitions
+            .try_read()
+            .expect("Failed to read partitions");
+        for (executor_id, table_map) in partitions {
+            let flight_sql_clients = *self
+                .flight_sql_clients
+                .try_read()
+                .expect("Failed to read flight_sql_clients");
+            let Some(client) = flight_sql_clients.get(&executor_id) else {
+                continue;
+            };
+
+            for (tbl, parts) in table_map {
+                let table_provider = Arc::new(
+                    FlightSQLTable::create("", &executor_id, client.clone(), tbl)
+                        .await
+                        .expect("Failed to create FlightSQLTable"),
+                ) as Arc<dyn TableProvider>;
+                let v = tables
+                    .entry(tbl.clone())
+                    .or_insert_with(Vec::new)
+                    .push((table_provider, parts.clone()));
+            }
+        }
+
+        Ok(tables)
     }
 
     /// Registers an executor connection.
