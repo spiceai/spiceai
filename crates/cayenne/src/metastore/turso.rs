@@ -143,18 +143,23 @@ impl TursoMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
+    ///
+    /// Supports composite partition keys by storing column names and values as JSON arrays.
+    /// The `partition_key` column stores a unique composite key (slash-separated values)
+    /// for efficient lookups and uniqueness constraints.
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
             partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_id INTEGER NOT NULL,
-            partition_column TEXT NOT NULL,
-            partition_value TEXT NOT NULL,
+            partition_columns_json TEXT NOT NULL,
+            partition_values_json TEXT NOT NULL,
+            partition_key TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
-            UNIQUE(table_id, partition_column, partition_value)
+            UNIQUE(table_id, partition_key)
         )
     ";
 

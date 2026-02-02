@@ -88,7 +88,9 @@ pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
         ScalarValue::TimestampMillisecond(v, _) => v.map(|v| format!("{v}")),
         ScalarValue::TimestampMicrosecond(v, _) => v.map(|v| format!("{v}")),
         ScalarValue::TimestampNanosecond(v, _) => v.map(|v| format!("{v}")),
-        ScalarValue::Utf8(v) => v.as_ref().map(std::string::ToString::to_string),
+        ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) => {
+            v.as_ref().map(std::string::ToString::to_string)
+        }
         value => {
             return Err(Error::UnsupportedPartitionKey {
                 value: value.clone(),

@@ -81,9 +81,11 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 #[cfg(feature = "s3_vectors")]
 use {
-    crate::search::util::find_index_in_table_provider, search::index::SearchIndex,
-    search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector,
-    search::provider::SearchQueryProvider,
+    crate::search::util::find_index_in_table_provider,
+    search::index::SearchIndex,
+    search::index::chunking::ChunkedSearchIndex,
+    search::index::s3_vectors::S3Vector,
+    search::provider::{SearchQueryProvider, UdtfSource},
 };
 
 use tokio::sync::RwLock;
@@ -404,6 +406,13 @@ impl VectorSearchTableFunc {
                 args.query.as_str(),
                 args.limit,
             )?
+            .with_udtf_source(UdtfSource::VectorSearch {
+                table: args.tbl.to_string(),
+                query: args.query.clone(),
+                column: args.column.clone(),
+                limit: args.limit,
+                include_score: args.include_score,
+            })
             .call_on_scan(Arc::new(|| {
                 async {
                     let request_context = RequestContext::current(AsyncMarker::new().await);
@@ -515,15 +524,24 @@ impl ScalarUDFImpl for VectorSearchTableFunc {
 }
 
 /// The [`TableProvider`] produced from the [`VECTOR_SEARCH_UDTF_NAME`] UDTF.
+///
+/// This provider computes vector similarity scores on-the-fly using the embedding model,
+/// without relying on a pre-built vector index.
 #[derive(Debug, Clone)]
-pub(super) struct VectorSearchUDTFProvider {
-    pub args: VectorSearchTableFuncArgs,
+pub struct VectorSearchUDTFProvider {
+    args: VectorSearchTableFuncArgs,
     underlying: Arc<dyn TableProvider>,
     embedded_columns: HashMap<String, EmbeddingColumnConfig>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
 impl VectorSearchUDTFProvider {
+    /// Returns the arguments used to create this provider.
+    #[must_use]
+    pub fn args(&self) -> &VectorSearchTableFuncArgs {
+        &self.args
+    }
+
     /// Embed the query argument and convert to [`Float32Array`].
     async fn vector(
         &self,
