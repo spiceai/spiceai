@@ -48,6 +48,7 @@ mod sys {
     #![allow(deprecated)]
     #![allow(dead_code)]
     #![allow(clippy::upper_case_acronyms)]
+    #![allow(clippy::pub_underscore_fields)]
     #![allow(clippy::struct_field_names)]
     // Bindgen generates #[allow(...)] attributes which violate allow_attributes lint
     #![allow(clippy::allow_attributes)]
@@ -819,8 +820,12 @@ impl NfsFile {
         #[cfg(libnfs_new_api)]
         let write_size = {
             // SAFETY: We target 64-bit minimum platforms, so usize -> u64 is safe
-            #[expect(clippy::cast_possible_truncation)]
-            let count = buffer.len() as u64;
+            let count = u64::try_from(buffer.len()).map_err(|_| Error::NfsOperationFailed {
+                message: format!(
+                    "Write buffer length {} exceeds platform u64 limit",
+                    buffer.len()
+                ),
+            })?;
             unsafe {
                 sys::nfs_pwrite(
                     self.nfs.0,
