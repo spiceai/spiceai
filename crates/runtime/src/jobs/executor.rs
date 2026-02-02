@@ -219,7 +219,7 @@ impl JobExecutor {
 
         tokio::select! {
             _ = cancel.cancelled() => {
-                tracing::info!(job_id = %job_id, "Job cancelled before completion");
+                tracing::debug!(job_id = %job_id, "Job cancelled before completion");
                 if let Err(e) = query_handle.cancel().await {
                     tracing::error!("Failed to cancel the distributed query '{job_id}': {e}");
                 }
