@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bollard::secret::HealthConfig;
-use rdkafka::producer::FutureProducer;
+use rdkafka::producer::{FutureProducer, Producer};
 use rdkafka::{config::ClientConfig, producer::FutureRecord};
 use spicepod::acceleration::{Acceleration, RefreshMode};
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
@@ -96,14 +96,16 @@ pub async fn start_kafka_docker_container(
         );
     }
 
-    Ok((
-        running_container,
-        create_kafka_producer(
-            &format!("localhost:{port}"),
-            Some(KAFKA_SASL_USERNAME),
-            Some(KAFKA_SASL_PASSWORD),
-        )?,
-    ))
+    let producer = create_kafka_producer(
+        &format!("localhost:{port}"),
+        Some(KAFKA_SASL_USERNAME),
+        Some(KAFKA_SASL_PASSWORD),
+    )?;
+
+    // Verify broker is ready to accept connections by fetching metadata
+    verify_broker_ready(&producer, topics).await?;
+
+    Ok((running_container, producer))
 }
 
 pub fn create_kafka_producer(
@@ -128,6 +130,66 @@ pub fn create_kafka_producer(
 
     let producer: FutureProducer = config.create()?;
     Ok(producer)
+}
+
+/// Verify that the Kafka broker is ready to accept connections by fetching metadata.
+/// This helps avoid race conditions where the container is "healthy" but SASL auth
+/// isn't fully initialized yet.
+async fn verify_broker_ready(
+    producer: &FutureProducer,
+    topics: &[&str],
+) -> Result<(), anyhow::Error> {
+    const MAX_RETRIES: u32 = 10;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+    const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+
+    for attempt in 1..=MAX_RETRIES {
+        match producer.client().fetch_metadata(None, METADATA_TIMEOUT) {
+            Ok(metadata) => {
+                // Verify that all expected topics exist
+                let available_topics: Vec<&str> =
+                    metadata.topics().iter().map(|t| t.name()).collect();
+                let missing_topics: Vec<&str> = topics
+                    .iter()
+                    .filter(|t| !available_topics.contains(t))
+                    .copied()
+                    .collect();
+
+                if missing_topics.is_empty() {
+                    tracing::debug!(
+                        "Broker ready: found {} brokers and {} topics",
+                        metadata.brokers().len(),
+                        metadata.topics().len()
+                    );
+                    return Ok(());
+                }
+
+                tracing::debug!(
+                    "Broker metadata fetched but missing topics {:?} (attempt {}/{})",
+                    missing_topics,
+                    attempt,
+                    MAX_RETRIES
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to fetch broker metadata (attempt {}/{}): {}",
+                    attempt,
+                    MAX_RETRIES,
+                    e
+                );
+            }
+        }
+
+        if attempt < MAX_RETRIES {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Failed to verify broker readiness after {} attempts",
+        MAX_RETRIES
+    ))
 }
 
 pub async fn send_messages_to_kafka<T>(
