@@ -129,7 +129,7 @@ impl CayenneDeletionSink {
                     let vortex_filter = vortex_filter.clone();
                     scan_futures.push(async move {
                         let result = self
-                            .scan_file_for_deletions(
+                            .scan_file_for_new_deletions(
                                 &file_path,
                                 &vortex_session,
                                 &object_store,
@@ -177,7 +177,7 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
-        self.persist_per_file_position_based_deletions(per_file_row_ids)
+        self.persist_position_based_deletions(per_file_row_ids)
             .await
     }
 
@@ -190,7 +190,7 @@ impl CayenneDeletionSink {
     /// # Returns
     ///
     /// Vector of file-local row indices that match the filter (new deletions only).
-    async fn scan_file_for_deletions(
+    async fn scan_file_for_new_deletions(
         &self,
         file_path: &str,
         vortex_session: &VortexSession,
@@ -267,8 +267,8 @@ impl CayenneDeletionSink {
 
     /// Persist per-file position-based deletions.
     ///
-    /// Each entry in `per_file_row_ids` maps a source data file path to the
-    /// **new** file-local row positions to delete. This method:
+    /// Each entry in `row_ids` maps a source data file path to the
+    /// file-local row positions to delete. This method:
     ///
     /// 1. Merges new positions with existing deletions from the cache
     /// 2. Writes a combined deletion vector per source file
@@ -279,16 +279,16 @@ impl CayenneDeletionSink {
     ///
     /// # Arguments
     ///
-    /// * `per_file_row_ids` - Map of source data file path to NEW file-local row IDs
+    /// * `row_ids` - Map of source data file path to file-local row IDs
     ///
     /// # Returns
     ///
     /// The total number of **newly** deleted rows (not counting already-deleted).
-    pub(super) async fn persist_per_file_position_based_deletions(
+    pub(super) async fn persist_position_based_deletions(
         &self,
-        per_file_row_ids: HashMap<String, Vec<u64>>,
+        row_ids: HashMap<String, Vec<u64>>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        if per_file_row_ids.is_empty() {
+        if row_ids.is_empty() {
             return Ok(0);
         }
 
@@ -304,11 +304,11 @@ impl CayenneDeletionSink {
         let writer = DeletionVectorWriter::new(&self.table_metadata);
 
         // Track new deletion count for return value
-        let new_deletion_count: usize = per_file_row_ids.values().map(Vec::len).sum();
+        let new_deletion_count: usize = row_ids.values().map(Vec::len).sum();
 
         // Create one DeletionVectorWriteSpec per file with MERGED deletions
         // (existing from cache + new from this operation)
-        let specs: Vec<DeletionVectorWriteSpec> = per_file_row_ids
+        let specs: Vec<DeletionVectorWriteSpec> = row_ids
             .iter()
             .filter(|(_, row_ids)| !row_ids.is_empty())
             .map(|(file_path, new_row_ids)| {
@@ -346,7 +346,7 @@ impl CayenneDeletionSink {
         }
 
         // Pre-build updated bitmaps OUTSIDE the write lock to minimize lock hold time.
-        let cache_updates: HashMap<String, RoaringBitmap> = per_file_row_ids
+        let cache_updates: HashMap<String, RoaringBitmap> = row_ids
             .iter()
             .map(|(file_path, row_ids)| {
                 let mut bitmap = existing_deletions

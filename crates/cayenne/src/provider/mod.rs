@@ -59,7 +59,7 @@ pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
 pub use vortex_format::{attach_deletion_vectors_to_config, DeletionFilteringVortexFormat};
 
 // Re-export deletion utilities for advanced use cases
-pub use delete::{read_deletion_vectors, CayenneDeletionSink};
+pub use delete::CayenneDeletionSink;
 
 use snafu::prelude::*;
 

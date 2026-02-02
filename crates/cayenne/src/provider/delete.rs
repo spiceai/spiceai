@@ -45,7 +45,6 @@ mod vector_io;
 
 // Public API - re-exported in provider/mod.rs
 pub use sink::CayenneDeletionSink;
-pub use vector_io::read_deletion_vectors;
 
 // Crate-internal types used by table.rs
 pub(crate) use filter_exec::{

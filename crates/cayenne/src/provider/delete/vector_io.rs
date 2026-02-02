@@ -264,128 +264,6 @@ impl<'a> DeletionVectorWriter<'a> {
 // Reader
 // ============================================================================
 
-/// Read deletion vectors from files and return a `RoaringBitmap` of deleted row IDs.
-///
-/// # Blocking I/O Warning
-///
-/// This function performs **blocking file system I/O** operations using `std::fs::File::open`
-/// and must be called from within `tokio::task::spawn_blocking` to avoid blocking the async
-/// runtime. The caller is responsible for offloading this to a blocking task context.
-///
-/// # Design Constraints
-///
-/// `RoaringBitmap` uses u32 internally, supporting row IDs 0 to ~4 billion. Row IDs beyond
-/// `u32::MAX` are logged as warnings and skipped. Tables with excessive deleted rows should
-/// trigger compaction to remove deleted rows and clear deletion vectors.
-///
-/// # Errors
-///
-/// Returns an error if any deletion vector file cannot be read or parsed.
-pub fn read_deletion_vectors(
-    delete_files: Vec<DeleteFile>,
-) -> datafusion_common::Result<RoaringBitmap> {
-    let mut deleted_row_ids = RoaringBitmap::new();
-    let file_count = delete_files.len();
-
-    tracing::debug!(
-        "read_deletion_vectors: processing {} delete files",
-        file_count
-    );
-
-    // Track overflow occurrences to log once at the end instead of per-row
-    let mut overflow_count: u64 = 0;
-    let mut first_overflow_id: Option<u64> = None;
-
-    for delete_file in delete_files {
-        let path = std::path::Path::new(&delete_file.path);
-        tracing::debug!("read_deletion_vectors: reading file {:?}", path);
-
-        // Read deletion vector file
-        let file = std::fs::File::open(path).map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to open deletion vector file {}: {e}",
-                path.display()
-            ))
-        })?;
-
-        let reader = FileReader::try_new(file, None).map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to read deletion vector file {}: {e}",
-                path.display()
-            ))
-        })?;
-
-        // Read all batches and extract row IDs
-        for batch_result in reader {
-            let batch = batch_result.map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to read batch from deletion vector: {e}"
-                ))
-            })?;
-
-            // Get row_id column (first column)
-            let row_id_array = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(
-                        "Expected UInt64Array for row_id column".to_string(),
-                    )
-                })?;
-
-            // Optimized bulk insertion using Arrow's contiguous values slice
-            let values = row_id_array.values();
-
-            if row_id_array.null_count() == 0 {
-                // Fast path: no nulls, bulk insert entire slice
-                for &row_id in values {
-                    if let Ok(row_id_u32) = u32::try_from(row_id) {
-                        deleted_row_ids.insert(row_id_u32);
-                    } else {
-                        if first_overflow_id.is_none() {
-                            first_overflow_id = Some(row_id);
-                        }
-                        overflow_count += 1;
-                    }
-                }
-            } else {
-                // Slow path: check validity bitmap for nulls
-                for i in 0..row_id_array.len() {
-                    if row_id_array.is_valid(i) {
-                        let row_id = values[i];
-                        if let Ok(row_id_u32) = u32::try_from(row_id) {
-                            deleted_row_ids.insert(row_id_u32);
-                        } else {
-                            if first_overflow_id.is_none() {
-                                first_overflow_id = Some(row_id);
-                            }
-                            overflow_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Log once if any overflows occurred
-    if overflow_count > 0 {
-        tracing::warn!(
-            "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted",
-            overflow_count,
-            first_overflow_id.unwrap_or(0)
-        );
-    }
-
-    tracing::debug!(
-        "Loaded {} deleted row IDs from {} deletion vector files",
-        deleted_row_ids.len(),
-        file_count
-    );
-
-    Ok(deleted_row_ids)
-}
-
 /// Read deletion vectors from files, detecting whether each file is position-based or key-based
 /// from its schema, and return separate collections for each type.
 ///
@@ -481,7 +359,7 @@ pub fn detect_deletion_type_and_read(
                     }
                 }
             } else {
-                // Position-based: extract Int64 row_id column
+                // Position-based: extract UInt64 row_id column
                 // Use source_data_file_path to group deletions by their originating data file
                 let source_file = delete_file.source_data_file_path.clone().unwrap_or_else(|| {
                     tracing::warn!(
@@ -501,32 +379,17 @@ pub fn detect_deletion_type_and_read(
                         )
                     })?;
 
+                // Bulk insert row IDs - schema guarantees no nulls (nullable: false)
                 let bitmap = per_file_row_ids.entry(source_file).or_default();
                 let values = row_id_array.values();
-                if row_id_array.null_count() == 0 {
-                    for &row_id in values {
-                        if let Ok(row_id_u32) = u32::try_from(row_id) {
-                            bitmap.insert(row_id_u32);
-                        } else {
-                            if first_overflow_id.is_none() {
-                                first_overflow_id = Some(row_id);
-                            }
-                            overflow_count += 1;
+                for &row_id in values {
+                    if let Ok(row_id_u32) = u32::try_from(row_id) {
+                        bitmap.insert(row_id_u32);
+                    } else {
+                        if first_overflow_id.is_none() {
+                            first_overflow_id = Some(row_id);
                         }
-                    }
-                } else {
-                    for i in 0..row_id_array.len() {
-                        if row_id_array.is_valid(i) {
-                            let row_id = values[i];
-                            if let Ok(row_id_u32) = u32::try_from(row_id) {
-                                bitmap.insert(row_id_u32);
-                            } else if first_overflow_id.is_none() {
-                                first_overflow_id = Some(row_id);
-                                overflow_count += 1;
-                            } else {
-                                overflow_count += 1;
-                            }
-                        }
+                        overflow_count += 1;
                     }
                 }
             }
