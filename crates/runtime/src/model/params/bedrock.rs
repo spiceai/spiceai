@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
+use util::concat_arrays;
+
+use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN};
 use crate::parameters::ParameterSpec;
 
 pub(crate) const BEDROCK_PARAMETERS: [ParameterSpec; 7] = [
