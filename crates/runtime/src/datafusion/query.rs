@@ -18,7 +18,7 @@ use std::{fmt::Display, sync::Arc};
 
 use ::cache::{
     AsTableRefs, get_logical_plan_input_tables,
-    key::{CacheKey, RawCacheKey},
+    key::CacheKey,
     result::{CacheStatus, query::QueryResult},
 };
 use arrow::{array::RecordBatch, datatypes::Schema};
@@ -362,50 +362,81 @@ impl Query {
         // Get the session state for planning
         let session = session_ctx.state();
 
-        // Get logical plan and cache key
+        // Get logical plan and cache key, reusing existing cache infrastructure
         let (plan, cache_key) = match &self.sql {
             QueryMethod::Text {
                 sql, parameters, ..
             } => {
-                let sql_cache_key = CacheKey::Query(sql, parameters.as_ref());
-                let sql_raw_cache_key = sql_cache_key.as_raw_key(Self::plan_hasher(&self.df));
-
-                // Get or create the logical plan
-                let plan = match Query::get_plan(
+                // Use the existing get_plan_or_cached which handles all cache control,
+                // stale-while-revalidate, and query tracking
+                match Query::get_plan_or_cached(
                     &self.df,
                     &session,
+                    Arc::clone(&request_context),
                     sql,
-                    &sql_raw_cache_key,
                     parameters.clone(),
+                    self.tracker,
                 )
-                .await
+                .await?
                 {
-                    Ok(plan) => plan,
-                    Err(e) => {
-                        if let Some(t) = self.tracker {
-                            if let Error::UnableToExecuteQuery { ref source } = e {
-                                let code = ErrorCode::from(source);
-                                t.finish_with_error(&request_context, e.to_string(), code);
-                            } else {
-                                t.finish_with_error(
-                                    &request_context,
-                                    e.to_string(),
-                                    ErrorCode::QueryPlanningError,
-                                );
-                            }
-                        }
-                        return Err(e);
+                    cache::PlanOrCached::Cached(cached_result) => {
+                        tracing::debug!(job_id, "Returning cached result for distributed query");
+                        // Return a QueryHandle with cached results
+                        let schema = cached_result.data.schema();
+                        return Ok(QueryHandle::new_with_cached_result(
+                            job_id.to_string(),
+                            schema,
+                            Arc::clone(&self.df),
+                            None, // Cache key already used for lookup
+                            cached_result.data,
+                        ));
                     }
-                };
-
-                // Use plan-based cache key for results caching
-                let plan_cache_key =
-                    CacheKey::LogicalPlan(&plan).as_raw_key(Self::plan_hasher(&self.df));
-                (plan, Some(plan_cache_key))
+                    cache::PlanOrCached::Plan(plan, _tracker, cache_manager) => {
+                        // Plan needs execution - cache_manager contains the raw cache key for storing results
+                        let cache_key = if cache_manager.should_cache_results() {
+                            Some(cache_manager.raw_cache_key)
+                        } else {
+                            None
+                        };
+                        (*plan, cache_key)
+                    }
+                }
             }
             QueryMethod::Plan(logical_plan) => {
+                // For direct plan submission, compute cache key and check cache
                 let plan_cache_key =
                     CacheKey::LogicalPlan(logical_plan).as_raw_key(Self::plan_hasher(&self.df));
+
+                // Check for cached results using the standard cache lookup
+                if let Some(cache_provider) = self.df.results_cache_provider() {
+                    if let Ok(Some(cached_result)) =
+                        cache_provider.get_raw_key(&plan_cache_key).await
+                    {
+                        let ttl = cache_provider.ttl();
+                        let now = std::time::Instant::now();
+                        if !cached_result.is_stale(ttl, now) {
+                            if let Ok(records) = cached_result.records().await {
+                                tracing::debug!(
+                                    job_id,
+                                    cache_key = plan_cache_key.as_u64(),
+                                    "Returning cached result for distributed query (plan)"
+                                );
+                                let stream = ::cache::result::query::CachedStream::new(
+                                    Arc::new(records),
+                                    cached_result.schema,
+                                );
+                                return Ok(QueryHandle::new_with_cached_result(
+                                    job_id.to_string(),
+                                    logical_plan.schema().inner().clone(),
+                                    Arc::clone(&self.df),
+                                    None,
+                                    Box::pin(stream),
+                                ));
+                            }
+                        }
+                    }
+                }
+
                 (logical_plan.as_ref().clone(), Some(plan_cache_key))
             }
         };
@@ -413,34 +444,7 @@ impl Query {
         // Validate query operations
         if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
             let e = find_datafusion_root(e);
-            let code = ErrorCode::from(&e);
-            if let Some(t) = self.tracker {
-                t.finish_with_error(&request_context, e.to_string(), code);
-            }
             return Err(Error::UnableToExecuteQuery { source: e });
-        }
-
-        // Check for cached results before submitting the job
-        if let Some(ref cache_key) = cache_key {
-            if let Some(cached_result) =
-                Self::try_get_cached_for_distributed(&self.df, cache_key).await
-            {
-                tracing::debug!(
-                    job_id,
-                    cache_key = cache_key.as_u64(),
-                    "Returning cached result for distributed query"
-                );
-                // Return a QueryHandle with cached results
-                // The schema from the cached result matches the plan schema
-                let schema = Arc::new(plan.schema().as_arrow().clone());
-                return Ok(QueryHandle::new_with_cached_result(
-                    job_id.to_string(),
-                    schema,
-                    Arc::clone(&self.df),
-                    Some(cache_key.clone()),
-                    cached_result,
-                ));
-            }
         }
 
         // Get the schema from the logical plan
@@ -478,45 +482,6 @@ impl Query {
             .ok()
             .and_then(|guard| guard.clone())
             .ok_or(Error::SchedulerUnavailable)
-    }
-
-    /// Tries to get a cached result for a distributed query.
-    ///
-    /// Returns `Some(stream)` if a cached result exists and is valid.
-    async fn try_get_cached_for_distributed(
-        df: &DataFusion,
-        cache_key: &RawCacheKey,
-    ) -> Option<SendableRecordBatchStream> {
-        let cache_provider = df.results_cache_provider()?;
-
-        let cached_result = cache_provider.get_raw_key(cache_key).await.ok()??;
-
-        // Check if the cached result is stale
-        let ttl = cache_provider.ttl();
-        let now = std::time::Instant::now();
-        if cached_result.is_stale(ttl, now) {
-            tracing::debug!(
-                cache_key = cache_key.as_u64(),
-                "Cached result for distributed query is stale"
-            );
-            return None;
-        }
-
-        // Convert cached result to a stream
-        let records = match cached_result.records().await {
-            Ok(records) => Arc::new(records),
-            Err(e) => {
-                tracing::warn!(
-                    cache_key = cache_key.as_u64(),
-                    error = %e,
-                    "Failed to decode cached query result for distributed query"
-                );
-                return None;
-            }
-        };
-
-        let stream = ::cache::result::query::CachedStream::new(records, cached_result.schema);
-        Some(Box::pin(stream))
     }
 
     async fn run_distributed_with_managed_runtime(
