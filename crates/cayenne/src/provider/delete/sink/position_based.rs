@@ -117,11 +117,17 @@ impl CayenneDeletionSink {
             // Scan files in parallel with bounded concurrency using buffer_unordered
             let vortex_session = VortexSession::default();
 
-            // Collect file paths first to avoid lifetime issues with async closures
+            // Collect file paths for two reasons:
+            // 1. FileGroup::iter() returns `impl Iterator` (opaque type), and flat_map can't unify
+            //    opaque types across different closure invocations.
+            // 2. The async futures passed to buffer_unordered must be 'static, but a lazy iterator
+            //    would tie them to the file_groups lifetime. Collecting breaks this dependency by
+            //    giving us owned Strings that can move into the async blocks.
             #[expect(clippy::needless_collect)]
             let file_paths: Vec<String> = file_groups
                 .iter()
-                .flat_map(|fg| fg.iter().map(|pf| pf.path().to_string()))
+                .map(|fg| fg.iter().map(|pf| pf.path().to_string()).collect::<Vec<_>>())
+                .flatten()
                 .collect();
 
             let scan_futures = file_paths.into_iter().map(|file_path| {
