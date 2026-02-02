@@ -200,7 +200,24 @@ impl JobExecutor {
         }
 
         // Build and submit the query using Query::submit_distributed
-        let query = QueryBuilder::new(&state.sql, Arc::clone(&df)).build();
+        let mut query_builder = QueryBuilder::new(&state.sql, Arc::clone(&df));
+
+        // Parse parameters if present
+        if let Some(p) = state.parameters {
+            match crate::datafusion::param_utils::convert_json_to_param_values(p) {
+                Ok(params) => {
+                    query_builder = query_builder.parameters(Some(params));
+                }
+                Err(e) => {
+                    job_store
+                        .fail_job(job_id, "INVALID_PARAMETERS", e.to_string())
+                        .await?;
+                    return Ok(());
+                }
+            }
+        };
+
+        let query = query_builder.build();
 
         let query_handle = match query.submit_distributed(job_id).await {
             Ok(handle) => handle,
