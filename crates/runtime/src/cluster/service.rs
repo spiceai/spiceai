@@ -26,12 +26,16 @@ use std::sync::Arc;
 
 use app::App;
 use arrow::array::RecordBatch;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
 use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
-use flight_client::{Credentials, FlightClient};
+use flight_client::tls::new_tls_flight_channel;
+use flight_client::{
+    Credentials, FlightClient, MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use runtime_proto::cluster_service_server::ClusterService;
@@ -536,22 +540,23 @@ impl ClusterService for ClusterServiceImpl {
         let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
         tracing::error!("ClusterService::allocate_initial_partitions for executor {executor_id}");
 
-        let mut flight_client_registry = *self.executor_registry.flight_sql_clients.write().await;
+        let flight_channel = new_tls_flight_channel(&format!("http://{executor_id}"), None)
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to create Flight client for executor {executor_id}: {e}"
+                ))
+            })?;
 
-        let client = FlightClient::try_new(
-            format!("http://{executor_id}").as_str().into(),
-            Credentials::anonymous(),
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| {
-            Status::internal(format!(
-                "Failed to create Flight client for executor {executor_id}: {e}"
-            ))
-        })?;
+        let client = FlightServiceClient::new(flight_channel)
+            .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
 
-        flight_client_registry.insert(executor_id.clone(), client);
+        let mut flight_client_registry = self.executor_registry.flight_sql_clients.write().await;
+        flight_client_registry.insert(
+            executor_id.clone(),
+            FlightSqlServiceClient::new_from_inner(client),
+        );
 
         Ok(Response::new(AllocateInitialPartitionsResponse {
             table_partitions: HashMap::default(),

@@ -52,6 +52,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Represents a single executor's control stream connection.
+#[derive(Debug)]
 pub struct ExecutorConnection {
     /// Channel to send control messages to this executor
     request_tx: mpsc::Sender<SchedulerControlMessage>,
@@ -120,7 +121,7 @@ impl ExecutorConnection {
 /// - Register executors when they connect via control stream
 /// - Unregister executors when they disconnect
 /// - Request metrics from all connected executors
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
@@ -274,6 +275,7 @@ impl FlightSQLPartitionProvider for ExecutorRegistry {
     }
 }
 
+#[derive(Debug)]
 pub struct FlightSQLPartitionProviderProxy {
     registry: Arc<StdRwLock<Option<Arc<ExecutorRegistry>>>>,
 }

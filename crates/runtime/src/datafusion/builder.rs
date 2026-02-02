@@ -286,11 +286,10 @@ impl DataFusionBuilder {
             ))
             .with_analyzer_rules(
                 AnalyzerRulesBuilder::default()
-                    .with_extra_rules(vec![Arc::new(PartitionedFlightSQLTableScan::new(
-                        Arc::new(FlightSQLPartitionProviderProxy::new(Arc::clone(
-                            &executor_registry,
-                        ))),
-                    ))])
+                    .with_extra_rules(vec![Arc::new(PartitionedFlightSQLTableScan::new(Arc::new(
+                        FlightSQLPartitionProviderProxy::new(Arc::clone(&executor_registry)),
+                    )))
+                        as Arc<dyn AnalyzerRule + Send + Sync>])
                     .build(),
             );
 
