@@ -123,7 +123,7 @@ impl super::AcceleratedTable {
                     Ok(simplified) => simplified,
                     Err(e) => {
                         tracing::error!(
-                            "[retention] Failed to simplify retention filter for {dataset_name}: {e}"
+                            "[retention] Upon checking retention policy for table '{dataset_name}', an error occurred when attempting to simplify the relevant retention expression '{expr:?}'. Error: {e}"
                         );
                         continue;
                     }
