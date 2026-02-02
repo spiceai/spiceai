@@ -869,6 +869,28 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64> {
+        // Validate partition metadata invariants before persisting
+        // Without this, invalid metadata could cause incorrect partition lookups at query time
+        if partition.partition_columns.is_empty() {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: "partition_columns cannot be empty".to_string(),
+            });
+        }
+        if partition.partition_values.is_empty() {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: "partition_values cannot be empty".to_string(),
+            });
+        }
+        if partition.partition_columns.len() != partition.partition_values.len() {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: format!(
+                    "partition_columns count ({}) does not match partition_values count ({})",
+                    partition.partition_columns.len(),
+                    partition.partition_values.len()
+                ),
+            });
+        }
+
         // Serialize partition columns and values as JSON arrays for storage
         let columns_json = serde_json::to_string(&partition.partition_columns).map_err(|e| {
             CatalogError::Database {

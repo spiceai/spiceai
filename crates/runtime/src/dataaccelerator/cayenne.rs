@@ -2390,18 +2390,15 @@ impl PartitionCreator for CayennePartitionCreator {
             }
         })?;
 
+        let expected_partition_columns = self.partition_column_labels();
+
         for partition_meta in partitions {
-            // Parse partition values from stored strings back to ScalarValues
-            // Each partition column corresponds to a partition value string
-            if partition_meta.partition_values.len() != self.partition_by.len() {
-                tracing::warn!(
-                    "Skipping partition with {} values, expected {} (partition columns: {:?}, values: {:?})",
-                    partition_meta.partition_values.len(),
-                    self.partition_by.len(),
-                    partition_meta.partition_columns,
-                    partition_meta.partition_values
-                );
-                continue;
+            // Validate that stored partition metadata matches current partition_by expressions.
+            // Both the column names and their order must match exactly, otherwise the partition
+            // was created with different partition_by configuration and cannot be safely used.
+            // Silently skipping mismatched partitions would cause incomplete query results (data loss).
+            if partition_meta.partition_columns != expected_partition_columns {
+                return Err(creator::Error::PartitionByExpressionsChanged);
             }
 
             let mut partition_values = Vec::with_capacity(self.partition_by.len());
