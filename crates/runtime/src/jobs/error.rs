@@ -84,6 +84,7 @@ pub enum Error {
         failed_deletions: usize,
         total_chunks: usize,
     },
+
     #[snafu(display("Failed to read batch from result stream: {source}"))]
     StreamRead {
         source: Box<dyn std::error::Error + Send + Sync>,

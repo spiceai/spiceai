@@ -349,7 +349,8 @@ impl JobStore {
                 },
                 total_row_count: total_rows,
                 total_chunk_count: total_chunks,
-                total_byte_count: total_bytes,
+                truncated: false,
+                total_byte_count: Some(total_bytes),
             },
             chunk_indices,
         }
@@ -741,7 +742,7 @@ mod tests {
             .await
             .expect("to set running");
         assert_eq!(running.status, JobStatus::Running);
-        assert_eq!(running.scheduler_node.as_deref(), Some("node-1"));
+        assert_eq!(running.executor_node.as_deref(), Some("node-1"));
 
         // Complete with empty results
         let result = JobResult {
@@ -753,7 +754,8 @@ mod tests {
                 },
                 total_row_count: 0,
                 total_chunk_count: 0,
-                total_byte_count: 0,
+                truncated: false,
+                total_byte_count: Some(0),
             },
             chunk_indices: vec![],
         };
@@ -1035,7 +1037,7 @@ mod tests {
 
             // Verify byte count is tracked
             assert!(
-                result.manifest.total_byte_count > 0,
+                result.manifest.total_byte_count.is_some_and(|b| b > 0),
                 "Expected non-zero byte count"
             );
         }
@@ -1083,8 +1085,8 @@ mod tests {
                 .expect("to write stream within maximum size limit");
 
             assert_eq!(result.manifest.total_row_count, 3);
-            assert!(result.manifest.total_byte_count > 0);
-            assert!(result.manifest.total_byte_count <= 10_000);
+            assert!(result.manifest.total_byte_count.is_some_and(|b| b > 0));
+            assert!(result.manifest.total_byte_count.is_some_and(|b| b <= 10_000));
         }
 
         #[tokio::test]
@@ -1195,7 +1197,7 @@ mod tests {
                 .expect("to write stream without maximum size limit");
 
             assert_eq!(result.manifest.total_row_count, 1000);
-            assert!(result.manifest.total_byte_count > 0);
+            assert!(result.manifest.total_byte_count.is_some_and(|b| b > 0));
         }
     }
 
