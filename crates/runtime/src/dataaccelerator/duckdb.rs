@@ -302,7 +302,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("index_scan_percentage"),
     ParameterSpec::component("index_scan_max_count"),
     ParameterSpec::runtime("partition_mode"),
-    ParameterSpec::component("partitioned_write_flush_threshold"),
+    ParameterSpec::component("partitioned_write_flush_threshold_rows"),
     ParameterSpec::runtime("connection_pool_size").description(
         "The maximum number of client connections created in the duckdb connection pool.",
     ),
