@@ -34,10 +34,10 @@ limitations under the License.
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, BinaryArray, Int64Array, UInt64Array};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::reader::FileReader;
 use arrow_schema::SchemaRef;
@@ -539,23 +539,29 @@ fn build_delete_file(
 }
 
 /// Schema for position-based deletion vectors (tables without primary key).
-fn position_based_deletion_schema() -> SchemaRef {
-    use arrow::datatypes::{DataType, Field, Schema};
-
+static POSITION_BASED_DELETION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("row_id", DataType::UInt64, false),
         Field::new("deleted_at", DataType::Int64, false),
     ]))
-}
+});
 
 /// Schema for key-based deletion vectors (tables with primary key).
-fn key_based_deletion_schema() -> SchemaRef {
-    use arrow::datatypes::{DataType, Field, Schema};
-
+static KEY_BASED_DELETION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("row_key", DataType::Binary, false),
         Field::new("deleted_at", DataType::Int64, false),
     ]))
+});
+
+/// Returns the schema for position-based deletion vectors.
+fn position_based_deletion_schema() -> SchemaRef {
+    Arc::clone(&POSITION_BASED_DELETION_SCHEMA)
+}
+
+/// Returns the schema for key-based deletion vectors.
+fn key_based_deletion_schema() -> SchemaRef {
+    Arc::clone(&KEY_BASED_DELETION_SCHEMA)
 }
 
 // ============================================================================
