@@ -119,7 +119,7 @@ impl super::AcceleratedTable {
 
                 tracing::trace!("[retention] Expr before simplification: {expr:?}");
 
-                let expr = match simplify_expr(expr, &accelerator.schema()) {
+                let expr = match simplify_expr(expr.clone(), &accelerator.schema()) {
                     Ok(simplified) => simplified,
                     Err(e) => {
                         tracing::error!(
