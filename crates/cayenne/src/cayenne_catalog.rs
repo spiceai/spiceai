@@ -869,14 +869,50 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<i64> {
-        // Check if partition already exists
-        let existing_partition = self.metastore.query_row_helper(
+        // Validate partition metadata invariants before persisting
+        // Without this, invalid metadata could cause incorrect partition lookups at query time
+        if partition.partition_columns.is_empty() {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: "partition_columns cannot be empty".to_string(),
+            });
+        }
+        if partition.partition_values.is_empty() {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: "partition_values cannot be empty".to_string(),
+            });
+        }
+        if partition.partition_columns.len() != partition.partition_values.len() {
+            return Err(CatalogError::InvalidPartitionMetadata {
+                message: format!(
+                    "partition_columns count ({}) does not match partition_values count ({})",
+                    partition.partition_columns.len(),
+                    partition.partition_values.len()
+                ),
+            });
+        }
+
+        // Serialize partition columns and values as JSON arrays for storage
+        let columns_json = serde_json::to_string(&partition.partition_columns).map_err(|e| {
+            CatalogError::Database {
+                message: format!("Failed to serialize partition columns: {e}"),
+            }
+        })?;
+        let values_json = serde_json::to_string(&partition.partition_values).map_err(|e| {
+            CatalogError::Database {
+                message: format!("Failed to serialize partition values: {e}"),
+            }
+        })?;
+        let partition_key = partition.composite_key();
+
+        // Check if partition already exists using the composite key
+        let existing_partition = self
+            .metastore
+            .query_row_helper(
                 QueryRowParams {
-                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_column = ?2 AND partition_value = ?3",
+                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_key = ?2",
                     params: vec![
                         MetastoreValue::Integer(partition.table_id),
-                        MetastoreValue::Text(partition.partition_column.clone()),
-                        MetastoreValue::Text(partition.partition_value.clone()),
+                        MetastoreValue::Text(partition_key.clone()),
                     ],
                 },
                 |row| row.get_i64(0),
@@ -888,18 +924,21 @@ impl MetadataCatalog for CayenneCatalog {
             return Ok(id);
         }
 
-        // Insert partition metadata
-        let insert_result = self.metastore.execute_helper(ExecuteParams {
+        // Insert partition metadata with composite key support
+        let insert_result = self
+            .metastore
+            .execute_helper(ExecuteParams {
                 sql: r"
                 INSERT INTO cayenne_partition (
-                    table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+                    table_id, partition_columns_json, partition_values_json, partition_key, path, path_is_relative, record_count, file_size_bytes
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
                 )",
                 params: vec![
                     MetastoreValue::Integer(partition.table_id),
-                    MetastoreValue::Text(partition.partition_column.clone()),
-                    MetastoreValue::Text(partition.partition_value.clone()),
+                    MetastoreValue::Text(columns_json.clone()),
+                    MetastoreValue::Text(values_json.clone()),
+                    MetastoreValue::Text(partition_key.clone()),
                     MetastoreValue::Text(partition.path.clone()),
                     MetastoreValue::Bool(partition.path_is_relative),
                     MetastoreValue::Integer(partition.record_count),
@@ -919,15 +958,15 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
-        // Retrieve the assigned partition ID
-        let partition_id: i64 = self.metastore
+        // Retrieve the assigned partition ID using composite key
+        let partition_id: i64 = self
+            .metastore
             .query_row_helper(
                 QueryRowParams {
-                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_column = ?2 AND partition_value = ?3",
+                    sql: "SELECT partition_id FROM cayenne_partition WHERE table_id = ?1 AND partition_key = ?2",
                     params: vec![
                         MetastoreValue::Integer(partition.table_id),
-                        MetastoreValue::Text(partition.partition_column.clone()),
-                        MetastoreValue::Text(partition.partition_value.clone()),
+                        MetastoreValue::Text(partition_key),
                     ],
                 },
                 |row| row.get_i64(0),
@@ -941,32 +980,46 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn get_partitions(&self, table_id: i64) -> CatalogResult<Vec<PartitionMetadata>> {
-        self.metastore.query_helper(
-            QueryParams {
-                sql: r"
-                    SELECT partition_id, table_id, partition_column, partition_value, path, path_is_relative, record_count, file_size_bytes
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT partition_id, table_id, partition_columns_json, partition_values_json, path, path_is_relative, record_count, file_size_bytes
                     FROM cayenne_partition
                     WHERE table_id = ?1
                     ORDER BY partition_id
                 ",
-                params: vec![MetastoreValue::Integer(table_id)],
-            },
-            |row| {
-                Ok(PartitionMetadata {
-                    partition_id: row.get_i64(0)?,
-                    table_id: row.get_i64(1)?,
-                    partition_column: row.get_string(2)?,
-                    partition_value: row.get_string(3)?,
-                    path: row.get_string(4)?,
-                    path_is_relative: row.get_bool(5)?,
-                    record_count: row.get_i64(6)?,
-                    file_size_bytes: row.get_i64(7)?,
-                })
-            },
-        )
-        .await.map_err(|e| CatalogError::FailedToGetPartitions {
-            source: Box::new(e),
-        })
+                    params: vec![MetastoreValue::Integer(table_id)],
+                },
+                |row| {
+                    let columns_json = row.get_string(2)?;
+                    let values_json = row.get_string(3)?;
+
+                    let partition_columns: Vec<String> =
+                        serde_json::from_str(&columns_json).map_err(|e| CatalogError::Database {
+                            message: format!("Failed to deserialize partition columns: {e}"),
+                        })?;
+                    let partition_values: Vec<String> =
+                        serde_json::from_str(&values_json).map_err(|e| CatalogError::Database {
+                            message: format!("Failed to deserialize partition values: {e}"),
+                        })?;
+
+                    Ok(PartitionMetadata {
+                        partition_id: row.get_i64(0)?,
+                        table_id: row.get_i64(1)?,
+                        partition_columns,
+                        partition_values,
+                        path: row.get_string(4)?,
+                        path_is_relative: row.get_bool(5)?,
+                        record_count: row.get_i64(6)?,
+                        file_size_bytes: row.get_i64(7)?,
+                    })
+                },
+            )
+            .await
+            .map_err(|e| CatalogError::FailedToGetPartitions {
+                source: Box::new(e),
+            })
     }
 
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool> {
@@ -1181,8 +1234,8 @@ mod tests {
                 let partition = PartitionMetadata {
                     partition_id: 0, // Will be assigned by catalog
                     table_id,
-                    partition_column: "date".to_string(),
-                    partition_value: "2024-01-01".to_string(),
+                    partition_columns: vec!["date".to_string()],
+                    partition_values: vec!["2024-01-01".to_string()],
                     path: "/tmp/cayenne_test_partition/partition_20240101".to_string(),
                     path_is_relative: false,
                     record_count: 100,
@@ -1221,7 +1274,7 @@ mod tests {
 
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].partition_id, partition_ids[0]);
-        assert_eq!(partitions[0].partition_value, "2024-01-01");
+        assert_eq!(partitions[0].partition_values, vec!["2024-01-01"]);
 
         // Cleanup test database
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
@@ -1376,8 +1429,8 @@ mod tests {
             let partition = PartitionMetadata {
                 partition_id: 0,
                 table_id,
-                partition_column: "name".to_string(),
-                partition_value: "test_value".to_string(),
+                partition_columns: vec!["name".to_string()],
+                partition_values: vec!["test_value".to_string()],
                 path: format!("{base_path}/partition_test"),
                 path_is_relative: false,
                 record_count: 100,
@@ -1448,7 +1501,7 @@ mod tests {
                 .await
                 .expect("Failed to get partitions");
             assert_eq!(partitions.len(), 1);
-            assert_eq!(partitions[0].partition_value, "test_value");
+            assert_eq!(partitions[0].partition_values, vec!["test_value"]);
             assert_eq!(partitions[0].record_count, 100);
 
             // Verify delete file persisted

@@ -1030,21 +1030,6 @@ impl DataAccelerator for CayenneAccelerator {
 
             Ok(table_provider as Arc<dyn TableProvider>)
         } else {
-            // Cayenne currently only supports single-column partitioning due to catalog schema limitations
-            if partition_by.len() > 1 {
-                return Err(Box::new(Error::InvalidConfiguration {
-                    detail: Arc::from(format!(
-                        "Cayenne partitioning supports exactly one partition column, but {} were provided. Multi-column partitioning is not yet supported for Cayenne.",
-                        partition_by.len()
-                    )),
-                })
-                    as Box<dyn std::error::Error + Send + Sync>);
-            }
-
-            let partition_by_single = partition_by.first().cloned().ok_or_else(|| {
-                Box::new(Error::PartitionByRequired) as Box<dyn std::error::Error + Send + Sync>
-            })?;
-
             // Get metadata catalog for partition tracking
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
 
@@ -1135,7 +1120,7 @@ impl DataAccelerator for CayenneAccelerator {
             let creator = Arc::new(CayennePartitionCreator::new(
                 table_name,
                 PathBuf::from(&dir_path),
-                partition_by_single,
+                partition_by.clone(),
                 Arc::clone(&arrow_schema),
                 catalog,
                 table_metadata.table_id,
@@ -1208,11 +1193,16 @@ impl DataAccelerator for CayenneAccelerator {
     }
 }
 
-/// Partition creator for Cayenne accelerator
+/// Partition creator for Cayenne accelerator.
+///
+/// Supports single and composite partition keys (e.g., `partition_by: [year, month, day]`).
+/// For composite partitions, data is stored in nested Hive-style directories.
 struct CayennePartitionCreator {
     table_name: String,
     base_path: PathBuf,
-    partition_by: PartitionedBy,
+    /// Partition expressions. For hierarchical partitions like `partition_by: [year, month]`,
+    /// this contains all expressions in order.
+    partition_by: Vec<PartitionedBy>,
     schema: SchemaRef,
     catalog: Arc<dyn cayenne::MetadataCatalog>,
     table_id: i64,
@@ -1251,7 +1241,7 @@ impl CayennePartitionCreator {
     fn new(
         table_name: String,
         base_path: PathBuf,
-        partition_by: PartitionedBy,
+        partition_by: Vec<PartitionedBy>,
         schema: SchemaRef,
         catalog: Arc<dyn cayenne::MetadataCatalog>,
         table_id: i64,
@@ -1284,23 +1274,38 @@ impl CayennePartitionCreator {
         }
     }
 
-    fn partition_column_label(&self) -> &str {
-        match &self.partition_by.expression {
-            Expr::Column(col) => col.name.as_str(),
-            _ => self.partition_by.name.as_str(),
-        }
+    /// Returns the partition column labels for all partition expressions.
+    fn partition_column_labels(&self) -> Vec<String> {
+        self.partition_by
+            .iter()
+            .map(|p| match &p.expression {
+                Expr::Column(col) => col.name.clone(),
+                _ => p.name.clone(),
+            })
+            .collect()
     }
 
-    fn partition_table_name(&self, partition_value: &str) -> String {
-        format!("{}_{}", self.table_name, partition_value)
+    /// Generate a unique table name for this partition based on composite key.
+    fn partition_table_name(&self, partition_key: &str) -> String {
+        // Replace "/" with "_" to create a valid table name
+        let safe_key = partition_key.replace('/', "_");
+        format!("{}_{}", self.table_name, safe_key)
     }
 
-    /// Generate partition directory path from partition value
-    fn partition_dir(&self, partition_value: &ScalarValue) -> Result<PathBuf, creator::Error> {
-        let partition_dir =
-            to_hive_partition_dir(&[(self.partition_by.clone(), partition_value.clone())])
-                .boxed()
-                .context(creator::CreatePartitionSnafu)?;
+    /// Generate partition directory path from multiple partition values.
+    /// Creates nested Hive-style directories (e.g., `year=2025/month=10/day=15/`).
+    fn partition_dir(&self, partition_values: &[ScalarValue]) -> Result<PathBuf, creator::Error> {
+        let pairings: Vec<(PartitionedBy, ScalarValue)> = self
+            .partition_by
+            .iter()
+            .cloned()
+            .zip(partition_values.iter().cloned())
+            .collect();
+
+        let partition_dir = to_hive_partition_dir(&pairings)
+            .boxed()
+            .context(creator::CreatePartitionSnafu)?;
+
         Ok(self.base_path.join(partition_dir))
     }
 }
@@ -1311,54 +1316,53 @@ impl PartitionCreator for CayennePartitionCreator {
         &self,
         partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
-        // Cayenne only supports single-column partitions
         if partition_values.is_empty() {
             return Err(creator::Error::CreatePartition {
                 source: "At least one partition value is required".into(),
             });
         }
 
-        if partition_values.len() > 1 {
+        if partition_values.len() != self.partition_by.len() {
             return Err(creator::Error::CreatePartition {
                 source: format!(
-                    "Cayenne partitioning supports exactly one partition column, but {} values were provided",
+                    "Expected {} partition values but got {} (one per partition_by expression)",
+                    self.partition_by.len(),
                     partition_values.len()
                 )
                 .into(),
             });
         }
 
-        // SAFETY: We verified partition_values.len() == 1 above, so first() will always succeed
-        let Some(partition_value) = partition_values.into_iter().next() else {
-            unreachable!("partition_values length was verified to be exactly 1")
-        };
-
-        let partition_dir = self.partition_dir(&partition_value)?;
+        let partition_dir = self.partition_dir(&partition_values)?;
         let partition_path = partition_dir.to_string_lossy().to_string();
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
 
-        // Create the partition directory
+        // Create the partition directory (including nested directories for composite partitions)
         std::fs::create_dir_all(&partition_dir)
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
-        // Create partition metadata in catalog
-        let partition_value_str = encode_key(&partition_value)
+        // Encode partition values as strings for metadata storage
+        let partition_value_strings: Vec<String> = partition_values
+            .iter()
+            .map(encode_key)
+            .collect::<Result<Vec<_>, _>>()
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-        let partition_column_name = self.partition_column_label().to_string();
+        let partition_column_names = self.partition_column_labels();
 
-        let partition_metadata = cayenne::PartitionMetadata {
-            partition_id: 0, // Will be assigned by catalog
-            table_id: self.table_id,
-            partition_column: partition_column_name,
-            partition_value: partition_value_str.clone(),
-            path: partition_path.clone(),
-            path_is_relative: false,
-            record_count: 0,    // Will be updated as data is written
-            file_size_bytes: 0, // Will be updated as data is written
-        };
+        // Create composite key for table naming (slash-separated values)
+        let partition_key = partition_value_strings.join("/");
+
+        // Create partition metadata with composite key support
+        let partition_metadata = cayenne::PartitionMetadata::new_composite(
+            self.table_id,
+            partition_column_names,
+            partition_value_strings.clone(),
+            partition_path.clone(),
+            false, // path_is_relative
+        );
 
         self.catalog
             .add_partition(partition_metadata)
@@ -1368,7 +1372,7 @@ impl PartitionCreator for CayennePartitionCreator {
 
         // Create table options for this partition
         let table_options = cayenne::metadata::CreateTableOptions {
-            table_name: self.partition_table_name(&partition_value_str),
+            table_name: self.partition_table_name(&partition_key),
             schema: Arc::clone(&self.schema),
             primary_key: self.primary_key.clone(),
             on_conflict: self.on_conflict.clone(),
@@ -1392,7 +1396,7 @@ impl PartitionCreator for CayennePartitionCreator {
             .context(creator::CreatePartitionSnafu)?;
 
         Ok(Partition {
-            partition_values: vec![partition_value],
+            partition_values,
             table_provider: Arc::new(cayenne_table),
         })
     }
@@ -1412,18 +1416,33 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::InferringPartitionsSnafu)?;
 
-        for partition_meta in partitions {
-            // Parse partition value using proper NULL handling
-            let partition_value = parse_partition_value(
-                &df_schema,
-                &self.partition_by,
-                &partition_meta.partition_value,
-            )
-            .boxed()
-            .context(creator::InferringPartitionsSnafu)?;
+        let expected_partition_columns = self.partition_column_labels();
 
-            // Create Cayenne table provider for this partition
-            let partition_table_name = self.partition_table_name(&partition_meta.partition_value);
+        for partition_meta in partitions {
+            // Validate that stored partition metadata matches current partition_by expressions.
+            // Both the column names and their order must match exactly, otherwise the partition
+            // was created with different partition_by configuration and cannot be safely used.
+            // Silently skipping mismatched partitions would cause incomplete query results (data loss).
+            if partition_meta.partition_columns != expected_partition_columns {
+                return Err(creator::Error::PartitionByExpressionsChanged);
+            }
+
+            let mut partition_values = Vec::with_capacity(self.partition_by.len());
+            for (partition_expr, value_str) in self
+                .partition_by
+                .iter()
+                .zip(&partition_meta.partition_values)
+            {
+                let partition_value = parse_partition_value(&df_schema, partition_expr, value_str)
+                    .map_err(|e| creator::Error::InferringPartitions {
+                        source: Box::new(e),
+                    })?;
+                partition_values.push(partition_value);
+            }
+
+            // Create composite key for table lookup
+            let partition_key = partition_meta.partition_values.join("/");
+            let partition_table_name = self.partition_table_name(&partition_key);
 
             // Use builder pattern to pass object store config for S3 support.
             // Use the shared context to share footer/segment caches across partitions.
@@ -1440,7 +1459,7 @@ impl PartitionCreator for CayennePartitionCreator {
                 .context(creator::InferringPartitionsSnafu)?;
 
             result.push(Partition {
-                partition_values: vec![partition_value],
+                partition_values,
                 table_provider: Arc::new(cayenne_table),
             });
         }
@@ -1456,7 +1475,12 @@ impl PartitionCreator for CayennePartitionCreator {
         // Cayenne doesn't have native filter pushdown to the storage layer
         use datafusion::logical_expr::TableProviderFilterPushDown;
 
-        let partition_columns = self.partition_by.expression.column_refs();
+        // Collect all partition columns from all partition expressions
+        let partition_columns: std::collections::HashSet<_> = self
+            .partition_by
+            .iter()
+            .flat_map(|p| p.expression.column_refs())
+            .collect();
 
         Ok(filters
             .iter()
