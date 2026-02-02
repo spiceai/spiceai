@@ -1380,7 +1380,6 @@ impl PartitionCreator for CayennePartitionCreator {
         std::fs::create_dir_all(&partition_dir)
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-
         let partition_column_names = self.partition_column_labels();
 
         // Create composite key for table naming (slash-separated values)
