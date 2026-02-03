@@ -144,7 +144,7 @@ pub struct QueryHandle {
     schema: SchemaRef,
     /// Input datasets for the query.
     datasets: Option<Arc<HashSet<TableReference>>>,
-    /// Reference to DataFusion for TLS config and caching.
+    /// Reference to `DataFusion` instance.
     df: Arc<DataFusion>,
     /// Cache key for the query results (if caching is enabled).
     cache_key: Option<RawCacheKey>,
@@ -164,7 +164,10 @@ impl std::fmt::Debug for QueryHandle {
                 "is_cached",
                 &matches!(self.state, QueryHandleState::Cached { .. }),
             )
-            .field("cache_key", &self.cache_key.as_ref().map(|k| k.as_u64()))
+            .field(
+                "cache_key",
+                &self.cache_key.as_ref().map(RawCacheKey::as_u64),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -172,6 +175,7 @@ impl std::fmt::Debug for QueryHandle {
 impl QueryHandle {
     /// Creates a new `QueryHandle` for a submitted distributed query job.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         ballista_job_id: String,
         scheduler: Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>,
@@ -281,9 +285,8 @@ impl QueryHandle {
             Some(job_status::Status::Failed(failed)) => {
                 Ok(DistributedJobStatus::Failed(failed.error))
             }
-            Some(job_status::Status::Queued(_)) => Ok(DistributedJobStatus::Queued),
+            Some(job_status::Status::Queued(_)) | None => Ok(DistributedJobStatus::Queued),
             Some(job_status::Status::Running(_)) => Ok(DistributedJobStatus::Running),
-            None => Ok(DistributedJobStatus::Queued),
         }
     }
 
@@ -432,12 +435,12 @@ impl QueryHandle {
     fn finish_tracker_with_error(&self, error: &QueryHandleError) {
         if let Some(tracker) = self.tracker.lock().take() {
             let error_code = match error {
-                QueryHandleError::JobTimeout { .. } => ErrorCode::QueryExecutionError,
-                QueryHandleError::JobCancelled => ErrorCode::QueryExecutionError,
-                QueryHandleError::JobFailed { .. } => ErrorCode::QueryExecutionError,
-                QueryHandleError::StatusError { .. } => ErrorCode::InternalError,
-                QueryHandleError::PartitionLocationError { .. } => ErrorCode::InternalError,
-                QueryHandleError::JobNotFound { .. } => ErrorCode::InternalError,
+                QueryHandleError::JobTimeout { .. }
+                | QueryHandleError::JobCancelled
+                | QueryHandleError::JobFailed { .. } => ErrorCode::QueryExecutionError,
+                QueryHandleError::StatusError { .. }
+                | QueryHandleError::PartitionLocationError { .. }
+                | QueryHandleError::JobNotFound { .. } => ErrorCode::InternalError,
             };
             tracker.finish_with_error(&self.request_context, error.to_string(), error_code);
         }
@@ -506,14 +509,14 @@ impl QueryHandle {
 
         // Wrap with cache if cache key is provided
         if let (Some(cache_key), Some(cache_provider)) =
-            (self.cache_key.clone(), self.df.results_cache_provider())
+            (self.cache_key, self.df.results_cache_provider())
             && let Some(datasets) = &self.datasets
         {
             cache::to_cached_record_batch_stream(
                 cache_provider,
                 Box::pin(stream),
                 cache_key,
-                Arc::clone(&datasets),
+                Arc::clone(datasets),
             )
         } else {
             Box::pin(stream)

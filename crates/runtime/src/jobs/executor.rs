@@ -189,7 +189,7 @@ impl JobExecutor {
                     return Ok(());
                 }
             }
-        };
+        }
 
         let query = query_builder.build();
 
@@ -218,13 +218,13 @@ impl JobExecutor {
         }
 
         tokio::select! {
-            _ = cancel.cancelled() => {
+            () = cancel.cancelled() => {
                 tracing::debug!(job_id = %job_id, "Job cancelled before completion");
                 if let Err(e) = query_handle.cancel().await {
                     tracing::error!("Failed to cancel the distributed query '{job_id}': {e}");
                 }
                 job_store.cancel_job(job_id).await?;
-                return Ok(());
+                Ok(())
             },
             result_stream = query_handle.into_stream() => {
                 // Wait for completion and get the result stream
