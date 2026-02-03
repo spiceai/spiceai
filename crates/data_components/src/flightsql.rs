@@ -22,7 +22,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::{
-    MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, tls::new_tls_flight_channel,
+    MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
+    cookie::{CookieService, CookieStore},
+    tls::new_tls_flight_channel,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use snafu::prelude::*;
@@ -106,16 +108,23 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+type FlightSqlClient = FlightSqlServiceClient<CookieService<Channel>>;
+
 #[derive(Debug, Clone)]
 pub struct FlightSQLFactory {
-    client: FlightSqlServiceClient<Channel>,
+    client: FlightSqlClient,
     endpoint: String,
+    cookie_store: Arc<CookieStore>,
 }
 
 impl FlightSQLFactory {
     #[must_use]
-    pub fn new(client: FlightSqlServiceClient<Channel>, endpoint: String) -> Self {
-        Self { client, endpoint }
+    pub fn new(client: FlightSqlClient, endpoint: String, cookie_store: Arc<CookieStore>) -> Self {
+        Self {
+            client,
+            endpoint,
+            cookie_store,
+        }
     }
 }
 
@@ -131,6 +140,7 @@ impl Read for FlightSQLFactory {
                 &self.endpoint,
                 self.client.clone(),
                 table_reference,
+                Arc::clone(&self.cookie_store),
             )
             .await?,
         );
@@ -145,9 +155,10 @@ impl Read for FlightSQLFactory {
 pub struct FlightSQLTable {
     name: &'static str,
     join_push_down_context: String,
-    client: FlightSqlServiceClient<Channel>,
+    client: FlightSqlClient,
     table_reference: TableReference,
     schema: SchemaRef,
+    cookie_store: Arc<CookieStore>,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -155,8 +166,9 @@ impl FlightSQLTable {
     pub async fn create(
         name: &'static str,
         endpoint: &str,
-        client: FlightSqlServiceClient<Channel>,
+        client: FlightSqlClient,
         table_reference: impl Into<TableReference>,
+        cookie_store: Arc<CookieStore>,
     ) -> Result<Self> {
         let table_reference: TableReference = table_reference.into();
         let schema = Self::get_schema(client.clone(), table_reference.clone()).await?;
@@ -166,15 +178,17 @@ impl FlightSQLTable {
             table_reference,
             schema,
             join_push_down_context: format!("endpoint={endpoint}"),
+            cookie_store,
         })
     }
 
     pub fn create_with_schema(
         name: &'static str,
         endpoint: &str,
-        client: FlightSqlServiceClient<Channel>,
+        client: FlightSqlClient,
         table_reference: impl Into<TableReference>,
         schema: SchemaRef,
+        cookie_store: Arc<CookieStore>,
     ) -> Self {
         let table_reference: TableReference = table_reference.into();
         Self {
@@ -183,6 +197,7 @@ impl FlightSQLTable {
             table_reference,
             schema,
             join_push_down_context: format!("endpoint={endpoint}"),
+            cookie_store,
         }
     }
 
@@ -190,10 +205,12 @@ impl FlightSQLTable {
         s: &'static str,
         table_reference: impl Into<TableReference>,
     ) -> Result<Self> {
+        let cookie_store = Arc::new(CookieStore::new());
         let channel = channel::Endpoint::from_static(s)
             .connect()
             .await
             .context(UnableToConnectToServerSnafu)?;
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
 
         let flight_client = FlightServiceClient::new(channel)
             .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
@@ -204,6 +221,7 @@ impl FlightSQLTable {
             s,
             FlightSqlServiceClient::new_from_inner(flight_client),
             table_reference.into(),
+            cookie_store,
         )
         .await
     }
@@ -280,7 +298,7 @@ impl FlightSQLTable {
     }
 
     pub async fn get_schema(
-        mut client: FlightSqlServiceClient<Channel>,
+        mut client: FlightSqlClient,
         table_reference: TableReference,
     ) -> Result<SchemaRef> {
         let flight_info = client
@@ -350,6 +368,7 @@ impl FlightSQLTable {
             self.client.clone(),
             filters,
             limit,
+            Arc::clone(&self.cookie_store),
         )?))
     }
 }
@@ -398,10 +417,11 @@ impl TableProvider for FlightSQLTable {
 struct FlightSqlExec {
     projected_schema: SchemaRef,
     table_reference: TableReference,
-    client: FlightSqlServiceClient<Channel>,
+    client: FlightSqlClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
     properties: PlanProperties,
+    cookie_store: Arc<CookieStore>,
 }
 
 impl FlightSqlExec {
@@ -409,9 +429,10 @@ impl FlightSqlExec {
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &TableReference,
-        client: FlightSqlServiceClient<Channel>,
+        client: FlightSqlClient,
         filters: &[Expr],
         limit: Option<usize>,
+        cookie_store: Arc<CookieStore>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(schema, projections)?;
         Ok(Self {
@@ -426,6 +447,7 @@ impl FlightSqlExec {
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
+            cookie_store,
         })
     }
 
@@ -510,16 +532,19 @@ impl ExecutionPlan for FlightSqlExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
 
-        let stream_adapter =
-            RecordBatchStreamAdapter::new(self.schema(), query_to_stream(self.client.clone(), sql));
+        let stream_adapter = RecordBatchStreamAdapter::new(
+            self.schema(),
+            query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store)),
+        );
 
         Ok(Box::pin(stream_adapter))
     }
 }
 
 fn query_to_stream(
-    mut client: FlightSqlServiceClient<Channel>,
+    mut client: FlightSqlClient,
     sql: String,
+    cookie_store: Arc<CookieStore>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
         let flight_info = client
@@ -529,7 +554,7 @@ fn query_to_stream(
 
         for ep in flight_info.endpoint {
             if let Some(tkt) = ep.clone().ticket {
-                match get_client_for_flight_endpoint(&client, ep).await
+                match get_client_for_flight_endpoint(&client, ep, &cookie_store).await
                     .map_err(to_execution_error)?
                     .do_get(tkt.clone()).await {
                         Ok(mut flight_stream) => {
@@ -552,13 +577,15 @@ fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionErr
 }
 
 pub async fn get_client_for_flight_endpoint(
-    client: &FlightSqlServiceClient<Channel>,
+    client: &FlightSqlClient,
     ep: FlightEndpoint,
-) -> Result<FlightSqlServiceClient<Channel>, Box<dyn std::error::Error>> {
+    cookie_store: &Arc<CookieStore>,
+) -> Result<FlightSqlClient, Box<dyn std::error::Error>> {
     if ep.location.is_empty() {
         Ok(client.clone())
     } else {
         let channel = new_tls_flight_channel(&ep.location[0].uri, None).await?;
+        let channel = CookieService::new(channel, Arc::clone(cookie_store));
         Ok(FlightSqlServiceClient::new(channel))
     }
 }
