@@ -72,9 +72,11 @@ impl CookieStore {
 fn parse_set_cookie(value: &str) -> Option<(String, String)> {
     let entry = value.split(';').next()?.trim();
     let (name, val) = entry.split_once('=')?;
+    let name = name.trim();
     if name.is_empty() {
         return None;
     }
+    let val = val.trim();
     Some((name.to_string(), val.to_string()))
 }
 
@@ -170,5 +172,53 @@ mod tests {
             .to_string();
         assert!(header.contains("AWSALB=abc123"));
         assert!(header.contains("AWSALBTG=def456"));
+    }
+
+    #[test]
+    fn cookie_store_overwrites_cookie() {
+        let store = CookieStore::new();
+        let mut headers = HeaderMap::new();
+        headers.append(SET_COOKIE, HeaderValue::from_static("AWSALB=old; Path=/"));
+        store.update_from_headers(&headers);
+
+        let mut updated_headers = HeaderMap::new();
+        updated_headers.append(SET_COOKIE, HeaderValue::from_static("AWSALB=new; Path=/"));
+        store.update_from_headers(&updated_headers);
+
+        let header = store
+            .cookie_header_value()
+            .expect("cookie header should be present")
+            .to_str()
+            .expect("cookie header should be valid UTF-8")
+            .to_string();
+        assert!(header.contains("AWSALB=new"));
+        assert!(!header.contains("AWSALB=old"));
+    }
+
+    #[test]
+    fn cookie_store_trims_cookie_parts() {
+        let store = CookieStore::new();
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static(" name = value ; Path=/"),
+        );
+        store.update_from_headers(&headers);
+        let header = store
+            .cookie_header_value()
+            .expect("cookie header should be present")
+            .to_str()
+            .expect("cookie header should be valid UTF-8")
+            .to_string();
+        assert!(header.contains("name=value"));
+    }
+
+    #[test]
+    fn cookie_store_ignores_invalid_set_cookie() {
+        let store = CookieStore::new();
+        let mut headers = HeaderMap::new();
+        headers.append(SET_COOKIE, HeaderValue::from_static("invalid"));
+        store.update_from_headers(&headers);
+        assert!(store.cookie_header_value().is_none());
     }
 }

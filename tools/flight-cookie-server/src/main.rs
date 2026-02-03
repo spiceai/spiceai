@@ -176,12 +176,11 @@ impl FlightService for CookieFlightService {
         &self,
         _request: Request<tonic::Streaming<arrow_flight::HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        let response_stream: Self::HandshakeStream = Box::pin(tokio_stream::iter(vec![Ok(
-            HandshakeResponse {
+        let response_stream: Self::HandshakeStream =
+            Box::pin(tokio_stream::iter(vec![Ok(HandshakeResponse {
                 protocol_version: 0,
                 payload: Bytes::new(),
-            },
-        )]));
+            })]));
         let mut response = Response::new(response_stream);
         response.metadata_mut().insert(
             "set-cookie",
@@ -284,9 +283,7 @@ impl FlightService for CookieFlightService {
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(futures::stream::iter(
-                batches
-                    .into_iter()
-                    .map(|batch| Ok::<_, FlightError>(batch)),
+                batches.into_iter().map(|batch| Ok::<_, FlightError>(batch)),
             ))
             .map_err(Status::from);
         Ok(Response::new(Box::pin(stream)))
