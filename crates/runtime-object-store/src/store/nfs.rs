@@ -100,9 +100,7 @@ impl NFSObjectStore {
             format!("/{dir_path}")
         };
 
-        let dir = nfs
-            .opendir(StdPath::new(&path))
-            .map_err(|e| handle_error(e))?;
+        let dir = nfs.opendir(StdPath::new(&path)).map_err(handle_error)?;
 
         let mut entries = Vec::new();
         for entry_res in dir {
