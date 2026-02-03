@@ -50,13 +50,8 @@ mod tracker;
 pub use handle::{DistributedJobStatus, QueryHandle, QueryHandleError};
 
 use {
-    crate::config::ClusterRole,
-    crate::datafusion::builder::default_extension_planners,
-    ballista_core::extension::{SessionConfigExt, SessionStateExt},
-    ballista_core::planner::BallistaQueryPlanner,
+    ballista_core::extension::SessionConfigExt,
     ballista_scheduler::scheduler_server::SchedulerServer,
-    datafusion::execution::SessionStateBuilder,
-    datafusion::physical_planner::DefaultPhysicalPlanner,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
 
@@ -69,15 +64,12 @@ use futures::StreamExt;
 use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 use super::managed_runtime;
-use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
-use crate::cluster::metrics_collector::OtelResultFetchMetricsCallback;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
-use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 
