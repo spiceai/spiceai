@@ -478,8 +478,8 @@ pub struct Refresher {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
-    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
-    /// Shared with `CachingAccelerationScanExec`.
+    /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
+    /// Shared with `DataConnector` and `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// The bootstrap status from dataset initialization.
     bootstrap_status: BootstrapStatus,

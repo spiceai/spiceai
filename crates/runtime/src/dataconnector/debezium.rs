@@ -40,6 +40,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -402,6 +403,8 @@ impl DataConnector for Debezium {
         &self,
         federated_table: Arc<FederatedTable>,
         _dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;

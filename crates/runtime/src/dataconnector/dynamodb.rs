@@ -18,6 +18,7 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters, parameters::aws::initiate_config_with_auth_method,
 };
+use crate::accelerated_table::sink::table::TableSink;
 use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
@@ -30,7 +31,10 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use data_components::dynamodb::{Error, JsonNesting};
+use datafusion::catalog::Session;
 use datafusion::datasource::TableProvider;
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
@@ -43,6 +47,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use tokio::sync::Mutex;
 use util::time_format::is_valid_format;
 
 #[derive(Debug)]
@@ -367,6 +372,8 @@ impl DataConnector for DynamoDB {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
+        accelerated_table_provider: Arc<dyn TableProvider>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
 
@@ -382,7 +389,7 @@ impl DataConnector for DynamoDB {
                 let dataset_name = dataset.name.clone();
                 let dataset_name_2 = dataset_name.clone();
                 let dataset_name_3 = dataset_name.clone();
-                let dataset_name_4 = dataset_name.clone();
+                let dataset_name = dataset_name.clone();
                 let dynamodb = Arc::new(dynamodb_ref.clone());
                 let dynamodb_sys = Arc::new(if dataset.is_file_accelerated() {
                     initialize_dynamodb_sys(&dataset).await
@@ -446,19 +453,46 @@ impl DataConnector for DynamoDB {
                             .boxed(),
                     )
                 } else {
-                    // Resume reading from a checkpoint
-                    tracing::info!(
-                        "Found existing checkpoint for DynamoDB table {dataset_name}, resuming from checkpoint. Table will be marked as Ready once stream lag reaches < '{}'",
-                        humantime::format_duration(acceptable_lag),
-                    );
                     Some(
-                        stream::once(changes_stream_from_checkpoint(
-                            Arc::clone(&dynamodb),
-                            Arc::clone(&dynamodb_sys),
-                            checkpoint,
-                            acceptable_lag,
-                            dataset_name_4.clone(),
-                        ))
+                        stream::once(async move {
+
+                            rebootstrap_table(&dynamodb, &dynamodb_sys, acceptable_lag, &dataset_name, accelerated_table_provider, accelerator_write_mutex).await
+
+
+
+                            // let Some(changes_stream) = changes_stream_from_checkpoint(
+                            //     Arc::clone(&dynamodb),
+                            //     Arc::clone(&dynamodb_sys),
+                            //     checkpoint,
+                            //     acceptable_lag,
+                            //     dataset_name.clone(),
+                            // ).await else {
+                            //     return None;
+                            // };
+                            //
+                            // // Peek at the first record
+                            // let (first_item, rest) = changes_stream.into_future().await;
+                            //
+                            //
+                            //
+                            // match first_item {
+                            //     Some(Err(StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage { source: dynamodb_streams::Error::ShardNotFound})))
+                            //         // TODO: Mark current table as Ready by emitting a message with no rows and dataset_is_ready = True
+                            //         => rebootstrap_table(&dynamodb, &dynamodb_sys, acceptable_lag, &dataset_name, accelerated_table_provider, accelerator_write_mutex).await,
+                            //     Some(m) => {
+                            //         // Resume reading from a checkpoint
+                            //         tracing::info!(
+                            //             "Found existing checkpoint for DynamoDB table {dataset_name}, resuming from checkpoint. Table will be marked as Ready once stream lag reaches < '{}'",
+                            //             humantime::format_duration(acceptable_lag),
+                            //         );
+                            //         Some(stream::once(async { m }).chain(rest).boxed())
+                            //     }
+                            //     None => {
+                            //         tracing::info!("Resumed stream is empty");
+                            //         Some(stream::empty().boxed())
+                            //     }
+                            // }
+                        })
                         .filter_map(|opt| async move { opt })
                         .flatten()
                         .boxed(),
@@ -468,6 +502,89 @@ impl DataConnector for DynamoDB {
             .flat_map(|opt| opt.unwrap_or_else(|| stream::empty().boxed())),
         ))
     }
+}
+
+async fn rebootstrap_table(
+    dynamodb: &Arc<DynamoDBTableProvider>,
+    dynamodb_sys: &Arc<Option<DynamoDBSys>>,
+    acceptable_lag: Duration,
+    dataset_name: &TableReference,
+    accelerated_table_provider: Arc<dyn TableProvider>,
+    accelerator_write_mutex: Arc<Mutex<()>>,
+) -> Option<ChangesStream> {
+    tracing::debug!(
+        "Checkpoint for DynamoDB Table {} references expired shard, initiating re-bootstrap recovery",
+        dataset_name
+    );
+
+    // 1. Get new global checkpoint FIRST (before re-bootstrap starts)
+    let new_checkpoint = match dynamodb.latest_global_checkpoint().await {
+        Ok(cp) => cp,
+        Err(e) => {
+            tracing::error!("Failed to get new checkpoint for re-bootstrap: {:?}", e);
+            return None;
+        }
+    };
+
+    tracing::debug!(
+        "Got new checkpoint for re-bootstrap of DynamoDB table {}, checkpoint shards={}",
+        dataset_name,
+        new_checkpoint.shards.len()
+    );
+
+    // 2. Scan DynamoDB and get coalesced stream via DataFrame API
+    let ctx = SessionContext::new();
+    let df = match ctx.read_table(Arc::clone(dynamodb) as Arc<dyn TableProvider>) {
+        Ok(df) => df,
+        Err(e) => {
+            tracing::error!("Failed to create DataFrame for re-bootstrap: {:?}", e);
+            return None;
+        }
+    };
+
+    let stream = match df.execute_stream().await {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::error!("Failed to execute stream for re-bootstrap: {:?}", e);
+            return None;
+        }
+    };
+
+    // 3. Write to accelerator using TableSink
+    let table_sink = TableSink::new(accelerated_table_provider);
+    let _guard = accelerator_write_mutex.lock().await;
+    if let Err(e) = table_sink.insert_into(stream, InsertOp::Overwrite).await {
+        tracing::error!("Failed to execute re-bootstrap insert: {:?}", e);
+        return None;
+    }
+
+    tracing::debug!(
+        "Re-bootstrap data transfer complete for DynamoDB table {}",
+        dataset_name
+    );
+
+    // 4. Commit the checkpoint
+    let committer =
+        DynamoDBStreamCommitter::new(Arc::clone(dynamodb_sys), new_checkpoint.clone());
+    if let Err(e) = committer.commit() {
+        tracing::error!("Failed to commit checkpoint after re-bootstrap: {:?}", e);
+        return None;
+    }
+
+    tracing::info!(
+        "Re-bootstrap complete for DynamoDB table {}, continuing with changes stream",
+        dataset_name
+    );
+
+    // 5. Return changes stream from the checkpoint
+    changes_stream_from_checkpoint(
+        Arc::clone(dynamodb),
+        Arc::clone(dynamodb_sys),
+        new_checkpoint,
+        acceptable_lag,
+        dataset_name.clone(),
+    )
+    .await
 }
 
 async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<DynamoDBSys> {
