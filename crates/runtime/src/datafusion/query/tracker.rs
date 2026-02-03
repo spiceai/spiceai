@@ -25,6 +25,7 @@ use runtime_request_context::RequestContext;
 
 use super::{error_code::ErrorCode, metrics};
 
+#[derive(Clone)]
 pub(crate) struct QueryTracker {
     pub(crate) schema: Option<SchemaRef>,
     pub(crate) query_duration_secs: Option<f32>,

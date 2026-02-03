@@ -14,55 +14,34 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
-use ballista_core::extension::SessionConfigExt;
-use ballista_core::serde::protobuf::job_status;
-use ballista_core::serde::scheduler::PartitionLocation;
-use ballista_scheduler::scheduler_server::SchedulerServer;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::prelude::SessionContext;
-use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use futures::{Stream, StreamExt};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::datafusion::DataFusion;
+use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
 
 use super::Result;
 use super::state::{JobState, JobStatus};
 use super::store::JobStore;
 
-/// Interval between job status polls when waiting for Ballista job completion.
-const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Maximum number of poll iterations before timing out a job.
-/// At 100ms poll interval, this allows ~1 hour of job execution time.
-/// Convert polling to notifiers: <https://github.com/spiceai/spiceai/issues/9223>
-const MAX_JOB_POLL_ITERATIONS: u64 = 36_000;
-
-/// Default max message size (16MB matches typical default).
-const MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-
-/// Use block transfer mode instead of Arrow Flight for partition retrieval.
-/// Block transfer is more efficient for large result sets within a cluster.
-const USE_FLIGHT_TRANSFER: bool = false;
-
-/// Tracks an active job's cancellation token and Ballista job ID (once submitted).
+/// Tracks an active job's cancellation token and query handle (once submitted).
 struct ActiveJobInfo {
     cancel_token: CancellationToken,
     /// The Ballista scheduler job ID, set once submitted to the scheduler.
-    ballista_job_id: Option<String>,
+    query_handle: Option<QueryHandle>,
 }
 
 /// Manages background execution of async query jobs.
+///
+/// The `JobExecutor` coordinates asynchronous query execution by:
+/// 1. Creating jobs in the `JobStore`
+/// 2. Submitting queries via `Query::submit_distributed` to get a `QueryHandle`
+/// 3. Polling the `QueryHandle` for completion
+/// 4. Writing results to the `JobStore` when complete
 pub struct JobExecutor {
     job_store: Arc<JobStore>,
     df: Arc<DataFusion>,
@@ -89,13 +68,6 @@ impl JobExecutor {
         }
     }
 
-    /// Returns a reference to the scheduler server if available.
-    fn scheduler_server(
-        df: &DataFusion,
-    ) -> Option<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>> {
-        df.scheduler_server.try_read().ok()?.clone()
-    }
-
     /// Submits a new query job for async execution.
     ///
     /// Returns the job state immediately. The query will be executed in the background.
@@ -109,14 +81,16 @@ impl JobExecutor {
 
         // Create cancellation token for this job
         let cancel_token = CancellationToken::new();
-        let mut active = self.active_jobs.write().await;
-        active.insert(
-            job_id.clone(),
-            ActiveJobInfo {
-                cancel_token: cancel_token.clone(),
-                ballista_job_id: None,
-            },
-        );
+        {
+            let mut active = self.active_jobs.write().await;
+            active.insert(
+                job_id.clone(),
+                ActiveJobInfo {
+                    cancel_token: cancel_token.clone(),
+                    query_handle: None,
+                },
+            );
+        }
 
         // Spawn background task to execute the job
         let job_store = Arc::clone(&self.job_store);
@@ -131,8 +105,10 @@ impl JobExecutor {
                         .await;
 
                 // Remove from active jobs
-                let mut active = active_jobs.write().await;
-                active.remove(&job_id_clone);
+                {
+                    let mut active = active_jobs.write().await;
+                    active.remove(&job_id_clone);
+                }
 
                 if let Err(e) = result {
                     tracing::error!(job_id = %job_id_clone, error = %e, "Job execution failed");
@@ -146,28 +122,10 @@ impl JobExecutor {
 
     /// Requests cancellation of a running job.
     pub async fn cancel(&self, job_id: &str) -> Result<JobState> {
-        // Signal cancellation and get Ballista job ID if available
-        let ballista_job_id = {
-            let active = self.active_jobs.read().await;
-            if let Some(info) = active.get(job_id) {
-                info.cancel_token.cancel();
-                info.ballista_job_id.clone()
-            } else {
-                None
-            }
-        };
-
-        // Cancel in Ballista if we have a Ballista job ID and scheduler is available
-        if let (Some(ballista_id), Some(scheduler)) =
-            (ballista_job_id, Self::scheduler_server(&self.df))
-            && let Err(e) = scheduler.cancel_job(ballista_id.clone()).await
-        {
-            tracing::warn!(
-                job_id,
-                ballista_job_id = %ballista_id,
-                error = %e,
-                "Failed to cancel job in Ballista scheduler"
-            );
+        // Signal cancellation to the running task
+        let active = self.active_jobs.read().await;
+        if let Some(info) = active.get(job_id) {
+            info.cancel_token.cancel();
         }
 
         // Update job state
@@ -198,6 +156,7 @@ impl JobExecutor {
         self.job_store.list_jobs(status_filter).await
     }
 
+    /// Executes a job using `Query::submit_distributed` and writes results to the store.
     async fn execute_job(
         job_store: &JobStore,
         df: Arc<DataFusion>,
@@ -214,62 +173,32 @@ impl JobExecutor {
             return Ok(());
         }
 
-        // Get the scheduler server - required for job submission
-        let Some(scheduler) = Self::scheduler_server(&df) else {
-            job_store
-                .fail_job(
-                    job_id,
-                    "SCHEDULER_UNAVAILABLE",
-                    "Scheduler server not available",
-                )
-                .await?;
-            return Ok(());
-        };
+        // Build and submit the query using Query::submit_distributed
+        let mut query_builder = QueryBuilder::new(&state.sql, Arc::clone(&df));
 
-        // Create a session context for this job using the scheduler's session manager.
-        // We use SessionConfig::new_with_ballista() to get a config compatible with Ballista.
-        let session_config = datafusion::prelude::SessionConfig::new_with_ballista();
-        let session_ctx = match scheduler
-            .state
-            .session_manager
-            .create_or_update_session(job_id, &session_config)
-            .await
-        {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                job_store
-                    .fail_job(job_id, "SESSION_ERROR", e.to_string())
-                    .await?;
-                return Ok(());
+        // Parse parameters if present
+        if let Some(p) = state.parameters {
+            match crate::datafusion::param_utils::convert_json_to_param_values(p) {
+                Ok(params) => {
+                    query_builder = query_builder.parameters(Some(params));
+                }
+                Err(e) => {
+                    job_store
+                        .fail_job(job_id, "INVALID_PARAMETERS", e.to_string())
+                        .await?;
+                    return Ok(());
+                }
             }
-        };
-
-        // Parse and create the logical plan
-        let logical_plan = match Self::create_logical_plan(&session_ctx, &state.sql).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                job_store
-                    .fail_job(job_id, "QUERY_PLANNING", e.to_string())
-                    .await?;
-                return Ok(());
-            }
-        };
-
-        // Check for cancellation before submitting
-        if cancel.is_cancelled() {
-            job_store.cancel_job(job_id).await?;
-            return Ok(());
         }
 
-        // Submit the job to the Ballista scheduler
-        let ballista_job_id = match scheduler
-            .submit_job(job_id, session_ctx, &logical_plan)
-            .await
-        {
-            Ok(id) => id,
+        let query = query_builder.build();
+
+        let query_handle = match query.submit_distributed(job_id).await {
+            Ok(handle) => handle,
             Err(e) => {
+                let error_code = Self::query_error_to_code(&e);
                 job_store
-                    .fail_job(job_id, "JOB_SUBMISSION", e.to_string())
+                    .fail_job(job_id, error_code, e.to_string())
                     .await?;
                 return Ok(());
             }
@@ -277,26 +206,38 @@ impl JobExecutor {
 
         tracing::debug!(
             job_id,
-            ballista_job_id = %ballista_job_id,
-            "Job submitted to Ballista scheduler"
+            ballista_job_id = %query_handle.ballista_job_id(),
+            is_cached = %query_handle.is_cached(),
+            "Query submitted for distributed execution"
         );
 
         // Store the Ballista job ID for cancellation
         let mut active = active_jobs.write().await;
         if let Some(info) = active.get_mut(job_id) {
-            info.ballista_job_id = Some(ballista_job_id.clone());
+            info.query_handle = Some(query_handle.clone());
         }
 
-        // Poll for job completion
-        let poll_result = Self::poll_job_status(&scheduler, &ballista_job_id, &cancel).await;
+        drop(active);
 
-        match poll_result {
-            Ok(output_locations) => {
-                // Get the schema from the logical plan for the result stream
-                let schema: SchemaRef = Arc::new(logical_plan.schema().as_arrow().clone());
-
-                // Create a stream that lazily fetches results from partition locations
-                let result_stream = Self::fetch_results_stream(&df, output_locations, schema);
+        tokio::select! {
+            () = cancel.cancelled() => {
+                tracing::debug!(job_id = %job_id, "Job cancelled before completion");
+                if let Err(e) = query_handle.cancel().await {
+                    tracing::error!("Failed to cancel the distributed query '{job_id}': {e}");
+                }
+                job_store.cancel_job(job_id).await?;
+                Ok(())
+            },
+            result_stream = query_handle.into_stream() => {
+                // Wait for completion and get the result stream
+                let result_stream = match result_stream {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let (error_code, error_msg) = Self::handle_error_to_code_and_msg(&e);
+                        job_store.fail_job(job_id, error_code, error_msg).await?;
+                        return Ok(());
+                    }
+                };
 
                 // Write result chunks as batches arrive from the stream
                 let job_result = match job_store
@@ -314,292 +255,35 @@ impl JobExecutor {
 
                 // Mark job as succeeded
                 job_store.complete_job(job_id, job_result).await?;
-            }
-            Err(JobPollError::Cancelled) => {
-                job_store.cancel_job(job_id).await?;
-            }
-            Err(JobPollError::Failed(msg)) => {
-                job_store.fail_job(job_id, "QUERY_EXECUTION", msg).await?;
-            }
-        }
 
-        Ok(())
-    }
-
-    /// Creates a logical plan from a SQL string.
-    async fn create_logical_plan(
-        ctx: &SessionContext,
-        sql: &str,
-    ) -> std::result::Result<
-        datafusion::logical_expr::LogicalPlan,
-        datafusion::error::DataFusionError,
-    > {
-        ctx.state().create_logical_plan(sql).await
-    }
-
-    /// Polls the Ballista scheduler for job completion.
-    ///
-    /// Returns the output partition locations on success.
-    async fn poll_job_status(
-        scheduler: &SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
-        ballista_job_id: &str,
-        cancel: &CancellationToken,
-    ) -> std::result::Result<Vec<PartitionLocation>, JobPollError> {
-        let mut missing_retry_count = 0;
-        let mut poll_count: u64 = 0;
-        loop {
-            poll_count += 1;
-            if poll_count > MAX_JOB_POLL_ITERATIONS {
-                let _ = scheduler.cancel_job(ballista_job_id.to_string()).await;
-                return Err(JobPollError::Failed(format!(
-                    "Job {ballista_job_id} timed out after {poll_count} poll iterations"
-                )));
-            }
-
-            // Check for cancellation
-            if cancel.is_cancelled() {
-                // Try to cancel in Ballista
-                let _ = scheduler.cancel_job(ballista_job_id.to_string()).await;
-                return Err(JobPollError::Cancelled);
-            }
-
-            // Get job status from scheduler's task manager
-            let status = scheduler
-                .state
-                .task_manager
-                .get_job_status(ballista_job_id)
-                .await
-                .map_err(|e| JobPollError::Failed(e.to_string()))?;
-
-            if let Some(job_status) = status {
-                match job_status.status {
-                    Some(job_status::Status::Successful(success)) => {
-                        // Convert protobuf partition locations to core types.
-                        // All partition locations must convert successfully to ensure
-                        // complete results are returned (data correctness requirement).
-                        let mut locations = Vec::with_capacity(success.partition_location.len());
-                        for (i, loc) in success.partition_location.into_iter().enumerate() {
-                            match loc.try_into() {
-                                Ok(partition_loc) => locations.push(partition_loc),
-                                Err(e) => {
-                                    return Err(JobPollError::Failed(format!(
-                                        "Failed to convert partition location {i}: {e}"
-                                    )));
-                                }
-                            }
-                        }
-                        return Ok(locations);
-                    }
-                    Some(job_status::Status::Failed(failed)) => {
-                        return Err(JobPollError::Failed(failed.error));
-                    }
-                    Some(job_status::Status::Queued(_) | job_status::Status::Running(_)) | None => {
-                        // Still in progress or unknown status, continue polling
-                    }
-                }
-            } else {
-                missing_retry_count += 1;
-                // If job status is missing for several polls, assume it was cleaned up, failed to submit, or some other issue
-                if missing_retry_count >= 5 {
-                    return Err(JobPollError::Failed(format!(
-                        "Ballista job {ballista_job_id} not found after multiple polls"
-                    )));
-                }
-            }
-
-            // Wait before next poll, checking for cancellation
-            tokio::select! {
-                () = tokio::time::sleep(JOB_POLL_INTERVAL) => {}
-                () = cancel.cancelled() => {
-                    let _ = scheduler.cancel_job(ballista_job_id.to_string()).await;
-                    return Err(JobPollError::Cancelled);
-                }
+                Ok(())
             }
         }
     }
 
-    /// Fetches results from the output partition locations as a stream.
-    ///
-    /// Returns a `SendableRecordBatchStream` that lazily fetches batches from
-    /// partition locations, avoiding loading all results into memory at once.
-    fn fetch_results_stream(
-        df: &Arc<DataFusion>,
-        locations: Vec<PartitionLocation>,
-        schema: SchemaRef,
-    ) -> SendableRecordBatchStream {
-        let use_tls = df.cluster_config.client_tls_config().is_some();
-
-        // If TLS is configured, create a custom endpoint override function
-        let customize_endpoint = if let Some(tls_config) = df.cluster_config.client_tls_config() {
-            let tls = tls_config.clone();
-            let override_fn: ballista_core::extension::EndpointOverrideFn =
-                Arc::new(move |endpoint: tonic::transport::Endpoint| {
-                    endpoint
-                        .tls_config(tls.clone())
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                });
-            Some(Arc::new(
-                ballista_core::extension::BallistaConfigGrpcEndpoint::new(override_fn),
-            ))
-        } else {
-            None
-        };
-
-        let stream = PartitionResultStream::new(locations, use_tls, customize_endpoint);
-        Box::pin(RecordBatchStreamAdapter::new(schema, stream))
-    }
-}
-
-type NextPartitionResultStream = Pin<
-    Box<
-        dyn std::future::Future<
-                Output = std::result::Result<
-                    SendableRecordBatchStream,
-                    datafusion::error::DataFusionError,
-                >,
-            > + Send,
-    >,
->;
-
-/// A stream that lazily fetches `RecordBatch`es from multiple partition locations.
-///
-/// Connects to partition executors one at a time and streams their batches,
-/// avoiding loading all results into memory at once.
-///
-/// Partitions already return a `SendableRecordBatchStream`, so when we connect to a partition we pull its stream and return the items from it until it is exhausted.
-///
-/// The next partition is then connected to and its stream consumed, until all partitions are processed.
-struct PartitionResultStream {
-    /// Remaining partition locations to fetch from
-    locations: std::collections::VecDeque<PartitionLocation>,
-    /// Whether to use TLS for connections
-    use_tls: bool,
-    /// Optional endpoint customization for TLS
-    customize_endpoint: Option<Arc<ballista_core::extension::BallistaConfigGrpcEndpoint>>,
-    /// Current record batch stream being consumed (lazily initialized)
-    current_record_batch_stream: Option<SendableRecordBatchStream>,
-    /// Future for establishing the next partition stream (when transitioning between partitions)
-    next_partition_stream: Option<NextPartitionResultStream>,
-}
-
-impl PartitionResultStream {
-    fn new(
-        locations: Vec<PartitionLocation>,
-        use_tls: bool,
-        customize_endpoint: Option<Arc<ballista_core::extension::BallistaConfigGrpcEndpoint>>,
-    ) -> Self {
-        Self {
-            locations: locations.into(),
-            use_tls,
-            customize_endpoint,
-            current_record_batch_stream: None,
-            next_partition_stream: None,
+    /// Converts a `Query::Error` to an error code string.
+    fn query_error_to_code(e: &crate::datafusion::query::Error) -> &'static str {
+        use crate::datafusion::query::Error;
+        match e {
+            Error::SchedulerUnavailable => "SCHEDULER_UNAVAILABLE",
+            Error::SessionCreationFailed { .. } => "SESSION_ERROR",
+            Error::JobSubmissionFailed { .. } => "JOB_SUBMISSION",
+            Error::UnableToExecuteQuery { .. } => "QUERY_PLANNING",
+            Error::BindingParameters { .. } => "PARAMETER_BINDING",
+            Error::TableAccessDisallowed { .. } => "TABLE_ACCESS_DENIED",
+            _ => "INTERNAL_ERROR",
         }
     }
 
-    /// Creates a future that connects to a partition location and returns its stream.
-    fn connect_to_partition(
-        location: PartitionLocation,
-        use_tls: bool,
-        customize_endpoint: Option<Arc<ballista_core::extension::BallistaConfigGrpcEndpoint>>,
-    ) -> NextPartitionResultStream {
-        Box::pin(async move {
-            let executor_meta = &location.executor_meta;
-
-            // Create Ballista client to connect to executor
-            let mut client = ballista_core::client::BallistaClient::try_new(
-                &executor_meta.host,
-                executor_meta.port,
-                MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE,
-                use_tls,
-                customize_endpoint,
-            )
-            .await
-            .map_err(|e| {
-                datafusion::error::DataFusionError::External(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    format!(
-                        "Failed to create Ballista client for executor {}:{}: {e}",
-                        executor_meta.host, executor_meta.port
-                    ),
-                )))
-            })?;
-
-            let stream = client
-                .fetch_partition(
-                    &executor_meta.id,
-                    &location.partition_id,
-                    &location.path,
-                    &executor_meta.host,
-                    executor_meta.port,
-                    USE_FLIGHT_TRANSFER,
-                )
-                .await
-                .map_err(|e| {
-                    datafusion::error::DataFusionError::External(Box::new(std::io::Error::other(
-                        format!(
-                            "Failed to fetch partition {}: {e}",
-                            location.partition_id.partition_id
-                        ),
-                    )))
-                })?;
-
-            Ok(stream)
-        })
-    }
-}
-
-impl Stream for PartitionResultStream {
-    type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            // If we have a pending stream, poll it first
-            if let Some(ref mut pending) = self.next_partition_stream {
-                match pending.as_mut().poll(cx) {
-                    Poll::Ready(Ok(stream)) => {
-                        self.current_record_batch_stream = Some(stream);
-                        self.next_partition_stream = None;
-                        // Continue to poll the new stream
-                    }
-                    Poll::Ready(Err(e)) => {
-                        self.next_partition_stream = None;
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-
-            // If we have a current stream, poll it
-            if let Some(ref mut stream) = self.current_record_batch_stream {
-                match stream.poll_next_unpin(cx) {
-                    Poll::Ready(Some(batch)) => return Poll::Ready(Some(batch)),
-                    Poll::Ready(None) => {
-                        // Current stream exhausted, move to next partition
-                        self.current_record_batch_stream = None;
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-
-            // No current stream, try to start the next partition
-            if let Some(location) = self.locations.pop_front() {
-                self.next_partition_stream = Some(Self::connect_to_partition(
-                    location,
-                    self.use_tls,
-                    self.customize_endpoint.clone(),
-                ));
-                // Loop back to poll the pending connection
-            } else {
-                // No more partitions, stream is complete
-                return Poll::Ready(None);
-            }
+    /// Converts a `QueryHandleError` to an error code string and message.
+    fn handle_error_to_code_and_msg(e: &QueryHandleError) -> (&'static str, String) {
+        match e {
+            QueryHandleError::JobTimeout { .. } => ("JOB_TIMEOUT", e.to_string()),
+            QueryHandleError::JobCancelled => ("JOB_CANCELLED", e.to_string()),
+            QueryHandleError::JobFailed { message } => ("QUERY_EXECUTION", message.clone()),
+            QueryHandleError::StatusError { message } => ("STATUS_ERROR", message.clone()),
+            QueryHandleError::PartitionLocationError { .. } => ("PARTITION_ERROR", e.to_string()),
+            QueryHandleError::JobNotFound { .. } => ("JOB_NOT_FOUND", e.to_string()),
         }
     }
-}
-
-/// Error type for job polling.
-enum JobPollError {
-    Cancelled,
-    Failed(String),
 }
