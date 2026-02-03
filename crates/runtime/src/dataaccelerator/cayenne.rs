@@ -23,6 +23,7 @@ use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_bucket_name};
+use data_components::delete::DeletionTableProviderAdapter;
 use data_components::poly::PolyTableProvider;
 use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
@@ -2330,9 +2331,12 @@ impl PartitionCreator for CayennePartitionCreator {
                     source: Box::new(e),
                 })?;
 
+        let adapted_table: Arc<dyn TableProvider> =
+            Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
+
         Ok(Partition {
             partition_value,
-            table_provider: Arc::new(cayenne_table),
+            table_provider: adapted_table,
         })
     }
 
@@ -2382,9 +2386,12 @@ impl PartitionCreator for CayennePartitionCreator {
                 }
             })?;
 
+            let adapted_table: Arc<dyn TableProvider> =
+                Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
+
             result.push(Partition {
                 partition_value,
-                table_provider: Arc::new(cayenne_table),
+                table_provider: adapted_table,
             });
         }
 
