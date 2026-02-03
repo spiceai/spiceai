@@ -331,6 +331,16 @@ mod tests {
         );
     }
 
+    /// Test that invalid `row_id` formats produce appropriate error messages.
+    ///
+    /// Note: These tests use `contains()` for error message assertions rather than exact
+    /// matching because:
+    /// 1. The yaml crate wraps error messages with location information (line/column) that
+    ///    can vary based on whitespace and indentation in the test YAML
+    /// 2. The important assertion is that the correct semantic error is raised (e.g.,
+    ///    "Invalid format for `row_id`" for validation errors, or "expected ',' or ']'" for
+    ///    YAML syntax errors)
+    /// 3. Exact location matching would make tests fragile to formatting changes
     #[test]
     fn test_deserialize_row_ids_errors() {
         match yaml::from_str::<ColumnLevelEmbeddingConfig>(

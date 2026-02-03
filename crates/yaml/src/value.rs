@@ -656,4 +656,81 @@ mod tests {
         assert_eq!(set.len(), 3);
         assert!(set.contains(&Value::String("test".into())));
     }
+
+    /// Test that float equality uses bitwise comparison to maintain Eq/Hash contract.
+    /// This means -0.0 and 0.0 are treated as different values, and NaN values with
+    /// the same bit pattern are equal. This differs from IEEE 754 semantics but is
+    /// required for correct HashMap/HashSet behavior.
+    #[test]
+    fn test_float_equality_bitwise_semantics() {
+        // -0.0 and 0.0 have different bit patterns, so they are NOT equal
+        // This differs from IEEE 754 where -0.0 == 0.0
+        let neg_zero = Number::Float(-0.0_f64);
+        let pos_zero = Number::Float(0.0_f64);
+        assert_ne!(
+            neg_zero, pos_zero,
+            "-0.0 and 0.0 should be unequal (bitwise comparison)"
+        );
+
+        // Verify they have different bit patterns
+        assert_ne!((-0.0_f64).to_bits(), 0.0_f64.to_bits());
+
+        // NaN values with the same bit pattern should be equal
+        let nan1 = Number::Float(f64::NAN);
+        let nan2 = Number::Float(f64::NAN);
+        assert_eq!(nan1, nan2, "NaN with same bits should be equal");
+
+        // Regular floats work as expected
+        let a = Number::Float(1.5);
+        let b = Number::Float(1.5);
+        assert_eq!(a, b);
+    }
+
+    /// Test that float hashing is consistent with equality for HashMap/HashSet correctness.
+    #[test]
+    fn test_float_hash_consistency() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_number(n: &Number) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            n.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        // Equal values must have equal hashes
+        let a = Number::Float(1.5);
+        let b = Number::Float(1.5);
+        assert_eq!(hash_number(&a), hash_number(&b));
+
+        // NaN values with same bit pattern must have equal hashes
+        let nan1 = Number::Float(f64::NAN);
+        let nan2 = Number::Float(f64::NAN);
+        assert_eq!(hash_number(&nan1), hash_number(&nan2));
+
+        // -0.0 and 0.0 should hash differently (since they are unequal)
+        let neg_zero = Number::Float(-0.0_f64);
+        let pos_zero = Number::Float(0.0_f64);
+        // They are unequal, so their hashes don't need to match (but shouldn't cause issues)
+        let _ = hash_number(&neg_zero);
+        let _ = hash_number(&pos_zero);
+    }
+
+    /// Test that floats work correctly as map keys in `HashSet`.
+    #[test]
+    fn test_float_in_hashset() {
+        use std::collections::HashSet;
+
+        let mut set: HashSet<Number> = HashSet::new();
+        set.insert(Number::Float(1.0));
+        set.insert(Number::Float(2.0));
+        set.insert(Number::Float(-0.0));
+        set.insert(Number::Float(0.0));
+
+        // -0.0 and 0.0 are treated as different keys
+        assert_eq!(set.len(), 4, "Should have 4 distinct entries");
+        assert!(set.contains(&Number::Float(1.0)));
+        assert!(set.contains(&Number::Float(-0.0)));
+        assert!(set.contains(&Number::Float(0.0)));
+    }
 }

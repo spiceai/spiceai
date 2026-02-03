@@ -24,16 +24,29 @@ use crate::error::{Error, Result};
 use crate::value::{Mapping, Number, Value};
 
 /// Convert our Value type to yaml-rust2's Yaml type.
-pub(crate) fn value_to_yaml(value: &Value) -> Yaml {
-    match value {
+///
+/// # Errors
+///
+/// Returns an error if a `u64` value exceeds `i64::MAX` and cannot be represented
+/// in YAML's integer format.
+pub(crate) fn value_to_yaml(value: &Value) -> Result<Yaml> {
+    Ok(match value {
         Value::Null => Yaml::Null,
         Value::Bool(b) => Yaml::Boolean(*b),
         Value::Number(n) => match n {
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "YAML only supports i64, large u64 values are rare"
-            )]
-            Number::PosInt(i) => Yaml::Integer(*i as i64),
+            Number::PosInt(i) => {
+                // YAML only supports i64 integers. For u64 values that exceed i64::MAX,
+                // we must return an error to avoid silent data corruption.
+                match i64::try_from(*i) {
+                    Ok(signed) => Yaml::Integer(signed),
+                    Err(_) => {
+                        return Err(Error::serialize(format!(
+                            "u64 value {i} exceeds i64::MAX ({}) and cannot be represented in YAML",
+                            i64::MAX
+                        )));
+                    }
+                }
+            }
             Number::NegInt(i) => Yaml::Integer(*i),
             Number::Float(f) => {
                 if f.is_nan() {
@@ -50,22 +63,28 @@ pub(crate) fn value_to_yaml(value: &Value) -> Yaml {
             }
         },
         Value::String(s) => Yaml::String(s.clone()),
-        Value::Sequence(seq) => Yaml::Array(seq.iter().map(value_to_yaml).collect()),
+        Value::Sequence(seq) => {
+            let mut arr = Vec::with_capacity(seq.len());
+            for item in seq {
+                arr.push(value_to_yaml(item)?);
+            }
+            Yaml::Array(arr)
+        }
         Value::Mapping(map) => {
             let mut hash = yaml_rust2::yaml::Hash::new();
             for (k, v) in map {
-                hash.insert(value_to_yaml(k), value_to_yaml(v));
+                hash.insert(value_to_yaml(k)?, value_to_yaml(v)?);
             }
             Yaml::Hash(hash)
         }
-    }
+    })
 }
 
 /// Emit a Value as a YAML string.
 ///
 /// The output always ends with a newline to ensure safe file concatenation.
 pub(crate) fn emit_yaml(value: &Value) -> Result<String> {
-    let yaml = value_to_yaml(value);
+    let yaml = value_to_yaml(value)?;
     let mut out = String::new();
     let mut emitter = YamlEmitter::new(&mut out);
     emitter.dump(&yaml)?;
@@ -574,16 +593,38 @@ mod tests {
     #[test]
     fn test_value_to_yaml() {
         let value = Value::Bool(true);
-        let yaml = value_to_yaml(&value);
+        let yaml = value_to_yaml(&value).expect("convert bool");
         assert_eq!(yaml, Yaml::Boolean(true));
 
         let value = Value::Number(Number::PosInt(42));
-        let yaml = value_to_yaml(&value);
+        let yaml = value_to_yaml(&value).expect("convert pos int");
         assert_eq!(yaml, Yaml::Integer(42));
 
         let value = Value::String("hello".into());
-        let yaml = value_to_yaml(&value);
+        let yaml = value_to_yaml(&value).expect("convert string");
         assert_eq!(yaml, Yaml::String("hello".into()));
+    }
+
+    #[test]
+    fn test_value_to_yaml_large_u64_error() {
+        // Values larger than i64::MAX should return an error instead of silently corrupting
+        let value = Value::Number(Number::PosInt(u64::MAX));
+        let result = value_to_yaml(&value);
+        let err = result.expect_err("should fail for u64::MAX");
+        assert!(
+            err.to_string().contains("exceeds i64::MAX"),
+            "Error should mention i64::MAX: {err}"
+        );
+
+        // Test boundary case: i64::MAX + 1
+        let value = Value::Number(Number::PosInt(i64::MAX as u64 + 1));
+        let result = value_to_yaml(&value);
+        let _ = result.expect_err("should fail for i64::MAX + 1");
+
+        // i64::MAX should succeed
+        let value = Value::Number(Number::PosInt(i64::MAX as u64));
+        let yaml = value_to_yaml(&value).expect("i64::MAX should succeed");
+        assert_eq!(yaml, Yaml::Integer(i64::MAX));
     }
 
     #[test]
