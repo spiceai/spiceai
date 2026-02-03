@@ -281,7 +281,10 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     // Fetch DynamoDB metrics from Spice's Prometheus endpoint before restart
     let dynamodb_metrics = match get_dynamodb_metrics().await {
         Ok(metrics) => {
-            println!("DynamoDB records consumed: {}", metrics.records_consumed_total);
+            println!(
+                "DynamoDB records consumed: {}",
+                metrics.records_consumed_total
+            );
             if metrics.errors_transient_total > 0 {
                 println!(
                     "DynamoDB transient errors: {}",
@@ -342,10 +345,14 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
             crate::metrics::P90_DURATION.record(query.percentile_90_duration_ms, &attributes);
             crate::metrics::P95_DURATION.record(query.percentile_95_duration_ms, &attributes);
             crate::metrics::P99_DURATION.record(query.percentile_99_duration_ms, &attributes);
-            crate::metrics::ROW_COUNT.record((*row_count).try_into().unwrap_or(u64::MAX), &attributes);
+            crate::metrics::ROW_COUNT
+                .record((*row_count).try_into().unwrap_or(u64::MAX), &attributes);
         }
 
-        (verification_result.spiced_instance, verification_result.all_passed)
+        (
+            verification_result.spiced_instance,
+            verification_result.all_passed,
+        )
     } else {
         (spiced_instance, true)
     };
@@ -366,12 +373,12 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     let _ = std::fs::remove_file(&temp_path);
 
     // Record streaming metrics
-    crate::metrics::STREAM_LAG.record(
-        stream_lag.as_millis().try_into().unwrap_or(u64::MAX),
-        &[],
-    );
+    crate::metrics::STREAM_LAG.record(stream_lag.as_millis().try_into().unwrap_or(u64::MAX), &[]);
     crate::metrics::INGESTION_DURATION.record(
-        ingestion_duration.as_millis().try_into().unwrap_or(u64::MAX),
+        ingestion_duration
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
         &[],
     );
     crate::metrics::RECORDS_PER_SECOND.record(throughput, &[]);
@@ -384,18 +391,15 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     // Report result
     println!("\nBenchmark Result:");
     println!("  Config: {}", config_name);
-    println!("  Ingestion Duration: {:.2}s", ingestion_duration.as_secs_f64());
+    println!(
+        "  Ingestion Duration: {:.2}s",
+        ingestion_duration.as_secs_f64()
+    );
     println!("  Stream Lag: {:.2}s", stream_lag.as_secs_f64());
     println!(
         "  Verification: {}",
-        if verification_passed {
-            "PASS"
-        } else {
-            "FAIL"
-        }
+        if verification_passed { "PASS" } else { "FAIL" }
     );
-
-
 
     Ok(())
 }

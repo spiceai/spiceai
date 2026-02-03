@@ -22,15 +22,15 @@ limitations under the License.
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use test_framework::TestType;
 use test_framework::anyhow::Result;
 use test_framework::metrics::{
     DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus,
 };
 use test_framework::queries::{Query, QueryOverrides, QuerySet, get_tpch_test_queries};
 use test_framework::spiced::SpicedInstance;
-use test_framework::spicetest::datasets::{EndCondition, NotStarted};
 use test_framework::spicetest::SpiceTest;
-use test_framework::TestType;
+use test_framework::spicetest::datasets::{EndCondition, NotStarted};
 
 /// Result of running TPCH verification using SpiceTest.
 pub struct VerificationResult {

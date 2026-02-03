@@ -374,7 +374,9 @@ pub static SPICED_ACTIVE_CONNECTIONS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
 pub static INGESTION_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("ingestion_duration_ms")
-        .with_description("Duration from Spice ready until all markers detected (CDC ingestion time).")
+        .with_description(
+            "Duration from Spice ready until all markers detected (CDC ingestion time).",
+        )
         .with_unit("ms")
         .build()
 });

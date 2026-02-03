@@ -268,15 +268,13 @@ impl MutationGenerator {
             for row in 0..batch.num_rows() {
                 if update_path_indices.contains(&global_row_idx) {
                     // Update path: INSERT wrong → UPDATE correct
-                    let wrong_row =
-                        self.generate_wrong_row(&schema, batch, row, &pk_columns)?;
+                    let wrong_row = self.generate_wrong_row(&schema, batch, row, &pk_columns)?;
                     let correct_row = Self::extract_row(batch, row)?;
                     update_path_wrong.push(wrong_row);
                     update_path_correct.push(correct_row);
                 } else if delete_path_indices.contains(&global_row_idx) {
                     // Delete path: INSERT wrong → DELETE → INSERT correct
-                    let wrong_row =
-                        self.generate_wrong_row(&schema, batch, row, &pk_columns)?;
+                    let wrong_row = self.generate_wrong_row(&schema, batch, row, &pk_columns)?;
                     let key_row = Self::extract_key_row(batch, row, &pk_columns)?;
                     let correct_row = Self::extract_row(batch, row)?;
                     delete_path_wrong.push(wrong_row);

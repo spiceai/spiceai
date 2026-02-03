@@ -251,9 +251,8 @@ pub async fn poll_for_all_snapshots(dataset_names: &[&str], timeout: Duration) -
         // Check each pending dataset
         let mut newly_completed = Vec::new();
         for dataset_name in &pending {
-            let url = format!(
-                "http://localhost:8090/v1/datasets/{dataset_name}/acceleration/snapshots"
-            );
+            let url =
+                format!("http://localhost:8090/v1/datasets/{dataset_name}/acceleration/snapshots");
 
             if let Ok(response) = client.get(&url).send().await
                 && response.status().is_success()

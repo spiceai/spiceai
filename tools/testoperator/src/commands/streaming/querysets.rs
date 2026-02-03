@@ -18,8 +18,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use super::datasets::{
-    CustomerDataset, LineitemDataset, NationDataset, OrdersDataset, PartDataset,
-    PartsuppDataset, RegionDataset, SupplierDataset,
+    CustomerDataset, LineitemDataset, NationDataset, OrdersDataset, PartDataset, PartsuppDataset,
+    RegionDataset, SupplierDataset,
 };
 use super::traits::StreamingDataset;
 

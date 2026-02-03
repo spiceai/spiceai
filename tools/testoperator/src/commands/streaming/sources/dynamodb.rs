@@ -58,14 +58,16 @@ const TAG_SCALE_FACTOR: &str = "testoperator:scale_factor";
 const STALE_TABLE_AGE_SECS: u64 = 24 * 60 * 60;
 
 use spicepod::acceleration::SnapshotBehavior;
-use spicepod::component::snapshot::Snapshots;
 use spicepod::component::ComponentOrReference;
+use spicepod::component::snapshot::Snapshots;
 use spicepod::metric::{Metric, Metrics};
 use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
 
 use crate::commands::streaming::datasets::DatasetType;
-use crate::commands::streaming::traits::{DynamoDBStreamingSource, SnapshotConfig, StreamingSource};
+use crate::commands::streaming::traits::{
+    DynamoDBStreamingSource, SnapshotConfig, StreamingSource,
+};
 
 /// Configuration for AWS `DynamoDB` source.
 ///
@@ -191,7 +193,10 @@ impl DynamoDbStreamsSource {
         let integer_part = value / divisor;
         let fractional_part = (value % divisor).abs();
 
-        format!("{integer_part}.{fractional_part:0>width$}", width = scale as usize)
+        format!(
+            "{integer_part}.{fractional_part:0>width$}",
+            width = scale as usize
+        )
     }
 
     /// Convert an Arrow array value to a `DynamoDB` `AttributeValue`.
@@ -272,7 +277,9 @@ impl DynamoDbStreamsSource {
     }
 
     /// Check if an error is a "resource not found" error.
-    fn is_resource_not_found<E: std::fmt::Debug>(err: &aws_sdk_dynamodb::error::SdkError<E>) -> bool {
+    fn is_resource_not_found<E: std::fmt::Debug>(
+        err: &aws_sdk_dynamodb::error::SdkError<E>,
+    ) -> bool {
         // Check the raw response for 400 status with ResourceNotFoundException
         if let aws_sdk_dynamodb::error::SdkError::ServiceError(service_err) = err {
             let raw = service_err.raw();
@@ -351,26 +358,23 @@ impl DynamoDbStreamsSource {
             if let Some(table_names) = response.table_names {
                 for table_name in table_names {
                     // Get table ARN via describe_table
-                    let table_arn = match client
-                        .describe_table()
-                        .table_name(&table_name)
-                        .send()
-                        .await
-                    {
-                        Ok(desc) => {
-                            desc.table()
-                                .and_then(|t| t.table_arn())
-                                .map(String::from)
-                        }
-                        Err(_) => continue, // Skip if we can't describe the table
-                    };
+                    let table_arn =
+                        match client.describe_table().table_name(&table_name).send().await {
+                            Ok(desc) => desc.table().and_then(|t| t.table_arn()).map(String::from),
+                            Err(_) => continue, // Skip if we can't describe the table
+                        };
 
                     let Some(arn) = table_arn else {
                         continue;
                     };
 
                     // Get tags for this table using the ARN
-                    match client.list_tags_of_resource().resource_arn(&arn).send().await {
+                    match client
+                        .list_tags_of_resource()
+                        .resource_arn(&arn)
+                        .send()
+                        .await
+                    {
                         Ok(tags_response) => {
                             if let Some(tags) = tags_response.tags {
                                 // Look for our created_at tag
@@ -482,7 +486,9 @@ impl DynamoDbStreamsSource {
                     println!("Table '{table_name}' does not exist, skipping deletion");
                     Ok(())
                 } else {
-                    Err(anyhow::anyhow!("Failed to describe table {table_name}: {e}"))
+                    Err(anyhow::anyhow!(
+                        "Failed to describe table {table_name}: {e}"
+                    ))
                 }
             }
         }
@@ -652,11 +658,7 @@ impl DynamoDbStreamsSource {
 
     /// Perform batch deletes with parallelization.
     #[expect(clippy::cast_precision_loss)]
-    async fn batch_delete_items(
-        client: &Client,
-        table: &str,
-        keys: &[RecordBatch],
-    ) -> Result<()> {
+    async fn batch_delete_items(client: &Client, table: &str, keys: &[RecordBatch]) -> Result<()> {
         use aws_sdk_dynamodb::types::DeleteRequest;
 
         let total_rows: usize = keys.iter().map(RecordBatch::num_rows).sum();
@@ -955,7 +957,10 @@ impl DynamoDbStreamsSource {
                 })?;
         }
 
-        println!("Deleted {} marker records from '{table_name}'", MARKER_ORDER_KEYS.len());
+        println!(
+            "Deleted {} marker records from '{table_name}'",
+            MARKER_ORDER_KEYS.len()
+        );
         Ok(())
     }
 
@@ -1032,7 +1037,8 @@ impl StreamingSource for DynamoDbStreamsSource {
         // Create the table with prefixed name
         match dataset {
             DatasetType::Lineitem => {
-                self.create_lineitem_table_named(client, &table_name).await?;
+                self.create_lineitem_table_named(client, &table_name)
+                    .await?;
             }
             DatasetType::Orders => {
                 self.create_simple_table(client, &table_name, "o_orderkey")
@@ -1233,10 +1239,9 @@ fn transform_spicepod(
                         let duckdb_file = format!(
                             "/tmp/{run_id}_{config_name}_{dataset_name}_{phase_suffix}-19.db"
                         );
-                        params.data.insert(
-                            "duckdb_file".to_string(),
-                            ParamValue::String(duckdb_file),
-                        );
+                        params
+                            .data
+                            .insert("duckdb_file".to_string(), ParamValue::String(duckdb_file));
                     }
                     Some("cayenne") => {
                         let cayenne_dir = format!(
@@ -1289,7 +1294,11 @@ fn transform_spicepod(
     spicepod.snapshots = Some(Snapshots {
         enabled: true,
         location: Some(location),
-        params: if params.data.is_empty() { None } else { Some(params) },
+        params: if params.data.is_empty() {
+            None
+        } else {
+            Some(params)
+        },
         ..Default::default()
     });
 

@@ -52,8 +52,8 @@ use super::mutations;
 use super::sources::{DynamoDbConfig, DynamoDbStreamsSource};
 use super::traits::{DynamoDBStreamingSource, SnapshotConfig, StreamingDataset, StreamingSource};
 use super::utils::{
-    generate_run_id, load_spicepod_definition, poll_for_all_snapshots,
-    skip_rows, write_temp_spicepod, DatasetInfo,
+    DatasetInfo, generate_run_id, load_spicepod_definition, poll_for_all_snapshots, skip_rows,
+    write_temp_spicepod,
 };
 use crate::args::StreamingDynamodbDispatchArgs;
 
@@ -256,7 +256,6 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
             source.insert(&table_name, &remaining_data).await?;
             total_insert_duration += insert_start.elapsed();
         }
-
     };
 
     println!("Data insertion completed in {total_insert_duration:?}");
@@ -286,8 +285,10 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
         println!("\nPhase 8: Workflow dispatch complete");
         println!("Run ID: {run_id}");
         println!("Configs dispatched: {}", config_names.join(", "));
-        println!("\nMonitor workflows at: https://github.com/{}/actions",
-            args.repo.as_deref().unwrap_or("spiceai/spiceai"));
+        println!(
+            "\nMonitor workflows at: https://github.com/{}/actions",
+            args.repo.as_deref().unwrap_or("spiceai/spiceai")
+        );
 
         // Don't cleanup - tables need to remain for workflows to use
         println!("\nNote: DynamoDB tables preserved for workflow execution");
@@ -326,7 +327,10 @@ fn trigger_workflow(
     cmd.args(["-f", &format!("spicepod_path={}", spicepod_path.display())]);
     cmd.args(["-f", &format!("queryset={}", args.queryset)]);
     cmd.args(["-f", &format!("scale_factor={}", args.scale_factor)]);
-    cmd.args(["-f", &format!("ingestion_timeout={}", args.ingestion_timeout)]);
+    cmd.args([
+        "-f",
+        &format!("ingestion_timeout={}", args.ingestion_timeout),
+    ]);
 
     if args.verify {
         cmd.args(["-f", "verify=true"]);
@@ -360,7 +364,18 @@ fn wait_for_workflow_completion(workflow: &str, repo: Option<&str>) -> Result<()
 
     // Get the most recent run of this workflow
     let mut list_cmd = Command::new("gh");
-    list_cmd.args(["run", "list", "--workflow", workflow, "--limit", "1", "--json", "databaseId", "--jq", ".[0].databaseId"]);
+    list_cmd.args([
+        "run",
+        "list",
+        "--workflow",
+        workflow,
+        "--limit",
+        "1",
+        "--json",
+        "databaseId",
+        "--jq",
+        ".[0].databaseId",
+    ]);
 
     if let Some(repo) = repo {
         list_cmd.args(["--repo", repo]);
@@ -371,7 +386,9 @@ fn wait_for_workflow_completion(workflow: &str, repo: Option<&str>) -> Result<()
         return Err(anyhow::anyhow!("Failed to get workflow run ID"));
     }
 
-    let run_id = String::from_utf8_lossy(&list_output.stdout).trim().to_string();
+    let run_id = String::from_utf8_lossy(&list_output.stdout)
+        .trim()
+        .to_string();
     if run_id.is_empty() {
         return Err(anyhow::anyhow!("No workflow runs found"));
     }
