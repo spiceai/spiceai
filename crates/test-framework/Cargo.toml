@@ -45,7 +45,7 @@ rustls.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 spiceai = { workspace = true }
 spicepod = { path = "../spicepod" }
 sysinfo = "0.37.2"

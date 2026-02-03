@@ -183,12 +183,12 @@ fn deserialize_row_ids<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D
 where
     D: serde::Deserializer<'de>,
 {
-    match serde_yaml::Value::deserialize(deserializer)? {
-            serde_yaml::Value::Null => Ok(None),
-            serde_yaml::Value::String(s) => {
+    match yaml::Value::deserialize(deserializer)? {
+            yaml::Value::Null => Ok(None),
+            yaml::Value::String(s) => {
                 Ok(Some(s.split(',').map(|s| s.trim().to_string()).collect()))
             }
-            serde_yaml::Value::Sequence(seq) => {
+            yaml::Value::Sequence(seq) => {
                 seq.iter()
                     .map(|v| {
                         v.as_str().map(ToString::to_string).ok_or_else(|| {
@@ -288,7 +288,7 @@ pub enum MetadataType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_deserialize_row_ids_single_string() {
@@ -297,7 +297,7 @@ mod tests {
                 row_id: foo
             ";
         let parsed: ColumnLevelEmbeddingConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
+            yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
         assert_eq!(parsed.row_ids, Some(vec!["foo".to_string()]));
     }
 
@@ -308,7 +308,7 @@ mod tests {
                 row_id: foo, bar
             ";
         let parsed: ColumnLevelEmbeddingConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
+            yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
         assert_eq!(
             parsed.row_ids,
             Some(vec!["foo".to_string(), "bar".to_string()])
@@ -324,16 +324,26 @@ mod tests {
                  - bar
             ";
         let parsed: ColumnLevelEmbeddingConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
+            yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
         assert_eq!(
             parsed.row_ids,
             Some(vec!["foo".to_string(), "bar".to_string()])
         );
     }
 
+    /// Test that invalid `row_id` formats produce appropriate error messages.
+    ///
+    /// Note: These tests use `contains()` for error message assertions rather than exact
+    /// matching because:
+    /// 1. The yaml crate wraps error messages with location information (line/column) that
+    ///    can vary based on whitespace and indentation in the test YAML
+    /// 2. The important assertion is that the correct semantic error is raised (e.g.,
+    ///    "Invalid format for `row_id`" for validation errors, or "expected ',' or ']'" for
+    ///    YAML syntax errors)
+    /// 3. Exact location matching would make tests fragile to formatting changes
     #[test]
     fn test_deserialize_row_ids_errors() {
-        match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
+        match yaml::from_str::<ColumnLevelEmbeddingConfig>(
             r"
                 from: foo
                 row_id:
@@ -341,35 +351,37 @@ mod tests {
             ",
         ) {
             Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-            Err(e) => assert_eq!(
-                e.to_string(),
-                "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\")} at line 2 column 17"
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("Invalid format for row_id. Expected a string, or array of strings."),
+                "Expected row_id format error, got: {e}"
             ),
         }
 
-        match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
+        match yaml::from_str::<ColumnLevelEmbeddingConfig>(
             r"
                 from: foo
                 row_id: {foo: bar, extra: value}
             ",
         ) {
             Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-            Err(e) => assert_eq!(
-                e.to_string(),
-                "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\"), \"extra\": String(\"value\")} at line 2 column 17"
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("Invalid format for row_id. Expected a string, or array of strings."),
+                "Expected row_id format error, got: {e}"
             ),
         }
 
-        match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
+        match yaml::from_str::<ColumnLevelEmbeddingConfig>(
             r"
                 from: foo
                 row_id: [foo, bar
             ",
         ) {
             Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-            Err(e) => assert_eq!(
-                e.to_string(),
-                "did not find expected ',' or ']' at line 5 column 1, while parsing a flow sequence at line 3 column 25"
+            Err(e) => assert!(
+                e.to_string().contains("expected ',' or ']'"),
+                "Expected YAML parse error, got: {e}"
             ),
         }
     }
@@ -378,7 +390,7 @@ mod tests {
     fn test_deserialize_row_ids_missing() {
         let yaml = "from: model_name";
         let parsed: ColumnLevelEmbeddingConfig =
-            serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
+            yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
         assert_eq!(parsed.row_ids, None);
     }
 }

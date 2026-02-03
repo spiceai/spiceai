@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
 use spicepod::component::{dataset::Dataset as DatasetComponent, eval::Eval as EvalComponent};
 use std::collections::HashMap;
 use std::path::Path;
+use yaml::Value;
 
 /// YAML representation of an eval specification file.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -111,7 +111,7 @@ impl EvalSpecification {
         let file_contents = std::fs::read_to_string(file)
             .context(anyhow!("Failed to read YAML file '{}'", file.display()))?;
 
-        let spec: EvalSpecification = serde_yaml::from_str(&file_contents)
+        let spec: EvalSpecification = yaml::from_str(&file_contents)
             .context(anyhow!("Failed to parse YAML file '{}'", file.display()))?;
 
         // Break into sub-[`EvalSpecification`]. Each [`EvalSpecification`] should have one [`EvalMetadata`] followed by >=1 [`EvalDefinition`].

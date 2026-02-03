@@ -13,7 +13,7 @@ object_store.workspace = true
 tracing.workspace = true
 snafu.workspace = true
 serde.workspace = true
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 spicepod = { path = "../spicepod" }
 zip = "7.2.0"
 bytes.workspace = true

@@ -183,7 +183,7 @@ workers = { path = "../workers" }
 x509-certificate.workspace = true
 
 [build-dependencies]
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -235,7 +235,7 @@ repl = { path = "../repl" }
 rstest = "0.26.1"
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
 tar = "0.4"
