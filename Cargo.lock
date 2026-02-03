@@ -7169,11 +7169,14 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
+ "http 1.4.0",
+ "parking_lot 0.12.5",
  "rustls-native-certs 0.8.3",
  "secrecy",
  "snafu",
  "tokio",
  "tonic",
+ "tower 0.5.3",
  "url",
 ]
 

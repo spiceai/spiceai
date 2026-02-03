@@ -45,6 +45,7 @@ use tonic::IntoStreamingRequest;
 use tonic::transport::Channel;
 
 pub mod arrow_flight_factory;
+pub mod cookie;
 pub mod tls;
 
 pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
