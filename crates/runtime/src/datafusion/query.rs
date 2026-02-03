@@ -181,7 +181,15 @@ impl Query {
     /// This is only used by the async queries API (`/v1/queries`) which needs to
     /// distribute work across the cluster. Returns an error if not in scheduler mode
     /// or if required configuration is missing.
-    fn get_distributed_session_state(&self) -> Result<SessionState> {
+    ///
+    /// # Arguments
+    ///
+    /// * `target_partitions_override` - Optional override for target_partitions, useful for
+    ///   profiling distributed queries with different partition counts.
+    fn get_distributed_session_state(
+        &self,
+        target_partitions_override: Option<usize>,
+    ) -> Result<SessionState> {
         if !matches!(self.df.cluster_config.role(), Some(ClusterRole::Scheduler)) {
             return Err(Error::UnableToExecuteQuery {
                 source: datafusion::error::DataFusionError::Configuration(
@@ -214,6 +222,15 @@ impl Query {
             .with_ballista_result_fetch_metrics_callback(OtelResultFetchMetricsCallback::new_arc(
                 scheduler_url.to_string(),
             ));
+
+        // Apply target_partitions override if provided (for profiling)
+        if let Some(target_partitions) = target_partitions_override {
+            tracing::info!(
+                target_partitions,
+                "Overriding target_partitions via X-Spice-Target-Partitions header"
+            );
+            cfg = cfg.with_target_partitions(target_partitions);
+        }
 
         if let Some(tls_config) = client_tls_config {
             cfg = cfg.with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
@@ -332,7 +349,10 @@ impl Query {
 
         let query_result = async {
             // Use distributed session state for Ballista execution
-            let mut session = self.get_distributed_session_state()?;
+            // Pass target_partitions_override from request context for profiling
+            let mut session = self.get_distributed_session_state(
+                request_context.target_partitions_override(),
+            )?;
 
             let ctx = self;
             let tracker = ctx.tracker;

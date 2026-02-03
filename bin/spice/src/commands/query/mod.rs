@@ -62,6 +62,12 @@ pub struct QueryArgs {
     #[arg(long)]
     timeout: Option<humantime::Duration>,
 
+    /// Override target_partitions for distributed query profiling.
+    /// By default, this is set to SUM(executor_task_slots).
+    /// Use this to experiment with different partition counts.
+    #[arg(long)]
+    target_partitions: Option<usize>,
+
     #[command(subcommand)]
     command: Option<QuerySubcommand>,
 }
@@ -145,7 +151,15 @@ pub async fn execute(ctx: &RuntimeContext, args: &QueryArgs) -> Result<()> {
 
     // If SQL argument provided, submit directly
     if let Some(sql) = &args.sql {
-        return submit_and_wait(&client, sql, !args.no_wait, args.timeout.map(Into::into)).await;
+        return submit_and_wait(
+            ctx,
+            &client,
+            sql,
+            !args.no_wait,
+            args.timeout.map(Into::into),
+            args.target_partitions,
+        )
+        .await;
     }
 
     // No argument, start REPL
@@ -218,17 +232,28 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
 }
 
 async fn submit_and_wait(
+    ctx: &RuntimeContext,
     client: &Arc<Client>,
     sql: &str,
     wait: bool,
     timeout: Option<Duration>,
+    target_partitions: Option<usize>,
 ) -> Result<()> {
-    let job = client
-        .query(sql)
-        .await
-        .map_err(|e| crate::error::Error::InvalidResponse {
-            message: e.to_string(),
-        })?;
+    // If target_partitions is specified, use custom HTTP submission with the header
+    let job = if let Some(tp) = target_partitions {
+        println!(
+            "Using target_partitions override: {} (via X-Spice-Target-Partitions header)",
+            tp
+        );
+        submit_with_target_partitions(ctx, sql, tp).await?
+    } else {
+        client
+            .query(sql)
+            .await
+            .map_err(|e| crate::error::Error::InvalidResponse {
+                message: e.to_string(),
+            })?
+    };
 
     let query_id = job.id().to_string();
 
@@ -285,6 +310,69 @@ async fn submit_and_wait(
     }
 
     Ok(())
+}
+
+/// Submits a query with the X-Spice-Target-Partitions header for profiling.
+/// This bypasses the SDK to add the custom header.
+async fn submit_with_target_partitions(
+    ctx: &RuntimeContext,
+    sql: &str,
+    target_partitions: usize,
+) -> Result<spiceai::QueryJob> {
+    use reqwest::Client as HttpClient;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize)]
+    struct SubmitRequest<'a> {
+        sql: &'a str,
+    }
+
+    #[derive(Deserialize)]
+    struct SubmitResponse {
+        query_id: String,
+    }
+
+    let http_client = HttpClient::new();
+    let url = format!("{}/v1/queries", ctx.http_endpoint());
+
+    let mut request = http_client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("X-Spice-Target-Partitions", target_partitions.to_string())
+        .json(&SubmitRequest { sql });
+
+    if let Some(api_key) = ctx.api_key() {
+        request = request.header("X-API-Key", api_key);
+    }
+
+    let response = request.send().await.map_err(|e| {
+        crate::error::Error::InvalidResponse {
+            message: format!("HTTP request failed: {e}"),
+        }
+    })?;
+
+    let status_code = response.status().as_u16();
+    if status_code != 202 {
+        let body = response.text().await.unwrap_or_default();
+        return Err(crate::error::Error::InvalidResponse {
+            message: format!("Query submission failed (HTTP {status_code}): {body}"),
+        });
+    }
+
+    let submit_response: SubmitResponse =
+        response.json().await.map_err(|e| {
+            crate::error::Error::InvalidResponse {
+                message: format!("Failed to parse response: {e}"),
+            }
+        })?;
+
+    // Get the query job from the SDK client using the query_id
+    let sdk_client = build_client(ctx).await?;
+    sdk_client
+        .get_query(&submit_response.query_id)
+        .map_err(|e| crate::error::Error::InvalidResponse {
+            message: e.to_string(),
+        })
 }
 
 async fn run_query_repl(client: &Arc<Client>) -> Result<()> {

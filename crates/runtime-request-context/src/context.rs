@@ -36,6 +36,10 @@ use std::{
     },
 };
 
+/// HTTP header name for overriding target_partitions at query time.
+/// This is useful for profiling distributed queries with different partition counts.
+pub const TARGET_PARTITIONS_HEADER: &str = "x-spice-target-partitions";
+
 static HTTP_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
 static FLIGHT_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
 static FLIGHTSQL_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
@@ -53,6 +57,10 @@ pub struct RequestContext {
     extensions: RwLock<Extensions>,
     trace_parent: Option<TraceParent>,
     nested_query_level: AtomicI16,
+    /// Optional override for `target_partitions` in distributed query execution.
+    /// When set, this value overrides the dynamic cluster-based calculation.
+    /// Useful for profiling distributed queries with different partition counts.
+    target_partitions_override: Option<usize>,
 }
 
 #[async_trait::async_trait]
@@ -275,6 +283,13 @@ impl RequestContext {
     pub fn exited_top_level_query(&self) -> bool {
         self.nested_query_level.fetch_add(-1, Ordering::Relaxed) == 1
     }
+
+    /// Returns the target partitions override if set via the `X-Spice-Target-Partitions` header.
+    /// This is used for profiling distributed queries with different partition counts.
+    #[must_use]
+    pub fn target_partitions_override(&self) -> Option<usize> {
+        self.target_partitions_override
+    }
 }
 
 impl AuthRequestContext for RequestContext {
@@ -301,6 +316,7 @@ pub struct RequestContextBuilder {
     baggage: Vec<KeyValue>,
     extensions: Extensions,
     trace_parent: Option<TraceParent>,
+    target_partitions_override: Option<usize>,
 }
 
 impl RequestContextBuilder {
@@ -315,6 +331,7 @@ impl RequestContextBuilder {
             baggage: vec![],
             extensions: Extensions::default(),
             trace_parent: None,
+            target_partitions_override: None,
         }
     }
 
@@ -363,6 +380,27 @@ impl RequestContextBuilder {
             }
         }
 
+        // Parse target_partitions override header for distributed query profiling
+        self.target_partitions_override = headers
+            .get(TARGET_PARTITIONS_HEADER)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| {
+                match s.parse::<usize>() {
+                    Ok(0) => {
+                        tracing::warn!("Ignoring {TARGET_PARTITIONS_HEADER}=0; target_partitions must be at least 1");
+                        None
+                    }
+                    Ok(value) => {
+                        tracing::debug!("Target partitions override set to {value} via header");
+                        Some(value)
+                    }
+                    Err(_) => {
+                        tracing::warn!("Invalid {TARGET_PARTITIONS_HEADER} header value: '{s}'; expected positive integer");
+                        None
+                    }
+                }
+            });
+
         self
     }
 
@@ -393,6 +431,17 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_trace_parent(mut self, trace_parent: Option<TraceParent>) -> Self {
         self.trace_parent = trace_parent;
+        self
+    }
+
+    /// Sets the target partitions override for distributed query profiling.
+    /// When set, this value overrides the dynamic cluster-based calculation.
+    #[must_use]
+    pub fn with_target_partitions_override(
+        mut self,
+        target_partitions: Option<usize>,
+    ) -> Self {
+        self.target_partitions_override = target_partitions;
         self
     }
 
@@ -491,6 +540,7 @@ impl RequestContextBuilder {
             extensions: RwLock::new(self.extensions),
             trace_parent: self.trace_parent,
             nested_query_level: AtomicI16::new(0),
+            target_partitions_override: self.target_partitions_override,
         }
     }
 
@@ -542,5 +592,84 @@ mod tests {
             CacheControl::Cache(CacheKeyType::Default)
         );
         assert_eq!(ctx_bad_user_key.client_supplied_cache_key, None);
+    }
+
+    #[test]
+    fn test_target_partitions_override_from_header() {
+        // Test valid target_partitions header
+        let mut headers = HeaderMap::new();
+        headers.append(
+            super::TARGET_PARTITIONS_HEADER,
+            HeaderValue::from_static("16"),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(ctx.target_partitions_override(), Some(16));
+
+        // Test zero value is rejected
+        let mut headers = HeaderMap::new();
+        headers.append(
+            super::TARGET_PARTITIONS_HEADER,
+            HeaderValue::from_static("0"),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(ctx.target_partitions_override(), None);
+
+        // Test invalid value is rejected
+        let mut headers = HeaderMap::new();
+        headers.append(
+            super::TARGET_PARTITIONS_HEADER,
+            HeaderValue::from_static("not_a_number"),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(ctx.target_partitions_override(), None);
+
+        // Test negative value is rejected
+        let mut headers = HeaderMap::new();
+        headers.append(
+            super::TARGET_PARTITIONS_HEADER,
+            HeaderValue::from_static("-5"),
+        );
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(ctx.target_partitions_override(), None);
+
+        // Test no header means None
+        let headers = HeaderMap::new();
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .from_headers(&headers)
+            .build();
+
+        assert_eq!(ctx.target_partitions_override(), None);
+    }
+
+    #[test]
+    fn test_target_partitions_override_builder_method() {
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .with_target_partitions_override(Some(32))
+            .build();
+
+        assert_eq!(ctx.target_partitions_override(), Some(32));
+
+        let ctx = RequestContextBuilder::new(Protocol::Http)
+            .with_target_partitions_override(None)
+            .build();
+
+        assert_eq!(ctx.target_partitions_override(), None);
     }
 }

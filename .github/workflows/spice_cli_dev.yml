@@ -1,0 +1,228 @@
+name: spice_cli_dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build for specific architecture(s)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'linux-x86_64'
+          - 'linux-aarch64'
+          - 'darwin-aarch64'
+        default: 'all'
+
+jobs:
+  setup:
+    runs-on: ubuntu-22.04
+    outputs:
+      dev_label: ${{ steps.set_version.outputs.dev_label }}
+      run_linux_x64: ${{ steps.set_targets.outputs.run_linux_x64 }}
+      run_linux_arm64: ${{ steps.set_targets.outputs.run_linux_arm64 }}
+      run_darwin_arm64: ${{ steps.set_targets.outputs.run_darwin_arm64 }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set version
+        id: set_version
+        run: |
+          commit_hash=$(git rev-parse --short HEAD)
+          branch_name="${GITHUB_REF_NAME}"
+          # Sanitize branch name for use in version string
+          safe_branch=$(echo "$branch_name" | sed 's/[^a-zA-Z0-9]/-/g' | head -c 20)
+          date="$(date +%Y%m%d)"
+          dev_label="dev.${date}.${commit_hash}"
+          echo "dev_label=${dev_label}" >> $GITHUB_OUTPUT
+          echo "Building dev CLI with version label: \"${dev_label}\""
+
+      - name: Set target architectures
+        id: set_targets
+        run: |
+          target="${{ inputs.target }}"
+          case "$target" in
+            all)
+              echo "run_linux_x64=true" >> $GITHUB_OUTPUT
+              echo "run_linux_arm64=true" >> $GITHUB_OUTPUT
+              echo "run_darwin_arm64=true" >> $GITHUB_OUTPUT
+              ;;
+            linux-x86_64)
+              echo "run_linux_x64=true" >> $GITHUB_OUTPUT
+              echo "run_linux_arm64=false" >> $GITHUB_OUTPUT
+              echo "run_darwin_arm64=false" >> $GITHUB_OUTPUT
+              ;;
+            linux-aarch64)
+              echo "run_linux_x64=false" >> $GITHUB_OUTPUT
+              echo "run_linux_arm64=true" >> $GITHUB_OUTPUT
+              echo "run_darwin_arm64=false" >> $GITHUB_OUTPUT
+              ;;
+            darwin-aarch64)
+              echo "run_linux_x64=false" >> $GITHUB_OUTPUT
+              echo "run_linux_arm64=false" >> $GITHUB_OUTPUT
+              echo "run_darwin_arm64=true" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+  build-linux-x64:
+    needs: setup
+    if: needs.setup.outputs.run_linux_x64 == 'true'
+    runs-on: spiceai-dev-runners
+    env:
+      RUST_PROFILE: release
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Add dev postfix to version in Cargo.toml
+        env:
+          DEV_LABEL: ${{ needs.setup.outputs.dev_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$DEV_LABEL"
+          else
+            new_version="${current_version}-$DEV_LABEL"
+          fi
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Build spice CLI
+        run: cargo build --profile ${{ env.RUST_PROFILE }} -p spice --target-dir target
+
+      - name: Package CLI binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar czf spice_linux_x86_64.tar.gz spice
+
+      - name: Print CLI version
+        run: ./spice version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: spice_linux_x86_64
+          path: spice_linux_x86_64.tar.gz
+
+  build-linux-arm64:
+    needs: setup
+    if: needs.setup.outputs.run_linux_arm64 == 'true'
+    runs-on: hosted-linux-arm-runner
+    env:
+      RUST_PROFILE: release
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Add dev postfix to version in Cargo.toml
+        env:
+          DEV_LABEL: ${{ needs.setup.outputs.dev_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$DEV_LABEL"
+          else
+            new_version="${current_version}-$DEV_LABEL"
+          fi
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Build spice CLI
+        run: cargo build --profile ${{ env.RUST_PROFILE }} -p spice --target-dir target
+
+      - name: Package CLI binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar czf spice_linux_aarch64.tar.gz spice
+
+      - name: Print CLI version
+        run: ./spice version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: spice_linux_aarch64
+          path: spice_linux_aarch64.tar.gz
+
+  build-darwin-arm64:
+    needs: setup
+    if: needs.setup.outputs.run_darwin_arm64 == 'true'
+    runs-on: spiceai-macos
+    env:
+      RUST_PROFILE: release
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Add dev postfix to version in Cargo.toml
+        env:
+          DEV_LABEL: ${{ needs.setup.outputs.dev_label }}
+        run: |
+          current_version=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "$current_version" =~ -[a-zA-Z0-9]+(\.[0-9]+)*$ ]]; then
+            new_version="${current_version}.$DEV_LABEL"
+          else
+            new_version="${current_version}-$DEV_LABEL"
+          fi
+          sed -i '' "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+          grep '^version =' Cargo.toml
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Build spice CLI
+        run: cargo build --profile ${{ env.RUST_PROFILE }} -p spice --target-dir target
+
+      - name: Package CLI binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar czf spice_darwin_aarch64.tar.gz spice
+
+      - name: Print CLI version
+        run: ./spice version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        with:
+          name: spice_darwin_aarch64
+          path: spice_darwin_aarch64.tar.gz
+
+  summary:
+    needs: [setup, build-linux-x64, build-linux-arm64, build-darwin-arm64]
+    if: always() && (needs.build-linux-x64.result == 'success' || needs.build-linux-arm64.result == 'success' || needs.build-darwin-arm64.result == 'success')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Summary
+        env:
+          DEV_LABEL: ${{ needs.setup.outputs.dev_label }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "## 🛠️ Dev CLI Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${DEV_LABEL}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Install with:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "curl -sSL https://raw.githubusercontent.com/spiceai/spiceai/${GITHUB_REF_NAME}/install/install-cli-dev.sh | GITHUB_TOKEN=ghp_xxx bash -s -- --run-url https://github.com/spiceai/spiceai/actions/runs/${RUN_ID}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Artifacts available:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Download from the workflow run artifacts section below" >> $GITHUB_STEP_SUMMARY
