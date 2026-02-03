@@ -57,7 +57,7 @@ ansi_colors = { path = "../../crates/ansi_colors" }
 # Archive extraction
 flate2 = "1"
 tar = "0.4"
-zip = "6"
+zip = "7"
 
 # YAML parsing for spicepod
 serde_yaml = "0.9"
