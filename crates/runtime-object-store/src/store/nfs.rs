@@ -91,7 +91,7 @@ impl NFSObjectStore {
     }
 
     /// List a single directory and return its entries (blocking).
-    fn list_directory_blocking(nfs: &Nfs, dir_path: &str) -> Vec<DirEntry> {
+    fn list_directory_blocking(nfs: &Nfs, dir_path: &str) -> object_store::Result<Vec<DirEntry>> {
         let path = if dir_path.is_empty() {
             "/".to_string()
         } else if dir_path.starts_with('/') {
@@ -100,41 +100,29 @@ impl NFSObjectStore {
             format!("/{dir_path}")
         };
 
-        let dir = match nfs.opendir(StdPath::new(&path)) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("Failed to open NFS directory {path}: {e}");
-                return Vec::new();
-            }
-        };
+        let dir = nfs
+            .opendir(StdPath::new(&path))
+            .map_err(|e| handle_error(e))?;
 
-        dir.filter_map(|entry_res| match entry_res {
-            Ok(entry) => Some(entry),
-            Err(e) => {
-                tracing::warn!(
-                    path = %path,
-                    error = %e,
-                    "Failed to read NFS directory entry"
-                );
-                None
-            }
-        })
-        .filter_map(|entry| {
+        let mut entries = Vec::new();
+        for entry_res in dir {
+            let entry = entry_res.map_err(handle_error)?;
             let name = entry.path.to_string_lossy().to_string();
             match entry.d_type {
-                EntryType::Directory => Some(DirEntry::directory(name)),
+                EntryType::Directory => entries.push(DirEntry::directory(name)),
                 EntryType::File => {
-                    let last_modified = DateTime::<Utc>::from_timestamp(
-                        entry.mtime.tv_sec,
-                        u32::try_from(entry.mtime.tv_usec).unwrap_or(0) * 1000,
-                    )
-                    .unwrap_or(DateTime::UNIX_EPOCH);
-                    Some(DirEntry::file(name, entry.size, last_modified))
+                    let usec = u32::try_from(entry.mtime.tv_usec)
+                        .map_err(|_| handle_error("NFS mtime microseconds overflow"))?
+                        * 1000;
+                    let last_modified = DateTime::<Utc>::from_timestamp(entry.mtime.tv_sec, usec)
+                        .ok_or_else(|| handle_error("Invalid NFS mtime returned"))?;
+                    entries.push(DirEntry::file(name, entry.size, last_modified));
                 }
-                _ => None,
+                _ => {}
             }
-        })
-        .collect()
+        }
+
+        Ok(entries)
     }
 
     /// List all files recursively, offloading blocking NFS traversal to a dedicated thread.
@@ -152,7 +140,7 @@ impl NFSObjectStore {
 
             // Process directories sequentially within this blocking task
             while let Some(current_path) = queue.pop() {
-                let entries = Self::list_directory_blocking(&nfs, &current_path);
+                let entries = Self::list_directory_blocking(&nfs, &current_path)?;
                 let (files, dirs) = process_directory_entries(&current_path, entries);
                 results.extend(files);
                 queue.extend(dirs);
@@ -174,7 +162,7 @@ impl NFSObjectStore {
 
         tokio::task::spawn_blocking(move || {
             let nfs = config.connect()?;
-            let entries = Self::list_directory_blocking(&nfs, &prefix_str);
+            let entries = Self::list_directory_blocking(&nfs, &prefix_str)?;
             Ok(process_directory_entries_shallow(&prefix_str, entries))
         })
         .await
@@ -202,7 +190,8 @@ impl NFSObjectStore {
                 let mtime = stat.nfs_mtime as i64;
                 #[expect(clippy::cast_possible_truncation)]
                 let mtime_nsec = stat.nfs_mtime_nsec as u32;
-                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec).unwrap_or(DateTime::UNIX_EPOCH)
+                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
+                    .ok_or_else(|| handle_error("Invalid NFS mtime returned"))?
             };
             Ok(build_object_meta(location, stat.nfs_size, last_modified))
         })
@@ -263,7 +252,7 @@ impl ObjectStore for NFSObjectStore {
                     #[expect(clippy::cast_possible_truncation)]
                     let mtime_nsec = file_stat.nfs_mtime_nsec as u32;
                     DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
-                        .unwrap_or(DateTime::UNIX_EPOCH)
+                        .ok_or_else(|| handle_error("Invalid NFS mtime returned"))?
                 };
                 let object_meta = build_object_meta(location.clone(), size, last_modified);
 

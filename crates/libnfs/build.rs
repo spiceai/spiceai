@@ -79,28 +79,11 @@ fn main() {
         }
     }
 
-    let bindings = match builder.generate() {
-        Ok(bindings) => bindings,
-        Err(e) => {
-            // If we can't generate bindings, create a stub file that will cause a compile error
-            // when the crate is actually used. This allows the crate to be a workspace member
-            // without requiring libnfs-dev to be installed when the nfs feature isn't used.
-            eprintln!("Warning: Could not generate libnfs bindings: {e}");
-            eprintln!("The NFS feature will not be available. Install libnfs-dev to enable it.");
-
-            let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-            std::fs::write(
-                out_path.join("bindings.rs"),
-                r#"
-// libnfs bindings could not be generated because libnfs-dev is not installed.
-// Install libnfs-dev (or libnfs on macOS via brew) to enable NFS support.
-compile_error!("libnfs bindings not available: install libnfs-dev to enable NFS support");
-"#,
-            )
-            .expect("Failed to write stub bindings file");
-            return;
-        }
-    };
+    let bindings = builder.generate().unwrap_or_else(|e| {
+        panic!(
+            "Could not generate libnfs bindings: {e}. Install libnfs-dev (or libnfs via brew on macOS) to enable NFS support."
+        );
+    });
 
     let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let bindings_path = out_path.join("bindings.rs");
