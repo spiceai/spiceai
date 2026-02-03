@@ -236,7 +236,6 @@ rstest = "0.26.1"
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 yaml = { path = "../yaml" }
-serde_yaml.workspace = true
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
 tar = "0.4"

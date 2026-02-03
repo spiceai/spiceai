@@ -398,6 +398,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc"
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6488,7 +6494,7 @@ dependencies = [
  "cast",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
- "hashlink",
+ "hashlink 0.10.0",
  "libduckdb-sys",
  "num",
  "num-integer",
@@ -6819,8 +6825,8 @@ dependencies = [
  "clap 4.5.54",
  "env_logger 0.11.8",
  "serde",
- "serde_yaml",
  "spicepod",
+ "yaml",
 ]
 
 [[package]]
@@ -8168,6 +8174,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
  "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea0b22561a9c04a7cb1a302c013e0259cd3b4bb619f145b32f72b8b4bcbed230"
+dependencies = [
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -12487,7 +12502,6 @@ dependencies = [
  "futures",
  "object_store",
  "serde",
- "serde_yaml",
  "snafu",
  "spicepod",
  "tracing",
@@ -14996,7 +15010,6 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "serde_yaml",
  "snafu",
  "spice-cloud",
  "spiceai",
@@ -15034,6 +15047,7 @@ dependencies = [
  "vortex-datafusion",
  "workers",
  "x509-certificate",
+ "yaml",
 ]
 
 [[package]]
@@ -15319,7 +15333,7 @@ dependencies = [
  "chrono",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
- "hashlink",
+ "hashlink 0.10.0",
  "libsqlite3-sys",
  "smallvec",
 ]
@@ -16927,7 +16941,6 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "serde_yaml",
  "snafu",
  "spiceai",
  "spicepod",
@@ -17029,7 +17042,6 @@ dependencies = [
  "runtime",
  "runtime-async",
  "rustls 0.23.36",
- "serde_yaml",
  "snafu",
  "snmalloc-rs",
  "spice-cloud",
@@ -17042,6 +17054,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "util",
+ "yaml",
 ]
 
 [[package]]
@@ -17059,12 +17072,12 @@ dependencies = [
  "serde",
  "serde-value",
  "serde_json",
- "serde_yaml",
  "snafu",
  "subtle",
  "tokio",
  "tracing",
  "url",
+ "yaml",
 ]
 
 [[package]]
@@ -17116,7 +17129,7 @@ dependencies = [
  "clap 4.5.54",
  "runtime",
  "serde_json",
- "serde_yaml",
+ "yaml",
 ]
 
 [[package]]
@@ -18090,7 +18103,6 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "serde_yaml",
  "spiceai",
  "spicepod",
  "sysinfo 0.37.2",
@@ -18102,6 +18114,7 @@ dependencies = [
  "tonic",
  "util",
  "uuid 1.20.0",
+ "yaml",
 ]
 
 [[package]]
@@ -18138,11 +18151,11 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "serde_yaml",
  "spiceai",
  "test-framework",
  "tokio",
  "tokio-util",
+ "yaml",
 ]
 
 [[package]]
@@ -21964,6 +21977,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
 dependencies = [
  "lzma-sys",
+]
+
+[[package]]
+name = "yaml"
+version = "2.0.0-unstable"
+dependencies = [
+ "indexmap 2.13.0",
+ "serde",
+ "yaml-rust2",
+]
+
+[[package]]
+name = "yaml-rust2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "631a50d867fafb7093e709d75aaee9e0e0d5deb934021fcea25ac2fe09edc51e"
+dependencies = [
+ "arraydeque",
+ "encoding_rs",
+ "hashlink 0.11.0",
 ]
 
 [[package]]
