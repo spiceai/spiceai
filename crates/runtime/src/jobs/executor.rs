@@ -273,12 +273,12 @@ impl JobExecutor {
         use crate::datafusion::query::Error;
         match e {
             Error::SchedulerUnavailable => JobErrorCode::SchedulerUnavailable,
-            Error::SessionCreationFailed { message } => JobErrorCode::SubmissionFailed,
-            Error::JobSubmissionFailed { message } => JobErrorCode::SubmissionFailed,
-            Error::UnableToExecuteQuery { source } => JobErrorCode::ExecutionFailed,
-            Error::BindingParameters { source } => JobErrorCode::ParameterBindingFailed,
-            Error::TableAccessDisallowed { table } => JobErrorCode::ExecutionFailed,
-            Error::UnableToExecuteQuery { source } => JobErrorCode::ExecutionFailed,
+            Error::SessionCreationFailed { .. } => JobErrorCode::SubmissionFailed,
+            Error::JobSubmissionFailed { .. } => JobErrorCode::SubmissionFailed,
+            Error::UnableToExecuteQuery { .. } => JobErrorCode::ExecutionFailed,
+            Error::BindingParameters { .. } => JobErrorCode::ParameterBindingFailed,
+            Error::TableAccessDisallowed { .. } => JobErrorCode::ExecutionFailed,
+            Error::UnableToExecuteQuery { .. } => JobErrorCode::ExecutionFailed,
             _ => JobErrorCode::Internal,
         }
     }
