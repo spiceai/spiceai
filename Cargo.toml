@@ -58,6 +58,7 @@ members = [
     "tools/evalconverter",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
+    "tools/flight-cookie-server/",
     "tools/otelpublisher/",
     "tools/spicepodschema/",
     "tools/spiceschema",

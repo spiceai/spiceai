@@ -171,6 +171,8 @@ ctor = "0.6.3"
 iceberg_test_utils = { workspace = true, features = ["tests"] }
 insta.workspace = true
 object_store = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [[bench]]
