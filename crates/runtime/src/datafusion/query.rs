@@ -428,7 +428,7 @@ impl Query {
                         );
                         return Ok(QueryHandle::new_with_cached_result(
                             job_id.to_string(),
-                            Arc::clone(&logical_plan.schema().inner()),
+                            Arc::clone(logical_plan.schema().inner()),
                             Arc::clone(&self.df),
                             None,
                             Box::pin(stream),
