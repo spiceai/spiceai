@@ -76,10 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let location = format!("http://{addr}");
 
     let table_info = Arc::new(TableInfo::new(
-        args.catalog,
-        args.schema,
-        args.table,
-        args.column,
+        &args.catalog,
+        &args.schema,
+        &args.table,
+        &args.column,
     )?);
 
     let service = CookieFlightService::new(args.cookie, args.require_cookie, location, table_info);
@@ -103,10 +103,10 @@ struct TableInfo {
 
 impl TableInfo {
     fn new(
-        catalog: String,
-        schema: String,
-        table: String,
-        column: String,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        column: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let table_schema = Arc::new(Schema::new(vec![Field::new(
             column,
@@ -125,7 +125,7 @@ impl TableInfo {
             Vec::<String>::new(),
             true,
         );
-        tables_builder.append(&catalog, &schema, &table, "TABLE", table_schema.as_ref())?;
+        tables_builder.append(catalog, schema, table, "TABLE", table_schema.as_ref())?;
         let tables_batch = tables_builder.build()?;
 
         Ok(Self {
@@ -283,7 +283,7 @@ impl FlightService for CookieFlightService {
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(futures::stream::iter(
-                batches.into_iter().map(|batch| Ok::<_, FlightError>(batch)),
+                batches.into_iter().map(Ok::<_, FlightError>),
             ))
             .map_err(Status::from);
         Ok(Response::new(Box::pin(stream)))
