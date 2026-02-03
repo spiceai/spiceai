@@ -94,6 +94,7 @@ pub async fn run_verification(
     let test = SpiceTest::new("streaming_verification".to_string(), state)
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(false)
+        .with_explain_plan_snapshot()
         .start()
         .await?
         .wait()
