@@ -1217,6 +1217,7 @@ impl DataFusion {
             self.io_runtime.clone(),
         );
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
+        accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {
@@ -1869,6 +1870,7 @@ impl DataFusion {
             self.io_runtime.clone(),
         );
         builder.cpu_runtime(self.refresh_runtime().cloned());
+        builder.cluster_role(self.cluster_config.effective_role());
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
