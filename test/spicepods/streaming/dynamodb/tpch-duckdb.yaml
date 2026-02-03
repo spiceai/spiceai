@@ -1,0 +1,99 @@
+version: v1beta1
+kind: Spicepod
+name: streaming-benchmark-dynamodb
+
+common_config:
+  acceleration: &common_acceleration
+    enabled: true
+    engine: duckdb
+    mode: file
+    refresh_mode: changes
+
+datasets:
+  - from: dynamodb:region
+    name: region
+    acceleration: *common_acceleration
+    params:
+      dynamodb_aws_auth: key
+      dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
+      dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
+      dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
+      ready_lag: 1h
+      scan_segments: 1
+
+  - from: dynamodb:nation
+    name: nation
+    acceleration: *common_acceleration
+    params:
+      dynamodb_aws_auth: key
+      dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
+      dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
+      dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
+      ready_lag: 1h
+      scan_segments: 1
+
+  - from: dynamodb:supplier
+    name: supplier
+    acceleration: *common_acceleration
+    params:
+      dynamodb_aws_auth: key
+      dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
+      dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
+      dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
+      ready_lag: 1h
+      scan_segments: 4
+
+  - from: dynamodb:part
+    name: part
+    acceleration: *common_acceleration
+    params:
+      dynamodb_aws_auth: key
+      dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
+      dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
+      dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
+      ready_lag: 1h
+      scan_segments: 8
+
+  - from: dynamodb:partsupp
+    name: partsupp
+    acceleration: *common_acceleration
+    params:
+      dynamodb_aws_auth: key
+      dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
+      dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
+      dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
+      ready_lag: 1h
+      scan_segments: 16
+
+  - from: dynamodb:customer
+    name: customer
+    acceleration: *common_acceleration
+    params:
+      dynamodb_aws_auth: key
+      dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
+      dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
+      dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
+      ready_lag: 1h
+      scan_segments: 8
+
+  - from: dynamodb:orders
+    name: orders
+    acceleration: *common_acceleration
+    params:
+      dynamodb_aws_auth: key
+      dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
+      dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
+      dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
+      ready_lag: 1h
+      scan_segments: 16
+
+  - from: dynamodb:lineitem
+    name: lineitem
+    acceleration: *common_acceleration
+    params:
+      dynamodb_aws_auth: key
+      dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
+      dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
+      dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
+      ready_lag: 1h
+      scan_segments: 48
