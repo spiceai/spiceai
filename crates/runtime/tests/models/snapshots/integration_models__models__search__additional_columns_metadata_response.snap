@@ -56,7 +56,7 @@ snapshot_kind: text
     },
     {
       "data": {
-        "reference_answer": "78.54 cm\u00b2\n\nPlease provide the actual question and detailed answer you need me to work with.",
+        "reference_answer": "78.54 cm²\n\nPlease provide the actual question and detailed answer you need me to work with.",
         "source": "textbook_reasoning"
       },
       "dataset": "qs",
