@@ -251,7 +251,7 @@ pub struct QuerySummary {
     pub created_at: String,
 }
 
-/// Reponse object for the query status route
+/// Response object for the query status route
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct StatusResponse {
