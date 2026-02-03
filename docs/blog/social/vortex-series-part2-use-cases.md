@@ -207,66 +207,55 @@ Choose alternatives when:
 
 ---
 
-## LinkedIn Post (3000 characters)
+## LinkedIn
 
-🤖 Three Data Problems Killing Your AI Applications and Agents in 2026
+Three Data Problems Killing Your AI Applications and Agents in 2026
 
 Your AI agents are only as fast as the data they can access. Here are the patterns we see across teams building intelligent applications—and what we did about it at Spice AI.
 
-🔷 Problem 1: Your AI Agents Are Slow Because Your Data Layer Is Slow
+Problem 1: Your AI Agents Are Slow Because Your Data Layer Is Slow
 
 Your agents need real-time context to make intelligent decisions. But fetching customer history takes 200ms. Retrieving relevant documents takes another 150ms. By the time your agent has context, the user has already lost patience.
 
 The real issue? Traditional storage formats weren't designed for the random access patterns AI agents need. Every tool call becomes a data bottleneck.
 
-THE SHIFT: We moved to Vortex—a columnar format designed for fast, concurrent data access. Multi-file architecture means agents can fetch context in parallel without contention. Our agent response times dropped from 800ms to under 200ms. Same logic, 4x faster—just better data access.
+The shift: We moved to Vortex—a columnar format designed for fast, concurrent data access. Multi-file architecture means agents can fetch context in parallel without contention. Our agent response times dropped from 800ms to under 200ms. Same logic, 4x faster—just better data access.
 
-🔷 Problem 2: Your RAG Pipeline Has a Data Problem, Not an LLM Problem
+Problem 2: Your RAG Pipeline Has a Data Problem, Not an LLM Problem
 
 You've tuned your prompts. You've tried 5 different embedding models. But retrieval quality is still inconsistent. The bottleneck isn't your LLM—it's that your data layer can't serve embeddings, metadata, and structured context fast enough for real-time retrieval.
 
 The real issue? Your embeddings live in one store, your metadata in another, your source documents somewhere else. Three round trips before your agent can reason.
 
-THE SHIFT: Vortex stores vectors, metadata, and structured data together. Zero-copy Arrow access means no serialization overhead. One query returns everything your agent needs. RAG latency dropped 60%, and retrieval quality improved because we could include richer context.
+The shift: Vortex stores vectors, metadata, and structured data together. Zero-copy Arrow access means no serialization overhead. One query returns everything your agent needs. RAG latency dropped 60%, and retrieval quality improved because we could include richer context.
 
-🔷 Problem 3: Your Feature Store Can't Keep Up With Agent Tool Calls
+Problem 3: Your Feature Store Can't Keep Up With Agent Tool Calls
 
 Your AI agents make dozens of tool calls per request. Each call needs fresh features: user preferences, recent transactions, real-time signals. Your feature store was built for batch ML training, not real-time agent serving.
 
 The real issue? Wide tables with 800+ features. Traditional formats choke on metadata parsing alone. Every tool call pays that tax.
 
-THE SHIFT: Vortex's zero-parse design makes 1000-column tables as fast as 10-column tables. Feature serving dropped from 50ms to 5ms. Agents now make complex multi-step decisions without latency penalties. We stopped choosing between agent capability and response time.
+The shift: Vortex's zero-parse design makes 1000-column tables as fast as 10-column tables. Feature serving dropped from 50ms to 5ms. Agents now make complex multi-step decisions without latency penalties. We stopped choosing between agent capability and response time.
 
-What teams building AI apps tell us after switching:
-• "Agent response times dropped from 2 seconds to 400ms"
-• "We added 5 new tools without impacting latency"
-• "RAG retrieval quality improved because we could include more context"
+What teams building AI apps tell us after switching: "Agent response times dropped from 2 seconds to 400ms." "We added 5 new tools without impacting latency." "RAG retrieval quality improved because we could include more context."
 
 The data infrastructure choices you make now determine whether your AI applications feel magical or frustrating. Build on a foundation that serves AI workloads at the speed users expect.
 
-What's bottlenecking your AI applications right now? Let's talk about it!
-
 ---
 
-## X Post (280 characters)
+## X (5 posts, 280 characters each)
 
-2026 AI app reality:
+Post 1:
+2026 AI app reality: Agents slow because data access is slow. RAG bottlenecked by scattered data. Feature stores can't handle agent tool calls. Vortex: one format that serves AI workloads fast.
 
-• Agents slow because data access is slow
-• RAG bottlenecked by scattered data
-• Feature stores can't handle agent tool calls
+Post 2:
+AI agent data problem: fetching customer history takes 200ms, documents another 150ms. By the time agent has context, user lost patience. Traditional formats weren't built for random access patterns agents need.
 
-Vortex: one format that serves AI workloads fast, unifies your data, and makes agents actually responsive!!
+Post 3:
+RAG data problem: embeddings in one store, metadata in another, source docs somewhere else. Three round trips before agent can reason. Solution: store vectors, metadata, and structured data together in Vortex.
 
----
+Post 4:
+Feature store problem: 800+ column tables choke on metadata parsing. Every tool call pays that tax. Vortex zero-parse design: 1000 columns as fast as 10. Feature serving 50ms to 5ms.
 
-## Reply with References
-
-References:
-• Vortex GitHub: github.com/vortex-data/vortex
-• Vortex docs: docs.vortex.dev
-• Cayenne documentation: spiceai.org/docs/components/data-accelerators/cayenne
-• Apache Arrow: arrow.apache.org
-• Apache DataFusion: datafusion.apache.org
-• Vortex Spark integration: central.sonatype.com/artifact/dev.vortex/vortex-spark
-• Part 1 (Research): [link to Part 1 post]
+Post 5:
+Results after switching to Vortex: agent response 2s to 400ms. Added 5 tools without latency impact. RAG quality improved with richer context. Data infrastructure determines if AI feels magical or frustrating.

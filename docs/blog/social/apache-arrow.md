@@ -7,117 +7,53 @@ By Luke Kim, Founder.
 
 ## LinkedIn
 
-**Apache Arrow: The Universal Data Format for Analytics**
+Apache Arrow: The Universal Data Format for Analytics
 
 Every time data moves between systems, formats, or languages, something has to serialize it, transmit it, and deserialize it on the other side. This serialization tax is the hidden cost of data infrastructure.
 
 Apache Arrow eliminates this tax by defining a language-independent columnar memory format. Not a serialization format—a memory layout specification.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    APACHE ARROW: HOW IT WORKS                    │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   THE SERIALIZATION TAX (without Arrow):                        │
-│                                                                  │
-│   Python ──JSON──→ Java ──Protobuf──→ Rust ──CSV──→ Database   │
-│            │              │                │                     │
-│            ▼              ▼                ▼                     │
-│         Encode        Decode/Encode     Decode/Encode           │
-│         (~20% CPU)    (~25% CPU)        (~20% CPU)              │
-│                                                                  │
-│   Total overhead: 60-80% of processing time in format conversion│
-│                                                                  │
-│   WITH ARROW:                                                    │
-│                                                                  │
-│   Python ──Arrow──→ Java ──Arrow──→ Rust ──Arrow──→ Database   │
-│            │              │               │                      │
-│            ▼              ▼               ▼                      │
-│       Same bytes      Same bytes      Same bytes                │
-│       (zero-copy)     (zero-copy)     (zero-copy)               │
-│                                                                  │
-│   Total overhead: ~0% (no format conversion)                    │
-│                                                                  │
-│   COLUMNAR LAYOUT:                                               │
-│                                                                  │
-│   Row-oriented:  [id, name, value] [id, name, value] [...]      │
-│                   └─── record 1 ──┘ └─── record 2 ──┘           │
-│                                                                  │
-│   Column-oriented (Arrow):                                       │
-│   ids:    [1, 2, 3, 4, 5, ...]                                  │
-│   names:  ["a", "b", "c", "d", "e", ...]                       │
-│   values: [10, 20, 30, 40, 50, ...]                             │
-│                                                                  │
-│   Why columnar is faster for analytics:                          │
-│   • SIMD: Process 4/8/16 values in one CPU instruction          │
-│   • Cache efficiency: Related data is contiguous                │
-│   • Compression: Similar values compress better                 │
-│   • Projection: Skip columns you don't need                     │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+Without Arrow, data flowing from Python to Java to Rust to a database goes through encode/decode cycles at every boundary. That's 60-80% of processing time spent on format conversion. With Arrow, the same bytes flow through every system. Zero-copy. Zero conversion overhead.
 
-**Key Arrow concepts:**
+Arrow uses columnar layout: instead of storing records together [id, name, value], it stores columns together: all ids, then all names, then all values. This enables SIMD vectorization (process 4-16 values per CPU instruction), cache efficiency (related data is contiguous), better compression (similar values together), and projection pushdown (skip columns you don't need).
 
-**RecordBatch**: The fundamental unit. A schema (column names and types) plus a collection of equal-length column arrays. Immutable once created.
+Key Arrow concepts:
 
-**Array Types**: Int32Array, StringArray, StructArray, ListArray, etc. Each has a specialized memory layout optimized for its data type.
+→ RecordBatch: The fundamental unit. A schema plus equal-length column arrays. Immutable once created.
 
-**Null Bitmaps**: Missing values tracked in a separate bitmap, not inline with data. No sentinel values. No special-casing in processing loops.
+→ Array Types: Int32Array, StringArray, StructArray, ListArray. Each has a specialized memory layout optimized for its data type.
 
-**Dictionary Encoding**: Low-cardinality strings (country codes, status values) stored once and referenced by index. Built into the format, not a separate compression step.
+→ Null Bitmaps: Missing values tracked in a separate bitmap, not inline with data. No sentinel values. No special-casing in processing loops.
 
-**Zero-Copy Slicing**: `batch.slice(1000, 100)` creates a view into existing data. No bytes copied. Reference counting keeps memory alive.
+→ Dictionary Encoding: Low-cardinality strings stored once and referenced by index. Built into the format.
 
-**Arrow Flight**: RPC framework for exchanging Arrow data over the network. Same format on wire as in memory. No encode/decode step.
+→ Zero-Copy Slicing: batch.slice(1000, 100) creates a view into existing data. No bytes copied. Reference counting keeps memory alive.
 
-**Language interoperability:**
+→ Arrow Flight: RPC framework for exchanging Arrow data over the network. Same format on wire as in memory. No encode/decode step.
 
-The same memory layout works in Python (PyArrow), Rust (arrow-rs), Java, C++, Go, JavaScript, and more. When data moves between languages using shared memory or Arrow Flight, the bytes don't change.
+Language interoperability is the killer feature. The same memory layout works in Python (PyArrow), Rust (arrow-rs), Java, C++, Go, JavaScript, and more. When data moves between languages using shared memory or Arrow Flight, the bytes don't change.
 
-This enables architectures like:
-- Python for data science, Rust for performance-critical processing
-- Java services exchanging data with C++ analytics
-- Cross-language query engines (DataFusion, DuckDB, Polars)
+This enables architectures like Python for data science with Rust for performance-critical processing, Java services exchanging data with C++ analytics, and cross-language query engines (DataFusion, DuckDB, Polars).
 
-**When to use Arrow:**
-
-- Data pipelines crossing language/process boundaries
-- Analytical processing (aggregations, filters, joins)
-- High-throughput data transfer (Arrow Flight)
-- Any workload where format conversion is a bottleneck
+When to use Arrow: data pipelines crossing language/process boundaries, analytical processing (aggregations, filters, joins), high-throughput data transfer, any workload where format conversion is a bottleneck.
 
 From building data infrastructure: the difference between Arrow and traditional formats isn't incremental. We measured 8 minutes down to 47 seconds on a 50M row pipeline—not from algorithmic improvements, but from eliminating serialization overhead.
 
 ---
 
-## X
+## X (5 posts, 280 characters each)
 
-Apache Arrow: the data format that changed everything
+Post 1:
+Apache Arrow: the data format that changed everything. Before Arrow: row formats (JSON, CSV) = easy but slow. Custom columnar = fast but serialization at every boundary. Arrow solves both with a language-agnostic columnar memory format.
 
-Before Arrow:
-- Row formats (JSON, CSV, protobuf) = easy, slow for analytics
-- Custom columnar = fast, serialization at boundaries
+Post 2:
+Arrow is columnar: store all ids together, all names together, all values together. This enables SIMD vectorization (8-16 values per CPU instruction), cache efficiency, better compression, and skipping columns you don't need.
 
-Arrow solves both:
-- Columnar memory format → SIMD vectorization, cache-efficient
-- Language-agnostic → same layout in Rust, Python, Java, C++
-- Zero-copy sharing → no serialization across components
+Post 3:
+Arrow's killer feature: language interoperability. Same memory layout in Python, Rust, Java, C++, Go, JavaScript. Data moves between languages with zero conversion. The bytes don't change. Zero-copy across your entire stack.
 
-```rust
-// All connectors produce the same type
-async fn query_postgres() -> SendableRecordBatchStream { ... }
-async fn query_snowflake() -> SendableRecordBatchStream { ... }
-// Processed identically
-```
+Post 4:
+RecordBatch is the fundamental unit: schema + equal-length column arrays. Immutable once created. batch.slice() creates a view without copying. Arc for cheap sharing. Arrow Flight for network transfer with same format on wire.
 
-RecordBatch: schema + equal-length column arrays + immutable
-
-Key patterns:
-- `Arc<dyn Array>` for cheap sharing (refcount++)
-- `batch.slice(offset, length)` shares buffers
-- Schema in `Arc` for zero-cost passing
-
-Arrow Flight for network transfer. Same format over the wire.
-
-Modern data infra without Arrow = constant format conversion overhead.
+Post 5:
+Real result: 50M row pipeline went from 8 minutes to 47 seconds. Not algorithmic improvements—just eliminating serialization overhead. Modern data infrastructure without Arrow means constant format conversion tax.

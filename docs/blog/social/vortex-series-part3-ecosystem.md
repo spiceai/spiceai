@@ -226,19 +226,15 @@ The Vortex project represents the future of columnar storage: research-grade alg
 
 ---
 
-## LinkedIn Post (~3000 characters)
+## LinkedIn
 
-🌐 The Vortex Ecosystem Is Ready
+The Vortex Ecosystem Is Ready
 
 In August 2024, Vortex was donated to the Linux Foundation. Eighteen months later, the ecosystem has matured into something production-ready. Here's the full picture.
 
 Linux Foundation Governance
 
-Vortex now sits alongside projects like PyTorch and ONNX under the LF AI & Data Foundation. This matters for enterprise adoption:
-
-• Neutral governance—no single vendor controls the roadmap
-• Long-term stability—foundation outlives any company
-• Enterprise trust—legal teams know what they're getting
+Vortex now sits alongside projects like PyTorch and ONNX under the LF AI and Data Foundation. This matters for enterprise adoption: Neutral governance—no single vendor controls the roadmap. Long-term stability—foundation outlives any company. Enterprise trust—legal teams know what they're getting.
 
 Spiral, the company behind Vortex (founded by ex-Google/Meta columnar systems engineers), provides commercial support while contributing to the open-source core. The proven open-core model aligns incentives—Spiral wins when Vortex adoption grows.
 
@@ -252,13 +248,7 @@ The result: 100x faster random access, 10-20x faster scans, Arrow-native from th
 
 Ecosystem Integrations
 
-The integration story is strong and growing:
-
-• DataFusion—native TableProvider via vortex-datafusion
-• DuckDB—core extension with full read/write support
-• Polars—Rust + Arrow compatibility
-• PyArrow—Python data science workflows
-• NVIDIA nvCOMP—GPU-accelerated decompression for AI/ML pipelines
+The integration story is strong and growing: DataFusion—native TableProvider via vortex-datafusion. DuckDB—core extension with full read/write support. Polars—Rust plus Arrow compatibility. PyArrow—Python data science workflows. NVIDIA nvCOMP—GPU-accelerated decompression for AI/ML pipelines.
 
 DuckDB's adoption as a core extension in January 2026 signals Vortex is ready for mainstream use.
 
@@ -266,94 +256,39 @@ Real-World Results
 
 Early adopters are seeing consistent improvements across independent evaluations:
 
-DuckDB benchmarks (TPC-H SF100):
-• 18% faster than Parquet v2 (geometric mean)
-• 35% faster than Parquet v1
+DuckDB benchmarks (TPC-H SF100): 18% faster than Parquet v2 (geometric mean), 35% faster than Parquet v1.
 
-Polar Signals (profiling database):
-• 70% query performance improvement
-• 10% better uncompressed storage size
+Polar Signals (profiling database): 70% query performance improvement, 10% better uncompressed storage size.
 
-Spice AI Cayenne (data accelerator):
-• 1.4x faster than DuckDB on TPC-H
-• ~3x lower memory usage
+Spice AI Cayenne (data accelerator): 1.4x faster than DuckDB on TPC-H, approximately 3x lower memory usage.
 
 These numbers come from three independent teams—this isn't one vendor's marketing.
 
-Where Vortex Fits
-
-Vortex isn't replacing Parquet everywhere. It's the right choice for:
-
-• Latency-sensitive workloads on object storage
-• Multi-terabyte datasets with sub-second query requirements
-• Arrow-native applications (DataFusion, DuckDB, Polars)
-• ML/AI pipelines needing efficient GPU data transfer
-
-For archival storage or maximum interoperability, Parquet remains the safe choice. But for hot data acceleration? The ecosystem has shifted.
-
 The adopter list speaks volumes:
 
-🟢 NVIDIA — Official LF project backer, actively developing CUDA kernels for GPU-direct decompression. Their vision: load training data straight from S3 to GPU memory, bypassing CPU bottlenecks entirely.
+NVIDIA — Official LF project backer, actively developing CUDA kernels for GPU-direct decompression. Their vision: load training data straight from S3 to GPU memory, bypassing CPU bottlenecks entirely.
 
-🟢 LangChain — Uses Vortex internally for LangSmith observability and their cloud products. Millions of LLM traces need fast columnar decode.
+LangChain — Uses Vortex internally for LangSmith observability and their cloud products. Millions of LLM traces need fast columnar decode.
 
-🟢 Spice AI — Vortex powers Cayenne, our data accelerator.
+Spice AI — Vortex powers Cayenne, our data accelerator.
 
 Plus academic groups, Arrow-ecosystem startups, and the growing community of contributors. We've built Spice Cayenne on Vortex and contribute improvements upstream. The combination of research-grade algorithms, production-quality code, and sustainable governance is rare.
 
-What columnar formats are you building on?
-
 ---
 
-## X Post (280 characters)
+## X (5 posts, 280 characters each)
 
-🌐 Vortex ecosystem is production-ready:
+Post 1:
+Vortex ecosystem is production-ready: DuckDB core extension (18-35% faster than Parquet). NVIDIA nvCOMP GPU acceleration. Spice Cayenne (1.4x faster than DuckDB). Polar Signals (70% speedup). Linux Foundation governance.
 
-✅ DuckDB core extension (18-35% faster)
-✅ NVIDIA nvCOMP GPU acceleration
-✅ Spice Cayenne (1.4x faster)
-✅ Polar Signals (70% speedup)
-✅ Linux Foundation governance
+Post 2:
+Linux Foundation stewardship matters: neutral governance, no single vendor controls roadmap. Long-term stability. Enterprise legal teams trust LF model. Spiral provides commercial support while contributing to open-source core.
 
-The Arrow-native columnar format.
+Post 3:
+Why Vortex beats Parquet for hot data: late decompression, compute pushdown on compressed data. Filter expressions run directly on encoded columns. SIMD-friendly decode straight to Arrow. 100x faster random access.
 
----
+Post 4:
+Who's using Vortex: NVIDIA for GPU-direct decompression (S3 to GPU, skip CPU). LangChain for LangSmith observability (millions of LLM traces). DuckDB as core extension. Polar Signals for profiling database.
 
-## Reply with References
-
-References:
-
-- Vortex GitHub: <https://github.com/vortex-data/vortex>
-- Spiral: <https://spiraldb.com>
-- Linux Foundation Announcement: <https://www.linuxfoundation.org/press/lf-ai-data-foundation-hosts-vortex-project-to-power-high-performance-data-access-for-ai-and-analytics>
-- DuckDB Vortex Extension: <https://duckdb.org/2026/01/23/duckdb-vortex-extension>
-- Spiral Blog - Vortex LF Project: <https://spiraldb.com/post/vortex-a-linux-foundation-project>
-- Spice Cayenne: <https://spice.ai/blog/introducing-spice-cayenne-data-accelerator>
-- Polar Signals Vortex: <https://www.polarsignals.com/blog/posts/2025/11/25/interface-parquet-vortex>
-- Vortex CUDA (nvCOMP): <https://github.com/vortex-data/vortex/tree/develop/vortex-cuda>
-- Vortex Benchmarks: <https://bench.vortex.dev>
-- Spice AI Vortex fork: <https://github.com/spiceai/vortex>
-- Apache Arrow: <https://arrow.apache.org>
-- Apache DataFusion: <https://datafusion.apache.org>
-- Polars: <https://pola.rs>
-- DuckDB: <https://duckdb.org>
-- LangChain: <https://www.langchain.com>
-- LangSmith: <https://www.langchain.com/langsmith>
-- NVIDIA RAPIDS cuDF: <https://github.com/rapidsai/cudf>
-- FastLanes Paper: <https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf>
-- FastLanes on GPU: <https://dbdbd2023.ugent.be/abstracts/felius_fastlanes.pdf>
-
-Previous posts in this series:
-
-- Part 1 (Research): <https://www.linkedin.com/posts/lukekim_datafusion-spiceai-data-activity-7417019189477126144-1TRe>
-- Part 2 (Use Cases): <https://www.linkedin.com/posts/lukekim_vortex-efficient-columnar-storage-for-hot-activity-7419472524750798848-lZC6>
-
-Related:
-
-- Vortex at Spice AI: <https://www.linkedin.com/posts/lukekim_datafusion-developers-ai-activity-7417649503291498496-TD5_>
-- Spiral Blog - Announcing Spiral: <https://spiraldb.com/post/announcing-spiral>
-- Linux Foundation: <https://www.linuxfoundation.org>
-- LF AI & Data Foundation: <https://lfaidata.foundation>
-- Apache Parquet: <https://parquet.apache.org>
-- Apache Iceberg: <https://iceberg.apache.org>
-- Spice AI: <https://spiceai.org>
+Post 5:
+Vortex integrations: DataFusion native TableProvider. DuckDB full read/write. Polars via Rust plus Arrow. PyArrow for Python. NVIDIA nvCOMP for GPU. The Arrow-native columnar format ecosystem is ready.

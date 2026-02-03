@@ -87,67 +87,58 @@ Vortex bridges this gap, bringing research-grade compression to production workl
 
 ---
 
-## LinkedIn Post (~3000 characters)
+## LinkedIn
 
-🔬 The Research Behind Modern Data Compression: Why Vortex Matters
+The Research Behind Modern Data Compression: Why Vortex Matters
 
 When we chose Vortex as the storage layer for Cayenne (our data accelerator at Spice AI), we weren't just picking a file format—we were betting on decades of database research finally reaching production-ready maturity.
 
 Here's the research lineage that powers Vortex:
 
-📄 BtrBlocks (SIGMOD 2023) - The core algorithm from Technical University of Munich. Cascading multiple lightweight encodings outperforms monolithic compression. Key insight: optimize for decompression speed, not just compression ratio.
+BtrBlocks (SIGMOD 2023) - The core algorithm from Technical University of Munich. Cascading multiple lightweight encodings outperforms monolithic compression. Key insight: optimize for decompression speed, not just compression ratio.
 
-📄 FastLanes (VLDB 2023) - Hardware-friendly integer compression. Structures bit-packing to maximize SIMD (Single Instruction, Multiple Data) utilization across Intel and ARM processors. Near-memory-bandwidth decompression.
+FastLanes (VLDB 2023) - Hardware-friendly integer compression. Structures bit-packing to maximize SIMD (Single Instruction, Multiple Data) utilization across Intel and ARM processors. Near-memory-bandwidth decompression.
 
-📄 FSST (VLDB 2020) - Fast Static Symbol Table for strings. Near-LZ4 ratios at 5-10× faster decompression. Critical for string-heavy analytical columns.
+FSST (VLDB 2020) - Fast Static Symbol Table for strings. Near-LZ4 ratios at 5-10x faster decompression. Critical for string-heavy analytical columns.
 
-📄 ALP (CWI Amsterdam) - Adaptive Lossless floating-Point compression from the Dutch national research institute. Exploits real-world float patterns (prices with 2 decimals, sensor readings with limited precision).
+ALP (CWI Amsterdam) - Adaptive Lossless floating-Point compression from the Dutch national research institute. Exploits real-world float patterns (prices with 2 decimals, sensor readings with limited precision).
 
-📄 MonetDB/X100 + Morsel-Driven Parallelism - Foundations for vectorized, NUMA-aware (Non-Uniform Memory Access) query execution that Vortex builds on.
+MonetDB/X100 + Morsel-Driven Parallelism - Foundations for vectorized, NUMA-aware (Non-Uniform Memory Access) query execution that Vortex builds on.
 
-The result? Compression that understands your data:
-• Integers via FastLanes bit-packing
-• Floats via ALP adaptive encoding
-• Strings via FSST symbol tables
-• Timestamps via delta encoding
-• Sorted columns via run-length encoding
+The result? Compression that understands your data: Integers via FastLanes bit-packing. Floats via ALP adaptive encoding. Strings via FSST symbol tables. Timestamps via delta encoding. Sorted columns via run-length encoding.
 
 Why does this matter for production systems?
 
-1️⃣ Query performance scales with decompression speed. Academic focus on decode performance translates directly to faster queries.
+1. Query performance scales with decompression speed. Academic focus on decode performance translates directly to faster queries.
 
-2️⃣ Automatic encoding selection means zero configuration. The algorithm samples your data and picks optimal strategies per column.
+2. Automatic encoding selection means zero configuration. The algorithm samples your data and picks optimal strategies per column.
 
-3️⃣ SIMD acceleration is baked in. FastLanes was designed for vectorized execution from day one.
+3. SIMD acceleration is baked in. FastLanes was designed for vectorized execution from day one.
 
-4️⃣ Zero-copy Arrow access. Data decompresses directly to Arrow arrays—no intermediate copies.
+4. Zero-copy Arrow access. Data decompresses directly to Arrow arrays—no intermediate copies.
 
-Vortex is now a Linux Foundation AI & Data project, and researchers are building on it (Anyblox, F3). The gap between academic research and production systems is narrowing.
+Vortex is now a Linux Foundation AI and Data project, and researchers are building on it (Anyblox, F3). The gap between academic research and production systems is narrowing.
 
 What's next? GPU-accelerated decoding and learned compression. The future of data storage is adaptive, intelligent, and fast.
 
 ---
 
-## X Post (280 characters)
+## X (5 posts, 280 characters each)
 
-🔬 Vortex = decades of DB research in production.
+Post 1:
+Vortex equals decades of DB research in production. BtrBlocks plus FastLanes plus FSST plus ALP equals type-aware compression. Integers, floats, strings, timestamps—each gets optimal encoding. SIMD-accelerated decode. Zero-copy Arrow.
 
-BtrBlocks + FastLanes + FSST + ALP = type-aware compression.
+Post 2:
+BtrBlocks (SIGMOD 2023): cascade multiple lightweight encodings. Optimize for decompression speed, not just compression ratio. The algorithm samples data and picks optimal strategies per column automatically.
 
-Integers, floats, strings, timestamps—each gets optimal encoding. SIMD-accelerated decode. Zero-copy Arrow.
+Post 3:
+FastLanes (VLDB 2023): structure bit-packing for maximum SIMD utilization. Works across Intel AVX-512, AVX2, and ARM NEON. Near-memory-bandwidth decompression speeds. Now has GPU extensions too.
 
-100× faster random access vs Parquet.
+Post 4:
+FSST for strings: near-LZ4 compression at 5-10x faster decompression. ALP for floats: exploits real-world precision patterns. Prices with 2 decimals compress as scaled integers.
 
----
-
-## Reply with References
-
-Research papers powering Vortex:
-• BtrBlocks (SIGMOD '23): cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf
-• FastLanes (VLDB '23): vldb.org/pvldb/vol16/p2132-afroozeh.pdf
-• FSST (VLDB '20): vldb.org/pvldb/vol13/p2649-boncz.pdf
-• ALP: ir.cwi.nl/pub/33334/33334.pdf
-• MonetDB/X100: cidrdb.org/cidr2005/papers/P19.pdf
+Post 5:
+Vortex is now a Linux Foundation project. 100x faster random access vs Parquet. Research papers powering it: BtrBlocks, FastLanes, FSST, ALP, MonetDB/X100. The gap between academia and production is closing.
 • Morsel-Driven Parallelism: db.in.tum.de/~leis/papers/morsels.pdf
 
 Project links:

@@ -7,7 +7,7 @@ By Luke Kim, Founder.
 
 ## LinkedIn
 
-**SQL Federation: Query Any Data Source With One Interface**
+SQL Federation: Query Any Data Source With One Interface
 
 Most organizations have data in 5-15 different systems. PostgreSQL for transactions. Snowflake for analytics. S3 for the data lake. Salesforce for CRM. MongoDB for documents.
 
@@ -15,114 +15,39 @@ Traditionally, to analyze data across these sources, you build ETL pipelines. Ex
 
 SQL Federation takes a different approach: query the sources directly, through a unified SQL interface.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              SQL FEDERATION: HOW IT WORKS                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ETL APPROACH (traditional):                                    │
-│                                                                  │
-│   PostgreSQL ─┐                                                  │
-│               │                                                  │
-│   Snowflake  ─┼──→ ETL Jobs ──→ Warehouse ──→ Query             │
-│               │         │                                        │
-│   S3         ─┘         ▼                                        │
-│                  Costs:                                          │
-│                  • Storage: 3-10x duplication                    │
-│                  • Freshness: Hours to days stale               │
-│                  • Maintenance: Pipeline code, monitoring        │
-│                  • Flexibility: Schema changes break pipelines  │
-│                                                                  │
-│   FEDERATION APPROACH:                                           │
-│                                                                  │
-│   PostgreSQL ◄──┐                                                │
-│                 │                                                │
-│   Snowflake  ◄──┼─── Federation Engine ◄── SQL Query            │
-│                 │           │                                    │
-│   S3         ◄──┘           ▼                                    │
-│                      Push computation to sources                 │
-│                      Return only matching results                │
-│                                                                  │
-│   KEY MECHANISM: Query Push-Down                                 │
-│                                                                  │
-│   Query: SELECT * FROM pg.orders WHERE date > '2024-01-01'       │
-│                                                                  │
-│   Without push-down:                                             │
-│   └─ Fetch ALL orders from PostgreSQL                           │
-│   └─ Filter locally                                              │
-│   └─ Network: millions of rows                                   │
-│                                                                  │
-│   With push-down:                                                │
-│   └─ Send "WHERE date > '2024-01-01'" to PostgreSQL             │
-│   └─ PostgreSQL filters using its indexes                       │
-│   └─ Network: only matching rows                                 │
-│                                                                  │
-│   Push-down extends to:                                          │
-│   • Projections (SELECT specific columns)                        │
-│   • Aggregations (SUM, COUNT, AVG computed at source)           │
-│   • Joins (when both tables on same source)                      │
-│   • Limits (LIMIT 100 applied at source)                         │
-└─────────────────────────────────────────────────────────────────┘
-```
+The ETL approach has real costs. Storage duplication runs 3-10x. Data freshness is hours to days stale. There's constant pipeline maintenance. Schema changes break pipelines. You're managing infrastructure that exists only because your query systems can't talk to multiple sources.
 
-**The evolution of federation technology:**
+Federation works differently. PostgreSQL, Snowflake, and S3 connect to a federation engine. You write one SQL query. The engine pushes computation to the sources and returns only matching results.
 
-**1990s - Data Warehouses**: Copy everything centrally. Simple but stale.
+The key mechanism is query push-down. Without push-down, a query like SELECT FROM orders WHERE date greater than 2024-01-01 fetches ALL orders from PostgreSQL, then filters locally. Millions of rows cross the network. With push-down, the WHERE clause goes to PostgreSQL, PostgreSQL filters using its indexes, and only matching rows cross the network.
 
-**2000s - Federated Databases**: Query remote sources, but pull all data locally for processing. Poor performance.
+Push-down extends beyond filters. Projections push down (SELECT specific columns). Aggregations push down (SUM, COUNT, AVG computed at source). Joins push down when both tables are on the same source. Limits push down (LIMIT 100 applied at source).
 
-**2010s - Data Virtualization**: Added caching and smarter planning. Expensive, often became another silo.
+The evolution of federation technology: 1990s data warehouses copied everything centrally—simple but stale. 2000s federated databases queried remote sources but pulled all data locally for processing—poor performance. 2010s data virtualization added caching and smarter planning—expensive, often became another silo. 2020s push-down federation pushes computation to sources, with only results crossing the network, leveraging each source's native optimization.
 
-**2020s - Push-Down Federation**: Push computation to sources. Only results cross the network. Leverage each source's native optimization.
+Tradeoffs to understand: Federation queries hit your source systems—they need capacity. Query latency includes network round-trips. Cross-source joins can't use source-side optimization. Caching decisions add complexity.
 
-**Tradeoffs to understand:**
+When federation works well: Real-time requirements where you can't wait for ETL. Schema volatility where sources change frequently. Exploratory queries where you don't know what you need yet. Cost sensitivity where you don't want to store data twice.
 
-- **Source load**: Federation queries hit your source systems. They need capacity.
-- **Network dependency**: Query latency includes network round-trips.
-- **Optimization limits**: Cross-source joins can't use source-side optimization.
-- **Caching complexity**: When to cache vs. query live is a design decision.
-
-**When federation works well:**
-- Real-time requirements (can't wait for ETL)
-- Schema volatility (sources change frequently)
-- Exploratory queries (don't know what you need yet)
-- Cost sensitivity (don't want to store data twice)
-
-**When ETL is still right:**
-- Heavy analytical workloads (aggregations across billions of rows)
-- Strict latency requirements (pre-computed beats live queries)
-- Complex transformations (business logic too complex for SQL)
+When ETL is still right: Heavy analytical workloads with aggregations across billions of rows. Strict latency requirements where pre-computed beats live queries. Complex transformations with business logic too complex for SQL.
 
 From experience: I've built hundreds of ETL pipelines. Most of them existed because our query systems couldn't talk to multiple sources—not because ETL was the best architecture. Federation eliminates that constraint.
 
 ---
 
-## X
+## X (5 posts, 280 characters each)
 
-SQL Federation: the evolution
+Post 1:
+SQL Federation: query multiple data sources with one SQL interface. PostgreSQL, Snowflake, S3, Salesforce—one query, results from everywhere. No ETL pipelines, no data duplication, no staleness.
 
-Phase 1 (90s): Data Warehouses
-Source → ETL → Warehouse → Query
-✗ Data staleness, storage duplication, pipeline maintenance
+Post 2:
+The key mechanism: push-down. Without it, fetch all rows then filter locally. With it, WHERE clause goes to source, source filters with its indexes, only matching rows cross the network. Huge difference.
 
-Phase 2 (00s): Federated DBs
-SELECT * FROM oracle.customers JOIN db2.orders
-✗ Pulled all data centrally, poor performance
+Post 3:
+Push-down extends to projections (SELECT columns), aggregations (SUM at source), joins (same-source), limits (LIMIT 100 at source). The source systems do the heavy lifting. Federation engine orchestrates.
 
-Phase 3 (10s): Data Virtualization
-Added caching layer
-✗ Expensive licensing, another silo
+Post 4:
+Evolution: 90s warehouses (copy everything, stale). 00s federation (pull all data, slow). 10s virtualization (caching, expensive). 20s push-down (computation at source, only results travel).
 
-Phase 4 (20s): Push-down Federation
-Push WHERE, GROUP BY, projections to source systems
-✓ Minimal data movement, native optimization
-
-```sql
--- One query, multiple sources
-SELECT c.name, SUM(o.total)
-FROM postgres.customers c
-JOIN snowflake.orders o ON c.id = o.customer_id
-WHERE o.date > '2024-01-01'
-```
-
-The source systems do the heavy lifting.
+Post 5:
+When to federate: real-time needs, schema volatility, exploratory queries, cost sensitivity. When to ETL: billions of rows, strict latency, complex transforms. Most ETL exists because query systems couldn't talk to sources.
