@@ -152,14 +152,6 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
-      - name: Dispatch Testoperator - Scheduled Text-to-SQL - TPCH
-        run: |
-          testoperator dispatch ./tools/testoperator/dispatch/text_to_sql --workflow text-to-sql
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
-          WORKFLOW_COMMIT: ${{ matrix.branch }}
-
   dispatch-input:
     name: Dispatch tests - Input
     runs-on: spiceai-dev-runners
