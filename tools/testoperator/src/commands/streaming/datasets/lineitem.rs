@@ -173,7 +173,14 @@ impl StreamingDataset for LineitemDataset {
         // increases the chance of hitting different partitions/shards.
         // All markers use l_linenumber = -1 to avoid conflicts with real data.
         const MARKER_ORDER_KEYS: [i64; 8] = [
-            -1, -1000, -10000, -100000, -1000000, -2000000, -5000000, -10000000,
+            -1,
+            -1000,
+            -10000,
+            -100_000,
+            -1_000_000,
+            -2_000_000,
+            -5_000_000,
+            -10_000_000,
         ];
         let num_markers = MARKER_ORDER_KEYS.len();
 

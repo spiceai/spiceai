@@ -49,14 +49,14 @@ pub fn generate_run_id() -> String {
 
     // Combine timestamp with some randomness from the lower bits
     let seed = now.as_nanos();
-    format!("{:06x}", (seed & 0xFFFFFF) as u32)
+    format!("{:06x}", (seed & 0x00FF_FFFF) as u32)
 }
 
 /// Load a spicepod definition from a path.
 pub fn load_spicepod_definition(path: &Path) -> Result<SpicepodDefinition> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read spicepod: {}", path.display()))?;
-    let definition: SpicepodDefinition = serde_yaml::from_str(&content)
+    let definition: SpicepodDefinition = yaml::from_str(&content)
         .with_context(|| format!("Failed to parse spicepod: {}", path.display()))?;
     Ok(definition)
 }
@@ -72,7 +72,7 @@ pub fn write_temp_spicepod(
     let filename = format!("spicepod-{run_id}-{config_name}-{phase}.yaml");
     let path = temp_dir.join(filename);
 
-    let content = serde_yaml::to_string(spicepod).context("Failed to serialize spicepod")?;
+    let content = yaml::to_string(spicepod).context("Failed to serialize spicepod")?;
     std::fs::write(&path, content)
         .with_context(|| format!("Failed to write temp spicepod: {}", path.display()))?;
 

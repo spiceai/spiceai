@@ -7117,7 +7117,7 @@ dependencies = [
  "arrow-flight",
  "arrow-schema",
  "bytes",
- "clap 4.5.54",
+ "clap",
  "futures",
  "prost 0.14.3",
  "tokio",

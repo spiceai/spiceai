@@ -397,7 +397,6 @@ impl DynamoDbStreamsSource {
                         }
                         Err(_) => {
                             // Can't get tags, skip this table (might not be ours)
-                            continue;
                         }
                     }
                 }
@@ -941,7 +940,14 @@ impl DynamoDbStreamsSource {
     async fn delete_lineitem_marker_named(&self, client: &Client, table_name: &str) -> Result<()> {
         // Delete all marker records (multiple markers with different l_orderkey values)
         const MARKER_ORDER_KEYS: [i64; 8] = [
-            -1, -1000, -10000, -100000, -1000000, -2000000, -5000000, -10000000,
+            -1,
+            -1000,
+            -10000,
+            -100_000,
+            -1_000_000,
+            -2_000_000,
+            -5_000_000,
+            -10_000_000,
         ];
 
         for order_key in MARKER_ORDER_KEYS {
