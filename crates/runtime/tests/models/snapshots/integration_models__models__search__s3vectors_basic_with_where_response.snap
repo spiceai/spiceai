@@ -34,7 +34,7 @@ snapshot_kind: text
       "dataset": "qs",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%\u201310% of patients."
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
         ]
       },
       "primary_key": {
