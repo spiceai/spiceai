@@ -6507,15 +6507,6 @@
           "description": "Path to the Turso database file. If not specified, defaults to {spice_data_dir}/{dataset_name}.turso",
           "type": "string"
         },
-        "turso_turso_mvcc": {
-          "description": "Enable Multi-Version Concurrency Control (MVCC) for Turso database",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
         "turso_internal_timestamp_format": {
           "description": "Internal timestamp storage format: 'rfc3339' (default, preserves precision/timezone) or 'integer_millis' (performance, millisecond precision only)",
           "type": "string",

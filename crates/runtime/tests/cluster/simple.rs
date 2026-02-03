@@ -278,13 +278,14 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                 scheduler_rt.datafusion(),
             );
 
-            let query_result = query
+            let query_handle = query
                 .build()
-                .run_distributed()
+                .submit_distributed("testing_explain")
                 .await
-                .expect("should run distributed query");
+                .expect("should submit distributed query");
+
+            let query_result = query_handle.into_stream().await.expect("should get stream");
             let results = query_result
-                .data
                 .try_collect::<Vec<RecordBatch>>()
                 .await
                 .expect("should collect results");
@@ -311,14 +312,14 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                 scheduler_rt.datafusion(),
             );
 
-            let query_result = query
+            let query_handle = query
                 .build()
-                .run_distributed()
+                .submit_distributed("testing")
                 .await
-                .expect("should run distributed query");
+                .expect("should submit distributed query");
 
+            let query_result = query_handle.into_stream().await.expect("should get stream");
             let results = query_result
-                .data
                 .try_collect::<Vec<RecordBatch>>()
                 .await
                 .expect("should collect results");

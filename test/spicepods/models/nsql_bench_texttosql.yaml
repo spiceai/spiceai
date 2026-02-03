@@ -60,8 +60,8 @@ models:
       openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
       reasoning_effort: high
       system_prompt: *system_prompt
-  - name: claude-sonnet-4-5
-    from: anthropic:claude-sonnet-4-5
+  - name: claude-haiku-3-5
+    from: anthropic:claude-haiku-3-5
     params:
       tools: auto
       anthropic_api_key: ${ secrets:SPICE_ANTHROPIC_API_KEY }

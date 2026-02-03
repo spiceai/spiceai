@@ -123,7 +123,7 @@ impl DataSink for PutVectorsSink {
                     .table
                     .client
                     .put_vectors(
-                        PutVectorsInput::builder()
+                        &PutVectorsInput::builder()
                             .set_index_arn(index_arn.clone())
                             .set_index_name(index_name.clone())
                             .set_vector_bucket_name(vector_bucket_name.clone())

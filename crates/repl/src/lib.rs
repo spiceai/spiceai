@@ -22,7 +22,6 @@ limitations under the License.
 
 use std::borrow::Cow;
 use std::error::Error;
-use std::fmt::Display;
 use std::io::Write;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -38,9 +37,9 @@ use arrow_flight::{
 };
 
 use crate::completer::SchemaCache;
+use crate::pretty::format_batches_with_types;
 use ansi_colors::Color;
 use arrow::array::RecordBatch;
-use arrow::util::pretty::pretty_format_batches;
 use clap::Parser;
 use config::get_user_agent;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
@@ -65,6 +64,7 @@ use tonic::{Code, IntoRequest, Status};
 pub mod cache_control;
 mod completer;
 mod config;
+pub mod pretty;
 pub mod util;
 
 #[derive(Parser, Debug)]
@@ -650,13 +650,13 @@ fn add_api_key<T>(
 ///
 /// # Errors
 ///
-/// Returns an error if the record batches cannot be loaded into Datafusion.
+/// Returns an error if the record batches cannot be formatted.
 fn display_records(
     records: &[RecordBatch],
     start_time: Instant,
     total_rows: usize,
     from_cache: bool,
-) -> Result<impl Display, Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut limited_records = Vec::new();
     let mut rows_collected = 0;
 
@@ -674,7 +674,7 @@ fn display_records(
         }
     }
 
-    let pretty_batches = match pretty_format_batches(&limited_records) {
+    let pretty_batches = match format_batches_with_types(&limited_records) {
         Ok(pretty) => pretty,
         Err(e) => {
             println!(

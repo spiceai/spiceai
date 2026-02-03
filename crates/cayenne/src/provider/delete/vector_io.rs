@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Spice.ai OSS Authors
+Copyright 2025-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,26 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Helpers for working with Cayenne deletion vectors.
+//! Deletion vector I/O for Cayenne tables.
 //!
-//! The deletion-vector pipeline is shared by multiple code paths (SQL `DELETE`,
-//! runtime-triggered maintenance, and upcoming `on_conflict`/upsert flows).  This
-//! module consolidates the logic for writing deletion-vector files and producing
-//! the corresponding catalog metadata so callers can focus on selecting which rows
-//! to remove.
+//! This module handles reading and writing deletion vector files using Arrow IPC format.
+//! Deletion vectors are used to mark rows as deleted without rewriting data files.
+//!
+//! # File Format
+//!
+//! Deletion vectors are stored as Arrow IPC files with one of two schemas:
+//!
+//! - **Position-based** (for tables without primary key):
+//!   - `row_id: UInt64` - File-local row position (0-indexed)
+//!   - `deleted_at: Int64` - Deletion timestamp (microseconds)
+//!
+//! - **Key-based** (for tables with primary key):
+//!   - `row_key: Binary` - Primary key bytes (via Arrow's `RowConverter`)
+//!   - `deleted_at: Int64` - Deletion timestamp (microseconds)
 
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use arrow::array::{Array, BinaryArray, Int64Array};
+use arrow::array::{Array, BinaryArray, Int64Array, UInt64Array};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_ipc::reader::FileReader;
 use arrow_schema::SchemaRef;
 use chrono::Utc;
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::catalog::{CatalogError, CatalogResult};
-use crate::metadata::{DeleteFile, TableMetadata};
+use crate::metadata::{DeleteFile, DeletionType, TableMetadata};
 
 /// Directory under the table snapshot where deletion vectors are stored.
 const DELETION_DIR_NAME: &str = "deletions";
@@ -46,8 +59,8 @@ const DELETION_FILE_FORMAT: &str = "arrow_ipc";
 ///
 /// # Deletion Strategies
 ///
-/// - **Position-based (`row_ids`)**: Uses row position within the table. Requires consistent
-///   ordering between delete and read operations (ensured by `CoalescePartitionsExec`).
+/// - **Position-based (`row_ids`)**: Uses row position within a specific data file.
+///   File-local positions (0 to N-1) ensure correct deletion regardless of scan order.
 ///   Used when no primary key is defined.
 ///
 /// - **Key-based (`row_keys`)**: Uses the byte representation of primary key columns
@@ -55,9 +68,13 @@ const DELETION_FILE_FORMAT: &str = "arrow_ipc";
 ///   Used when a primary key is defined.
 #[derive(Debug)]
 pub enum DeletionIdentifier {
-    /// Position-based row IDs (for tables without primary key)
-    PositionBased(Vec<i64>),
-    /// Primary key-based row keys (for tables with primary key)
+    /// Position-based row IDs for a specific data file (tables without primary key).
+    /// The file path identifies which data file these row positions belong to.
+    PositionBased {
+        file_path: String,
+        row_ids: Vec<u64>,
+    },
+    /// Primary key-based row keys (for tables with primary key).
     KeyBased(Vec<Box<[u8]>>),
 }
 
@@ -66,38 +83,30 @@ impl DeletionIdentifier {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::PositionBased(ids) => ids.is_empty(),
+            Self::PositionBased { row_ids, .. } => row_ids.is_empty(),
             Self::KeyBased(keys) => keys.is_empty(),
-        }
-    }
-
-    /// Returns the number of rows to delete.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        match self {
-            Self::PositionBased(ids) => ids.len(),
-            Self::KeyBased(keys) => keys.len(),
         }
     }
 }
 
 /// Specification describing a deletion-vector file that should be produced.
 ///
-/// A single deletion-vector file applies to one virtual data file (identified by
-/// `source_data_file_path` for position-based deletions) and contains the logical
-/// row IDs to mark as deleted.
+/// For position-based deletions, the file path is embedded in the `DeletionIdentifier`.
+/// For key-based deletions, the deletion applies to the entire table.
 #[derive(Debug)]
 pub struct DeletionVectorWriteSpec {
-    /// Row identifiers (position-based or key-based)
+    /// Row identifiers (position-based with file path, or key-based)
     pub identifiers: DeletionIdentifier,
 }
 
 impl DeletionVectorWriteSpec {
-    /// Create a new specification with position-based row IDs.
+    /// Create a new specification with position-based row IDs for a specific data file.
+    ///
+    /// The row IDs should be file-local positions (0 to N-1 within the specified file).
     #[must_use]
-    pub fn new(row_ids: Vec<i64>) -> Self {
+    pub fn new_position_based(file_path: String, row_ids: Vec<u64>) -> Self {
         Self {
-            identifiers: DeletionIdentifier::PositionBased(row_ids),
+            identifiers: DeletionIdentifier::PositionBased { file_path, row_ids },
         }
     }
 
@@ -126,6 +135,10 @@ pub struct DeletionVectorWriteResult {
     /// Filesystem path where the deletion-vector file was written.
     pub path: PathBuf,
 }
+
+// ============================================================================
+// Writer
+// ============================================================================
 
 /// Writes deletion-vector files for a specific Cayenne table snapshot.
 #[derive(Debug)]
@@ -167,21 +180,12 @@ impl<'a> DeletionVectorWriter<'a> {
 
             let file_path = Self::deletion_file_path(&deletion_dir);
 
-            let (batch, schema, count, identifiers) = match spec.identifiers {
-                DeletionIdentifier::PositionBased(mut row_ids) => {
-                    // Validate no negative row IDs
-                    if row_ids.iter().any(|row_id| *row_id < 0) {
-                        return Err(CatalogError::NegativeRowId {
-                            row_ids: format!(
-                                "{:?}",
-                                row_ids
-                                    .iter()
-                                    .filter(|row_id| **row_id < 0)
-                                    .copied()
-                                    .collect::<Vec<_>>()
-                            ),
-                        });
-                    }
+            let (batch, schema, count, identifiers, source_data_file_path) = match spec.identifiers
+            {
+                DeletionIdentifier::PositionBased {
+                    file_path: source_file,
+                    mut row_ids,
+                } => {
                     row_ids.sort_unstable();
                     row_ids.dedup();
                     let count = row_ids.len();
@@ -191,7 +195,11 @@ impl<'a> DeletionVectorWriter<'a> {
                         batch,
                         schema,
                         count,
-                        DeletionIdentifier::PositionBased(row_ids),
+                        DeletionIdentifier::PositionBased {
+                            file_path: source_file.clone(),
+                            row_ids,
+                        },
+                        Some(source_file),
                     )
                 }
                 DeletionIdentifier::KeyBased(mut row_keys) => {
@@ -201,7 +209,13 @@ impl<'a> DeletionVectorWriter<'a> {
                     let count = row_keys.len();
                     let schema = key_based_deletion_schema();
                     let batch = build_key_based_batch(&schema, &row_keys)?;
-                    (batch, schema, count, DeletionIdentifier::KeyBased(row_keys))
+                    (
+                        batch,
+                        schema,
+                        count,
+                        DeletionIdentifier::KeyBased(row_keys),
+                        None,
+                    )
                 }
             };
 
@@ -210,10 +224,8 @@ impl<'a> DeletionVectorWriter<'a> {
 
             // Determine deletion type from identifiers
             let deletion_type = match &identifiers {
-                DeletionIdentifier::PositionBased(_) => {
-                    crate::metadata::DeletionType::PositionBased
-                }
-                DeletionIdentifier::KeyBased(_) => crate::metadata::DeletionType::KeyBased,
+                DeletionIdentifier::PositionBased { .. } => DeletionType::PositionBased,
+                DeletionIdentifier::KeyBased(_) => DeletionType::KeyBased,
             };
 
             let delete_file = build_delete_file(
@@ -222,6 +234,7 @@ impl<'a> DeletionVectorWriter<'a> {
                 count,
                 file_size_bytes,
                 deletion_type,
+                source_data_file_path,
             )?;
 
             results.push(DeletionVectorWriteResult {
@@ -247,11 +260,171 @@ impl<'a> DeletionVectorWriter<'a> {
     }
 }
 
+// ============================================================================
+// Reader
+// ============================================================================
+
+/// Read deletion vectors from files, detecting whether each file is position-based or key-based
+/// from its schema, and return separate collections for each type.
+///
+/// For position-based deletions, returns a map of source data file path to the `RoaringBitmap`
+/// of file-local row positions. This enables correct deletion filtering regardless of file
+/// scan order.
+///
+/// # Blocking I/O Warning
+///
+/// This function performs **blocking file system I/O** operations and must be called
+/// from within `tokio::task::spawn_blocking`.
+///
+/// # Returns
+///
+/// A tuple of `(per_file_row_ids, key_based_row_keys_with_sequence)`.
+/// - `per_file_row_ids`: Map of source data file path -> `RoaringBitmap` of deleted row positions
+/// - `key_based_row_keys_with_sequence`: Map of PK bytes -> max delete sequence number
+///
+/// # Errors
+///
+/// Returns an error if any deletion vector file cannot be read or parsed.
+#[expect(clippy::type_complexity)]
+pub fn detect_deletion_type_and_read(
+    delete_files: Vec<DeleteFile>,
+) -> datafusion_common::Result<(HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>)> {
+    let mut per_file_row_ids: HashMap<String, RoaringBitmap> = HashMap::new();
+    let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
+    let file_count = delete_files.len();
+
+    tracing::debug!(
+        "detect_deletion_type_and_read: processing {} delete files",
+        file_count
+    );
+
+    // Track overflow occurrences to log once at the end
+    let mut overflow_count: u64 = 0;
+    let mut first_overflow_id: Option<u64> = None;
+
+    for delete_file in delete_files {
+        let path = std::path::Path::new(&delete_file.path);
+        tracing::debug!("detect_deletion_type_and_read: reading file {:?}", path);
+
+        let file = std::fs::File::open(path).map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to open deletion vector file {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        let reader = FileReader::try_new(file, None).map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to read deletion vector file {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        // Detect type from schema: first column name determines type
+        // "row_id" (Int64) = position-based, "row_key" (Binary) = key-based
+        let schema = reader.schema();
+        let first_field = schema.field(0);
+        let is_key_based = matches!(first_field.data_type(), DataType::Binary);
+
+        // Get the sequence number for this delete file (for sequence-based ordering)
+        let file_sequence = delete_file.sequence_number;
+
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read batch from deletion vector: {e}"
+                ))
+            })?;
+
+            if is_key_based {
+                // Key-based: extract Binary row_key column
+                let row_key_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| {
+                        datafusion_common::DataFusionError::Execution(
+                            "Expected BinaryArray for row_key column".to_string(),
+                        )
+                    })?;
+
+                for i in 0..row_key_array.len() {
+                    if !row_key_array.is_null(i) {
+                        let key = row_key_array.value(i).to_vec().into_boxed_slice();
+                        // Track max delete sequence for each PK
+                        deleted_row_keys
+                            .entry(key)
+                            .and_modify(|seq| *seq = (*seq).max(file_sequence))
+                            .or_insert(file_sequence);
+                    }
+                }
+            } else {
+                // Position-based: extract UInt64 row_id column
+                // Use source_data_file_path to group deletions by their originating data file
+                let source_file = delete_file.source_data_file_path.clone().unwrap_or_else(|| {
+                    tracing::warn!(
+                        "Position-based deletion vector at {:?} has no source_data_file_path - using empty key",
+                        path
+                    );
+                    String::new()
+                });
+
+                let row_id_array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::DataFusionError::Execution(
+                            "Expected UInt64Array for row_id column".to_string(),
+                        )
+                    })?;
+
+                // Bulk insert row IDs - schema guarantees no nulls (nullable: false)
+                let bitmap = per_file_row_ids.entry(source_file).or_default();
+                let values = row_id_array.values();
+                for &row_id in values {
+                    if let Ok(row_id_u32) = u32::try_from(row_id) {
+                        bitmap.insert(row_id_u32);
+                    } else {
+                        if first_overflow_id.is_none() {
+                            first_overflow_id = Some(row_id);
+                        }
+                        overflow_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if overflow_count > 0 {
+        tracing::warn!(
+            "Skipped {} row ID(s) that exceed u32::MAX (first: {}) - table should be compacted",
+            overflow_count,
+            first_overflow_id.unwrap_or(0)
+        );
+    }
+
+    let total_position_based: u64 = per_file_row_ids.values().map(RoaringBitmap::len).sum();
+    tracing::debug!(
+        "Loaded {} position-based deletions across {} files + {} key-based deleted rows from {} deletion vector files",
+        total_position_based,
+        per_file_row_ids.len(),
+        deleted_row_keys.len(),
+        file_count
+    );
+
+    Ok((per_file_row_ids, deleted_row_keys))
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
 /// Build a deletion batch for position-based row IDs.
-fn build_position_based_batch(schema: &SchemaRef, row_ids: &[i64]) -> CatalogResult<RecordBatch> {
+fn build_position_based_batch(schema: &SchemaRef, row_ids: &[u64]) -> CatalogResult<RecordBatch> {
     let deleted_at = Utc::now().timestamp_micros();
 
-    let row_id_array = Int64Array::from(row_ids.to_vec());
+    let row_id_array = UInt64Array::from(row_ids.to_vec());
     let deleted_at_array = Int64Array::from(vec![deleted_at; row_ids.len()]);
 
     RecordBatch::try_new(
@@ -336,7 +509,8 @@ fn build_delete_file(
     file_path: &Path,
     delete_count: usize,
     file_size_bytes: u64,
-    deletion_type: crate::metadata::DeletionType,
+    deletion_type: DeletionType,
+    source_data_file_path: Option<String>,
 ) -> CatalogResult<DeleteFile> {
     let delete_count_i64 =
         i64::try_from(delete_count).map_err(|err| CatalogError::InvalidOperation {
@@ -352,7 +526,7 @@ fn build_delete_file(
     Ok(DeleteFile {
         delete_file_id: 0,
         table_id: table.table_id,
-        source_data_file_path: None, // Set by caller for position-based deletions
+        source_data_file_path,
         path: file_path.to_string_lossy().to_string(),
         path_is_relative: false,
         format: DELETION_FILE_FORMAT.to_string(),
@@ -365,32 +539,40 @@ fn build_delete_file(
 }
 
 /// Schema for position-based deletion vectors (tables without primary key).
-fn position_based_deletion_schema() -> SchemaRef {
-    use arrow::datatypes::{DataType, Field, Schema};
-
+static POSITION_BASED_DELETION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::Int64, false),
+        Field::new("row_id", DataType::UInt64, false),
         Field::new("deleted_at", DataType::Int64, false),
     ]))
-}
+});
 
 /// Schema for key-based deletion vectors (tables with primary key).
-fn key_based_deletion_schema() -> SchemaRef {
-    use arrow::datatypes::{DataType, Field, Schema};
-
+static KEY_BASED_DELETION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("row_key", DataType::Binary, false),
         Field::new("deleted_at", DataType::Int64, false),
     ]))
+});
+
+/// Returns the schema for position-based deletion vectors.
+fn position_based_deletion_schema() -> SchemaRef {
+    Arc::clone(&POSITION_BASED_DELETION_SCHEMA)
 }
+
+/// Returns the schema for key-based deletion vectors.
+fn key_based_deletion_schema() -> SchemaRef {
+    Arc::clone(&KEY_BASED_DELETION_SCHEMA)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::ipc::reader::FileReader;
-    use std::sync::Arc;
     use tempfile::TempDir;
-    use uuid::Uuid;
 
     fn build_table_metadata(temp_dir: &TempDir) -> TableMetadata {
         TableMetadata {
@@ -415,7 +597,10 @@ mod tests {
         let table_metadata = build_table_metadata(&temp_dir);
         let writer = DeletionVectorWriter::new(&table_metadata);
 
-        let specs = vec![DeletionVectorWriteSpec::new(vec![3, 1, 3, 2])];
+        let specs = vec![DeletionVectorWriteSpec::new_position_based(
+            "test_file.vortex".to_string(),
+            vec![3, 1, 3, 2],
+        )];
         let results = writer.write(specs).await.expect("write deletion vector");
 
         assert_eq!(results.len(), 1);
@@ -423,7 +608,7 @@ mod tests {
 
         // Extract the row IDs from the result
         let row_ids = match &result.identifiers {
-            DeletionIdentifier::PositionBased(ids) => ids.clone(),
+            DeletionIdentifier::PositionBased { row_ids, .. } => row_ids.clone(),
             DeletionIdentifier::KeyBased(_) => panic!("Expected position-based identifiers"),
         };
 
@@ -448,7 +633,7 @@ mod tests {
         let row_ids_col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<UInt64Array>()
             .expect("row_id column");
         let read_row_ids: Vec<_> = (0..row_ids_col.len())
             .map(|idx| row_ids_col.value(idx))
@@ -464,26 +649,12 @@ mod tests {
 
         let results = writer
             .write(vec![
-                DeletionVectorWriteSpec::new(vec![]),
-                DeletionVectorWriteSpec::new(vec![0]),
+                DeletionVectorWriteSpec::new_position_based("empty.vortex".to_string(), vec![]),
+                DeletionVectorWriteSpec::new_position_based("test.vortex".to_string(), vec![0]),
             ])
             .await
             .expect("write deletion vector");
 
         assert_eq!(results.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn rejects_negative_row_ids() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let table_metadata = build_table_metadata(&temp_dir);
-        let writer = DeletionVectorWriter::new(&table_metadata);
-
-        let err = writer
-            .write(vec![DeletionVectorWriteSpec::new(vec![1, -5])])
-            .await
-            .expect_err("negative row ids should fail");
-
-        matches!(err, CatalogError::InvalidOperation { .. });
     }
 }

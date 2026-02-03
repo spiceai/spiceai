@@ -16,6 +16,8 @@ arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
+http.workspace = true
+parking_lot.workspace = true
 rustls-native-certs = "0.8.2"
 secrecy.workspace = true
 snafu.workspace = true
@@ -25,7 +27,9 @@ tonic = { workspace = true, features = [
     "tls-ring",
     "tls-native-roots",
 ] }
+tower.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }

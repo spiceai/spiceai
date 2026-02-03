@@ -40,7 +40,6 @@ use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
-use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
@@ -48,6 +47,7 @@ use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
+use yaml::Value;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -732,7 +732,7 @@ fn apply_overrides(
         return Ok(runtime_config);
     }
 
-    let mut yaml = match serde_yaml::to_value(runtime_config) {
+    let mut yaml = match yaml::to_value(&runtime_config) {
         Ok(yaml) => yaml,
         Err(e) => {
             return FailedToApplyOverridesGenericSnafu {
@@ -743,8 +743,7 @@ fn apply_overrides(
     };
 
     for (path, value) in overrides {
-        let yaml_value =
-            serde_yaml::from_str(value).unwrap_or_else(|_| Value::String(value.clone()));
+        let yaml_value = yaml::from_str(value).unwrap_or_else(|_| Value::String(value.clone()));
         match apply_override(&mut yaml, path, yaml_value) {
             Ok(()) => (),
             Err(e) => {
@@ -758,7 +757,7 @@ fn apply_overrides(
         }
     }
 
-    match serde_yaml::from_value(yaml) {
+    match yaml::from_value(yaml) {
         Ok(runtime) => Ok(runtime),
         Err(e) => {
             FailedToApplyOverridesGenericSnafu {
@@ -788,7 +787,7 @@ fn apply_override(
                     return Ok(());
                 }
                 Value::Null => {
-                    let mut new_map = serde_yaml::Mapping::new();
+                    let mut new_map = yaml::Mapping::new();
                     new_map.insert(Value::String(part.to_string()), value);
                     *current = Value::Mapping(new_map);
                     return Ok(());
@@ -804,10 +803,10 @@ fn apply_override(
 
         match current {
             Value::Mapping(map) => {
-                if !map.contains_key(Value::String(part.to_string())) {
+                if !map.contains_key(&Value::String(part.to_string())) {
                     map.insert(
                         Value::String(part.to_string()),
-                        Value::Mapping(serde_yaml::Mapping::new()),
+                        Value::Mapping(yaml::Mapping::new()),
                     );
                 }
                 let key = Value::String(part.to_string());

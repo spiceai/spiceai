@@ -122,16 +122,15 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
             let path = table_dir.join(format!("partition_20240101_{i}"));
 
             let handle = tokio::spawn(async move {
-                let partition = PartitionMetadata {
-                    partition_id: 0, // Will be assigned by catalog
+                let mut partition = PartitionMetadata::new_single(
                     table_id,
-                    partition_column: "partition_date".to_string(),
-                    partition_value: "2024-01-01".to_string(), // Same value for all
-                    path: path.to_string_lossy().to_string(),
-                    path_is_relative: false,
-                    record_count: 100,
-                    file_size_bytes: 1024,
-                };
+                    "partition_date".to_string(),
+                    "2024-01-01".to_string(), // Same value for all
+                    path.to_string_lossy().to_string(),
+                    false,
+                );
+                partition.record_count = 100;
+                partition.file_size_bytes = 1024;
 
                 catalog_clone.add_partition(partition).await
             });
@@ -154,16 +153,15 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
         for i in 0..num_calls {
             let path = table_dir.join(format!("partition_20240101_{i}"));
 
-            let partition = PartitionMetadata {
-                partition_id: 0,
+            let mut partition = PartitionMetadata::new_single(
                 table_id,
-                partition_column: "partition_date".to_string(),
-                partition_value: "2024-01-01".to_string(), // Same value for all
-                path: path.to_string_lossy().to_string(),
-                path_is_relative: false,
-                record_count: 100,
-                file_size_bytes: 1024,
-            };
+                "partition_date".to_string(),
+                "2024-01-01".to_string(), // Same value for all
+                path.to_string_lossy().to_string(),
+                false,
+            );
+            partition.record_count = 100;
+            partition.file_size_bytes = 1024;
 
             let partition_id = fixture.catalog.add_partition(partition).await?;
             partition_ids.push(partition_id);
@@ -181,7 +179,7 @@ async fn test_concurrent_partition_creation_impl(fixture: TestFixture) -> TestRe
 
     assert_eq!(partitions.len(), 1, "Should have exactly one partition");
     assert_eq!(partitions[0].partition_id, partition_ids[0]);
-    assert_eq!(partitions[0].partition_value, "2024-01-01");
+    assert_eq!(partitions[0].partition_values[0], "2024-01-01");
 
     Ok(())
 }
@@ -207,19 +205,18 @@ async fn test_partition_roundtrip_impl(fixture: TestFixture) -> TestResult<()> {
     let mut expected_ids = vec![];
 
     for value in partition_values {
-        let partition = PartitionMetadata {
-            partition_id: 0,
+        let mut partition = PartitionMetadata::new_single(
             table_id,
-            partition_column: "partition_date".to_string(),
-            partition_value: value.to_string(),
-            path: table_dir
+            "partition_date".to_string(),
+            value.to_string(),
+            table_dir
                 .join(format!("partition_{value}"))
                 .to_string_lossy()
                 .to_string(),
-            path_is_relative: false,
-            record_count: 100,
-            file_size_bytes: 1024,
-        };
+            false,
+        );
+        partition.record_count = 100;
+        partition.file_size_bytes = 1024;
 
         let id = fixture.catalog.add_partition(partition).await?;
         expected_ids.push((id, value.to_string()));
@@ -235,7 +232,7 @@ async fn test_partition_roundtrip_impl(fixture: TestFixture) -> TestResult<()> {
         let found = partitions.iter().find(|p| p.partition_id == expected_id);
         assert!(found.is_some(), "Partition with id {expected_id} not found");
         assert_eq!(
-            found.expect("checked above").partition_value,
+            found.expect("checked above").partition_values[0],
             expected_value
         );
     }
@@ -365,16 +362,15 @@ async fn test_sequential_partition_stress_impl(fixture: TestFixture) -> TestResu
             .to_string_lossy()
             .to_string();
 
-        let partition = PartitionMetadata {
-            partition_id: 0,
+        let mut partition = PartitionMetadata::new_single(
             table_id,
-            partition_column: "partition_date".to_string(),
-            partition_value: partition_value.clone(),
+            "partition_date".to_string(),
+            partition_value.clone(),
             path,
-            path_is_relative: false,
-            record_count: 100,
-            file_size_bytes: 1024,
-        };
+            false,
+        );
+        partition.record_count = 100;
+        partition.file_size_bytes = 1024;
 
         let id = fixture.catalog.add_partition(partition).await?;
         created_ids.push((id, partition_value));
@@ -393,7 +389,7 @@ async fn test_sequential_partition_stress_impl(fixture: TestFixture) -> TestResu
         let found = partitions.iter().find(|p| p.partition_id == expected_id);
         assert!(found.is_some(), "Partition with id {expected_id} not found");
         assert_eq!(
-            found.expect("checked above").partition_value,
+            found.expect("checked above").partition_values[0],
             expected_value
         );
     }
@@ -415,30 +411,28 @@ async fn test_duplicate_partition_returns_existing_impl(fixture: TestFixture) ->
     .await?;
 
     // Create first partition
-    let partition1 = PartitionMetadata {
-        partition_id: 0,
+    let mut partition1 = PartitionMetadata::new_single(
         table_id,
-        partition_column: "partition_date".to_string(),
-        partition_value: "2024-06-15".to_string(),
-        path: table_dir.join("partition_v1").to_string_lossy().to_string(),
-        path_is_relative: false,
-        record_count: 1000,
-        file_size_bytes: 4096,
-    };
+        "partition_date".to_string(),
+        "2024-06-15".to_string(),
+        table_dir.join("partition_v1").to_string_lossy().to_string(),
+        false,
+    );
+    partition1.record_count = 1000;
+    partition1.file_size_bytes = 4096;
 
     let first_id = fixture.catalog.add_partition(partition1).await?;
 
     // Create second partition with same key but different path
-    let partition2 = PartitionMetadata {
-        partition_id: 0,
+    let mut partition2 = PartitionMetadata::new_single(
         table_id,
-        partition_column: "partition_date".to_string(),
-        partition_value: "2024-06-15".to_string(), // Same partition value
-        path: table_dir.join("partition_v2").to_string_lossy().to_string(), // Different path
-        path_is_relative: false,
-        record_count: 2000, // Different metadata
-        file_size_bytes: 8192,
-    };
+        "partition_date".to_string(),
+        "2024-06-15".to_string(), // Same partition value
+        table_dir.join("partition_v2").to_string_lossy().to_string(), // Different path
+        false,
+    );
+    partition2.record_count = 2000; // Different metadata
+    partition2.file_size_bytes = 8192;
 
     let second_id = fixture.catalog.add_partition(partition2).await?;
 
@@ -449,16 +443,15 @@ async fn test_duplicate_partition_returns_existing_impl(fixture: TestFixture) ->
     );
 
     // Create third partition with same key
-    let partition3 = PartitionMetadata {
-        partition_id: 0,
+    let mut partition3 = PartitionMetadata::new_single(
         table_id,
-        partition_column: "partition_date".to_string(),
-        partition_value: "2024-06-15".to_string(), // Same partition value again
-        path: table_dir.join("partition_v3").to_string_lossy().to_string(),
-        path_is_relative: false,
-        record_count: 3000,
-        file_size_bytes: 12288,
-    };
+        "partition_date".to_string(),
+        "2024-06-15".to_string(), // Same partition value again
+        table_dir.join("partition_v3").to_string_lossy().to_string(),
+        false,
+    );
+    partition3.record_count = 3000;
+    partition3.file_size_bytes = 12288;
 
     let third_id = fixture.catalog.add_partition(partition3).await?;
 
@@ -476,7 +469,7 @@ async fn test_duplicate_partition_returns_existing_impl(fixture: TestFixture) ->
         "Should have exactly one partition despite multiple add attempts"
     );
     assert_eq!(all_partitions[0].partition_id, first_id);
-    assert_eq!(all_partitions[0].partition_value, "2024-06-15");
+    assert_eq!(all_partitions[0].partition_values[0], "2024-06-15");
 
     Ok(())
 }
@@ -495,30 +488,28 @@ async fn test_constraint_violation_recovery_impl(fixture: TestFixture) -> TestRe
     .await?;
 
     // First, create a partition
-    let partition1 = PartitionMetadata {
-        partition_id: 0,
+    let mut partition1 = PartitionMetadata::new_single(
         table_id,
-        partition_column: "partition_date".to_string(),
-        partition_value: "2024-01-01".to_string(),
-        path: table_dir.join("partition_1").to_string_lossy().to_string(),
-        path_is_relative: false,
-        record_count: 100,
-        file_size_bytes: 1024,
-    };
+        "partition_date".to_string(),
+        "2024-01-01".to_string(),
+        table_dir.join("partition_1").to_string_lossy().to_string(),
+        false,
+    );
+    partition1.record_count = 100;
+    partition1.file_size_bytes = 1024;
 
     let first_id = fixture.catalog.add_partition(partition1).await?;
 
     // Now try to create the same partition again (should return same ID)
-    let partition2 = PartitionMetadata {
-        partition_id: 0,
+    let mut partition2 = PartitionMetadata::new_single(
         table_id,
-        partition_column: "partition_date".to_string(),
-        partition_value: "2024-01-01".to_string(), // Same value
-        path: table_dir.join("partition_2").to_string_lossy().to_string(), // Different path
-        path_is_relative: false,
-        record_count: 200, // Different count
-        file_size_bytes: 2048,
-    };
+        "partition_date".to_string(),
+        "2024-01-01".to_string(), // Same value
+        table_dir.join("partition_2").to_string_lossy().to_string(), // Different path
+        false,
+    );
+    partition2.record_count = 200; // Different count
+    partition2.file_size_bytes = 2048;
 
     let second_id = fixture.catalog.add_partition(partition2).await?;
 
