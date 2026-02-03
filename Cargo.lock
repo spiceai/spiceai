@@ -6733,6 +6733,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "flight-cookie-server"
+version = "1.11.0"
+dependencies = [
+ "arrow-array",
+ "arrow-flight",
+ "arrow-schema",
+ "bytes",
+ "clap 4.5.54",
+ "futures",
+ "prost 0.14.3",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "flight_client"
 version = "1.11.0"
 dependencies = [
@@ -6741,11 +6759,15 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
+ "http 1.4.0",
+ "parking_lot 0.12.5",
  "rustls-native-certs 0.8.3",
  "secrecy",
  "snafu",
  "tokio",
+ "tokio-stream",
  "tonic",
+ "tower 0.5.3",
  "url",
 ]
 
