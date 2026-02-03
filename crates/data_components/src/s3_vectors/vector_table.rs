@@ -230,7 +230,7 @@ impl S3VectorsTable {
 
         match client
             .create_index(
-                CreateIndexInput::builder()
+                &CreateIndexInput::builder()
                     .data_type(s3_vectors::DataType::Float32)
                     .dimension(dimension.try_into().unwrap_or(i32::MAX))
                     .distance_metric(distance_metric.clone())
@@ -271,7 +271,7 @@ impl S3VectorsTable {
         };
         match client
             .create_vector_bucket(
-                CreateVectorBucketInput::builder()
+                &CreateVectorBucketInput::builder()
                     .vector_bucket_name(bucket_name.clone())
                     .build()
                     .context(S3VectorBuildSnafu)?,
@@ -309,7 +309,7 @@ impl S3VectorsTable {
         let bucket_name_opt = id.bucket_name().map(ToString::to_string);
         match client
             .get_vector_bucket(
-                GetVectorBucketInput::builder()
+                &GetVectorBucketInput::builder()
                     .set_vector_bucket_name(bucket_name_opt)
                     .build()
                     .context(S3VectorBuildSnafu)?,
@@ -353,7 +353,7 @@ impl S3VectorsTable {
         let (index_arn, vector_bucket_name, index_name) = index.index_identifier_variables();
         match client
             .get_index(
-                GetIndexInput::builder()
+                &GetIndexInput::builder()
                     .set_index_arn(index_arn)
                     .set_vector_bucket_name(vector_bucket_name)
                     .set_index_name(index_name)
@@ -509,7 +509,7 @@ impl S3VectorsTable {
             let result = self
                 .client
                 .put_vectors(
-                    PutVectorsInput::builder()
+                    &PutVectorsInput::builder()
                         .set_index_arn(index_arn.clone())
                         .set_index_name(index_name.clone())
                         .set_vector_bucket_name(vector_bucket_name.clone())
@@ -708,7 +708,7 @@ mod tests {
         table
             .client
             .create_vector_bucket(
-                CreateVectorBucketInput::builder()
+                &CreateVectorBucketInput::builder()
                     .vector_bucket_name("test-bucket")
                     .build()?,
             )
@@ -717,7 +717,7 @@ mod tests {
         table
             .client
             .create_index(
-                CreateIndexInput::builder()
+                &CreateIndexInput::builder()
                     .index_name("test-index")
                     .vector_bucket_name("test-bucket")
                     .data_type(S3DataType::Float32)
@@ -753,7 +753,7 @@ mod tests {
         table
             .client
             .create_vector_bucket(
-                CreateVectorBucketInput::builder()
+                &CreateVectorBucketInput::builder()
                     .vector_bucket_name("test-bucket")
                     .build()?,
             )
@@ -762,7 +762,7 @@ mod tests {
         table
             .client
             .create_index(
-                CreateIndexInput::builder()
+                &CreateIndexInput::builder()
                     .index_name("test-index")
                     .vector_bucket_name("test-bucket")
                     .data_type(S3DataType::Float32)
@@ -814,7 +814,7 @@ mod tests {
         table
             .client
             .create_vector_bucket(
-                CreateVectorBucketInput::builder()
+                &CreateVectorBucketInput::builder()
                     .vector_bucket_name("test-bucket")
                     .build()?,
             )
@@ -823,7 +823,7 @@ mod tests {
         table
             .client
             .create_index(
-                CreateIndexInput::builder()
+                &CreateIndexInput::builder()
                     .index_name("test-index")
                     .vector_bucket_name("test-bucket")
                     .data_type(S3DataType::Float32)

@@ -42,8 +42,9 @@ use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
 use moka::future::FutureExt;
 use search::{
-    generation::text_search::index::FullTextDatabaseIndex, index::SearchIndex,
-    provider::SearchQueryProvider,
+    generation::text_search::index::FullTextDatabaseIndex,
+    index::SearchIndex,
+    provider::{SearchQueryProvider, UdtfSource},
 };
 use std::any::Any;
 use std::sync::LazyLock;
@@ -316,7 +317,16 @@ impl TableFunctionImpl for TextSearchTableFunc {
         // Select single column if needed.
         let column = args.column(&fts_index.search_fields)?;
         let mut fts_index = fts_index.clone();
-        fts_index.search_fields = vec![column];
+        fts_index.search_fields = vec![column.clone()];
+
+        // Create UDTF source for distributed serialization
+        let udtf_source = UdtfSource::TextSearch {
+            table: args.tbl.to_string(),
+            query: args.query.clone(),
+            column: Some(column),
+            limit: args.limit,
+            include_score: args.include_score,
+        };
 
         Ok(Arc::new(
             SearchQueryProvider::try_from_index(
@@ -325,6 +335,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 args.query.as_str(),
                 args.limit,
             )?
+            .with_udtf_source(udtf_source)
             .call_on_scan(Arc::new(|| {
                 async {
                     let request_context = RequestContext::current(AsyncMarker::new().await);

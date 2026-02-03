@@ -935,9 +935,7 @@ mod tests {
         let expected =
             "SELECT a, b FROM t WHERE x = $1 AND y = $2 GROUP BY a ORDER BY b DESC LIMIT $3";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -947,9 +945,7 @@ mod tests {
         let input = "INSERT INTO users (name, age) VALUES (?, ?)";
         let expected = "INSERT INTO users (name, age) VALUES ($1, $2)";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -959,9 +955,7 @@ mod tests {
         let input = "UPDATE users SET age = ? WHERE name = ?";
         let expected = "UPDATE users SET age = $1 WHERE name = $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -971,9 +965,7 @@ mod tests {
         let input = "DELETE FROM users WHERE id = ?";
         let expected = "DELETE FROM users WHERE id = $1";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -983,9 +975,7 @@ mod tests {
         let input = "SELECT COUNT(*) FROM users WHERE created_at > ? AND status = ?";
         let expected = "SELECT COUNT(*) FROM users WHERE created_at > $1 AND status = $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -995,9 +985,7 @@ mod tests {
         let input = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = ?) AND stock > ?";
         let expected = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = $1) AND stock > $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -1017,9 +1005,7 @@ mod tests {
         let input = "SELECT '?', name FROM users WHERE id = ? AND notes LIKE '%??%'";
         let expected = "SELECT '?', name FROM users WHERE id = $1 AND notes LIKE '%??%'";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }

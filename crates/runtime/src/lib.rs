@@ -92,6 +92,7 @@ pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;
 pub mod embeddings;
+pub mod execution_plan;
 pub mod extension;
 pub mod federated_table;
 pub mod flight;
@@ -1174,7 +1175,7 @@ impl Runtime {
 
         let ctx = &self.datafusion().ctx;
         ctx.register_udtf(
-            "list_udfs",
+            udtfs::LIST_UDFS_UDTF_NAME,
             Arc::new(ListUDFTableFunc::new(Arc::clone(ctx))),
         );
 

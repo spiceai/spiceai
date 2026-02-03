@@ -395,7 +395,7 @@ impl Default for Acceleration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_deserialize_acceleration_on_conflict_string() {
@@ -404,7 +404,7 @@ mod tests {
                   foo: upsert
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Upsert)
@@ -418,7 +418,7 @@ mod tests {
                   foo: upsert_dedup
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::UpsertDedup)
@@ -432,7 +432,7 @@ mod tests {
                   foo: upsert_dedup_by_row_id
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::UpsertDedupByRowId)
@@ -446,7 +446,7 @@ mod tests {
                   foo: drop
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Drop)

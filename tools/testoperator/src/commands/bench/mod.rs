@@ -128,7 +128,8 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             .with_validate(args.validate)
             .with_disable_caching(args.disable_caching)
             .with_scale_factor(args.scale_factor.unwrap_or(1.0))
-            .with_http_client(args.http_clients),
+            .with_http_client(args.http_clients)
+            .with_distributed_mode(args.distributed),
     )
     .await?;
 

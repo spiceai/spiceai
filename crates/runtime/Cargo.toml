@@ -88,6 +88,7 @@ moka.workspace = true
 notify = "8.2.0"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
+object_store_occ = { path = "../object_store_occ" }
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
@@ -182,7 +183,7 @@ workers = { path = "../workers" }
 x509-certificate.workspace = true
 
 [build-dependencies]
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -234,7 +235,7 @@ repl = { path = "../repl" }
 rstest = "0.26.1"
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 spice-cloud = { path = "../spice_cloud" }
 spiceai.workspace = true
 tar = "0.4"

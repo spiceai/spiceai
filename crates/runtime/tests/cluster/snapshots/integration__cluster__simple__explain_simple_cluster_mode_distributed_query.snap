@@ -6,7 +6,8 @@ expression: "pretty.replace(tempdir.path().to_string_lossy().split_once('/').exp
 | plan_type        | plan                                                                                                                                                                |
 +------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan     | Sort: names.id ASC NULLS LAST                                                                                                                                       |
-|                  |   TableScan: names projection=[id, name, age, city, score]                                                                                                          |
+|                  |   Projection: names.id, names.name, names.age, names.city, names.score                                                                                              |
+|                  |     TableScan: names                                                                                                                                                |
 | physical_plan    | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                 |
 |                  |   DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/test_simple_cluster_mode.csv]]}, projection=[id, name, age, city, score], file_type=csv, has_header=true   |
 |                  |                                                                                                                                                                     |
