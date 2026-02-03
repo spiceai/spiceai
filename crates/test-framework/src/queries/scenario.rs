@@ -68,7 +68,7 @@ impl ScenarioQuerySet {
     /// Load a scenario query set from a YAML file
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())?;
-        let query_set: ScenarioQuerySet = serde_yaml::from_str(&content)?;
+        let query_set: ScenarioQuerySet = yaml::from_str(&content)?;
         Ok(query_set)
     }
 
@@ -246,7 +246,7 @@ queries:
         - "2, Bob"
 "#;
 
-        let query_set: ScenarioQuerySet = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
+        let query_set: ScenarioQuerySet = yaml::from_str(yaml).expect("Failed to parse YAML");
         assert_eq!(query_set.name, Some("test_queries".to_string()));
         assert_eq!(query_set.queries.len(), 3);
         assert_eq!(query_set.queries[0].name, "simple_select");

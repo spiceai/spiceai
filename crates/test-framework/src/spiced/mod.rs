@@ -103,7 +103,7 @@ impl StartRequest {
 
     pub fn prepare(&mut self) -> Result<()> {
         // Serialize spicepod to `spicepod.yaml` in the tempdir
-        let spicepod_yaml = serde_yaml::to_string(&self.spicepod)?;
+        let spicepod_yaml = yaml::to_string(&self.spicepod)?;
         let spicepod_yaml_path = self.tempdir.path().join("spicepod.yaml");
         std::fs::write(spicepod_yaml_path, spicepod_yaml)?;
 

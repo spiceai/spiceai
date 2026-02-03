@@ -21,9 +21,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use app::spicepod::component::runtime::Scheduler as SchedulerConfig;
 use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
 use datafusion::execution::object_store::ObjectStoreRegistry;
-use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions, UpdateVersion};
+use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions};
+use object_store_occ::{InsertResult, ObjectState, UpdateResult};
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
@@ -83,9 +83,6 @@ pub enum Error {
 
     #[snafu(display("Failed to serialize scheduler state: {source}"))]
     SerializeState { source: serde_json::Error },
-
-    #[snafu(display("Failed to deserialize scheduler state: {source}"))]
-    DeserializeState { source: serde_json::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -114,12 +111,11 @@ pub type SchedulerPeers = HashMap<String, SchedulerRecord>;
 
 struct SchedulerRegistryRunner {
     store: Arc<dyn ObjectStore>,
+    state: ObjectState<SchedulerRecord>,
     scheduler_id: String,
-    record_path: Path,
     metadata_path: Path,
-    schedulers_prefix: Path,
+    record_path: Path,
     record: SchedulerRecord,
-    update_version: Option<UpdateVersion>,
     peers: Arc<RwLock<SchedulerPeers>>,
 }
 
@@ -195,16 +191,17 @@ impl SchedulerRegistryRunner {
     ) -> Self {
         let metadata_path = join_path(base_prefix, "metadata/cluster.json");
         let record_path = join_path(base_prefix, &format!("schedulers/{scheduler_id}.json"));
-        let schedulers_prefix = join_path(base_prefix, "schedulers");
+        let schedulers_prefix = format!("{}/schedulers/", base_prefix.trim_end_matches('/'));
+        let state: ObjectState<SchedulerRecord> =
+            ObjectState::new(Arc::clone(&store)).with_prefix(schedulers_prefix);
 
         Self {
             store,
+            state,
             scheduler_id,
-            record_path,
             metadata_path,
-            schedulers_prefix,
+            record_path,
             record,
-            update_version: None,
             peers,
         }
     }
@@ -263,114 +260,95 @@ impl SchedulerRegistryRunner {
     }
 
     async fn bootstrap_record(&mut self) -> Result<()> {
-        let payload = serde_json::to_vec(&self.record).context(SerializeStateSnafu)?;
-
         match self
-            .store
-            .put_opts(
-                &self.record_path,
-                payload.clone().into(),
-                PutOptions::from(PutMode::Create),
-            )
+            .state
+            .insert(&self.scheduler_id, &self.record)
             .await
+            .map_err(|e| e.into_object_store("scheduler_registry"))
+            .context(ObjectStoreWriteSnafu)?
         {
-            Ok(result) => {
-                self.update_version = Some(UpdateVersion::from(result));
-                return Ok(());
-            }
-            Err(ObjectStoreError::AlreadyExists { .. }) => {}
-            Err(err) => return Err(Error::ObjectStoreWrite { source: err }),
+            InsertResult::Ok => return Ok(()),
+            InsertResult::AlreadyExists => {}
         }
 
-        let existing = self.read_record_with_meta().await?;
-        let is_stale = record_is_stale(&existing.record, now_ms()?);
+        // Record exists - check if stale
+        let existing = self
+            .state
+            .get(&self.scheduler_id)
+            .await
+            .map_err(|e| e.into_object_store("scheduler_registry"))
+            .context(ObjectStoreReadSnafu)?
+            .ok_or_else(|| Error::SchedulerIdConflict {
+                scheduler_id: self.scheduler_id.clone(),
+            })?;
 
-        if !is_stale {
+        if !record_is_stale(&existing, now_ms()?) {
             return Err(Error::SchedulerIdConflict {
                 scheduler_id: self.scheduler_id.clone(),
             });
         }
 
-        self.update_version = Some(existing.version);
-        self.conditional_update(payload).await
+        // Stale record - overwrite it
+        self.conditional_update().await
     }
 
     async fn heartbeat(&mut self) -> Result<()> {
         self.record.last_heartbeat_ms = now_ms()?;
-        let payload = serde_json::to_vec(&self.record).context(SerializeStateSnafu)?;
-        self.conditional_update(payload).await
+        self.conditional_update().await
     }
 
-    async fn conditional_update(&mut self, payload: Vec<u8>) -> Result<()> {
+    async fn conditional_update(&mut self) -> Result<()> {
         let mut backoff = FibonacciBackoffBuilder::new()
             .max_retries(Some(MAX_CONDITIONAL_ATTEMPTS))
             .build();
 
         loop {
-            if self.update_version.is_none() {
-                self.update_version = Some(self.read_record_with_meta().await?.version);
-            }
-
-            let update_version = self.update_version.clone().unwrap_or(UpdateVersion {
-                e_tag: None,
-                version: None,
-            });
-
-            let put_result = self
-                .store
-                .put_opts(
-                    &self.record_path,
-                    payload.clone().into(),
-                    PutOptions::from(PutMode::Update(update_version)),
-                )
-                .await;
-
-            match put_result {
-                Ok(result) => {
-                    self.update_version = Some(UpdateVersion::from(result));
+            match self
+                .state
+                .update(&self.scheduler_id, &self.record)
+                .await
+                .map_err(|e| e.into_object_store("scheduler_registry"))
+                .context(ObjectStoreWriteSnafu)?
+            {
+                UpdateResult::Ok => return Ok(()),
+                UpdateResult::NotFound => {
+                    // Record was deleted - re-insert
+                    let _ = self.state.insert(&self.scheduler_id, &self.record).await;
                     return Ok(());
                 }
-                Err(ObjectStoreError::Precondition { .. }) => {
-                    self.update_version = None;
+                UpdateResult::Conflict { .. } => {
+                    // ETag mismatch - state.update() already refreshed cache with current value
                     let Some(delay) = backoff.next_duration() else {
-                        let source = Box::new(std::io::Error::other(
-                            "Conditional update failed after retries",
-                        ));
                         return Err(Error::ObjectStoreWrite {
                             source: ObjectStoreError::Precondition {
-                                path: self.record_path.to_string(),
-                                source,
+                                path: self.scheduler_id.clone(),
+                                source: Box::new(std::io::Error::other(
+                                    "Conditional update failed after retries",
+                                )),
                             },
                         });
                     };
                     tokio::time::sleep(delay).await;
                 }
-                Err(err) => return Err(Error::ObjectStoreWrite { source: err }),
             }
         }
     }
 
     async fn refresh_peers(&self) -> Result<()> {
-        let mut records = HashMap::new();
-        let mut stream = self.store.list(Some(&self.schedulers_prefix));
-        let now = now_ms()?;
-        while let Some(entry) = stream.next().await {
-            let meta = entry.map_err(|source| Error::ObjectStoreRead { source })?;
-            let bytes = self
-                .store
-                .get(&meta.location)
-                .await
-                .map_err(|source| Error::ObjectStoreRead { source })?
-                .bytes()
-                .await
-                .map_err(|source| Error::ObjectStoreRead { source })?;
-            let record: SchedulerRecord =
-                serde_json::from_slice(&bytes).context(DeserializeStateSnafu)?;
+        self.state
+            .refresh()
+            .await
+            .map_err(|e| e.into_object_store("scheduler_registry"))
+            .context(ObjectStoreReadSnafu)?;
 
-            if !record_is_stale(&record, now) {
-                records.insert(record.advertise_address.clone(), record);
-            }
-        }
+        let now = now_ms()?;
+        let records: HashMap<String, SchedulerRecord> = self
+            .state
+            .cached_entries()
+            .into_iter()
+            .filter(|(_, record)| !record_is_stale(record, now))
+            .map(|(_, record)| (record.advertise_address.clone(), record))
+            .collect();
 
         let mut peers = self.peers.write().await;
         let previous: HashSet<String> = peers.keys().cloned().collect();
@@ -400,32 +378,6 @@ impl SchedulerRegistryRunner {
             tracing::warn!("Failed to delete scheduler record: {err}");
         }
     }
-
-    async fn read_record_with_meta(&self) -> Result<RecordWithVersion> {
-        let result = self
-            .store
-            .get(&self.record_path)
-            .await
-            .map_err(|source| Error::ObjectStoreRead { source })?;
-        let meta = result.meta.clone();
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|source| Error::ObjectStoreRead { source })?;
-        let record: SchedulerRecord =
-            serde_json::from_slice(&bytes).context(DeserializeStateSnafu)?;
-        let version = UpdateVersion {
-            e_tag: meta.e_tag,
-            version: meta.version,
-        };
-
-        Ok(RecordWithVersion { record, version })
-    }
-}
-
-struct RecordWithVersion {
-    record: SchedulerRecord,
-    version: UpdateVersion,
 }
 
 static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
@@ -463,28 +415,23 @@ async fn build_object_store(
         let s3_params = build_s3_parameters(rt.secrets(), params.as_ref()).await;
 
         S3ObjectStoreBuilder::from_url(url, io_runtime)
-            .map_err(|source| Error::S3ObjectStoreInit {
+            .context(S3ObjectStoreInitSnafu {
                 location: url.to_string(),
-                source,
             })?
             .with_secret_params(&s3_params.to_secret_map())
-            .map_err(|source| Error::S3ObjectStoreInit {
+            .context(S3ObjectStoreInitSnafu {
                 location: url.to_string(),
-                source,
             })?
             .build()
             .await
-            .map_err(|source| Error::S3ObjectStoreInit {
+            .context(S3ObjectStoreInitSnafu {
                 location: url.to_string(),
-                source,
             })?
     } else {
-        let registry = SpiceObjectStoreRegistry::new(io_runtime);
-        registry
+        SpiceObjectStoreRegistry::new(io_runtime)
             .get_store(url)
-            .map_err(|source| Error::ObjectStoreInit {
+            .context(ObjectStoreInitSnafu {
                 location: url.to_string(),
-                source,
             })?
     };
 

@@ -37,6 +37,7 @@ use test_framework::{
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     if args.test_args.common.concurrency < 2 {
         return Err(anyhow::anyhow!(
@@ -128,7 +129,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
             .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients),
+            .with_http_client(args.test_args.http_clients)
+            .with_distributed_mode(args.test_args.distributed),
     )
     .await?;
 
@@ -155,7 +157,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
             .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients),
+            .with_http_client(args.test_args.http_clients)
+            .with_distributed_mode(args.test_args.distributed),
     )
     .await?;
 
@@ -202,6 +205,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_end_condition(load_end_condition)
         .with_disable_caching(args.test_args.disable_caching)
         .with_http_client(args.test_args.http_clients)
+        .with_distributed_mode(args.test_args.distributed)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);
 
     // Add streaming metrics sender if exporter is configured

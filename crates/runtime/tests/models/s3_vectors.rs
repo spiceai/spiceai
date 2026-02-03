@@ -1053,7 +1053,7 @@ async fn delete_index(
         .build()?;
 
     // Don't return error if delete fails, as index may not exist
-    if let Err(e) = s3_vector_client.delete_index(input).await {
+    if let Err(e) = s3_vector_client.delete_index(&input).await {
         tracing::debug!(
             "failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}."
         );

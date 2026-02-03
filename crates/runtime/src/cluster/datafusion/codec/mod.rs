@@ -16,3 +16,4 @@ limitations under the License.
 
 pub mod spice_logical_codec;
 pub mod spice_physical_codec;
+pub mod udtf_args;
