@@ -47,7 +47,7 @@ use datafusion::{
 pub(crate) fn simplify_expr(expr: Expr, schema: &SchemaRef) -> Result<Expr, DataFusionError> {
     let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
 
-    let execution_props = ExecutionProps::new();
+    let execution_props = ExecutionProps::new().with_query_execution_start_time(chrono::Utc::now()); // required to correctly evaluate now()
     let simplify_context = SimplifyContext::new(&execution_props).with_schema(Arc::new(df_schema));
     let simplifier = ExprSimplifier::new(simplify_context);
 
