@@ -217,6 +217,8 @@ impl JobExecutor {
             info.query_handle = Some(query_handle.clone());
         }
 
+        drop(active);
+
         tokio::select! {
             () = cancel.cancelled() => {
                 tracing::debug!(job_id = %job_id, "Job cancelled before completion");
