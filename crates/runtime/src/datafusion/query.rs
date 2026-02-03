@@ -69,6 +69,7 @@ use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::cluster::metrics_collector::OtelResultFetchMetricsCallback;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
+    target_partitions_override::TargetPartitionsOverride,
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
@@ -229,7 +230,11 @@ impl Query {
                 target_partitions,
                 "Overriding target_partitions via X-Spice-Target-Partitions header"
             );
-            cfg = cfg.with_target_partitions(target_partitions);
+            cfg = cfg
+                .with_target_partitions(target_partitions)
+                .with_extension(Arc::new(TargetPartitionsOverride::new(
+                    target_partitions,
+                )));
         }
 
         if let Some(tls_config) = client_tls_config {

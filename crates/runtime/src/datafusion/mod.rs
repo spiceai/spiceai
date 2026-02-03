@@ -127,6 +127,7 @@ pub mod schema;
 pub mod secrets_context_extension;
 pub mod sort_columns;
 pub(crate) mod sql_validator;
+pub mod target_partitions_override;
 pub mod udf;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";

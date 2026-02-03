@@ -20,7 +20,6 @@ use crate::context::RuntimeContext;
 use crate::error::Result;
 use crate::output::TableOutput;
 use clap::{Args, Subcommand};
-use repl::pretty::format_batches_with_types;
 use rustyline::error::ReadlineError;
 use rustyline::{Config, Editor};
 use spiceai::query::{QueryInfo, QueryStatus};
@@ -117,6 +116,13 @@ struct TrackedQuery {
 async fn build_client(ctx: &RuntimeContext) -> Result<Arc<Client>> {
     let mut builder = ClientBuilder::new().http_url(ctx.http_endpoint());
 
+    // Derive Flight URL from HTTP endpoint
+    // Default: HTTP 8090 -> Flight 50051
+    // The SDK requires a Flight connection, so we derive it from the HTTP endpoint
+    if let Some(flight_url) = derive_flight_url(ctx.http_endpoint()) {
+        builder = builder.flight_url(&flight_url);
+    }
+
     if let Some(api_key) = ctx.api_key() {
         builder = builder.api_key(api_key);
     }
@@ -140,6 +146,32 @@ async fn build_client(ctx: &RuntimeContext) -> Result<Arc<Client>> {
     Ok(Arc::new(client))
 }
 
+/// Derive the Flight URL from an HTTP endpoint.
+/// Maps HTTP port 8090 -> Flight port 50051, or uses the same host with port 50051.
+fn derive_flight_url(http_endpoint: &str) -> Option<String> {
+    let url = url::Url::parse(http_endpoint).ok()?;
+    let host = url.host_str()?;
+    let http_port = url.port().unwrap_or(8090);
+
+    // Map HTTP port to Flight port
+    // Default mapping: 8090 -> 50051
+    let flight_port = if http_port == 8090 {
+        50051
+    } else {
+        // For non-standard HTTP ports, try port - 8090 + 50051
+        // This handles cases like 8091 -> 50052
+        http_port.saturating_sub(8090).saturating_add(50051)
+    };
+
+    // Use http:// for Flight (grpc without TLS) when HTTP endpoint is http://
+    let scheme = if url.scheme() == "https" {
+        "https"
+    } else {
+        "http"
+    };
+
+    Some(format!("{scheme}://{host}:{flight_port}"))
+}
 /// Execute the query command.
 pub async fn execute(ctx: &RuntimeContext, args: &QueryArgs) -> Result<()> {
     let client = build_client(ctx).await?;
@@ -163,7 +195,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &QueryArgs) -> Result<()> {
     }
 
     // No argument, start REPL
-    run_query_repl(&client).await
+    run_query_repl(ctx, &client, args.target_partitions).await
 }
 
 async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Result<()> {
@@ -375,9 +407,16 @@ async fn submit_with_target_partitions(
         })
 }
 
-async fn run_query_repl(client: &Arc<Client>) -> Result<()> {
+async fn run_query_repl(
+    ctx: &RuntimeContext,
+    client: &Arc<Client>,
+    target_partitions: Option<usize>,
+) -> Result<()> {
     println!("Welcome to the Spice.ai async query REPL.");
     println!("Type SQL to submit a query, or .help for commands.");
+    if let Some(tp) = target_partitions {
+        println!("Target partitions override: {tp}");
+    }
     println!();
 
     let config = Config::builder().build();
@@ -435,12 +474,22 @@ async fn run_query_repl(client: &Arc<Client>) -> Result<()> {
         // Add to history
         let _ = rl.add_history_entry(input);
 
-        // Submit query
-        let job = match client.query(input).await {
-            Ok(j) => j,
-            Err(e) => {
-                println!("\x1b[31mError:\x1b[0m {e}");
-                continue;
+        // Submit query - use custom submission if target_partitions is set
+        let job = if let Some(tp) = target_partitions {
+            match submit_with_target_partitions(ctx, input, tp).await {
+                Ok(j) => j,
+                Err(e) => {
+                    println!("\x1b[31mError:\x1b[0m {e}");
+                    continue;
+                }
+            }
+        } else {
+            match client.query(input).await {
+                Ok(j) => j,
+                Err(e) => {
+                    println!("\x1b[31mError:\x1b[0m {e}");
+                    continue;
+                }
             }
         };
 
@@ -825,69 +874,22 @@ impl CtrlCGuard {
     }
 }
 
-async fn display_results(client: &Arc<Client>, query_id: &str, elapsed: Duration) -> Result<()> {
-    // First get query info to check status
-    let job = client
-        .get_query(query_id)
-        .map_err(|e| crate::error::Error::InvalidResponse {
-            message: e.to_string(),
-        })?;
+async fn display_results(_client: &Arc<Client>, query_id: &str, elapsed: Duration) -> Result<()> {
+    // Note: We can't use client.get_query().results() due to SDK/server API mismatch
+    // (SDK expects `result` field, server returns `manifest`).
+    // This will be addressed properly when the async query command is fully implemented.
+    // For now, just show the query ID and elapsed time.
 
-    let info = job
-        .info()
-        .await
-        .map_err(|e| crate::error::Error::InvalidResponse {
-            message: e.to_string(),
-        })?;
-
-    if !info.status.is_success() {
-        return Err(crate::error::Error::InvalidResponse {
-            message: format!(
-                "query '{}' is still {}. Use .wait {} to wait for completion",
-                query_id, info.status, query_id
-            ),
-        });
-    }
-
-    // Fetch results as Arrow RecordBatches
-    let batches = job
-        .results()
-        .await
-        .map_err(|e| crate::error::Error::InvalidResponse {
-            message: format!("getting results: {e}"),
-        })?;
-
-    let total_rows: usize = batches
-        .iter()
-        .map(arrow::array::RecordBatch::num_rows)
-        .sum();
-
-    if total_rows == 0 {
-        if elapsed > Duration::ZERO {
-            println!("Time: {:.8} seconds. 0 rows.", elapsed.as_secs_f64());
-        } else {
-            println!("No results.");
-        }
-        return Ok(());
-    }
-
-    // Use pretty formatting with types to display results
-    let formatted =
-        format_batches_with_types(&batches).map_err(|e| crate::error::Error::InvalidResponse {
-            message: format!("formatting results: {e}"),
-        })?;
-
-    println!("{formatted}");
-
-    // Show timing and row count
     if elapsed > Duration::ZERO {
         println!(
-            "\nTime: {:.8} seconds. {} rows.",
-            elapsed.as_secs_f64(),
-            total_rows
+            "Query {} completed in {:.8} seconds.",
+            query_id,
+            elapsed.as_secs_f64()
         );
+        println!("Use 'curl <http-endpoint>/v1/queries/{}/results/chunks/0?format=arrow' to fetch results.", query_id);
     } else {
-        println!("\n{total_rows} row(s)");
+        println!("Query {} completed.", query_id);
+        println!("Use 'curl <http-endpoint>/v1/queries/{}/results/chunks/0?format=arrow' to fetch results.", query_id);
     }
 
     Ok(())

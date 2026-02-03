@@ -15,6 +15,11 @@ on:
           - 'models'
           - 'default'
         default: 'models'
+      extra_features:
+        description: 'Additional cargo features to enable (comma-separated, e.g. vortex)'
+        required: false
+        type: string
+        default: ''
       target:
         description: 'Build for specific architecture(s)'
         required: false
@@ -120,10 +125,16 @@ jobs:
       - name: Set cargo features
         run: |
           variant="${{ inputs.variant }}"
+          extra_features="${{ inputs.extra_features }}"
           if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+            base_features="release,models"
           else
-            echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+            base_features="release"
+          fi
+          if [ -n "$extra_features" ]; then
+            echo "CARGO_FEATURES=${base_features},${extra_features}" >> $GITHUB_ENV
+          else
+            echo "CARGO_FEATURES=${base_features}" >> $GITHUB_ENV
           fi
 
       - name: Build ARM64 image
@@ -177,10 +188,16 @@ jobs:
       - name: Set cargo features
         run: |
           variant="${{ inputs.variant }}"
+          extra_features="${{ inputs.extra_features }}"
           if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+            base_features="release,models"
           else
-            echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+            base_features="release"
+          fi
+          if [ -n "$extra_features" ]; then
+            echo "CARGO_FEATURES=${base_features},${extra_features}" >> $GITHUB_ENV
+          else
+            echo "CARGO_FEATURES=${base_features}" >> $GITHUB_ENV
           fi
 
       - name: Build AMD64 image

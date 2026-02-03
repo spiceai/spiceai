@@ -283,13 +283,28 @@ pub struct QuerySummary {
 ))]
 pub(crate) async fn submit(
     Extension(rt): Extension<Arc<Runtime>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<SubmitQueryRequest>,
 ) -> Response {
     let executor = match get_executor(&rt) {
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let result = executor.submit(request.sql, request.parameters).await;
+
+    // Extract target_partitions override from header for profiling
+    let target_partitions_override = headers
+        .get(runtime_request_context::TARGET_PARTITIONS_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+
+    if let Some(tp) = target_partitions_override {
+        tracing::info!(target_partitions = tp, "Received X-Spice-Target-Partitions header");
+    }
+
+    let result = executor
+        .submit(request.sql, request.parameters, target_partitions_override)
+        .await;
 
     match result {
         Ok(state) => {

@@ -260,8 +260,13 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
         Status::invalid_argument(format!("Failed to parse SubmitAsyncQueryRequest: {e}"))
     })?;
 
+    // Pass target_partitions_override from request context for profiling
     let state = executor
-        .submit(request.sql, request.parameters)
+        .submit(
+            request.sql,
+            request.parameters,
+            context.target_partitions_override(),
+        )
         .await
         .map_err(|e| Status::internal(format!("Failed to submit query: {e}")))?;
 

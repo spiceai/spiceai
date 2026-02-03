@@ -19,6 +19,7 @@ use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
+use crate::datafusion::target_partitions_override::TargetPartitionsOverride;
 use crate::status::ComponentStatus;
 use crate::{
     FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
@@ -1225,16 +1226,29 @@ async fn create_scheduler_server(
     // Uses the dynamic total_executor_slots to set target_partitions
     let slots_for_session = Arc::clone(&total_executor_slots);
     let session_builder: ballista_scheduler::scheduler_server::SessionBuilder =
-        Arc::new(move |_cfg| {
-            // Get dynamic target_partitions based on cluster capacity
+        Arc::new(move |session_cfg| {
             let total_slots = slots_for_session.load(Ordering::Relaxed);
-            let target_partitions = if total_slots > 0 { total_slots } else { 16 };
+            let target_partitions_override = session_cfg
+                .get_extension::<TargetPartitionsOverride>()
+                .map(|override_config| override_config.target_partitions());
 
-            tracing::debug!(
-                total_slots,
-                target_partitions,
-                "Cluster session_builder: setting target_partitions based on cluster capacity"
-            );
+            let target_partitions = if let Some(target_partitions) = target_partitions_override {
+                tracing::debug!(
+                    target_partitions,
+                    "Cluster session_builder: using target_partitions override from session config"
+                );
+                target_partitions
+            } else {
+                let target_partitions = if total_slots > 0 { total_slots } else { 16 };
+
+                tracing::debug!(
+                    total_slots,
+                    target_partitions,
+                    "Cluster session_builder: setting target_partitions based on cluster capacity"
+                );
+
+                target_partitions
+            };
 
             let mut cfg = current_context
                 .copied_config()
@@ -1242,6 +1256,12 @@ async fn create_scheduler_server(
                 .with_option_extension(SpiceClusterConfig::default())
                 .with_ballista_shuffle_format(ballista_shuffle_format)
                 .with_ballista_shuffle_memory_mode(shuffle_memory_mode);
+
+            if let Some(target_partitions) = target_partitions_override {
+                cfg = cfg.with_extension(Arc::new(TargetPartitionsOverride::new(
+                    target_partitions,
+                )));
+            }
 
             // Apply object store shuffle configuration if specified
             if let Some(ref storage_type) = shuffle_storage_type {

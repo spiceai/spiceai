@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::datafusion::DataFusion;
+use crate::datafusion::target_partitions_override::TargetPartitionsOverride;
 
 use super::Result;
 use super::state::{JobState, JobStatus};
@@ -99,10 +100,17 @@ impl JobExecutor {
     /// Submits a new query job for async execution.
     ///
     /// Returns the job state immediately. The query will be executed in the background.
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - The SQL query to execute
+    /// * `parameters` - Optional query parameters
+    /// * `target_partitions_override` - Optional override for target_partitions (for profiling)
     pub async fn submit(
         &self,
         sql: String,
         parameters: Option<serde_json::Value>,
+        target_partitions_override: Option<usize>,
     ) -> Result<JobState> {
         let state = self.job_store.create_job(sql, parameters).await?;
         let job_id = state.job_id.clone();
@@ -126,9 +134,15 @@ impl JobExecutor {
 
         tokio::spawn(
             async move {
-                let result =
-                    Self::execute_job(&job_store, df, &job_id_clone, &active_jobs, cancel_token)
-                        .await;
+                let result = Self::execute_job(
+                    &job_store,
+                    df,
+                    &job_id_clone,
+                    &active_jobs,
+                    cancel_token,
+                    target_partitions_override,
+                )
+                .await;
 
                 // Remove from active jobs
                 let mut active = active_jobs.write().await;
@@ -204,6 +218,7 @@ impl JobExecutor {
         job_id: &str,
         active_jobs: &RwLock<std::collections::HashMap<String, ActiveJobInfo>>,
         cancel: CancellationToken,
+        target_partitions_override: Option<usize>,
     ) -> Result<()> {
         // Get job and mark as running
         let state = job_store.set_job_running(job_id).await?;
@@ -227,8 +242,26 @@ impl JobExecutor {
         };
 
         // Create a session context for this job using the scheduler's session manager.
-        // We use SessionConfig::new_with_ballista() to get a config compatible with Ballista.
-        let session_config = datafusion::prelude::SessionConfig::new_with_ballista();
+        // We use SessionConfig::new_with_ballista() to get a config compatible with Ballista,
+        // optionally applying target_partitions override for profiling.
+        let mut session_config = datafusion::prelude::SessionConfig::new_with_ballista();
+        if let Some(target_partitions) = target_partitions_override {
+            tracing::info!(
+                target_partitions,
+                job_id,
+                "Overriding target_partitions via X-Spice-Target-Partitions header"
+            );
+            session_config = session_config
+                .with_target_partitions(target_partitions)
+                .with_extension(Arc::new(TargetPartitionsOverride::new(
+                    target_partitions,
+                )));
+        }
+        tracing::debug!(
+            target_partitions = session_config.target_partitions(),
+            job_id,
+            "Session config target_partitions after override"
+        );
         let session_ctx = match scheduler
             .state
             .session_manager
@@ -243,6 +276,13 @@ impl JobExecutor {
                 return Ok(());
             }
         };
+
+        // Log the actual session context config to verify target_partitions was set
+        tracing::debug!(
+            target_partitions = session_ctx.state().config().target_partitions(),
+            job_id,
+            "Session context target_partitions after create_or_update_session"
+        );
 
         // Parse and create the logical plan
         let logical_plan = match Self::create_logical_plan(&session_ctx, &state.sql).await {

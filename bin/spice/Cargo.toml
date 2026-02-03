@@ -83,6 +83,9 @@ open = "5"
 # URL encoding
 urlencoding = "2"
 
+# URL parsing
+url = { workspace = true }
+
 # Certificate generation for cluster TLS
 pem = "3"
 rcgen = { version = "0.13", features = ["x509-parser"] }
