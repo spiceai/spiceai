@@ -114,8 +114,9 @@ impl NFSObjectStore {
                     let usec = u32::try_from(entry.mtime.tv_usec)
                         .map_err(|_| handle_error("NFS mtime microseconds overflow"))?
                         * 1000;
-                    let last_modified = DateTime::<Utc>::from_timestamp(entry.mtime.tv_sec, usec)
-                        .ok_or_else(|| handle_error("Invalid NFS mtime returned"))?;
+                    let last_modified =
+                        DateTime::<Utc>::from_timestamp(entry.mtime.tv_sec, usec)
+                            .ok_or_else(|| handle_error("Invalid NFS mtime returned"))?;
                     entries.push(DirEntry::file(name, entry.size, last_modified));
                 }
                 _ => {}

@@ -705,12 +705,11 @@ impl Nfs {
         let mut cwd: *const c_char = ptr::null();
         unsafe {
             sys::nfs_getcwd(self.context.0, &raw mut cwd);
-            let cwd = NonNull::new(cwd as *mut c_char).ok_or_else(|| Error::NfsOperationFailed {
-                message: "libnfs returned a null working directory".to_string(),
-            })?;
-            let path_tmp = CStr::from_ptr(cwd.as_ptr())
-                .to_string_lossy()
-                .into_owned();
+            let cwd =
+                NonNull::new(cwd as *mut c_char).ok_or_else(|| Error::NfsOperationFailed {
+                    message: "libnfs returned a null working directory".to_string(),
+                })?;
+            let path_tmp = CStr::from_ptr(cwd.as_ptr()).to_string_lossy().into_owned();
             Ok(PathBuf::from(path_tmp))
         }
     }
@@ -736,8 +735,7 @@ impl Nfs {
     #[must_use]
     pub fn get_readmax(&self) -> u64 {
         let max = unsafe { sys::nfs_get_readmax(self.context.0) };
-        u64::try_from(max)
-            .expect("libnfs requires a target pointer width of at least 64 bits")
+        u64::try_from(max).expect("libnfs requires a target pointer width of at least 64 bits")
     }
 
     /// Get the maximum write size supported by the server.
@@ -746,8 +744,7 @@ impl Nfs {
     #[must_use]
     pub fn get_writemax(&self) -> u64 {
         let max = unsafe { sys::nfs_get_writemax(self.context.0) };
-        u64::try_from(max)
-            .expect("libnfs requires a target pointer width of at least 64 bits")
+        u64::try_from(max).expect("libnfs requires a target pointer width of at least 64 bits")
     }
 }
 
