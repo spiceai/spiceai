@@ -136,7 +136,7 @@ jobs:
           fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: dawidd6/action-download-artifact@0bd50d53a6d7fb5cb921e607957e9cc12b4ce392 # v12
+        uses: dawidd6/action-download-artifact@5c98f0b039f36ef966fdb7dfa9779262785ecb05 # v14
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           run_id: ${{ needs.resolve-run.outputs.run_id }}
@@ -213,7 +213,7 @@ jobs:
           fetch-depth: 1
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: dawidd6/action-download-artifact@0bd50d53a6d7fb5cb921e607957e9cc12b4ce392 # v12
+        uses: dawidd6/action-download-artifact@5c98f0b039f36ef966fdb7dfa9779262785ecb05 # v14
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           run_id: ${{ needs.resolve-run.outputs.run_id }}

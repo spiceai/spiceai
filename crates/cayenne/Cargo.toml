@@ -22,6 +22,7 @@ data_components = { path = "../data_components" }
 datafusion = { workspace = true }
 datafusion-catalog = { workspace = true }
 datafusion-common = { workspace = true }
+datafusion-datasource = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-physical-expr = { workspace = true }
@@ -46,6 +47,7 @@ util = { path = "../util" }
 uuid = { workspace = true, features = ["v7"] }
 vortex = { workspace = true }
 vortex-datafusion = { workspace = true }
+vortex-scan = { workspace = true, features = ["roaring"] }
 vortex-session = { workspace = true }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::config::ClusterRole;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
@@ -326,6 +327,7 @@ pub struct Builder {
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
+    cluster_role: Option<ClusterRole>,
 }
 
 impl Builder {
@@ -369,7 +371,13 @@ impl Builder {
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
             is_s3_express_acceleration: false,
+            cluster_role: None,
         }
+    }
+
+    pub fn cluster_role(&mut self, role: Option<ClusterRole>) -> &mut Self {
+        self.cluster_role = role;
+        self
     }
 
     pub fn acceleration_layout(
@@ -710,12 +718,12 @@ impl Builder {
             Arc::clone(&accelerator_write_mutex),
         );
         refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
+        refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
         refresher.set_initial_load_completed(self.initial_load_complete);
         refresher.disable_federation(self.disable_federation);
-        refresher.with_last_updated_at(Arc::clone(&last_updated_at));
         refresher.with_metrics(self.metrics);
         if let Some(synchronize_with) = &self.synchronize_with {
             refresher.synchronize_with(synchronize_with.clone());
@@ -733,7 +741,11 @@ impl Builder {
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
-        let refresh_handle = refresher.start(acceleration_refresh_mode).await?;
+        let refresh_handle = if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+            None
+        } else {
+            refresher.start(acceleration_refresh_mode).await?
+        };
         let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];

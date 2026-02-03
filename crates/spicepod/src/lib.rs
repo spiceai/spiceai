@@ -59,7 +59,7 @@ pub enum Error {
         • Ensure component definitions match the schema\n\n\
         See: https://docs.spiceai.org/reference/spicepod for the complete schema reference."
     ))]
-    UnableToParseSpicepod { source: serde_yaml::Error },
+    UnableToParseSpicepod { source: yaml::Error },
 
     #[snafu(display("Unable to resolve spicepod components {}: {source}", path.display()))]
     UnableToResolveSpicepodComponents {
@@ -228,7 +228,7 @@ impl Spicepod {
     ) -> Result<Spicepod> {
         let path = path.into();
         let spicepod_definition: SpicepodDefinition =
-            serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+            yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
 
         let resolved_datasets = component::resolve_component_references(
             fs,
@@ -373,7 +373,7 @@ impl Spicepod {
             .context(SpicepodNotFoundSnafu { path: path.clone() })?;
 
         let spicepod_definition: SpicepodDefinition =
-            serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+            yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
 
         Ok(spicepod_definition)
     }
