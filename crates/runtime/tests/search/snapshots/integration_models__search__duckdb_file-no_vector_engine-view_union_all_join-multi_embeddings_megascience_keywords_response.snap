@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/search/mod.rs
+---source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 snapshot_kind: text
 ---
@@ -9,7 +8,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        "answer": [
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ]
       },
       "primary_key": {
         "id": 1277
@@ -19,7 +20,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "To find the product of 8 and 2, multiply the two numbers together: \\(8 \\times 2 = 16\\). The answer is \\(\\boxed{16}\\)."
+        "answer": [
+          "To find the product of 8 and 2, multiply the two numbers together: \\(8 \\times 2 = 16\\). The answer is \\(\\boxed{16}\\)."
+        ]
       },
       "primary_key": {
         "id": 1075
@@ -29,7 +32,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "To find the product of 12 and 0.1, multiply the two numbers:\n\\[ 12 \\times 0.1 = 1.2 \\]\nThus, the product is \\(\\boxed{1.2}\\)."
+        "answer": [
+          "To find the product of 12 and 0.1, multiply the two numbers:\n\\[ 12 \\times 0.1 = 1.2 \\]\nThus, the product is \\(\\boxed{1.2}\\)."
+        ]
       },
       "primary_key": {
         "id": 1055
@@ -39,7 +44,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "When multiplying two negative numbers, the product is positive. Thus:  \n$-18(-2) = 36$.  \nThe answer is $\\boxed{36}$."
+        "answer": [
+          "When multiplying two negative numbers, the product is positive. Thus:  \n$-18(-2) = 36$.  \nThe answer is $\\boxed{36}$."
+        ]
       },
       "primary_key": {
         "id": 605

@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/models/search.rs
+---source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
 snapshot_kind: text
 ---
@@ -9,7 +8,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
-        "cp_description": "Programmes receive just likely, key homes. Relevant"
+        "cp_description": [
+          "Programmes receive just likely, key homes. Relevant"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 11
@@ -19,7 +20,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
-        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make "
+        "cp_description": [
+          "Heavily direct problems try eventually on a nurses. Courses may make "
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 8

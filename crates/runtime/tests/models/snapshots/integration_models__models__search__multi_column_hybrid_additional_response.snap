@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/models/search.rs
+---source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(response)
 snapshot_kind: text
 ---
@@ -12,7 +11,9 @@ snapshot_kind: text
       },
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends con"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
@@ -25,7 +26,9 @@ snapshot_kind: text
       },
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_description": [
+          "Close customers might struggle away different mem"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 15

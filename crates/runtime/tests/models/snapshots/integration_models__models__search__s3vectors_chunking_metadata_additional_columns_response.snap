@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/models/search.rs
+---source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
 snapshot_kind: text
 ---
@@ -12,7 +11,9 @@ snapshot_kind: text
       },
       "dataset": "qs",
       "matches": {
-        "answer": "\n2"
+        "answer": [
+          "\n2"
+        ]
       },
       "primary_key": {
         "id": 612
@@ -25,7 +26,9 @@ snapshot_kind: text
       },
       "dataset": "qs",
       "matches": {
-        "answer": " is 2."
+        "answer": [
+          " is 2."
+        ]
       },
       "primary_key": {
         "id": 349
@@ -38,7 +41,9 @@ snapshot_kind: text
       },
       "dataset": "qs",
       "matches": {
-        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+        "answer": [
+          "\\times 2 \\times 2 \\times 2 = 32\\)"
+        ]
       },
       "primary_key": {
         "id": 948
@@ -51,7 +56,9 @@ snapshot_kind: text
       },
       "dataset": "qs",
       "matches": {
-        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+        "answer": [
+          "\\times 2 \\times 2 \\times 2 = 32\\)"
+        ]
       },
       "primary_key": {
         "id": 1277

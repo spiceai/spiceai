@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/models/search.rs
+---source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(response)
 snapshot_kind: text
 ---
@@ -9,7 +8,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.item",
       "matches": {
-        "i_item_desc": "Patient"
+        "i_item_desc": [
+          "Patient"
+        ]
       },
       "primary_key": {
         "i_item_sk": 19
@@ -19,7 +20,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.item",
       "matches": {
-        "i_item_desc": "New"
+        "i_item_desc": [
+          "New"
+        ]
       },
       "primary_key": {
         "i_item_sk": 7
