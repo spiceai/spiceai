@@ -360,7 +360,7 @@ pub async fn handle_cancel_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
 
 fn job_state_to_status_response(state: &JobState) -> GetAsyncQueryStatusResponse {
     let error = state.error.as_ref().map(|e| AsyncQueryError {
-        error_code: e.error_code.clone(),
+        error_code: e.error_code,
         message: e.message.clone(),
     });
 

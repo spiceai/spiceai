@@ -218,6 +218,14 @@ impl JobExecutor {
 
         drop(active);
 
+        let timeout_fut: Box<dyn Future<Output = ()>> = state
+            .timeout_seconds
+            .map(|secs| {
+                Box::new(tokio::time::sleep(Duration::from_secs(secs)))
+                    as Box<dyn Future<Output = ()>>
+            })
+            .unwrap_or_else(|| Box::new(std::future::pending()) as Box<dyn Future<Output = ()>>);
+
         tokio::select! {
             () = cancel.cancelled() => {
                 tracing::debug!(job_id = %job_id, "Job cancelled before completion");
@@ -227,7 +235,7 @@ impl JobExecutor {
                 job_store.cancel_job(job_id).await?;
                 Ok(())
             },
-            () = tokio::time::sleep(Duration::from_secs(state.timeout_seconds.unwrap_or(u64::MAX))) => {
+            () = timeout_fut => {
                 tracing::debug!(job_id = %job_id, "Job timed out");
                 if let Err(e) = query_handle.cancel().await {
                     tracing::error!("Failed to cancel the timed-out query '{job_id}': {e}");
@@ -273,12 +281,13 @@ impl JobExecutor {
         use crate::datafusion::query::Error;
         match e {
             Error::SchedulerUnavailable => JobErrorCode::SchedulerUnavailable,
-            Error::SessionCreationFailed { .. } => JobErrorCode::SubmissionFailed,
-            Error::JobSubmissionFailed { .. } => JobErrorCode::SubmissionFailed,
-            Error::UnableToExecuteQuery { .. } => JobErrorCode::ExecutionFailed,
+            Error::SessionCreationFailed { .. } | Error::JobSubmissionFailed { .. } => {
+                JobErrorCode::SubmissionFailed
+            }
+            Error::UnableToExecuteQuery { .. } | Error::TableAccessDisallowed { .. } => {
+                JobErrorCode::ExecutionFailed
+            }
             Error::BindingParameters { .. } => JobErrorCode::ParameterBindingFailed,
-            Error::TableAccessDisallowed { .. } => JobErrorCode::ExecutionFailed,
-            Error::UnableToExecuteQuery { .. } => JobErrorCode::ExecutionFailed,
             _ => JobErrorCode::Internal,
         }
     }

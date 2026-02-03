@@ -88,11 +88,11 @@ pub struct SubmitQueryRequest {
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
     /// Optional timeout for async jobs.
-    /// Jobs running for longer than this will be automatically cancelled.
+    /// Jobs running for longer than this will automatically timeout and fail.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
     /// Optional maximum size of results for async jobs.
-    /// Jobs with results larger than this will be automatically cancelled.
+    /// Jobs with results larger than this will be failed with an error for exceeding the maximum size.
     #[serde(default)]
     pub maximum_size: Option<u64>,
 }
@@ -301,7 +301,7 @@ pub(crate) async fn submit(
                 query_id: query_id.clone(),
                 status: state.status,
                 error: state.error.as_ref().map(|e| ErrorResponse {
-                    error_code: e.error_code.clone(),
+                    error_code: e.error_code,
                     message: e.message.clone(),
                     sql_state: e.sql_state.clone(),
                 }),
@@ -393,7 +393,7 @@ pub(crate) async fn get_status(
     match result {
         Ok(state) => {
             let error = state.error.as_ref().map(|e| ErrorResponse {
-                error_code: e.error_code.clone(),
+                error_code: e.error_code,
                 message: e.message.clone(),
                 sql_state: e.sql_state.clone(),
             });
@@ -690,7 +690,7 @@ pub(crate) async fn list(
 
 fn job_state_to_response(state: &JobState) -> QueryResponse {
     let error = state.error.as_ref().map(|e| ErrorResponse {
-        error_code: e.error_code.clone(),
+        error_code: e.error_code,
         message: e.message.clone(),
         sql_state: e.sql_state.clone(),
     });
