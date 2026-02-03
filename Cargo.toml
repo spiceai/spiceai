@@ -198,6 +198,7 @@ mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.3.0", features = ["openssl-tls"] }
 mysql_async = { version = "0.36.1", features = ["native-tls-tls", "chrono"] }
+nix = "0.30"
 num_cpus = "1.16"
 object_store = { version = "0.12.4", features = [
     "aws",
