@@ -17,12 +17,15 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::datafusion::DataFusion;
 use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
+use crate::http::v1::queries::SubmitQueryRequest;
+use crate::jobs::state::JobErrorCode;
 
 use super::Result;
 use super::state::{JobState, JobStatus};
@@ -71,12 +74,8 @@ impl JobExecutor {
     /// Submits a new query job for async execution.
     ///
     /// Returns the job state immediately. The query will be executed in the background.
-    pub async fn submit(
-        &self,
-        sql: String,
-        parameters: Option<serde_json::Value>,
-    ) -> Result<JobState> {
-        let state = self.job_store.create_job(sql, parameters).await?;
+    pub async fn submit(&self, request: SubmitQueryRequest) -> Result<JobState> {
+        let state = self.job_store.create_job(request).await?;
         let job_id = state.job_id.clone();
 
         // Create cancellation token for this job
@@ -184,7 +183,7 @@ impl JobExecutor {
                 }
                 Err(e) => {
                     job_store
-                        .fail_job(job_id, "INVALID_PARAMETERS", e.to_string())
+                        .fail_job(job_id, JobErrorCode::ParameterBindingFailed, e.to_string())
                         .await?;
                     return Ok(());
                 }
@@ -228,6 +227,14 @@ impl JobExecutor {
                 job_store.cancel_job(job_id).await?;
                 Ok(())
             },
+            () = tokio::time::sleep(Duration::from_secs(state.timeout_seconds.unwrap_or(u64::MAX))) => {
+                tracing::debug!(job_id = %job_id, "Job timed out");
+                if let Err(e) = query_handle.cancel().await {
+                    tracing::error!("Failed to cancel the timed-out query '{job_id}': {e}");
+                }
+                job_store.fail_job(job_id, JobErrorCode::Timeout, "Job execution timed out".to_string()).await?;
+                Ok(())
+            }
             result_stream = query_handle.into_stream() => {
                 // Wait for completion and get the result stream
                 let result_stream = match result_stream {
@@ -247,7 +254,7 @@ impl JobExecutor {
                     Ok(result) => result,
                     Err(e) => {
                         job_store
-                            .fail_job(job_id, "RESULT_FETCH", e.to_string())
+                            .fail_job(job_id, JobErrorCode::FetchingResultsFailed, e.to_string())
                             .await?;
                         return Ok(());
                     }
@@ -262,28 +269,33 @@ impl JobExecutor {
     }
 
     /// Converts a `Query::Error` to an error code string.
-    fn query_error_to_code(e: &crate::datafusion::query::Error) -> &'static str {
+    fn query_error_to_code(e: &crate::datafusion::query::Error) -> JobErrorCode {
         use crate::datafusion::query::Error;
         match e {
-            Error::SchedulerUnavailable => "SCHEDULER_UNAVAILABLE",
-            Error::SessionCreationFailed { .. } => "SESSION_ERROR",
-            Error::JobSubmissionFailed { .. } => "JOB_SUBMISSION",
-            Error::UnableToExecuteQuery { .. } => "QUERY_PLANNING",
-            Error::BindingParameters { .. } => "PARAMETER_BINDING",
-            Error::TableAccessDisallowed { .. } => "TABLE_ACCESS_DENIED",
-            _ => "INTERNAL_ERROR",
+            Error::SchedulerUnavailable => JobErrorCode::SchedulerUnavailable,
+            Error::SessionCreationFailed { message } => JobErrorCode::SubmissionFailed,
+            Error::JobSubmissionFailed { message } => JobErrorCode::SubmissionFailed,
+            Error::UnableToExecuteQuery { source } => JobErrorCode::ExecutionFailed,
+            Error::BindingParameters { source } => JobErrorCode::ParameterBindingFailed,
+            Error::TableAccessDisallowed { table } => JobErrorCode::ExecutionFailed,
+            Error::UnableToExecuteQuery { source } => JobErrorCode::ExecutionFailed,
+            _ => JobErrorCode::Internal,
         }
     }
 
     /// Converts a `QueryHandleError` to an error code string and message.
-    fn handle_error_to_code_and_msg(e: &QueryHandleError) -> (&'static str, String) {
+    fn handle_error_to_code_and_msg(e: &QueryHandleError) -> (JobErrorCode, String) {
         match e {
-            QueryHandleError::JobTimeout { .. } => ("JOB_TIMEOUT", e.to_string()),
-            QueryHandleError::JobCancelled => ("JOB_CANCELLED", e.to_string()),
-            QueryHandleError::JobFailed { message } => ("QUERY_EXECUTION", message.clone()),
-            QueryHandleError::StatusError { message } => ("STATUS_ERROR", message.clone()),
-            QueryHandleError::PartitionLocationError { .. } => ("PARTITION_ERROR", e.to_string()),
-            QueryHandleError::JobNotFound { .. } => ("JOB_NOT_FOUND", e.to_string()),
+            QueryHandleError::JobTimeout { .. } => (JobErrorCode::Timeout, e.to_string()),
+            QueryHandleError::JobCancelled => (JobErrorCode::Cancelled, e.to_string()),
+            QueryHandleError::JobFailed { message } => {
+                (JobErrorCode::ExecutionFailed, message.clone())
+            }
+            QueryHandleError::StatusError { message } => (JobErrorCode::Internal, message.clone()),
+            QueryHandleError::PartitionLocationError { .. } => {
+                (JobErrorCode::Internal, e.to_string())
+            }
+            QueryHandleError::JobNotFound { .. } => (JobErrorCode::NotFound, e.to_string()),
         }
     }
 }

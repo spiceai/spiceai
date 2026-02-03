@@ -12505,6 +12505,7 @@ dependencies = [
  "snafu",
  "spicepod",
  "tracing",
+ "yaml",
  "zip 7.2.0",
 ]
 
@@ -16952,6 +16953,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+ "yaml",
  "zip 7.2.0",
 ]
 
