@@ -140,8 +140,9 @@ impl RecursiveSplittingChunker<TokenizerWrapper> {
     }
 }
 
+/// Chunk sizer wrapper around `OpenAI` `CoreBPE` tokenizers.
 #[derive(Clone)]
-struct CoreBpeSizer(CoreBPE);
+pub struct CoreBpeSizer(CoreBPE);
 
 impl ChunkSizer for CoreBpeSizer {
     fn size(&self, chunk: &str) -> usize {
