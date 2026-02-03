@@ -189,69 +189,6 @@ impl Query {
         self.df.ctx.state()
     }
 
-    /// Returns the session state configured for distributed query execution via Ballista.
-    ///
-    /// This is only used by the async queries API (`/v1/queries`) which needs to
-    /// distribute work across the cluster. Returns an error if not in scheduler mode
-    /// or if required configuration is missing.
-    fn get_distributed_session_state(&self) -> Result<SessionState> {
-        if !matches!(self.df.cluster_config.role(), Some(ClusterRole::Scheduler)) {
-            return Err(Error::UnableToExecuteQuery {
-                source: datafusion::error::DataFusionError::Configuration(
-                    "Distributed execution requires scheduler mode".to_string(),
-                ),
-            });
-        }
-
-        let Some(scheduler_url) = self.df.cluster_config.scheduler_url_string() else {
-            return Err(Error::UnableToExecuteQuery {
-                source: datafusion::error::DataFusionError::Configuration(
-                    "Scheduler mode requires --node-advertise-address".to_string(),
-                ),
-            });
-        };
-
-        let client_tls_config = self.df.cluster_config.client_tls_config().cloned();
-        let tls_enabled = client_tls_config.is_some();
-        let mut cfg = self
-            .df
-            .ctx
-            .copied_config()
-            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec())
-            .with_ballista_use_tls(tls_enabled)
-            // Use 100MB max message size to match other gRPC configurations in the codebase
-            // (see flight_client::MAX_DECODING_MESSAGE_SIZE). The default Ballista config
-            // is 16MB which is too small for queries returning large batches.
-            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024)
-            // Enable result fetch metrics callback to track final result fetching from executors
-            .with_ballista_result_fetch_metrics_callback(OtelResultFetchMetricsCallback::new_arc(
-                scheduler_url.to_string(),
-            ));
-
-        if let Some(tls_config) = client_tls_config {
-            cfg = cfg.with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
-                ep.tls_config(tls_config.clone()).boxed()
-            }));
-        }
-
-        let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
-            BallistaQueryPlanner::with_local_planner(
-                scheduler_url.to_string(),
-                cfg.ballista_config(),
-                SpiceLogicalCodec::new_codec(),
-                DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
-            );
-
-        SessionStateBuilder::new_from_existing(self.df.ctx.state())
-            .with_config(
-                cfg.with_ballista_query_planner(Arc::new(query_planner))
-                    .with_option_extension(SpiceClusterConfig::default()),
-            )
-            .build()
-            .upgrade_for_ballista(scheduler_url.to_string())
-            .map_err(|e| Error::UnableToExecuteQuery { source: e })
-    }
-
     /// Run a query and return the result.
     ///
     /// # Panics
