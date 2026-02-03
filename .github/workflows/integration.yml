@@ -223,7 +223,7 @@ jobs:
 
       - name: Login to ACR
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: spiceaitestimages.azurecr.io
           username: spiceai-repo-pull
@@ -394,7 +394,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -434,7 +434,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -507,7 +507,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
