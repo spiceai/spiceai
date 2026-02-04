@@ -7831,7 +7831,7 @@ dependencies = [
  "dyn-clone",
  "graph-error",
  "http 1.4.0",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "parking_lot 0.12.5",
  "percent-encoding",
  "remain",
@@ -7855,7 +7855,7 @@ dependencies = [
  "handlebars 2.0.4",
  "http 1.4.0",
  "http-serde",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "reqwest",
  "ring",
  "serde",
@@ -7905,7 +7905,7 @@ dependencies = [
  "graph-error",
  "hex",
  "http 1.4.0",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "lazy_static",
  "reqwest",
  "serde",
@@ -9471,6 +9471,22 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "simple_asn1",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "10.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0529410abe238729a60b108898784df8984c87f6054c9c4fcacc47e4803c1ce1"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "js-sys",
+ "pem",
+ "serde",
+ "serde_json",
+ "signature 2.2.0",
  "simple_asn1",
 ]
 
@@ -11867,7 +11883,7 @@ dependencies = [
  "hyper-rustls 0.27.7",
  "hyper-timeout",
  "hyper-util",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "once_cell",
  "percent-encoding",
  "pin-project",
@@ -14399,7 +14415,7 @@ dependencies = [
  "hmac 0.12.1",
  "home",
  "http 1.4.0",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "log",
  "percent-encoding",
  "quick-xml 0.37.5",
@@ -14866,7 +14882,7 @@ dependencies = [
  "insta",
  "itertools 0.14.0",
  "jsonpath-rust",
- "jsonwebtoken",
+ "jsonwebtoken 10.3.0",
  "linkme",
  "llms",
  "mediatype",
@@ -16740,7 +16756,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f1c0c8818bb7400e821b166075ec771c8e8a012af41a8982b34eefaad4739fd"
 dependencies = [
  "base64 0.22.1",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "rsa 0.9.10",
  "serde",
  "sha2 0.10.9",

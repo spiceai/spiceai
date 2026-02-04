@@ -79,7 +79,7 @@ iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
-jsonwebtoken = "9.3.0"
+jsonwebtoken = "10.3.0"
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"
