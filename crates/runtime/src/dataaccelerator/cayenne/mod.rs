@@ -24,6 +24,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use data_components::delete::DeletionTableProviderAdapter;
 use data_components::poly::PolyTableProvider;
 use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
@@ -1395,9 +1396,13 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
+        // Wrap in DeletionTableProviderAdapter so get_deletion_provider can find it
+        let adapted_table: Arc<dyn TableProvider> =
+            Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
+
         Ok(Partition {
             partition_values,
-            table_provider: Arc::new(cayenne_table),
+            table_provider: adapted_table,
         })
     }
 
@@ -1458,9 +1463,13 @@ impl PartitionCreator for CayennePartitionCreator {
                 .boxed()
                 .context(creator::InferringPartitionsSnafu)?;
 
+            // Wrap in DeletionTableProviderAdapter so get_deletion_provider can find it
+            let adapted_table: Arc<dyn TableProvider> =
+                Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
+
             result.push(Partition {
                 partition_values,
-                table_provider: Arc::new(cayenne_table),
+                table_provider: adapted_table,
             });
         }
 

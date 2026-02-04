@@ -786,7 +786,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_deserialize_api_keys() {
@@ -799,7 +799,7 @@ mod tests {
                 - api-key-3:rw
         ";
 
-        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+        let parsed: Auth = yaml::from_str(yaml).expect("Failed to parse Auth");
 
         let api_key = parsed.api_key.expect("api_key section exists");
 
@@ -832,7 +832,7 @@ mod tests {
                 - api-key-1
         ";
 
-        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+        let parsed: Auth = yaml::from_str(yaml).expect("Failed to parse Auth");
 
         let api_key = parsed.api_key.expect("api_key section exists");
 
@@ -920,7 +920,7 @@ mod tests {
         let yaml = r"
             memory_limit: 100MiB
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -935,7 +935,7 @@ mod tests {
             query:
                 memory_limit: 200MiB
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -951,7 +951,7 @@ mod tests {
             query:
                 memory_limit: 200MiB
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -964,7 +964,7 @@ mod tests {
         // Test when neither is present
         let yaml = r"
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
     }
 
@@ -974,7 +974,7 @@ mod tests {
         let yaml = r"
             temp_directory: '/foo'
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -989,7 +989,7 @@ mod tests {
             query:
                 temp_directory: '/bar'
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -1005,7 +1005,7 @@ mod tests {
             query:
                 temp_directory: '/bar'
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.query,
             Some(Query {
@@ -1018,7 +1018,7 @@ mod tests {
         // Test when neither is present
         let yaml = r"
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
     }
 
@@ -1092,7 +1092,7 @@ mod tests {
                 retention_check_interval: 15m
                 min_sql_duration: 10ms
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, Some("10ms".into()));
         assert_eq!(
             runtime
@@ -1107,7 +1107,7 @@ mod tests {
             task_history:
                 enabled: true
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, None);
     }
 
@@ -1251,7 +1251,7 @@ mod tests {
                 captured_plan: explain analyze
                 min_plan_duration: 100ms
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(
             runtime.task_history.captured_plan,
             Some("explain analyze".into())
@@ -1283,7 +1283,7 @@ mod tests {
                 captured_plan: explain
                 min_plan_duration: 50ms
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.task_history.min_sql_duration, Some("10ms".into()));
         assert_eq!(runtime.task_history.captured_plan, Some("explain".into()));
         assert_eq!(runtime.task_history.min_plan_duration, Some("50ms".into()));
@@ -1298,7 +1298,7 @@ mod tests {
                     endpoint: otel-collector:4317
                     push_interval: 30s
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         let otel_config = runtime
             .telemetry
@@ -1318,7 +1318,7 @@ mod tests {
                     endpoint: http://localhost:4318/v1/metrics
                     push_interval: 1m
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         let otel_config = runtime
             .telemetry
@@ -1337,7 +1337,7 @@ mod tests {
                 otel_exporter:
                     endpoint: otel-collector
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         let otel_config = runtime
             .telemetry
@@ -1430,7 +1430,7 @@ mod tests {
             telemetry:
                 enabled: true
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert!(runtime.telemetry.otel_exporter.is_none());
     }
 
@@ -1519,7 +1519,7 @@ mod tests {
                 otel_exporter:
                     endpoint: otel-collector
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         let otel_config = runtime
             .telemetry
             .otel_exporter
@@ -1535,7 +1535,7 @@ mod tests {
                     enabled: false
                     endpoint: otel-collector
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         let otel_config = runtime
             .telemetry
             .otel_exporter
@@ -1554,7 +1554,7 @@ mod tests {
                         - request_duration_seconds
                         - active_connections
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         let otel_config = runtime
             .telemetry
             .otel_exporter
@@ -1580,7 +1580,7 @@ mod tests {
                 otel_exporter:
                     endpoint: otel-collector:4317
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         let otel_config = runtime
             .telemetry
             .otel_exporter
@@ -1600,7 +1600,7 @@ mod tests {
                     endpoint: otel-collector:4317
                     push_interval: 45s
         ";
-        let runtime: Runtime = serde_yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
 
         assert!(runtime.telemetry.enabled);
         assert_eq!(

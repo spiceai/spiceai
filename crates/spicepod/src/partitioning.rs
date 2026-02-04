@@ -61,7 +61,7 @@ where
 mod tests {
     use super::*;
 
-    use serde_yaml::from_str;
+    use yaml::from_str;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -75,7 +75,7 @@ mod tests {
         pub partition_by: Vec<PartitionedBy>,
     }
     #[test]
-    fn deserialize_partition_by_unnamed() -> Result<(), serde_yaml::Error> {
+    fn deserialize_partition_by_unnamed() -> Result<(), yaml::Error> {
         let yaml = r#"
 partition_by:
   - "YEAR(created_at)"
@@ -95,7 +95,7 @@ partition_by:
     }
 
     #[test]
-    fn deserialize_partition_by_named() -> Result<(), serde_yaml::Error> {
+    fn deserialize_partition_by_named() -> Result<(), yaml::Error> {
         let yaml = r#"
 partition_by:
   - year: "YEAR(created_at)"
