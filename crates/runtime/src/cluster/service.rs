@@ -549,7 +549,7 @@ impl ClusterService for ClusterServiceImpl {
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
         let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
 
-        match create_executor_flight_client(&executor_id).await {
+        match create_executor_flight_client(&executor_id) {
             Ok(client) => {
                 let mut flight_client_registry =
                     self.executor_registry.flight_sql_clients.write().await;
@@ -560,7 +560,7 @@ impl ClusterService for ClusterServiceImpl {
                     "Failed to create Flight SQL client for executor {executor_id}: {e}"
                 );
             }
-        };
+        }
 
         let table_partitions: HashMap<TableReference, StringArray> = (*self.app.read().await)
             .as_ref()
@@ -580,8 +580,8 @@ impl ClusterService for ClusterServiceImpl {
         executor_partitions.insert(
             executor_id.clone(),
             table_partitions
-                .iter()
-                .map(|(tbl, _)| (tbl.clone(), vec![]))
+                .keys()
+                .map(|tbl| (tbl.clone(), vec![]))
                 .collect(),
         );
 
@@ -594,7 +594,7 @@ impl ClusterService for ClusterServiceImpl {
     }
 }
 
-async fn create_executor_flight_client(
+fn create_executor_flight_client(
     endpoint: &str,
 ) -> Result<FlightSqlClient, tonic::transport::Error> {
     let executor_address = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
@@ -604,7 +604,7 @@ async fn create_executor_flight_client(
     };
 
     // TODO support for mTLS certificates per executor.
-    let flight_channel = Endpoint::from_shared(executor_address.clone())?.connect_lazy();
+    let flight_channel = Endpoint::from_shared(executor_address)?.connect_lazy();
 
     Ok(FlightSqlServiceClient::new_from_inner(
         FlightServiceClient::new(CookieService::new(

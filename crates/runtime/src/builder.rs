@@ -242,7 +242,7 @@ impl RuntimeBuilder {
         let executor_registry = self
             .resolved_cluster_config
             .as_ref()
-            .and_then(|c| c.effective_role())
+            .and_then(ResolvedClusterConfig::effective_role)
             .is_some_and(|role| role == ClusterRole::Scheduler)
             .then(|| Arc::new(ExecutorRegistry::new()));
 

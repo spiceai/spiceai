@@ -704,8 +704,7 @@ impl ResolvedClusterConfig {
     pub fn node_id(&self) -> String {
         self.scheduler_url_string()
             .or_else(|| self.node_advertise_address())
-            .map(str::to_string)
-            .unwrap_or_else(|| self.node_bind_address().to_string())
+            .map_or_else(|| self.node_bind_address().to_string(), str::to_string)
     }
 }
 
@@ -735,7 +734,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     rt: &Arc<Runtime>,
     scheduler_executor_registry: Arc<ExecutorRegistry>,
 ) -> crate::Result<Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'static>>>> {
-    initialize_cluster_scheduler(&rt).await?;
+    initialize_cluster_scheduler(rt).await?;
     // Start internal cluster server for scheduler on separate port
     let internal_server_shutdown = CancellationToken::new();
     let cloned_shutdown = internal_server_shutdown.clone();
@@ -749,7 +748,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         .await
         .context(UnableToStartClusterServerSnafu)
     };
-    let self_for_task = Arc::clone(&rt);
+    let self_for_task = Arc::clone(rt);
     let internal_server_future = self_for_task
         .start_runtime_task(
             CLUSTER_INTERNAL_SERVER,
@@ -765,7 +764,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             let registry_shutdown = CancellationToken::new();
             let registry_shutdown_for_task = registry_shutdown.clone();
             let peers = rt.scheduler_peers();
-            let self_ref = Arc::clone(&rt);
+            let self_ref = Arc::clone(rt);
             let registry_task = async move {
                 start_scheduler_registry(self_ref, &config, registry_shutdown.clone(), peers)
                     .await

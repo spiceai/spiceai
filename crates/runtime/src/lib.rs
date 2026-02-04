@@ -501,7 +501,7 @@ pub struct Runtime {
     /// Job executor for async SQL query jobs (only available in cluster mode with scheduler config)
     job_executor: Arc<RwLock<Option<Arc<jobs::JobExecutor>>>>,
 
-    /// Registry of connected executors for FlightSQL.
+    /// Registry of connected executors for `FlightSQL`.
     /// Only used in scheduler mode.
     pub executor_registry: Option<Arc<cluster::ExecutorRegistry>>,
 
@@ -755,7 +755,7 @@ impl Runtime {
                     Some(Arc::new(
                         metrics_server::cluster::ClusterMetricsCollector::new(
                             self.scheduler_peers(),
-                            Arc::clone(&scheduler_executor_registry),
+                            Arc::clone(scheduler_executor_registry),
                             self.df.cluster_config.client_tls_config().cloned(),
                             self.df.cluster_config.node_id(),
                             local_metrics_collector,

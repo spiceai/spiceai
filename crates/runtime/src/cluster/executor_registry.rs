@@ -115,6 +115,8 @@ impl ExecutorConnection {
     }
 }
 
+pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
+
 /// Registry for tracking executor control stream connections.
 ///
 /// Schedulers use this registry to:
@@ -126,12 +128,12 @@ pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
 
-    /// Map of `executor_id` -> FlightSqlClient
+    /// Map of `executor_id` -> `FlightSqlClient`
     /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
     pub flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
 
-    /// Map of `executor_id` -> HashMap<TableReference, Vec<Expr>>
-    pub partitions: Arc<RwLock<HashMap<String, HashMap<TableReference, Vec<Expr>>>>>,
+    /// Map of `executor_id` -> table partitions for that executor
+    pub partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
 }
 
 impl ExecutorRegistry {
@@ -287,7 +289,7 @@ impl TablePartitionProvider for ExecutorRegistry {
                     executor_id,
                     client.clone(),
                     table.clone(),
-                    schema.clone(),
+                    Arc::clone(schema),
                      Arc::new(CookieStore::new()),
 
                 )) as Arc<dyn TableProvider>;
