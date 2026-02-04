@@ -1253,7 +1253,7 @@ fn transform_spicepod(
                 match engine {
                     None | Some("duckdb") => {
                         let duckdb_file = format!(
-                            "/tmp/{run_id}_{config_name}_{dataset_name}_{phase_suffix}-19.db"
+                            "/tmp/{config_name}_{dataset_name}_{phase_suffix}.db"
                         );
                         params
                             .data
@@ -1261,7 +1261,7 @@ fn transform_spicepod(
                     }
                     Some("cayenne") => {
                         let cayenne_dir = format!(
-                            "/tmp/{run_id}_{config_name}_{dataset_name}_{phase_suffix}_cayenne/"
+                            "/tmp/{config_name}_{dataset_name}_{phase_suffix}_cayenne/"
                         );
                         params.data.insert(
                             "cayenne_file_path".to_string(),
