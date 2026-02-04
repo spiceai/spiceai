@@ -12,8 +12,15 @@ use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
+use runtime_proto::UdtfArgs;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+
+use crate::cluster::datafusion::codec::udtf_args::UdtfArgsExt;
+use crate::execution_plan::UdtfExec;
+
+/// UDTF name constant for `list_udfs`
+pub const LIST_UDFS_UDTF_NAME: &str = "list_udfs";
 
 pub struct ListUDFTableFunc {
     context: Arc<SessionContext>,
@@ -38,14 +45,17 @@ impl TableFunctionImpl for ListUDFTableFunc {
     }
 }
 
+/// The `TableProvider` produced by the `list_udfs()` UDTF.
+///
+/// This table contains a single column "name" with all registered UDF names.
 #[derive(Debug)]
-struct ListUDFTable {
+pub struct ListUDFTable {
     schema: SchemaRef,
     udf_names: Vec<String>,
 }
 
 impl ListUDFTable {
-    fn new(udf_names: Vec<String>) -> Self {
+    pub fn new(udf_names: Vec<String>) -> Self {
         Self {
             schema: Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)])),
             udf_names,
@@ -80,8 +90,12 @@ impl TableProvider for ListUDFTable {
         let memory_source =
             MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?;
 
-        let data_source_exec = DataSourceExec::new(Arc::new(memory_source));
+        let inner_exec = Arc::new(DataSourceExec::new(Arc::new(memory_source)));
 
-        Ok(Arc::new(data_source_exec))
+        // Wrap in UdtfExec for distributed execution support.
+        // The UdtfArgs allow the UDTF to be re-invoked on remote executors.
+        let udtf_exec = UdtfExec::new(UdtfArgs::list_udfs(), inner_exec);
+
+        Ok(Arc::new(udtf_exec))
     }
 }

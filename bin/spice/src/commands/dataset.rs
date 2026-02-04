@@ -188,10 +188,9 @@ fn configure_dataset() -> Result<()> {
     };
 
     // Serialize to YAML
-    let dataset_yaml =
-        serde_yaml::to_string(&dataset).map_err(|e| crate::error::Error::ConfigParse {
-            message: format!("Failed to serialize dataset to YAML: {e}"),
-        })?;
+    let dataset_yaml = yaml::to_string(&dataset).map_err(|e| crate::error::Error::ConfigParse {
+        message: format!("Failed to serialize dataset to YAML: {e}"),
+    })?;
 
     // Create dataset directory with secure permissions (0700)
     let dir_path = PathBuf::from("datasets").join(&dataset_name);
@@ -304,7 +303,7 @@ fn update_spicepod_with_dataset(dataset_dir: &Path) -> Result<()> {
     })?;
 
     let mut spicepod: SpicepodDefinition =
-        serde_yaml::from_str(&content).map_err(|e| crate::error::Error::ConfigParse {
+        yaml::from_str(&content).map_err(|e| crate::error::Error::ConfigParse {
             message: format!("Failed to parse spicepod.yaml: {e}"),
         })?;
 
@@ -326,7 +325,7 @@ fn update_spicepod_with_dataset(dataset_dir: &Path) -> Result<()> {
 
         // Write back to spicepod.yaml
         let updated_yaml =
-            serde_yaml::to_string(&spicepod).map_err(|e| crate::error::Error::ConfigParse {
+            yaml::to_string(&spicepod).map_err(|e| crate::error::Error::ConfigParse {
                 message: format!("Failed to serialize spicepod.yaml: {e}"),
             })?;
 

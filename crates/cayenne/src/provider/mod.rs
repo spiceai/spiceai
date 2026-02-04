@@ -50,14 +50,16 @@ pub(crate) mod sink;
 pub(crate) mod streaming;
 pub(crate) mod table;
 pub(crate) mod utils;
+pub(crate) mod vortex_format;
 
 // Re-export the main type at the module level for convenience
 pub use context::CayenneContext;
 pub use scan::CayenneAccelerationExec;
 pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
+pub use vortex_format::{attach_deletion_vectors_to_config, DeletionFilteringVortexFormat};
 
 // Re-export deletion utilities for advanced use cases
-pub use delete::{read_deletion_vectors, CayenneDeletionSink, DeletionFilterExec};
+pub use delete::CayenneDeletionSink;
 
 use snafu::prelude::*;
 

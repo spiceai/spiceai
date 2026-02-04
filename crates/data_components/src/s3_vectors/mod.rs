@@ -185,7 +185,7 @@ pub async fn list_index_names(
 ) -> Result<Vec<String>, Error> {
     let list_indexes_output = client
         .list_indexes(
-            ListIndexesInput::builder()
+            &ListIndexesInput::builder()
                 .set_vector_bucket_name(Some(bucket_name.to_string()))
                 .set_prefix(Some(prefix.to_string()))
                 .build()

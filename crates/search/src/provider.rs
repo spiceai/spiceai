@@ -37,11 +37,35 @@ use datafusion::{
 use datafusion_expr::select_expr::SelectExpr;
 use futures::future::BoxFuture;
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME,
     index::{SearchIndex, chunking::ChunkedSearchIndex},
 };
+
+/// Tracks the original UDTF invocation that produced this `SearchQueryProvider`.
+///
+/// This is used for serialization during distributed query execution with Ballista.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UdtfSource {
+    /// Created by `text_search(tbl, query, [col], [limit], [include_score])`
+    TextSearch {
+        table: String,
+        query: String,
+        column: Option<String>,
+        limit: Option<usize>,
+        include_score: Option<bool>,
+    },
+    /// Created by `vector_search(tbl, query, [col], [limit], [include_score])`
+    VectorSearch {
+        table: String,
+        query: String,
+        column: Option<String>,
+        limit: Option<usize>,
+        include_score: Option<bool>,
+    },
+}
 
 /// Performs a search on a given [`SearchIndex`] and combine with the underlying [`TableProvider`]
 /// if required by filters or additional columns in the projection.
@@ -59,6 +83,11 @@ pub struct SearchQueryProvider {
     /// immediately before the provider executes a scan operation. The callback is asynchronous and
     /// will be awaited before the scan proceeds. If `None`, no callback is invoked.
     pub scan_callback: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
+    /// Tracks the original UDTF invocation for distributed serialization.
+    ///
+    /// This is set when the provider is created via a UDTF like `text_search()` or `vector_search()`.
+    /// It enables `SpiceLogicalCodec` to serialize and reconstruct this provider on remote executors.
+    pub udtf_source: Option<UdtfSource>,
 }
 
 impl std::fmt::Debug for SearchQueryProvider {
@@ -69,6 +98,7 @@ impl std::fmt::Debug for SearchQueryProvider {
             .field("search_column", &self.search_column)
             .field("primary_key", &self.primary_key)
             .field("pre_limit", &self.pre_limit)
+            .field("udtf_source", &self.udtf_source)
             .finish_non_exhaustive()
     }
 }
@@ -89,6 +119,7 @@ impl SearchQueryProvider {
             pre_limit,
             scan_callback: None,
             constraints: None,
+            udtf_source: None,
         };
 
         // Create `constraints` based on [`Self::schema`]
@@ -116,6 +147,13 @@ impl SearchQueryProvider {
         func: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
     ) -> Self {
         self.scan_callback = Some(func);
+        self
+    }
+
+    /// Sets the UDTF source for distributed serialization.
+    #[must_use]
+    pub fn with_udtf_source(mut self, source: UdtfSource) -> Self {
+        self.udtf_source = Some(source);
         self
     }
 

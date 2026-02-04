@@ -49,7 +49,7 @@ reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 runtime-async = { path = "../../crates/runtime-async" }
 rustls.workspace = true
-serde_yaml.workspace = true
+yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
