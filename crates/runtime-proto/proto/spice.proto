@@ -98,6 +98,7 @@ message ExecutorControlMessage {
     oneof message {
         ExecutorHeartbeat heartbeat = 2;
         MetricsResponse metrics = 3;
+        ExecutorShutdown shutdown = 4;
     }
 }
 
@@ -120,6 +121,14 @@ message PollNowCommand {
 // Heartbeat message sent by executor to scheduler.
 message ExecutorHeartbeat {
     int64 timestamp_ms = 1;
+}
+
+// Executor shutdown notification sent by executor to scheduler.
+message ExecutorShutdown {
+    // Ballista executor ID to deregister from the scheduler.
+    string ballista_executor_id = 1;
+    // Optional reason for shutdown (for debugging/logging).
+    string reason = 2;
 }
 
 // Request for metrics from an executor.

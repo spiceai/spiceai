@@ -9,7 +9,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
+        "answer": [
+          "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
+        ]
       },
       "primary_key": {
         "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
@@ -19,7 +21,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
       },
       "primary_key": {
         "answer": "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\)."
@@ -29,7 +33,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
+        "answer": [
+          "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
+        ]
       },
       "primary_key": {
         "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."

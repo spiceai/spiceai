@@ -28,6 +28,9 @@ use object_store::{Error as ObjectStoreError, ObjectStore};
 use snafu::prelude::*;
 use uuid::Uuid;
 
+use crate::http::v1::queries::SubmitQueryRequest;
+use crate::jobs::state::JobErrorCode;
+
 use super::error::{
     DeserializeChunkSnafu, DeserializeStateSnafu, ObjectStoreDeleteSnafu, ObjectStoreListSnafu,
     ObjectStoreReadSnafu, ObjectStoreWriteSnafu, Result, SerializeChunkSnafu, SerializeStateSnafu,
@@ -127,13 +130,11 @@ impl JobStore {
     }
 
     /// Creates a new pending job and stores it.
-    pub async fn create_job(
-        &self,
-        sql: String,
-        parameters: Option<serde_json::Value>,
-    ) -> Result<JobState> {
+    pub async fn create_job(&self, request: SubmitQueryRequest) -> Result<JobState> {
         let job_id = Self::generate_job_id();
-        let state = JobState::new_pending(job_id, sql, parameters);
+        let state = JobState::new_pending(job_id, request.sql, request.parameters)
+            .with_timeout_seconds(request.timeout_seconds)
+            .with_maximum_size(request.maximum_size);
         self.write_job_state(&state).await?;
         Ok(state)
     }
@@ -186,100 +187,6 @@ impl JobStore {
         Ok(state)
     }
 
-    /// Writes result chunks for a completed job.
-    ///
-    /// Takes a schema and an iterator of `RecordBatch`es and writes them as Arrow IPC chunks.
-    /// The schema is used for the result manifest even if no batches are provided,
-    /// ensuring empty result sets still have valid schema information.
-    ///
-    /// Returns the job result manifest.
-    pub async fn write_result_chunks(
-        &self,
-        job_id: &str,
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-    ) -> Result<JobResult> {
-        if batches.is_empty() {
-            // Empty result set - still include the schema
-            return Ok(Self::build_job_result(&schema, 0, 0, 0, vec![]));
-        }
-        let mut total_rows = 0usize;
-        let mut total_bytes = 0usize;
-        let mut chunk_indices = Vec::new();
-
-        // Group batches into chunks based on row count
-        let mut current_chunk_batches: Vec<RecordBatch> = Vec::new();
-        let mut current_chunk_rows = 0usize;
-        let mut chunk_index = 0usize;
-
-        for batch in batches {
-            let batch_rows = batch.num_rows();
-            total_rows = total_rows.checked_add(batch_rows).ok_or_else(|| {
-                super::error::Error::IntegerOverflow {
-                    field: "total_row_count".to_string(),
-                    left_value: total_rows,
-                    right_value: batch_rows,
-                }
-            })?;
-
-            current_chunk_batches.push(batch);
-            current_chunk_rows = current_chunk_rows.checked_add(batch_rows).ok_or_else(|| {
-                super::error::Error::IntegerOverflow {
-                    field: "chunk_row_count".to_string(),
-                    left_value: current_chunk_rows,
-                    right_value: batch_rows,
-                }
-            })?;
-
-            // Flush chunk if we've reached the chunk size
-            if current_chunk_rows >= self.chunk_size {
-                let bytes = self
-                    .write_chunk(job_id, chunk_index, &current_chunk_batches)
-                    .await?;
-                total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
-                    super::error::Error::IntegerOverflow {
-                        field: "total_byte_count".to_string(),
-                        left_value: total_bytes,
-                        right_value: bytes,
-                    }
-                })?;
-                chunk_indices.push(chunk_index);
-                chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
-                    super::error::Error::IntegerOverflow {
-                        field: "chunk_index".to_string(),
-                        left_value: chunk_index,
-                        right_value: 1,
-                    }
-                })?;
-                current_chunk_batches.clear();
-                current_chunk_rows = 0;
-            }
-        }
-
-        // Flush remaining batches
-        if !current_chunk_batches.is_empty() {
-            let bytes = self
-                .write_chunk(job_id, chunk_index, &current_chunk_batches)
-                .await?;
-            total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
-                super::error::Error::IntegerOverflow {
-                    field: "total_byte_count".to_string(),
-                    left_value: total_bytes,
-                    right_value: bytes,
-                }
-            })?;
-            chunk_indices.push(chunk_index);
-        }
-
-        Ok(Self::build_job_result(
-            &schema,
-            total_rows,
-            total_bytes,
-            chunk_indices.len(),
-            chunk_indices,
-        ))
-    }
-
     /// Writes result chunks for a completed job from a stream of record batches.
     ///
     /// Streams `RecordBatch`es and writes them as Arrow IPC chunks as they arrive,
@@ -292,6 +199,8 @@ impl JobStore {
         job_id: &str,
         mut stream: SendableRecordBatchStream,
     ) -> Result<JobResult> {
+        let state = self.get_job(job_id).await?;
+
         let schema: SchemaRef = stream.schema();
 
         let mut total_rows = 0usize;
@@ -338,6 +247,13 @@ impl JobStore {
                         right_value: bytes,
                     }
                 })?;
+
+                if let Some(maximum_size) = state.maximum_size
+                    && (total_bytes as u64) > maximum_size
+                {
+                    return Err(super::error::Error::MaximumJobSizeExceeded { maximum_size });
+                }
+
                 chunk_indices.push(chunk_index);
                 chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
                     super::error::Error::IntegerOverflow {
@@ -363,6 +279,13 @@ impl JobStore {
                     right_value: bytes,
                 }
             })?;
+
+            if let Some(maximum_size) = state.maximum_size
+                && (total_bytes as u64) > maximum_size
+            {
+                return Err(super::error::Error::MaximumJobSizeExceeded { maximum_size });
+            }
+
             chunk_indices.push(chunk_index);
         }
 
@@ -417,8 +340,7 @@ impl JobStore {
                 },
                 total_row_count: total_rows,
                 total_chunk_count: total_chunks,
-                truncated: false,
-                total_byte_count: Some(total_bytes),
+                total_byte_count: total_bytes,
             },
             chunk_indices,
         }
@@ -496,12 +418,12 @@ impl JobStore {
     pub async fn fail_job(
         &self,
         job_id: &str,
-        error_code: impl Into<String>,
+        error_code: JobErrorCode,
         message: impl Into<String>,
     ) -> Result<JobState> {
         let mut state = self.get_job(job_id).await?;
         state.set_failed(super::state::JobError {
-            error_code: error_code.into(),
+            error_code,
             message: message.into(),
             sql_state: None,
         });
@@ -738,13 +660,24 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use object_store::memory::InMemory;
 
+    use crate::http::v1::queries::SubmitQueryRequest;
+
+    fn make_request(sql: impl Into<String>) -> SubmitQueryRequest {
+        SubmitQueryRequest {
+            sql: sql.into(),
+            parameters: None,
+            timeout_seconds: None,
+            maximum_size: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_create_and_get_job() {
         let store = Arc::new(InMemory::new());
         let job_store = JobStore::new(store, "test", "node-1");
 
         let state = job_store
-            .create_job("SELECT 1".to_string(), None)
+            .create_job(make_request("SELECT 1"))
             .await
             .expect("to create job");
 
@@ -764,7 +697,7 @@ mod tests {
 
         // Create job
         let state = job_store
-            .create_job("SELECT * FROM test".to_string(), None)
+            .create_job(make_request("SELECT * FROM test"))
             .await
             .expect("to create job");
         let job_id = state.job_id.clone();
@@ -775,7 +708,7 @@ mod tests {
             .await
             .expect("to set running");
         assert_eq!(running.status, JobStatus::Running);
-        assert_eq!(running.executor_node.as_deref(), Some("node-1"));
+        assert_eq!(running.scheduler_node.as_deref(), Some("node-1"));
 
         // Complete with empty results
         let result = JobResult {
@@ -787,8 +720,7 @@ mod tests {
                 },
                 total_row_count: 0,
                 total_chunk_count: 0,
-                truncated: false,
-                total_byte_count: Some(0),
+                total_byte_count: 0,
             },
             chunk_indices: vec![],
         };
@@ -802,59 +734,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_and_read_chunks() {
-        let store = Arc::new(InMemory::new());
-        let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
-
-        let state = job_store
-            .create_job("SELECT * FROM test".to_string(), None)
-            .await
-            .expect("to create job");
-
-        // Create test batches
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-
-        let batch1 = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![1, 2]))],
-        )
-        .expect("to create batch");
-
-        let batch2 = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![3, 4]))],
-        )
-        .expect("to create batch");
-
-        let result = job_store
-            .write_result_chunks(&state.job_id, Arc::clone(&schema), vec![batch1, batch2])
-            .await
-            .expect("to write chunks");
-
-        assert_eq!(result.manifest.total_row_count, 4);
-        assert_eq!(result.manifest.total_chunk_count, 2);
-
-        // Read chunks back
-        let chunk0 = job_store
-            .read_chunk(&state.job_id, 0)
-            .await
-            .expect("to read chunk 0");
-        assert!(!chunk0.is_empty());
-
-        let chunk1 = job_store
-            .read_chunk(&state.job_id, 1)
-            .await
-            .expect("to read chunk 1");
-        assert!(!chunk1.is_empty());
-    }
-
-    #[tokio::test]
     async fn test_cancel_job() {
         let store = Arc::new(InMemory::new());
         let job_store = JobStore::new(store, "test", "node-1");
 
         let state = job_store
-            .create_job("SELECT 1".to_string(), None)
+            .create_job(make_request("SELECT 1"))
             .await
             .expect("to create job");
 
@@ -882,45 +767,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_write_result_chunks_empty_with_schema() {
-        let store = Arc::new(InMemory::new());
-        let job_store = JobStore::new(store, "test", "node-1");
-
-        let state = job_store
-            .create_job("SELECT * FROM test WHERE 1=0".to_string(), None)
-            .await
-            .expect("to create job");
-
-        // Create a schema but no batches - simulating an empty result set
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-
-        let result = job_store
-            .write_result_chunks(&state.job_id, Arc::clone(&schema), vec![])
-            .await
-            .expect("to write empty result with schema");
-
-        // Should have 0 rows but valid schema
-        assert_eq!(result.manifest.total_row_count, 0);
-        assert_eq!(result.manifest.total_chunk_count, 0);
-        assert!(result.chunk_indices.is_empty());
-
-        // Schema should be preserved even with no rows
-        assert_eq!(result.manifest.schema.column_count, 2);
-        assert_eq!(result.manifest.schema.columns.len(), 2);
-        assert_eq!(result.manifest.schema.columns[0].name, "id");
-        assert_eq!(result.manifest.schema.columns[0].type_name, "Int32");
-        assert!(!result.manifest.schema.columns[0].nullable);
-        assert_eq!(result.manifest.schema.columns[1].name, "name");
-        assert_eq!(result.manifest.schema.columns[1].type_name, "Utf8");
-        assert!(result.manifest.schema.columns[1].nullable);
-    }
-
     mod write_result_chunks_from_stream {
         use super::*;
+        use crate::jobs::Error;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use futures::stream;
 
@@ -938,7 +787,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job("SELECT * FROM test WHERE 1=0".to_string(), None)
+                .create_job(make_request("SELECT * FROM test WHERE 1=0"))
                 .await
                 .expect("to create job");
 
@@ -970,7 +819,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(100);
 
             let state = job_store
-                .create_job("SELECT * FROM test".to_string(), None)
+                .create_job(make_request("SELECT * FROM test"))
                 .await
                 .expect("to create job");
 
@@ -1008,7 +857,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(100);
 
             let state = job_store
-                .create_job("SELECT * FROM test".to_string(), None)
+                .create_job(make_request("SELECT * FROM test"))
                 .await
                 .expect("to create job");
 
@@ -1046,7 +895,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
 
             let state = job_store
-                .create_job("SELECT * FROM test".to_string(), None)
+                .create_job(make_request("SELECT * FROM test"))
                 .await
                 .expect("to create job");
 
@@ -1103,7 +952,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job("SELECT * FROM test".to_string(), None)
+                .create_job(make_request("SELECT * FROM test"))
                 .await
                 .expect("to create job");
 
@@ -1132,7 +981,7 @@ mod tests {
             let job_store = JobStore::new(store, "test", "node-1");
 
             let state = job_store
-                .create_job("SELECT * FROM test".to_string(), None)
+                .create_job(make_request("SELECT * FROM test"))
                 .await
                 .expect("to create job");
 
@@ -1153,9 +1002,167 @@ mod tests {
 
             // Verify byte count is tracked
             assert!(
-                result.manifest.total_byte_count.is_some_and(|b| b > 0),
+                result.manifest.total_byte_count > 0,
                 "Expected non-zero byte count"
             );
+        }
+
+        fn make_request_with_maximum_size(
+            sql: impl Into<String>,
+            maximum_size: Option<u64>,
+        ) -> SubmitQueryRequest {
+            SubmitQueryRequest {
+                sql: sql.into(),
+                parameters: None,
+                timeout_seconds: None,
+                maximum_size,
+            }
+        }
+
+        #[tokio::test]
+        async fn test_maximum_size_allows_within_limit() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1");
+
+            // Create job with a generous maximum size limit
+            let state = job_store
+                .create_job(make_request_with_maximum_size(
+                    "SELECT * FROM test",
+                    Some(10_000),
+                ))
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .expect("to create batch");
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![batch]);
+
+            // Should succeed since results are within the maximum size limit
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await
+                .expect("to write stream within maximum size limit");
+
+            assert_eq!(result.manifest.total_row_count, 3);
+            assert!(result.manifest.total_byte_count > 0);
+            assert!(result.manifest.total_byte_count <= 10_000);
+        }
+
+        #[tokio::test]
+        async fn test_maximum_size_exceeds_limit() {
+            let store = Arc::new(InMemory::new());
+            // Use small chunk size to force chunk flush and trigger the size check
+            let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
+
+            // Create job with a very small maximum size limit (1 byte)
+            let state = job_store
+                .create_job(make_request_with_maximum_size(
+                    "SELECT * FROM test",
+                    Some(1),
+                ))
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            // Create batches that will exceed the 1 byte limit
+            let batch1 = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            )
+            .expect("to create batch");
+
+            let batch2 = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![3, 4]))],
+            )
+            .expect("to create batch");
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![batch1, batch2]);
+
+            // Should fail because results exceed the maximum size limit
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await;
+
+            assert!(
+                matches!(result, Err(Error::MaximumJobSizeExceeded { .. })),
+                "Expected MaximumJobSizeExceeded error, got: {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_maximum_size_exceeds_on_final_flush() {
+            let store = Arc::new(InMemory::new());
+            // Large chunk size to ensure flush happens at the end
+            let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(100);
+
+            // Create job with a very small maximum size limit
+            let state = job_store
+                .create_job(make_request_with_maximum_size(
+                    "SELECT * FROM test",
+                    Some(1),
+                ))
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .expect("to create batch");
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![batch]);
+
+            // Should fail on final flush because results exceed the maximum size limit
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await;
+
+            assert!(
+                matches!(result, Err(Error::MaximumJobSizeExceeded { .. })),
+                "Expected MaximumJobSizeExceeded error, got: {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_maximum_size_none_allows_any_size() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1");
+
+            // Create job without a maximum size limit
+            let state = job_store
+                .create_job(make_request_with_maximum_size("SELECT * FROM test", None))
+                .await
+                .expect("to create job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            // Create a larger batch
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from((0..1000).collect::<Vec<_>>()))],
+            )
+            .expect("to create batch");
+
+            let stream = create_test_stream(Arc::clone(&schema), vec![batch]);
+
+            // Should succeed since there's no maximum size limit
+            let result = job_store
+                .write_result_chunks_from_stream(&state.job_id, stream)
+                .await
+                .expect("to write stream without maximum size limit");
+
+            assert_eq!(result.manifest.total_row_count, 1000);
+            assert!(result.manifest.total_byte_count > 0);
         }
     }
 }

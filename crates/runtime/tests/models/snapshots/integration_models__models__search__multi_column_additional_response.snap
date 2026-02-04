@@ -11,7 +11,9 @@ expression: normalize_search_response(resp)
       },
       "dataset": "multi_column_search",
       "matches": {
-        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make "
+        "cp_description": [
+          "Heavily direct problems try eventually on a nurses. Courses may make "
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 8
@@ -24,7 +26,9 @@ expression: normalize_search_response(resp)
       },
       "dataset": "multi_column_search",
       "matches": {
-        "cp_department": "DEPARTMENT"
+        "cp_department": [
+          "DEPARTMENT"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 2

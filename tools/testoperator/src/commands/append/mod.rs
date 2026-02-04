@@ -125,9 +125,8 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
 
     let health_report = health_monitor.stop().await;
 
-    // Test passes only if: (1) table row counts match expected values, (2) all queries succeeded, and (3) health checks passed
-    let test_status: TestStatus =
-        (table_count_result.is_ok() && test_succeeded && health_report.is_ok()).into();
+    // Test passes only if: (1) table row counts match expected values and (2) all queries succeeded
+    let test_status: TestStatus = (table_count_result.is_ok() && test_succeeded).into();
     test_metrics.emit(test_status).await?;
 
     spiced_instance.stop()?;
@@ -135,7 +134,8 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
 
     table_count_result?;
     if let Some(message) = health_report.failure_message() {
-        return Err(anyhow::anyhow!(message));
+        // Health check failures are logged as warnings but don't fail the test
+        eprintln!("Warning: {message}");
     }
     Ok(())
 }

@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/search/mod.rs
+---source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 ---
 {
@@ -8,7 +7,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+        "answer": [
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+        ]
       },
       "primary_key": {
         "id": 468
@@ -18,7 +19,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        "answer": [
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ]
       },
       "primary_key": {
         "id": 1277
@@ -28,7 +31,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+        "answer": [
+          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+        ]
       },
       "primary_key": {
         "id": 189
@@ -38,7 +43,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        "answer": [
+          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ]
       },
       "primary_key": {
         "id": 948

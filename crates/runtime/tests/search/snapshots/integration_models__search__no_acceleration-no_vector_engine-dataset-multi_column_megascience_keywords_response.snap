@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/search/mod.rs
+---source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 ---
 {
@@ -8,8 +7,12 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers.",
-        "question": "How many numbers between 0 and 60 are even multiples of 5?"
+        "answer": [
+          "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers."
+        ],
+        "question": [
+          "How many numbers between 0 and 60 are even multiples of 5?"
+        ]
       },
       "primary_key": {
         "id": 470
@@ -19,7 +22,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
       },
       "primary_key": {
         "id": 361
@@ -29,7 +34,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        "answer": [
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ]
       },
       "primary_key": {
         "id": 1277
@@ -39,7 +46,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
+        "question": [
+          "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
+        ]
       },
       "primary_key": {
         "id": 787

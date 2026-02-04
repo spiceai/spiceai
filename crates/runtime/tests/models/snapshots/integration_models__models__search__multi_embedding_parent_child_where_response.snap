@@ -9,8 +9,12 @@ snapshot_kind: text
     {
       "dataset": "multiple_columns",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "Members comfort major horses. All good vehicles must perform ago wrong new conditions. Pl"
+        "cp_department": [
+          "DEPARTMENT"
+        ],
+        "cp_description": [
+          "Members comfort major horses. All good vehicles must perform ago wrong new conditions. Pl"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 20
