@@ -9,8 +9,12 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "A relation is partial if there is an element in the domain that",
-        "question": "What is the definition of a partial relation?"
+        "answer": [
+          "A relation is partial if there is an element in the domain that"
+        ],
+        "question": [
+          "What is the definition of a partial relation?"
+        ]
       },
       "primary_key": {
         "id": 921

@@ -9,8 +9,12 @@ snapshot_kind: text
     {
       "dataset": "qs_view",
       "matches": {
-        "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content.",
-        "question": "What is the possible action of pedunculagin and alchemillin, chemical components of lady's mantle?"
+        "answer": [
+          "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
+        ],
+        "question": [
+          "What is the possible action of pedunculagin and alchemillin, chemical components of lady's mantle?"
+        ]
       },
       "primary_key": {
         "id": 1015
@@ -20,8 +24,12 @@ snapshot_kind: text
     {
       "dataset": "qs_view",
       "matches": {
-        "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*).",
-        "question": "What causes dermatomycosis, and what are some examples of this condition?"
+        "answer": [
+          "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
+        ],
+        "question": [
+          "What causes dermatomycosis, and what are some examples of this condition?"
+        ]
       },
       "primary_key": {
         "id": 821
@@ -31,8 +39,12 @@ snapshot_kind: text
     {
       "dataset": "qs_view",
       "matches": {
-        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients.",
-        "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+        "answer": [
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+        ],
+        "question": [
+          "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
+        ]
       },
       "primary_key": {
         "id": 449
@@ -42,8 +54,12 @@ snapshot_kind: text
     {
       "dataset": "qs_view",
       "matches": {
-        "answer": "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour.",
-        "question": "What is the unusual characteristic of the body profile of Menidae (moonfish)?"
+        "answer": [
+          "The body profile of Menidae is very deep and resembles a flat disc, due to the strongly curved ventral contour."
+        ],
+        "question": [
+          "What is the unusual characteristic of the body profile of Menidae (moonfish)?"
+        ]
       },
       "primary_key": {
         "id": 1193

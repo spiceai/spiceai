@@ -1,0 +1,135 @@
+name: streaming dynamodb dispatch
+run-name: streaming-dispatch - ${{ github.event.inputs.queryset }} - sf${{ github.event.inputs.scale_factor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      queryset:
+        description: 'Query set type'
+        required: true
+        default: 'tpch'
+        type: choice
+        options:
+          - 'tpch'
+      scale_factor:
+        description: 'Scale factor for data generation'
+        required: true
+        default: '0.01'
+        type: string
+      ingestion_timeout:
+        description: 'Timeout in seconds to wait for ingestion'
+        required: true
+        default: '600'
+        type: string
+      ready_wait:
+        description: 'How long (in seconds) to wait for spiced to start'
+        required: true
+        default: '60'
+        type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-dev-runners'
+        type: choice
+        options:
+          - 'spiceai-dev-runners'
+          - 'spiceai-dev-large-runners'
+      verify:
+        description: 'Run TPCH queries to verify data integrity'
+        required: false
+        type: boolean
+        default: true
+      mutation_ratio:
+        description: 'Ratio of rows to mutate for CDC testing (0.0-1.0)'
+        required: false
+        type: string
+        default: '0.01'
+      wait_for_workflows:
+        description: 'Wait for each triggered workflow to complete'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  run-streaming-dispatch:
+    name: Run DynamoDB streaming dispatch
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Validate spicepod directory exists
+        run: |
+          SPICEPOD_DIR="./test/spicepods/streaming/dynamodb"
+          if [ ! -d "${SPICEPOD_DIR}" ]; then
+            echo "Error: Spicepod directory not found at ${SPICEPOD_DIR}"
+            exit 1
+          fi
+          echo "Spicepod directory found at ${SPICEPOD_DIR}"
+          echo "YAML files in directory:"
+          ls -la "${SPICEPOD_DIR}"/*.yaml "${SPICEPOD_DIR}"/*.yml 2>/dev/null || echo "No YAML files found"
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Run DynamoDB streaming dispatch
+        run: |
+          VERIFY_FLAG=""
+          if [ "${{ github.event.inputs.verify }}" = "true" ]; then
+            VERIFY_FLAG="--verify"
+          fi
+
+          WAIT_FLAG=""
+          if [ "${{ github.event.inputs.wait_for_workflows }}" = "true" ]; then
+            WAIT_FLAG="--wait-for-workflows"
+          fi
+
+          testoperator run streaming-dynamodb-dispatch \
+            -s /usr/local/bin/spiced \
+            -p ./test/spicepods/streaming/dynamodb \
+            --queryset ${{ github.event.inputs.queryset }} \
+            --scale-factor ${{ github.event.inputs.scale_factor }} \
+            --ingestion-timeout ${{ github.event.inputs.ingestion_timeout }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --mutation-ratio ${{ github.event.inputs.mutation_ratio }} \
+            --workflow testoperator_run_streaming_dynamodb.yml \
+            ${WAIT_FLAG} \
+            ${VERIFY_FLAG}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # DynamoDB credentials
+          DYNAMODB_AWS_REGION: ${{ secrets.DYNAMODB_AWS_REGION }}
+          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          # Snapshot storage
+          SNAPSHOT_S3_LOCATION: ${{ secrets.STREAMING_SNAPSHOT_S3_LOCATION }}
+          SNAPSHOT_S3_ACCESS_KEY_ID: ${{ secrets.STREAMING_SNAPSHOT_S3_ACCESS_KEY_ID }}
+          SNAPSHOT_S3_SECRET_ACCESS_KEY: ${{ secrets.STREAMING_SNAPSHOT_S3_SECRET_ACCESS_KEY }}
+          SNAPSHOT_S3_REGION: ${{ secrets.STREAMING_SNAPSHOT_S3_REGION }}
+          # Metrics
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

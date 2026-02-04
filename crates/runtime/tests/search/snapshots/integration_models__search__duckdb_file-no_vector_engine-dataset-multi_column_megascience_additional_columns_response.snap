@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/search/mod.rs
+---source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 ---
 {
@@ -11,7 +10,9 @@ expression: normalize_search_response(resp)
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+        "answer": [
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+        ]
       },
       "primary_key": {
         "id": 468
@@ -24,7 +25,9 @@ expression: normalize_search_response(resp)
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
       },
       "primary_key": {
         "id": 361
@@ -37,7 +40,9 @@ expression: normalize_search_response(resp)
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "How many groups of 2 are in 14?"
+        "question": [
+          "How many groups of 2 are in 14?"
+        ]
       },
       "primary_key": {
         "id": 462
@@ -50,7 +55,9 @@ expression: normalize_search_response(resp)
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        "answer": [
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ]
       },
       "primary_key": {
         "id": 1277

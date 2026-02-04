@@ -368,3 +368,137 @@ pub static SPICED_ACTIVE_CONNECTIONS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .with_unit("connections")
         .build()
 });
+
+// Streaming ingestion benchmark metrics
+
+pub static INGESTION_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("ingestion_duration_ms")
+        .with_description(
+            "Duration from Spice ready until all markers detected (CDC ingestion time).",
+        )
+        .with_unit("ms")
+        .build()
+});
+
+pub static STREAM_LAG: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("stream_lag_ms")
+        .with_description("Duration from marker insertion until marker detected (CDC stream lag).")
+        .with_unit("ms")
+        .build()
+});
+
+#[expect(dead_code)]
+pub static DATA_INSERTION_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("data_insertion_duration_ms")
+        .with_description("Duration to insert all data into DynamoDB.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static RECORD_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("record_count")
+        .with_description("Number of records generated and inserted.")
+        .with_unit("records")
+        .build()
+});
+
+pub static RECORDS_PER_SECOND: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("records_per_second")
+        .with_description("Ingestion throughput in records per second.")
+        .with_unit("records/s")
+        .build()
+});
+
+pub static DYNAMODB_TRANSIENT_ERRORS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("dynamodb_transient_errors_total")
+        .with_description("Total transient errors during DynamoDB streaming ingestion.")
+        .with_unit("errors")
+        .build()
+});
+
+pub static LIVENESS_FAILURES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("liveness_failures")
+        .with_description("Total health check failures during streaming ingestion.")
+        .with_unit("failures")
+        .build()
+});
+
+pub static LIVENESS_MAX_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("liveness_max_latency_ms")
+        .with_description("Maximum health check latency during streaming ingestion.")
+        .with_unit("ms")
+        .build()
+});
+
+// Query liveness metrics
+pub static QUERY_LIVENESS_TOTAL: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("query_liveness_total")
+        .with_description("Total query liveness checks executed during streaming ingestion.")
+        .with_unit("queries")
+        .build()
+});
+
+pub static QUERY_LIVENESS_FAILURES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("query_liveness_failures")
+        .with_description("Failed query liveness checks during streaming ingestion.")
+        .with_unit("failures")
+        .build()
+});
+
+pub static QUERY_LIVENESS_SUCCESS_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("query_liveness_success_rate")
+        .with_description("Query liveness success rate during streaming ingestion.")
+        .with_unit("%")
+        .build()
+});
+
+pub static QUERY_LIVENESS_AVG_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("query_liveness_avg_latency_ms")
+        .with_description("Average query liveness latency during streaming ingestion.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static QUERY_LIVENESS_MAX_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("query_liveness_max_latency_ms")
+        .with_description("Maximum query liveness latency during streaming ingestion.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static QUERY_LIVENESS_P90_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("query_liveness_p90_latency_ms")
+        .with_description("P90 query liveness latency during streaming ingestion.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static QUERY_LIVENESS_P95_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("query_liveness_p95_latency_ms")
+        .with_description("P95 query liveness latency during streaming ingestion.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static QUERY_LIVENESS_P99_LATENCY: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("query_liveness_p99_latency_ms")
+        .with_description("P99 query liveness latency during streaming ingestion.")
+        .with_unit("ms")
+        .build()
+});

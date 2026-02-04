@@ -122,10 +122,12 @@ pub struct ResponseMetadata {
 
 impl ResponseMetadata {
     /// Creates an empty `ResponseMetadata`
+    #[must_use]
     pub fn empty() -> Self {
         Self { sql: None }
     }
 
+    #[must_use]
     pub fn with_sql(mut self, sql: impl Into<String>) -> Self {
         self.sql = Some(sql.into());
         self
@@ -138,6 +140,7 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
 }
 
 impl ResponseMimeType {
+    #[must_use]
     pub fn to_accept_header(self) -> Option<http::HeaderValue> {
         let media_type = match self {
             Self::Json => "application/json",
@@ -149,6 +152,7 @@ impl ResponseMimeType {
         HeaderValue::from_str(media_type).ok()
     }
 
+    #[must_use]
     pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
         accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
