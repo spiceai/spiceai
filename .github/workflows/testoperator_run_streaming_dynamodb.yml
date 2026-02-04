@@ -1,5 +1,5 @@
 name: streaming dynamodb benchmark
-run-name: streaming - ${{ github.event.inputs.queryset }} - ${{ github.event.inputs.spicepod_path }} - ${{ github.event.inputs.run_id }}
+run-name: streaming - ${{ github.event.inputs.queryset }} - ${{ github.event.inputs.config_name }} - ${{ github.event.inputs.run_id }}
 
 on:
   workflow_dispatch:
@@ -9,7 +9,11 @@ on:
         required: false
         type: string
       spicepod_path:
-        description: 'Spicepod file path (relative to repo root, e.g., test/spicepods/streaming/dynamodb/duckdb.yaml)'
+        description: 'Spicepod file path (relative to repo root, e.g., test/spicepods/streaming/dynamodb/tpch-duckdb.yaml)'
+        required: true
+        type: string
+      config_name:
+        description: 'Configuration name (e.g., tpch-duckdb, tpch-cayenne)'
         required: true
         type: string
       run_id:
@@ -23,19 +27,13 @@ on:
         type: choice
         options:
           - 'tpch'
-          - 'clickbench'
       scale_factor:
         description: 'Scale factor (must match dispatch scale factor)'
         required: true
         default: '0.01'
         type: string
-      ingestion_timeout:
-        description: 'Timeout in seconds to wait for marker ingestion'
-        required: true
-        default: '600'
-        type: string
       ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
+        description: 'How long (in seconds) to wait for spiced to start and markers to be ingested'
         required: true
         default: '60'
         type: string
@@ -70,7 +68,7 @@ on:
 
 jobs:
   run-streaming-benchmark:
-    name: Run DynamoDB streaming benchmark
+    name: Run DynamoDB streaming benchmark - ${{ github.event.inputs.config_name }}
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 120
     steps:
@@ -142,7 +140,6 @@ jobs:
             --run-id ${{ github.event.inputs.run_id }} \
             --queryset ${{ github.event.inputs.queryset }} \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
-            --ingestion-timeout ${{ github.event.inputs.ingestion_timeout }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --metrics \
             ${VERIFY_FLAG} \

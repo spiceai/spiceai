@@ -17,21 +17,20 @@ limitations under the License.
 //! `DynamoDB` Streams dispatch for multi-config benchmarks.
 //!
 //! This module orchestrates benchmarks across multiple spicepod configurations,
-//! ingesting data once and running each configuration sequentially.
+//! using a single set of shared tables for all configs.
 //!
 //! ## Flow
-//! 1. Create tables, insert first record (for schema inference)
-//! 2. For each config: capture checkpoint snapshot (sequential)
-//! 3. Insert remaining data
-//! 4. For each config: trigger GitHub workflow OR run benchmark locally (sequential)
-//! 5. Report results
+//! 1. Create tables with unique prefix (shared across all configs)
+//! 2. Insert initial records (for schema inference)
+//! 3. Capture checkpoint snapshot FOR EACH config (sequential)
+//! 4. Insert remaining data (shared)
+//! 5. Trigger GitHub workflow FOR EACH config OR run benchmark locally
 //!
 //! ## Modes
 //!
 //! ### GitHub Workflow Mode (`--workflow`)
 //! When `--workflow` is specified, dispatch triggers GitHub Actions workflows
-//! for each config instead of running benchmarks locally. This is useful for
-//! running benchmarks in CI/CD environments.
+//! for each config instead of running benchmarks locally.
 //!
 //! ### Local Mode (default)
 //! When `--workflow` is not specified, benchmarks run locally (sequential).
@@ -59,30 +58,27 @@ use crate::args::StreamingDynamodbDispatchArgs;
 
 /// Run the `DynamoDB` streaming dispatch (multi-config benchmarks).
 ///
-/// This ingests data once and runs benchmarks for multiple configurations.
+/// Creates a single set of shared tables, then processes each spicepod configuration
+/// with its own checkpoint snapshot and workflow trigger.
 pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
-    let spicepod_paths = args.all_spicepod_paths();
+    let spicepod_paths = args.all_spicepod_paths()?;
     let datasets = args.queryset.get_datasets();
 
-    if spicepod_paths.len() < 2 {
-        println!("Warning: dispatch-dynamodb is designed for multiple configs.");
-        println!("Consider using streaming-dynamodb for single config benchmarks.");
+    println!("Starting DynamoDB streaming dispatch");
+    println!("Config directory: {}", args.path.display());
+    println!("Query set: {}", args.queryset);
+    println!("Scale factor: {}", args.scale_factor);
+    println!("Configs found: {}", spicepod_paths.len());
+    for path in &spicepod_paths {
+        println!("  - {}", path.display());
     }
 
-    println!("Starting DynamoDB streaming dispatch");
-    println!("Query set: {}", args.queryset);
-    println!("Configs: {}", spicepod_paths.len());
-    println!(
-        "Datasets: {}",
-        datasets
-            .iter()
-            .map(|d| d.dataset_type().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    println!("Scale factor: {}", args.scale_factor);
+    // Check if snapshots are configured (required for DynamoDB)
+    let snapshot_config = build_snapshot_config().ok_or_else(|| {
+        anyhow::anyhow!("DynamoDB benchmarks require SNAPSHOT_S3_LOCATION environment variable")
+    })?;
 
-    // Generate unique run ID for table isolation
+    // Generate unique run ID for table isolation (shared across all configs)
     let run_id = generate_run_id();
     println!("Generated run ID: {run_id}");
 
@@ -91,11 +87,6 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
     let mut source = DynamoDbStreamsSource::new(config);
     source.set_table_prefix(run_id.clone());
     source.set_scale_factor(args.scale_factor);
-
-    // Check if snapshots are configured (required for DynamoDB)
-    let snapshot_config = build_snapshot_config().ok_or_else(|| {
-        anyhow::anyhow!("DynamoDB benchmarks require SNAPSHOT_S3_LOCATION environment variable")
-    })?;
 
     // Phase 1: Prepare source and create tables
     println!("Phase 1: Preparing streaming source");
@@ -125,10 +116,10 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
     for dataset in datasets {
         let dataset_type = dataset.dataset_type();
 
-        println!("Generating data for {dataset_type}");
+        println!("  Generating data for {dataset_type}");
         let records = dataset.generate(args.scale_factor)?;
         let record_count: usize = records.iter().map(RecordBatch::num_rows).sum();
-        println!("Generated {record_count} records for {dataset_type}");
+        println!("  Generated {record_count} records for {dataset_type}");
 
         let marker = dataset.marker_record()?;
         dataset_infos.push(DatasetInfo {
@@ -167,31 +158,31 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
         );
     }
 
-    // Phase 5: Capture checkpoints for ALL configs (sequential due to fixed port)
-    let config_names: Vec<String> = spicepod_paths
-        .iter()
-        .map(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string()
-        })
-        .collect();
-
-    // Collect dataset names for snapshot polling
+    // Phase 5: Capture checkpoint snapshot FOR EACH config
     let dataset_names: Vec<&str> = dataset_infos
         .iter()
         .map(|info| info.dataset.table_name())
         .collect();
 
-    println!("Phase 5: Capturing checkpoints for all configs (sequential)");
+    println!("Phase 5: Capturing checkpoint snapshots for each config");
+    for (idx, spicepod_path) in spicepod_paths.iter().enumerate() {
+        let config_name = spicepod_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
 
-    for (path, config_name) in spicepod_paths.iter().zip(config_names.iter()) {
+        println!(
+            "  Capturing checkpoint {}/{}: {config_name}",
+            idx + 1,
+            spicepod_paths.len()
+        );
+
         capture_checkpoint_snapshot(
             &source,
-            path,
+            spicepod_path,
             &run_id,
-            config_name,
+            &config_name,
             &snapshot_config,
             args,
             &dataset_names,
@@ -199,11 +190,8 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
         .await?;
     }
 
-    println!("All checkpoint snapshots captured");
-
     // Phase 6: Insert remaining data
     println!("Phase 6: Inserting remaining data");
-    let _data_insertion_start = Instant::now();
     let mut total_insert_duration = Duration::ZERO;
 
     if args.mutation_ratio > 0.0 {
@@ -214,7 +202,7 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
             args.mutation_ratio * 100.0
         );
 
-        let config = mutations::MutationConfig {
+        let mutation_config = mutations::MutationConfig {
             seed: args.mutation_seed,
             mutation_ratio: args.mutation_ratio,
         };
@@ -238,7 +226,7 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
             source.as_ref(),
             &datasets_for_mutation,
             &original_data,
-            config,
+            mutation_config,
         )
         .await?;
         total_insert_duration = insert_start.elapsed();
@@ -260,41 +248,51 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
 
     println!("Data insertion completed in {total_insert_duration:?}");
 
-    // Phase 7: Trigger benchmarks for ALL configs (sequential)
+    // Phase 7: Trigger workflows FOR EACH config
     if let Some(ref workflow) = args.workflow {
-        // GitHub workflow dispatch mode
-        println!("Phase 7: Triggering GitHub workflows for all configs (sequential)");
+        println!("Phase 7: Triggering GitHub workflows for each config");
 
-        for (path, config_name) in spicepod_paths.iter().zip(config_names.iter()) {
+        for (idx, spicepod_path) in spicepod_paths.iter().enumerate() {
+            let config_name = spicepod_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            println!(
+                "  Triggering workflow {}/{}: {config_name}",
+                idx + 1,
+                spicepod_paths.len()
+            );
+
             trigger_workflow(
                 workflow,
                 args.repo.as_deref(),
                 args.git_ref.as_deref(),
                 &run_id,
-                config_name,
-                path,
+                &config_name,
+                spicepod_path,
                 args,
             )?;
 
             if args.wait_for_workflows {
-                // Wait for workflow to complete before triggering next
                 wait_for_workflow_completion(workflow, args.repo.as_deref())?;
             }
         }
 
-        println!("\nPhase 8: Workflow dispatch complete");
         println!("Run ID: {run_id}");
-        println!("Configs dispatched: {}", config_names.join(", "));
         println!(
-            "\nMonitor workflows at: https://github.com/{}/actions",
+            "Monitor workflows at: https://github.com/{}/actions",
             args.repo.as_deref().unwrap_or("spiceai/spiceai")
         );
-
-        // Don't cleanup - tables need to remain for workflows to use
-        println!("\nNote: DynamoDB tables preserved for workflow execution");
-        println!("Run cleanup manually after workflows complete");
+        println!("Note: DynamoDB tables preserved for workflow execution");
     }
 
+    println!(
+        "\n{}\nAll configs processed successfully\n{}",
+        "=".repeat(60),
+        "=".repeat(60)
+    );
     Ok(())
 }
 
@@ -308,8 +306,6 @@ fn trigger_workflow(
     spicepod_path: &Path,
     args: &StreamingDynamodbDispatchArgs,
 ) -> Result<()> {
-    println!("  Triggering workflow for {config_name}");
-
     let mut cmd = Command::new("gh");
     cmd.args(["workflow", "run", workflow]);
 
@@ -327,10 +323,7 @@ fn trigger_workflow(
     cmd.args(["-f", &format!("spicepod_path={}", spicepod_path.display())]);
     cmd.args(["-f", &format!("queryset={}", args.queryset)]);
     cmd.args(["-f", &format!("scale_factor={}", args.scale_factor)]);
-    cmd.args([
-        "-f",
-        &format!("ingestion_timeout={}", args.ingestion_timeout),
-    ]);
+    cmd.args(["-f", &format!("ready_wait={}", args.ready_wait)]);
 
     if args.verify {
         cmd.args(["-f", "verify=true"]);
@@ -347,13 +340,13 @@ fn trigger_workflow(
         ));
     }
 
-    println!("  Workflow triggered for {config_name}");
+    println!("    Workflow triggered for {config_name}");
     Ok(())
 }
 
 /// Wait for a workflow run to complete.
 fn wait_for_workflow_completion(workflow: &str, repo: Option<&str>) -> Result<()> {
-    println!("  Waiting for workflow to complete...");
+    println!("    Waiting for workflow to complete...");
 
     let mut cmd = Command::new("gh");
     cmd.args(["run", "watch", "--exit-status"]);
@@ -400,7 +393,7 @@ fn wait_for_workflow_completion(workflow: &str, repo: Option<&str>) -> Result<()
         return Err(anyhow::anyhow!("Workflow failed"));
     }
 
-    println!("  Workflow completed successfully");
+    println!("    Workflow completed successfully");
     Ok(())
 }
 
@@ -414,8 +407,6 @@ async fn capture_checkpoint_snapshot(
     args: &StreamingDynamodbDispatchArgs,
     dataset_names: &[&str],
 ) -> Result<()> {
-    println!("  Capturing checkpoint for {config_name}");
-
     // Load and transform spicepod
     let spicepod_def = load_spicepod_definition(spicepod_path)?;
     let transformed =
@@ -423,10 +414,7 @@ async fn capture_checkpoint_snapshot(
 
     // Write transformed spicepod to temp file
     let temp_path = write_temp_spicepod(&transformed, run_id, config_name, "checkpoint")?;
-    println!(
-        "  Wrote transformed spicepod to capture checkpoints to {}",
-        temp_path.display()
-    );
+    println!("    Wrote transformed spicepod to {}", temp_path.display());
 
     // Start temp Spice
     let mut start_request = StartRequest::new(args.spiced_path_buf(), transformed)?;
@@ -450,6 +438,6 @@ async fn capture_checkpoint_snapshot(
     // Cleanup temp file
     let _ = std::fs::remove_file(&temp_path);
 
-    println!("  Checkpoint captured for {config_name}");
+    println!("    Checkpoint captured for {config_name}");
     Ok(())
 }

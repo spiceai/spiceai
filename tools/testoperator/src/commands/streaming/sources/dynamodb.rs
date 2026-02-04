@@ -1209,7 +1209,19 @@ fn transform_spicepod(
             // Prefix the table name in the `from` field (e.g., dynamodb:lineitem -> dynamodb:abc123_lineitem)
             // The `name` field stays unchanged so SQL queries work as expected
             if let Some(table_name) = d.from.strip_prefix("dynamodb:") {
-                d.from = format!("dynamodb:{run_id}_{table_name}");
+                // Skip if table name already appears to have a hex prefix (e.g., "57be98_supplier")
+                // This prevents double-prefixing if the spicepod was already transformed
+                let already_prefixed = table_name.split('_').next().is_some_and(|first| {
+                    first.len() == 6 && first.chars().all(|c| c.is_ascii_hexdigit())
+                });
+
+                if already_prefixed {
+                    eprintln!(
+                        "Warning: Table '{table_name}' appears to already have a prefix, skipping transformation"
+                    );
+                } else {
+                    d.from = format!("dynamodb:{run_id}_{table_name}");
+                }
 
                 // Add DynamoDB-specific metrics for tracking records consumed and transient errors
                 d.metrics = Some(Metrics {

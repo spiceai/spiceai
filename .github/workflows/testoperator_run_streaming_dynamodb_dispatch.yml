@@ -8,14 +8,6 @@ on:
         description: 'spiced build commit'
         required: false
         type: string
-      spicepod_path:
-        description: 'Primary spicepod file path (relative to repo root, e.g., test/spicepods/streaming/dynamodb/duckdb.yaml)'
-        required: true
-        type: string
-      additional_configs:
-        description: 'Additional spicepod paths (comma-separated, relative to repo root)'
-        required: false
-        type: string
       queryset:
         description: 'Query set type'
         required: true
@@ -56,11 +48,6 @@ on:
         required: false
         type: string
         default: '0.01'
-      trigger_workflows:
-        description: 'Trigger separate workflows for each config instead of running locally'
-        required: false
-        type: boolean
-        default: false
       wait_for_workflows:
         description: 'Wait for each triggered workflow to complete'
         required: false
@@ -75,58 +62,16 @@ jobs:
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - name: Set spicepod paths
-        id: set_paths
+      - name: Validate spicepod directory exists
         run: |
-          # Support both relative paths (from repo root) and paths with ./ prefix
-          INPUT_PATH="${{ github.event.inputs.spicepod_path }}"
-          if [[ "${INPUT_PATH}" == ./* ]]; then
-            PRIMARY_PATH="${INPUT_PATH}"
-          else
-            PRIMARY_PATH="./${INPUT_PATH}"
-          fi
-          echo "PRIMARY_PATH=${PRIMARY_PATH}" >> $GITHUB_OUTPUT
-
-          # Build additional config args
-          ADDITIONAL_CONFIGS="${{ github.event.inputs.additional_configs }}"
-          CONFIG_ARGS=""
-          if [ -n "${ADDITIONAL_CONFIGS}" ]; then
-            IFS=',' read -ra CONFIGS <<< "${ADDITIONAL_CONFIGS}"
-            for config in "${CONFIGS[@]}"; do
-              config=$(echo "${config}" | xargs)  # trim whitespace
-              if [[ "${config}" == ./* ]]; then
-                CONFIG_ARGS="${CONFIG_ARGS} --config ${config}"
-              else
-                CONFIG_ARGS="${CONFIG_ARGS} --config ./${config}"
-              fi
-            done
-          fi
-          echo "CONFIG_ARGS=${CONFIG_ARGS}" >> $GITHUB_OUTPUT
-
-      - name: Validate spicepod files exist
-        run: |
-          if [ ! -f "${{ steps.set_paths.outputs.PRIMARY_PATH }}" ]; then
-            echo "Error: Primary spicepod file not found at ${{ steps.set_paths.outputs.PRIMARY_PATH }}"
+          SPICEPOD_DIR="./test/spicepods/streaming/dynamodb"
+          if [ ! -d "${SPICEPOD_DIR}" ]; then
+            echo "Error: Spicepod directory not found at ${SPICEPOD_DIR}"
             exit 1
           fi
-          echo "Primary spicepod found at ${{ steps.set_paths.outputs.PRIMARY_PATH }}"
-
-          # Validate additional configs
-          ADDITIONAL_CONFIGS="${{ github.event.inputs.additional_configs }}"
-          if [ -n "${ADDITIONAL_CONFIGS}" ]; then
-            IFS=',' read -ra CONFIGS <<< "${ADDITIONAL_CONFIGS}"
-            for config in "${CONFIGS[@]}"; do
-              config=$(echo "${config}" | xargs)
-              if [[ "${config}" != ./* ]]; then
-                config="./${config}"
-              fi
-              if [ ! -f "${config}" ]; then
-                echo "Error: Additional config not found at ${config}"
-                exit 1
-              fi
-              echo "Additional config found at ${config}"
-            done
-          fi
+          echo "Spicepod directory found at ${SPICEPOD_DIR}"
+          echo "YAML files in directory:"
+          ls -la "${SPICEPOD_DIR}"/*.yaml "${SPICEPOD_DIR}"/*.yml 2>/dev/null || echo "No YAML files found"
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -158,17 +103,21 @@ jobs:
             VERIFY_FLAG="--verify"
           fi
 
+          WAIT_FLAG=""
+          if [ "${{ github.event.inputs.wait_for_workflows }}" = "true" ]; then
+            WAIT_FLAG="--wait-for-workflows"
+          fi
+
           testoperator run streaming-dynamodb-dispatch \
             -s /usr/local/bin/spiced \
-            -p ${{ steps.set_paths.outputs.PRIMARY_PATH }} \
-            ${{ steps.set_paths.outputs.CONFIG_ARGS }} \
+            -p ./test/spicepods/streaming/dynamodb \
             --queryset ${{ github.event.inputs.queryset }} \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             --ingestion-timeout ${{ github.event.inputs.ingestion_timeout }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --mutation-ratio ${{ github.event.inputs.mutation_ratio }} \
             --workflow testoperator_run_streaming_dynamodb.yml \
-            --wait-for-workflows \
+            ${WAIT_FLAG} \
             ${VERIFY_FLAG}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

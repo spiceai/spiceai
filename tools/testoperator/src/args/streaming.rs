@@ -17,6 +17,7 @@ limitations under the License.
 use std::path::PathBuf;
 
 use clap::Parser;
+use test_framework::anyhow;
 
 use super::CommonArgs;
 use crate::commands::streaming::querysets::QuerySetType;
@@ -109,9 +110,10 @@ pub struct StreamingDynamodbTestArgs {
 #[derive(Parser, Debug, Clone)]
 #[expect(clippy::struct_excessive_bools)]
 pub struct StreamingDynamodbDispatchArgs {
-    /// Path to the first spicepod.yaml file
-    #[arg(short('p'), long, default_value = "spicepod.yaml")]
-    pub spicepod_path: PathBuf,
+    /// Directory containing spicepod YAML files to benchmark.
+    /// All .yaml and .yml files in this directory will be discovered and processed.
+    #[arg(short('p'), long)]
+    pub path: PathBuf,
 
     /// Path to the spiced binary
     #[arg(short, long, default_value = "spiced")]
@@ -132,10 +134,6 @@ pub struct StreamingDynamodbDispatchArgs {
     /// Scale factor for data generation (e.g., 0.01, 0.1, 1.0)
     #[arg(long, default_value = "0.01")]
     pub scale_factor: f64,
-
-    /// Timeout in seconds to wait for ingestion to complete
-    #[arg(long, default_value = "300")]
-    pub ingestion_timeout: u64,
 
     /// Enable health monitoring during ingestion (tracks latency and failures)
     #[arg(long)]
@@ -172,12 +170,6 @@ pub struct StreamingDynamodbDispatchArgs {
     #[arg(long, default_value = "10")]
     pub checkpoint_records: usize,
 
-    /// Additional spicepod paths for multi-config benchmarks.
-    /// The first config comes from --spicepod-path.
-    /// Additional configs are specified here. Can be repeated.
-    #[arg(long = "config", value_name = "PATH")]
-    pub additional_spicepod_paths: Vec<PathBuf>,
-
     // GitHub workflow dispatch arguments
     /// GitHub workflow file name (e.g., "streaming-benchmark.yml").
     /// If set, dispatch will trigger GitHub workflows instead of running benchmarks locally.
@@ -199,12 +191,32 @@ pub struct StreamingDynamodbDispatchArgs {
 }
 
 impl StreamingDynamodbDispatchArgs {
-    /// Get all spicepod paths (first + additional).
-    #[must_use]
-    pub fn all_spicepod_paths(&self) -> Vec<PathBuf> {
-        let mut paths = vec![self.spicepod_path.clone()];
-        paths.extend(self.additional_spicepod_paths.clone());
-        paths
+    /// Discover all spicepod YAML files in the configured directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be read or contains no YAML files.
+    pub fn all_spicepod_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+
+        for entry in std::fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file()
+                && let Some(ext) = path.extension()
+                    && (ext == "yaml" || ext == "yml") {
+                        paths.push(path);
+                    }
+        }
+
+        // Sort for deterministic ordering
+        paths.sort();
+
+        if paths.is_empty() {
+            anyhow::bail!("No YAML files found in {}", self.path.display());
+        }
+
+        Ok(paths)
     }
 
     /// Get the spiced path as a `PathBuf`.
