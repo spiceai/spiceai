@@ -96,7 +96,7 @@ pub mod execution_plan;
 pub mod extension;
 pub mod federated_table;
 pub mod flight;
-mod http;
+pub mod http;
 mod init;
 pub mod internal_table;
 pub mod jobs;
