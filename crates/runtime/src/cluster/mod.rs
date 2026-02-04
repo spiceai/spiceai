@@ -1307,6 +1307,9 @@ async fn create_scheduler_server(
         override_create_grpc_client_endpoint,
         override_metrics_collector: Some(scheduler_metrics_collector),
         on_work_available: Some(on_work_available),
+
+        // Faster failure detection: 30s timeout with 10s heartbeat interval
+        executor_timeout_seconds: 30,
         ..Default::default()
     };
 
