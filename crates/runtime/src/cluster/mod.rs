@@ -67,7 +67,6 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
-use uuid::Uuid;
 use x509_certificate::CapturedX509Certificate;
 
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
@@ -708,6 +707,7 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 /// work loop as a future
 pub async fn initialize_cluster_executor(
     rt: Arc<Runtime>,
+    shutdown_token: CancellationToken,
 ) -> crate::Result<impl Future<Output = crate::Result<()>>> {
     let runtime_handle = Arc::clone(&rt);
 
@@ -726,8 +726,47 @@ pub async fn initialize_cluster_executor(
     let client_tls_config = rt.df.cluster_config.client_tls_config().cloned();
     let tls_enabled = client_tls_config.is_some();
 
-    // Generate executor_id early so we can use it for both the app definition request and executor registration
-    let executor_id = Uuid::new_v4().to_string();
+    // Use the configured node_bind_address for the executor flight server.
+    // Fall back to dynamic port assignment if binding fails (e.g., port already in use).
+    let cluster_bind_addr = rt.df.cluster_config.node_bind_address();
+    let bind_addr = if let Ok(bound_addr) = TcpListener::bind(cluster_bind_addr)
+        .await
+        .and_then(|l| l.local_addr())
+    {
+        bound_addr
+    } else if let Ok(dynamic_addr) = TcpListener::bind((cluster_bind_addr.ip(), 0))
+        .await
+        .and_then(|l| l.local_addr())
+    {
+        tracing::warn!(
+            "Unable to bind executor flight server to {cluster_bind_addr}, using dynamic port {dynamic_addr}"
+        );
+        dynamic_addr
+    } else {
+        return Err(FailedToStartClusterExecutor {
+            source: format!(
+                "Unable to bind executor Flight service to configured address ({cluster_bind_addr}) or fallback"
+            )
+            .into(),
+        });
+    };
+
+    // Determine the advertise host and port for executor registration
+    // node_advertise_address() returns host-only (port already stripped during config resolution)
+    let (advertise_host, advertise_port) =
+        if let Some(advertise_host) = rt.df.cluster_config.node_advertise_address() {
+            (advertise_host.to_string(), bind_addr.port())
+        } else {
+            // Fall back to hostname and bind_addr port
+            let hostname = gethostname::gethostname().into_string().map_err(|_| {
+                FailedToStartClusterExecutor {
+                    source: "Unable to determine executor hostname".to_string().into(),
+                }
+            })?;
+            (hostname, bind_addr.port())
+        };
+
+    let executor_id = format!("{advertise_host}:{advertise_port}");
 
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
@@ -854,31 +893,6 @@ pub async fn initialize_cluster_executor(
 
     let app_def = Arc::new(app_def);
 
-    // Use the configured node_bind_address for the executor flight server.
-    // Fall back to dynamic port assignment if binding fails (e.g., port already in use).
-    let cluster_bind_addr = rt.df.cluster_config.node_bind_address();
-    let bind_addr = if let Ok(bound_addr) = TcpListener::bind(cluster_bind_addr)
-        .await
-        .and_then(|l| l.local_addr())
-    {
-        bound_addr
-    } else if let Ok(dynamic_addr) = TcpListener::bind((cluster_bind_addr.ip(), 0))
-        .await
-        .and_then(|l| l.local_addr())
-    {
-        tracing::warn!(
-            "Unable to bind executor flight server to {cluster_bind_addr}, using dynamic port {dynamic_addr}"
-        );
-        dynamic_addr
-    } else {
-        return Err(FailedToStartClusterExecutor {
-            source: format!(
-                "Unable to bind executor Flight service to configured address ({cluster_bind_addr}) or fallback"
-            )
-            .into(),
-        });
-    };
-
     let Some(concurrent_tasks) = std::thread::available_parallelism()
         .ok()
         .and_then(|nz| u32::try_from(nz.get()).ok())
@@ -889,21 +903,6 @@ pub async fn initialize_cluster_executor(
                 .into(),
         });
     };
-
-    // Determine the advertise host and port for executor registration
-    // node_advertise_address() returns host-only (port already stripped during config resolution)
-    let (advertise_host, advertise_port) =
-        if let Some(advertise_host) = rt.df.cluster_config.node_advertise_address() {
-            (advertise_host.to_string(), bind_addr.port())
-        } else {
-            // Fall back to hostname and bind_addr port
-            let hostname = gethostname::gethostname().into_string().map_err(|_| {
-                FailedToStartClusterExecutor {
-                    source: "Unable to determine executor hostname".to_string().into(),
-                }
-            })?;
-            (hostname, bind_addr.port())
-        };
 
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
@@ -993,18 +992,12 @@ pub async fn initialize_cluster_executor(
     let initial_scheduler_addresses_for_manager = initial_scheduler_addresses.clone();
     let available_task_slots_for_manager = Arc::clone(&available_task_slots);
 
-    // Compute the executor's advertise address for control stream identification.
-    let executor_advertise_id =
-        if let Some(advertise_host) = rt.df.cluster_config.node_advertise_address() {
-            let bind_port = rt.df.cluster_config.node_bind_address().port();
-            format!("{advertise_host}:{bind_port}")
-        } else {
-            rt.df.cluster_config.node_bind_address().to_string()
-        };
-    let control_stream_executor_id = executor_advertise_id;
+    let control_stream_executor_id = executor_id.clone();
+    let control_stream_ballista_id = executor_id.clone();
     let control_stream_tls_config = client_tls_config.clone();
     let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
     let control_stream_metrics_reader = rt.metrics_reader().cloned();
+    let shutdown_token_for_manager = shutdown_token.clone();
 
     let poll_manager = tokio::spawn(async move {
         let mut pollers: HashMap<String, SchedulerPollHandle> = HashMap::new();
@@ -1013,6 +1006,7 @@ pub async fn initialize_cluster_executor(
         // Initialize control stream manager for metrics collection
         let mut control_stream_manager = ControlStreamManager::new(
             control_stream_executor_id,
+            control_stream_ballista_id,
             control_stream_tls_config,
             control_stream_metrics_reader,
         );
@@ -1047,33 +1041,47 @@ pub async fn initialize_cluster_executor(
 
         let mut refresh = tokio::time::interval(SCHEDULER_REFRESH_INTERVAL);
         loop {
-            refresh.tick().await;
-            if let Some(addresses) = fetch_scheduler_membership(
-                &scheduler_url_for_manager,
-                client_tls_config_for_manager.clone(),
-            )
-            .await
-            {
-                if addresses.is_empty() {
-                    tracing::warn!(
-                        "Scheduler membership refresh returned empty list; keeping existing schedulers"
-                    );
-                    continue;
+            tokio::select! {
+                () = shutdown_token_for_manager.cancelled() => {
+                    control_stream_manager
+                        .notify_shutdown("runtime shutdown")
+                        .await;
+                    control_stream_manager.shutdown();
+                    for (_, handle) in pollers.drain() {
+                        handle.cancel.cancel();
+                        let _ = handle.task.await;
+                    }
+                    break;
                 }
-                // Update control streams with new scheduler membership
-                control_stream_manager.update_schedulers(addresses.clone());
+                _ = refresh.tick() => {
+                    if let Some(addresses) = fetch_scheduler_membership(
+                        &scheduler_url_for_manager,
+                        client_tls_config_for_manager.clone(),
+                    )
+                    .await
+                    {
+                        if addresses.is_empty() {
+                            tracing::warn!(
+                                "Scheduler membership refresh returned empty list; keeping existing schedulers"
+                            );
+                            continue;
+                        }
+                        // Update control streams with new scheduler membership
+                        control_stream_manager.update_schedulers(addresses.clone());
 
-                update_scheduler_pollers(
-                    &mut pollers,
-                    &mut known_schedulers,
-                    addresses,
-                    client_tls_config_for_manager.as_ref(),
-                    &executor_for_manager,
-                    &codec_for_manager,
-                    &readiness_sender,
-                    Some(&poll_now_notify),
-                    &available_task_slots_for_manager,
-                );
+                        update_scheduler_pollers(
+                            &mut pollers,
+                            &mut known_schedulers,
+                            addresses,
+                            client_tls_config_for_manager.as_ref(),
+                            &executor_for_manager,
+                            &codec_for_manager,
+                            &readiness_sender,
+                            Some(&poll_now_notify),
+                            &available_task_slots_for_manager,
+                        );
+                    }
+                }
             }
         }
     });
@@ -1094,7 +1102,9 @@ pub async fn initialize_cluster_executor(
         poll_manager
             .await
             .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?
+            .context(FailedToStartClusterExecutorSnafu)?;
+
+        Ok(())
     })
 }
 
