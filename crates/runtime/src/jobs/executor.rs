@@ -220,15 +220,13 @@ impl JobExecutor {
 
         drop(active);
 
-        let timeout_fut: Pin<Box<dyn Future<Output = ()> + Send>> = state
-            .timeout_seconds
-            .map(|secs| {
+        let timeout_fut: Pin<Box<dyn Future<Output = ()> + Send>> = state.timeout_seconds.map_or(
+            Box::pin(std::future::pending()) as Pin<Box<dyn Future<Output = ()> + Send>>,
+            |secs| {
                 Box::pin(tokio::time::sleep(Duration::from_secs(secs)))
                     as Pin<Box<dyn Future<Output = ()> + Send>>
-            })
-            .unwrap_or_else(|| {
-                Box::pin(std::future::pending()) as Pin<Box<dyn Future<Output = ()> + Send>>
-            });
+            },
+        );
 
         tokio::select! {
             () = cancel.cancelled() => {
