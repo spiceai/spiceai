@@ -82,7 +82,7 @@ impl PartitionedTableScanRewrite {
 
 impl Debug for PartitionedTableScanRewrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PartitionedFlightSQLTableScan")
+        f.debug_struct("PartitionedTableScanRewrite")
             .field("partition_provider", &self.partition_provider)
             .finish()
     }

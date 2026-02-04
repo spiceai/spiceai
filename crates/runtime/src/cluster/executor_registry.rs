@@ -266,7 +266,7 @@ impl TablePartitionProvider for ExecutorRegistry {
 
         let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
             tracing::warn!(
-                "For table {table:?}, failed to acquire read lock on ExecutorRegistryflight_sql_clients"
+                "For table {table:?}, failed to acquire read lock on ExecutorRegistry flight_sql_clients"
             );
             return Vec::new();
         };

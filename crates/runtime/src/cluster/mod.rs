@@ -1182,7 +1182,6 @@ pub async fn initialize_cluster_executor(
         }
     });
 
-    //
     Ok(async move {
         let _ = rx_ready
             .await
