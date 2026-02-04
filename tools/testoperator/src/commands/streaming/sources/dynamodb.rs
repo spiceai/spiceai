@@ -1252,17 +1252,15 @@ fn transform_spicepod(
 
                 match engine {
                     None | Some("duckdb") => {
-                        let duckdb_file = format!(
-                            "/tmp/{config_name}_{dataset_name}_{phase_suffix}.db"
-                        );
+                        let duckdb_file =
+                            format!("/tmp/{config_name}_{dataset_name}_{phase_suffix}.db");
                         params
                             .data
                             .insert("duckdb_file".to_string(), ParamValue::String(duckdb_file));
                     }
                     Some("cayenne") => {
-                        let cayenne_dir = format!(
-                            "/tmp/{config_name}_{dataset_name}_{phase_suffix}_cayenne/"
-                        );
+                        let cayenne_dir =
+                            format!("/tmp/{config_name}_{dataset_name}_{phase_suffix}_cayenne/");
                         params.data.insert(
                             "cayenne_file_path".to_string(),
                             ParamValue::String(cayenne_dir),
