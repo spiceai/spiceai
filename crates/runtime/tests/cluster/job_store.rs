@@ -23,7 +23,7 @@ use object_store::{ObjectStore, path::Path};
 use runtime::Runtime;
 use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::ClusterConfig;
-use runtime::http::v1::queries::SubmitQueryRequest;
+use runtime::http_types::SubmitQueryRequest;
 use runtime::jobs::{JobExecutor, JobStore};
 use runtime::{auth::EndpointAuth, config::Config};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};

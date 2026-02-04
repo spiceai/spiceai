@@ -96,7 +96,12 @@ pub mod execution_plan;
 pub mod extension;
 pub mod federated_table;
 pub mod flight;
-pub mod http;
+mod http;
+
+pub mod http_types {
+    pub use crate::http::v1::queries::SubmitQueryRequest;
+}
+
 mod init;
 pub mod internal_table;
 pub mod jobs;
