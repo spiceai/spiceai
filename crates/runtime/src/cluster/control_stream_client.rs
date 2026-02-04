@@ -30,10 +30,10 @@ use futures::StreamExt;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
-    ExecutorControlMessage, ExecutorHeartbeat, MetricsResponse,
+    ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown, MetricsResponse,
     executor_control_message::Message as ExecutorMessage,
 };
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::ClientTlsConfig;
@@ -48,6 +48,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 struct ControlStreamHandle {
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
+    outbound_tx: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
 }
 
 /// Spawns a control stream connection to a single scheduler.
@@ -64,9 +65,11 @@ fn spawn_control_stream(
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
     poll_now_notify: Arc<Notify>,
+    outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
+    let outbound_tx_state_for_task = Arc::clone(&outbound_tx_state);
 
     let task = tokio::spawn(async move {
         let tls_enabled = client_tls_config.is_some();
@@ -139,6 +142,10 @@ fn spawn_control_stream(
 
             // Create channels for outbound messages
             let (outbound_tx, outbound_rx) = mpsc::channel::<ExecutorControlMessage>(32);
+            {
+                let mut outbound_guard = outbound_tx_state_for_task.write().await;
+                *outbound_guard = Some(outbound_tx.clone());
+            }
 
             // Spawn heartbeat sender
             let heartbeat_executor_id = executor_id.clone();
@@ -182,6 +189,8 @@ fn spawn_control_stream(
             };
             if outbound_tx.send(init_msg).await.is_err() {
                 heartbeat_task.abort();
+                let mut outbound_guard = outbound_tx_state_for_task.write().await;
+                *outbound_guard = None;
                 continue;
             }
 
@@ -196,6 +205,8 @@ fn spawn_control_stream(
                         "Failed to establish control stream to {scheduler_address}: {e}"
                     );
                     heartbeat_task.abort();
+                    let mut outbound_guard = outbound_tx_state_for_task.write().await;
+                    *outbound_guard = None;
                     if let Some(delay) = backoff.next_duration() {
                         tokio::select! {
                             () = token.cancelled() => break,
@@ -214,6 +225,10 @@ fn spawn_control_stream(
                 tokio::select! {
                     () = token.cancelled() => {
                         heartbeat_task.abort();
+                        {
+                            let mut outbound_guard = outbound_tx_state_for_task.write().await;
+                            *outbound_guard = None;
+                        }
                         tracing::debug!(
                             "Control stream to {scheduler_address} cancelled"
                         );
@@ -252,6 +267,10 @@ fn spawn_control_stream(
             }
 
             heartbeat_task.abort();
+            {
+                let mut outbound_guard = outbound_tx_state_for_task.write().await;
+                *outbound_guard = None;
+            }
             tracing::debug!("Control stream to {scheduler_address} disconnected, will reconnect");
 
             if let Some(delay) = backoff.next_duration() {
@@ -263,7 +282,11 @@ fn spawn_control_stream(
         }
     });
 
-    ControlStreamHandle { cancel, task }
+    ControlStreamHandle {
+        cancel,
+        task,
+        outbound_tx: outbound_tx_state,
+    }
 }
 
 /// Handles a message from the scheduler on the control stream.
@@ -329,6 +352,7 @@ fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
 /// handle that is signaled when any scheduler sends a [`PollNow`] command.
 pub struct ControlStreamManager {
     executor_id: String,
+    ballista_executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
     streams: HashMap<String, ControlStreamHandle>,
@@ -342,11 +366,13 @@ impl ControlStreamManager {
     #[must_use]
     pub fn new(
         executor_id: String,
+        ballista_executor_id: String,
         client_tls_config: Option<ClientTlsConfig>,
         metrics_reader: Option<MetricsReader>,
     ) -> Self {
         Self {
             executor_id,
+            ballista_executor_id,
             client_tls_config,
             metrics_reader: metrics_reader.map(Arc::new),
             streams: HashMap::new(),
@@ -362,6 +388,42 @@ impl ControlStreamManager {
     #[must_use]
     pub fn poll_now_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.poll_now_notify)
+    }
+
+    /// Sends a shutdown notification to all connected schedulers.
+    pub async fn notify_shutdown(&self, reason: &str) {
+        if self.streams.is_empty() {
+            return;
+        }
+
+        let message = ExecutorControlMessage {
+            executor_id: self.executor_id.clone(),
+            message: Some(ExecutorMessage::Shutdown(ExecutorShutdown {
+                ballista_executor_id: self.ballista_executor_id.clone(),
+                reason: reason.to_string(),
+            })),
+        };
+
+        let mut sent = 0usize;
+        for (scheduler_address, handle) in &self.streams {
+            let outbound_tx = { handle.outbound_tx.read().await.clone() };
+            if let Some(outbound_tx) = outbound_tx {
+                match outbound_tx.try_send(message.clone()) {
+                    Ok(()) => {
+                        sent += 1;
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            "Failed to send shutdown to scheduler {scheduler_address}: {err}"
+                        );
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            "Sent executor shutdown notification to {sent} scheduler streams: {reason}"
+        );
     }
 
     /// Updates the set of schedulers and spawns/removes control streams as needed.
@@ -388,12 +450,14 @@ impl ControlStreamManager {
 
         // Spawn new control streams
         for address in added {
+            let outbound_tx_state = Arc::new(RwLock::new(None));
             let handle = spawn_control_stream(
                 address.clone(),
                 self.executor_id.clone(),
                 self.client_tls_config.clone(),
                 self.metrics_reader.clone(),
                 Arc::clone(&self.poll_now_notify),
+                Arc::clone(&outbound_tx_state),
             );
             self.streams.insert(address, handle);
         }
@@ -471,6 +535,7 @@ mod tests {
     fn test_control_stream_manager_new() {
         let manager = ControlStreamManager::new(
             "executor-1".to_string(),
+            "executor-1".to_string(),
             None, // no TLS
             None, // no metrics reader
         );
@@ -482,13 +547,23 @@ mod tests {
     #[test]
     fn test_control_stream_manager_new_with_metrics_reader() {
         let reader = MetricsReader::new();
-        let manager = ControlStreamManager::new("executor-2".to_string(), None, Some(reader));
+        let manager = ControlStreamManager::new(
+            "executor-2".to_string(),
+            "executor-2".to_string(),
+            None,
+            Some(reader),
+        );
         assert!(manager.metrics_reader.is_some());
     }
 
     #[test]
     fn test_control_stream_manager_update_schedulers_empty() {
-        let mut manager = ControlStreamManager::new("executor-1".to_string(), None, None);
+        let mut manager = ControlStreamManager::new(
+            "executor-1".to_string(),
+            "executor-1".to_string(),
+            None,
+            None,
+        );
         manager.update_schedulers(vec![]);
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -496,7 +571,12 @@ mod tests {
 
     #[test]
     fn test_control_stream_manager_shutdown_empty() {
-        let mut manager = ControlStreamManager::new("executor-1".to_string(), None, None);
+        let mut manager = ControlStreamManager::new(
+            "executor-1".to_string(),
+            "executor-1".to_string(),
+            None,
+            None,
+        );
         // Should not panic on empty manager
         manager.shutdown();
         assert!(manager.known_schedulers.is_empty());
