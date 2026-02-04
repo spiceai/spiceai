@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Version for job state schema, incremented on breaking changes

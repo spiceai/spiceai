@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -218,13 +220,15 @@ impl JobExecutor {
 
         drop(active);
 
-        let timeout_fut: Box<dyn Future<Output = ()>> = state
+        let timeout_fut: Pin<Box<dyn Future<Output = ()> + Send>> = state
             .timeout_seconds
             .map(|secs| {
-                Box::new(tokio::time::sleep(Duration::from_secs(secs)))
-                    as Box<dyn Future<Output = ()>>
+                Box::pin(tokio::time::sleep(Duration::from_secs(secs)))
+                    as Pin<Box<dyn Future<Output = ()> + Send>>
             })
-            .unwrap_or_else(|| Box::new(std::future::pending()) as Box<dyn Future<Output = ()>>);
+            .unwrap_or_else(|| {
+                Box::pin(std::future::pending()) as Pin<Box<dyn Future<Output = ()> + Send>>
+            });
 
         tokio::select! {
             () = cancel.cancelled() => {
