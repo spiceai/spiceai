@@ -25,6 +25,8 @@ pub struct MetricsCollector {
     pub records: AtomicUsize,
     /// Total number of transient errors encountered (counter)
     pub transient_errors: AtomicUsize,
+    /// Total number of rebootstrap operations (counter)
+    pub rebootstraps: AtomicUsize,
     /// Latest watermark from stream batches
     pub watermark: RwLock<Option<SystemTime>>,
 }
@@ -85,6 +87,12 @@ impl Metrics {
         self.metrics_collector
             .transient_errors
             .load(Ordering::Relaxed)
+    }
+
+    /// Total number of rebootstrap operations (counter)
+    #[must_use]
+    pub fn rebootstraps(&self) -> usize {
+        self.metrics_collector.rebootstraps.load(Ordering::Relaxed)
     }
 }
 

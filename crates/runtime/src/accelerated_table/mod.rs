@@ -565,7 +565,10 @@ impl Builder {
 
     /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
     /// Shared with `DataConnector`, `Refresher` and `CachingAccelerationScanExec`.
-    pub fn accelerator_write_mutex(&mut self, accelerator_write_mutex: Arc<Mutex<()>>) -> &mut Self {
+    pub fn accelerator_write_mutex(
+        &mut self,
+        accelerator_write_mutex: Arc<Mutex<()>>,
+    ) -> &mut Self {
         self.accelerator_write_mutex = accelerator_write_mutex;
         self
     }

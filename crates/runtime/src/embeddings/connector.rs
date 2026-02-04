@@ -259,9 +259,12 @@ impl DataConnector for EmbeddingConnector {
             let Some(underlying_federated_table) =
                 underlying_federated_table_for_indexed_table(&table_provider)
             else {
-                return self
-                    .inner_connector
-                    .changes_stream(federated_table, dataset, accelerated_table_provider, accelerator_write_mutex);
+                return self.inner_connector.changes_stream(
+                    federated_table,
+                    dataset,
+                    accelerated_table_provider,
+                    accelerator_write_mutex,
+                );
             };
 
             // Avoid reindexing full-text indexes.
@@ -279,7 +282,12 @@ impl DataConnector for EmbeddingConnector {
 
             let stream = self
                 .inner_connector
-                .changes_stream(underlying_federated_table, dataset, accelerated_table_provider, accelerator_write_mutex)?
+                .changes_stream(
+                    underlying_federated_table,
+                    dataset,
+                    accelerated_table_provider,
+                    accelerator_write_mutex,
+                )?
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
@@ -307,7 +315,12 @@ impl DataConnector for EmbeddingConnector {
 
             Some(
                 self.inner_connector
-                    .changes_stream(underlying_federated_table, dataset, accelerated_table_provider, accelerator_write_mutex)?
+                    .changes_stream(
+                        underlying_federated_table,
+                        dataset,
+                        accelerated_table_provider,
+                        accelerator_write_mutex,
+                    )?
                     .then(move |item| {
                         Self::embed_change_envelope(item, Arc::clone(&embedding_table))
                     })

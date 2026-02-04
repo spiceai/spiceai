@@ -157,7 +157,12 @@ impl DataConnector for FullTextConnector {
         accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
-            inner.changes_stream(ft, dataset, Arc::clone(&accelerated_table_provider), Arc::clone(&accelerator_write_mutex))
+            inner.changes_stream(
+                ft,
+                dataset,
+                Arc::clone(&accelerated_table_provider),
+                Arc::clone(&accelerator_write_mutex),
+            )
         })
     }
 
