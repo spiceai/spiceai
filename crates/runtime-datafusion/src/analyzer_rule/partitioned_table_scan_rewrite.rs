@@ -14,11 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Debug,
-    sync::Arc,
-};
+use std::{fmt::Debug, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -50,30 +46,17 @@ pub trait TablePartitionProvider: Send + Sync + Debug {
     fn should_partition(&self, tbl: &TableScan) -> bool;
 }
 
-impl TablePartitionProvider for HashMap<TableReference, Vec<(Arc<dyn TableProvider>, Vec<Expr>)>> {
-    fn get_partitions(
-        &self,
-        table: &TableReference,
-        _schema: SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
-        self.get(table).cloned().unwrap_or_default()
-    }
-    fn should_partition(&self, tbl: &TableScan) -> bool {
-        self.contains_key(&tbl.table_name)
-    }
-}
-
 /// An [`AnalyzerRule`] that rewrites table scans on a single locally registered table as the
 /// `UNION ALL` of one or more partitions of this table (possibly from a different source).
 ///
-/// For example, suppose we want to do it on `sales`. The we go from this
+/// For example, suppose we want to do it on `sales`. Then we go from this
 ///
-//// ```
+/// ```
 /// Limit: skip=0, fetch=3
 ///  Projection: sales.order_number, sales.phone, sales.postal_code
 ///    TableScan: sales projection=[order_number, phone, postal_code], full_filters=[sales.status = Utf8("Disputed")]
 /// ```
-// To something like this:
+/// To something like this:
 /// ```
 /// Union
 ///  Limit: skip=0, fetch=3
@@ -161,7 +144,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
         .data()
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "PartitionedTableScanRewrite"
     }
 }

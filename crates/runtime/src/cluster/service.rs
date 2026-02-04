@@ -29,6 +29,7 @@ use arrow::array::RecordBatch;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
+use data_components::flightsql::FlightSqlClient;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
@@ -36,6 +37,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
 use datafusion_expr::Expr;
+use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
@@ -57,8 +59,8 @@ use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Channel, Endpoint};
-use tonic::{Request, Response, Status, Streaming};
+
+use tonic::{Request, Response, Status, Streaming, transport::Endpoint};
 
 use crate::cluster::SchedulerPeers;
 use crate::cluster::executor_registry::ExecutorRegistry;
@@ -596,7 +598,7 @@ impl ClusterService for ClusterServiceImpl {
 
 async fn create_executor_flight_client(
     endpoint: &str,
-) -> Result<FlightSqlServiceClient<Channel>, tonic::transport::Error> {
+) -> Result<FlightSqlClient, tonic::transport::Error> {
     let executor_address = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         endpoint.to_string()
     } else {
@@ -607,9 +609,12 @@ async fn create_executor_flight_client(
     let flight_channel = Endpoint::from_shared(executor_address.clone())?.connect_lazy();
 
     Ok(FlightSqlServiceClient::new_from_inner(
-        FlightServiceClient::new(flight_channel)
-            .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
-            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
+        FlightServiceClient::new(CookieService::new(
+            flight_channel,
+            Arc::new(CookieStore::new()),
+        ))
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
     ))
 }
 

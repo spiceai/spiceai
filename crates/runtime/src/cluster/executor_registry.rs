@@ -24,15 +24,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use arrow_flight::sql::client::FlightSqlServiceClient;
-use data_components::flightsql::FlightSQLTable;
+use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
 use datafusion_expr::{Expr, TableScan};
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc, oneshot};
-use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::accelerated_table::AcceleratedTable;
@@ -129,7 +127,7 @@ pub struct ExecutorRegistry {
 
     /// Map of `executor_id` -> FlightSqlClient
     /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
-    pub flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlServiceClient<Channel>>>>,
+    pub flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
 
     /// Map of `executor_id` -> HashMap<TableReference, Vec<Expr>>
     pub partitions: Arc<RwLock<HashMap<String, HashMap<TableReference, Vec<Expr>>>>>,
@@ -289,6 +287,8 @@ impl TablePartitionProvider for ExecutorRegistry {
                     client.clone(),
                     table.clone(),
                     schema.clone(),
+                    client.cookie_store()
+
                 )) as Arc<dyn TableProvider>;
 
                 Some((table_provider, parts.clone()))
