@@ -39,7 +39,7 @@ pub struct CronRequestChannel {
 static CRON_PARSER: LazyLock<CronParser> = LazyLock::new(|| {
     CronParser::builder()
         .seconds(Seconds::Optional)
-        .year(Year::Disallowed) // TODO: allow optional years in 2.0.0 - https://github.com/spiceai/spiceai/issues/6548
+        .year(Year::Optional)
         .build()
 });
 
@@ -161,7 +161,7 @@ impl TaskRequestChannel for CronRequestChannel {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Timelike;
+    use chrono::{Datelike, Timelike};
 
     use super::*;
 
@@ -333,5 +333,21 @@ mod tests {
             .expect("Should find occurrence after next");
         let interval = next_after.signed_duration_since(next).num_seconds();
         assert_eq!(interval, 60, "5-field cron should have 60-second intervals");
+    }
+
+    #[tokio::test]
+    async fn test_cron_year_optional() {
+        // Test that a 7-field cron expression with a year is supported
+        let cron = Arc::from("0 0 0 1 1 * 2030");
+        let channel = CronRequestChannel::new(&cron).expect("Should parse cron with year");
+
+        let now = Local::now();
+        let next = channel
+            .cron
+            .find_next_occurrence(&now, false)
+            .expect("Should find next occurrence");
+
+        // The year should be 2030
+        assert_eq!(next.year(), 2030, "Cron should schedule in year 2030");
     }
 }

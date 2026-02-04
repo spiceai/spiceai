@@ -49,13 +49,8 @@ impl CacheKeyType {
             .clone()
             .unwrap_or(SQLResultsCacheConfig::default());
 
-        let cache_key_type = app.runtime.results_cache.as_ref().map_or_else(
-            || sql_results_config.cache_key_type,
-            |c| c.cache_key_type, // while results_cache is being deprecated, it has higher priority than sql_results
-        );
-
         // Mapping from the user-facing `CacheKeyType` to the internal `CacheKeyType`.
-        match cache_key_type {
+        match sql_results_config.cache_key_type {
             spicepod::component::caching::CacheKeyType::Plan => Self::Default,
             spicepod::component::caching::CacheKeyType::Sql => Self::Raw,
         }
@@ -103,7 +98,7 @@ impl Default for CacheControl {
 impl CacheControl {
     #[must_use]
     pub fn from_headers(headers: &HeaderMap) -> Self {
-        // This will be updated later if the runtime parameter `runtime.results_cache.cache_key_type` is present.
+        // This will be updated later if the runtime parameter `runtime.caching.sql_results.cache_key_type` is present.
         let cache_key_type = match headers.get("Spice-Cache-Key") {
             Some(header) if !header.is_empty() => CacheKeyType::ClientSupplied,
             _ => CacheKeyType::Default,

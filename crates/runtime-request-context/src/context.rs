@@ -442,7 +442,7 @@ impl RequestContextBuilder {
             .client_supplied_cache_key
             .and_then(Self::sanitize_cache_key);
 
-        // Apply the runtime parameter `runtime.results_cache.cache_key_type` to the cache control if set.
+        // Apply the runtime parameter `runtime.caching.sql_results.cache_key_type` to the cache control if set.
         let cache_control = match self.cache_control {
             CacheControl::Cache(CacheKeyType::Default) => {
                 let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());

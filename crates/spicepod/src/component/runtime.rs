@@ -19,8 +19,8 @@ use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
 use super::{
-    caching::{Caching, ResultsCache},
-    default_true, is_default, is_default_or_none,
+    caching::{Caching, ResultsCache, SQLResultsCacheConfig},
+    default_true, is_default,
 };
 use crate::metric::Metrics;
 use crate::param::Params;
@@ -35,8 +35,6 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 #[serde(deny_unknown_fields)]
 #[serde(try_from = "RuntimeDeserializer")]
 pub struct Runtime {
-    #[serde(default, skip_serializing_if = "is_default_or_none")]
-    pub results_cache: Option<ResultsCache>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub caching: Caching,
 
@@ -672,6 +670,7 @@ pub struct Scheduler {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeDeserializer {
     #[serde(default, skip_serializing_if = "is_default_or_none")]
+    #[deprecated(since = "2.0.0", note = "Use `runtime.caching.sql_results` instead.")]
     pub results_cache: Option<ResultsCache>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub caching: Caching,
@@ -758,9 +757,22 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             (None, None) => None,
         };
 
+        // Convert deprecated runtime.results_cache to runtime.caching.sql_results
+        let mut caching = deserializer.caching;
+        if let Some(results_cache) = deserializer.results_cache {
+            tracing::warn!(
+                "`runtime.results_cache` is deprecated, use `runtime.caching.sql_results` instead"
+            );
+            // Only apply if caching.sql_results wasn't explicitly set (prefer the new field)
+            if caching.sql_results.is_none()
+                || caching.sql_results == Some(SQLResultsCacheConfig::default())
+            {
+                caching.sql_results = Some(results_cache.into());
+            }
+        }
+
         Ok(Runtime {
-            results_cache: deserializer.results_cache,
-            caching: deserializer.caching,
+            caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
             tls: deserializer.tls,
             tracing: deserializer.tracing,
