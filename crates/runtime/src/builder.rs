@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
+use crate::config::ClusterRole;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
 use crate::metrics_reader::MetricsReader;
@@ -33,6 +35,8 @@ use crate::{
     tracers,
 };
 use app::App;
+use datafusion::optimizer::AnalyzerRule;
+use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 use spicepod::component::caching::Caching;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
@@ -234,6 +238,14 @@ impl RuntimeBuilder {
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
 
+        // Only create an executor registry if this node is a scheduler
+        let executor_registry = self
+            .resolved_cluster_config
+            .as_ref()
+            .and_then(|c| c.effective_role())
+            .is_some_and(|role| role == ClusterRole::Scheduler)
+            .then(|| Arc::new(ExecutorRegistry::new()));
+
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
@@ -247,6 +259,14 @@ impl RuntimeBuilder {
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
         .with_url_tables(url_tables_enabled);
+
+        if let Some(ref reg) = executor_registry {
+            df_builder =
+                df_builder.with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(
+                    Arc::clone(reg) as Arc<dyn TablePartitionProvider>,
+                ))
+                    as Arc<dyn AnalyzerRule + Send + Sync>]);
+        }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
             df_builder = df_builder.with_cluster_config(resolved_cluster_config);
@@ -315,6 +335,7 @@ impl RuntimeBuilder {
             schedulers: Arc::new(RwLock::new(HashMap::new())),
             scheduler_peers: Arc::new(RwLock::new(HashMap::new())),
             job_executor: Arc::new(RwLock::new(None)), // Initialized later when scheduler registry starts
+            executor_registry,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };

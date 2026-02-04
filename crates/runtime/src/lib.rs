@@ -495,6 +495,10 @@ pub struct Runtime {
     /// Job executor for async SQL query jobs (only available in cluster mode with scheduler config)
     job_executor: Arc<RwLock<Option<Arc<jobs::JobExecutor>>>>,
 
+    /// Registry of connected executors for FlightSQL.
+    /// Only used in scheduler mode.
+    pub executor_registry: Option<Arc<cluster::ExecutorRegistry>>,
+
     resource_monitor: resource_monitor::ResourceMonitor,
 
     config: Arc<Config>,
@@ -722,10 +726,12 @@ impl Runtime {
             Option<Arc<metrics_server::cluster::ClusterMetricsCollector>>,
         ) = match self.df.cluster_config.effective_role() {
             Some(ClusterRole::Scheduler) => {
-                let scheduler_executor_registry = Arc::new(cluster::ExecutorRegistry::new());
+                let Some(ref scheduler_executor_registry) = self.executor_registry else {
+                    return Err(Error::MissingSchedulerExecutorRegistry);
+                };
                 let fut = cluster::initialize_cluster_scheduler_future(
                     &self,
-                    Arc::clone(&scheduler_executor_registry),
+                    Arc::clone(scheduler_executor_registry),
                 )
                 .await?;
 

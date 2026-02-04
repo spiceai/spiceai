@@ -21,20 +21,21 @@ limitations under the License.
 //! registry to request metrics from executors on-demand.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use data_components::flightsql::FlightSQLTable;
-use datafusion::{catalog::TableProvider, sql::TableReference};
-use datafusion_expr::Expr;
-use flight_client::FlightClient;
-use runtime_datafusion::analyzer_rule::FlightSQLPartitionProvider;
+use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
+use datafusion_expr::{Expr, TableScan};
+use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tonic::transport::Channel;
 use uuid::Uuid;
+
+use crate::accelerated_table::AcceleratedTable;
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
@@ -240,64 +241,59 @@ impl ExecutorRegistry {
     }
 }
 
-impl FlightSQLPartitionProvider for ExecutorRegistry {
+impl TablePartitionProvider for ExecutorRegistry {
+    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables.
+    fn should_partition(&self, tbl: &TableScan) -> bool {
+        let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
+            return false;
+        };
+        default
+            .table_provider
+            .as_any()
+            .downcast_ref::<AcceleratedTable>()
+            .is_some()
+    }
+
     fn get_partitions(
         &self,
         table: &TableReference,
         schema: SchemaRef,
-    ) -> Option<Vec<(Arc<dyn TableProvider>, Vec<Expr>)>> {
-        let partitions = self.partitions.try_read().ok()?;
-        let flight_sql_clients = self.flight_sql_clients.try_read().ok()?;
+    ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
+        let Ok(partitions) = self.partitions.try_read() else {
+            tracing::warn!(
+                "For table {table:?}, failed to acquire read lock on ExecutorRegistry partitions"
+            );
+            return Vec::new();
+        };
 
-        let mut result = Vec::new();
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!(
+                "For table {table:?}, failed to acquire read lock on ExecutorRegistryflight_sql_clients"
+            );
+            return Vec::new();
+        };
 
-        for (executor_id, table_map) in partitions.iter() {
-            if let Some(parts) = table_map.get(table) {
-                if let Some(client) = flight_sql_clients.get(executor_id) {
-                    let table_provider = Arc::new(FlightSQLTable::create_with_schema(
-                        "flightsql",
-                        executor_id,
-                        client.clone(),
-                        table.clone(),
-                        schema.clone(),
-                    )) as Arc<dyn TableProvider>;
+        partitions
+            .iter()
+            .filter_map(|(executor_id, table_map)| {
+                let parts = table_map.get(table)?;
+                let Some(client) = flight_sql_clients.get(executor_id) else {
+                    tracing::warn!(
+                        "Executor '{executor_id}' registered with partitions for table {table:?}, but no FlightSQL client found."
+                    );
+                    return None;
+                };
+                let table_provider = Arc::new(FlightSQLTable::create_with_schema(
+                    "flightsql",
+                    executor_id,
+                    client.clone(),
+                    table.clone(),
+                    schema.clone(),
+                )) as Arc<dyn TableProvider>;
 
-                    result.push((table_provider, parts.clone()));
-                }
-            }
-        }
-
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct FlightSQLPartitionProviderProxy {
-    registry: Arc<StdRwLock<Option<Arc<ExecutorRegistry>>>>,
-}
-
-impl FlightSQLPartitionProviderProxy {
-    pub fn new(registry: Arc<StdRwLock<Option<Arc<ExecutorRegistry>>>>) -> Self {
-        Self { registry }
-    }
-}
-
-impl FlightSQLPartitionProvider for FlightSQLPartitionProviderProxy {
-    fn get_partitions(
-        &self,
-        table: &TableReference,
-        schema: SchemaRef,
-    ) -> Option<Vec<(Arc<dyn TableProvider>, Vec<Expr>)>> {
-        let registry_guard = self.registry.read().ok()?;
-        if let Some(registry) = registry_guard.as_ref() {
-            registry.get_partitions(table, schema)
-        } else {
-            None
-        }
+                Some((table_provider, parts.clone()))
+            })
+            .collect()
     }
 }
 
