@@ -1,0 +1,160 @@
+name: streaming dynamodb benchmark
+run-name: streaming - ${{ github.event.inputs.queryset }} - ${{ github.event.inputs.config_name }} - ${{ github.event.inputs.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'Spicepod file path (relative to repo root, e.g., test/spicepods/streaming/dynamodb/tpch-duckdb.yaml)'
+        required: true
+        type: string
+      config_name:
+        description: 'Configuration name (e.g., tpch-duckdb, tpch-cayenne)'
+        required: true
+        type: string
+      run_id:
+        description: 'Run ID from dispatch-dynamodb (identifies tables and snapshots)'
+        required: true
+        type: string
+      queryset:
+        description: 'Query set type'
+        required: true
+        default: 'tpch'
+        type: choice
+        options:
+          - 'tpch'
+      scale_factor:
+        description: 'Scale factor (must match dispatch scale factor)'
+        required: true
+        default: '0.01'
+        type: string
+      ready_wait:
+        description: 'How long (in seconds) to wait for spiced to start and markers to be ingested'
+        required: true
+        default: '60'
+        type: string
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-dev-runners'
+        type: choice
+        options:
+          - 'spiceai-dev-runners'
+          - 'spiceai-dev-large-runners'
+      verify:
+        description: 'Run TPCH queries to verify data integrity'
+        required: false
+        type: boolean
+        default: true
+      enable_liveness:
+        description: 'Enable health monitoring during ingestion'
+        required: false
+        type: boolean
+        default: false
+      enable_query_liveness:
+        description: 'Enable query liveness monitoring'
+        required: false
+        type: boolean
+        default: false
+      query_liveness_interval_ms:
+        description: 'Poll interval for query liveness checks (ms)'
+        required: false
+        type: string
+        default: '500'
+
+jobs:
+  run-streaming-benchmark:
+    name: Run DynamoDB streaming benchmark - ${{ github.event.inputs.config_name }}
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          # Support both relative paths (from repo root) and paths with ./ prefix
+          INPUT_PATH="${{ github.event.inputs.spicepod_path }}"
+          if [[ "${INPUT_PATH}" == ./* ]]; then
+            SPICEPOD_PATH="${INPUT_PATH}"
+          else
+            SPICEPOD_PATH="./${INPUT_PATH}"
+          fi
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Run DynamoDB streaming benchmark
+        run: |
+          VERIFY_FLAG=""
+          if [ "${{ github.event.inputs.verify }}" = "true" ]; then
+            VERIFY_FLAG="--verify"
+          fi
+
+          LIVENESS_FLAG=""
+          if [ "${{ github.event.inputs.enable_liveness }}" = "true" ]; then
+            LIVENESS_FLAG="--enable-liveness"
+          fi
+
+          QUERY_LIVENESS_FLAG=""
+          if [ "${{ github.event.inputs.enable_query_liveness }}" = "true" ]; then
+            QUERY_LIVENESS_FLAG="--enable-query-liveness --query-liveness-interval-ms ${{ github.event.inputs.query_liveness_interval_ms }}"
+          fi
+
+          testoperator run streaming-dynamodb \
+            -s /usr/local/bin/spiced \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
+            --run-id ${{ github.event.inputs.run_id }} \
+            --queryset ${{ github.event.inputs.queryset }} \
+            --scale-factor ${{ github.event.inputs.scale_factor }} \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --metrics \
+            ${VERIFY_FLAG} \
+            ${LIVENESS_FLAG} \
+            ${QUERY_LIVENESS_FLAG}
+        env:
+          # DynamoDB credentials
+          DYNAMODB_AWS_REGION: ${{ secrets.DYNAMODB_AWS_REGION }}
+          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          # Snapshot storage
+          SNAPSHOT_S3_LOCATION: ${{ secrets.STREAMING_SNAPSHOT_S3_LOCATION }}
+          SNAPSHOT_S3_ACCESS_KEY_ID: ${{ secrets.STREAMING_SNAPSHOT_S3_ACCESS_KEY_ID }}
+          SNAPSHOT_S3_SECRET_ACCESS_KEY: ${{ secrets.STREAMING_SNAPSHOT_S3_SECRET_ACCESS_KEY }}
+          SNAPSHOT_S3_REGION: ${{ secrets.STREAMING_SNAPSHOT_S3_REGION }}
+          # Metrics
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}

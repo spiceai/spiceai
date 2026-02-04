@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/search/mod.rs
+---source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 snapshot_kind: text
 ---
@@ -9,7 +8,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        "answer": [
+          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        ]
       },
       "primary_key": {
         "id": 890
@@ -19,7 +20,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The metallic bonds become longer and weaker as the atoms get larger, resulting in lower boiling points."
+        "answer": [
+          "The metallic bonds become longer and weaker as the atoms get larger, resulting in lower boiling points."
+        ]
       },
       "primary_key": {
         "id": 1303
@@ -29,7 +32,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+        "answer": [
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%\u201310% of patients."
+        ]
       },
       "primary_key": {
         "id": 449
@@ -39,7 +44,9 @@ snapshot_kind: text
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The main advantages of PI chemotherapy are reduced hematologic toxicity and lower total cost because fewer drugs are used."
+        "answer": [
+          "The main advantages of PI chemotherapy are reduced hematologic toxicity and lower total cost because fewer drugs are used."
+        ]
       },
       "primary_key": {
         "id": 819

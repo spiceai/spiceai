@@ -9,7 +9,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
+        "question": [
+          "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
+        ]
       },
       "primary_key": {
         "id": 938
@@ -19,7 +21,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
+        "answer": [
+          "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
+        ]
       },
       "primary_key": {
         "id": 1015
@@ -29,7 +33,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
+        "answer": [
+          "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
+        ]
       },
       "primary_key": {
         "id": 821
@@ -39,7 +45,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "Which compound is not an intermediate of the TCA cycle?"
+        "question": [
+          "Which compound is not an intermediate of the TCA cycle?"
+        ]
       },
       "primary_key": {
         "id": 1279

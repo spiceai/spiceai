@@ -93,6 +93,22 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(TestCommands::TextToSql(args)) => {
             commands::text_to_sql::run(&args).await?;
         }
+        Commands::Run(TestCommands::StreamingDynamodb(args)) => {
+            commands::streaming::run_dynamodb(&args).await?;
+        }
+        Commands::Export(TestCommands::StreamingDynamodb(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for streaming-dynamodb (spicepods are transformed at runtime)"
+            ));
+        }
+        Commands::Run(TestCommands::StreamingDynamodbDispatch(args)) => {
+            commands::streaming::run_dispatch(&args).await?;
+        }
+        Commands::Export(TestCommands::StreamingDynamodbDispatch(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for dispatch-dynamodb (spicepods are transformed at runtime)"
+            ));
+        }
         _ => {
             return Err(anyhow::anyhow!("Unsupported command"));
         }

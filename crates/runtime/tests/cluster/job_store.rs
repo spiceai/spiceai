@@ -23,6 +23,7 @@ use object_store::{ObjectStore, path::Path};
 use runtime::Runtime;
 use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::ClusterConfig;
+use runtime::http_types::SubmitQueryRequest;
 use runtime::jobs::{JobExecutor, JobStore};
 use runtime::{auth::EndpointAuth, config::Config};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
@@ -40,6 +41,15 @@ use crate::{
 };
 
 const NAMES_CSV: &str = include_str!("../acceleration/data/names.csv");
+
+fn make_request(sql: impl Into<String>) -> SubmitQueryRequest {
+    SubmitQueryRequest {
+        sql: sql.into(),
+        parameters: None,
+        timeout_seconds: None,
+        maximum_size: None,
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_simple_job_store() -> Result<(), anyhow::Error> {
@@ -215,10 +225,9 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
             );
 
             let result = job_executor
-                .submit(
-                    "SELECT id, name, age, city, score FROM names ORDER BY id".to_string(),
-                    None,
-                )
+                .submit(make_request(
+                    "SELECT id, name, age, city, score FROM names ORDER BY id",
+                ))
                 .await
                 .expect("should submit job");
 

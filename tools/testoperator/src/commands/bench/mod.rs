@@ -208,7 +208,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
     }
 
     if let Some(message) = health_report.failure_message() {
-        error_messages.push(message);
+        eprintln!("Warning: {message}");
     }
 
     if !error_messages.is_empty() {

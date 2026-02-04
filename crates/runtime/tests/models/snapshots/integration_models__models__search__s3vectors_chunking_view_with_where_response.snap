@@ -9,7 +9,9 @@ snapshot_kind: text
     {
       "dataset": "qs_view",
       "matches": {
-        "answer": "The presence of fibrinolysin in the reagents can partially o"
+        "answer": [
+          "The presence of fibrinolysin in the reagents can partially o"
+        ]
       },
       "primary_key": {
         "id": 938
@@ -19,7 +21,9 @@ snapshot_kind: text
     {
       "dataset": "qs_view",
       "matches": {
-        "answer": " properties, possibly due to their high tannin content"
+        "answer": [
+          " properties, possibly due to their high tannin content"
+        ]
       },
       "primary_key": {
         "id": 1015
@@ -29,7 +33,9 @@ snapshot_kind: text
     {
       "dataset": "qs_view",
       "matches": {
-        "answer": " Late recurrences can occur beyond 10 years, so patients requir"
+        "answer": [
+          " Late recurrences can occur beyond 10 years, so patients requir"
+        ]
       },
       "primary_key": {
         "id": 551
@@ -39,7 +45,9 @@ snapshot_kind: text
     {
       "dataset": "qs_view",
       "matches": {
-        "answer": "stemic vascular resistance (SVR) by causing vasodilation."
+        "answer": [
+          "stemic vascular resistance (SVR) by causing vasodilation."
+        ]
       },
       "primary_key": {
         "id": 1035

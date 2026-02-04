@@ -37,7 +37,7 @@ pub type VectorSearchResult = HashMap<TableReference, AggregationResult>;
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Match {
     /// The matches for this result
-    matches: HashMap<String, MatchType>,
+    matches: HashMap<String, Vec<Value>>,
 
     /// Addditional data from the `dataset` requested by the user.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -55,26 +55,6 @@ pub struct Match {
 
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(untagged)]
-pub enum MatchType {
-    Single(Value),
-    Multiple(Vec<Value>),
-}
-
-impl From<Vec<Value>> for MatchType {
-    fn from(mut value: Vec<Value>) -> Self {
-        if value.len() == 1 {
-            let Some(v) = value.pop() else {
-                unreachable!("The value array must have one element");
-            };
-            return MatchType::Single(v);
-        }
-        MatchType::Multiple(value)
-    }
 }
 
 impl Match {
@@ -203,7 +183,7 @@ pub async fn to_matches(
 /// Convert a map of {column name -> column values}, to a per-row representation.
 fn transpose_and_convert(
     column_format: HashMap<String, Vec<Vec<Value>>>,
-) -> Vec<HashMap<String, MatchType>> {
+) -> Vec<HashMap<String, Vec<Value>>> {
     let max_rows = column_format
         .values()
         .map(std::vec::Vec::len)
@@ -218,7 +198,7 @@ fn transpose_and_convert(
     for (key, vv) in column_format {
         for (i, row_values) in vv.into_iter().enumerate() {
             if !row_values.is_empty() {
-                rows[i].insert(key.clone(), row_values.into());
+                rows[i].insert(key.clone(), row_values);
             }
         }
     }
@@ -233,12 +213,12 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
 
-    fn sort_result(v: Vec<HashMap<String, MatchType>>) -> Vec<Vec<(String, MatchType)>> {
+    fn sort_result(v: Vec<HashMap<String, Vec<Value>>>) -> Vec<Vec<(String, Vec<Value>)>> {
         v.into_iter()
             .map(|x| {
                 x.into_iter()
                     .sorted_by_key(|(a, _)| a.clone())
-                    .collect::<Vec<(String, MatchType)>>()
+                    .collect::<Vec<(String, Vec<Value>)>>()
             })
             .collect::<Vec<_>>()
     }
