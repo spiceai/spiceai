@@ -73,13 +73,6 @@ pub enum DistributedJobStatus {
 /// Error type for distributed query handle operations.
 #[derive(Debug, Snafu)]
 pub enum QueryHandleError {
-    /// Job timed out.
-    #[snafu(display("Job {ballista_job_id} timed out after {timeout_secs} seconds"))]
-    JobTimeout {
-        ballista_job_id: String,
-        timeout_secs: u64,
-    },
-
     /// Job was cancelled.
     #[snafu(display("Job was cancelled"))]
     JobCancelled,
@@ -538,9 +531,9 @@ impl QueryHandle {
     fn finish_tracker_with_error(&self, error: &QueryHandleError) {
         if let Some(tracker) = self.tracker.lock().take() {
             let error_code = match error {
-                QueryHandleError::JobTimeout { .. }
-                | QueryHandleError::JobCancelled
-                | QueryHandleError::JobFailed { .. } => ErrorCode::QueryExecutionError,
+                QueryHandleError::JobCancelled | QueryHandleError::JobFailed { .. } => {
+                    ErrorCode::QueryExecutionError
+                }
                 QueryHandleError::StatusError { .. }
                 | QueryHandleError::PartitionLocationError { .. }
                 | QueryHandleError::JobNotFound { .. } => ErrorCode::InternalError,
