@@ -573,15 +573,10 @@ impl ClusterService for ClusterServiceImpl {
             executor_id.clone(),
             table_partitions
                 .iter()
-                .map(|(tbl, _)| {
-                    (
-                        tbl.clone(),
-                        vec![
-                            Expr::Literal(ScalarValue::UInt16(Some(1)), None)
-                                .eq(Expr::Literal(ScalarValue::UInt16(Some(1)), None)),
-                        ],
-                    )
-                })
+                // Empty partitions for now.
+                // TODO: Schedulers assign partitions `https://github.com/spiceai/spiceai/issues/9203`
+                // TODO: Executors poll for new updates `https://github.com/spiceai/spiceai/issues/9204`
+                .map(|(tbl, _)| (tbl.clone(), vec![]))
                 .collect(),
         );
 
