@@ -204,9 +204,10 @@ impl StreamingDynamodbDispatchArgs {
             let path = entry.path();
             if path.is_file()
                 && let Some(ext) = path.extension()
-                    && (ext == "yaml" || ext == "yml") {
-                        paths.push(path);
-                    }
+                && (ext == "yaml" || ext == "yml")
+            {
+                paths.push(path);
+            }
         }
 
         // Sort for deterministic ordering
