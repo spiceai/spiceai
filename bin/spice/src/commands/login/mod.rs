@@ -241,7 +241,7 @@ fn read_spicepod_metadata() -> (Option<String>, Option<String>) {
         return (None, None);
     };
 
-    let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&contents) else {
+    let Ok(yaml) = yaml::from_str::<yaml::Value>(&contents) else {
         return (None, None);
     };
 

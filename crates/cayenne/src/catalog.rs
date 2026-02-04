@@ -168,6 +168,14 @@ pub enum CatalogError {
         /// Details about the constraint that was violated
         message: String,
     },
+
+    /// Invalid partition metadata (e.g., mismatched columns/values count, empty partition)
+    /// This prevents persisting malformed partition data that could cause incorrect query results.
+    #[snafu(display("Invalid partition metadata: {message}"))]
+    InvalidPartitionMetadata {
+        /// Description of why the partition metadata is invalid
+        message: String,
+    },
 }
 
 /// Result type for catalog operations.

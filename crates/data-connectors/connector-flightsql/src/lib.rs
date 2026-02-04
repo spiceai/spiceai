@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use data_components::Read;
 use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
 use datafusion::datasource::TableProvider;
+use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::tls::new_tls_flight_channel;
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use runtime::component::dataset::Dataset;
@@ -113,9 +114,11 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .ok()
                 .map(PathBuf::from);
 
+            let cookie_store = Arc::new(CookieStore::new());
             let flight_channel = new_tls_flight_channel(&endpoint, ca_certificate_path.as_deref())
                 .await
                 .context(UnableToConstructTlsChannelSnafu)?;
+            let flight_channel = CookieService::new(flight_channel, Arc::clone(&cookie_store));
 
             let max_message_size =
                 match params
@@ -145,7 +148,8 @@ impl DataConnectorFactory for FlightSQLFactory {
                     .await
                     .context(UnableToPerformHandshakeSnafu)?;
             }
-            let flightsql_factory = DataComponentFlightSQLFactory::new(client, endpoint);
+            let flightsql_factory =
+                DataComponentFlightSQLFactory::new(client, endpoint, cookie_store);
             Ok(Arc::new(FlightSQL { flightsql_factory }) as Arc<dyn DataConnector>)
         })
     }

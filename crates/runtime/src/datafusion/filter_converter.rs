@@ -124,7 +124,7 @@ fn convert_to_expr(
         ExprTimeFormat::Timestamptz(tz) => binary_expr(
             cast(
                 col(time_column),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, tz.clone()),
             ),
             op,
             Expr::Literal(
@@ -286,7 +286,7 @@ mod test {
 
         assert_eq!(
             result.to_string(),
-            r#"CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
+            r#"CAST(timestamp AS Timestamp(ns, "UTC")) > TimestampNanosecond(1620000000000000000, Some("UTC"))"#
         );
     }
 

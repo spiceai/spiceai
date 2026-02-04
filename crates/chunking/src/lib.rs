@@ -140,7 +140,23 @@ impl RecursiveSplittingChunker<TokenizerWrapper> {
     }
 }
 
-impl RecursiveSplittingChunker<CoreBPE> {
+/// Chunk sizer wrapper around `OpenAI` `CoreBPE` tokenizers.
+#[derive(Clone)]
+pub struct CoreBpeSizer(CoreBPE);
+
+impl ChunkSizer for CoreBpeSizer {
+    fn size(&self, chunk: &str) -> usize {
+        self.0.encode_ordinary(chunk).len()
+    }
+}
+
+impl From<CoreBPE> for CoreBpeSizer {
+    fn from(bpe: CoreBPE) -> Self {
+        Self(bpe)
+    }
+}
+
+impl RecursiveSplittingChunker<CoreBpeSizer> {
     pub fn for_openai_model(
         model_id: &str,
         cfg: &ChunkingConfig,
@@ -148,7 +164,7 @@ impl RecursiveSplittingChunker<CoreBPE> {
         let bpe =
             get_bpe_from_tokenizer(get_tokenizer(model_id).unwrap_or(OpenAITokenizer::Cl100kBase))
                 .map_err(|e| format!("Could not create BPE tokenizer: {e:?}"))?;
-        Self::try_new(cfg, bpe).boxed()
+        Self::try_new(cfg, bpe.into()).boxed()
     }
 }
 
