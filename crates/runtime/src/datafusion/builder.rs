@@ -259,6 +259,7 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Adds additional analyzer rules to the `DataFusion` instance.
     pub fn with_analyzer_rules(mut self, rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>) -> Self {
         self.additional_analyzer_rules = rules;
         self

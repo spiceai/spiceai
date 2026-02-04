@@ -739,10 +739,10 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     // Start internal cluster server for scheduler on separate port
     let internal_server_shutdown = CancellationToken::new();
     let cloned_shutdown = internal_server_shutdown.clone();
-    let z = Arc::clone(rt);
+    let internal_server_rt = Arc::clone(rt);
     let internal_server_fut = async move {
         start_internal_cluster_server(
-            z,
+            internal_server_rt,
             Some(cloned_shutdown),
             Arc::clone(&scheduler_executor_registry),
         )

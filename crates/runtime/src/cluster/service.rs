@@ -31,21 +31,17 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
 
-use datafusion::{
-    scalar::ScalarValue,
-    sql::{
-        TableReference,
-        sqlparser::{
-            ast::{Ident, ObjectNamePart, visit_relations_mut},
-            dialect::PostgreSqlDialect,
-            parser::Parser,
-        },
+use datafusion::sql::{
+    TableReference,
+    sqlparser::{
+        ast::{Ident, ObjectNamePart, visit_relations_mut},
+        dialect::PostgreSqlDialect,
+        parser::Parser,
     },
 };
 
 use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
 
-use datafusion_expr::Expr;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -585,15 +581,7 @@ impl ClusterService for ClusterServiceImpl {
             executor_id.clone(),
             table_partitions
                 .iter()
-                .map(|(tbl, _)| {
-                    (
-                        tbl.clone(),
-                        vec![
-                            Expr::Literal(ScalarValue::UInt16(Some(1)), None)
-                                .eq(Expr::Literal(ScalarValue::UInt16(Some(1)), None)),
-                        ],
-                    )
-                })
+                .map(|(tbl, _)| (tbl.clone(), vec![]))
                 .collect(),
         );
 

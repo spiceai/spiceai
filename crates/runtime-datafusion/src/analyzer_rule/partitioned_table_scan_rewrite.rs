@@ -98,7 +98,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
             let LogicalPlan::TableScan(scan) = &plan else {
                 return Ok(Transformed::no(plan));
             };
-            if !self.partition_provider.should_partition(&scan) {
+            if !self.partition_provider.should_partition(scan) {
                 return Ok(Transformed::no(plan));
             }
 
@@ -132,13 +132,13 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
                     EmptyRelation {
                         produce_one_row: false,
-                        schema: Arc::clone(&plan.schema()),
+                        schema: Arc::clone(plan.schema()),
                     },
                 )));
             }
             Ok(Transformed::yes(LogicalPlan::Union(Union {
                 inputs: sub_scans,
-                schema: Arc::clone(&plan.schema()),
+                schema: Arc::clone(plan.schema()),
             })))
         })
         .data()

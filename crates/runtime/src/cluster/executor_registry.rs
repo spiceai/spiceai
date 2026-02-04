@@ -27,6 +27,7 @@ use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
 use datafusion_expr::{Expr, TableScan};
+use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
@@ -287,7 +288,7 @@ impl TablePartitionProvider for ExecutorRegistry {
                     client.clone(),
                     table.clone(),
                     schema.clone(),
-                    client.cookie_store()
+                     Arc::new(CookieStore::new()),
 
                 )) as Arc<dyn TableProvider>;
 
