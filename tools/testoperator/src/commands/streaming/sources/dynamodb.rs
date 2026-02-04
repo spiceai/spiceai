@@ -181,7 +181,7 @@ impl DynamoDbStreamsSource {
     ///
     /// Decimal128 stores values as integers scaled by 10^scale.
     /// For example, 12345 with scale=2 represents 123.45
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     fn format_decimal128(value: i128, _precision: u8, scale: i8) -> String {
         if scale <= 0 {
             // No decimal places needed
@@ -297,7 +297,7 @@ impl DynamoDbStreamsSource {
     }
 
     /// Build tags for a new table.
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     fn build_table_tags(run_id: &str, scale_factor: Option<f64>) -> Vec<Tag> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -375,20 +375,22 @@ impl DynamoDbStreamsSource {
                         .list_tags_of_resource()
                         .resource_arn(&arn)
                         .send()
-                        .await {
+                        .await
+                    {
                         if let Some(tags) = tags_response.tags {
                             // Look for our created_at tag
                             for tag in tags {
                                 if tag.key() == TAG_CREATED_AT {
                                     let value = tag.value();
                                     if let Ok(created_at) = value.parse::<u64>()
-                                        && created_at < cutoff {
-                                            let age_hours = (now - created_at) / 3600;
-                                            println!(
-                                                "  Found stale table: {table_name} ({age_hours}h old)"
-                                            );
-                                            tables_to_delete.push(table_name.clone());
-                                        }
+                                        && created_at < cutoff
+                                    {
+                                        let age_hours = (now - created_at) / 3600;
+                                        println!(
+                                            "  Found stale table: {table_name} ({age_hours}h old)"
+                                        );
+                                        tables_to_delete.push(table_name.clone());
+                                    }
                                 }
                             }
                         }

@@ -84,7 +84,7 @@ pub trait StreamingDataset: Send + Sync {
 /// This is the generic interface for all streaming sources (`DynamoDB`, Kafka, etc.).
 /// Sources match on `DatasetType` to determine source-specific configuration
 /// like key schemas, topic settings, etc.
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[async_trait::async_trait]
 pub trait StreamingSource: Send + Sync {
     /// Set a table name prefix for isolated test runs.

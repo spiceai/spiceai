@@ -115,17 +115,16 @@ pub async fn run_verification(
         .count();
     let failed_count = metrics.metrics.len() - passed_count;
 
-    println!(
-        "Verification complete: {passed_count} passed, {failed_count} failed"
-    );
+    println!("Verification complete: {passed_count} passed, {failed_count} failed");
 
     if !all_passed {
         println!("WARNING: Some queries failed verification!");
         for metric in &metrics.metrics {
             if let QueryStatus::Failed(reason) = &metric.query_status {
-                let reason_str = reason
-                    .as_ref()
-                    .map_or("unknown error".to_string(), std::string::ToString::to_string);
+                let reason_str = reason.as_ref().map_or(
+                    "unknown error".to_string(),
+                    std::string::ToString::to_string,
+                );
                 println!("  {}: {}", metric.query_name, reason_str);
             }
         }

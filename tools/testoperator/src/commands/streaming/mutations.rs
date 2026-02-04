@@ -214,7 +214,7 @@ impl MutationGenerator {
     }
 
     /// Select which row indices to mutate based on the ratio.
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss

@@ -79,7 +79,7 @@ impl QueryLivenessStats {
 
     /// Calculate a percentile latency (0-100).
     #[must_use]
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss

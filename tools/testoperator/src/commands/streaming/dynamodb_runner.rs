@@ -360,7 +360,7 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     let record_count = dynamodb_metrics.records_consumed_total;
 
     // Calculate throughput
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     let throughput = if ingestion_duration.as_secs_f64() > 0.0 && record_count > 0 {
         record_count as f64 / ingestion_duration.as_secs_f64()
     } else {
