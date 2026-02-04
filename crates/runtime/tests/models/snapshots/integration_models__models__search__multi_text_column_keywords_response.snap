@@ -9,7 +9,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
       },
       "primary_key": {
         "id": 361

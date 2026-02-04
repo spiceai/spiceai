@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/search/mod.rs
+---source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 ---
 {
@@ -11,8 +10,12 @@ expression: normalize_search_response(resp)
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
-        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
+        "answer": [
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+        ],
+        "question": [
+          "How many multiples of 4 are there between 1 and 30? List them and count the total."
+        ]
       },
       "primary_key": {
         "id": 468
@@ -25,8 +28,12 @@ expression: normalize_search_response(resp)
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
+        "answer": [
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ],
+        "question": [
+          "Which base number, when raised to the fifth power, equals thirty-two?"
+        ]
       },
       "primary_key": {
         "id": 1277
@@ -39,8 +46,12 @@ expression: normalize_search_response(resp)
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
-        "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
+        "answer": [
+          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+        ],
+        "question": [
+          "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
+        ]
       },
       "primary_key": {
         "id": 189
@@ -53,8 +64,12 @@ expression: normalize_search_response(resp)
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
-        "question": "What is the fifth root of 32?"
+        "answer": [
+          "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ],
+        "question": [
+          "What is the fifth root of 32?"
+        ]
       },
       "primary_key": {
         "id": 948

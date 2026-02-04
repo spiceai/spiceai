@@ -9,7 +9,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "$\\boxed{\\text{True}}$, because severe post-treatment cardiopulmonary complications sometimes occur."
+        "answer": [
+          "$\\boxed{\\text{True}}$, because severe post-treatment cardiopulmonary complications sometimes occur."
+        ]
       },
       "primary_key": {
         "id": 120
@@ -19,7 +21,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": [
+          "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        ]
       },
       "primary_key": {
         "id": 6
@@ -29,7 +33,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Consequential late effects are late effects that develop as a consequence of severe early effects."
+        "answer": [
+          "Consequential late effects are late effects that develop as a consequence of severe early effects."
+        ]
       },
       "primary_key": {
         "id": 810
@@ -39,7 +45,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        "answer": [
+          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        ]
       },
       "primary_key": {
         "id": 890

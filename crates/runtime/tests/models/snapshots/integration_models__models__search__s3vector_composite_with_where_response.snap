@@ -9,7 +9,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Choices create costs and benefits."
+        "answer": [
+          "Choices create costs and benefits."
+        ]
       },
       "primary_key": {
         "id": 863,
@@ -20,7 +22,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": [
+          "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        ]
       },
       "primary_key": {
         "id": 6,
