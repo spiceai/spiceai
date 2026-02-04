@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/search/mod.rs
+---source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 ---
 {
