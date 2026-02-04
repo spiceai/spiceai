@@ -289,8 +289,8 @@ impl TablePartitionProvider for ExecutorRegistry {
                     executor_id,
                     client.clone(),
                     table.clone(),
-                    Arc::clone(schema),
-                     Arc::new(CookieStore::new()),
+                    Arc::clone(&schema),
+                    Arc::new(CookieStore::new()),
 
                 )) as Arc<dyn TableProvider>;
 
