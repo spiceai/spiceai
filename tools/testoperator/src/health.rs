@@ -57,7 +57,7 @@ impl EndpointStats {
 
 #[derive(Debug, Default)]
 pub(crate) struct HealthCheckReport {
-    endpoints: BTreeMap<&'static str, EndpointStats>,
+    pub endpoints: BTreeMap<&'static str, EndpointStats>,
 }
 
 impl HealthCheckReport {

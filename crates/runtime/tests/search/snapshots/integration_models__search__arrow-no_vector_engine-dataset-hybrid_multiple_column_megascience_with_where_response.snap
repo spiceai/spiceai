@@ -1,5 +1,4 @@
----
-source: crates/runtime/tests/search/mod.rs
+---source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 ---
 {
@@ -8,7 +7,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
+        "question": [
+          "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
+        ]
       },
       "primary_key": {
         "id": 938
@@ -18,7 +19,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        "answer": [
+          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        ]
       },
       "primary_key": {
         "id": 890
@@ -28,7 +31,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "Which compound is not an intermediate of the TCA cycle?"
+        "question": [
+          "Which compound is not an intermediate of the TCA cycle?"
+        ]
       },
       "primary_key": {
         "id": 1279
@@ -38,7 +43,9 @@ expression: normalize_search_response(resp)
     {
       "dataset": "spice.public.qs",
       "matches": {
-        "question": "Which of the following is an intensive property of a system?"
+        "question": [
+          "Which of the following is an intensive property of a system?"
+        ]
       },
       "primary_key": {
         "id": 1289

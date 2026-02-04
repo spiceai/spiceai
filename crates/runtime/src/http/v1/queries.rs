@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Runtime;
 use crate::config::ClusterRole;
-use crate::jobs::{JobExecutor, JobState, JobStatus};
+use crate::jobs::{JobErrorCode, JobExecutor, JobState, JobStatus};
 
 /// Check if cluster mode with scheduler role is enabled.
 /// Returns 503 error response if not in scheduler cluster mode.
@@ -87,15 +87,14 @@ pub struct SubmitQueryRequest {
     /// Optional query parameters (bind variables).
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
-    /// Optional timeout for sync wait (0 = fully async). In seconds.
-    /// If > 0, the server will wait up to this long for results before returning.
+    /// Optional timeout for async jobs.
+    /// Jobs running for longer than this will automatically timeout and fail.
     #[serde(default)]
-    #[expect(dead_code)]
     pub timeout_seconds: Option<u64>,
-    /// Optional target dataset or namespace.
+    /// Optional maximum size of results for async jobs.
+    /// Jobs with results larger than this will be failed with an error for exceeding the maximum size.
     #[serde(default)]
-    #[expect(dead_code)]
-    pub dataset: Option<String>,
+    pub maximum_size: Option<u64>,
 }
 
 /// Response for query submission.
@@ -105,22 +104,14 @@ pub struct SubmitQueryResponse {
     /// Unique identifier for the query.
     pub query_id: String,
     /// Current status of the query.
-    pub status: StatusResponse,
+    pub status: JobStatus,
+    /// Optional error details if the query failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorResponse>,
     /// URL to check status.
     pub status_url: String,
     /// URL to get results (once completed).
     pub results_url: String,
-}
-
-/// Status information within responses.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct StatusResponse {
-    /// Current state of the query.
-    pub state: String,
-    /// Error details if the query failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorResponse>,
 }
 
 /// Error details in responses.
@@ -128,7 +119,7 @@ pub struct StatusResponse {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ErrorResponse {
     /// Error code categorizing the failure.
-    pub error_code: String,
+    pub error_code: JobErrorCode,
     /// Human-readable error message.
     pub message: String,
     /// SQL state code if applicable.
@@ -172,8 +163,6 @@ pub struct ManifestResponse {
     pub total_row_count: usize,
     /// Total number of chunks.
     pub total_chunk_count: usize,
-    /// Whether results were truncated.
-    pub truncated: bool,
 }
 
 /// Chunk information in result responses.
@@ -204,7 +193,10 @@ pub struct QueryResponse {
     /// Unique identifier for the query.
     pub query_id: String,
     /// Current status.
-    pub status: StatusResponse,
+    pub status: JobStatus,
+    /// Error details if the query failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorResponse>,
     /// Result manifest if completed successfully.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<ManifestResponse>,
@@ -251,12 +243,23 @@ pub struct ListQueriesResponse {
 pub struct QuerySummary {
     /// Query ID.
     pub query_id: String,
-    /// Current state.
-    pub state: String,
+    /// Current status.
+    pub status: JobStatus,
     /// SQL preview (first 100 chars).
     pub sql_preview: String,
     /// When created (ISO 8601).
     pub created_at: String,
+}
+
+/// Response object for the query status route
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct StatusResponse {
+    /// Current status of the query.
+    pub status: JobStatus,
+    /// Optional error details if the query failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorResponse>,
 }
 
 /// Submit a new SQL query for async execution.
@@ -289,17 +292,19 @@ pub(crate) async fn submit(
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let result = executor.submit(request.sql, request.parameters).await;
+    let result = executor.submit(request).await;
 
     match result {
         Ok(state) => {
             let query_id = state.job_id.clone();
             let response = SubmitQueryResponse {
                 query_id: query_id.clone(),
-                status: StatusResponse {
-                    state: state.status.to_string(),
-                    error: None,
-                },
+                status: state.status,
+                error: state.error.as_ref().map(|e| ErrorResponse {
+                    error_code: e.error_code,
+                    message: e.message.clone(),
+                    sql_state: e.sql_state.clone(),
+                }),
                 status_url: format!("/v1/queries/{query_id}/status"),
                 results_url: format!("/v1/queries/{query_id}/results"),
             };
@@ -388,13 +393,13 @@ pub(crate) async fn get_status(
     match result {
         Ok(state) => {
             let error = state.error.as_ref().map(|e| ErrorResponse {
-                error_code: e.error_code.clone(),
+                error_code: e.error_code,
                 message: e.message.clone(),
                 sql_state: e.sql_state.clone(),
             });
 
             let status_response = StatusResponse {
-                state: state.status.to_string(),
+                status: state.status,
                 error,
             };
 
@@ -665,7 +670,7 @@ pub(crate) async fn list(
                     };
                     QuerySummary {
                         query_id: job.job_id,
-                        state: job.status.to_string(),
+                        status: job.status,
                         sql_preview,
                         created_at: ms_to_iso8601(job.created_at_ms),
                     }
@@ -685,7 +690,7 @@ pub(crate) async fn list(
 
 fn job_state_to_response(state: &JobState) -> QueryResponse {
     let error = state.error.as_ref().map(|e| ErrorResponse {
-        error_code: e.error_code.clone(),
+        error_code: e.error_code,
         message: e.message.clone(),
         sql_state: e.sql_state.clone(),
     });
@@ -709,15 +714,12 @@ fn job_state_to_response(state: &JobState) -> QueryResponse {
         },
         total_row_count: r.manifest.total_row_count,
         total_chunk_count: r.manifest.total_chunk_count,
-        truncated: r.manifest.truncated,
     });
 
     QueryResponse {
         query_id: state.job_id.clone(),
-        status: StatusResponse {
-            state: state.status.to_string(),
-            error,
-        },
+        status: state.status,
+        error,
         manifest,
         result: None,
         created_at: ms_to_iso8601(state.created_at_ms),

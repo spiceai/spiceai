@@ -22,7 +22,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 2 are in 14?"
+        "question": [
+          "How many groups of 2 are in 14?"
+        ]
       },
       "primary_key": {
         "id": 462
@@ -32,7 +34,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 5 are in 25?"
+        "question": [
+          "How many groups of 5 are in 25?"
+        ]
       },
       "primary_key": {
         "id": 464
@@ -42,7 +46,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many groups of 3 are in 18?"
+        "question": [
+          "How many groups of 3 are in 18?"
+        ]
       },
       "primary_key": {
         "id": 463

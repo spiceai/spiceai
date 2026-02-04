@@ -13,7 +13,9 @@ snapshot_kind: text
       },
       "dataset": "catalog_page_with_chunking",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends con"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
