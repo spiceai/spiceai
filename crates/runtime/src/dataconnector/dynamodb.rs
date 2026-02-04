@@ -434,9 +434,6 @@ impl DataConnector for DynamoDB {
 
                 let acceptable_lag = dynamodb_ref.ready_lag;
                 let dataset_name = dataset.name.clone();
-                let dataset_name_2 = dataset_name.clone();
-                let dataset_name_3 = dataset_name.clone();
-                let dataset_name = dataset_name.clone();
                 let dynamodb = Arc::new(dynamodb_ref.clone());
                 let dynamodb_sys = Arc::new(if dataset.is_file_accelerated() {
                     initialize_dynamodb_sys(&dataset).await
@@ -449,162 +446,352 @@ impl DataConnector for DynamoDB {
                     load_or_initialize_checkpoint(&dynamodb, &dynamodb_sys, &dataset_name).await?;
 
                 if should_bootstrap {
-                    tracing::info!(
-                        "No existing lag found for DynamoDB Streams table {dataset_name}, starting initialization"
-                    );
-                    // Initialize bootstrap stream
-                    let bootstrap_stream = Arc::clone(&dynamodb)
-                        .bootstrap_stream()
-                        .await
-                        .ok()?
-                        .map(move |msg| {
-                            msg.map(|change_batch| {
-                                tracing::info!("Initializing DynamoDB Streams table {}, records={}", dataset_name.clone(), change_batch.record.num_rows());
-                                // Bootstrap stream doesn't commit changes and doesn't mark dataset as ready
-                                ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false)
-                            })
-                        });
-
-                    let checkpoint_cloned = checkpoint.clone();
-                    let dynamodb_sys_cloned = Arc::clone(&dynamodb_sys);
-
-                    // Attach changes stream from initial checkpoint to bootstrap stream
-                    Some(
-                        bootstrap_stream
-                            .chain(
-                                stream::once(async move {
-                                    tracing::info!("DynamoDB Streams table {} initialization complete, starting to process changes from the Stream. \
-                                        Table will be marked as Ready once lag reaches < '{}'",
-                                        dataset_name_2, humantime::format_duration(acceptable_lag));
-
-                                    let committer = DynamoDBStreamCommitter::new(dynamodb_sys_cloned, checkpoint_cloned);
-                                    if let Err(err) = committer.commit() {
-                                        tracing::error!("Failed to commit bootstrap checkpoint: {:?}", err);
-                                    }
-
-                                    stream::empty()
-                                })
-                                .flatten()
-                            )
-                            .chain(
-                                stream::once(async move {
-                                    let dataset_name = dataset_name_3.clone();
-                                    match changes_stream_from_checkpoint(
-                                        Arc::clone(&dynamodb),
-                                        Arc::clone(&dynamodb_sys),
-                                        checkpoint,
-                                        acceptable_lag,
-                                        dataset_name.clone(),
-                                    ).await {
-                                        Ok(stream) => Some(stream),
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to start changes stream after bootstrap for DynamoDB table {}: {}",
-                                                dataset_name, e
-                                            );
-                                            None
-                                        }
-                                    }
-                                })
-                                .filter_map(|opt| async move { opt })
-                                .flatten(),
-                            )
-                            .boxed(),
+                    create_bootstrap_stream(
+                        dynamodb,
+                        dynamodb_sys,
+                        checkpoint,
+                        acceptable_lag,
+                        dataset_name,
                     )
+                    .await
                 } else {
-                    // Resume from existing checkpoint
-                    Some(
-                        stream::once(async move {
-                            match changes_stream_from_checkpoint(
-                                Arc::clone(&dynamodb),
-                                Arc::clone(&dynamodb_sys),
-                                checkpoint,
-                                acceptable_lag,
-                                dataset_name.clone(),
-                            ).await {
-                                Ok(changes_stream) => {
-                                    // Resume reading from checkpoint normally
-                                    tracing::info!(
-                                        "Found existing lag for DynamoDB Streams table {dataset_name}, resuming. \
-                                        Table will be marked as Ready once lag reaches < '{}'",
-                                        humantime::format_duration(acceptable_lag),
-                                    );
-                                    Some(changes_stream)
-                                }
-                                Err(Error::FailedToInitializeCheckpoint { source: dynamodb_streams::Error::ShardNotFound }) => {
-                                    // ShardNotFound - check checkpoint age to determine action
-                                    const CHECKPOINT_AGE_THRESHOLD: Duration = Duration::from_secs(CHECKPOINT_EXPIRATION_HOURS * 60 * 60);
-                                    let checkpoint_age = checkpoint_updated_at
-                                        .and_then(|t| SystemTime::now().duration_since(t).ok())
-                                        .unwrap_or(Duration::from_secs(24 * 60 * 60)); // Assume old if no timestamp
-
-                                    if checkpoint_age < CHECKPOINT_AGE_THRESHOLD {
-                                        // Checkpoint is fresh (<18h), ShardNotFound is unexpected - propagate error
-                                        tracing::warn!(
-                                            "ShardNotFound for DynamoDB table {} but checkpoint is only {:?} old (< 18h threshold). Propagating error.",
-                                            dataset_name, checkpoint_age
-                                        );
-                                        return Some(stream::once(async move {
-                                            Err(StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage {
-                                                source: dynamodb_streams::Error::ShardNotFound
-                                            }))
-                                        }).boxed());
-                                    }
-
-                                    // Checkpoint is old enough (> 18h) - apply configured behavior
-                                    match lag_exceeds_behavior {
-                                        LagExceedsShardRetentionBehavior::Error => {
-                                            // Propagate the original error so downstream marks dataset as Error
-                                            tracing::error!(
-                                                "DynamoDB table {} checkpoint references expired shard (age {:?}). \
-                                                Configured behavior is 'error', propagating error to mark dataset as failed.",
-                                                dataset_name, checkpoint_age
-                                            );
-                                            Some(stream::once(async move {
-                                                Err(StreamError::DynamoDB(DynamoDBStreamError::FailedToReceiveMessage {
-                                                    source: dynamodb_streams::Error::ShardNotFound
-                                                }))
-                                            }).boxed())
-                                        }
-                                        _ => {
-                                            // ReadyBeforeLoad or ReadyAfterLoad - do rebootstrap
-                                            tracing::info!(
-                                                "DynamoDB table {} checkpoint references expired shard (age {:?}). \
-                                                Initiating re-bootstrap with behavior {:?}.",
-                                                dataset_name, checkpoint_age, lag_exceeds_behavior
-                                            );
-                                            rebootstrap_table(
-                                                &dynamodb,
-                                                &dynamodb_sys,
-                                                acceptable_lag,
-                                                &dataset_name,
-                                                accelerated_table_provider,
-                                                accelerator_write_mutex,
-                                                lag_exceeds_behavior,
-                                                metrics_collector,
-                                            ).await
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    // Other errors - log and return None
-                                    tracing::error!(
-                                        "Failed to get stream from checkpoint for DynamoDB table {}: {}",
-                                        dataset_name, err
-                                    );
-                                    None
-                                }
-                            }
-                        })
-                        .filter_map(|opt| async move { opt })
-                        .flatten()
-                        .boxed(),
+                    resume_from_checkpoint_stream(
+                        dynamodb,
+                        dynamodb_sys,
+                        checkpoint,
+                        checkpoint_updated_at,
+                        acceptable_lag,
+                        dataset_name,
+                        lag_exceeds_behavior,
+                        accelerated_table_provider,
+                        accelerator_write_mutex,
+                        metrics_collector,
                     )
                 }
             })
             .flat_map(|opt| opt.unwrap_or_else(|| stream::empty().boxed())),
         ))
     }
+}
+
+async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<DynamoDBSys> {
+    match DynamoDBSys::try_new(dataset, OpenOption::OpenExisting).await {
+        Ok(sys) => Some(sys),
+        Err(err) => {
+            tracing::error!(
+                "Failed to initialize DynamoDBSys for checkpoint persistence: table={} - {:?}",
+                dataset.name,
+                err
+            );
+            None
+        }
+    }
+}
+
+/// Loads checkpoint from `DynamoDBSys`, or initializes a new checkpoint if none exists.
+/// Returns (should_bootstrap, checkpoint, checkpoint_updated_at).
+async fn load_or_initialize_checkpoint(
+    dynamodb: &Arc<DynamoDBTableProvider>,
+    dynamodb_sys: &Arc<Option<DynamoDBSys>>,
+    dataset_name: &TableReference,
+) -> Option<(bool, Checkpoint, Option<SystemTime>)> {
+    if let Some(ref dynamodb_sys) = **dynamodb_sys {
+        if let Some(metadata) = dynamodb_sys.get().await {
+            match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
+                Ok(checkpoint) => Some((false, checkpoint, metadata.updated_at)),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to deserialize checkpoint, falling back to bootstrap: table_name={} - {:?}",
+                        dataset_name,
+                        err
+                    );
+                    get_latest_checkpoint(dynamodb, dataset_name)
+                        .await
+                        .map(|cp| (true, cp, None))
+                }
+            }
+        } else {
+            get_latest_checkpoint(dynamodb, dataset_name)
+                .await
+                .map(|cp| (true, cp, None))
+        }
+    } else {
+        get_latest_checkpoint(dynamodb, dataset_name)
+            .await
+            .map(|cp| (true, cp, None))
+    }
+}
+
+async fn get_latest_checkpoint(
+    dynamodb: &Arc<DynamoDBTableProvider>,
+    dataset_name: &TableReference,
+) -> Option<Checkpoint> {
+    match dynamodb.latest_global_checkpoint().await {
+        Ok(checkpoint) => Some(checkpoint),
+        Err(err) => {
+            if let Error::FailedToInitializeStream { source: e } = err {
+                tracing::error!(
+                    "Failed to initialize DynamoDB Stream for dataset {dataset_name}: {e}"
+                );
+            } else {
+                tracing::error!(
+                    "Failed to initialize DynamoDB Stream checkpoint for dataset {dataset_name}: {err}",
+                );
+            }
+
+            None
+        }
+    }
+}
+
+/// Creates a bootstrap stream that initializes the table from a full scan,
+/// then transitions to the changes stream from the checkpoint.
+async fn create_bootstrap_stream(
+    dynamodb: Arc<DynamoDBTableProvider>,
+    dynamodb_sys: Arc<Option<DynamoDBSys>>,
+    checkpoint: Checkpoint,
+    acceptable_lag: Duration,
+    dataset_name: TableReference,
+) -> Option<ChangesStream> {
+    tracing::info!(
+        "No existing lag found for DynamoDB Streams table {dataset_name}, starting initialization"
+    );
+
+    let dataset_name_for_bootstrap = dataset_name.clone();
+    let dataset_name_for_complete = dataset_name.clone();
+    let dataset_name_for_changes = dataset_name.clone();
+
+    // Initialize bootstrap stream
+    let bootstrap_stream = Arc::clone(&dynamodb)
+        .bootstrap_stream()
+        .await
+        .ok()?
+        .map(move |msg| {
+            msg.map(|change_batch| {
+                tracing::info!(
+                    "Initializing DynamoDB Streams table {}, records={}",
+                    dataset_name_for_bootstrap.clone(),
+                    change_batch.record.num_rows()
+                );
+                // Bootstrap stream doesn't commit changes and doesn't mark dataset as ready
+                ChangeEnvelope::new(Box::new(NoOpCommitter), change_batch, false)
+            })
+        });
+
+    let checkpoint_cloned = checkpoint.clone();
+    let dynamodb_sys_cloned = Arc::clone(&dynamodb_sys);
+
+    // Attach changes stream from initial checkpoint to bootstrap stream
+    Some(
+        bootstrap_stream
+            .chain(
+                stream::once(async move {
+                    tracing::info!(
+                        "DynamoDB Streams table {} initialization complete, starting to process changes from the Stream. \
+                        Table will be marked as Ready once lag reaches < '{}'",
+                        dataset_name_for_complete,
+                        humantime::format_duration(acceptable_lag)
+                    );
+
+                    let committer =
+                        DynamoDBStreamCommitter::new(dynamodb_sys_cloned, checkpoint_cloned);
+                    if let Err(err) = committer.commit() {
+                        tracing::error!("Failed to commit bootstrap checkpoint: {:?}", err);
+                    }
+
+                    stream::empty()
+                })
+                .flatten(),
+            )
+            .chain(
+                stream::once(async move {
+                    match changes_stream_from_checkpoint(
+                        Arc::clone(&dynamodb),
+                        Arc::clone(&dynamodb_sys),
+                        checkpoint,
+                        acceptable_lag,
+                        dataset_name_for_changes.clone(),
+                    )
+                    .await
+                    {
+                        Ok(stream) => Some(stream),
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to start changes stream after bootstrap for DynamoDB table {}: {}",
+                                dataset_name_for_changes, e
+                            );
+                            None
+                        }
+                    }
+                })
+                .filter_map(|opt| async move { opt })
+                .flatten(),
+            )
+            .boxed(),
+    )
+}
+
+/// Resumes streaming from an existing checkpoint, handling shard expiration scenarios.
+#[allow(clippy::too_many_arguments)]
+fn resume_from_checkpoint_stream(
+    dynamodb: Arc<DynamoDBTableProvider>,
+    dynamodb_sys: Arc<Option<DynamoDBSys>>,
+    checkpoint: Checkpoint,
+    checkpoint_updated_at: Option<SystemTime>,
+    acceptable_lag: Duration,
+    dataset_name: TableReference,
+    lag_exceeds_behavior: LagExceedsShardRetentionBehavior,
+    accelerated_table_provider: Arc<dyn TableProvider>,
+    accelerator_write_mutex: Arc<Mutex<()>>,
+    metrics_collector: Arc<MetricsCollector>,
+) -> Option<ChangesStream> {
+    Some(
+        stream::once(async move {
+            match changes_stream_from_checkpoint(
+                Arc::clone(&dynamodb),
+                Arc::clone(&dynamodb_sys),
+                checkpoint,
+                acceptable_lag,
+                dataset_name.clone(),
+            )
+            .await
+            {
+                Ok(changes_stream) => {
+                    // Resume reading from lag normally
+                    tracing::info!(
+                        "Found existing lag for DynamoDB Streams table {dataset_name}, resuming. \
+                        Table will be marked as Ready once lag reaches < '{}'",
+                        humantime::format_duration(acceptable_lag),
+                    );
+                    Some(changes_stream)
+                }
+                Err(Error::FailedToInitializeCheckpoint {
+                    source: dynamodb_streams::Error::ShardNotFound,
+                }) => {
+                    // ShardNotFound - check checkpoint age to determine action
+                    const CHECKPOINT_AGE_THRESHOLD: Duration =
+                        Duration::from_secs(CHECKPOINT_EXPIRATION_HOURS * 60 * 60);
+                    let checkpoint_age = checkpoint_updated_at
+                        .and_then(|t| SystemTime::now().duration_since(t).ok())
+                        .unwrap_or(Duration::from_secs(24 * 60 * 60)); // Assume old if no timestamp
+
+                    if checkpoint_age < CHECKPOINT_AGE_THRESHOLD {
+                        // Checkpoint is fresh (<18h), ShardNotFound is unexpected - propagate error
+                        tracing::warn!(
+                            "ShardNotFound for DynamoDB table {} but checkpoint is only {:?} old (< 18h threshold). Propagating error.",
+                            dataset_name, checkpoint_age
+                        );
+                        return Some(
+                            stream::once(async move {
+                                Err(StreamError::DynamoDB(
+                                    DynamoDBStreamError::FailedToReceiveMessage {
+                                        source: dynamodb_streams::Error::ShardNotFound,
+                                    },
+                                ))
+                            })
+                            .boxed(),
+                        );
+                    }
+
+                    // Checkpoint is old enough (> 18h) - apply configured behavior
+                    match lag_exceeds_behavior {
+                        LagExceedsShardRetentionBehavior::Error => {
+                            // Propagate the original error so downstream marks dataset as Error
+                            tracing::error!(
+                                "DynamoDB table {} checkpoint references expired shard (age {:?}). \
+                                Configured behavior is 'error', propagating error to mark dataset as failed.",
+                                dataset_name, checkpoint_age
+                            );
+                            Some(
+                                stream::once(async move {
+                                    Err(StreamError::DynamoDB(
+                                        DynamoDBStreamError::FailedToReceiveMessage {
+                                            source: dynamodb_streams::Error::ShardNotFound,
+                                        },
+                                    ))
+                                })
+                                .boxed(),
+                            )
+                        }
+                        _ => {
+                            // ReadyBeforeLoad or ReadyAfterLoad - do rebootstrap
+                            tracing::info!(
+                                "DynamoDB table {} checkpoint references expired shard (age {:?}). \
+                                Initiating re-bootstrap with behavior {:?}.",
+                                dataset_name, checkpoint_age, lag_exceeds_behavior
+                            );
+                            rebootstrap_table(
+                                &dynamodb,
+                                &dynamodb_sys,
+                                acceptable_lag,
+                                &dataset_name,
+                                accelerated_table_provider,
+                                accelerator_write_mutex,
+                                lag_exceeds_behavior,
+                                metrics_collector,
+                            )
+                            .await
+                        }
+                    }
+                }
+                Err(err) => {
+                    // Other errors - log and return None
+                    tracing::error!(
+                        "Failed to get stream from checkpoint for DynamoDB table {}: {}",
+                        dataset_name, err
+                    );
+                    None
+                }
+            }
+        })
+        .filter_map(|opt| async move { opt })
+        .flatten()
+        .boxed(),
+    )
+}
+
+async fn changes_stream_from_checkpoint(
+    dynamodb: Arc<DynamoDBTableProvider>,
+    dynamodb_sys: Arc<Option<DynamoDBSys>>,
+    checkpoint: Checkpoint,
+    acceptable_lag: Duration,
+    dataset_name: TableReference,
+) -> Result<ChangesStream, Error> {
+    tracing::debug!(
+        "Starting DynamoDB stream from checkpoint: table_name={}, checkpoint={:?}",
+        dataset_name,
+        checkpoint,
+    );
+
+    let stream = dynamodb.stream_from_checkpoint(checkpoint).await?;
+
+    Ok(stream
+        .map(move |msg| {
+            msg.map(|(change_batch, checkpoint, watermark)| {
+                let lag = watermark.and_then(|v| SystemTime::now().duration_since(v).ok());
+
+                tracing::debug!(
+                    "Processing DynamoDB Streams batch: table_name={}, watermark={}, lag={}, shards={}, records={}",
+                    dataset_name,
+                    watermark
+                        .map_or_else(|| "-".to_string(), |w| humantime::format_rfc3339(w).to_string()),
+                    lag
+                        .map_or_else(|| "-".to_string(), |l| humantime::format_duration(l).to_string()),
+                    checkpoint.shards.len(),
+                    change_batch.record.num_rows(),
+                );
+
+                ChangeEnvelope::new(
+                    Box::new(DynamoDBStreamCommitter::new(
+                        Arc::clone(&dynamodb_sys),
+                        checkpoint,
+                    )),
+                    change_batch,
+                    lag.is_some_and(|l| l < acceptable_lag),
+                )
+            })
+        })
+        .boxed())
 }
 
 async fn rebootstrap_table(
@@ -801,120 +988,6 @@ fn create_empty_ready_envelope(
         change_batch,
         true,
     ))
-}
-
-async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<DynamoDBSys> {
-    match DynamoDBSys::try_new(dataset, OpenOption::OpenExisting).await {
-        Ok(sys) => Some(sys),
-        Err(err) => {
-            tracing::error!(
-                "Failed to initialize DynamoDBSys for checkpoint persistence: table={} - {:?}",
-                dataset.name,
-                err
-            );
-            None
-        }
-    }
-}
-
-/// Loads checkpoint from `DynamoDBSys`, or initializes a new checkpoint if none exists.
-/// Returns (should_bootstrap, checkpoint, checkpoint_updated_at).
-async fn load_or_initialize_checkpoint(
-    dynamodb: &Arc<DynamoDBTableProvider>,
-    dynamodb_sys: &Arc<Option<DynamoDBSys>>,
-    dataset_name: &TableReference,
-) -> Option<(bool, Checkpoint, Option<SystemTime>)> {
-    if let Some(ref dynamodb_sys) = **dynamodb_sys {
-        if let Some(metadata) = dynamodb_sys.get().await {
-            match serde_json::from_str::<Checkpoint>(&metadata.checkpoint_data) {
-                Ok(checkpoint) => Some((false, checkpoint, metadata.updated_at)),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to deserialize checkpoint, falling back to bootstrap: table_name={} - {:?}",
-                        dataset_name,
-                        err
-                    );
-                    get_latest_checkpoint(dynamodb, dataset_name)
-                        .await
-                        .map(|cp| (true, cp, None))
-                }
-            }
-        } else {
-            get_latest_checkpoint(dynamodb, dataset_name)
-                .await
-                .map(|cp| (true, cp, None))
-        }
-    } else {
-        get_latest_checkpoint(dynamodb, dataset_name)
-            .await
-            .map(|cp| (true, cp, None))
-    }
-}
-
-async fn get_latest_checkpoint(
-    dynamodb: &Arc<DynamoDBTableProvider>,
-    dataset_name: &TableReference,
-) -> Option<Checkpoint> {
-    match dynamodb.latest_global_checkpoint().await {
-        Ok(checkpoint) => Some(checkpoint),
-        Err(err) => {
-            if let Error::FailedToInitializeStream { source: e } = err {
-                tracing::error!(
-                    "Failed to initialize DynamoDB Stream for dataset {dataset_name}: {e}"
-                );
-            } else {
-                tracing::error!(
-                    "Failed to initialize DynamoDB Stream checkpoint for dataset {dataset_name}: {err}",
-                );
-            }
-
-            None
-        }
-    }
-}
-
-async fn changes_stream_from_checkpoint(
-    dynamodb: Arc<DynamoDBTableProvider>,
-    dynamodb_sys: Arc<Option<DynamoDBSys>>,
-    checkpoint: Checkpoint,
-    acceptable_lag: Duration,
-    dataset_name: TableReference,
-) -> Result<ChangesStream, Error> {
-    tracing::debug!(
-        "Starting DynamoDB stream from checkpoint: table_name={}, checkpoint={:?}",
-        dataset_name,
-        checkpoint,
-    );
-
-    let stream = dynamodb.stream_from_checkpoint(checkpoint).await?;
-
-    Ok(stream
-        .map(move |msg| {
-            msg.map(|(change_batch, checkpoint, watermark)| {
-                let lag = watermark.and_then(|v| SystemTime::now().duration_since(v).ok());
-
-                tracing::debug!(
-                    "Processing DynamoDB Streams batch: table_name={}, watermark={}, lag={}, shards={}, records={}",
-                    dataset_name,
-                    watermark
-                        .map_or_else(|| "-".to_string(), |w| humantime::format_rfc3339(w).to_string()),
-                    lag
-                        .map_or_else(|| "-".to_string(), |l| humantime::format_duration(l).to_string()),
-                    checkpoint.shards.len(),
-                    change_batch.record.num_rows(),
-                );
-
-                ChangeEnvelope::new(
-                    Box::new(DynamoDBStreamCommitter::new(
-                        Arc::clone(&dynamodb_sys),
-                        checkpoint,
-                    )),
-                    change_batch,
-                    lag.is_some_and(|l| l < acceptable_lag),
-                )
-            })
-        })
-        .boxed())
 }
 
 #[derive(Debug, Clone)]

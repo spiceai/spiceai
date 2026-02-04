@@ -706,8 +706,6 @@ impl Builder {
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
-        // Create the accelerator write mutex early so it can be shared between the Refresher and the AcceleratedTable.
-        // let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
