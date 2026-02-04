@@ -731,95 +731,102 @@ impl Runtime {
             None
         };
 
-        let maybe_cluster_future: Option<BoxedClusterFuture> =
-            match self.df.cluster_config.effective_role() {
-                Some(ClusterRole::Scheduler) => {
-                    cluster::initialize_cluster_scheduler(&self).await?;
-                    // Start internal cluster server for scheduler on separate port
-                    let internal_server_shutdown = CancellationToken::new();
-                    let self_ref = Arc::clone(&self);
-                    let cloned_shutdown = internal_server_shutdown.clone();
-                    let executor_registry = Arc::clone(
-                        scheduler_executor_registry
-                            .as_ref()
-                            .context(MissingSchedulerExecutorRegistrySnafu)?,
-                    );
-                    let internal_server_fut = async move {
-                        cluster::start_internal_cluster_server(
-                            Arc::clone(&self_ref),
-                            Some(cloned_shutdown),
-                            executor_registry,
-                        )
-                        .await
-                        .context(UnableToStartClusterServerSnafu)
-                    };
-                    let self_for_task = Arc::clone(&self);
-                    let internal_server_future = self_for_task
-                        .start_runtime_task(
-                            CLUSTER_INTERNAL_SERVER,
-                            Some(internal_server_shutdown),
-                            internal_server_fut,
-                        )
-                        .await;
+        let maybe_cluster_future: Option<BoxedClusterFuture> = match self
+            .df
+            .cluster_config
+            .effective_role()
+        {
+            Some(ClusterRole::Scheduler) => {
+                cluster::initialize_cluster_scheduler(&self).await?;
+                // Start internal cluster server for scheduler on separate port
+                let internal_server_shutdown = CancellationToken::new();
+                let self_ref = Arc::clone(&self);
+                let cloned_shutdown = internal_server_shutdown.clone();
+                let executor_registry = Arc::clone(
+                    scheduler_executor_registry
+                        .as_ref()
+                        .context(MissingSchedulerExecutorRegistrySnafu)?,
+                );
+                let internal_server_fut = async move {
+                    cluster::start_internal_cluster_server(
+                        Arc::clone(&self_ref),
+                        Some(cloned_shutdown),
+                        executor_registry,
+                    )
+                    .await
+                    .context(UnableToStartClusterServerSnafu)
+                };
+                let self_for_task = Arc::clone(&self);
+                let internal_server_future = self_for_task
+                    .start_runtime_task(
+                        CLUSTER_INTERNAL_SERVER,
+                        Some(internal_server_shutdown),
+                        internal_server_fut,
+                    )
+                    .await;
 
-                    let scheduler_registry_future = {
-                        let app = self.app.read().await;
-                        let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
-                        if let Some(config) = config {
-                            let registry_shutdown = CancellationToken::new();
-                            let registry_shutdown_for_task = registry_shutdown.clone();
-                            let peers = self.scheduler_peers();
-                            let self_ref = Arc::clone(&self);
-                            let registry_task = async move {
-                                cluster::start_scheduler_registry(
-                                    self_ref,
-                                    &config,
-                                    registry_shutdown.clone(),
-                                    peers,
-                                )
-                                .await
-                                .map_err(|err| {
-                                    Error::FailedToRegisterScheduler {
-                                        source: Box::new(err),
-                                    }
-                                })
-                            };
-                            Some(
-                                self_for_task
-                                    .start_runtime_task(
-                                        CLUSTER_SCHEDULER_REGISTRY,
-                                        Some(registry_shutdown_for_task),
-                                        registry_task,
-                                    )
-                                    .await,
+                let scheduler_registry_future = {
+                    let app = self.app.read().await;
+                    let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
+                    if let Some(config) = config {
+                        let registry_shutdown = CancellationToken::new();
+                        let registry_shutdown_for_task = registry_shutdown.clone();
+                        let peers = self.scheduler_peers();
+                        let self_ref = Arc::clone(&self);
+                        let registry_task = async move {
+                            cluster::start_scheduler_registry(
+                                self_ref,
+                                &config,
+                                registry_shutdown.clone(),
+                                peers,
                             )
-                        } else {
-                            None
-                        }
-                    };
+                            .await
+                            .map_err(|err| {
+                                Error::FailedToRegisterScheduler {
+                                    source: Box::new(err),
+                                }
+                            })
+                        };
+                        Some(
+                            self_for_task
+                                .start_runtime_task(
+                                    CLUSTER_SCHEDULER_REGISTRY,
+                                    Some(registry_shutdown_for_task),
+                                    registry_task,
+                                )
+                                .await,
+                        )
+                    } else {
+                        None
+                    }
+                };
 
-                    let cluster_future = async move {
-                        if let Some(registry_future) = scheduler_registry_future {
-                            tokio::try_join!(internal_server_future, registry_future).map(|_| ())
-                        } else {
-                            internal_server_future.await
-                        }
-                    };
+                let cluster_future = async move {
+                    if let Some(registry_future) = scheduler_registry_future {
+                        tokio::try_join!(internal_server_future, registry_future).map(|_| ())
+                    } else {
+                        internal_server_future.await
+                    }
+                };
 
-                    Some(Box::pin(cluster_future))
-                }
-                Some(ClusterRole::Executor) => {
-                    let executor_fut =
-                        cluster::initialize_cluster_executor(Arc::clone(&self)).await?;
-                    let self_ref = Arc::clone(&self);
-                    Some(Box::pin(
-                        self_ref
-                            .start_runtime_task(CLUSTER_EXECUTOR, None, executor_fut)
-                            .await,
-                    ))
-                }
-                _ => None,
-            };
+                Some(Box::pin(cluster_future))
+            }
+            Some(ClusterRole::Executor) => {
+                let executor_shutdown = CancellationToken::new();
+                let executor_fut = cluster::initialize_cluster_executor(
+                    Arc::clone(&self),
+                    executor_shutdown.clone(),
+                )
+                .await?;
+                let self_ref = Arc::clone(&self);
+                Some(Box::pin(
+                    self_ref
+                        .start_runtime_task(CLUSTER_EXECUTOR, Some(executor_shutdown), executor_fut)
+                        .await,
+                ))
+            }
+            _ => None,
+        };
 
         if self.df.cluster_config.effective_role().is_some() {
             tracing::warn!(
