@@ -42,7 +42,7 @@ use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 use crate::metrics_reader::MetricsReader;
 
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Handle for a single control stream connection to a scheduler.
 struct ControlStreamHandle {
