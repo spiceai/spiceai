@@ -79,6 +79,11 @@ impl QueryLivenessStats {
 
     /// Calculate a percentile latency (0-100).
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     pub fn percentile(&self, p: f64) -> Duration {
         if self.latencies.is_empty() {
             return Duration::ZERO;

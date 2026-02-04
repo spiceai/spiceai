@@ -389,6 +389,7 @@ pub static STREAM_LAG: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+#[allow(dead_code)]
 pub static DATA_INSERTION_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("data_insertion_duration_ms")

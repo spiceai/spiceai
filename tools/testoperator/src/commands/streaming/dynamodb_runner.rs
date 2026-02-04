@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! DynamoDB Streams ingestion benchmark runner.
+//! `DynamoDB` Streams ingestion benchmark runner.
 //!
 //! This module contains the DynamoDB-specific benchmark orchestration logic.
 //! It uses snapshot-based checkpoint capture to ensure fair benchmarking.
@@ -24,7 +24,7 @@ limitations under the License.
 //! The streaming benchmark uses a two-phase approach:
 //!
 //! 1. **Preparation phase** (`streaming-dynamodb-dispatch` command):
-//!    - Creates DynamoDB tables
+//!    - Creates `DynamoDB` tables
 //!    - Inserts data and captures snapshots for each config
 //!    - Tables and snapshots identified by a shared `run_id`
 //!
@@ -57,7 +57,7 @@ use crate::args::StreamingDynamodbTestArgs;
 use crate::commands::create_telemetry_with_resource;
 use crate::health::HealthMonitor;
 
-/// Run the DynamoDB streaming ingestion benchmark from a snapshot.
+/// Run the `DynamoDB` streaming ingestion benchmark from a snapshot.
 ///
 /// This requires that `dispatch-dynamodb` has already:
 /// 1. Created tables and inserted data
@@ -239,7 +239,7 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         let mut total_failures: u64 = 0;
         let mut max_latency_ms: f64 = 0.0;
 
-        for (_endpoint, stats) in report.endpoints.iter() {
+        for stats in report.endpoints.values() {
             total_failures += stats.failure_count;
             let latency_ms = stats.max_latency.as_secs_f64() * 1000.0;
             if latency_ms > max_latency_ms {
@@ -360,6 +360,7 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     let record_count = dynamodb_metrics.records_consumed_total;
 
     // Calculate throughput
+    #[allow(clippy::cast_precision_loss)]
     let throughput = if ingestion_duration.as_secs_f64() > 0.0 && record_count > 0 {
         record_count as f64 / ingestion_duration.as_secs_f64()
     } else {
@@ -390,7 +391,7 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
 
     // Report result
     println!("\nBenchmark Result:");
-    println!("  Config: {}", config_name);
+    println!("  Config: {config_name}");
     println!(
         "  Ingestion Duration: {:.2}s",
         ingestion_duration.as_secs_f64()

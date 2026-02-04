@@ -21,7 +21,7 @@ use clap::Parser;
 use super::CommonArgs;
 use crate::commands::streaming::querysets::QuerySetType;
 
-/// Arguments for DynamoDB streaming ingestion benchmarks (single config).
+/// Arguments for `DynamoDB` streaming ingestion benchmarks (single config).
 ///
 /// This command runs a benchmark from an existing snapshot created by `dispatch-dynamodb`:
 /// 1. Starts Spice from snapshot
@@ -34,11 +34,11 @@ use crate::commands::streaming::querysets::QuerySetType;
 ///
 /// ## Environment Variables
 ///
-/// ### AWS DynamoDB
+/// ### AWS `DynamoDB`
 /// - `DYNAMODB_AWS_REGION`: AWS region (required)
 /// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
 /// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
-/// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for LocalStack)
+/// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for `LocalStack`)
 ///
 /// ### Snapshot Storage (required)
 /// - `SNAPSHOT_S3_LOCATION`: S3 location for snapshots (e.g., `s3://bucket/snapshots/`)
@@ -46,7 +46,6 @@ use crate::commands::streaming::querysets::QuerySetType;
 /// - `SNAPSHOT_S3_SECRET_ACCESS_KEY`: S3 secret access key (optional)
 /// - `SNAPSHOT_S3_REGION`: S3 region (optional)
 #[derive(Parser, Debug, Clone)]
-#[expect(clippy::struct_excessive_bools)]
 pub struct StreamingDynamodbTestArgs {
     /// Common arguments (spicepod path, spiced path, metrics, etc.)
     #[command(flatten)]
@@ -76,13 +75,13 @@ pub struct StreamingDynamodbTestArgs {
     #[arg(long, default_value = "500")]
     pub query_liveness_interval_ms: u64,
 
-    /// Run ID that identifies the DynamoDB tables and snapshot location
+    /// Run ID that identifies the `DynamoDB` tables and snapshot location
     /// created by a previous dispatch-dynamodb run. Required.
     #[arg(long)]
     pub run_id: String,
 }
 
-/// Arguments for DynamoDB streaming dispatch (multi-config benchmarks).
+/// Arguments for `DynamoDB` streaming dispatch (multi-config benchmarks).
 ///
 /// This command ingests data once and runs multiple benchmark configurations:
 /// 1. Creates tables and inserts initial data
@@ -96,11 +95,11 @@ pub struct StreamingDynamodbTestArgs {
 ///
 /// ## Environment Variables
 ///
-/// ### AWS DynamoDB
+/// ### AWS `DynamoDB`
 /// - `DYNAMODB_AWS_REGION`: AWS region (required)
 /// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
 /// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
-/// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for LocalStack)
+/// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for `LocalStack`)
 ///
 /// ### Snapshot Storage (required)
 /// - `SNAPSHOT_S3_LOCATION`: S3 location for snapshots (e.g., `s3://bucket/snapshots/`)
@@ -159,6 +158,7 @@ pub struct StreamingDynamodbDispatchArgs {
     /// Ratio of rows to mutate (0.0-1.0). When > 0, selected rows are split 50/50:
     /// - Half go through: INSERT (wrong) → UPDATE (correct)
     /// - Half go through: INSERT (wrong) → DELETE → INSERT (correct)
+    ///
     /// Remaining rows are inserted directly with final values.
     #[arg(long, default_value = "0.0")]
     pub mutation_ratio: f64,

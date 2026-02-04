@@ -95,10 +95,10 @@ impl MutationSummary {
 /// Data for mutation execution, organized by operation type.
 struct MutationData {
     /// Rows for update path: INSERT wrong → UPDATE correct
-    /// (wrong_values, correct_values)
+    /// (`wrong_values`, `correct_values`)
     update_path: (Vec<RecordBatch>, Vec<RecordBatch>),
     /// Rows for delete path: INSERT wrong → DELETE → INSERT correct
-    /// (wrong_values, keys_for_delete, correct_values)
+    /// (`wrong_values`, `keys_for_delete`, `correct_values`)
     delete_path: (Vec<RecordBatch>, Vec<RecordBatch>, Vec<RecordBatch>),
     /// Rows to insert directly with correct values
     direct_inserts: Vec<RecordBatch>,
@@ -205,7 +205,7 @@ impl MutationGenerator {
         for (col_idx, field) in schema.fields().iter().enumerate() {
             if primary_key_columns.contains(&field.name().as_str()) {
                 key_columns.push(batch.column(col_idx).slice(row, 1));
-                key_fields.push(field.clone());
+                key_fields.push(Arc::clone(field));
             }
         }
 
@@ -214,6 +214,11 @@ impl MutationGenerator {
     }
 
     /// Select which row indices to mutate based on the ratio.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     fn select_rows_to_mutate(&mut self, total_rows: usize) -> HashSet<usize> {
         let num_to_mutate =
             ((total_rows as f64 * self.config.mutation_ratio).round() as usize).min(total_rows);
@@ -298,19 +303,19 @@ impl MutationGenerator {
     }
 }
 
+/// Batch size for concatenating single-row batches.
+const CONCATENATE_BATCH_SIZE: usize = 1000;
+
 /// Concatenate multiple single-row batches into larger batches.
-fn concatenate_batches(single_row_batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+fn concatenate_batches(single_row_batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
     if single_row_batches.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Group into batches of ~1000 rows for efficient processing
-    const BATCH_SIZE: usize = 1000;
-
     let schema = single_row_batches[0].schema();
     let mut result = Vec::new();
 
-    for chunk in single_row_batches.chunks(BATCH_SIZE) {
+    for chunk in single_row_batches.chunks(CONCATENATE_BATCH_SIZE) {
         let batch = arrow::compute::concat_batches(&schema, chunk)
             .context("Failed to concatenate batches")?;
         result.push(batch);
@@ -322,7 +327,7 @@ fn concatenate_batches(single_row_batches: Vec<RecordBatch>) -> Result<Vec<Recor
 /// Execute mutation sequences for all datasets using batched operations.
 ///
 /// For each dataset, this will:
-/// 1. Select rows to mutate based on mutation_ratio
+/// 1. Select rows to mutate based on `mutation_ratio`
 /// 2. Split mutated rows 50/50 between update path and delete path
 /// 3. Execute operations:
 ///    - INSERT wrong values for all mutated rows
@@ -372,8 +377,7 @@ pub async fn execute_mutation_sequences(
         summary.direct_insert_rows += direct_insert_count;
 
         println!(
-            "  {} update-path + {} delete-path + {} direct = {} total",
-            update_path_count, delete_path_count, direct_insert_count, total_rows
+            "  {update_path_count} update-path + {delete_path_count} delete-path + {direct_insert_count} direct = {total_rows} total"
         );
 
         // Step 1: INSERT wrong values for all mutated rows
@@ -389,7 +393,7 @@ pub async fn execute_mutation_sequences(
                 "  Step 1: INSERT {} rows with wrong values...",
                 all_wrong.len()
             );
-            let batches = concatenate_batches(all_wrong)?;
+            let batches = concatenate_batches(&all_wrong)?;
             if let Err(e) = source.insert(&table_name, &batches).await {
                 eprintln!("    Failed: {e}");
                 summary.failed_operations += 1;
@@ -404,7 +408,7 @@ pub async fn execute_mutation_sequences(
                 "  Step 2: UPDATE {} rows with correct values...",
                 data.update_path.1.len()
             );
-            let batches = concatenate_batches(data.update_path.1)?;
+            let batches = concatenate_batches(&data.update_path.1)?;
             if let Err(e) = source.update(&table_name, &batches).await {
                 eprintln!("    Failed: {e}");
                 summary.failed_operations += 1;
@@ -416,7 +420,7 @@ pub async fn execute_mutation_sequences(
         // Step 3: DELETE delete-path rows
         if !data.delete_path.1.is_empty() {
             println!("  Step 3: DELETE {} rows...", data.delete_path.1.len());
-            let batches = concatenate_batches(data.delete_path.1)?;
+            let batches = concatenate_batches(&data.delete_path.1)?;
             if let Err(e) = source.delete(&table_name, &batches).await {
                 eprintln!("    Failed: {e}");
                 summary.failed_operations += 1;
@@ -431,7 +435,7 @@ pub async fn execute_mutation_sequences(
                 "  Step 4: INSERT {} rows with correct values (delete-path)...",
                 data.delete_path.2.len()
             );
-            let batches = concatenate_batches(data.delete_path.2)?;
+            let batches = concatenate_batches(&data.delete_path.2)?;
             if let Err(e) = source.insert(&table_name, &batches).await {
                 eprintln!("    Failed: {e}");
                 summary.failed_operations += 1;
@@ -446,7 +450,7 @@ pub async fn execute_mutation_sequences(
                 "  Step 5: Direct INSERT {} rows with correct values...",
                 data.direct_inserts.len()
             );
-            let batches = concatenate_batches(data.direct_inserts)?;
+            let batches = concatenate_batches(&data.direct_inserts)?;
             if let Err(e) = source.insert(&table_name, &batches).await {
                 eprintln!("    Failed: {e}");
                 summary.failed_operations += 1;
@@ -456,8 +460,7 @@ pub async fn execute_mutation_sequences(
         }
 
         println!(
-            "Completed {}: {} update-path + {} delete-path + {} direct = {} total",
-            dataset_type, update_path_count, delete_path_count, direct_insert_count, total_rows
+            "Completed {dataset_type}: {update_path_count} update-path + {delete_path_count} delete-path + {direct_insert_count} direct = {total_rows} total"
         );
     }
 

@@ -20,8 +20,8 @@ limitations under the License.
 //!
 //! ## Commands
 //!
-//! - `streaming-dynamodb`: Run a single DynamoDB streaming benchmark
-//! - `dispatch-dynamodb`: Run multi-config DynamoDB benchmarks (ingest once, benchmark many)
+//! - `streaming-dynamodb`: Run a single `DynamoDB` streaming benchmark
+//! - `dispatch-dynamodb`: Run multi-config `DynamoDB` benchmarks (ingest once, benchmark many)
 
 pub mod datasets;
 pub mod dynamodb_dispatch;

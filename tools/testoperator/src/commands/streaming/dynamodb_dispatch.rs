@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! DynamoDB Streams dispatch for multi-config benchmarks.
+//! `DynamoDB` Streams dispatch for multi-config benchmarks.
 //!
 //! This module orchestrates benchmarks across multiple spicepod configurations,
 //! ingesting data once and running each configuration sequentially.
@@ -57,7 +57,7 @@ use super::utils::{
 };
 use crate::args::StreamingDynamodbDispatchArgs;
 
-/// Run the DynamoDB streaming dispatch (multi-config benchmarks).
+/// Run the `DynamoDB` streaming dispatch (multi-config benchmarks).
 ///
 /// This ingests data once and runs benchmarks for multiple configurations.
 pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
@@ -256,7 +256,7 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
             source.insert(&table_name, &remaining_data).await?;
             total_insert_duration += insert_start.elapsed();
         }
-    };
+    }
 
     println!("Data insertion completed in {total_insert_duration:?}");
 
@@ -405,7 +405,6 @@ fn wait_for_workflow_completion(workflow: &str, repo: Option<&str>) -> Result<()
 }
 
 /// Capture a checkpoint snapshot for a single configuration.
-#[expect(clippy::too_many_arguments)]
 async fn capture_checkpoint_snapshot(
     source: &Arc<dyn DynamoDBStreamingSource>,
     spicepod_path: &Path,
@@ -424,7 +423,10 @@ async fn capture_checkpoint_snapshot(
 
     // Write transformed spicepod to temp file
     let temp_path = write_temp_spicepod(&transformed, run_id, config_name, "checkpoint")?;
-    println!("  Wrote transformed spicepod to capture checkpoints to {temp_path:?}");
+    println!(
+        "  Wrote transformed spicepod to capture checkpoints to {}",
+        temp_path.display()
+    );
 
     // Start temp Spice
     let mut start_request = StartRequest::new(args.spiced_path_buf(), transformed)?;

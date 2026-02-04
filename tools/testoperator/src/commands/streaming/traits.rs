@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! The streaming benchmark system is built around these abstractions:
 //! - [`StreamingDataset`]: Defines a table within a benchmark dataset (e.g., TPCH lineitem)
-//! - [`StreamingSource`]: Generic interface for streaming sources (DynamoDB, Kafka, etc.)
+//! - [`StreamingSource`]: Generic interface for streaming sources (`DynamoDB`, Kafka, etc.)
 //! - [`DynamoDBStreamingSource`]: DynamoDB-specific extension with snapshot/checkpoint support
 
 use arrow::array::RecordBatch;
@@ -30,7 +30,7 @@ use super::datasets::DatasetType;
 /// Configuration for snapshot storage (S3).
 #[derive(Debug, Clone)]
 pub struct SnapshotConfig {
-    /// Base S3 location for snapshots (e.g., "s3://bucket/snapshots/")
+    /// Base S3 location for snapshots (e.g., "<s3://bucket/snapshots>/")
     pub location: String,
     /// S3 access key ID
     pub access_key_id: Option<String>,
@@ -81,15 +81,16 @@ pub trait StreamingDataset: Send + Sync {
 
 /// Represents a streaming source that can receive data.
 ///
-/// This is the generic interface for all streaming sources (DynamoDB, Kafka, etc.).
+/// This is the generic interface for all streaming sources (`DynamoDB`, Kafka, etc.).
 /// Sources match on `DatasetType` to determine source-specific configuration
 /// like key schemas, topic settings, etc.
+#[allow(dead_code)]
 #[async_trait::async_trait]
 pub trait StreamingSource: Send + Sync {
     /// Set a table name prefix for isolated test runs.
     ///
     /// When set, all table names will be prefixed with this value.
-    /// For example, with prefix "abc123", table "lineitem" becomes "abc123_lineitem".
+    /// For example, with prefix "abc123", table "lineitem" becomes "`abc123_lineitem`".
     fn set_table_prefix(&mut self, prefix: String);
 
     /// Set the scale factor for TPCH data generation.
@@ -132,14 +133,14 @@ pub trait StreamingSource: Send + Sync {
 /// DynamoDB-specific streaming source with snapshot/checkpoint support.
 ///
 /// This trait extends [`StreamingSource`] with methods for transforming spicepods
-/// to capture checkpoints and restore from snapshots. This is required for DynamoDB
-/// benchmarks because DynamoDB Streams has limited retention (24 hours) and shard
+/// to capture checkpoints and restore from snapshots. This is required for `DynamoDB`
+/// benchmarks because `DynamoDB` Streams has limited retention (24 hours) and shard
 /// lifecycle issues that require snapshot-based checkpoint capture.
 pub trait DynamoDBStreamingSource: StreamingSource {
     /// Transform spicepod for checkpoint capture phase.
     ///
     /// This method:
-    /// - Renames datasets with run_id prefix to match DynamoDB table names
+    /// - Renames datasets with `run_id` prefix to match `DynamoDB` table names
     /// - Sets `acceleration.snapshots: create_only` to capture checkpoint
     /// - Configures runtime snapshot location
     fn prepare_checkpoint_spicepod(
@@ -153,7 +154,7 @@ pub trait DynamoDBStreamingSource: StreamingSource {
     /// Transform spicepod for benchmark phase.
     ///
     /// This method:
-    /// - Renames datasets with run_id prefix to match DynamoDB table names
+    /// - Renames datasets with `run_id` prefix to match `DynamoDB` table names
     /// - Sets `acceleration.snapshots: bootstrap_only` to restore from snapshot
     /// - Configures runtime snapshot location
     fn prepare_benchmark_spicepod(

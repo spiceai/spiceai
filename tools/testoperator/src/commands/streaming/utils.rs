@@ -31,6 +31,7 @@ use super::datasets::DatasetType;
 use super::traits::StreamingDataset;
 
 /// Information about a dataset being benchmarked.
+#[allow(dead_code)]
 pub struct DatasetInfo {
     pub dataset: Box<dyn StreamingDataset>,
     pub marker: RecordBatch,
@@ -107,6 +108,7 @@ pub fn skip_rows(batches: &[RecordBatch], rows_to_skip: usize) -> Vec<RecordBatc
 }
 
 /// Extract count value from a query result batch.
+#[allow(clippy::cast_possible_wrap)]
 pub fn get_count_from_batch(batch: &RecordBatch) -> Option<i64> {
     if let Some(array) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
         return Some(array.value(0));
@@ -119,6 +121,7 @@ pub fn get_count_from_batch(batch: &RecordBatch) -> Option<i64> {
 
 /// Poll until ALL markers are detected in their respective accelerated tables.
 /// The `marker_counts` map specifies how many markers to expect for each dataset.
+#[allow(clippy::cast_possible_wrap)]
 pub async fn poll_for_all_markers(
     spiced: &SpicedInstance,
     marker_queries: &HashMap<DatasetType, String>,
@@ -256,20 +259,16 @@ pub async fn poll_for_all_snapshots(dataset_names: &[&str], timeout: Duration) -
 
             if let Ok(response) = client.get(&url).send().await
                 && response.status().is_success()
-            {
-                if let Ok(body) = response.text().await {
+                && let Ok(body) = response.text().await {
                     // Parse JSON response to check if snapshots array is non-empty
                     // Response format: {"dataset_name":"...","snapshots":[...],...}
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if let Some(snapshots) = json.get("snapshots").and_then(|s| s.as_array()) {
-                            if !snapshots.is_empty() {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+                        && let Some(snapshots) = json.get("snapshots").and_then(|s| s.as_array())
+                            && !snapshots.is_empty() {
                                 println!("Snapshot created for {dataset_name}");
                                 newly_completed.push(*dataset_name);
                             }
-                        }
-                    }
                 }
-            }
         }
 
         for name in newly_completed {
@@ -285,7 +284,7 @@ pub async fn poll_for_all_snapshots(dataset_names: &[&str], timeout: Duration) -
     }
 }
 
-/// DynamoDB metrics fetched from Spice's Prometheus endpoint.
+/// `DynamoDB` metrics fetched from Spice's Prometheus endpoint.
 #[derive(Debug, Default)]
 pub struct DynamoDbMetrics {
     /// Total records consumed across all datasets.
@@ -294,13 +293,14 @@ pub struct DynamoDbMetrics {
     pub errors_transient_total: u64,
 }
 
-/// Fetch DynamoDB metrics from Spice's Prometheus metrics endpoint.
+/// Fetch `DynamoDB` metrics from Spice's Prometheus metrics endpoint.
 ///
 /// This sums metrics across all datasets:
 /// - `dataset_dynamodb_records_consumed_total`
 /// - `dataset_dynamodb_errors_transient_total`
 ///
 /// Requires spiced to be started with `--metrics` flag.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub async fn get_dynamodb_metrics() -> Result<DynamoDbMetrics> {
     let client = reqwest::Client::new();
     let response = client
@@ -325,8 +325,7 @@ pub async fn get_dynamodb_metrics() -> Result<DynamoDbMetrics> {
             line.split_whitespace()
                 .last()
                 .and_then(|v| v.parse::<f64>().ok())
-                .map(|v| v as u64)
-                .unwrap_or(0)
+                .map_or(0, |v| v as u64)
         };
 
         // Match lines like: dataset_dynamodb_records_consumed_total{dataset="lineitem",...} 12345

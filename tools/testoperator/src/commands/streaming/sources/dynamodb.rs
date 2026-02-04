@@ -39,7 +39,7 @@ use futures::stream::{self, StreamExt};
 use test_framework::anyhow::{self, Context, Result};
 use tokio::time::sleep;
 
-/// Maximum items per batch write request (DynamoDB limit).
+/// Maximum items per batch write request (`DynamoDB` limit).
 const BATCH_SIZE: usize = 25;
 
 /// Number of concurrent batch write requests.
@@ -75,7 +75,7 @@ use crate::commands::streaming::traits::{
 /// - `DYNAMODB_AWS_REGION`: AWS region (required)
 /// - `DYNAMODB_AWS_ACCESS_KEY_ID`: AWS access key ID (required)
 /// - `DYNAMODB_AWS_SECRET_ACCESS_KEY`: AWS secret access key (required)
-/// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for LocalStack)
+/// - `DYNAMODB_AWS_ENDPOINT_URL`: Custom endpoint URL (optional, for `LocalStack`)
 #[derive(Debug, Clone)]
 pub struct DynamoDbConfig {
     /// AWS region (e.g., "us-east-1")
@@ -181,6 +181,7 @@ impl DynamoDbStreamsSource {
     ///
     /// Decimal128 stores values as integers scaled by 10^scale.
     /// For example, 12345 with scale=2 represents 123.45
+    #[allow(clippy::cast_sign_loss)]
     fn format_decimal128(value: i128, _precision: u8, scale: i8) -> String {
         if scale <= 0 {
             // No decimal places needed
@@ -296,6 +297,7 @@ impl DynamoDbStreamsSource {
     }
 
     /// Build tags for a new table.
+    #[allow(clippy::expect_used)]
     fn build_table_tags(run_id: &str, scale_factor: Option<f64>) -> Vec<Tag> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -369,35 +371,29 @@ impl DynamoDbStreamsSource {
                     };
 
                     // Get tags for this table using the ARN
-                    match client
+                    if let Ok(tags_response) = client
                         .list_tags_of_resource()
                         .resource_arn(&arn)
                         .send()
-                        .await
-                    {
-                        Ok(tags_response) => {
-                            if let Some(tags) = tags_response.tags {
-                                // Look for our created_at tag
-                                for tag in tags {
-                                    if tag.key() == TAG_CREATED_AT {
-                                        let value = tag.value();
-                                        if let Ok(created_at) = value.parse::<u64>() {
-                                            if created_at < cutoff {
-                                                let age_hours = (now - created_at) / 3600;
-                                                println!(
-                                                    "  Found stale table: {} ({}h old)",
-                                                    table_name, age_hours
-                                                );
-                                                tables_to_delete.push(table_name.clone());
-                                            }
+                        .await {
+                        if let Some(tags) = tags_response.tags {
+                            // Look for our created_at tag
+                            for tag in tags {
+                                if tag.key() == TAG_CREATED_AT {
+                                    let value = tag.value();
+                                    if let Ok(created_at) = value.parse::<u64>()
+                                        && created_at < cutoff {
+                                            let age_hours = (now - created_at) / 3600;
+                                            println!(
+                                                "  Found stale table: {table_name} ({age_hours}h old)"
+                                            );
+                                            tables_to_delete.push(table_name.clone());
                                         }
-                                    }
                                 }
                             }
                         }
-                        Err(_) => {
-                            // Can't get tags, skip this table (might not be ours)
-                        }
+                    } else {
+                        // Can't get tags, skip this table (might not be ours)
                     }
                 }
             }
@@ -529,7 +525,7 @@ impl DynamoDbStreamsSource {
         }
     }
 
-    /// Convert a record batch row to a HashMap of attribute values.
+    /// Convert a record batch row to a `HashMap` of attribute values.
     fn row_to_item(batch: &RecordBatch, row: usize) -> Result<HashMap<String, AttributeValue>> {
         let schema = batch.schema();
         let mut item = HashMap::new();
@@ -568,7 +564,7 @@ impl DynamoDbStreamsSource {
         // Split into batches of BATCH_SIZE
         let batches: Vec<Vec<WriteRequest>> = all_requests
             .chunks(BATCH_SIZE)
-            .map(|chunk| chunk.to_vec())
+            .map(<[aws_sdk_dynamodb::types::WriteRequest]>::to_vec)
             .collect();
 
         let total_batches = batches.len();
@@ -585,12 +581,12 @@ impl DynamoDbStreamsSource {
                 let table = table.to_string();
                 let inserted = &inserted;
                 async move {
+                    const MAX_RETRIES: usize = 5;
                     let batch_len = batch.len();
 
                     // Retry logic for unprocessed items
                     let mut items_to_write = batch;
                     let mut retry_count = 0;
-                    const MAX_RETRIES: usize = 5;
 
                     while !items_to_write.is_empty() && retry_count < MAX_RETRIES {
                         let mut request_items = HashMap::new();
@@ -613,7 +609,7 @@ impl DynamoDbStreamsSource {
                             retry_count += 1;
                             let backoff = Duration::from_millis(100 * (1 << retry_count));
                             sleep(backoff).await;
-                            items_to_write = remaining.clone();
+                            items_to_write.clone_from(remaining);
                             continue;
                         }
 
@@ -680,7 +676,7 @@ impl DynamoDbStreamsSource {
         // Split into batches of BATCH_SIZE
         let batches: Vec<Vec<WriteRequest>> = all_requests
             .chunks(BATCH_SIZE)
-            .map(|chunk| chunk.to_vec())
+            .map(<[aws_sdk_dynamodb::types::WriteRequest]>::to_vec)
             .collect();
 
         let total_batches = batches.len();
@@ -697,12 +693,12 @@ impl DynamoDbStreamsSource {
                 let table = table.to_string();
                 let deleted = &deleted;
                 async move {
+                    const MAX_RETRIES: usize = 5;
                     let batch_len = batch.len();
 
                     // Retry logic for unprocessed items
                     let mut items_to_delete = batch;
                     let mut retry_count = 0;
-                    const MAX_RETRIES: usize = 5;
 
                     while !items_to_delete.is_empty() && retry_count < MAX_RETRIES {
                         let mut request_items = HashMap::new();
@@ -725,7 +721,7 @@ impl DynamoDbStreamsSource {
                             retry_count += 1;
                             let backoff = Duration::from_millis(100 * (1 << retry_count));
                             sleep(backoff).await;
-                            items_to_delete = remaining.clone();
+                            items_to_delete.clone_from(remaining);
                             continue;
                         }
 
@@ -1183,12 +1179,12 @@ impl DynamoDBStreamingSource for DynamoDbStreamsSource {
     }
 }
 
-/// Transform a spicepod for DynamoDB streaming benchmarks.
+/// Transform a spicepod for `DynamoDB` streaming benchmarks.
 ///
 /// This function:
 /// 1. Prefixes the table name in `from` field (e.g., `dynamodb:lineitem` -> `dynamodb:{run_id}_lineitem`)
 /// 2. Sets `acceleration.snapshots` to the specified behavior
-/// 3. Adds engine-specific file path configs (duckdb_file or cayenne_file_path) based on acceleration.engine
+/// 3. Adds engine-specific file path configs (`duckdb_file` or `cayenne_file_path`) based on acceleration.engine
 /// 4. Configures runtime snapshots with unique location per config
 /// 5. Uses different paths for checkpoint vs benchmark phases
 fn transform_spicepod(
@@ -1230,7 +1226,7 @@ fn transform_spicepod(
 
             // Set acceleration snapshot behavior and add engine-specific file paths
             if let Some(ref mut accel) = d.acceleration {
-                accel.snapshots = snapshot_behavior.clone();
+                accel.snapshots = snapshot_behavior;
 
                 let dataset_name = &d.name;
                 let params = accel.params.get_or_insert_with(Params::default);

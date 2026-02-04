@@ -16,7 +16,7 @@ limitations under the License.
 
 //! TPCH query verification for streaming benchmarks.
 //!
-//! Uses SpiceTest from test-framework to run TPCH queries with validation,
+//! Uses `SpiceTest` from test-framework to run TPCH queries with validation,
 //! collecting per-query metrics (timing, status, row counts).
 
 use std::collections::BTreeMap;
@@ -32,9 +32,9 @@ use test_framework::spiced::SpicedInstance;
 use test_framework::spicetest::SpiceTest;
 use test_framework::spicetest::datasets::{EndCondition, NotStarted};
 
-/// Result of running TPCH verification using SpiceTest.
+/// Result of running TPCH verification using `SpiceTest`.
 pub struct VerificationResult {
-    /// The SpicedInstance (returned for continued use)
+    /// The `SpicedInstance` (returned for continued use)
     pub spiced_instance: SpicedInstance,
     /// Per-query metrics collected during verification
     pub metrics: QueryMetrics<DatasetMetrics, NoExtendedMetrics>,
@@ -44,18 +44,18 @@ pub struct VerificationResult {
     pub all_passed: bool,
 }
 
-/// Run TPCH query verification against the spiced instance using SpiceTest.
+/// Run TPCH query verification against the spiced instance using `SpiceTest`.
 ///
-/// This uses the same SpiceTest infrastructure as the bench command,
+/// This uses the same `SpiceTest` infrastructure as the bench command,
 /// running queries with validation and collecting per-query metrics.
 ///
 /// # Arguments
-/// * `spiced_instance` - Takes ownership of the SpicedInstance
+/// * `spiced_instance` - Takes ownership of the `SpicedInstance`
 /// * `iterations` - Number of times to run each query (default: 1 for correctness, higher for timing stats)
 /// * `scale_factor` - TPCH scale factor for validation
 ///
 /// # Returns
-/// * `VerificationResult` containing the SpicedInstance (for continued use) and metrics
+/// * `VerificationResult` containing the `SpicedInstance` (for continued use) and metrics
 pub async fn run_verification(
     spiced_instance: SpicedInstance,
     iterations: usize,
@@ -116,8 +116,7 @@ pub async fn run_verification(
     let failed_count = metrics.metrics.len() - passed_count;
 
     println!(
-        "Verification complete: {} passed, {} failed",
-        passed_count, failed_count
+        "Verification complete: {passed_count} passed, {failed_count} failed"
     );
 
     if !all_passed {
@@ -126,7 +125,7 @@ pub async fn run_verification(
             if let QueryStatus::Failed(reason) = &metric.query_status {
                 let reason_str = reason
                     .as_ref()
-                    .map_or("unknown error".to_string(), |r| r.to_string());
+                    .map_or("unknown error".to_string(), std::string::ToString::to_string);
                 println!("  {}: {}", metric.query_name, reason_str);
             }
         }
