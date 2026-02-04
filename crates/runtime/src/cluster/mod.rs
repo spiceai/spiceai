@@ -364,7 +364,7 @@ mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
-pub use executor_registry::{ExecutorRegistry, FlightSQLPartitionProviderProxy};
+pub use executor_registry::ExecutorRegistry;
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -548,7 +548,7 @@ impl ResolvedClusterConfig {
         };
 
         // Pre-compute scheduler URL from advertise address
-        let bind_port = config.node_bind_address.port();
+        let bind_port = config.node_port();
         let node_advertise_host = config.node_advertise_address.as_ref().map(|addr| {
             // Extract just the host, ignoring any port - always use bind_port
             if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
@@ -618,6 +618,19 @@ impl ResolvedClusterConfig {
     #[must_use]
     pub fn role(&self) -> Option<&ClusterRole> {
         self.config.role.as_ref()
+    }
+
+    /// Returns the fully qualified URL that this node advertises to other cluster nodes.
+    fn node_advertise_url(&self) -> String {
+        let port = self.config.node_bind_address.port();
+        let protocol = if self.tls_enabled() { "https" } else { "http" };
+        format!(
+            "{}://{}:{}",
+            protocol,
+            self.node_advertise_address()
+                .unwrap_or(&self.config.node_bind_address.ip().to_string()),
+            port
+        )
     }
 
     /// Returns the effective cluster role.
@@ -724,12 +737,6 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     scheduler_executor_registry: Arc<ExecutorRegistry>,
 ) -> crate::Result<Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'static>>>> {
     initialize_cluster_scheduler(rt).await?;
-    rt.df
-        .bind_executor_registry(Arc::clone(&scheduler_executor_registry))
-        .map_err(|e| FailedToStartClusterScheduler {
-            source: Box::new(e),
-        })?;
-
     // Start internal cluster server for scheduler on separate port
     let internal_server_shutdown = CancellationToken::new();
     let cloned_shutdown = internal_server_shutdown.clone();
@@ -858,33 +865,6 @@ pub async fn initialize_cluster_executor(
     let app_json = response.into_inner().app_json;
 
     let app_def: App = serde_json::from_str(&app_json)
-        .boxed()
-        .context(FailedToStartClusterExecutorSnafu)?;
-
-    // Get initial allocation of Accelerated table partitions.
-    // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
-    let _ = cluster_client
-        .allocate_initial_partitions(AllocateInitialPartitionsRequest {
-            executor_id: executor_id.clone(),
-        })
-        .await
-        .map_err(|status| FailedToStartClusterExecutor {
-            source: format!("Failed to get app definition from scheduler: {status}").into(),
-        })?
-        .into_inner()
-        .table_partitions
-        .into_iter()
-        .map(|(table_id, partitions)| {
-            Ok((
-                TableReference::parse_str(&table_id),
-                partitions
-                    .items
-                    .into_iter()
-                    .map(|e| Expr::from_bytes(&e.into_bytes()))
-                    .collect::<Result<Vec<Expr>, _>>()?,
-            ))
-        })
-        .collect::<Result<HashMap<TableReference, Vec<Expr>>, DataFusionError>>()
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
@@ -1206,6 +1186,36 @@ pub async fn initialize_cluster_executor(
     Ok(async move {
         let _ = rx_ready
             .await
+            .boxed()
+            .context(FailedToStartClusterExecutorSnafu)?;
+
+        // Get initial allocation of Accelerated table partitions.
+        // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
+        //
+        // This must be done after executor's flight service is ready to accept connections. Otherwise the scheduler will attempt to make connection and fail. Waiting until after `rx_ready` (which is done after the executor has established a network connection to the Scheduler's control plane), should give enough time for executor to bind locally for flight.
+        let _ = cluster_client
+            .allocate_initial_partitions(AllocateInitialPartitionsRequest {
+                executor_id: rt.datafusion().cluster_config.node_advertise_url(),
+            })
+            .await
+            .map_err(|status| FailedToStartClusterExecutor {
+                source: format!("Failed to allocate initial partitions from scheduler: {status}")
+                    .into(),
+            })?
+            .into_inner()
+            .table_partitions
+            .into_iter()
+            .map(|(table_id, partitions)| {
+                Ok((
+                    TableReference::parse_str(&table_id),
+                    partitions
+                        .items
+                        .into_iter()
+                        .map(|e| Expr::from_bytes(&e.into_bytes()))
+                        .collect::<Result<Vec<Expr>, _>>()?,
+                ))
+            })
+            .collect::<Result<HashMap<TableReference, Vec<Expr>>, DataFusionError>>()
             .boxed()
             .context(FailedToStartClusterExecutorSnafu)?;
 

@@ -164,4 +164,8 @@ impl ClusterConfig {
         self.scheduler_address = Some(url.into());
         self
     }
+
+    pub fn node_port(&self) -> u16 {
+        self.node_bind_address.port()
+    }
 }

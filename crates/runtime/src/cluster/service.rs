@@ -29,13 +29,14 @@ use arrow::array::RecordBatch;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
+use datafusion::scalar::ScalarValue;
+use datafusion::sql::TableReference;
 use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
-use flight_client::tls::new_tls_flight_channel;
-use flight_client::{
-    Credentials, FlightClient, MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
-};
+
+use datafusion_expr::Expr;
+use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use runtime_proto::cluster_service_server::ClusterService;
@@ -46,7 +47,7 @@ use runtime_proto::{
     ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
     GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest, GetSchedulersResponse,
     GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand, SchedulerControlMessage,
-    SchedulerInstance,
+    SchedulerInstance, StringArray,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -56,6 +57,7 @@ use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::cluster::SchedulerPeers;
@@ -538,30 +540,77 @@ impl ClusterService for ClusterServiceImpl {
         request: Request<AllocateInitialPartitionsRequest>,
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
         let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
-        tracing::error!("ClusterService::allocate_initial_partitions for executor {executor_id}");
 
-        let flight_channel = new_tls_flight_channel(&format!("http://{executor_id}"), None)
-            .await
-            .map_err(|e| {
-                Status::internal(format!(
-                    "Failed to create Flight client for executor {executor_id}: {e}"
-                ))
-            })?;
+        match create_executor_flight_client(&executor_id).await {
+            Ok(client) => {
+                let mut flight_client_registry =
+                    self.executor_registry.flight_sql_clients.write().await;
+                flight_client_registry.insert(executor_id.clone(), client);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to create Flight SQL client for executor {executor_id}: {e}"
+                );
+            }
+        };
 
-        let client = FlightServiceClient::new(flight_channel)
-            .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
-            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
-
-        let mut flight_client_registry = self.executor_registry.flight_sql_clients.write().await;
-        flight_client_registry.insert(
+        let table_partitions: HashMap<TableReference, StringArray> = (*self.app.read().await)
+            .as_ref()
+            .map(|app| {
+                app.datasets
+                    .iter()
+                    .map(|ds| {
+                        (
+                            TableReference::parse_str(&ds.name),
+                            StringArray { items: vec![] },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut executor_partitions = self.executor_registry.partitions.write().await;
+        executor_partitions.insert(
             executor_id.clone(),
-            FlightSqlServiceClient::new_from_inner(client),
+            table_partitions
+                .iter()
+                .map(|(tbl, _)| {
+                    (
+                        tbl.clone(),
+                        vec![
+                            Expr::Literal(ScalarValue::UInt16(Some(1)), None)
+                                .eq(Expr::Literal(ScalarValue::UInt16(Some(1)), None)),
+                        ],
+                    )
+                })
+                .collect(),
         );
 
         Ok(Response::new(AllocateInitialPartitionsResponse {
-            table_partitions: HashMap::default(),
+            table_partitions: table_partitions
+                .into_iter()
+                .map(|(tbl, x)| (tbl.to_string(), x))
+                .collect(),
         }))
     }
+}
+
+async fn create_executor_flight_client(
+    endpoint: &str,
+) -> Result<FlightSqlServiceClient<Channel>, tonic::transport::Error> {
+    let executor_address = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+
+    // TODO support for mTLS certificates per executor.
+    let flight_channel = Endpoint::from_shared(executor_address.clone())?.connect_lazy();
+
+    Ok(FlightSqlServiceClient::new_from_inner(
+        FlightServiceClient::new(flight_channel)
+            .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
+    ))
 }
 
 /// Handles an executor control message (heartbeat, etc.)

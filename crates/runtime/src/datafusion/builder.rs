@@ -24,7 +24,6 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
-use crate::cluster::FlightSQLPartitionProviderProxy;
 use crate::cluster::ResolvedClusterConfig;
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use crate::{metrics::telemetry::track_bytes_processed, status};
@@ -67,7 +66,6 @@ use datafusion_optimizer_rules::{
     physical_plan::EmptyHashJoinExecPhysicalOptimization,
 };
 use runtime_datafusion::{
-    analyzer_rule::PartitionedFlightSQLTableScan,
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
     url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
@@ -129,6 +127,8 @@ pub struct DataFusionBuilder {
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     url_tables_enabled: bool,
+    /// Arbitrary additional analyzer rules.
+    additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -172,6 +172,7 @@ impl DataFusionBuilder {
             io_runtime,
             resource_monitor: None,
             url_tables_enabled: false,
+            additional_analyzer_rules: vec![],
         }
     }
 
@@ -258,6 +259,11 @@ impl DataFusionBuilder {
         self
     }
 
+    pub fn with_analyzer_rules(mut self, rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>) -> Self {
+        self.additional_analyzer_rules = rules;
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
@@ -271,8 +277,6 @@ impl DataFusionBuilder {
             config = config.with_spill_compression(spill_compression);
         }
 
-        let executor_registry = Arc::new(RwLock::new(None));
-
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
@@ -283,15 +287,11 @@ impl DataFusionBuilder {
                 self.memory_limit,
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
-            ))
-            .with_analyzer_rules(
-                AnalyzerRulesBuilder::default()
-                    .with_extra_rules(vec![Arc::new(PartitionedFlightSQLTableScan::new(Arc::new(
-                        FlightSQLPartitionProviderProxy::new(Arc::clone(&executor_registry)),
-                    )))
-                        as Arc<dyn AnalyzerRule + Send + Sync>])
-                    .build(),
-            );
+            ));
+
+        for rule in self.additional_analyzer_rules {
+            state = state.with_analyzer_rule(rule);
+        }
 
         #[cfg(feature = "duckdb")]
         {
@@ -426,7 +426,6 @@ impl DataFusionBuilder {
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
-            executor_registry,
         }
     }
 }

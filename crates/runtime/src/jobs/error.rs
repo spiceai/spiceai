@@ -45,6 +45,9 @@ pub enum Error {
     #[snafu(display("Failed to delete job state from object store: {source}"))]
     ObjectStoreDelete { source: ObjectStoreError },
 
+    #[snafu(display("Failed to list objects in object store: {source}"))]
+    ObjectStoreList { source: ObjectStoreError },
+
     #[snafu(display("Failed to serialize job state: {source}"))]
     SerializeState { source: serde_json::Error },
 
@@ -71,6 +74,15 @@ pub enum Error {
         field: String,
         left_value: usize,
         right_value: usize,
+    },
+
+    #[snafu(display(
+        "Failed to delete distributed job '{job_id}': failed to delete {failed_deletions} of {total_chunks} data chunks."
+    ))]
+    PartialChunkDeletion {
+        job_id: String,
+        failed_deletions: usize,
+        total_chunks: usize,
     },
 
     #[snafu(display("Failed to read batch from result stream: {source}"))]
