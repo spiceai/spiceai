@@ -909,6 +909,8 @@ mod tests {
     use std::collections::HashMap;
     use std::process::ExitCode;
     use std::sync::{Arc, LazyLock};
+    use std::thread;
+    use std::time::Duration;
 
     pub static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> =
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
@@ -917,9 +919,12 @@ mod tests {
     /// Model loading from `HuggingFace` uses file locks; creating multiple models in parallel
     /// can fail with lock acquisition errors.
     #[cfg(feature = "models")]
-    static TEST_EMBEDDING_MODEL: LazyLock<Arc<Model2Vec>> = LazyLock::new(|| {
-        Arc::new(
-            Model2Vec::from_params(
+    fn load_test_embedding_model() -> Model2Vec {
+        const MAX_RETRIES: usize = 5;
+        let mut attempt = 0;
+
+        loop {
+            match Model2Vec::from_params(
                 "minishlab/potion-base-2M",
                 None,
                 None,
@@ -927,10 +932,23 @@ mod tests {
                 None,
                 None,
                 None,
-            )
-            .expect("Must make embedding model"),
-        )
-    });
+            ) {
+                Ok(model) => return model,
+                Err(err) => {
+                    let is_lock_error = err.to_string().contains("Lock acquisition failed");
+                    let should_retry = is_lock_error && attempt < MAX_RETRIES;
+                    assert!(should_retry, "Must make embedding model: {err}");
+                    let backoff_ms = 200_u64 * (1_u64 << attempt);
+                    thread::sleep(Duration::from_millis(backoff_ms));
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "models")]
+    static TEST_EMBEDDING_MODEL: LazyLock<Arc<Model2Vec>> =
+        LazyLock::new(|| Arc::new(load_test_embedding_model()));
 
     macro_rules! spice_named_lit {
         ($name:literal, $value:expr) => {{

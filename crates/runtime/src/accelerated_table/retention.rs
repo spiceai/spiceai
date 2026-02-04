@@ -122,10 +122,10 @@ impl super::AcceleratedTable {
                 let expr = match simplify_expr(expr.clone(), &accelerator.schema()) {
                     Ok(simplified) => simplified,
                     Err(e) => {
-                        tracing::error!(
-                            "[retention] Upon checking retention policy for table '{dataset_name}', an error occurred when attempting to simplify the relevant retention expression '{expr:?}'. Error: {e}"
+                        tracing::warn!(
+                            "[retention] Failed to simplify retention expression for table '{dataset_name}'. Using unsimplified expression. Error: {e}"
                         );
-                        continue;
+                        expr
                     }
                 };
 
