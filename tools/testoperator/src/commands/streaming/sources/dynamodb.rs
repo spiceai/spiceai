@@ -1206,7 +1206,6 @@ fn transform_spicepod(
     #[expect(clippy::expect_used)]
     std::fs::create_dir_all(format!("/tmp/benchmarks/{run_id}"))
         .expect("Failed to create benchmark directory");
-
     // 1. Update dataset `from` field with prefixed table name, keep `name` unchanged
     for dataset in &mut spicepod.datasets {
         if let ComponentOrReference::Component(d) = dataset {
