@@ -30,26 +30,34 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
-use datafusion::scalar::ScalarValue;
-use datafusion::sql::TableReference;
-use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
-use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::sqlparser::parser::Parser;
+
+use datafusion::{
+    scalar::ScalarValue,
+    sql::{
+        TableReference,
+        sqlparser::{
+            ast::{Ident, ObjectNamePart, visit_relations_mut},
+            dialect::PostgreSqlDialect,
+            parser::Parser,
+        },
+    },
+};
+
+use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
 
 use datafusion_expr::Expr;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
-use runtime_proto::cluster_service_server::ClusterService;
-use runtime_proto::executor_control_message::Message as ExecutorMessage;
-use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, ExecutorControlMessage,
     ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
     GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest, GetSchedulersResponse,
     GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand, SchedulerControlMessage,
-    SchedulerInstance, StringArray,
+    SchedulerInstance, StringArray, cluster_service_server::ClusterService,
+    executor_control_message::Message as ExecutorMessage,
+    scheduler_control_message::Message as SchedulerMessage,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -440,6 +448,7 @@ impl ClusterService for ClusterServiceImpl {
         // We need to identify the executor from its first message.
         // Spawn a task to handle the bidirectional stream.
         let executor_registry = Arc::clone(&self.executor_registry);
+        let datafusion = Arc::clone(&self.datafusion);
         let outbound_tx_for_registry = outbound_tx.clone();
         let inbound_task = tokio::spawn(async move {
             let executor_id = match inbound.next().await {
@@ -453,7 +462,7 @@ impl ClusterService for ClusterServiceImpl {
 
                     // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, &message, &executor_registry);
+                        handle_executor_message(&executor_id, &message, &datafusion).await;
                     }
                     executor_id
                 }
@@ -483,27 +492,28 @@ impl ClusterService for ClusterServiceImpl {
                     }
                     result = inbound.next() => {
                         match result {
-                            Some(Ok(ExecutorControlMessage { message: None,.. })) => {
-                                tracing::debug!("Received empty executor control message from {executor_id}");
-                            }
-                            Some(Ok(ExecutorControlMessage { message: Some(ExecutorMessage::Metrics(response)),..})) => {
-                                // Handle metrics responses by completing pending requests.
-                                let mut pending = pending_requests.write().await;
-                                if let Some(sender) = pending.remove(&response.request_id) {
-                                    let _ = sender.send(response.clone());
-                                } else {
-                                    tracing::warn!(
-                                        "Received metrics response for unknown request_id: {}",
-                                        response.request_id
-                                    );
+                            Some(Ok(msg)) => {
+                                if let Some(message) = msg.message {
+                                    // Handle metrics responses by completing pending requests.
+                                    if let ExecutorMessage::Metrics(response) = &message {
+                                        let mut pending = pending_requests.write().await;
+                                        if let Some(sender) = pending.remove(&response.request_id) {
+                                            let _ = sender.send(response.clone());
+                                        } else {
+                                            tracing::warn!(
+                                                "Received metrics response for unknown request_id: {}",
+                                                response.request_id
+                                            );
+                                        }
+                                    } else {
+                                        handle_executor_message(
+                                            &executor_id,
+                                            &message,
+                                            &datafusion,
+                                        )
+                                        .await;
+                                    }
                                 }
-                            }
-                            Some(Ok(ExecutorControlMessage { executor_id, message: Some(ExecutorMessage::Heartbeat(response))})) => {
-                                handle_executor_message(
-                                    &executor_id,
-                                    &ExecutorMessage::Heartbeat(response),
-                                    &executor_registry,
-                                );
                             }
                             Some(Err(e)) => {
                                 tracing::debug!("Executor control stream error for {executor_id}: {e}");
@@ -618,11 +628,11 @@ async fn create_executor_flight_client(
     ))
 }
 
-/// Handles an executor control message (heartbeat, etc.)
-fn handle_executor_message(
+/// Handles an executor control message (heartbeat, shutdown, etc.)
+async fn handle_executor_message(
     executor_id: &str,
     message: &ExecutorMessage,
-    _registry: &ExecutorRegistry,
+    datafusion: &DataFusion,
 ) {
     match message {
         ExecutorMessage::Heartbeat(heartbeat) => {
@@ -638,7 +648,55 @@ fn handle_executor_message(
                 "Unexpected metrics response in handle_executor_message for {executor_id}"
             );
         }
+        ExecutorMessage::Shutdown(shutdown) => {
+            let reason = if shutdown.reason.is_empty() {
+                "executor shutdown".to_string()
+            } else {
+                shutdown.reason.clone()
+            };
+            let ballista_executor_id = if shutdown.ballista_executor_id.is_empty() {
+                executor_id
+            } else {
+                shutdown.ballista_executor_id.as_str()
+            };
+            tracing::info!(
+                executor_id = %executor_id,
+                ballista_executor_id = %ballista_executor_id,
+                reason = %reason,
+                "Executor shutdown requested"
+            );
+            if let Err(err) =
+                notify_scheduler_executor_shutdown(datafusion, ballista_executor_id, &reason).await
+            {
+                tracing::warn!(
+                    "Failed to notify scheduler about executor shutdown for {ballista_executor_id}: {err}"
+                );
+            }
+        }
     }
+}
+
+async fn notify_scheduler_executor_shutdown(
+    datafusion: &DataFusion,
+    executor_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let scheduler = datafusion
+        .scheduler_server
+        .read()
+        .map_err(|_| "Failed to lock scheduler server".to_string())?
+        .clone()
+        .ok_or_else(|| "Scheduler server not initialized".to_string())?;
+
+    scheduler
+        .executor_stopped(Request::new(ExecutorStoppedParams {
+            executor_id: executor_id.to_string(),
+            reason: reason.to_string(),
+        }))
+        .await
+        .map_err(|e| format!("Failed to notify scheduler about executor shutdown: {e}"))?;
+
+    Ok(())
 }
 /// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
 ///

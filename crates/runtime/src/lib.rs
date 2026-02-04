@@ -759,11 +759,21 @@ impl Runtime {
                 )
             }
             Some(ClusterRole::Executor) => {
-                let executor_fut = cluster::initialize_cluster_executor(Arc::clone(&self)).await?;
+                let executor_shutdown = CancellationToken::new();
+                let executor_fut = cluster::initialize_cluster_executor(
+                    Arc::clone(&self),
+                    executor_shutdown.clone(),
+                )
+                .await?;
+                let self_ref = Arc::clone(&self);
                 (
                     Some(Box::pin(
-                        Arc::clone(&self)
-                            .start_runtime_task(CLUSTER_EXECUTOR, None, executor_fut)
+                        self_ref
+                            .start_runtime_task(
+                                CLUSTER_EXECUTOR,
+                                Some(executor_shutdown),
+                                executor_fut,
+                            )
                             .await,
                     )),
                     None,
