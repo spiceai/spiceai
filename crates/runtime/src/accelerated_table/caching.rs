@@ -1955,7 +1955,7 @@ mod tests {
     #[derive(Debug)]
     struct MockHttpTableProvider {
         schema: SchemaRef,
-        /// Data to return from scan (should include response_status column)
+        /// Data to return from scan (should include `response_status` column)
         data: Vec<RecordBatch>,
     }
 
@@ -3106,7 +3106,7 @@ mod tests {
         );
     }
 
-    /// Helper to create a schema with response_status column for filter_5xx tests
+    /// Helper to create a schema with `response_status` column for `filter_5xx` tests
     fn create_http_response_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("content", DataType::Utf8, false),

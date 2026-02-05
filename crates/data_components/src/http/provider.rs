@@ -63,6 +63,9 @@ pub enum Error {
     #[snafu(display("HTTP request failed: {source}"))]
     HttpRequest { source: reqwest::Error },
 
+    #[snafu(display("HTTP request failed with status code {status}"))]
+    HttpServerError { status: u16 },
+
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
@@ -96,6 +99,10 @@ impl From<Error> for DataFusionError {
             Error::HttpClientError { status, message } => {
                 DataFusionError::Plan(format!("HTTP client error ({status}): {message}"))
             }
+            // Server errors (5xx) are external errors
+            Error::HttpServerError { status } => DataFusionError::External(Box::new(
+                std::io::Error::other(format!("HTTP request failed with status code {status}")),
+            )),
             // Retry exhaustion is an external error
             Error::AllRetriesFailed { max_retries, url } => {
                 DataFusionError::External(Box::new(std::io::Error::other(format!(
@@ -733,7 +740,10 @@ impl HttpTableProvider {
             if let Err(e) = response.error_for_status() {
                 return Err(RetryError::transient(Error::HttpRequest { source: e }));
             }
-            unreachable!("5xx status code should produce error from error_for_status");
+            // Defensive: should never reach here since 5xx always produces error_for_status Err
+            return Err(RetryError::transient(Error::HttpServerError {
+                status: status_code,
+            }));
         }
 
         // 2xx, 3xx, 4xx (and 5xx when accept_5xx=true): valid response
