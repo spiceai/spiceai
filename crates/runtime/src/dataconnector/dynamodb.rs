@@ -32,7 +32,6 @@ use data_components::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitEr
 use data_components::dynamodb::provider::DynamoDBTableProvider;
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 use data_components::dynamodb::{Error, JsonNesting};
-use datafusion::catalog::Session;
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::prelude::SessionContext;
@@ -454,7 +453,7 @@ impl DataConnector for DynamoDB {
                     )
                     .await
                 } else {
-                    resume_from_checkpoint_stream(
+                    Some(resume_from_checkpoint_stream(
                         dynamodb,
                         dynamodb_sys,
                         checkpoint,
@@ -465,7 +464,7 @@ impl DataConnector for DynamoDB {
                         accelerated_table_provider,
                         accelerator_write_mutex,
                         metrics_collector,
-                    )
+                    ))
                 }
             })
             .flat_map(|opt| opt.unwrap_or_else(|| stream::empty().boxed())),
@@ -643,9 +642,8 @@ fn resume_from_checkpoint_stream(
     accelerated_table_provider: Arc<dyn TableProvider>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     metrics_collector: Arc<MetricsCollector>,
-) -> Option<ChangesStream> {
-    Some(
-        stream::once(async move {
+) -> ChangesStream {
+    stream::once(async move {
             match changes_stream_from_checkpoint(
                 Arc::clone(&dynamodb),
                 Arc::clone(&dynamodb_sys),
@@ -742,8 +740,7 @@ fn resume_from_checkpoint_stream(
         })
         .filter_map(|opt| async move { opt })
         .flatten()
-        .boxed(),
-    )
+        .boxed()
 }
 
 async fn changes_stream_from_checkpoint(
@@ -790,6 +787,7 @@ async fn changes_stream_from_checkpoint(
         .boxed())
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn rebootstrap_table(
     dynamodb: &Arc<DynamoDBTableProvider>,
     dynamodb_sys: &Arc<Option<DynamoDBSys>>,

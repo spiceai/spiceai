@@ -87,7 +87,7 @@ impl DynamoDBSys {
                     let checkpoint_data: String = row.get(0)?;
                     let updated_at_epoch: Option<i64> = row.get(1).ok();
                     let updated_at = updated_at_epoch.and_then(|epoch| {
-                        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(epoch as u64))
+                        u64::try_from(epoch).ok().and_then(|e| std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(e)))
                     });
 
                     Ok(DynamoDBCheckpointMetadata {
