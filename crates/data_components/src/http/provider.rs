@@ -680,18 +680,17 @@ impl HttpTableProvider {
         // If retries exhausted due to transient errors (5xx), make one final attempt
         // and return whatever response we get - 5xx is still valid data.
         // Don't retry on permanent errors (e.g., failed to read response body).
-        match result {
-            Ok(fetch_result) => Ok(fetch_result),
-            Err(_) => {
-                tracing::debug!(
-                    "Retries exhausted for {url}, making final attempt accepting any status"
-                );
-                self.perform_single_request(&url, body, path_label, true)
-                    .await
-                    .map_err(|e| match e {
-                        RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
-                    })
-            }
+        if let Ok(fetch_result) = result {
+            Ok(fetch_result)
+        } else {
+            tracing::debug!(
+                "Retries exhausted for {url}, making final attempt accepting any status"
+            );
+            self.perform_single_request(&url, body, path_label, true)
+                .await
+                .map_err(|e| match e {
+                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
+                })
         }
     }
 
@@ -729,12 +728,12 @@ impl HttpTableProvider {
         // 5xx: retry with backoff (might be transient server issue)
         // After retries exhausted, we'll accept 5xx as valid response
         if !accept_5xx && (500..600).contains(&status_code) {
-            tracing::debug!("HTTP server error ({}), will retry", status_code);
-            return Err(RetryError::transient(Error::HttpRequest {
-                source: response
-                    .error_for_status()
-                    .expect_err("5xx should be error"),
-            }));
+            tracing::debug!("HTTP server error ({status_code}), will retry");
+            // We already verified status_code is 5xx, so error_for_status will return Err
+            if let Err(e) = response.error_for_status() {
+                return Err(RetryError::transient(Error::HttpRequest { source: e }));
+            }
+            unreachable!("5xx status code should produce error from error_for_status");
         }
 
         // 2xx, 3xx, 4xx (and 5xx when accept_5xx=true): valid response
