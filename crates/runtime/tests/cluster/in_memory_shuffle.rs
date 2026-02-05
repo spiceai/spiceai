@@ -51,7 +51,7 @@ use crate::{
 
 /// CSV data with more rows to ensure shuffle occurs across multiple partitions.
 /// The data has multiple cities to enable meaningful GROUP BY operations.
-const TEST_DATA_CSV: &str = r#"id,name,age,city,score
+const TEST_DATA_CSV: &str = r"id,name,age,city,score
 1,Alice,30,New York,85
 2,Bob,25,Los Angeles,90
 3,Charlie,35,Chicago,88
@@ -68,7 +68,7 @@ const TEST_DATA_CSV: &str = r#"id,name,age,city,score
 14,Noah,31,Los Angeles,81
 15,Olivia,28,Chicago,88
 16,Paul,32,New York,90
-"#;
+";
 
 async fn wait_for_executor_count(
     executor_manager: &ExecutorManager,
@@ -102,7 +102,7 @@ async fn wait_for_executor_count(
 ///
 /// Then runs a GROUP BY query that requires shuffle between executors.
 /// Before the fix for issue #9290, this would fail with:
-/// "Shuffle partition not found in memory: memory://job-id/stage/partition"
+/// `Shuffle partition not found in memory: memory://job-id/stage/partition`
 ///
 /// The fix ensures executors correctly fetch shuffle partitions from remote
 /// executors when they don't exist in local memory.
