@@ -14,28 +14,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use datafusion::common::ParamValues;
-use futures::TryStreamExt;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::datafusion::DataFusion;
-use crate::datafusion::query::QueryBuilder;
+use crate::datafusion::query::{QueryBuilder, QueryHandle, QueryHandleError};
+use crate::http::v1::queries::SubmitQueryRequest;
+use crate::jobs::state::JobErrorCode;
 
 use super::Result;
 use super::state::{JobState, JobStatus};
 use super::store::JobStore;
 
+/// Tracks an active job's cancellation token and query handle (once submitted).
+struct ActiveJobInfo {
+    cancel_token: CancellationToken,
+    /// The Ballista scheduler job ID, set once submitted to the scheduler.
+    query_handle: Option<QueryHandle>,
+}
+
 /// Manages background execution of async query jobs.
+///
+/// The `JobExecutor` coordinates asynchronous query execution by:
+/// 1. Creating jobs in the `JobStore`
+/// 2. Submitting queries via `Query::submit_distributed` to get a `QueryHandle`
+/// 3. Polling the `QueryHandle` for completion
+/// 4. Writing results to the `JobStore` when complete
 pub struct JobExecutor {
     job_store: Arc<JobStore>,
     df: Arc<DataFusion>,
-    /// Tracks active job cancellation tokens by `job_id`
-    active_jobs: Arc<RwLock<std::collections::HashMap<String, CancellationToken>>>,
+    /// Tracks active jobs by Spice `job_id`
+    active_jobs: Arc<RwLock<std::collections::HashMap<String, ActiveJobInfo>>>,
 }
 
 impl std::fmt::Debug for JobExecutor {
@@ -60,19 +76,21 @@ impl JobExecutor {
     /// Submits a new query job for async execution.
     ///
     /// Returns the job state immediately. The query will be executed in the background.
-    pub async fn submit(
-        &self,
-        sql: String,
-        parameters: Option<serde_json::Value>,
-    ) -> Result<JobState> {
-        let state = self.job_store.create_job(sql, parameters).await?;
+    pub async fn submit(&self, request: SubmitQueryRequest) -> Result<JobState> {
+        let state = self.job_store.create_job(request).await?;
         let job_id = state.job_id.clone();
 
         // Create cancellation token for this job
         let cancel_token = CancellationToken::new();
         {
             let mut active = self.active_jobs.write().await;
-            active.insert(job_id.clone(), cancel_token.clone());
+            active.insert(
+                job_id.clone(),
+                ActiveJobInfo {
+                    cancel_token: cancel_token.clone(),
+                    query_handle: None,
+                },
+            );
         }
 
         // Spawn background task to execute the job
@@ -84,7 +102,8 @@ impl JobExecutor {
         tokio::spawn(
             async move {
                 let result =
-                    Self::execute_job(&job_store, df, &job_id_clone, cancel_token.clone()).await;
+                    Self::execute_job(&job_store, df, &job_id_clone, &active_jobs, cancel_token)
+                        .await;
 
                 // Remove from active jobs
                 {
@@ -104,12 +123,10 @@ impl JobExecutor {
 
     /// Requests cancellation of a running job.
     pub async fn cancel(&self, job_id: &str) -> Result<JobState> {
-        // Signal cancellation if job is active
-        {
-            let active = self.active_jobs.read().await;
-            if let Some(token) = active.get(job_id) {
-                token.cancel();
-            }
+        // Signal cancellation to the running task
+        let active = self.active_jobs.read().await;
+        if let Some(info) = active.get(job_id) {
+            info.cancel_token.cancel();
         }
 
         // Update job state
@@ -140,10 +157,12 @@ impl JobExecutor {
         self.job_store.list_jobs(status_filter).await
     }
 
+    /// Executes a job using `Query::submit_distributed` and writes results to the store.
     async fn execute_job(
         job_store: &JobStore,
         df: Arc<DataFusion>,
         job_id: &str,
+        active_jobs: &RwLock<std::collections::HashMap<String, ActiveJobInfo>>,
         cancel: CancellationToken,
     ) -> Result<()> {
         // Get job and mark as running
@@ -155,92 +174,139 @@ impl JobExecutor {
             return Ok(());
         }
 
+        // Build and submit the query using Query::submit_distributed
+        let mut query_builder = QueryBuilder::new(&state.sql, Arc::clone(&df));
+
         // Parse parameters if present
-        let params: Option<ParamValues> = if let Some(p) = state.parameters {
+        if let Some(p) = state.parameters {
             match crate::datafusion::param_utils::convert_json_to_param_values(p) {
-                Ok(params) => Some(params),
+                Ok(params) => {
+                    query_builder = query_builder.parameters(Some(params));
+                }
                 Err(e) => {
                     job_store
-                        .fail_job(job_id, "INVALID_PARAMETERS", e.to_string())
+                        .fail_job(job_id, JobErrorCode::ParameterBindingFailed, e.to_string())
                         .await?;
                     return Ok(());
                 }
             }
-        } else {
-            None
+        }
+
+        let query = query_builder.build();
+
+        let query_handle = match query.submit_distributed(job_id).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                let error_code = Self::query_error_to_code(&e);
+                job_store
+                    .fail_job(job_id, error_code, e.to_string())
+                    .await?;
+                return Ok(());
+            }
         };
 
-        // Execute the query using distributed execution (Ballista)
-        let query_result = {
-            let mut builder = QueryBuilder::new(&state.sql, Arc::clone(&df));
-            if let Some(p) = params {
-                builder = builder.parameters(Some(p));
-            }
+        tracing::debug!(
+            job_id,
+            ballista_job_id = %query_handle.ballista_job_id(),
+            is_cached = %query_handle.is_cached(),
+            "Query submitted for distributed execution"
+        );
 
-            tokio::select! {
-                result = builder.build().run_distributed() => result,
-                () = cancel.cancelled() => {
-                    job_store.cancel_job(job_id).await?;
-                    return Ok(());
+        // Store the Ballista job ID for cancellation
+        let mut active = active_jobs.write().await;
+        if let Some(info) = active.get_mut(job_id) {
+            info.query_handle = Some(query_handle.clone());
+        }
+
+        drop(active);
+
+        let timeout_fut: Pin<Box<dyn Future<Output = ()> + Send>> = state.timeout_seconds.map_or(
+            Box::pin(std::future::pending()) as Pin<Box<dyn Future<Output = ()> + Send>>,
+            |secs| {
+                Box::pin(tokio::time::sleep(Duration::from_secs(secs)))
+                    as Pin<Box<dyn Future<Output = ()> + Send>>
+            },
+        );
+
+        tokio::select! {
+            () = cancel.cancelled() => {
+                tracing::debug!(job_id = %job_id, "Job cancelled before completion");
+                if let Err(e) = query_handle.cancel().await {
+                    tracing::error!("Failed to cancel the distributed query '{job_id}': {e}");
                 }
+                job_store.cancel_job(job_id).await?;
+                Ok(())
+            },
+            () = timeout_fut => {
+                tracing::debug!(job_id = %job_id, "Job timed out");
+                if let Err(e) = query_handle.cancel().await {
+                    tracing::error!("Failed to cancel the timed-out query '{job_id}': {e}");
+                }
+                job_store.fail_job(job_id, JobErrorCode::Timeout, "Job execution timed out".to_string()).await?;
+                Ok(())
             }
-        };
-
-        match query_result {
-            Ok(result) => {
-                // Collect results - check for cancellation periodically
-                let mut batches = Vec::new();
-                let mut stream = result.data;
-
-                loop {
-                    tokio::select! {
-                        batch_opt = stream.try_next() => {
-                            match batch_opt {
-                                Ok(Some(batch)) => batches.push(batch),
-                                Ok(None) => break,
-                                Err(e) => {
-                                    job_store.fail_job(job_id, "QUERY_EXECUTION", e.to_string()).await?;
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        () = cancel.cancelled() => {
-                            job_store.cancel_job(job_id).await?;
-                            return Ok(());
-                        }
+            result_stream = query_handle.into_stream() => {
+                // Wait for completion and get the result stream
+                let result_stream = match result_stream {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let (error_code, error_msg) = Self::handle_error_to_code_and_msg(&e);
+                        job_store.fail_job(job_id, error_code, error_msg).await?;
+                        return Ok(());
                     }
-                }
+                };
 
-                // Write result chunks
-                let job_result = job_store.write_result_chunks(job_id, batches).await?;
+                // Write result chunks as batches arrive from the stream
+                let job_result = match job_store
+                    .write_result_chunks_from_stream(job_id, result_stream)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        job_store
+                            .fail_job(job_id, JobErrorCode::FetchingResultsFailed, e.to_string())
+                            .await?;
+                        return Ok(());
+                    }
+                };
 
                 // Mark job as succeeded
                 job_store.complete_job(job_id, job_result).await?;
-            }
-            Err(e) => {
-                let error_message = e.to_string();
-                let error_code = categorize_error(&error_message);
-                job_store
-                    .fail_job(job_id, error_code, error_message)
-                    .await?;
+
+                Ok(())
             }
         }
-
-        Ok(())
     }
-}
 
-/// Categorizes an error message into an error code.
-///
-/// Returns a generic `QUERY_EXECUTION` error code rather than attempting to
-/// infer categories from error message text. String-based error categorization
-/// is unreliable because:
-/// - Error messages can contain user-controlled content (e.g., SQL with "timeout" in comments)
-/// - Error message formats can change between `DataFusion` versions
-/// - Misclassification can mislead users about the actual error
-///
-/// For reliable error categorization, use structured error types from `DataFusion`
-/// rather than string matching.
-fn categorize_error(_message: &str) -> &'static str {
-    "QUERY_EXECUTION"
+    /// Converts a `Query::Error` to an error code string.
+    fn query_error_to_code(e: &crate::datafusion::query::Error) -> JobErrorCode {
+        use crate::datafusion::query::Error;
+        match e {
+            Error::SchedulerUnavailable => JobErrorCode::SchedulerUnavailable,
+            Error::SessionCreationFailed { .. } | Error::JobSubmissionFailed { .. } => {
+                JobErrorCode::SubmissionFailed
+            }
+            Error::UnableToExecuteQuery { .. } | Error::TableAccessDisallowed { .. } => {
+                JobErrorCode::ExecutionFailed
+            }
+            Error::BindingParameters { .. } => JobErrorCode::ParameterBindingFailed,
+            _ => JobErrorCode::Internal,
+        }
+    }
+
+    /// Converts a `QueryHandleError` to an error code string and message.
+    fn handle_error_to_code_and_msg(e: &QueryHandleError) -> (JobErrorCode, String) {
+        match e {
+            QueryHandleError::JobTimeout { .. } => (JobErrorCode::Timeout, e.to_string()),
+            QueryHandleError::JobCancelled => (JobErrorCode::Cancelled, e.to_string()),
+            QueryHandleError::JobFailed { message } => {
+                (JobErrorCode::ExecutionFailed, message.clone())
+            }
+            QueryHandleError::StatusError { message } => (JobErrorCode::Internal, message.clone()),
+            QueryHandleError::PartitionLocationError { .. } => {
+                (JobErrorCode::Internal, e.to_string())
+            }
+            QueryHandleError::JobNotFound { .. } => (JobErrorCode::NotFound, e.to_string()),
+        }
+    }
 }

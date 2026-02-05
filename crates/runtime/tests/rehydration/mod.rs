@@ -20,7 +20,7 @@ use crate::{
     configure_test_datafusion,
     docker::RunningContainer,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use std::sync::Arc;
 
@@ -54,6 +54,7 @@ mod sqlite;
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope(async {
         let running_container = prepare_test_environment()
@@ -273,6 +274,9 @@ async fn init_spice_app(
     db_file_path: Option<&str>,
     with_pk_and_indexes: bool,
 ) -> Result<Runtime, anyhow::Error> {
+    // Re-register connectors in case a previous runtime shutdown cleared them
+    register_test_connectors().await;
+
     let ds = create_test_dataset(acceleration_engine, db_file_path, with_pk_and_indexes);
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();

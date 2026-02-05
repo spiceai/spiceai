@@ -55,7 +55,6 @@ limitations under the License.
 
 pub mod catalog;
 pub mod cayenne_catalog;
-pub mod deletion;
 pub mod metadata;
 pub mod metastore;
 pub mod optimizer_rules;

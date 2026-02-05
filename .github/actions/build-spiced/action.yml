@@ -1,0 +1,280 @@
+# Copyright 2026 The Spice.ai OSS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Build spiced
+description: 'Builds the spiced binary with configurable features'
+
+inputs:
+  features:
+    description: 'Comma-separated list of features to enable (e.g., "models,tpc-extension,postgres-accel")'
+    required: false
+    default: ''
+  build_cli:
+    description: 'Whether to also build the spice CLI'
+    required: false
+    default: 'false'
+  upload_artifact:
+    description: 'Whether to upload spiced (and optionally spice CLI) as artifacts'
+    required: false
+    default: 'false'
+  artifact_name:
+    description: 'Name of the artifact to upload (defaults to spiced)'
+    required: false
+    default: 'spiced'
+  use_makefile:
+    description: 'Whether to use the Makefile for building (recommended for most builds). Note: Makefile always produces release builds; rust_profile is ignored when use_makefile is true.'
+    required: false
+    default: 'true'
+  rust_profile:
+    description: 'Cargo profile to use (release, dev, etc.). Note: Only honored when use_makefile is false. The "dev" profile outputs to target/debug.'
+    required: false
+    default: 'release'
+  target_dir:
+    description: 'Target directory for the build output'
+    required: false
+    default: '../../target'
+  minio_endpoint:
+    description: 'MinIO endpoint for sccache'
+    required: false
+  minio_access_key:
+    description: 'MinIO access key for sccache'
+    required: false
+  minio_secret_key:
+    description: 'MinIO secret key for sccache'
+    required: false
+
+outputs:
+  spiced_path:
+    description: 'Path to the built spiced binary'
+    value: ${{ steps.set-paths.outputs.spiced_path }}
+  spice_path:
+    description: 'Path to the built spice CLI binary (if build_cli is true)'
+    value: ${{ steps.set-paths.outputs.spice_path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect OS
+      id: detect-os
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Linux)
+            echo "os=linux" >> $GITHUB_OUTPUT
+            echo "ext=" >> $GITHUB_OUTPUT
+            ;;
+          macOS)
+            echo "os=darwin" >> $GITHUB_OUTPUT
+            echo "ext=" >> $GITHUB_OUTPUT
+            ;;
+          Windows)
+            echo "os=windows" >> $GITHUB_OUTPUT
+            echo "ext=.exe" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "Unsupported OS: $RUNNER_OS"
+            exit 1
+            ;;
+        esac
+
+    - name: Detect architecture
+      id: detect-arch
+      shell: bash
+      run: |
+        case "$(uname -m)" in
+          x86_64)
+            echo "arch=x86_64" >> $GITHUB_OUTPUT
+            ;;
+          aarch64|arm64)
+            echo "arch=aarch64" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "arch=$(uname -m)" >> $GITHUB_OUTPUT
+            ;;
+        esac
+
+    - name: Check if sccache can be set up
+      id: check-sccache
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.minio_endpoint }}" ]; then
+          echo "SCCACHE_SETUP=false" >> $GITHUB_OUTPUT
+          echo "RUSTC_WRAPPER=" >> $GITHUB_OUTPUT
+        else
+          echo "SCCACHE_SETUP=true" >> $GITHUB_OUTPUT
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set up sccache
+      if: steps.check-sccache.outputs.SCCACHE_SETUP == 'true'
+      uses: ./.github/actions/setup-sccache
+      with:
+        minio_endpoint: ${{ inputs.minio_endpoint }}
+
+    - name: Compute target directory for profile
+      id: compute-target-dir
+      shell: bash
+      run: |
+        # Cargo's dev profile outputs to target/debug, not target/dev
+        if [ "${{ inputs.rust_profile }}" == "dev" ]; then
+          echo "target_subdir=debug" >> $GITHUB_OUTPUT
+        else
+          echo "target_subdir=${{ inputs.rust_profile }}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Build spiced (Makefile)
+      if: inputs.use_makefile == 'true'
+      shell: bash
+      env:
+        RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_GIT_FETCH_WITH_CLI: true
+        # Skip Metal kernel precompilation on macOS to avoid requiring Xcode Metal Toolchain
+        MISTRALRS_METAL_PRECOMPILE: 0
+      run: |
+        if [ -n "${{ inputs.features }}" ]; then
+          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="${{ inputs.features }}"
+        else
+          make -C bin/spiced
+        fi
+
+    - name: Build spiced (Cargo)
+      if: inputs.use_makefile != 'true'
+      shell: bash
+      env:
+        RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_GIT_FETCH_WITH_CLI: true
+        MISTRALRS_METAL_PRECOMPILE: 0
+      working-directory: bin/spiced
+      run: |
+        FEATURES_FLAG=""
+        if [ -n "${{ inputs.features }}" ]; then
+          FEATURES_FLAG="--features ${{ inputs.features }}"
+        fi
+
+        cargo build --profile ${{ inputs.rust_profile }} ${FEATURES_FLAG} -p spiced --target-dir ${{ inputs.target_dir }}
+
+    - name: Build spice CLI
+      if: inputs.build_cli == 'true'
+      shell: bash
+      env:
+        RUSTC_WRAPPER: ${{ steps.check-sccache.outputs.RUSTC_WRAPPER }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.minio_access_key }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.minio_secret_key }}
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_GIT_FETCH_WITH_CLI: true
+      run: |
+        cargo build --profile ${{ inputs.rust_profile }} -p spice
+
+    - name: Make binaries executable
+      if: steps.detect-os.outputs.os != 'windows'
+      shell: bash
+      run: |
+        TARGET_SUBDIR="${{ steps.compute-target-dir.outputs.target_subdir }}"
+        if [ -f "target/${TARGET_SUBDIR}/spiced" ]; then
+          mv "target/${TARGET_SUBDIR}/spiced" spiced
+          chmod +x spiced
+        elif [ -f "target/release/spiced" ]; then
+          mv target/release/spiced spiced
+          chmod +x spiced
+        fi
+
+        if [ "${{ inputs.build_cli }}" == "true" ]; then
+          if [ -f "target/${TARGET_SUBDIR}/spice" ]; then
+            mv "target/${TARGET_SUBDIR}/spice" spice
+            chmod +x spice
+          elif [ -f "target/release/spice" ]; then
+            mv target/release/spice spice
+            chmod +x spice
+          fi
+        fi
+
+    - name: Move binaries (Windows)
+      if: steps.detect-os.outputs.os == 'windows'
+      shell: pwsh
+      run: |
+        $targetSubdir = "${{ steps.compute-target-dir.outputs.target_subdir }}"
+        $spicedPath = "target\${targetSubdir}\spiced.exe"
+        if (-not (Test-Path $spicedPath)) {
+          $spicedPath = "target\release\spiced.exe"
+        }
+        if (Test-Path $spicedPath) {
+          Copy-Item $spicedPath -Destination "spiced.exe"
+        } else {
+          Write-Error "spiced.exe not found"
+          exit 1
+        }
+
+        if ("${{ inputs.build_cli }}" -eq "true") {
+          $spicePath = "target\${targetSubdir}\spice.exe"
+          if (-not (Test-Path $spicePath)) {
+            $spicePath = "target\release\spice.exe"
+          }
+          if (Test-Path $spicePath) {
+            Copy-Item $spicePath -Destination "spice.exe"
+          } else {
+            Write-Error "spice.exe not found"
+            exit 1
+          }
+        }
+
+    - name: Set output paths
+      id: set-paths
+      shell: bash
+      run: |
+        echo "spiced_path=${{ github.workspace }}/spiced${{ steps.detect-os.outputs.ext }}" >> $GITHUB_OUTPUT
+        if [ "${{ inputs.build_cli }}" == "true" ]; then
+          echo "spice_path=${{ github.workspace }}/spice${{ steps.detect-os.outputs.ext }}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Print spiced version
+      if: steps.detect-os.outputs.os != 'windows'
+      shell: bash
+      run: ./spiced --version
+
+    - name: Print spiced version (Windows)
+      if: steps.detect-os.outputs.os == 'windows'
+      shell: pwsh
+      run: .\spiced.exe --version
+
+    - name: Print spice version
+      if: inputs.build_cli == 'true' && steps.detect-os.outputs.os != 'windows'
+      shell: bash
+      run: ./spice version
+
+    - name: Print spice version (Windows)
+      if: inputs.build_cli == 'true' && steps.detect-os.outputs.os == 'windows'
+      shell: pwsh
+      run: .\spice.exe version
+
+    - name: Upload spiced artifact
+      if: inputs.upload_artifact == 'true' && inputs.build_cli != 'true'
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: spiced${{ steps.detect-os.outputs.ext }}
+
+    - name: Upload spiced and spice CLI artifacts
+      if: inputs.upload_artifact == 'true' && inputs.build_cli == 'true'
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: |
+          spiced${{ steps.detect-os.outputs.ext }}
+          spice${{ steps.detect-os.outputs.ext }}

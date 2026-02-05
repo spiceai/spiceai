@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod allowlist;
+pub mod analyzer_rule;
 pub mod config;
 pub mod execution_plan;
 pub mod extension;

@@ -91,7 +91,7 @@ impl NFSObjectStore {
     }
 
     /// List a single directory and return its entries (blocking).
-    fn list_directory_blocking(nfs: &mut Nfs, dir_path: &str) -> Vec<DirEntry> {
+    fn list_directory_blocking(nfs: &Nfs, dir_path: &str) -> object_store::Result<Vec<DirEntry>> {
         let path = if dir_path.is_empty() {
             "/".to_string()
         } else if dir_path.starts_with('/') {
@@ -100,31 +100,28 @@ impl NFSObjectStore {
             format!("/{dir_path}")
         };
 
-        let dir = match nfs.opendir(StdPath::new(&path)) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("Failed to open NFS directory {path}: {e}");
-                return Vec::new();
-            }
-        };
+        let dir = nfs.opendir(StdPath::new(&path)).map_err(handle_error)?;
 
-        dir.filter_map(|e| e.ok())
-            .filter_map(|entry| {
-                let name = entry.path.to_string_lossy().to_string();
-                match entry.d_type {
-                    EntryType::Directory => Some(DirEntry::directory(name)),
-                    EntryType::File => {
-                        let last_modified = DateTime::<Utc>::from_timestamp(
-                            entry.mtime.tv_sec,
-                            u32::try_from(entry.mtime.tv_usec).unwrap_or(0) * 1000,
-                        )
-                        .unwrap_or_else(Utc::now);
-                        Some(DirEntry::file(name, entry.size, last_modified))
-                    }
-                    _ => None,
+        let mut entries = Vec::new();
+        for entry_res in dir {
+            let entry = entry_res.map_err(handle_error)?;
+            let name = entry.path.to_string_lossy().to_string();
+            match entry.d_type {
+                EntryType::Directory => entries.push(DirEntry::directory(name)),
+                EntryType::File => {
+                    let usec = u32::try_from(entry.mtime.tv_usec)
+                        .map_err(|_| handle_error("NFS mtime microseconds overflow"))?
+                        * 1000;
+                    let last_modified =
+                        DateTime::<Utc>::from_timestamp(entry.mtime.tv_sec, usec)
+                            .ok_or_else(|| handle_error("Invalid NFS mtime returned"))?;
+                    entries.push(DirEntry::file(name, entry.size, last_modified));
                 }
-            })
-            .collect()
+                _ => {}
+            }
+        }
+
+        Ok(entries)
     }
 
     /// List all files recursively, offloading blocking NFS traversal to a dedicated thread.
@@ -136,13 +133,13 @@ impl NFSObjectStore {
         let prefix = prefix.unwrap_or_default();
 
         tokio::task::spawn_blocking(move || {
-            let mut nfs = config.connect()?;
+            let nfs = config.connect()?;
             let mut results = Vec::new();
             let mut queue = vec![prefix];
 
             // Process directories sequentially within this blocking task
             while let Some(current_path) = queue.pop() {
-                let entries = Self::list_directory_blocking(&mut nfs, &current_path);
+                let entries = Self::list_directory_blocking(&nfs, &current_path)?;
                 let (files, dirs) = process_directory_entries(&current_path, entries);
                 results.extend(files);
                 queue.extend(dirs);
@@ -154,17 +151,17 @@ impl NFSObjectStore {
         .map_err(|e| generic_error(STORE_NAME, e))?
     }
 
-    /// List a single directory level (for list_with_delimiter).
+    /// List a single directory level (for `list_with_delimiter`).
     async fn list_directory_shallow(
         &self,
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
         let config = Arc::clone(&self.config);
-        let prefix_str = prefix.map_or(String::new(), |p| p.to_string());
+        let prefix_str = prefix.map_or(String::new(), Path::to_string);
 
         tokio::task::spawn_blocking(move || {
-            let mut nfs = config.connect()?;
-            let entries = Self::list_directory_blocking(&mut nfs, &prefix_str);
+            let nfs = config.connect()?;
+            let entries = Self::list_directory_blocking(&nfs, &prefix_str)?;
             Ok(process_directory_entries_shallow(&prefix_str, entries))
         })
         .await
@@ -177,7 +174,7 @@ impl NFSObjectStore {
         let location = location.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut nfs = config.connect()?;
+            let nfs = config.connect()?;
             let location_string = format!("/{location}");
 
             let stat = nfs.stat64(StdPath::new(&location_string)).map_err(|e| {
@@ -192,7 +189,8 @@ impl NFSObjectStore {
                 let mtime = stat.nfs_mtime as i64;
                 #[expect(clippy::cast_possible_truncation)]
                 let mtime_nsec = stat.nfs_mtime_nsec as u32;
-                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec).unwrap_or_else(Utc::now)
+                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
+                    .ok_or_else(|| handle_error("Invalid NFS mtime returned"))?
             };
             Ok(build_object_meta(location, stat.nfs_size, last_modified))
         })
@@ -234,25 +232,26 @@ impl ObjectStore for NFSObjectStore {
 
         let (object_meta, start, end, data) = tokio::task::spawn_blocking({
             let location = location.clone();
-            let config = config.clone();
+            let config = Arc::clone(&config);
             move || -> object_store::Result<(ObjectMeta, u64, u64, Vec<u8>)> {
-                let mut nfs = config.connect()?;
+                let nfs = config.connect()?;
                 let location_string = format!("/{location}");
 
-                let stat = nfs.stat64(StdPath::new(&location_string)).map_err(|e| {
+                let file_stat = nfs.stat64(StdPath::new(&location_string)).map_err(|e| {
                     object_store::Error::NotFound {
                         path: location_string.clone(),
                         source: e.into(),
                     }
                 })?;
 
-                let size = stat.nfs_size;
+                let size = file_stat.nfs_size;
                 let last_modified = {
                     #[expect(clippy::cast_possible_wrap)]
-                    let mtime = stat.nfs_mtime as i64;
+                    let mtime = file_stat.nfs_mtime as i64;
                     #[expect(clippy::cast_possible_truncation)]
-                    let mtime_nsec = stat.nfs_mtime_nsec as u32;
-                    DateTime::<Utc>::from_timestamp(mtime, mtime_nsec).unwrap_or_else(Utc::now)
+                    let mtime_nsec = file_stat.nfs_mtime_nsec as u32;
+                    DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
+                        .ok_or_else(|| handle_error("Invalid NFS mtime returned"))?
                 };
                 let object_meta = build_object_meta(location.clone(), size, last_modified);
 

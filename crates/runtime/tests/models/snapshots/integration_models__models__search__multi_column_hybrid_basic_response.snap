@@ -9,7 +9,9 @@ snapshot_kind: text
     {
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_department": "DEPARTMENT"
+        "cp_department": [
+          "DEPARTMENT"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 2
@@ -19,8 +21,12 @@ snapshot_kind: text
     {
       "dataset": "multi_column_hybrid_search",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_department": [
+          "DEPARTMENT"
+        ],
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends con"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 1

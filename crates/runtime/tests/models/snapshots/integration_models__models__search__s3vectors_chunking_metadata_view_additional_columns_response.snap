@@ -12,7 +12,9 @@ snapshot_kind: text
       },
       "dataset": "qs_view",
       "matches": {
-        "answer": "\n2"
+        "answer": [
+          "\n2"
+        ]
       },
       "primary_key": {
         "id": 612
@@ -25,7 +27,9 @@ snapshot_kind: text
       },
       "dataset": "qs_view",
       "matches": {
-        "answer": " is 2."
+        "answer": [
+          " is 2."
+        ]
       },
       "primary_key": {
         "id": 349
@@ -38,7 +42,9 @@ snapshot_kind: text
       },
       "dataset": "qs_view",
       "matches": {
-        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+        "answer": [
+          "\\times 2 \\times 2 \\times 2 = 32\\)"
+        ]
       },
       "primary_key": {
         "id": 948
@@ -51,7 +57,9 @@ snapshot_kind: text
       },
       "dataset": "qs_view",
       "matches": {
-        "answer": "\\times 2 \\times 2 \\times 2 = 32\\)"
+        "answer": [
+          "\\times 2 \\times 2 \\times 2 = 32\\)"
+        ]
       },
       "primary_key": {
         "id": 1277

@@ -19,7 +19,7 @@ schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde-value = "0.7.0"
 serde_json.workspace = true
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 snafu.workspace = true
 subtle = "2.6"
 tokio = { workspace = true, features = ["fs"] }

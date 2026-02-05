@@ -22,7 +22,9 @@ snapshot_kind: text
     {
       "dataset": "hybrid_column_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different memb"
+        "cp_description": [
+          "Close customers might struggle away different memb"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 15

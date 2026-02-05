@@ -64,7 +64,7 @@ pub(crate) mod search {
 
     use crate::DEFAULT_TRACING_MODELS;
     use crate::models::s3_vectors::get_package_delivery_dataset;
-    use crate::utils::runtime_ready_check;
+    use crate::utils::{register_test_connectors, runtime_ready_check};
 
     async fn add_mega_science_view_from_ds(
         mut app: AppBuilder,
@@ -932,6 +932,7 @@ pub(crate) mod search {
     }
 
     async fn start_app(app: App) -> Result<Arc<Runtime>, anyhow::Error> {
+        register_test_connectors().await;
         configure_test_datafusion();
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
@@ -1052,7 +1053,7 @@ async fn delete_index(
         .build()?;
 
     // Don't return error if delete fails, as index may not exist
-    if let Err(e) = s3_vector_client.delete_index(input).await {
+    if let Err(e) = s3_vector_client.delete_index(&input).await {
         tracing::debug!(
             "failed to delete index {index_name} before test. This may just be because index does not exist. Error: {e}."
         );

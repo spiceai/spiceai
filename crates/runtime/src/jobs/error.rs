@@ -45,6 +45,9 @@ pub enum Error {
     #[snafu(display("Failed to delete job state from object store: {source}"))]
     ObjectStoreDelete { source: ObjectStoreError },
 
+    #[snafu(display("Failed to list objects in object store: {source}"))]
+    ObjectStoreList { source: ObjectStoreError },
+
     #[snafu(display("Failed to serialize job state: {source}"))]
     SerializeState { source: serde_json::Error },
 
@@ -72,6 +75,35 @@ pub enum Error {
         left_value: usize,
         right_value: usize,
     },
+
+    #[snafu(display(
+        "Failed to delete distributed job '{job_id}': failed to delete {failed_deletions} of {total_chunks} data chunks."
+    ))]
+    PartialChunkDeletion {
+        job_id: String,
+        failed_deletions: usize,
+        total_chunks: usize,
+    },
+
+    #[snafu(display("Failed to read batch from result stream: {source}"))]
+    StreamRead {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Failed to write results to object store. The maximum job size of '{maximum_size}' bytes was exceeded."
+    ))]
+    MaximumJobSizeExceeded { maximum_size: u64 },
+
+    #[snafu(display(
+        "Concurrent modification detected for job {job_id}. Another scheduler modified the job state."
+    ))]
+    ConcurrentModification { job_id: String },
+
+    #[snafu(display(
+        "Concurrent modification detected for chunk {chunk_index} of job {job_id}. Another scheduler already wrote this chunk."
+    ))]
+    ChunkAlreadyExists { job_id: String, chunk_index: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

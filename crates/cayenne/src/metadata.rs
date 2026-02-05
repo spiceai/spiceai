@@ -141,16 +141,26 @@ pub struct DeleteFile {
 }
 
 /// Metadata about a partition in a table.
+///
+/// Supports both single and composite partition keys (e.g., `partition_by: [year, month, day]`).
+/// Partition columns and values are stored as ordered lists, where the i-th column name
+/// corresponds to the i-th partition value.
 #[derive(Debug, Clone)]
 pub struct PartitionMetadata {
     /// Unique identifier for this partition
     pub partition_id: i64,
     /// Table this partition belongs to
     pub table_id: i64,
-    /// Name of the partition column
-    pub partition_column: String,
-    /// Partition value (serialized as string for storage)
-    pub partition_value: String,
+    /// Names of the partition columns (ordered).
+    /// For a single partition column, this is a single-element vector.
+    /// For composite partitions like `partition_by: [year, month]`, this contains
+    /// all column names in order: `["year", "month"]`.
+    pub partition_columns: Vec<String>,
+    /// Partition values (serialized as strings, ordered to match `partition_columns`).
+    /// For a single partition, this is a single-element vector.
+    /// For composite partitions, values are ordered to match columns:
+    /// e.g., `["2025", "10"]` for year=2025, month=10.
+    pub partition_values: Vec<String>,
     /// Path to the partition's data directory
     pub path: String,
     /// Whether the path is relative to the table's base path
@@ -159,6 +169,62 @@ pub struct PartitionMetadata {
     pub record_count: i64,
     /// Total size of data files in this partition (bytes)
     pub file_size_bytes: i64,
+}
+
+impl PartitionMetadata {
+    /// Returns a composite key string for this partition.
+    ///
+    /// For single partitions: returns the single value (e.g., `"us-east-1"`).
+    /// For composite partitions: returns a slash-separated path (e.g., `"2025/10/15"`).
+    ///
+    /// This key uniquely identifies the partition within a table and is used
+    /// for `HashMap` lookups and Hive-style directory naming.
+    #[must_use]
+    pub fn composite_key(&self) -> String {
+        self.partition_values.join("/")
+    }
+
+    /// Creates a new `PartitionMetadata` for a single partition column (legacy compatibility).
+    #[must_use]
+    pub fn new_single(
+        table_id: i64,
+        partition_column: String,
+        partition_value: String,
+        path: String,
+        path_is_relative: bool,
+    ) -> Self {
+        Self {
+            partition_id: 0,
+            table_id,
+            partition_columns: vec![partition_column],
+            partition_values: vec![partition_value],
+            path,
+            path_is_relative,
+            record_count: 0,
+            file_size_bytes: 0,
+        }
+    }
+
+    /// Creates a new `PartitionMetadata` for composite partition columns.
+    #[must_use]
+    pub fn new_composite(
+        table_id: i64,
+        partition_columns: Vec<String>,
+        partition_values: Vec<String>,
+        path: String,
+        path_is_relative: bool,
+    ) -> Self {
+        Self {
+            partition_id: 0,
+            table_id,
+            partition_columns,
+            partition_values,
+            path,
+            path_is_relative,
+            record_count: 0,
+            file_size_bytes: 0,
+        }
+    }
 }
 
 /// Which compression strategy to use for the Vortex layout.

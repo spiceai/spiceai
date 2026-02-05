@@ -12,7 +12,9 @@ snapshot_kind: text
       },
       "dataset": "qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": [
+          "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        ]
       },
       "primary_key": {
         "id": 6
@@ -25,7 +27,9 @@ snapshot_kind: text
       },
       "dataset": "qs",
       "matches": {
-        "answer": "$\\frac{5}{6} < \\frac{5}{5}$ because $\\frac{5}{6}$ is less than 1, while $\\frac{5}{5}$ equals 1.  \n\nFinal answer: $\\boxed{<}$"
+        "answer": [
+          "$\\frac{5}{6} < \\frac{5}{5}$ because $\\frac{5}{6}$ is less than 1, while $\\frac{5}{5}$ equals 1.  \n\nFinal answer: $\\boxed{<}$"
+        ]
       },
       "primary_key": {
         "id": 58
@@ -38,7 +42,9 @@ snapshot_kind: text
       },
       "dataset": "qs",
       "matches": {
-        "answer": "This is an example of a $\\boxed{\\text{rate}}$ because it compares two unlike denominate numbers (erasers and pencils)."
+        "answer": [
+          "This is an example of a $\\boxed{\\text{rate}}$ because it compares two unlike denominate numbers (erasers and pencils)."
+        ]
       },
       "primary_key": {
         "id": 543
@@ -51,7 +57,9 @@ snapshot_kind: text
       },
       "dataset": "qs",
       "matches": {
-        "answer": "1. In words: \"two and three tenths.\"  \n2. As a fraction: \\(\\boxed{\\dfrac{23}{10}}\\)."
+        "answer": [
+          "1. In words: \"two and three tenths.\"  \n2. As a fraction: \\(\\boxed{\\dfrac{23}{10}}\\)."
+        ]
       },
       "primary_key": {
         "id": 1318

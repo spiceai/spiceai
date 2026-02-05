@@ -27,7 +27,10 @@ use spicepod::{
     param::Params,
 };
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
 fn make_s3_tpch_dataset(name: &str) -> Dataset {
     let mut test_dataset = Dataset::new(
@@ -46,6 +49,7 @@ fn make_s3_tpch_dataset(name: &str) -> Dataset {
 #[tokio::test]
 async fn results_cache_system_queries() -> Result<(), String> {
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

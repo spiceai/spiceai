@@ -195,6 +195,8 @@ pub struct LoadArgs {
     pub random_param_set_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_clients: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distributed: Option<bool>,
 }
 
 /// Append workflow arguments, defined in the test files
@@ -229,6 +231,7 @@ impl<'de> Deserialize<'de> for LoadArgs {
             concurrency: Option<u64>,
             random_param_set_count: Option<usize>,
             http_clients: Option<bool>,
+            distributed: Option<bool>,
         }
 
         let mut helper = LoadArgsHelper::deserialize(deserializer)?;
@@ -253,6 +256,7 @@ impl<'de> Deserialize<'de> for LoadArgs {
             concurrency: helper.concurrency,
             random_param_set_count: helper.random_param_set_count,
             http_clients: helper.http_clients,
+            distributed: helper.distributed,
         })
     }
 }
@@ -369,8 +373,7 @@ tests:
     random_param_set_count: 1000
 ";
 
-        let test_file: DispatchTestFile =
-            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
 
         // Verify bench section (single item becomes vec with one element)
         assert_eq!(test_file.tests.bench.len(), 1);
@@ -428,8 +431,7 @@ tests:
       random_param_set_count: 500
 ";
 
-        let test_file: DispatchTestFile =
-            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
 
         // Verify we have 3 load sections
         assert_eq!(test_file.tests.load.len(), 3);
@@ -487,8 +489,7 @@ tests:
 tests: {}
 ";
 
-        let test_file: DispatchTestFile =
-            serde_yaml::from_str(yaml).expect("Failed to deserialize");
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
 
         // All sections should default to empty vectors
         assert_eq!(test_file.tests.bench.len(), 0);
