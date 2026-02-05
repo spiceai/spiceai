@@ -43,7 +43,7 @@ use snowflake_api::SnowflakeApi;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Not implemented"))]
+    #[snafu(display("This Snowflake operation is not implemented"))]
     NotImplemented,
 
     #[snafu(display("Unable to retrieve schema: {reason}"))]
@@ -60,13 +60,13 @@ pub enum Error {
     #[snafu(display("Error executing query: {source}"))]
     SnowflakeArrowError { source: arrow::error::ArrowError },
 
-    #[snafu(display("Failed to cast snowflake timestamp to arrow timestamp: {reason}"))]
+    #[snafu(display("Failed to convert Snowflake timestamp value: {reason}"))]
     UnableToCastSnowflakeTimestamp { reason: String },
 
-    #[snafu(display("Failed to cast snowflake fixed-point number to decimal: {source}"))]
+    #[snafu(display("Failed to convert Snowflake numeric value to decimal: {source}"))]
     UnableToCastSnowflakeNumericToDecimal { source: arrow::error::ArrowError },
 
-    #[snafu(display("Failed to create record batch: {source}"))]
+    #[snafu(display("Failed to process Snowflake query result: {source}"))]
     FailedToCreateRecordBatch { source: arrow::error::ArrowError },
 }
 

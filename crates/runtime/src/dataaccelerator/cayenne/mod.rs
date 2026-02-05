@@ -92,7 +92,7 @@ pub enum Error {
     ))]
     PartitionByRequired,
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Cayenne acceleration S3 storage error: {source}"))]
     S3Error { source: s3::Error },
 }
 

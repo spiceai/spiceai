@@ -54,7 +54,7 @@ mod datatypes;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Not implemented"))]
+    #[snafu(display("This Databricks SQL Warehouse operation is not implemented"))]
     NotImplemented,
 
     #[snafu(display("HTTP client build failed: {source}"))]

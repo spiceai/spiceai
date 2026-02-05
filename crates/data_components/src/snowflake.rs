@@ -34,7 +34,7 @@ pub type SnowflakeConnectionPool =
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to construct SQL table: {source}"))]
+    #[snafu(display("Failed to create Snowflake SQL table: {source}"))]
     UnableToConstructSQLTable {
         source: sql_provider_datafusion::Error,
     },

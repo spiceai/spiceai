@@ -22,22 +22,22 @@ use super::SnapshotEngine;
 #[derive(Debug, Snafu)]
 #[expect(clippy::enum_variant_names)]
 pub enum DuckDBSnapshotError {
-    #[snafu(display("Failed to open DuckDB for compaction: {path:?}"))]
+    #[snafu(display("Failed to open DuckDB for snapshot preparation: {path:?}"))]
     CompactionConnect {
         path: PathBuf,
         source: duckdb::Error,
     },
-    #[snafu(display("Failed to attach database for compaction: {path:?}"))]
+    #[snafu(display("Failed to attach DuckDB database for snapshot preparation: {path:?}"))]
     CompactionAttach {
         path: PathBuf,
         source: duckdb::Error,
     },
-    #[snafu(display("Failed to run COPY FROM DATABASE for {dataset}"))]
+    #[snafu(display("Failed to copy data during snapshot preparation for dataset '{dataset}'"))]
     CompactionCopy {
         dataset: String,
         source: duckdb::Error,
     },
-    #[snafu(display("Compaction task panicked for {dataset}"))]
+    #[snafu(display("Snapshot preparation task failed unexpectedly for dataset '{dataset}'"))]
     CompactionJoin {
         dataset: String,
         source: tokio::task::JoinError,

@@ -29,17 +29,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("ConnectionPoolError: {source}"))]
+    #[snafu(display("Failed to connect to ClickHouse: {source}"))]
     ConnectionPoolError {
         source: clickhouse_rs::errors::ConnectionError,
     },
 
-    #[snafu(display("ConnectionTlsError: {source}"))]
+    #[snafu(display("Failed to establish TLS connection to ClickHouse: {source}"))]
     ConnectionTlsError {
         source: clickhouse_rs::errors::ConnectionError,
     },
 
-    #[snafu(display("ConnectionPoolRunError: {source}"))]
+    #[snafu(display("ClickHouse connection failed: {source}"))]
     ConnectionPoolRunError {
         source: clickhouse_rs::errors::Error,
     },
