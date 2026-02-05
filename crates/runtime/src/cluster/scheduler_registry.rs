@@ -151,6 +151,7 @@ pub async fn start_scheduler_registry(
 
     let job_executor = crate::jobs::JobExecutor::new(Arc::clone(&job_store), rt.datafusion());
     rt.set_job_executor(Arc::new(job_executor)).await;
+    rt.create_job_store_cleanup_schedule(&job_store).await?;
     tracing::info!(
         "Initialized async SQL jobs API with state location: {}",
         config.state_location
