@@ -94,6 +94,7 @@ pub struct SnapshotInfo {
     pub checksum: String,
     pub checksum_algorithm: String,
     pub size_bytes: u64,
+    pub engine: Option<String>,
     pub row_count: Option<u64>,
     pub is_current: bool,
 }
@@ -104,6 +105,7 @@ pub struct SnapshotSummary {
     pub dataset_name: String,
     pub location: String,
     pub last_updated_ms: i64,
+    pub engine: Option<String>,
     pub current_snapshot_id: Option<u64>,
     pub snapshots: Vec<SnapshotInfo>,
 }
@@ -194,6 +196,9 @@ async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result
 
     println!("Dataset: {}", summary.dataset_name);
     println!("Location: {}", summary.location);
+    if let Some(ref engine) = summary.engine {
+        println!("Engine: {engine}");
+    }
     if let Some(current_id) = summary.current_snapshot_id {
         println!("Current Snapshot ID: {current_id}");
     }
@@ -255,6 +260,9 @@ async fn execute_snapshot(ctx: &RuntimeContext, args: &SnapshotArgs) -> Result<(
     println!("Snapshot ID: {}", snapshot.snapshot_id);
     println!("Timestamp: {}", format_timestamp_ms(snapshot.timestamp_ms));
     println!("Location: {}", snapshot.location);
+    if let Some(ref engine) = snapshot.engine {
+        println!("Engine: {engine}");
+    }
     println!(
         "Size: {} ({} bytes)",
         format_bytes(snapshot.size_bytes),

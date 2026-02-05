@@ -991,7 +991,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                     let mutex = Arc::new(Mutex::new(()));
                     let lock_guard = mutex.lock_owned().await;
                     manager_clone
-                        .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+                        .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
                         .await
                         .map(|opt| opt.expect("snapshot should be created"))
                 }
@@ -1104,7 +1104,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let lock_guard = mutex.lock_owned().await;
 
             manager
-                .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+                .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
                 .await
                 .context("Creating modified snapshot after deleting data")?
                 .context("Snapshot should be created")?;
@@ -1314,7 +1314,7 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             let lock_guard = mutex.lock_owned().await;
 
             let compacted_location = manager_with_compaction
-                .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+                .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
                 .await
                 .context("Creating snapshot with compaction enabled")?
                 .context("Snapshot should be created")?;
@@ -1494,7 +1494,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             let lock_guard = Arc::clone(&mutex).lock_owned().await;
 
             let first_result = manager
-                .create_snapshot(&schema, lock_guard, last_updated_at, ForceCreate(false))
+                .create_snapshot(&schema, lock_guard, last_updated_at, None, ForceCreate(false))
                 .await
                 .context("Creating first snapshot with OnChange policy")?;
 
@@ -1538,7 +1538,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             // Try to create another snapshot with the SAME last_updated_at
             let lock_guard = Arc::clone(&mutex).lock_owned().await;
             let second_result = manager
-                .create_snapshot(&schema, lock_guard, last_updated_at, ForceCreate(false))
+                .create_snapshot(&schema, lock_guard, last_updated_at, None, ForceCreate(false))
                 .await
                 .context("Attempting second snapshot with same last_updated_at")?;
 
@@ -1564,7 +1564,7 @@ async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()
             let new_last_updated_at = Some(99999i64);
             let lock_guard = Arc::clone(&mutex).lock_owned().await;
             let third_result = manager
-                .create_snapshot(&schema, lock_guard, new_last_updated_at, ForceCreate(false))
+                .create_snapshot(&schema, lock_guard, new_last_updated_at, None, ForceCreate(false))
                 .await
                 .context("Creating snapshot with new last_updated_at")?;
 
