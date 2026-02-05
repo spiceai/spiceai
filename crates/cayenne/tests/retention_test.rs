@@ -20,7 +20,7 @@ limitations under the License.
 
 mod common;
 
-use arrow::array::{Int64Array, RecordBatch};
+use arrow::array::{Int64Array, RecordBatch, UInt64Array};
 
 use arrow::datatypes::{DataType, Field, Schema};
 
@@ -108,8 +108,8 @@ async fn test_retention_filters_apply_on_insert_impl(
         let row_id_array = batch
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("row_id column");
+            .downcast_ref::<UInt64Array>()
+            .expect("row_id column (UInt64)");
         for idx in 0..row_id_array.len() {
             deleted_row_ids.push(row_id_array.value(idx));
         }
