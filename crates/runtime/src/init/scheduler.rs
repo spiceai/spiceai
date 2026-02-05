@@ -323,6 +323,15 @@ impl Runtime {
         self: Arc<Self>,
         job_store: &Arc<JobStore>,
     ) -> Result<()> {
+        let schedulers_lock = Arc::clone(&self.schedulers);
+        let mut schedulers = schedulers_lock.write().await;
+        if let Some(existing_scheduler) = schedulers.get(JOB_CLEANUP_SCHEDULER_NAME) {
+            tracing::debug!(
+                "Job cleanup scheduler already exists, skipping creation of job cleanup schedule"
+            );
+            return Ok(());
+        }
+
         let cleanup_task: Arc<dyn ScheduledTask> =
             Arc::new(JobCleanupTask::new(Arc::clone(job_store)));
 
@@ -344,15 +353,6 @@ impl Runtime {
                 .await
                 .context(crate::FailedToStartSchedulerSnafu)?,
         );
-
-        let schedulers_lock = Arc::clone(&self.schedulers);
-        let mut schedulers = schedulers_lock.write().await;
-        if let Some(existing_scheduler) = schedulers.get(JOB_CLEANUP_SCHEDULER_NAME) {
-            tracing::debug!(
-                "Job cleanup scheduler already exists, skipping creation of job cleanup schedule"
-            );
-            return Ok(());
-        }
 
         schedulers.insert(JOB_CLEANUP_SCHEDULER_NAME.into(), Arc::clone(&scheduler));
 
