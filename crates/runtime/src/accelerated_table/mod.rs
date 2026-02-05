@@ -103,7 +103,9 @@ pub enum Error {
         message: String,
     },
 
-    #[snafu(display("Failed to trigger dataset refresh: the refresh worker is no longer running. {source}"))]
+    #[snafu(display(
+        "Failed to trigger dataset refresh: the refresh worker is no longer running. {source}"
+    ))]
     FailedToTriggerRefresh {
         source: tokio::sync::mpsc::error::SendError<Option<RefreshOverrides>>,
     },

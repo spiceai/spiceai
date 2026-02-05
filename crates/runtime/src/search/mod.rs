@@ -86,10 +86,14 @@ pub enum Error {
     #[snafu(display("Invalid WHERE condition: {where_cond}"))]
     InvalidWhereCondition { where_cond: String },
 
-    #[snafu(display("An invalid search keyword was specified: '{keyword}'. Verify the keyword and try again."))]
+    #[snafu(display(
+        "An invalid search keyword was specified: '{keyword}'. Verify the keyword and try again."
+    ))]
     InvalidKeyword { keyword: String },
 
-    #[snafu(display("Invalid additional column was specified: '{additional_column}'. Verify the column exists in the data source and try again."))]
+    #[snafu(display(
+        "Invalid additional column was specified: '{additional_column}'. Verify the column exists in the data source and try again."
+    ))]
     InvalidAdditionalColumns { additional_column: String },
 }
 
