@@ -20,9 +20,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
-use arrow::array::StringArray;
+use arrow::array::{ArrayRef, StringArray};
 use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
-use arrow::datatypes::SchemaRef;
+use arrow::compute::{cast, concat_batches};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::datasource::TableProvider;
@@ -45,6 +46,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
+use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use util::expr::combine_exprs_balanced;
 
 /// Type alias for tracking in-flight revalidation requests.
@@ -363,13 +365,18 @@ fn check_cache_freshness(
             .index_of(CACHE_REFRESHED_AT_COLUMN)
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         let array = batch.column(col_idx);
-        let ts_array = array
+
+        // Normalize timestamp to nanoseconds for comparison (if needed). Accelerators may store
+        // timestamps with different precisions (e.g., Cayenne uses Microseconds).
+        // We cast only this column here vs SchemaCastScanExec which casts user schema (other columns).
+        let ns_array = as_timestamp_nanosecond_array(array)?;
+        let ts_array = ns_array
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
-                    "CACHE_REFRESHED_AT_COLUMN is not TimestampNanosecondArray".to_string(),
-                )
+                datafusion::error::DataFusionError::Execution(format!(
+                    "{CACHE_REFRESHED_AT_COLUMN} conversion to TimestampNanosecond failed"
+                ))
             })?;
         for i in 0..ts_array.len() {
             if !ts_array.is_valid(i) {
@@ -401,6 +408,19 @@ fn compute_cache_key_from_filters(filters: &[Expr]) -> String {
     let mut parts: Vec<String> = filters.iter().map(ToString::to_string).collect();
     parts.sort();
     parts.join("|")
+}
+
+/// Convert a timestamp array to nanosecond precision, returning the original if already nanoseconds.
+fn as_timestamp_nanosecond_array(array: &ArrayRef) -> DataFusionResult<ArrayRef> {
+    // Fast path: if already nanoseconds, return Arc clone (no data copy)
+    if array.data_type() == &DataType::Timestamp(TimeUnit::Nanosecond, None) {
+        return Ok(Arc::clone(array));
+    }
+
+    // This handles Microsecond (Cayenne), Millisecond, Second precisions
+    cast(array, &DataType::Timestamp(TimeUnit::Nanosecond, None)).map_err(|e| {
+        DataFusionError::Execution(format!("Failed to cast timestamp to nanoseconds: {e}"))
+    })
 }
 
 /// Helper functions for cache refresh operations
@@ -656,12 +676,10 @@ impl CacheRefreshHelper {
             .iter()
             .map(arrow::array::RecordBatch::num_rows)
             .sum();
+        let batch_count = batches.len();
 
         tracing::debug!(
-            "overwrite_accelerator - inserting {} batches ({} total rows) into accelerator for dataset={}",
-            batches.len(),
-            total_rows,
-            dataset_name
+            "overwrite_accelerator - inserting {batch_count} batches ({total_rows} total rows) into accelerator for dataset={dataset_name}",
         );
 
         // Log the schema and sample data for debugging
@@ -673,6 +691,14 @@ impl CacheRefreshHelper {
             );
         }
 
+        // Concatenate multiple small batches into a single batch for better write performance.
+        // This reduces per-batch overhead (FFI calls for DuckDB, streaming overhead for Cayenne).
+        let batches = if batch_count > 1 {
+            vec![concat_batches(&schema, &batches)?]
+        } else {
+            batches
+        };
+
         // Create a stream from the batches
         let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
         let adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
@@ -681,8 +707,14 @@ impl CacheRefreshHelper {
         );
 
         // Create an execution plan that produces this stream
-        let plan: Arc<dyn ExecutionPlan> =
+        let streaming_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(adapter)));
+
+        // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
+        // (e.g., timestamp precision conversion from Nanosecond to Microsecond for Cayenne)
+        let target_schema = accelerator.schema();
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
 
         // For caching mode, we use InsertOp::Overwrite to replace all existing data
         // because HTTP responses can contain multiple rows with the same filter values
@@ -692,23 +724,17 @@ impl CacheRefreshHelper {
         let insert_op = InsertOp::Overwrite;
 
         tracing::debug!(
-            "overwrite_accelerator calling accelerator.insert_into with op={:?} for dataset={}",
+            "overwrite_accelerator calling accelerator.insert_into with op={:?} for dataset={dataset_name}",
             insert_op,
-            dataset_name
         );
         let insert_plan = accelerator.insert_into(&state, plan, insert_op).await?;
 
         // Execute the insertion
-        tracing::debug!(
-            "overwrite_accelerator executing insert plan for dataset={}",
-            dataset_name
-        );
+        tracing::debug!("overwrite_accelerator executing insert plan for dataset={dataset_name}",);
         let task_ctx = Arc::new(TaskContext::default());
         let _ = datafusion::physical_plan::collect(insert_plan, task_ctx).await?;
         tracing::debug!(
-            "overwrite_accelerator COMPLETED - successfully inserted {} rows into accelerator for dataset={}",
-            total_rows,
-            dataset_name
+            "overwrite_accelerator COMPLETED - successfully inserted {total_rows} rows into accelerator for dataset={dataset_name}",
         );
         Ok(())
     }
@@ -880,11 +906,19 @@ impl CacheRefreshHelper {
         let state = ctx.state();
         let schema = batches[0].schema();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let batch_count = batches.len();
 
         tracing::trace!(
-            "append_to_accelerator - appending {} batches ({total_rows} total rows) to accelerator for dataset={dataset_name}",
-            batches.len(),
+            "append_to_accelerator - appending {batch_count} batches ({total_rows} total rows) to accelerator for dataset={dataset_name}",
         );
+
+        // Concatenate multiple small batches into a single batch for better write performance.
+        // This reduces per-batch overhead (FFI calls for DuckDB, streaming overhead for Cayenne).
+        let batches = if batch_count > 1 {
+            vec![concat_batches(&schema, &batches)?]
+        } else {
+            batches
+        };
 
         let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
         let adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
@@ -892,8 +926,14 @@ impl CacheRefreshHelper {
             batch_stream,
         );
 
-        let plan: Arc<dyn ExecutionPlan> =
+        let streaming_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(adapter)));
+
+        // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
+        // (e.g., timestamp precision conversion from Nanosecond to Microsecond for Cayenne)
+        let target_schema = accelerator.schema();
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
 
         // Use InsertOp::Append - the accelerator's OnConflict::Upsert handles deduplication
         let insert_op = InsertOp::Append;
