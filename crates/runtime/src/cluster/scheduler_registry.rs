@@ -83,6 +83,9 @@ pub enum Error {
 
     #[snafu(display("Failed to serialize scheduler state: {source}"))]
     SerializeState { source: serde_json::Error },
+
+    #[snafu(display("{source}"))]
+    FailedToStartJobStoreCleanupTask { source: crate::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -151,7 +154,9 @@ pub async fn start_scheduler_registry(
 
     let job_executor = crate::jobs::JobExecutor::new(Arc::clone(&job_store), rt.datafusion());
     rt.set_job_executor(Arc::new(job_executor)).await;
-    rt.create_job_store_cleanup_schedule(&job_store).await?;
+    rt.create_job_store_cleanup_schedule(&job_store)
+        .await
+        .context(FailedToStartJobStoreCleanupTaskSnafu)?;
     tracing::info!(
         "Initialized async SQL jobs API with state location: {}",
         config.state_location

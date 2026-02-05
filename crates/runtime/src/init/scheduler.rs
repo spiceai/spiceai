@@ -325,7 +325,7 @@ impl Runtime {
     ) -> Result<()> {
         let schedulers_lock = Arc::clone(&self.schedulers);
         let mut schedulers = schedulers_lock.write().await;
-        if let Some(existing_scheduler) = schedulers.get(JOB_CLEANUP_SCHEDULER_NAME) {
+        if schedulers.get(JOB_CLEANUP_SCHEDULER_NAME).is_some() {
             tracing::debug!(
                 "Job cleanup scheduler already exists, skipping creation of job cleanup schedule"
             );
