@@ -23,10 +23,18 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
+use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
+use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
+use datafusion_expr::{Expr, TableScan};
+use flight_client::cookie::CookieStore;
+use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use uuid::Uuid;
+
+use crate::accelerated_table::AcceleratedTable;
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
@@ -44,6 +52,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Represents a single executor's control stream connection.
+#[derive(Debug)]
 pub struct ExecutorConnection {
     /// Channel to send control messages to this executor
     request_tx: mpsc::Sender<SchedulerControlMessage>,
@@ -106,16 +115,25 @@ impl ExecutorConnection {
     }
 }
 
+pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
+
 /// Registry for tracking executor control stream connections.
 ///
 /// Schedulers use this registry to:
 /// - Register executors when they connect via control stream
 /// - Unregister executors when they disconnect
 /// - Request metrics from all connected executors
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
+
+    /// Map of `executor_id` -> `FlightSqlClient`
+    /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
+    pub flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
+
+    /// Map of `executor_id` -> table partitions for that executor
+    pub partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
 }
 
 impl ExecutorRegistry {
@@ -124,6 +142,8 @@ impl ExecutorRegistry {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
+            partitions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -219,6 +239,64 @@ impl ExecutorRegistry {
                 failed_executors: failures.join(", "),
             })
         }
+    }
+}
+
+impl TablePartitionProvider for ExecutorRegistry {
+    /// Determines if the given table scan should be partitioned. Executors in [`ExecutorRegistry`] will only have partitions for accelerated tables.
+    fn should_partition(&self, tbl: &TableScan) -> bool {
+        let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
+            return false;
+        };
+        default
+            .table_provider
+            .as_any()
+            .downcast_ref::<AcceleratedTable>()
+            .is_some()
+    }
+
+    fn get_partitions(
+        &self,
+        table: &TableReference,
+        schema: SchemaRef,
+    ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
+        let Ok(partitions) = self.partitions.try_read() else {
+            tracing::warn!(
+                "For table {table:?}, failed to acquire read lock on ExecutorRegistry partitions"
+            );
+            return Vec::new();
+        };
+
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!(
+                "For table {table:?}, failed to acquire read lock on ExecutorRegistry flight_sql_clients"
+            );
+            return Vec::new();
+        };
+
+        partitions
+            .iter()
+            .filter_map(|(executor_id, table_map)| {
+                let parts = table_map.get(table)?;
+                let Some(client) = flight_sql_clients.get(executor_id) else {
+                    tracing::warn!(
+                        "Executor '{executor_id}' registered with partitions for table {table:?}, but no FlightSQL client found."
+                    );
+                    return None;
+                };
+                let table_provider = Arc::new(FlightSQLTable::create_with_schema(
+                    "flightsql",
+                    executor_id,
+                    client.clone(),
+                    table.clone(),
+                    Arc::clone(&schema),
+                    Arc::new(CookieStore::new()),
+
+                )) as Arc<dyn TableProvider>;
+
+                Some((table_provider, parts.clone()))
+            })
+            .collect()
     }
 }
 

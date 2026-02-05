@@ -31,6 +31,11 @@ service ClusterService {
     // Bidirectional control stream for executor-scheduler communication.
     // Initiated by executors, allows schedulers to request metrics on-demand.
     rpc ControlStream(stream ExecutorControlMessage) returns (stream SchedulerControlMessage);
+
+    // Get an initial allocation of accelerated table partitions.
+    // Called by executors when they first register to get initial Accelerated Table partitions.
+    // Allows schedulers to subsequently query executors over FlightSQL for accelerated table data.
+    rpc AllocateInitialPartitions(AllocateInitialPartitionsRequest) returns (AllocateInitialPartitionsResponse);
 }
 
 // Request message for GetAppDefinition RPC.
@@ -109,6 +114,23 @@ message SchedulerControlMessage {
         PollNowCommand poll_now = 2;
     }
 }
+
+// Request message for AllocateInitialPartitions RPC.
+message AllocateInitialPartitionsRequest {
+  // Executor's advertise address (used as identifier).
+  string executor_id = 1;
+}
+
+message StringArray {
+  repeated string items = 1;
+}
+
+// Response message for AllocateInitialPartitions RPC.
+message AllocateInitialPartitionsResponse {
+  // Map of table name to list of partition expressions.
+  map<string, StringArray> table_partitions = 1;
+}
+
 
 // Command sent from scheduler to executor to immediately poll for new work.
 // This allows the scheduler to notify executors when new tasks are available,

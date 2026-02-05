@@ -127,6 +127,8 @@ pub struct DataFusionBuilder {
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
     url_tables_enabled: bool,
+    /// Arbitrary additional analyzer rules.
+    additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -170,6 +172,7 @@ impl DataFusionBuilder {
             io_runtime,
             resource_monitor: None,
             url_tables_enabled: false,
+            additional_analyzer_rules: vec![],
         }
     }
 
@@ -256,6 +259,13 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Adds additional analyzer rules to the `DataFusion` instance.
+    #[must_use]
+    pub fn with_analyzer_rules(mut self, rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>) -> Self {
+        self.additional_analyzer_rules = rules;
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
@@ -281,6 +291,10 @@ impl DataFusionBuilder {
                 self.io_runtime.clone(),
             ))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
+
+        for rule in self.additional_analyzer_rules {
+            state = state.with_analyzer_rule(rule);
+        }
 
         #[cfg(feature = "duckdb")]
         {
