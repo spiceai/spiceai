@@ -32,3 +32,4 @@ pub use executor::JobExecutor;
 pub use state::JobErrorCode;
 pub use state::{DEFAULT_CHUNK_SIZE, JobResult, JobResultManifest, JobSchema, JobState, JobStatus};
 pub use store::JobStore;
+pub use store::{CLEANUP_INTERVAL_SECONDS, JOB_CLEANUP_SCHEDULE_NAME, JOB_CLEANUP_SCHEDULER_NAME};

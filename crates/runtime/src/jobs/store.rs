@@ -40,6 +40,15 @@ use super::state::{
     JobState, JobStatus,
 };
 
+/// Interval in seconds between expired job cleanup runs.
+pub const CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60; // 5 minutes
+
+/// Name of the scheduler used for job cleanup.
+pub const JOB_CLEANUP_SCHEDULER_NAME: &str = "job_cleanup_scheduler";
+
+/// Name of the schedule used for job cleanup.
+pub const JOB_CLEANUP_SCHEDULE_NAME: &str = "job_cleanup";
+
 /// Stores job state and results in the shared object store.
 ///
 /// Layout:

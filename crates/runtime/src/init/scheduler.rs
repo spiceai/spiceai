@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use datafusion::sql::TableReference;
 use scheduler::{
-    channel::cron::CronRequestChannel,
+    channel::{cron::CronRequestChannel, interval::IntervalRequestChannel},
     schedule::Schedule,
     scheduler::{Running, Scheduler, SchedulerBuilder},
     task::ScheduledTask,
@@ -36,8 +36,12 @@ use crate::{
         view::View,
     },
     dataaccelerator::AccelerationSource,
+    jobs::{
+        CLEANUP_INTERVAL_SECONDS, JOB_CLEANUP_SCHEDULE_NAME, JOB_CLEANUP_SCHEDULER_NAME, JobStore,
+    },
     scheduling::{
         dataset::DatasetRefreshTask,
+        jobs::JobCleanupTask,
         view::ViewRefreshTask,
         worker::{WorkerPromptTask, WorkerSqlTask},
     },
@@ -311,6 +315,51 @@ impl Runtime {
         );
 
         schedulers.insert(REFRESH_SCHEDULER_NAME.into(), Arc::clone(&scheduler));
+
+        Ok(())
+    }
+
+    pub async fn create_job_store_cleanup_schedule(
+        self: Arc<Self>,
+        job_store: &Arc<JobStore>,
+    ) -> Result<()> {
+        let cleanup_task: Arc<dyn ScheduledTask> =
+            Arc::new(JobCleanupTask::new(Arc::clone(job_store)));
+
+        let interval_channel = Arc::new(RwLock::new(IntervalRequestChannel::new(
+            CLEANUP_INTERVAL_SECONDS,
+        )));
+
+        let schedule = Arc::new(
+            Schedule::new(JOB_CLEANUP_SCHEDULE_NAME.into(), cleanup_task)
+                .add_trigger(interval_channel),
+        );
+
+        let scheduler = Arc::new(
+            SchedulerBuilder::new(JOB_CLEANUP_SCHEDULER_NAME.into())
+                .add_schedule(schedule)
+                .build()
+                .context(crate::FailedToBuildSchedulerSnafu)?
+                .start()
+                .await
+                .context(crate::FailedToStartSchedulerSnafu)?,
+        );
+
+        let schedulers_lock = Arc::clone(&self.schedulers);
+        let mut schedulers = schedulers_lock.write().await;
+        if let Some(existing_scheduler) = schedulers.get(JOB_CLEANUP_SCHEDULER_NAME) {
+            tracing::debug!(
+                "Job cleanup scheduler already exists, skipping creation of job cleanup schedule"
+            );
+            return Ok(());
+        }
+
+        schedulers.insert(JOB_CLEANUP_SCHEDULER_NAME.into(), Arc::clone(&scheduler));
+
+        tracing::debug!(
+            interval_seconds = CLEANUP_INTERVAL_SECONDS,
+            "Started distributed job cleanup scheduler"
+        );
 
         Ok(())
     }
