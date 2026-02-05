@@ -365,7 +365,6 @@ async fn run_snapshot_workload(
     accelerator: &Arc<dyn TableProvider>,
     accelerator_write_mutex: &Arc<Mutex<()>>,
     federated_schema: &Arc<Schema>,
-    _dataset_name: &TableReference,
     stop_signal: &Arc<AtomicBool>,
     snapshot_interval: Duration,
 ) -> ContentionMetrics {
@@ -392,7 +391,7 @@ async fn run_snapshot_workload(
                 .is_ok()
             {
                 match ctx.table("snapshot_table").await {
-                    Ok(df) => df.count().await.ok().map(|c| c as u64),
+                    Ok(df) => df.count().await.ok().and_then(|c| u64::try_from(c).ok()),
                     Err(_) => None,
                 }
             } else {
@@ -478,7 +477,6 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
 
     let checkpointer: Arc<dyn DatasetCheckpointer> =
         Arc::new(DelayedMockCheckpointer::new(Duration::from_millis(10)));
-    let dataset_name = TableReference::bare("lock_contention_test");
 
     // Configuration
     let baseline_duration = Duration::from_secs(5);
@@ -539,7 +537,6 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
     let snap_accel = Arc::clone(&accelerator);
     let snap_mutex = Arc::clone(&accelerator_write_mutex);
     let snap_schema = Arc::clone(&schema);
-    let snap_dataset = dataset_name.clone();
     let snap_stop = Arc::clone(&stop_signal);
     let snapshot_handle = tokio::spawn(async move {
         run_snapshot_workload(
@@ -548,7 +545,6 @@ async fn test_snapshot_lock_contention_effect_on_queries() -> anyhow::Result<()>
             &snap_accel,
             &snap_mutex,
             &snap_schema,
-            &snap_dataset,
             &snap_stop,
             snapshot_interval,
         )
@@ -826,7 +822,6 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     let checkpointer: Arc<dyn DatasetCheckpointer> =
         Arc::new(DelayedMockCheckpointer::new(Duration::from_millis(5)));
     let accelerator_write_mutex = Arc::new(Mutex::new(()));
-    let dataset_name = TableReference::bare(format!("test_{engine_type}"));
 
     // Run baseline (no snapshots)
     let baseline_duration = Duration::from_secs(3);
@@ -882,7 +877,6 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     let snap_accel = Arc::clone(&accelerator);
     let snap_mutex = Arc::clone(&accelerator_write_mutex);
     let snap_schema = Arc::clone(&schema);
-    let snap_dataset = dataset_name.clone();
     let snap_stop = Arc::clone(&stop_signal);
     let snapshot_handle = tokio::spawn(async move {
         run_snapshot_workload(
@@ -891,7 +885,6 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
             &snap_accel,
             &snap_mutex,
             &snap_schema,
-            &snap_dataset,
             &snap_stop,
             snapshot_interval,
         )

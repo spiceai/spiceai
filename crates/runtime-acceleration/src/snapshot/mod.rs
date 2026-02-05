@@ -1498,6 +1498,13 @@ impl SnapshotManager {
                     current_engine,
                 });
             }
+        } else {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                snapshot = %entry.snapshot,
+                snapshot_id = entry.snapshot_id,
+                "Downloading snapshot without engine metadata; skipping engine compatibility validation which may restore an incompatible snapshot"
+            );
         }
 
         let object_path = self.snapshot_uri_to_object_path(&entry.snapshot)?;
@@ -1879,10 +1886,8 @@ impl SnapshotManager {
                     ..Default::default()
                 });
             dataset_entry.name.clone_from(&dataset_name);
-            // Update engine if not already set or changed
-            if dataset_entry.engine.is_none() {
-                dataset_entry.engine = Some(engine_str);
-            }
+            // Always update engine to match the current engine
+            dataset_entry.engine = Some(engine_str);
 
             if dataset_entry.schemas.is_empty() {
                 let schema_metadata = SchemaMetadata::from_schema(0, schema).map_err(|source| {
