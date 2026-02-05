@@ -495,7 +495,7 @@ fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str,
 
     if let Some(shards) = checkpoint.get_mut("shards").and_then(|s| s.as_object_mut()) {
         // Collect existing shard data (collect is needed because we clear the map before re-inserting)
-        #[allow(clippy::needless_collect)]
+        #[expect(clippy::needless_collect)]
         let shard_values: Vec<_> = shards.values().cloned().collect();
 
         // Clear and replace with fake shard IDs
