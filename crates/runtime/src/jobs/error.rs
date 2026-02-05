@@ -89,6 +89,21 @@ pub enum Error {
     StreamRead {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to write results to object store. The maximum job size of '{maximum_size}' bytes was exceeded."
+    ))]
+    MaximumJobSizeExceeded { maximum_size: u64 },
+
+    #[snafu(display(
+        "Concurrent modification detected for job {job_id}. Another scheduler modified the job state."
+    ))]
+    ConcurrentModification { job_id: String },
+
+    #[snafu(display(
+        "Concurrent modification detected for chunk {chunk_index} of job {job_id}. Another scheduler already wrote this chunk."
+    ))]
+    ChunkAlreadyExists { job_id: String, chunk_index: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

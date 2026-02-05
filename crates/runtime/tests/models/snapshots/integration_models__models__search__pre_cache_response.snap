@@ -8,7 +8,9 @@ expression: normalize_search_response(response)
     {
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends con"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
@@ -18,7 +20,9 @@ expression: normalize_search_response(response)
     {
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_description": [
+          "Close customers might struggle away different mem"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 15

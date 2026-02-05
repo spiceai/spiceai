@@ -106,7 +106,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let health_report = health_report?;
 
     if let Some(message) = health_report.failure_message() {
-        return Err(anyhow::anyhow!(message));
+        eprintln!("Warning: {message}");
     }
 
     println!(

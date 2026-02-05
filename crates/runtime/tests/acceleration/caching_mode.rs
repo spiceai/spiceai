@@ -47,7 +47,7 @@ limitations under the License.
 //! - `test_caching_mode_background_refresh_on_stale`: Background refresh triggered when data becomes stale (TTL expiration)
 
 use app::AppBuilder;
-use arrow::array::{Array, StringArray, TimestampNanosecondArray};
+use arrow::array::{Array, StringArray, TimestampNanosecondArray, UInt16Array};
 use datafusion::prelude::*;
 use runtime::Runtime;
 use spicepod::{
@@ -2429,6 +2429,160 @@ async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
 
             let batches2 = df2.collect().await?;
             assert_column_has_data(&batches2, "content");
+
+            Ok(())
+        })
+        .await
+}
+
+/// 4xx responses (like 404 "Not Found") represent valid business responses (e.g., "user not found",
+/// "resource doesn't exist") and should be returned to user and cached.
+///
+/// This test:
+/// 1. Queries an invalid path that returns 404
+/// 2. Verifies user receives the 404 response with status code
+/// 3. Queries same path again (should be cache hit)
+/// 4. Verifies cached data is returned
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_http_404_responses_cached() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=trace,runtime::accelerated_table::caching=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            // Create HTTP dataset with caching mode
+            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            dataset.params = Some(Params::from_string_map(
+                vec![
+                    (
+                        "allowed_request_paths".to_string(),
+                        "/search/invalid_404_test".to_string(), // Invalid path that returns 404
+                    ),
+                    ("request_query_filters".to_string(), "enabled".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Caching),
+                refresh_check_interval: Some("30s".to_string()),
+                ..Acceleration::default()
+            });
+
+            let mut app = AppBuilder::new("test_caching_404")
+                .with_dataset(dataset)
+                .build();
+
+            // Disable SQL results caching to test acceleration caching specifically
+            if app.runtime.caching.sql_results.is_none() {
+                app.runtime.caching.sql_results =
+                    Some(spicepod::component::caching::SQLResultsCacheConfig::default());
+            }
+            if let Some(ref mut sql_cache) = app.runtime.caching.sql_results {
+                sql_cache.enabled = false;
+            }
+
+            configure_test_datafusion();
+            let status = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&status).load_components() => {}
+            }
+
+            runtime_ready_check(&status).await;
+
+            // STEP 1: Query invalid path (cache miss) - should fetch from HTTP and return 404
+            eprintln!("TEST: Step 1 - Cache miss: querying invalid path that returns 404...");
+            let df1 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/invalid_404_test")))?
+                .select(vec![
+                    col("request_path"),
+                    col("response_status"),
+                    col("content"),
+                ])?;
+
+            let batches1 = df1.collect().await?;
+            assert!(!batches1.is_empty(), "Should have results even for 404");
+            assert_eq!(batches1[0].num_rows(), 1, "Should have exactly 1 row");
+
+            // Verify response_status is 404
+            let status_col = batches1[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("response_status should be UInt16Array");
+            assert_eq!(
+                status_col.value(0),
+                404,
+                "Invalid path should return 404 status"
+            );
+
+            // Verify content contains 404 error message
+            let content_col = batches1[0]
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("content should be StringArray");
+            let content = content_col.value(0);
+            assert!(
+                content.contains("Not Found"),
+                "404 response body should contain 'Not Found'"
+            );
+
+            // Small delay to allow cache write to complete
+            tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
+
+            // STEP 2: Same query again (cache hit) - should return cached 404 response
+            eprintln!("TEST: Step 2 - Cache hit: same query should return cached 404 response...");
+            let df2 = status
+                .datafusion()
+                .ctx
+                .table("tvmaze")
+                .await?
+                .filter(col("request_path").eq(lit("/search/invalid_404_test")))?
+                .select(vec![
+                    col("request_path"),
+                    col("response_status"),
+                    col("content"),
+                ])?;
+
+            let batches2 = df2.collect().await?;
+            assert!(!batches2.is_empty(), "Should have cached results");
+            assert_eq!(batches2[0].num_rows(), 1, "Cached result should have 1 row");
+
+            // Verify cached response still has 404 status
+            let status_col2 = batches2[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("response_status should be UInt16Array");
+            assert_eq!(
+                status_col2.value(0),
+                404,
+                "Cached response should still have 404 status"
+            );
+
+            // Verify cached content still contains error message
+            let content_col2 = batches2[0]
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("content should be StringArray");
+            let cached_content = content_col2.value(0);
+            assert!(
+                cached_content.contains("Not Found"),
+                "Cached 404 response should contain 'Not Found'"
+            );
 
             Ok(())
         })

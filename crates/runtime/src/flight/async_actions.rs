@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use tonic::Status;
 
 use crate::datafusion::job_executor_context_extension::get_job_executor;
-use crate::jobs::{JobState, JobStatus};
+use crate::http::v1::queries::SubmitQueryRequest;
+use crate::jobs::{JobErrorCode, JobState, JobStatus};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 /// Action types for async query operations.
@@ -163,16 +164,6 @@ impl fmt::Display for QueryId {
     }
 }
 
-/// Request to submit an async query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubmitAsyncQueryRequest {
-    /// The SQL query to execute.
-    pub sql: String,
-    /// Optional query parameters as JSON.
-    #[serde(default)]
-    pub parameters: Option<serde_json::Value>,
-}
-
 /// Response from submitting an async query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitAsyncQueryResponse {
@@ -208,7 +199,7 @@ pub struct GetAsyncQueryStatusResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsyncQueryError {
     /// Error code.
-    pub error_code: String,
+    pub error_code: JobErrorCode,
     /// Error message.
     pub message: String,
 }
@@ -256,12 +247,12 @@ pub async fn handle_submit_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
     let executor = get_job_executor(&context)
         .ok_or_else(|| Status::unavailable("Async queries are only available in cluster mode"))?;
 
-    let request: SubmitAsyncQueryRequest = serde_json::from_slice(body).map_err(|e| {
-        Status::invalid_argument(format!("Failed to parse SubmitAsyncQueryRequest: {e}"))
+    let request: SubmitQueryRequest = serde_json::from_slice(body).map_err(|e| {
+        Status::invalid_argument(format!("Failed to parse SubmitQueryRequest: {e}"))
     })?;
 
     let state = executor
-        .submit(request.sql, request.parameters)
+        .submit(request)
         .await
         .map_err(|e| Status::internal(format!("Failed to submit query: {e}")))?;
 
@@ -369,7 +360,7 @@ pub async fn handle_cancel_async_query(body: &[u8]) -> Result<Vec<u8>, Status> {
 
 fn job_state_to_status_response(state: &JobState) -> GetAsyncQueryStatusResponse {
     let error = state.error.as_ref().map(|e| AsyncQueryError {
-        error_code: e.error_code.clone(),
+        error_code: e.error_code,
         message: e.message.clone(),
     });
 
