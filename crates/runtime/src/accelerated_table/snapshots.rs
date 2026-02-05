@@ -61,7 +61,7 @@ pub fn spawn_snapshot_interval_task(
     dataset_name: TableReference,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
-    _bootstrap_status: crate::dataaccelerator::BootstrapStatus,
+    bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -79,20 +79,19 @@ pub fn spawn_snapshot_interval_task(
         runtime_status.wait_for_ready().await;
 
         // Determine the initial delay based on last checkpoint time
-        let initial_delay = match checkpointer.last_checkpoint_time().await {
-            Ok(Some(last_checkpoint)) => {
-                let elapsed = last_checkpoint.elapsed().unwrap_or(Duration::ZERO);
-                if elapsed >= interval_duration {
-                    // Enough time has passed, create snapshot immediately
-                    Duration::ZERO
-                } else {
-                    // Wait until interval_duration has passed since last checkpoint
-                    interval_duration - elapsed
+        let initial_delay = if !bootstrap_status.is_bootstrapped() {
+            Duration::ZERO
+        } else {
+            match checkpointer.last_checkpoint_time().await {
+                Ok(Some(last_checkpoint)) => {
+                    let elapsed = last_checkpoint.elapsed().unwrap_or(Duration::ZERO);
+                    if elapsed >= interval_duration {
+                        Duration::ZERO
+                    } else {
+                        interval_duration - elapsed
+                    }
                 }
-            }
-            Ok(None) | Err(_) => {
-                // No previous checkpoint or error getting it, create immediately
-                Duration::ZERO
+                Ok(None) | Err(_) => Duration::ZERO,
             }
         };
 
@@ -277,13 +276,62 @@ pub async fn create_checkpoint_and_snapshot(
             None
         };
 
-        if let Err(e) = snapshot_manager
-            .create_snapshot(federated_schema, lock_guard, updated_at, row_count, force_create)
+        match snapshot_manager
+            .create_snapshot(
+                federated_schema,
+                lock_guard,
+                updated_at,
+                row_count,
+                force_create,
+            )
             .await
         {
-            let dataset_label = dataset_name.to_string();
-            snapshot_metrics::record_snapshot_failure(&dataset_label);
-            tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
+            Ok(_) => {}
+            Err(e) => {
+                let dataset_label = dataset_name.to_string();
+                snapshot_metrics::record_snapshot_failure(&dataset_label);
+                tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");
+            }
+        }
+    }
+}
+
+/// Gets the row count from the accelerator using the `DataFrame` API.
+///
+/// Returns `None` if the row count cannot be determined (e.g., due to errors).
+async fn get_row_count(
+    accelerator: &Arc<dyn TableProvider>,
+    dataset_name: &TableReference,
+) -> Option<u64> {
+    let ctx = SessionContext::new();
+    let table_name = dataset_name.table();
+
+    if ctx
+        .register_table(table_name, Arc::clone(accelerator))
+        .is_err()
+    {
+        tracing::debug!(dataset = %dataset_name, "Failed to register accelerator table for row count query");
+        return None;
+    }
+
+    match ctx.table(table_name).await {
+        Ok(df) => match df.count().await {
+            Ok(count) => {
+                if let Ok(row_count) = u64::try_from(count) {
+                    Some(row_count)
+                } else {
+                    tracing::debug!(dataset = %dataset_name, "Row count for snapshot exceeds u64::MAX; proceeding without it");
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::debug!(dataset = %dataset_name, error = %e, "Failed to get row count for snapshot; proceeding without it");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!(dataset = %dataset_name, error = %e, "Failed to get DataFrame for row count query");
+            None
         }
     }
 }
