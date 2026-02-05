@@ -458,6 +458,16 @@ impl JobStore {
             total_chunks = total_chunks.saturating_add(1);
 
             if let Err(err) = self.store.delete(&meta.location).await {
+                if let ObjectStoreError::NotFound { .. } = err {
+                    // Chunk was already deleted - deletion occurred concurrently
+                    tracing::debug!(
+                        job_id,
+                        path = %meta.location,
+                        "Chunk already deleted during job deletion (likely deleted during list operation), skipping"
+                    );
+                    continue;
+                }
+
                 tracing::warn!(
                     job_id,
                     path = %meta.location,
@@ -479,10 +489,19 @@ impl JobStore {
 
         // Delete job state
         let path = self.job_state_path(job_id);
-        self.store
-            .delete(&path)
-            .await
-            .context(ObjectStoreDeleteSnafu)?;
+        let job_state_delete_result = self.store.delete(&path).await;
+
+        if let Err(ObjectStoreError::NotFound { .. }) = job_state_delete_result {
+            // Job state was already deleted - deletion occurred concurrently
+            tracing::debug!(
+                job_id,
+                path = %path,
+                "Job state already deleted during job deletion (likely deleted during list operation), skipping"
+            );
+            return Ok(());
+        }
+
+        job_state_delete_result.context(ObjectStoreDeleteSnafu)?;
 
         Ok(())
     }
