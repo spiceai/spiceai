@@ -19,6 +19,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
+use arrow_array::UInt16Array;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
@@ -125,6 +126,7 @@ struct CachedResponse {
     max_age: Duration,
     detected_format: Option<String>,
     response_date: Option<SystemTime>,
+    response_status: u16,
 }
 
 impl CachedResponse {
@@ -196,6 +198,7 @@ struct HttpFetchResult {
     max_age: Duration,
     detected_format: String,
     response_date: Option<SystemTime>,
+    response_status: u16,
 }
 
 impl HttpFetchResult {
@@ -420,6 +423,7 @@ impl HttpTableProvider {
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
+            Field::new("response_status", DataType::UInt16, false),
             Field::new(
                 "fetched_at",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
@@ -629,22 +633,20 @@ impl HttpTableProvider {
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
-        result: HttpFetchResult,
-    ) -> String {
+        result: &HttpFetchResult,
+    ) {
         let cache_key = Self::get_cache_key(path, query, body);
-        let content_arc = Arc::new(result.content);
         let cached_response = CachedResponse {
-            content: Arc::clone(&content_arc),
+            content: Arc::new(result.content.clone()),
             cached_at: SystemTime::now(),
             max_age: result.max_age,
-            detected_format: Some(result.detected_format),
+            detected_format: Some(result.detected_format.clone()),
             response_date: result.response_date,
+            response_status: result.response_status,
         };
 
         let mut cache_write = self.cache.write().await;
         cache_write.insert(cache_key, cached_response);
-
-        Arc::unwrap_or_clone(content_arc)
     }
 
     async fn perform_request_with_retry(
@@ -687,19 +689,21 @@ impl HttpTableProvider {
                     RetryError::transient(Error::HttpRequest { source: e })
                 })?;
 
+                let status_code = response.status().as_u16();
+
                 if let Err(err) = response.error_for_status_ref() {
-                    if let Some(status) = err.status() {
-                        let status_code = status.as_u16();
-                        if (400..500).contains(&status_code) {
-                            return Err(RetryError::permanent(Error::HttpClientError {
-                                status: status_code,
-                                message: format!(
-                                    "{} for url ({})",
-                                    status.canonical_reason().unwrap_or("Client Error"),
-                                    url
-                                ),
-                            }));
-                        }
+                    if (400..500).contains(&status_code) {
+                        return Err(RetryError::permanent(Error::HttpClientError {
+                            status: status_code,
+                            message: format!(
+                                "{} for url ({})",
+                                response
+                                    .status()
+                                    .canonical_reason()
+                                    .unwrap_or("Client Error"),
+                                url
+                            ),
+                        }));
                     }
                     tracing::debug!("HTTP request returned server error, will retry: {}", err);
                     return Err(RetryError::transient(Error::HttpRequest { source: err }));
@@ -745,6 +749,7 @@ impl HttpTableProvider {
                     max_age,
                     detected_format,
                     response_date,
+                    response_status: status_code,
                 })
             }
         })
@@ -756,7 +761,7 @@ impl HttpTableProvider {
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
         let query_owned = query.map(ToOwned::to_owned);
@@ -767,25 +772,24 @@ impl HttpTableProvider {
             .await?;
 
         if fetch_result.should_cache() {
-            return Ok(self
-                .cache_response(
-                    &path_owned,
-                    query_owned.as_deref(),
-                    body_owned.as_deref(),
-                    fetch_result,
-                )
-                .await);
+            self.cache_response(
+                &path_owned,
+                query_owned.as_deref(),
+                body_owned.as_deref(),
+                &fetch_result,
+            )
+            .await;
         }
 
-        Ok(fetch_result.content)
+        Ok(fetch_result)
     }
 
-    async fn get_content(
+    async fn get_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<HttpFetchResult> {
         // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it
         if self.acceleration_enabled {
             return self.fetch_and_cache(path, query, body).await;
@@ -811,7 +815,13 @@ impl HttpTableProvider {
             } else {
                 tracing::debug!("Returning fresh cached content for {}", cache_key);
             }
-            return Ok((*cached_response.content).clone());
+            return Ok(HttpFetchResult {
+                content: (*cached_response.content).clone(),
+                max_age: cached_response.max_age,
+                detected_format: cached_response.detected_format.clone().unwrap_or_default(),
+                response_date: cached_response.response_date,
+                response_status: cached_response.response_status,
+            });
         }
 
         // Fetch fresh content
@@ -960,19 +970,17 @@ impl HttpExec {
         );
 
         // Fetch content with path, query, and body
-        let content = provider
-            .get_content(path_val, query_val, body_val)
+        let result = provider
+            .get_response(path_val, query_val, body_val)
             .await
             .map_err(DataFusionError::from)?;
 
-        // Get the response date from cache (if available)
-        let cache_key = HttpTableProvider::get_cache_key(path_val, query_val, body_val);
-        let response_date = {
-            let cache = provider.cache.read().await;
-            cache
-                .get(&cache_key)
-                .and_then(|cached| cached.response_date)
-        };
+        let HttpFetchResult {
+            content,
+            response_date,
+            response_status,
+            ..
+        } = result;
 
         // Store the actual values from the partition for the primary key
         let path_for_batch = path.as_deref().unwrap_or("");
@@ -1030,6 +1038,9 @@ impl HttpExec {
                     Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
                 }
                 "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
+                "response_status" => {
+                    Ok(Arc::new(UInt16Array::from(vec![response_status; num_rows])) as ArrayRef)
+                }
                 "fetched_at" => {
                     use arrow::array::TimestampNanosecondArray;
                     Ok(Arc::new(TimestampNanosecondArray::from(vec![
@@ -1959,25 +1970,28 @@ mod tests {
     fn test_base_table_schema() {
         let schema = HttpTableProvider::base_table_schema();
 
-        assert_eq!(schema.fields().len(), 5);
+        assert_eq!(schema.fields().len(), 6);
         assert_eq!(schema.field(0).name(), "request_path");
         assert_eq!(schema.field(1).name(), "request_query");
         assert_eq!(schema.field(2).name(), "request_body");
         assert_eq!(schema.field(3).name(), "content");
-        assert_eq!(schema.field(4).name(), "fetched_at");
+        assert_eq!(schema.field(4).name(), "response_status");
+        assert_eq!(schema.field(5).name(), "fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
+        assert_eq!(*schema.field(4).data_type(), DataType::UInt16);
         assert_eq!(
-            *schema.field(4).data_type(),
+            *schema.field(5).data_type(),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
         );
         assert!(!schema.field(0).is_nullable()); // request_path is not nullable
         assert!(schema.field(1).is_nullable()); // request_query is nullable
         assert!(schema.field(2).is_nullable()); // request_body is nullable
         assert!(!schema.field(3).is_nullable()); // content is not nullable
-        assert!(schema.field(4).is_nullable()); // fetched_at is nullable
+        assert!(!schema.field(4).is_nullable()); // response_status is not nullable
+        assert!(schema.field(5).is_nullable()); // fetched_at is nullable
     }
 
     #[test]
