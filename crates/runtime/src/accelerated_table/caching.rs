@@ -2690,10 +2690,12 @@ mod tests {
     #[tokio::test]
     async fn test_swr_handle_cache_hit_refreshes_only_accessed_entry() {
         // Create schema with request columns (HTTP connector cache pattern)
+        // Includes response_status column required by filter_5xx_responses
         let schema = Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, true),
             Field::new("request_query", DataType::Utf8, true),
             Field::new("data", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
             Field::new(
                 CACHE_REFRESHED_AT_COLUMN,
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -2706,6 +2708,7 @@ mod tests {
             let path = StringArray::from(vec!["/api/users"]);
             let query = StringArray::from(vec!["id=1"]);
             let data = StringArray::from(vec!["fresh_user_data"]);
+            let status = UInt16Array::from(vec![200]); // 200 OK - will pass filter_5xx_responses
 
             #[expect(clippy::cast_possible_truncation)]
             let now = SystemTime::now()
@@ -2720,6 +2723,7 @@ mod tests {
                     Arc::new(path),
                     Arc::new(query),
                     Arc::new(data),
+                    Arc::new(status),
                     Arc::new(timestamp),
                 ],
             )
@@ -2744,6 +2748,7 @@ mod tests {
                 "stale_post_data",
                 "stale_comment_data",
             ]);
+            let status = UInt16Array::from(vec![200, 200, 200]); // All 200 OK
 
             #[expect(clippy::cast_possible_truncation)]
             let two_min_ago = (SystemTime::now()
@@ -2764,6 +2769,7 @@ mod tests {
                     Arc::new(path),
                     Arc::new(query),
                     Arc::new(data),
+                    Arc::new(status),
                     Arc::new(timestamp),
                 ],
             )
