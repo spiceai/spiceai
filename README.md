@@ -72,8 +72,8 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 
 ### Latest Capabilities
 
-- **Spice Cayenne Data Accelerator (Beta)**: Simplified multi-file acceleration using the [Vortex columnar format](https://github.com/vortex-data/vortex) + SQLite metadata. Delivers DuckDB-comparable performance without single-file scaling limitations.
-- **Multi-Node Distributed Query (Preview)**: Scale query execution across multiple nodes with Apache Ballista integration for improved performance on large datasets.
+- **Spice Cayenne Data Accelerator**: Simplified multi-file acceleration using the [Vortex columnar format](https://github.com/vortex-data/vortex) + SQLite metadata. Delivers DuckDB-comparable performance without single-file scaling limitations.
+- **Multi-Node Distributed Query**: Scale query execution across multiple nodes with Apache Ballista integration for improved performance on large datasets.
 - **Acceleration Snapshots**: Bootstrap accelerations from S3 for fast cold starts (seconds vs. minutes). Supports ephemeral storage with persistent recovery.
 - **Iceberg Table Writes**: Write to Iceberg tables using standard SQL `INSERT INTO` for data ingestion and transformation—no Spark required.
 - **Petabyte-Scale Vector Search**: Native Amazon S3 Vectors integration manages the full vector lifecycle from ingestion to embedding to querying. SQL-integrated hybrid search with RRF.
@@ -218,7 +218,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | Name       | Description                       | Status              | Engine Modes     |
 | ---------- | --------------------------------- | ------------------- | ---------------- |
 | `arrow`    | [In-Memory Arrow Records][arrow]  | Stable              | `memory`         |
-| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Beta (v1.9.0-rc.2+) | `file`           |
+| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable               | `file`           |
 | `duckdb`   | Embedded [DuckDB][duckdb]         | Stable              | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres]   | Release Candidate   | N/A              |
 | `sqlite`   | Embedded [SQLite][sqlite]         | Release Candidate   | `memory`, `file` |
