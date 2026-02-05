@@ -616,17 +616,16 @@ impl Runtime {
     pub fn job_executor(&self) -> Option<Arc<jobs::JobExecutor>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler { job_executor, .. }) => {
-                match job_executor.try_read() {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => {
-                        tracing::debug!(
-                            "Job executor is currently being initialized. Returning None. This is a transient condition during startup."
-                        );
-                        None
-                    }
+                if let Ok(guard) = job_executor.try_read() {
+                    guard.clone()
+                } else {
+                    tracing::debug!(
+                        "Job executor is currently being initialized. Returning None. This is a transient condition during startup."
+                    );
+                    None
                 }
             }
-            None | Some(DistributedNode::Executor {}) => None,
+            None | Some(DistributedNode::Executor) => None,
         }
     }
 
@@ -637,7 +636,7 @@ impl Runtime {
                 let mut guard = job_executor.write().await;
                 *guard = Some(executor);
             }
-            Some(DistributedNode::Executor {}) => {
+            Some(DistributedNode::Executor) => {
                 tracing::warn!(
                     "Attempted to set job executor on an executor node. This should only be set on the scheduler. Ignoring."
                 );
@@ -647,7 +646,7 @@ impl Runtime {
                     "Attempted to set job executor on a non-cluster runtime. This should only be set in cluster mode on the scheduler node. Ignoring."
                 );
             }
-        };
+        }
     }
 
     #[must_use]
@@ -786,7 +785,7 @@ impl Runtime {
                     )),
                 )
             }
-            Some(DistributedNode::Executor {}) => {
+            Some(DistributedNode::Executor) => {
                 let executor_shutdown = CancellationToken::new();
                 let executor_fut = cluster::initialize_cluster_executor(
                     Arc::clone(&self),
