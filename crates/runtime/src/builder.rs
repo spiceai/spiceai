@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::cluster::DistributedNode;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
 use crate::config::ClusterRole;
@@ -238,14 +239,20 @@ impl RuntimeBuilder {
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
 
-        // Only create an executor registry if this node is a scheduler
-        let executor_registry = self
+        let distributed = match self
             .resolved_cluster_config
             .as_ref()
             .and_then(ResolvedClusterConfig::effective_role)
-            .is_some_and(|role| role == ClusterRole::Scheduler)
-            .then(|| Arc::new(ExecutorRegistry::new()));
-
+        {
+            Some(ClusterRole::Scheduler) => Some(DistributedNode::Scheduler {
+                peers: Arc::new(RwLock::new(HashMap::new())),
+                // Initialized later when scheduler registry starts
+                job_executor: Arc::new(RwLock::new(None)),
+                executor_registry: Arc::new(ExecutorRegistry::new()),
+            }),
+            Some(ClusterRole::Executor) => Some(DistributedNode::Executor {}),
+            None => None, // No cluster config means we're running in standalone mode
+        };
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
@@ -260,10 +267,13 @@ impl RuntimeBuilder {
         .with_resource_monitor(resource_monitor.clone())
         .with_url_tables(url_tables_enabled);
 
-        if let Some(ref reg) = executor_registry {
+        if let Some(DistributedNode::Scheduler {
+            executor_registry, ..
+        }) = distributed.as_ref()
+        {
             df_builder =
                 df_builder.with_analyzer_rules(vec![Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::clone(reg) as Arc<dyn TablePartitionProvider>,
+                    Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
                 ))
                     as Arc<dyn AnalyzerRule + Send + Sync>]);
         }
@@ -333,9 +343,7 @@ impl RuntimeBuilder {
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
-            scheduler_peers: Arc::new(RwLock::new(HashMap::new())),
-            job_executor: Arc::new(RwLock::new(None)), // Initialized later when scheduler registry starts
-            executor_registry,
+            distributed,
             resource_monitor,
             config: Arc::clone(&self.runtime_config),
         };

@@ -19,6 +19,7 @@ use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
+use crate::jobs::JobExecutor;
 use crate::status::ComponentStatus;
 use crate::{
     CLUSTER_INTERNAL_SERVER, CLUSTER_SCHEDULER_REGISTRY, FailedToStartClusterExecutorSnafu,
@@ -70,7 +71,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
@@ -78,6 +79,29 @@ use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 use x509_certificate::CapturedX509Certificate;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+pub enum DistributedNode {
+    Scheduler {
+        peers: Arc<RwLock<SchedulerPeers>>,
+
+        /// Job executor for async SQL query jobs (only available in cluster mode with scheduler config)
+        job_executor: Arc<RwLock<Option<Arc<JobExecutor>>>>,
+
+        /// Registry of connected executors for `FlightSQL`.
+        executor_registry: Arc<ExecutorRegistry>,
+    },
+    Executor,
+}
+
+impl DistributedNode {
+    pub fn is_scheduler(&self) -> bool {
+        matches!(self, DistributedNode::Scheduler { .. })
+    }
+
+    pub fn is_executor(&self) -> bool {
+        matches!(self, DistributedNode::Executor)
+    }
+}
 
 type SchedulerEndpointOverride =
     Arc<dyn Fn(Endpoint) -> Result<Endpoint, tonic::transport::Error> + Send + Sync>;

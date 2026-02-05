@@ -75,7 +75,7 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
-use crate::cluster::SchedulerPeers;
+use crate::cluster::{DistributedNode, SchedulerPeers};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 pub mod accelerated_table;
@@ -496,15 +496,9 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
-    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 
-    /// Job executor for async SQL query jobs (only available in cluster mode with scheduler config)
-    job_executor: Arc<RwLock<Option<Arc<jobs::JobExecutor>>>>,
-
-    /// Registry of connected executors for `FlightSQL`.
-    /// Only used in scheduler mode.
-    pub executor_registry: Option<Arc<cluster::ExecutorRegistry>>,
-
+    /// When the runtime is part of a distributed cluster, this holds the node-specific information. It is `None` for stand-alone runtimes.
+    distributed: Option<DistributedNode>,
     resource_monitor: resource_monitor::ResourceMonitor,
 
     config: Arc<Config>,
@@ -617,16 +611,51 @@ impl Runtime {
     /// 2. The executor is being initialized (rare, transient condition)
     #[must_use]
     pub fn job_executor(&self) -> Option<Arc<jobs::JobExecutor>> {
-        self.job_executor
-            .try_read()
-            .ok()
-            .and_then(|guard| guard.clone())
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { job_executor, .. }) => {
+                match job_executor.try_read() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => {
+                        tracing::debug!(
+                            "Job executor is currently being initialized. Returning None. This is a transient condition during startup."
+                        );
+                        None
+                    }
+                }
+            }
+            Some(DistributedNode::Executor {}) => {
+                tracing::warn!(
+                    "Attempted to get job executor on an executor node. This should only be set on the scheduler. Returning None."
+                );
+                None
+            }
+            None => {
+                tracing::warn!(
+                    "Attempted to get job executor on a non-cluster runtime. This should only be set in cluster mode on the scheduler node. Returning None."
+                );
+                None
+            }
+        }
     }
 
     /// Sets the job executor for async SQL queries.
     pub async fn set_job_executor(&self, executor: Arc<jobs::JobExecutor>) {
-        let mut guard = self.job_executor.write().await;
-        *guard = Some(executor);
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { job_executor, .. }) => {
+                let mut guard = job_executor.write().await;
+                *guard = Some(executor);
+            }
+            Some(DistributedNode::Executor {}) => {
+                tracing::warn!(
+                    "Attempted to set job executor on an executor node. This should only be set on the scheduler. Ignoring."
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "Attempted to set job executor on a non-cluster runtime. This should only be set in cluster mode on the scheduler node. Ignoring."
+                );
+            }
+        };
     }
 
     #[must_use]
@@ -730,14 +759,13 @@ impl Runtime {
         let (maybe_cluster_future, cluster_collector): (
             Option<BoxedClusterFuture>,
             Option<Arc<metrics_server::cluster::ClusterMetricsCollector>>,
-        ) = match self.df.cluster_config.effective_role() {
-            Some(ClusterRole::Scheduler) => {
-                let Some(ref scheduler_executor_registry) = self.executor_registry else {
-                    return Err(Error::MissingSchedulerExecutorRegistry);
-                };
+        ) = match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                executor_registry, ..
+            }) => {
                 let fut = cluster::initialize_cluster_scheduler_future(
                     &self,
-                    Arc::clone(scheduler_executor_registry),
+                    Arc::clone(executor_registry),
                 )
                 .await?;
 
@@ -755,7 +783,7 @@ impl Runtime {
                     Some(Arc::new(
                         metrics_server::cluster::ClusterMetricsCollector::new(
                             self.scheduler_peers(),
-                            Arc::clone(scheduler_executor_registry),
+                            Arc::clone(executor_registry),
                             self.df.cluster_config.client_tls_config().cloned(),
                             self.df.cluster_config.node_id(),
                             local_metrics_collector,
@@ -763,7 +791,7 @@ impl Runtime {
                     )),
                 )
             }
-            Some(ClusterRole::Executor) => {
+            Some(DistributedNode::Executor {}) => {
                 let executor_shutdown = CancellationToken::new();
                 let executor_fut = cluster::initialize_cluster_executor(
                     Arc::clone(&self),
@@ -784,7 +812,7 @@ impl Runtime {
                     None,
                 )
             }
-            _ => (None, None),
+            None => (None, None),
         };
 
         if self.df.cluster_config.effective_role().is_some() {
