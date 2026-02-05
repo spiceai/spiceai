@@ -494,7 +494,8 @@ fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str,
         serde_json::from_str(&checkpoint_data).expect("Failed to parse checkpoint JSON");
 
     if let Some(shards) = checkpoint.get_mut("shards").and_then(|s| s.as_object_mut()) {
-        // Collect existing shard data
+        // Collect existing shard data (collect is needed because we clear the map before re-inserting)
+        #[allow(clippy::needless_collect)]
         let shard_values: Vec<_> = shards.values().cloned().collect();
 
         // Clear and replace with fake shard IDs
@@ -547,7 +548,7 @@ fn get_acceleration_row_count(duckdb_path: &str, table_name: &str) -> usize {
             row.get(0)
         })
         .unwrap_or(0);
-    count as usize
+    usize::try_from(count).unwrap_or(0)
 }
 
 async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: u64) -> bool {
@@ -597,7 +598,7 @@ async fn wait_for_dataset_rows(
                 .column(0)
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-            && col.value(0) as usize >= expected_rows
+            && usize::try_from(col.value(0)).unwrap_or(0) >= expected_rows
         {
             return true;
         }
@@ -627,7 +628,7 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
             // Create temp DuckDB file and insert fake checkpoint with FRESH timestamp (1h ago)
             let temp_dir = tempfile::tempdir()?;
             let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().unwrap();
+            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
 
             // Insert fake checkpoint that's only 1h old (< 18h threshold)
             // This should propagate error regardless of lag_exceeds_behavior setting
@@ -696,7 +697,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
             // Create temp DuckDB file for acceleration
             let temp_dir = tempfile::tempdir()?;
             let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().unwrap();
+            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
 
             // === PHASE 1: Start Spice normally to create real checkpoint ===
             {
@@ -817,7 +818,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
             // Create temp DuckDB file for acceleration
             let temp_dir = tempfile::tempdir()?;
             let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().unwrap();
+            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
 
             // === PHASE 1: Start Spice normally to create real checkpoint ===
             {
