@@ -1211,7 +1211,11 @@ impl CacheRefreshHelper {
                 let cache_key = compute_cache_key_from_filters(filters);
 
                 // Only cache if we have non-5xx data to cache
-                if !batches_for_cache.is_empty() {
+                if batches_for_cache.is_empty() {
+                    tracing::debug!(
+                        "Fetch returned 5xx response, skipping cache write for dataset={dataset_name}"
+                    );
+                } else {
                     let cache_rows: usize =
                         batches_for_cache.iter().map(RecordBatch::num_rows).sum();
 
@@ -1248,10 +1252,6 @@ impl CacheRefreshHelper {
 
                     tracing::debug!(
                         "Background cache update performed for dataset={dataset_name}, {cache_rows} rows"
-                    );
-                } else {
-                    tracing::debug!(
-                        "Fetch returned 5xx response, skipping cache write for dataset={dataset_name}"
                     );
                 }
 
@@ -1946,6 +1946,86 @@ mod tests {
             // Return an empty exec as we don't need output
             Ok(Arc::new(DataSourceExec::new(Arc::new(
                 MemorySourceConfig::try_new(&[vec![]], Arc::clone(&self.schema), None)?,
+            ))))
+        }
+    }
+
+    /// Mock HTTP source table provider that returns data with configurable response status codes.
+    /// Used to test that 5xx responses are returned to users but NOT cached.
+    #[derive(Debug)]
+    struct MockHttpTableProvider {
+        schema: SchemaRef,
+        /// Data to return from scan (should include response_status column)
+        data: Vec<RecordBatch>,
+    }
+
+    impl MockHttpTableProvider {
+        /// Create a mock HTTP provider that returns data with the specified response status code.
+        fn with_status(status_code: u16, content: &str) -> Self {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("request_path", DataType::Utf8, true),
+                Field::new("request_query", DataType::Utf8, true),
+                Field::new("content", DataType::Utf8, true),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                Field::new(
+                    CACHE_REFRESHED_AT_COLUMN,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ]));
+
+            #[expect(clippy::cast_possible_truncation)]
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos() as i64;
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["/api/test"])),
+                    Arc::new(StringArray::from(vec!["q=test"])),
+                    Arc::new(StringArray::from(vec![content])),
+                    Arc::new(UInt16Array::from(vec![status_code])),
+                    Arc::new(TimestampNanosecondArray::from(vec![Some(now)])),
+                ],
+            )
+            .expect("to create batch");
+
+            Self {
+                schema,
+                data: vec![batch],
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for MockHttpTableProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(
+                    std::slice::from_ref(&self.data),
+                    Arc::clone(&self.schema),
+                    None,
+                )?,
             ))))
         }
     }
@@ -2855,6 +2935,175 @@ mod tests {
 
         let total_rows: usize = data.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "Should have 3 rows from 3 requests");
+    }
+
+    /// Test that 5xx responses are returned to users but NOT written to the cache.
+    ///
+    /// Simulates cache miss flow:
+    /// 1. Create mock HTTP source (federated) and empty accelerator
+    /// 2. Call `handle_cache_miss` (called when accelerator has no data for query)
+    /// 3. Verify user receives 5xx response data (can see the error)
+    /// 4. Verify accelerator remains empty (transient errors not persisted)
+    #[tokio::test]
+    async fn test_5xx_responses_returned_to_user_but_not_cached() {
+        use futures::StreamExt;
+
+        // 1. Create mock HTTP source (returns 500) and empty accelerator
+        let http_source = Arc::new(MockHttpTableProvider::with_status(
+            500,
+            "Internal Server Error",
+        ));
+        let schema = http_source.schema();
+
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        // 2. Call handle_cache_miss - this is what happens when user queries and cache is empty
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            "test_dataset",
+            &[col("content").eq(lit("test"))], // filters
+            None,                              // limit
+            Arc::clone(&schema),
+            false, // is_expired
+            false, // stale_if_error
+            None,  // expired_batches
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()), // synchronized_children
+            batch_write_tx,
+        )
+        .await;
+
+        // Collect user-visible results
+        let mut user_batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            user_batches.push(result.expect("stream should not error"));
+        }
+
+        // 3. Verify user receives the 500 response data
+        assert_eq!(user_batches.len(), 1, "User should receive 1 batch");
+        assert_eq!(user_batches[0].num_rows(), 1, "User should receive 1 row");
+
+        let status_col = user_batches[0]
+            .column(
+                user_batches[0]
+                    .schema()
+                    .index_of(RESPONSE_STATUS_COLUMN)
+                    .expect("column exists"),
+            )
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("status column");
+        assert_eq!(status_col.value(0), 500, "User should see status 500");
+
+        // Wait for cache write flush
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+
+        // 4. Verify accelerator is empty (5xx was not cached)
+        let cached_data = accelerator.get_data();
+        assert!(
+            cached_data.is_empty(),
+            "5xx responses should NOT be in accelerator"
+        );
+    }
+
+    /// Test that 404 responses are cached.
+    ///
+    /// Simulates cache miss flow:
+    /// 1. Create mock HTTP source (federated) and empty accelerator
+    /// 2. Call `handle_cache_miss` (called when accelerator has no data for query)
+    /// 3. Verify user receives 404 response data
+    /// 4. Verify accelerator contains the 404 response
+    #[tokio::test]
+    async fn test_4xx_responses_are_cached() {
+        use futures::StreamExt;
+
+        // 1. Create mock HTTP source (returns 404) and empty accelerator
+        let http_source = Arc::new(MockHttpTableProvider::with_status(404, "Not Found"));
+        let schema = http_source.schema();
+
+        let accelerator = Arc::new(MockAcceleratorTableProvider::new(
+            Arc::clone(&schema),
+            vec![],
+        ));
+        let in_flight: InFlightRevalidations =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+
+        // 2. Call handle_cache_miss - this is what happens when user queries and cache is empty
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            "test_dataset",
+            &[col("content").eq(lit("test"))], // filters
+            None,                              // limit
+            Arc::clone(&schema),
+            false, // is_expired
+            false, // stale_if_error
+            None,  // expired_batches
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()), // synchronized_children
+            batch_write_tx,
+        )
+        .await;
+
+        // Collect user-visible results
+        let mut user_batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            user_batches.push(result.expect("stream should not error"));
+        }
+
+        // 3. Verify user receives the 404 response data
+        assert_eq!(user_batches.len(), 1, "User should receive 1 batch");
+        assert_eq!(user_batches[0].num_rows(), 1, "User should receive 1 row");
+
+        let status_col = user_batches[0]
+            .column(
+                user_batches[0]
+                    .schema()
+                    .index_of(RESPONSE_STATUS_COLUMN)
+                    .expect("column exists"),
+            )
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("status column");
+        assert_eq!(status_col.value(0), 404, "User should see status 404");
+
+        // Wait for cache write flush
+        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+
+        // 4. Verify accelerator has the 404 response cached
+        let cached_data = accelerator.get_data();
+        assert!(
+            !cached_data.is_empty(),
+            "4xx responses SHOULD be in accelerator"
+        );
+
+        let cached_rows: usize = cached_data.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(cached_rows, 1, "Should have 1 cached row");
+
+        // Verify cached data has status 404
+        let cached_status = cached_data[0]
+            .column(
+                cached_data[0]
+                    .schema()
+                    .index_of(RESPONSE_STATUS_COLUMN)
+                    .expect("column exists"),
+            )
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("status column");
+        assert_eq!(
+            cached_status.value(0),
+            404,
+            "Cached response should have status 404"
+        );
     }
 
     /// Helper to create a schema with response_status column for filter_5xx tests
