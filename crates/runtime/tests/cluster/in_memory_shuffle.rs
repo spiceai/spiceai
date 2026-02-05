@@ -128,11 +128,8 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                 .expect("should create executor2 cert");
 
             // Write test data file
-            std::fs::write(
-                tempdir.path().join("test_shuffle_data.csv"),
-                TEST_DATA_CSV,
-            )
-            .expect("write test data file");
+            std::fs::write(tempdir.path().join("test_shuffle_data.csv"), TEST_DATA_CSV)
+                .expect("write test data file");
 
             // Scheduler app with dataset
             let scheduler_app = AppBuilder::new("test_in_memory_shuffle")
