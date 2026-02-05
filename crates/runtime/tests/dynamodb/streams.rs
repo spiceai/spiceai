@@ -453,8 +453,7 @@ fn create_mock_checkpoint(duckdb_path: &str, dataset_name: &str, hours_ago: u64)
 
     // Build checkpoint JSON with all required fields matching the Checkpoint struct
     let checkpoint_json = format!(
-        r#"{{"shards":{{"fake-nonexistent-shard-id":{{"sequence_number":"00000000000000000000001","parent_id":null,"updated_at":{{"secs_since_epoch":{},"nanos_since_epoch":0}},"position":"At"}}}}}}"#,
-        checkpoint_updated_at_secs
+        r#"{{"shards":{{"fake-nonexistent-shard-id":{{"sequence_number":"00000000000000000000001","parent_id":null,"updated_at":{{"secs_since_epoch":{checkpoint_updated_at_secs},"nanos_since_epoch":0}},"position":"At"}}}}}}"#
     );
 
     // Calculate timestamp hours_ago for the database updated_at column
@@ -466,8 +465,7 @@ fn create_mock_checkpoint(duckdb_path: &str, dataset_name: &str, hours_ago: u64)
     conn.execute(
         &format!(
             "INSERT INTO spice_sys_dynamodb_streams (dataset_name, checkpoint_data, created_at, updated_at)
-             VALUES (?, ?, to_timestamp({}), to_timestamp({}))",
-            timestamp_secs, timestamp_secs
+             VALUES (?, ?, to_timestamp({timestamp_secs}), to_timestamp({timestamp_secs}))"
         ),
         [dataset_name, &checkpoint_json],
     )
@@ -475,7 +473,7 @@ fn create_mock_checkpoint(duckdb_path: &str, dataset_name: &str, hours_ago: u64)
 }
 
 /// Corrupts the checkpoint by replacing shard IDs with fake ones and making the timestamp old.
-/// This simulates the scenario where shards have expired (>24h DynamoDB retention).
+/// This simulates the scenario where shards have expired (>24h `DynamoDB` retention).
 fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str, hours_ago: u64) {
     use duckdb::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -502,7 +500,7 @@ fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str,
         // Clear and replace with fake shard IDs
         shards.clear();
         for (i, value) in shard_values.into_iter().enumerate() {
-            shards.insert(format!("fake-nonexistent-shard-{}", i), value);
+            shards.insert(format!("fake-nonexistent-shard-{i}"), value);
         }
     }
 
@@ -519,9 +517,8 @@ fn corrupt_checkpoint_for_shard_not_found(duckdb_path: &str, dataset_name: &str,
     conn.execute(
         &format!(
             "UPDATE spice_sys_dynamodb_streams
-             SET checkpoint_data = ?, updated_at = to_timestamp({})
-             WHERE dataset_name = ?",
-            timestamp_secs
+             SET checkpoint_data = ?, updated_at = to_timestamp({timestamp_secs})
+             WHERE dataset_name = ?"
         ),
         [&corrupted_checkpoint, dataset_name],
     )
@@ -535,7 +532,7 @@ fn delete_rows_from_acceleration(duckdb_path: &str, table_name: &str, ids_to_del
     let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
 
     for id in ids_to_delete {
-        conn.execute(&format!("DELETE FROM {} WHERE id = ?", table_name), [id])
+        conn.execute(&format!("DELETE FROM {table_name} WHERE id = ?"), [id])
             .expect("Failed to delete row");
     }
 }
@@ -546,7 +543,7 @@ fn get_acceleration_row_count(duckdb_path: &str, table_name: &str) -> usize {
 
     let conn = Connection::open(duckdb_path).expect("Failed to open DuckDB file");
     let count: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {}", table_name), [], |row| {
+        .query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |row| {
             row.get(0)
         })
         .unwrap_or(0);
@@ -565,11 +562,10 @@ async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: 
         }
         // Check dataset status
         let statuses = rt.datafusion().runtime_status().get_dataset_statuses();
-        if let Some(status) = statuses.get(&table_ref) {
-            if *status == ComponentStatus::Error {
+        if let Some(status) = statuses.get(&table_ref)
+            && *status == ComponentStatus::Error {
                 return true;
             }
-        }
         sleep(Duration::from_millis(500)).await;
     }
 }
@@ -592,21 +588,16 @@ async fn wait_for_dataset_rows(
             .run()
             .await;
 
-        if let Ok(result) = query_result {
-            if let Ok(batches) = result.data.try_collect::<Vec<_>>().await {
-                if !batches.is_empty() && batches[0].num_rows() > 0 {
-                    if let Some(col) = batches[0]
+        if let Ok(result) = query_result
+            && let Ok(batches) = result.data.try_collect::<Vec<_>>().await
+                && !batches.is_empty() && batches[0].num_rows() > 0
+                    && let Some(col) = batches[0]
                         .column(0)
                         .as_any()
                         .downcast_ref::<arrow::array::Int64Array>()
-                    {
-                        if col.value(0) as usize >= expected_rows {
+                        && col.value(0) as usize >= expected_rows {
                             return true;
                         }
-                    }
-                }
-            }
-        }
         sleep(Duration::from_millis(500)).await;
     }
 }

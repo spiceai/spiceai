@@ -1154,9 +1154,11 @@ impl DataFusion {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
             // snapshotting enabled, we delay readiness until the first refresh completes so that
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
+            // Additionally, for CDC we let connector/stream to decide when dataset is ready.
             let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
                 && dataset.time_column.is_some()
-                && acceleration_settings.snapshot_behavior.bootstrap_enabled();
+                && acceleration_settings.snapshot_behavior.bootstrap_enabled()
+                || matches!(refresh_mode, RefreshMode::Changes);
 
             if !delay_initial_ready {
                 self.runtime_status

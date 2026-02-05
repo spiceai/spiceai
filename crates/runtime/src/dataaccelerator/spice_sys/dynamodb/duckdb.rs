@@ -60,7 +60,7 @@ impl DynamoDBSys {
         &self,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Option<DynamoDBCheckpointMetadata> {
-        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        use std::time::{Duration, UNIX_EPOCH};
 
         let mut db_conn = Arc::clone(pool).connect_sync().ok()?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)

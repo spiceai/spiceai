@@ -81,7 +81,7 @@ const DEFAULT_SCHEMA_INFER_MAX_RECORDS_STR: &str = "10";
 const SEGMENTS_AUTO_STR: &str = "auto";
 const DEFAULT_TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
 
-/// Behavior when the stream lag exceeds shard retention (ShardNotFound error).
+/// Behavior when the stream lag exceeds shard retention (`ShardNotFound` error).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LagExceedsShardRetentionBehavior {
     /// Dataset is marked as Error state.
@@ -102,8 +102,7 @@ impl FromStr for LagExceedsShardRetentionBehavior {
             "ready_before_load" => Ok(Self::ReadyBeforeLoad),
             "ready_after_load" => Ok(Self::ReadyAfterLoad),
             _ => Err(format!(
-                "Invalid lag_exceeds_shard_retention_behavior: '{}'. Valid values: error, ready_before_load, ready_after_load",
-                s
+                "Invalid lag_exceeds_shard_retention_behavior: '{s}'. Valid values: error, ready_before_load, ready_after_load"
             )),
         }
     }
@@ -489,7 +488,7 @@ async fn initialize_dynamodb_sys(dataset: &Dataset) -> Option<DynamoDBSys> {
 }
 
 /// Loads checkpoint from `DynamoDBSys`, or initializes a new checkpoint if none exists.
-/// Returns (should_bootstrap, checkpoint, checkpoint_updated_at).
+/// Returns (`should_bootstrap`, checkpoint, `checkpoint_updated_at`).
 async fn load_or_initialize_checkpoint(
     dynamodb: &Arc<DynamoDBTableProvider>,
     dynamodb_sys: &Arc<Option<DynamoDBSys>>,
@@ -632,7 +631,7 @@ async fn create_bootstrap_stream(
 }
 
 /// Resumes streaming from an existing checkpoint, handling shard expiration scenarios.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn resume_from_checkpoint_stream(
     dynamodb: Arc<DynamoDBTableProvider>,
     dynamodb_sys: Arc<Option<DynamoDBSys>>,
@@ -694,44 +693,41 @@ fn resume_from_checkpoint_stream(
                     }
 
                     // Checkpoint is old enough (> 18h) - apply configured behavior
-                    match lag_exceeds_behavior {
-                        LagExceedsShardRetentionBehavior::Error => {
-                            // Propagate the original error so downstream marks dataset as Error
-                            tracing::error!(
-                                "DynamoDB table {} checkpoint references expired shard (age {:?}). \
-                                Configured behavior is 'error', propagating error to mark dataset as failed.",
-                                dataset_name, checkpoint_age
-                            );
-                            Some(
-                                stream::once(async move {
-                                    Err(StreamError::DynamoDB(
-                                        DynamoDBStreamError::FailedToReceiveMessage {
-                                            source: dynamodb_streams::Error::ShardNotFound,
-                                        },
-                                    ))
-                                })
-                                .boxed(),
-                            )
-                        }
-                        _ => {
-                            // ReadyBeforeLoad or ReadyAfterLoad - do rebootstrap
-                            tracing::info!(
-                                "DynamoDB table {} checkpoint references expired shard (age {:?}). \
-                                Initiating re-bootstrap with behavior {:?}.",
-                                dataset_name, checkpoint_age, lag_exceeds_behavior
-                            );
-                            rebootstrap_table(
-                                &dynamodb,
-                                &dynamodb_sys,
-                                acceptable_lag,
-                                &dataset_name,
-                                accelerated_table_provider,
-                                accelerator_write_mutex,
-                                lag_exceeds_behavior,
-                                metrics_collector,
-                            )
-                            .await
-                        }
+                    if lag_exceeds_behavior == LagExceedsShardRetentionBehavior::Error {
+                        // Propagate the original error so downstream marks dataset as Error
+                        tracing::error!(
+                            "DynamoDB table {} checkpoint references expired shard (age {}). \
+                            Configured behavior is 'error'",
+                            dataset_name, humantime::format_duration(checkpoint_age)
+                        );
+                        Some(
+                            stream::once(async move {
+                                Err(StreamError::DynamoDB(
+                                    DynamoDBStreamError::FailedToReceiveMessage {
+                                        source: dynamodb_streams::Error::ShardNotFound,
+                                    },
+                                ))
+                            })
+                            .boxed(),
+                        )
+                    } else {
+                        // ReadyBeforeLoad or ReadyAfterLoad - do rebootstrap
+                        tracing::info!(
+                            "DynamoDB table {} checkpoint references expired shard (age {}). \
+                            Initiating table re-initialization with behavior {:?}.",
+                            dataset_name, humantime::format_duration(checkpoint_age), lag_exceeds_behavior
+                        );
+                        rebootstrap_table(
+                            &dynamodb,
+                            &dynamodb_sys,
+                            acceptable_lag,
+                            &dataset_name,
+                            accelerated_table_provider,
+                            accelerator_write_mutex,
+                            lag_exceeds_behavior,
+                            metrics_collector,
+                        )
+                        .await
                     }
                 }
                 Err(err) => {
@@ -863,7 +859,7 @@ async fn rebootstrap_table(
     .await
 }
 
-/// Performs the actual re-bootstrap: scans DynamoDB, writes to accelerator, commits checkpoint.
+/// Performs the actual re-bootstrap: scans `DynamoDB`, writes to accelerator, commits checkpoint.
 async fn do_rebootstrap(
     dynamodb: &Arc<DynamoDBTableProvider>,
     dynamodb_sys: &Arc<Option<DynamoDBSys>>,
@@ -913,24 +909,19 @@ async fn do_rebootstrap(
         .insert_into(data_stream, InsertOp::Overwrite)
         .await
     {
-        tracing::error!("Failed to execute re-bootstrap insert: {:?}", e);
+        tracing::error!("Failed to execute re-initialization insert: {:?}", e);
         return None;
     }
-
-    tracing::debug!(
-        "Re-bootstrap data transfer complete for DynamoDB table {}",
-        dataset_name
-    );
 
     // 4. Commit the checkpoint
     let committer = DynamoDBStreamCommitter::new(Arc::clone(dynamodb_sys), new_checkpoint.clone());
     if let Err(e) = committer.commit() {
-        tracing::error!("Failed to commit checkpoint after re-bootstrap: {:?}", e);
+        tracing::error!("Failed to commit lag after re-initialization: {:?}", e);
         return None;
     }
 
     tracing::info!(
-        "Re-bootstrap complete for DynamoDB table {}, continuing with changes stream",
+        "Re-initialization complete for DynamoDB table {}, continuing with changes stream",
         dataset_name
     );
 
@@ -952,7 +943,7 @@ async fn do_rebootstrap(
         Ok(stream) => Some(stream),
         Err(e) => {
             tracing::error!(
-                "Failed to get changes stream after re-bootstrap for DynamoDB table {}: {}",
+                "Failed to get changes stream after re-initialization for DynamoDB table {}: {}",
                 dataset_name,
                 e
             );
