@@ -203,6 +203,9 @@ struct HttpFetchResult {
 
 impl HttpFetchResult {
     fn should_cache(&self) -> bool {
+        // We don't explicitly disable caching for 5xx responses because well-behaved servers
+        // should return Cache-Control: no-cache or max-age=0 for transient error responses.
+        // This keeps the caching logic simple and respects server-specified cache directives.
         self.max_age.as_secs() > 0
     }
 }
@@ -656,104 +659,137 @@ impl HttpTableProvider {
         path_label: &str,
     ) -> Result<HttpFetchResult> {
         let retry_strategy = self.retry_strategy.clone();
-        let client = self.client.clone();
-        let content_type = self.content_type.clone();
-        let custom_headers = self.custom_headers.clone();
-        let path_owned = path_label.to_string();
+        let this = self.clone();
+        let url_clone = url.clone();
         let body_owned = body.map(ToOwned::to_owned);
+        let path_owned = path_label.to_string();
 
-        retry(retry_strategy, || {
-            let client = client.clone();
-            let url = url.clone();
-            let headers = custom_headers.clone();
-            let content_type = content_type.clone();
-            let path_for_detection = path_owned.clone();
-            let body_for_request = body_owned.clone();
+        let result = retry(retry_strategy, || {
+            let this = this.clone();
+            let url = url_clone.clone();
+            let body = body_owned.clone();
+            let path = path_owned.clone();
 
             async move {
-                let mut request_builder = if let Some(ref body_content) = body_for_request {
-                    let mut req = client.post(url.clone());
-                    let ct = content_type.as_deref().unwrap_or("application/json");
-                    req = req.header("Content-Type", ct);
-                    req.body(body_content.clone())
-                } else {
-                    client.get(url.clone())
-                };
-
-                for (name, value) in &headers {
-                    request_builder = request_builder.header(name, value);
-                }
-
-                let response = request_builder.send().await.map_err(|e| {
-                    tracing::debug!("HTTP request failed: {}", e);
-                    RetryError::transient(Error::HttpRequest { source: e })
-                })?;
-
-                let status_code = response.status().as_u16();
-
-                if let Err(err) = response.error_for_status_ref() {
-                    if (400..500).contains(&status_code) {
-                        return Err(RetryError::permanent(Error::HttpClientError {
-                            status: status_code,
-                            message: format!(
-                                "{} for url ({})",
-                                response
-                                    .status()
-                                    .canonical_reason()
-                                    .unwrap_or("Client Error"),
-                                url
-                            ),
-                        }));
-                    }
-                    tracing::debug!("HTTP request returned server error, will retry: {}", err);
-                    return Err(RetryError::transient(Error::HttpRequest { source: err }));
-                }
-
-                let detected_format = Self::detect_file_format(&response, &path_for_detection);
-                tracing::debug!(
-                    "Detected file format from Content-Type header: {}",
-                    detected_format
-                );
-
-                let cache_control_header = response
-                    .headers()
-                    .get(CACHE_CONTROL)
-                    .and_then(|v| v.to_str().ok());
-                let max_age = Self::parse_cache_control(cache_control_header);
-
-                // Extract Date header from response
-                let response_date = response
-                    .headers()
-                    .get(reqwest::header::DATE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|date_str| {
-                        // Parse HTTP date format (RFC 2822/RFC 1123)
-                        httpdate::parse_http_date(date_str).ok()
-                    });
-
-                let content = response
-                    .text()
+                this.perform_single_request(&url, body.as_deref(), &path, false)
                     .await
-                    .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?;
-
-                let detected_format = if detected_format.is_empty() {
-                    let inferred = Self::infer_format_from_content(&content);
-                    tracing::debug!("Inferred file format from content: {}", inferred);
-                    inferred
-                } else {
-                    detected_format
-                };
-
-                Ok(HttpFetchResult {
-                    content,
-                    max_age,
-                    detected_format,
-                    response_date,
-                    response_status: status_code,
-                })
             }
         })
-        .await
+        .await;
+
+        // If retries exhausted due to transient errors (5xx), make one final attempt
+        // and return whatever response we get - 5xx is still valid data.
+        // Don't retry on permanent errors (e.g., failed to read response body).
+        match result {
+            Ok(fetch_result) => Ok(fetch_result),
+            Err(_) => {
+                tracing::debug!(
+                    "Retries exhausted for {url}, making final attempt accepting any status"
+                );
+                self.perform_single_request(&url, body, path_label, true)
+                    .await
+                    .map_err(|e| match e {
+                        RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
+                    })
+            }
+        }
+    }
+
+    /// Perform a single HTTP request without retry logic.
+    ///
+    /// If `accept_5xx` is false, returns a transient error on 5xx to trigger retry.
+    /// If `accept_5xx` is true, accepts any status code and returns the response.
+    async fn perform_single_request(
+        &self,
+        url: &Url,
+        body: Option<&str>,
+        path_label: &str,
+        accept_5xx: bool,
+    ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        let mut request_builder = if let Some(body_content) = body {
+            let mut req = self.client.post(url.clone());
+            let ct = self.content_type.as_deref().unwrap_or("application/json");
+            req = req.header("Content-Type", ct);
+            req.body(body_content.to_owned())
+        } else {
+            self.client.get(url.clone())
+        };
+
+        for (name, value) in &self.custom_headers {
+            request_builder = request_builder.header(name, value);
+        }
+
+        let response = request_builder.send().await.map_err(|e| {
+            tracing::debug!("HTTP request failed: {e}");
+            RetryError::transient(Error::HttpRequest { source: e })
+        })?;
+
+        let status_code = response.status().as_u16();
+
+        // 5xx: retry with backoff (might be transient server issue)
+        // After retries exhausted, we'll accept 5xx as valid response
+        if !accept_5xx && (500..600).contains(&status_code) {
+            tracing::debug!("HTTP server error ({}), will retry", status_code);
+            return Err(RetryError::transient(Error::HttpRequest {
+                source: response
+                    .error_for_status()
+                    .expect_err("5xx should be error"),
+            }));
+        }
+
+        // 2xx, 3xx, 4xx (and 5xx when accept_5xx=true): valid response
+        // 4xx like 404 "not found" is a valid business response, not an error
+        Self::extract_response(response, status_code, path_label).await
+    }
+
+    /// Extract content and metadata from an HTTP response.
+    async fn extract_response(
+        response: reqwest::Response,
+        status_code: u16,
+        path_label: &str,
+    ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        let detected_format = Self::detect_file_format(&response, path_label);
+        tracing::debug!(
+            "Detected file format from Content-Type header: {}",
+            detected_format
+        );
+
+        let cache_control_header = response
+            .headers()
+            .get(CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok());
+        let max_age = Self::parse_cache_control(cache_control_header);
+
+        // Extract Date header from response
+        let response_date = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|date_str| {
+                // Parse HTTP date format (RFC 2822/RFC 1123)
+                httpdate::parse_http_date(date_str).ok()
+            });
+
+        let content = response
+            .text()
+            .await
+            .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?;
+
+        let detected_format = if detected_format.is_empty() {
+            let inferred = Self::infer_format_from_content(&content);
+            tracing::debug!("Inferred file format from content: {}", inferred);
+            inferred
+        } else {
+            detected_format
+        };
+
+        Ok(HttpFetchResult {
+            content,
+            max_age,
+            detected_format,
+            response_date,
+            response_status: status_code,
+        })
     }
 
     async fn fetch_and_cache(
