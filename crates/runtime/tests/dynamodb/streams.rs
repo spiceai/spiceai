@@ -734,7 +734,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 // Runtime drops here, stopping Spice
             }
 
-            // === PHASE 2: Corrupt checkpoint and delete some rows ===
+            // === PHASE 2: Corrupt checkpoint, delete some rows, and add new records while Spice is down ===
             // Make checkpoint reference non-existent shards and set timestamp to 20h ago
             corrupt_checkpoint_for_shard_not_found(duckdb_path_str, table_name, 20);
 
@@ -742,6 +742,10 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
             delete_rows_from_acceleration(duckdb_path_str, table_name, &["id-0", "id-1", "id-2"]);
             let count_after_delete = get_acceleration_row_count(duckdb_path_str, table_name);
             assert_eq!(count_after_delete, 2, "Phase 2: Should have 2 rows after deletion");
+
+            // Add new records to DynamoDB while Spice is down
+            insert_rows(&client, table_name, 5..8).await;
+            sleep(Duration::from_secs(1)).await;
 
             // === PHASE 3: Start Spice again - should detect ShardNotFound and rebootstrap ===
             {
@@ -771,9 +775,9 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                     () = cloned_rt.load_components() => {}
                 }
 
-                // With ready_after_load, should rebootstrap and restore all 5 rows
-                let has_rows = wait_for_dataset_rows(&rt, table_name, 5, 30).await;
-                assert!(has_rows, "Phase 3: Dataset should have 5 rows after rebootstrap with ready_after_load");
+                // With ready_after_load, should rebootstrap and restore all 8 rows (5 original + 3 new)
+                let has_rows = wait_for_dataset_rows(&rt, table_name, 8, 30).await;
+                assert!(has_rows, "Phase 3: Dataset should have 8 rows after rebootstrap with ready_after_load (5 original + 3 added while down)");
 
                 runtime_ready_check(&rt).await;
             }
@@ -851,7 +855,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 // Runtime drops here, stopping Spice
             }
 
-            // === PHASE 2: Corrupt checkpoint and delete some rows ===
+            // === PHASE 2: Corrupt checkpoint, delete some rows, and add new records while Spice is down ===
             // Make checkpoint reference non-existent shards and set timestamp to 20h ago
             corrupt_checkpoint_for_shard_not_found(duckdb_path_str, table_name, 20);
 
@@ -859,6 +863,10 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
             delete_rows_from_acceleration(duckdb_path_str, table_name, &["id-0", "id-1", "id-2"]);
             let count_after_delete = get_acceleration_row_count(duckdb_path_str, table_name);
             assert_eq!(count_after_delete, 2, "Phase 2: Should have 2 rows after deletion");
+
+            // Add new records to DynamoDB while Spice is down
+            insert_rows(&client, table_name, 5..8).await;
+            sleep(Duration::from_secs(1)).await;
 
             // === PHASE 3: Start Spice again - should detect ShardNotFound and rebootstrap ===
             {
@@ -888,9 +896,9 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                     () = cloned_rt.load_components() => {}
                 }
 
-                // With ready_before_load, should rebootstrap and restore all 5 rows
-                let has_rows = wait_for_dataset_rows(&rt, table_name, 5, 30).await;
-                assert!(has_rows, "Phase 3: Dataset should have 5 rows after rebootstrap with ready_before_load");
+                // With ready_before_load, should rebootstrap and restore all 8 rows (5 original + 3 new)
+                let has_rows = wait_for_dataset_rows(&rt, table_name, 8, 30).await;
+                assert!(has_rows, "Phase 3: Dataset should have 8 rows after rebootstrap with ready_before_load (5 original + 3 added while down)");
 
                 runtime_ready_check(&rt).await;
             }
