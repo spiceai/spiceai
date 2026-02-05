@@ -21,8 +21,8 @@ use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
 use arrow::array::StringArray;
-use arrow::array::{Array, RecordBatch, TimestampNanosecondArray, UInt16Array};
-use arrow::compute::filter_record_batch;
+use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray, UInt16Array};
+use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
