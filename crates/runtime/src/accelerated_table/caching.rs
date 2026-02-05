@@ -22,7 +22,6 @@ use std::time::{Duration, SystemTime};
 
 use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
 use arrow::array::{ArrayRef, StringArray};
-use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
