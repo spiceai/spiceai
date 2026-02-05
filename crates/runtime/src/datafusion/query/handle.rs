@@ -24,7 +24,6 @@ use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use crate::datafusion::DataFusion;
 use crate::datafusion::query::QueryTracker;
@@ -35,9 +34,7 @@ use ballista_core::extension::BallistaConfigGrpcEndpoint;
 use ballista_core::serde::protobuf::job_status;
 use ballista_core::serde::scheduler::PartitionLocation;
 use ballista_scheduler::scheduler_server::SchedulerServer;
-use ballista_scheduler::scheduler_server::job_state_event::{
-    JobState as BallistaJobState, JobStateEvent,
-};
+use ballista_scheduler::scheduler_server::job_state_event::JobState as BallistaJobState;
 use cache::key::RawCacheKey;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
