@@ -294,13 +294,14 @@ async fn get_row_count(
 
     match ctx.table(table_name).await {
         Ok(df) => match df.count().await {
-            Ok(count) => match u64::try_from(count) {
-                Ok(row_count) => Some(row_count),
-                Err(_) => {
+            Ok(count) => {
+                if let Ok(row_count) = u64::try_from(count) {
+                    Some(row_count)
+                } else {
                     tracing::debug!(dataset = %dataset_name, "Row count for snapshot exceeds u64::MAX; proceeding without it");
                     None
                 }
-            },
+            }
             Err(e) => {
                 tracing::debug!(dataset = %dataset_name, error = %e, "Failed to get row count for snapshot; proceeding without it");
                 None
