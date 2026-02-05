@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
 use arrow::array::{ArrayRef, StringArray};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
@@ -2803,7 +2804,7 @@ mod tests {
         assert_eq!(total_rows, 3, "Should have 3 rows from 3 requests");
     }
 
-    /// Tests overwrite_accelerator with DuckDB in-memory accelerator.
+    /// Tests `overwrite_accelerator` with `DuckDB` in-memory accelerator.
     /// This path is used when the accelerator has NO constraints configured.
     #[tokio::test]
     #[cfg(feature = "duckdb")]
@@ -2892,7 +2893,7 @@ mod tests {
         insta::assert_snapshot!("duckdb_overwrite_accelerator", pretty);
     }
 
-    /// Tests append_to_accelerator with DuckDB using primary key and on_conflict upsert.
+    /// Tests `append_to_accelerator` with `DuckDB` using primary key and `on_conflict` upsert.
     /// This path is used when the accelerator has constraints configured.
     /// Also tests that there are no issues with multiple upserts for the same key spread across
     /// multiple batches.
