@@ -32,16 +32,16 @@ use async_openai::{
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
-use mistralrs::{
-    ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device,
-    Function, ModelDType, NormalRequest, Request as MistralRequest, Response as MistralResponse,
-    SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
-};
 use mistralrs::core::{
     AdapterPaths, AutoDeviceMapParams, DeviceMapSetting, GGMLLoaderBuilder, GGMLSpecificConfig,
     GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
     ModelPaths, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Pipeline,
     RequestMessage, TokenSource,
+};
+use mistralrs::{
+    ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
+    ModelDType, NormalRequest, Request as MistralRequest, Response as MistralResponse,
+    SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
 use secrecy::{ExposeSecret, SecretString};
