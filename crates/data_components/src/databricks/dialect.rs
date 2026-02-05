@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2026 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -344,13 +344,14 @@ mod tests {
         ));
 
         // Convert to SQL using the unparser with our dialect
-        let sql_result = unparser.expr_to_sql(&array_has_expr);
-        assert!(sql_result.is_ok(), "Failed to convert expr to SQL");
-
-        let sql_str = sql_result.unwrap().to_string();
-        assert!(
-            sql_str.contains("array_contains"),
-            "Expected 'array_contains' in SQL output, got: {sql_str}"
+        let sql_str = unparser
+            .expr_to_sql(&array_has_expr)
+            .expect("to convert expr to sql")
+            .to_string();
+        assert_eq!(
+            sql_str,
+            "array_contains([1, 2, 3], 2)",
+            "Expected full SQL string match"
         );
     }
 }
