@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, SystemTime};
 
-use arrow::array::{ArrayRef, StringArray};
 use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
-use arrow::compute::{cast, concat_batches};
+use arrow::array::{ArrayRef, StringArray};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
@@ -691,14 +691,6 @@ impl CacheRefreshHelper {
             );
         }
 
-        // Concatenate multiple small batches into a single batch for better write performance.
-        // This reduces per-batch overhead (FFI calls for DuckDB, streaming overhead for Cayenne).
-        let batches = if batch_count > 1 {
-            vec![concat_batches(&schema, &batches)?]
-        } else {
-            batches
-        };
-
         // Create a stream from the batches
         let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
         let adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
@@ -911,14 +903,6 @@ impl CacheRefreshHelper {
         tracing::trace!(
             "append_to_accelerator - appending {batch_count} batches ({total_rows} total rows) to accelerator for dataset={dataset_name}",
         );
-
-        // Concatenate multiple small batches into a single batch for better write performance.
-        // This reduces per-batch overhead (FFI calls for DuckDB, streaming overhead for Cayenne).
-        let batches = if batch_count > 1 {
-            vec![concat_batches(&schema, &batches)?]
-        } else {
-            batches
-        };
 
         let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
         let adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
@@ -1737,17 +1721,29 @@ impl ExecutionPlan for CachingAccelerationScanExec {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "duckdb")]
+    use crate::dataaccelerator::duckdb::create_table_provider;
+    #[cfg(feature = "duckdb")]
+    use datafusion::logical_expr::CreateExternalTable;
+    #[cfg(feature = "duckdb")]
+    use datafusion_table_providers::duckdb::DuckDBTableProviderFactory;
+    #[cfg(feature = "duckdb")]
+    use duckdb::AccessMode;
+
     use super::*;
     use arrow::array::{Int32Array, RecordBatch, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use async_trait::async_trait;
     use datafusion::catalog::Session;
+    use datafusion::common::{Constraint, Constraints, ToDFSchema};
     use datafusion::datasource::TableType;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::sql::TableReference;
     use parking_lot::RwLock;
     use std::any::Any;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
@@ -2806,5 +2802,256 @@ mod tests {
 
         let total_rows: usize = data.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "Should have 3 rows from 3 requests");
+    }
+
+    /// Tests overwrite_accelerator with DuckDB in-memory accelerator.
+    /// This path is used when the accelerator has NO constraints configured.
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn test_overwrite_accelerator_duckdb() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        // Create an in-memory DuckDB table (no constraints = overwrite path)
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("cache_concat_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_factory = DuckDBTableProviderFactory::new(AccessMode::ReadWrite);
+        let table = create_table_provider(&duckdb_factory, &external_table, None)
+            .await
+            .expect("table should be created");
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        // Create 5 small batches with 2 rows each (10 rows total)
+        let batches: Vec<RecordBatch> = (0..5)
+            .map(|i| {
+                let base_id = i * 2;
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from(vec![base_id, base_id + 1])),
+                        Arc::new(StringArray::from(vec![
+                            format!("name_{base_id}"),
+                            format!("name_{}", base_id + 1),
+                        ])),
+                        Arc::new(TimestampNanosecondArray::from(vec![Some(now); 2])),
+                    ],
+                )
+                .expect("Should create batch")
+            })
+            .collect();
+
+        // Call overwrite_accelerator with multiple batches
+        CacheRefreshHelper::overwrite_accelerator(Arc::clone(&table), "cache_concat_test", batches)
+            .await
+            .expect("Should overwrite accelerator");
+
+        // Query the DuckDB table to verify all rows were inserted
+        let ctx = SessionContext::new();
+        ctx.register_table("cache_concat_test", Arc::clone(&table))
+            .expect("Should register table");
+
+        let result = ctx
+            .sql("SELECT id, name FROM cache_concat_test ORDER BY id")
+            .await
+            .expect("Should execute query")
+            .collect()
+            .await
+            .expect("Should collect results");
+
+        let pretty =
+            arrow::util::pretty::pretty_format_batches(&result).expect("Should format batches");
+        insta::assert_snapshot!("duckdb_overwrite_accelerator", pretty);
+    }
+
+    /// Tests append_to_accelerator with DuckDB using primary key and on_conflict upsert.
+    /// This path is used when the accelerator has constraints configured.
+    /// Also tests that there are no issues with multiple upserts for the same key spread across
+    /// multiple batches.
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn test_append_to_accelerator_duckdb() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                CACHE_REFRESHED_AT_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]));
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        // Create primary key constraint on the "id" column (index 0) with upsert behavior
+        let mut options = HashMap::new();
+        options.insert("on_conflict".to_string(), "upsert:id".to_string());
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("cache_upsert_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_factory = DuckDBTableProviderFactory::new(AccessMode::ReadWrite);
+        let table = create_table_provider(&duckdb_factory, &external_table, None)
+            .await
+            .expect("table should be created");
+
+        // Verify that constraints are set (this triggers the append path)
+        assert!(
+            table.constraints().is_some_and(|c| !c.is_empty()),
+            "Table should have constraints configured"
+        );
+
+        #[expect(clippy::cast_possible_truncation)]
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos() as i64;
+
+        // Insert initial data: 5 rows with ids 0-4
+        let initial_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    "initial_0",
+                    "initial_1",
+                    "initial_2",
+                    "initial_3",
+                    "initial_4",
+                ])),
+                Arc::new(TimestampNanosecondArray::from(vec![Some(now); 5])),
+            ],
+        )
+        .expect("Should create batch");
+
+        CacheRefreshHelper::append_to_accelerator(&table, "cache_upsert_test", vec![initial_batch])
+            .await
+            .expect("Should append initial data");
+
+        // Register table with SessionContext for SQL queries
+        let ctx = SessionContext::new();
+        ctx.register_table("cache_upsert_test", Arc::clone(&table))
+            .expect("Should register table");
+
+        // Verify initial insert with snapshot
+        let initial_result = ctx
+            .sql("SELECT id, name FROM cache_upsert_test ORDER BY id")
+            .await
+            .expect("Should execute query")
+            .collect()
+            .await
+            .expect("Should collect results");
+        let initial_pretty = arrow::util::pretty::pretty_format_batches(&initial_result)
+            .expect("Should format batches");
+        insta::assert_snapshot!("duckdb_upsert_initial_data", initial_pretty);
+
+        // Create upsert data to test that the same ID can appear across SEPARATE batches
+        // within a single append_to_accelerator call. This simulates the scenario where
+        // multiple cache refresh responses for the same entry are batched together.
+        // Batch 1: id=2 (update), id=3 (update)
+        // Batch 2: id=2 (update), id=4 (update), id=5 (new), id=6 (new)
+        let upsert_batch_1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 3])),
+                Arc::new(StringArray::from(vec![
+                    "updated_2", // Update for id=2
+                    "updated_3",
+                ])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(
+                        now + 1_000_000_000
+                    );
+                    2
+                ])),
+            ],
+        )
+        .expect("Should create batch");
+
+        let upsert_batch_2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 4, 5, 6])),
+                Arc::new(StringArray::from(vec![
+                    "updated_2", // Update for id=2 again
+                    "updated_4",
+                    "new_5",
+                    "new_6",
+                ])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(
+                        now + 1_000_000_000
+                    );
+                    4
+                ])),
+            ],
+        )
+        .expect("Should create batch");
+
+        // Single append with multiple batches containing duplicate id=2 (same data)
+        CacheRefreshHelper::append_to_accelerator(
+            &table,
+            "cache_upsert_test",
+            vec![upsert_batch_1, upsert_batch_2],
+        )
+        .await
+        .expect("Should append/upsert batches with duplicate keys (same data)");
+
+        // Verify upsert results with snapshot
+        // Expected: 7 rows (ids 0,1,2,3,4,5,6), with id=2 having "updated_2"
+        let upsert_result = ctx
+            .sql("SELECT id, name FROM cache_upsert_test ORDER BY id")
+            .await
+            .expect("Should execute query")
+            .collect()
+            .await
+            .expect("Should collect results");
+        let upsert_pretty = arrow::util::pretty::pretty_format_batches(&upsert_result)
+            .expect("Should format batches");
+        insta::assert_snapshot!("duckdb_upsert_second_update", upsert_pretty);
     }
 }
