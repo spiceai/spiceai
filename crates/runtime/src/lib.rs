@@ -588,8 +588,11 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn scheduler_peers(&self) -> Arc<RwLock<SchedulerPeers>> {
-        Arc::clone(&self.scheduler_peers)
+    pub fn scheduler_peers(&self) -> Option<Arc<RwLock<SchedulerPeers>>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { peers, .. }) => Some(Arc::clone(peers)),
+            _ => None,
+        }
     }
 
     /// Returns the metrics reader for on-demand OTLP metrics collection.
@@ -623,18 +626,7 @@ impl Runtime {
                     }
                 }
             }
-            Some(DistributedNode::Executor {}) => {
-                tracing::warn!(
-                    "Attempted to get job executor on an executor node. This should only be set on the scheduler. Returning None."
-                );
-                None
-            }
-            None => {
-                tracing::warn!(
-                    "Attempted to get job executor on a non-cluster runtime. This should only be set in cluster mode on the scheduler node. Returning None."
-                );
-                None
-            }
+            None | Some(DistributedNode::Executor {}) => None,
         }
     }
 
@@ -761,11 +753,14 @@ impl Runtime {
             Option<Arc<metrics_server::cluster::ClusterMetricsCollector>>,
         ) = match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
-                executor_registry, ..
+                executor_registry,
+                peers,
+                ..
             }) => {
                 let fut = cluster::initialize_cluster_scheduler_future(
                     &self,
                     Arc::clone(executor_registry),
+                    Arc::clone(peers),
                 )
                 .await?;
 
@@ -782,7 +777,7 @@ impl Runtime {
                     fut,
                     Some(Arc::new(
                         metrics_server::cluster::ClusterMetricsCollector::new(
-                            self.scheduler_peers(),
+                            Arc::clone(peers),
                             Arc::clone(executor_registry),
                             self.df.cluster_config.client_tls_config().cloned(),
                             self.df.cluster_config.node_id(),

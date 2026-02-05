@@ -80,6 +80,7 @@ use x509_certificate::CapturedX509Certificate;
 const SCHEDULER_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const SCHEDULER_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
 pub enum DistributedNode {
     Scheduler {
         peers: Arc<RwLock<SchedulerPeers>>,
@@ -757,17 +758,20 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 pub(crate) async fn initialize_cluster_scheduler_future(
     rt: &Arc<Runtime>,
     scheduler_executor_registry: Arc<ExecutorRegistry>,
+    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 ) -> crate::Result<Option<Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'static>>>> {
     initialize_cluster_scheduler(rt).await?;
     // Start internal cluster server for scheduler on separate port
     let internal_server_shutdown = CancellationToken::new();
     let cloned_shutdown = internal_server_shutdown.clone();
     let internal_server_rt = Arc::clone(rt);
+    let internal_server_peers = Arc::clone(&scheduler_peers);
     let internal_server_fut = async move {
         start_internal_cluster_server(
             internal_server_rt,
             Some(cloned_shutdown),
             Arc::clone(&scheduler_executor_registry),
+            internal_server_peers,
         )
         .await
         .context(UnableToStartClusterServerSnafu)
@@ -787,7 +791,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         if let Some(config) = config {
             let registry_shutdown = CancellationToken::new();
             let registry_shutdown_for_task = registry_shutdown.clone();
-            let peers = rt.scheduler_peers();
+            let peers = Arc::clone(&scheduler_peers);
             let self_ref = Arc::clone(rt);
             let registry_task = async move {
                 start_scheduler_registry(self_ref, &config, registry_shutdown.clone(), peers)

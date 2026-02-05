@@ -289,7 +289,8 @@ impl DataFusionBuilder {
                 self.memory_limit,
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
-            ));
+            ))
+            .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
 
         for rule in self.additional_analyzer_rules {
             state = state.with_analyzer_rule(rule);
