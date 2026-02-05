@@ -46,7 +46,7 @@ limitations under the License.
 //! 6. Update in-memory caches for immediate query consistency
 
 use super::super::constants::{DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
-use super::super::table::PkDeletionStrategyWithCache;
+use super::super::deletion_strategy::PkDeletionStrategyWithCache;
 use super::super::utils::{convert_to_i64_box, convert_to_u64_box};
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::{CatalogError, MetadataCatalog};

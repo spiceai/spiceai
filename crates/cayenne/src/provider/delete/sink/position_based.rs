@@ -297,7 +297,7 @@ impl CayenneDeletionSink {
 
         // Get the position-based cache from the PkDeletionStrategy (only valid for PositionBased)
         let cached_deleted_row_ids = self.pk_deletion_strategy.position_based_cache().ok_or(
-            "persist_per_file_position_based_deletions called with incompatible PkDeletionStrategy",
+            "persist_position_based_deletions called with incompatible PkDeletionStrategy",
         )?;
 
         // Read existing deletions to merge with new ones

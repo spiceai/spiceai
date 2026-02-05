@@ -70,6 +70,7 @@ use tokio::task;
 use vortex_datafusion::VortexFormat;
 
 use super::context::CayenneContext;
+use super::deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
 use super::vortex_format::DeletionFilteringVortexFormat;
 
 /// Extension trait to extract `UpsertOptions` from `OnConflict`.
@@ -85,138 +86,6 @@ trait OnConflictExt {
 impl OnConflictExt for OnConflict {
     fn get_upsert_options(&self) -> UpsertOptions {
         UpsertOptions::default()
-    }
-}
-
-/// Strategy for primary key-based deletion filtering.
-///
-/// Determines which cache and filter execution plan to use at query time.
-/// Chosen based on the table's primary key configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PkDeletionStrategy {
-    /// No primary key - use position-based deletion with `RoaringBitmap`.
-    /// Requires `CoalescePartitionsExec` to ensure consistent ordering.
-    PositionBased,
-    /// Single-column Int64 primary key - use direct `HashSet<i64>` lookup.
-    /// Most efficient: no serialization, 8 bytes per key, parallel reads.
-    Int64Pk,
-    /// Composite or non-integer primary key - use `RowConverter` + `HashSet<Box<[u8]>>`.
-    /// Handles all PK types but has serialization overhead.
-    RowConverterBased,
-}
-
-/// Runtime caches for deletion and insert tracking, organized by [`PkDeletionStrategy`].
-///
-/// Each variant holds the in-memory caches required for its corresponding strategy:
-/// - Deletion caches track which rows should be filtered out during scans
-/// - Insert caches (for PK-based strategies) track inserted rows to prevent
-///   resurrection of previously deleted keys during upserts
-#[derive(Debug, Clone)]
-#[expect(clippy::type_complexity)]
-pub enum PkDeletionStrategyWithCache {
-    PositionBased {
-        /// Maps data file path -> `RoaringBitmap` of file-local row positions.
-        /// Uses Arc-wrapped `HashMap` for zero-copy sharing across concurrent operations.
-        cached_deleted_row_ids: Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>,
-    },
-    Int64Pk {
-        /// Maps PK (i64) -> `delete_sequence_number` for sequence-based ordering.
-        cached_deleted_pk: Arc<RwLock<Arc<HashMap<i64, i64>>>>,
-        /// Maps PK (i64) -> `insert_sequence_number` for upsert tracking.
-        cached_insert_records: Arc<RwLock<Arc<HashMap<i64, i64>>>>,
-    },
-    RowConverterBased {
-        /// Maps PK bytes -> `delete_sequence_number` for sequence-based ordering.
-        cached_deleted_row_keys: Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>,
-        /// Maps PK bytes -> `insert_sequence_number` for upsert tracking.
-        cached_insert_records: Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>,
-    },
-}
-
-#[expect(clippy::type_complexity)]
-impl PkDeletionStrategyWithCache {
-    /// Returns the `PkDeletionStrategy` variant for this cache.
-    #[must_use]
-    pub const fn strategy(&self) -> PkDeletionStrategy {
-        match self {
-            Self::PositionBased { .. } => PkDeletionStrategy::PositionBased,
-            Self::Int64Pk { .. } => PkDeletionStrategy::Int64Pk,
-            Self::RowConverterBased { .. } => PkDeletionStrategy::RowConverterBased,
-        }
-    }
-
-    /// Returns `true` if this is the `PositionBased` strategy.
-    #[must_use]
-    pub const fn is_position_based(&self) -> bool {
-        matches!(self, Self::PositionBased { .. })
-    }
-
-    /// Returns `true` if this is the `Int64Pk` strategy.
-    #[must_use]
-    pub const fn is_int64_pk(&self) -> bool {
-        matches!(self, Self::Int64Pk { .. })
-    }
-
-    /// Returns the position-based deletion cache, if this is a `PositionBased` strategy.
-    #[must_use]
-    pub fn position_based_cache(
-        &self,
-    ) -> Option<&Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>> {
-        match self {
-            Self::PositionBased {
-                cached_deleted_row_ids,
-            } => Some(cached_deleted_row_ids),
-            Self::Int64Pk { .. } | Self::RowConverterBased { .. } => None,
-        }
-    }
-
-    /// Returns the Int64 PK deletion cache, if this is an `Int64Pk` strategy.
-    #[must_use]
-    pub fn int64_pk_cache(&self) -> Option<&Arc<RwLock<Arc<HashMap<i64, i64>>>>> {
-        match self {
-            Self::Int64Pk {
-                cached_deleted_pk, ..
-            } => Some(cached_deleted_pk),
-            _ => None,
-        }
-    }
-
-    /// Returns the row keys deletion cache, if this is a `RowConverterBased` strategy.
-    #[must_use]
-    pub fn row_keys_cache(&self) -> Option<&Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>> {
-        match self {
-            Self::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
-            } => Some(cached_deleted_row_keys),
-            _ => None,
-        }
-    }
-
-    /// Returns the Int64 insert records cache, if this is an `Int64Pk` strategy.
-    #[must_use]
-    pub fn int64_insert_records_cache(&self) -> Option<&Arc<RwLock<Arc<HashMap<i64, i64>>>>> {
-        match self {
-            Self::Int64Pk {
-                cached_insert_records,
-                ..
-            } => Some(cached_insert_records),
-            _ => None,
-        }
-    }
-
-    /// Returns the row keys insert records cache, if this is a `RowConverterBased` strategy.
-    #[must_use]
-    pub fn row_keys_insert_records_cache(
-        &self,
-    ) -> Option<&Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>> {
-        match self {
-            Self::RowConverterBased {
-                cached_insert_records,
-                ..
-            } => Some(cached_insert_records),
-            _ => None,
-        }
     }
 }
 
@@ -3121,7 +2990,6 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if deletion vectors cannot be loaded from the catalog.
     async fn refresh_deletion_cache(&self) -> CatalogResult<()> {
-        // Load fresh data into a new PkDeletionStrategy
         let fresh_strategy = Self::load_deletion_vectors_all(
             self.table_metadata.table_id,
             Arc::clone(&self.catalog),
@@ -3129,143 +2997,7 @@ impl CayenneTableProvider {
         )
         .await?;
 
-        // Update the existing caches in self.pk_deletion_strategy with the fresh data
-        // We update the inner values of the RwLocks so that shared references
-        // (e.g., held by CayenneDeletionSink) see the updated data.
-        match (&self.pk_deletion_strategy, &fresh_strategy) {
-            (
-                PkDeletionStrategyWithCache::PositionBased {
-                    cached_deleted_row_ids: existing,
-                },
-                PkDeletionStrategyWithCache::PositionBased {
-                    cached_deleted_row_ids: fresh,
-                },
-            ) => {
-                let fresh_data = {
-                    let guard = fresh.read().map_err(|_| CatalogError::LockPoisoned {
-                        operation: "refresh deletion cache (read fresh position data)".to_string(),
-                    })?;
-                    Arc::clone(&*guard)
-                };
-                let mut guard = existing.write().map_err(|_| CatalogError::LockPoisoned {
-                    operation: "refresh deletion cache (position write)".to_string(),
-                })?;
-                *guard = fresh_data;
-            }
-            (
-                PkDeletionStrategyWithCache::Int64Pk {
-                    cached_deleted_pk: existing_pk,
-                    cached_insert_records: existing_insert,
-                },
-                PkDeletionStrategyWithCache::Int64Pk {
-                    cached_deleted_pk: fresh_pk,
-                    cached_insert_records: fresh_insert,
-                },
-            ) => {
-                // Update deleted PKs
-                {
-                    let fresh_data = {
-                        let guard = fresh_pk.read().map_err(|_| CatalogError::LockPoisoned {
-                            operation: "refresh deletion cache (read fresh pk_i64 data)"
-                                .to_string(),
-                        })?;
-                        Arc::clone(&*guard)
-                    };
-                    let mut guard =
-                        existing_pk
-                            .write()
-                            .map_err(|_| CatalogError::LockPoisoned {
-                                operation: "refresh deletion cache (pk_i64 write)".to_string(),
-                            })?;
-                    *guard = fresh_data;
-                }
-                // Update insert records
-                {
-                    let fresh_data = {
-                        let guard =
-                            fresh_insert
-                                .read()
-                                .map_err(|_| CatalogError::LockPoisoned {
-                                    operation:
-                                        "refresh deletion cache (read fresh insert_pk_i64 data)"
-                                            .to_string(),
-                                })?;
-                        Arc::clone(&*guard)
-                    };
-                    let mut guard =
-                        existing_insert
-                            .write()
-                            .map_err(|_| CatalogError::LockPoisoned {
-                                operation: "refresh deletion cache (insert_pk_i64 write)"
-                                    .to_string(),
-                            })?;
-                    *guard = fresh_data;
-                }
-            }
-            (
-                PkDeletionStrategyWithCache::RowConverterBased {
-                    cached_deleted_row_keys: existing_keys,
-                    cached_insert_records: existing_insert,
-                },
-                PkDeletionStrategyWithCache::RowConverterBased {
-                    cached_deleted_row_keys: fresh_keys,
-                    cached_insert_records: fresh_insert,
-                },
-            ) => {
-                // Update deleted row keys
-                {
-                    let fresh_data = {
-                        let guard = fresh_keys.read().map_err(|_| CatalogError::LockPoisoned {
-                            operation: "refresh deletion cache (read fresh row_keys data)"
-                                .to_string(),
-                        })?;
-                        Arc::clone(&*guard)
-                    };
-                    let mut guard =
-                        existing_keys
-                            .write()
-                            .map_err(|_| CatalogError::LockPoisoned {
-                                operation: "refresh deletion cache (row_keys write)".to_string(),
-                            })?;
-                    *guard = fresh_data;
-                }
-                // Update insert records
-                {
-                    let fresh_data = {
-                        let guard =
-                            fresh_insert
-                                .read()
-                                .map_err(|_| CatalogError::LockPoisoned {
-                                    operation:
-                                        "refresh deletion cache (read fresh insert_row_keys data)"
-                                            .to_string(),
-                                })?;
-                        Arc::clone(&*guard)
-                    };
-                    let mut guard =
-                        existing_insert
-                            .write()
-                            .map_err(|_| CatalogError::LockPoisoned {
-                                operation: "refresh deletion cache (insert_row_keys write)"
-                                    .to_string(),
-                            })?;
-                    *guard = fresh_data;
-                }
-            }
-            // Strategy mismatch - this should not happen
-            _ => {
-                return Err(CatalogError::InvalidOperation {
-                    message: format!(
-                        "Strategy mismatch during cache refresh: existing={:?}, fresh={:?}",
-                        self.pk_deletion_strategy.strategy(),
-                        fresh_strategy.strategy()
-                    ),
-                    source: Box::<dyn std::error::Error + Send + Sync>::from(
-                        "PkDeletionStrategy variant mismatch",
-                    ),
-                });
-            }
-        }
+        self.pk_deletion_strategy.refresh_from(&fresh_strategy)?;
 
         tracing::debug!(
             "Refreshed deletion cache for table {} (strategy: {:?})",
