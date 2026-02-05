@@ -19,6 +19,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
+use arrow_array::UInt16Array;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
@@ -62,6 +63,9 @@ pub enum Error {
     #[snafu(display("HTTP request failed: {source}"))]
     HttpRequest { source: reqwest::Error },
 
+    #[snafu(display("HTTP request failed with status code {status}"))]
+    HttpServerError { status: u16 },
+
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
@@ -95,6 +99,10 @@ impl From<Error> for DataFusionError {
             Error::HttpClientError { status, message } => {
                 DataFusionError::Plan(format!("HTTP client error ({status}): {message}"))
             }
+            // Server errors (5xx) are external errors
+            Error::HttpServerError { status } => DataFusionError::External(Box::new(
+                std::io::Error::other(format!("HTTP request failed with status code {status}")),
+            )),
             // Retry exhaustion is an external error
             Error::AllRetriesFailed { max_retries, url } => {
                 DataFusionError::External(Box::new(std::io::Error::other(format!(
@@ -125,6 +133,7 @@ struct CachedResponse {
     max_age: Duration,
     detected_format: Option<String>,
     response_date: Option<SystemTime>,
+    response_status: u16,
 }
 
 impl CachedResponse {
@@ -196,10 +205,14 @@ struct HttpFetchResult {
     max_age: Duration,
     detected_format: String,
     response_date: Option<SystemTime>,
+    response_status: u16,
 }
 
 impl HttpFetchResult {
     fn should_cache(&self) -> bool {
+        // We don't explicitly disable caching for 5xx responses because well-behaved servers
+        // should return Cache-Control: no-cache or max-age=0 for transient error responses.
+        // This keeps the caching logic simple and respects server-specified cache directives.
         self.max_age.as_secs() > 0
     }
 }
@@ -420,6 +433,7 @@ impl HttpTableProvider {
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
             Field::new("content", DataType::Utf8, false),
+            Field::new("response_status", DataType::UInt16, false),
             Field::new(
                 "fetched_at",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
@@ -629,22 +643,20 @@ impl HttpTableProvider {
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
-        result: HttpFetchResult,
-    ) -> String {
+        result: &HttpFetchResult,
+    ) {
         let cache_key = Self::get_cache_key(path, query, body);
-        let content_arc = Arc::new(result.content);
         let cached_response = CachedResponse {
-            content: Arc::clone(&content_arc),
+            content: Arc::new(result.content.clone()),
             cached_at: SystemTime::now(),
             max_age: result.max_age,
-            detected_format: Some(result.detected_format),
+            detected_format: Some(result.detected_format.clone()),
             response_date: result.response_date,
+            response_status: result.response_status,
         };
 
         let mut cache_write = self.cache.write().await;
         cache_write.insert(cache_key, cached_response);
-
-        Arc::unwrap_or_clone(content_arc)
     }
 
     async fn perform_request_with_retry(
@@ -654,101 +666,139 @@ impl HttpTableProvider {
         path_label: &str,
     ) -> Result<HttpFetchResult> {
         let retry_strategy = self.retry_strategy.clone();
-        let client = self.client.clone();
-        let content_type = self.content_type.clone();
-        let custom_headers = self.custom_headers.clone();
-        let path_owned = path_label.to_string();
+        let this = self.clone();
+        let url_clone = url.clone();
         let body_owned = body.map(ToOwned::to_owned);
+        let path_owned = path_label.to_string();
 
-        retry(retry_strategy, || {
-            let client = client.clone();
-            let url = url.clone();
-            let headers = custom_headers.clone();
-            let content_type = content_type.clone();
-            let path_for_detection = path_owned.clone();
-            let body_for_request = body_owned.clone();
+        let result = retry(retry_strategy, || {
+            let this = this.clone();
+            let url = url_clone.clone();
+            let body = body_owned.clone();
+            let path = path_owned.clone();
 
             async move {
-                let mut request_builder = if let Some(ref body_content) = body_for_request {
-                    let mut req = client.post(url.clone());
-                    let ct = content_type.as_deref().unwrap_or("application/json");
-                    req = req.header("Content-Type", ct);
-                    req.body(body_content.clone())
-                } else {
-                    client.get(url.clone())
-                };
-
-                for (name, value) in &headers {
-                    request_builder = request_builder.header(name, value);
-                }
-
-                let response = request_builder.send().await.map_err(|e| {
-                    tracing::debug!("HTTP request failed: {}", e);
-                    RetryError::transient(Error::HttpRequest { source: e })
-                })?;
-
-                if let Err(err) = response.error_for_status_ref() {
-                    if let Some(status) = err.status() {
-                        let status_code = status.as_u16();
-                        if (400..500).contains(&status_code) {
-                            return Err(RetryError::permanent(Error::HttpClientError {
-                                status: status_code,
-                                message: format!(
-                                    "{} for url ({})",
-                                    status.canonical_reason().unwrap_or("Client Error"),
-                                    url
-                                ),
-                            }));
-                        }
-                    }
-                    tracing::debug!("HTTP request returned server error, will retry: {}", err);
-                    return Err(RetryError::transient(Error::HttpRequest { source: err }));
-                }
-
-                let detected_format = Self::detect_file_format(&response, &path_for_detection);
-                tracing::debug!(
-                    "Detected file format from Content-Type header: {}",
-                    detected_format
-                );
-
-                let cache_control_header = response
-                    .headers()
-                    .get(CACHE_CONTROL)
-                    .and_then(|v| v.to_str().ok());
-                let max_age = Self::parse_cache_control(cache_control_header);
-
-                // Extract Date header from response
-                let response_date = response
-                    .headers()
-                    .get(reqwest::header::DATE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|date_str| {
-                        // Parse HTTP date format (RFC 2822/RFC 1123)
-                        httpdate::parse_http_date(date_str).ok()
-                    });
-
-                let content = response
-                    .text()
+                this.perform_single_request(&url, body.as_deref(), &path, false)
                     .await
-                    .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?;
-
-                let detected_format = if detected_format.is_empty() {
-                    let inferred = Self::infer_format_from_content(&content);
-                    tracing::debug!("Inferred file format from content: {}", inferred);
-                    inferred
-                } else {
-                    detected_format
-                };
-
-                Ok(HttpFetchResult {
-                    content,
-                    max_age,
-                    detected_format,
-                    response_date,
-                })
             }
         })
-        .await
+        .await;
+
+        // If retries exhausted due to transient errors (5xx), make one final attempt
+        // and return whatever response we get - 5xx is still valid data.
+        // Don't retry on permanent errors (e.g., failed to read response body).
+        if let Ok(fetch_result) = result {
+            Ok(fetch_result)
+        } else {
+            tracing::debug!(
+                "Retries exhausted for {url}, making final attempt accepting any status"
+            );
+            self.perform_single_request(&url, body, path_label, true)
+                .await
+                .map_err(|e| match e {
+                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
+                })
+        }
+    }
+
+    /// Perform a single HTTP request without retry logic.
+    ///
+    /// If `accept_5xx` is false, returns a transient error on 5xx to trigger retry.
+    /// If `accept_5xx` is true, accepts any status code and returns the response.
+    async fn perform_single_request(
+        &self,
+        url: &Url,
+        body: Option<&str>,
+        path_label: &str,
+        accept_5xx: bool,
+    ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        let mut request_builder = if let Some(body_content) = body {
+            let mut req = self.client.post(url.clone());
+            let ct = self.content_type.as_deref().unwrap_or("application/json");
+            req = req.header("Content-Type", ct);
+            req.body(body_content.to_owned())
+        } else {
+            self.client.get(url.clone())
+        };
+
+        for (name, value) in &self.custom_headers {
+            request_builder = request_builder.header(name, value);
+        }
+
+        let response = request_builder.send().await.map_err(|e| {
+            tracing::debug!("HTTP request failed: {e}");
+            RetryError::transient(Error::HttpRequest { source: e })
+        })?;
+
+        let status_code = response.status().as_u16();
+
+        // 5xx: retry with backoff (might be transient server issue)
+        // After retries exhausted, we'll accept 5xx as valid response
+        if !accept_5xx && (500..600).contains(&status_code) {
+            tracing::debug!("HTTP server error ({status_code}), will retry");
+            // We already verified status_code is 5xx, so error_for_status will return Err
+            if let Err(e) = response.error_for_status() {
+                return Err(RetryError::transient(Error::HttpRequest { source: e }));
+            }
+            // Defensive: should never reach here since 5xx always produces error_for_status Err
+            return Err(RetryError::transient(Error::HttpServerError {
+                status: status_code,
+            }));
+        }
+
+        // 2xx, 3xx, 4xx (and 5xx when accept_5xx=true): valid response
+        // 4xx like 404 "not found" is a valid business response, not an error
+        Self::extract_response(response, status_code, path_label).await
+    }
+
+    /// Extract content and metadata from an HTTP response.
+    async fn extract_response(
+        response: reqwest::Response,
+        status_code: u16,
+        path_label: &str,
+    ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        let detected_format = Self::detect_file_format(&response, path_label);
+        tracing::debug!(
+            "Detected file format from Content-Type header: {}",
+            detected_format
+        );
+
+        let cache_control_header = response
+            .headers()
+            .get(CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok());
+        let max_age = Self::parse_cache_control(cache_control_header);
+
+        // Extract Date header from response
+        let response_date = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|date_str| {
+                // Parse HTTP date format (RFC 2822/RFC 1123)
+                httpdate::parse_http_date(date_str).ok()
+            });
+
+        let content = response
+            .text()
+            .await
+            .map_err(|e| RetryError::permanent(Error::HttpRequest { source: e }))?;
+
+        let detected_format = if detected_format.is_empty() {
+            let inferred = Self::infer_format_from_content(&content);
+            tracing::debug!("Inferred file format from content: {}", inferred);
+            inferred
+        } else {
+            detected_format
+        };
+
+        Ok(HttpFetchResult {
+            content,
+            max_age,
+            detected_format,
+            response_date,
+            response_status: status_code,
+        })
     }
 
     async fn fetch_and_cache(
@@ -756,7 +806,7 @@ impl HttpTableProvider {
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
         let query_owned = query.map(ToOwned::to_owned);
@@ -767,25 +817,24 @@ impl HttpTableProvider {
             .await?;
 
         if fetch_result.should_cache() {
-            return Ok(self
-                .cache_response(
-                    &path_owned,
-                    query_owned.as_deref(),
-                    body_owned.as_deref(),
-                    fetch_result,
-                )
-                .await);
+            self.cache_response(
+                &path_owned,
+                query_owned.as_deref(),
+                body_owned.as_deref(),
+                &fetch_result,
+            )
+            .await;
         }
 
-        Ok(fetch_result.content)
+        Ok(fetch_result)
     }
 
-    async fn get_content(
+    async fn get_response(
         &self,
         path: &str,
         query: Option<&str>,
         body: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<HttpFetchResult> {
         // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it
         if self.acceleration_enabled {
             return self.fetch_and_cache(path, query, body).await;
@@ -811,7 +860,13 @@ impl HttpTableProvider {
             } else {
                 tracing::debug!("Returning fresh cached content for {}", cache_key);
             }
-            return Ok((*cached_response.content).clone());
+            return Ok(HttpFetchResult {
+                content: (*cached_response.content).clone(),
+                max_age: cached_response.max_age,
+                detected_format: cached_response.detected_format.clone().unwrap_or_default(),
+                response_date: cached_response.response_date,
+                response_status: cached_response.response_status,
+            });
         }
 
         // Fetch fresh content
@@ -960,19 +1015,17 @@ impl HttpExec {
         );
 
         // Fetch content with path, query, and body
-        let content = provider
-            .get_content(path_val, query_val, body_val)
+        let result = provider
+            .get_response(path_val, query_val, body_val)
             .await
             .map_err(DataFusionError::from)?;
 
-        // Get the response date from cache (if available)
-        let cache_key = HttpTableProvider::get_cache_key(path_val, query_val, body_val);
-        let response_date = {
-            let cache = provider.cache.read().await;
-            cache
-                .get(&cache_key)
-                .and_then(|cached| cached.response_date)
-        };
+        let HttpFetchResult {
+            content,
+            response_date,
+            response_status,
+            ..
+        } = result;
 
         // Store the actual values from the partition for the primary key
         let path_for_batch = path.as_deref().unwrap_or("");
@@ -1030,6 +1083,9 @@ impl HttpExec {
                     Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
                 }
                 "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
+                "response_status" => {
+                    Ok(Arc::new(UInt16Array::from(vec![response_status; num_rows])) as ArrayRef)
+                }
                 "fetched_at" => {
                     use arrow::array::TimestampNanosecondArray;
                     Ok(Arc::new(TimestampNanosecondArray::from(vec![
@@ -1058,6 +1114,12 @@ impl HttpExec {
     /// If limit is provided, only returns up to that many rows
     fn parse_content(content: &str, limit: Option<usize>) -> Vec<String> {
         let trimmed = content.trim();
+
+        // Handle empty content - return a single row with empty content
+        // This is important for HTTP responses that return empty bodies (e.g., 5xx errors)
+        if trimmed.is_empty() {
+            return vec![content.to_string()];
+        }
 
         // Try to parse as JSON
         if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -1956,28 +2018,78 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_content_empty_body() {
+        // Empty body should return single row with empty content
+        let rows = HttpExec::parse_content("", None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], "");
+
+        // Whitespace-only should also return single row
+        let rows = HttpExec::parse_content("   ", None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], "   ");
+    }
+
+    #[test]
+    fn test_parse_content_json_object() {
+        let content = r#"{"id": 1, "name": "test"}"#;
+        let rows = HttpExec::parse_content(content, None);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("\"id\""));
+    }
+
+    #[test]
+    fn test_parse_content_json_array() {
+        let content = r#"[{"id": 1}, {"id": 2}, {"id": 3}]"#;
+        let rows = HttpExec::parse_content(content, None);
+        assert_eq!(rows.len(), 3);
+
+        // With limit
+        let rows = HttpExec::parse_content(content, Some(2));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_content_ndjson() {
+        let content = "{\"id\": 1}\n{\"id\": 2}\n{\"id\": 3}";
+        let rows = HttpExec::parse_content(content, None);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_content_plain_text() {
+        let content = "This is plain text content";
+        let rows = HttpExec::parse_content(content, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], content);
+    }
+
+    #[test]
     fn test_base_table_schema() {
         let schema = HttpTableProvider::base_table_schema();
 
-        assert_eq!(schema.fields().len(), 5);
+        assert_eq!(schema.fields().len(), 6);
         assert_eq!(schema.field(0).name(), "request_path");
         assert_eq!(schema.field(1).name(), "request_query");
         assert_eq!(schema.field(2).name(), "request_body");
         assert_eq!(schema.field(3).name(), "content");
-        assert_eq!(schema.field(4).name(), "fetched_at");
+        assert_eq!(schema.field(4).name(), "response_status");
+        assert_eq!(schema.field(5).name(), "fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
+        assert_eq!(*schema.field(4).data_type(), DataType::UInt16);
         assert_eq!(
-            *schema.field(4).data_type(),
+            *schema.field(5).data_type(),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
         );
         assert!(!schema.field(0).is_nullable()); // request_path is not nullable
         assert!(schema.field(1).is_nullable()); // request_query is nullable
         assert!(schema.field(2).is_nullable()); // request_body is nullable
         assert!(!schema.field(3).is_nullable()); // content is not nullable
-        assert!(schema.field(4).is_nullable()); // fetched_at is nullable
+        assert!(!schema.field(4).is_nullable()); // response_status is not nullable
+        assert!(schema.field(5).is_nullable()); // fetched_at is nullable
     }
 
     #[test]
@@ -2447,7 +2559,7 @@ mod tests {
 
         // Test basic query
         let df = ctx
-            .sql("SELECT request_path, content FROM posts WHERE request_path = '/posts/1'")
+            .sql("SELECT request_path, content, response_status FROM posts WHERE request_path = '/posts/1'")
             .await
             .expect("query should succeed");
 
@@ -2456,7 +2568,19 @@ mod tests {
 
         let batch = &results[0];
         assert!(batch.num_rows() > 0, "Should have rows");
-        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.num_columns(), 3);
+
+        // Validate response_status is 200 for successful request
+        let status_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .expect("response_status should be UInt16Array");
+        assert_eq!(
+            status_col.value(0),
+            200,
+            "Successful request should have response_status 200"
+        );
 
         // Validate content contains expected post fields
         let content_col = batch
@@ -2504,7 +2628,7 @@ mod tests {
 
         // Test IN list filter for multiple paths
         let df = ctx
-            .sql("SELECT request_path, content FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3')")
+            .sql("SELECT request_path, content, response_status FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3')")
             .await
             .expect("query should succeed");
 
@@ -2514,7 +2638,7 @@ mod tests {
         let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 posts");
 
-        // Verify content contains expected post IDs
+        // Verify response_status is 200 for all successful requests and content contains expected post IDs
         let mut found_posts = [false, false, false]; // Track posts 1, 2, 3
         for batch in &results {
             let content_col = batch
@@ -2523,7 +2647,20 @@ mod tests {
                 .downcast_ref::<arrow::array::StringArray>()
                 .expect("content should be string array");
 
+            let status_col = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt16Array>()
+                .expect("response_status should be UInt16Array");
+
             for i in 0..batch.num_rows() {
+                // Validate response_status is 200
+                assert_eq!(
+                    status_col.value(i),
+                    200,
+                    "All successful requests should have response_status 200"
+                );
+
                 let content = content_col.value(i);
                 assert!(content.contains("userId"), "Should contain userId field");
                 assert!(content.contains("id"), "Should contain id field");
@@ -2672,6 +2809,110 @@ mod tests {
         assert!(
             content.contains("sealed off from the rest of the world"),
             "Should contain expected summary text"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_tvmaze_404_not_found() {
+        use datafusion::prelude::SessionContext;
+
+        // Use an invalid route that returns 404 with JSON error body
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/search/invalid_404".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("tvmaze", Arc::new(provider))
+            .expect("register table");
+
+        // Query for an invalid route - should return a row with 404 status and error JSON
+        let df = ctx
+            .sql("SELECT request_path, content, response_status FROM tvmaze WHERE request_path = '/search/invalid_404'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results even for 404");
+
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
+
+        // Validate response_status is 404
+        let status_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .expect("response_status should be UInt16Array");
+        assert_eq!(
+            status_col.value(0),
+            404,
+            "Invalid route should have response_status 404"
+        );
+
+        // Validate content contains the 404 JSON error response body
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+
+        let content = content_col.value(0);
+        // TVMaze returns JSON error: {"name":"Not Found","message":"Page not found.","code":0,"status":404,...}
+        assert!(
+            content.contains("Not Found"),
+            "404 response should contain 'Not Found' in body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_httpbin_500_server_error() {
+        use datafusion::prelude::SessionContext;
+
+        // httpbin.org provides endpoints that return specific HTTP status codes
+        let url = Url::parse("https://httpbin.org").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/status/500".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("httpbin", Arc::new(provider))
+            .expect("register table");
+
+        // Query for a 500 status endpoint - should return a row with 500 status
+        let df = ctx
+            .sql("SELECT request_path, content, response_status FROM httpbin WHERE request_path = '/status/500'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results even for 5xx");
+
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
+
+        // Validate response_status is 500
+        let status_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .expect("response_status should be UInt16Array");
+        assert_eq!(
+            status_col.value(0),
+            500,
+            "Server error should have response_status 500"
+        );
+
+        // Validate content is empty (httpbin /status/500 returns empty body)
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+        let content = content_col.value(0);
+        assert!(
+            content.is_empty(),
+            "httpbin 500 response should have empty content body"
         );
     }
 
