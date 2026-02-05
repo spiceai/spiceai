@@ -1357,5 +1357,56 @@ mod tests {
             let final_state = job_store.get_job(&job_id).await.expect("to get job");
             assert_eq!(final_state.status, JobStatus::Cancelled);
         }
+
+        #[tokio::test]
+        async fn test_chunk_already_exists_error() {
+            use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+            use futures::stream;
+
+            let store = Arc::new(InMemory::new());
+            // Use small chunk size to ensure we write multiple chunks
+            let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
+
+            // Create first job and write chunks
+            let state1 = job_store
+                .create_job(make_request("SELECT * FROM test"))
+                .await
+                .expect("to create first job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            )
+            .expect("to create batch");
+
+            let stream1 = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(vec![Ok(batch.clone())]),
+            ));
+
+            // Write chunks for first job - should succeed
+            job_store
+                .write_result_chunks_from_stream(&state1.job_id, stream1)
+                .await
+                .expect("first write should succeed");
+
+            // Now try to write the same chunks again for the same job
+            // This simulates another scheduler trying to write results for the same job
+            let stream2 = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(vec![Ok(batch)]),
+            ));
+
+            let result = job_store
+                .write_result_chunks_from_stream(&state1.job_id, stream2)
+                .await;
+
+            assert!(
+                matches!(result, Err(Error::ChunkAlreadyExists { .. })),
+                "Expected ChunkAlreadyExists error when writing duplicate chunk, got: {result:?}"
+            );
+        }
     }
 }
