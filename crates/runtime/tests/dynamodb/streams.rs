@@ -563,9 +563,10 @@ async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: 
         // Check dataset status
         let statuses = rt.datafusion().runtime_status().get_dataset_statuses();
         if let Some(status) = statuses.get(&table_ref)
-            && *status == ComponentStatus::Error {
-                return true;
-            }
+            && *status == ComponentStatus::Error
+        {
+            return true;
+        }
         sleep(Duration::from_millis(500)).await;
     }
 }
@@ -590,14 +591,16 @@ async fn wait_for_dataset_rows(
 
         if let Ok(result) = query_result
             && let Ok(batches) = result.data.try_collect::<Vec<_>>().await
-                && !batches.is_empty() && batches[0].num_rows() > 0
-                    && let Some(col) = batches[0]
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<arrow::array::Int64Array>()
-                        && col.value(0) as usize >= expected_rows {
-                            return true;
-                        }
+            && !batches.is_empty()
+            && batches[0].num_rows() > 0
+            && let Some(col) = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+            && col.value(0) as usize >= expected_rows
+        {
+            return true;
+        }
         sleep(Duration::from_millis(500)).await;
     }
 }
