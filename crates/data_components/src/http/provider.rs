@@ -1106,6 +1106,12 @@ impl HttpExec {
     fn parse_content(content: &str, limit: Option<usize>) -> Vec<String> {
         let trimmed = content.trim();
 
+        // Handle empty content - return a single row with empty content
+        // This is important for HTTP responses that return empty bodies (e.g., 5xx errors)
+        if trimmed.is_empty() {
+            return vec![content.to_string()];
+        }
+
         // Try to parse as JSON
         if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(trimmed) {
             match json_value {
@@ -2003,6 +2009,53 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_content_empty_body() {
+        // Empty body should return single row with empty content
+        let rows = HttpExec::parse_content("", None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], "");
+
+        // Whitespace-only should also return single row
+        let rows = HttpExec::parse_content("   ", None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], "   ");
+    }
+
+    #[test]
+    fn test_parse_content_json_object() {
+        let content = r#"{"id": 1, "name": "test"}"#;
+        let rows = HttpExec::parse_content(content, None);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("\"id\""));
+    }
+
+    #[test]
+    fn test_parse_content_json_array() {
+        let content = r#"[{"id": 1}, {"id": 2}, {"id": 3}]"#;
+        let rows = HttpExec::parse_content(content, None);
+        assert_eq!(rows.len(), 3);
+
+        // With limit
+        let rows = HttpExec::parse_content(content, Some(2));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_content_ndjson() {
+        let content = "{\"id\": 1}\n{\"id\": 2}\n{\"id\": 3}";
+        let rows = HttpExec::parse_content(content, None);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_content_plain_text() {
+        let content = "This is plain text content";
+        let rows = HttpExec::parse_content(content, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], content);
+    }
+
+    #[test]
     fn test_base_table_schema() {
         let schema = HttpTableProvider::base_table_schema();
 
@@ -2497,7 +2550,7 @@ mod tests {
 
         // Test basic query
         let df = ctx
-            .sql("SELECT request_path, content FROM posts WHERE request_path = '/posts/1'")
+            .sql("SELECT request_path, content, response_status FROM posts WHERE request_path = '/posts/1'")
             .await
             .expect("query should succeed");
 
@@ -2506,7 +2559,19 @@ mod tests {
 
         let batch = &results[0];
         assert!(batch.num_rows() > 0, "Should have rows");
-        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.num_columns(), 3);
+
+        // Validate response_status is 200 for successful request
+        let status_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .expect("response_status should be UInt16Array");
+        assert_eq!(
+            status_col.value(0),
+            200,
+            "Successful request should have response_status 200"
+        );
 
         // Validate content contains expected post fields
         let content_col = batch
@@ -2554,7 +2619,7 @@ mod tests {
 
         // Test IN list filter for multiple paths
         let df = ctx
-            .sql("SELECT request_path, content FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3')")
+            .sql("SELECT request_path, content, response_status FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3')")
             .await
             .expect("query should succeed");
 
@@ -2564,7 +2629,7 @@ mod tests {
         let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 posts");
 
-        // Verify content contains expected post IDs
+        // Verify response_status is 200 for all successful requests and content contains expected post IDs
         let mut found_posts = [false, false, false]; // Track posts 1, 2, 3
         for batch in &results {
             let content_col = batch
@@ -2573,7 +2638,20 @@ mod tests {
                 .downcast_ref::<arrow::array::StringArray>()
                 .expect("content should be string array");
 
+            let status_col = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt16Array>()
+                .expect("response_status should be UInt16Array");
+
             for i in 0..batch.num_rows() {
+                // Validate response_status is 200
+                assert_eq!(
+                    status_col.value(i),
+                    200,
+                    "All successful requests should have response_status 200"
+                );
+
                 let content = content_col.value(i);
                 assert!(content.contains("userId"), "Should contain userId field");
                 assert!(content.contains("id"), "Should contain id field");
@@ -2722,6 +2800,110 @@ mod tests {
         assert!(
             content.contains("sealed off from the rest of the world"),
             "Should contain expected summary text"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_tvmaze_404_not_found() {
+        use datafusion::prelude::SessionContext;
+
+        // Use an invalid route that returns 404 with JSON error body
+        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/search/invalid_404".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("tvmaze", Arc::new(provider))
+            .expect("register table");
+
+        // Query for an invalid route - should return a row with 404 status and error JSON
+        let df = ctx
+            .sql("SELECT request_path, content, response_status FROM tvmaze WHERE request_path = '/search/invalid_404'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results even for 404");
+
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
+
+        // Validate response_status is 404
+        let status_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .expect("response_status should be UInt16Array");
+        assert_eq!(
+            status_col.value(0),
+            404,
+            "Invalid route should have response_status 404"
+        );
+
+        // Validate content contains the 404 JSON error response body
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+
+        let content = content_col.value(0);
+        // TVMaze returns JSON error: {"name":"Not Found","message":"Page not found.","code":0,"status":404,...}
+        assert!(
+            content.contains("Not Found"),
+            "404 response should contain 'Not Found' in body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integration_httpbin_500_server_error() {
+        use datafusion::prelude::SessionContext;
+
+        // httpbin.org provides endpoints that return specific HTTP status codes
+        let url = Url::parse("https://httpbin.org").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(vec!["/status/500".to_string()])
+            .expect("allowed paths");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("httpbin", Arc::new(provider))
+            .expect("register table");
+
+        // Query for a 500 status endpoint - should return a row with 500 status
+        let df = ctx
+            .sql("SELECT request_path, content, response_status FROM httpbin WHERE request_path = '/status/500'")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        assert!(!results.is_empty(), "Should have results even for 5xx");
+
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
+
+        // Validate response_status is 500
+        let status_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .expect("response_status should be UInt16Array");
+        assert_eq!(
+            status_col.value(0),
+            500,
+            "Server error should have response_status 500"
+        );
+
+        // Validate content is empty (httpbin /status/500 returns empty body)
+        let content_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+        let content = content_col.value(0);
+        assert!(
+            content.is_empty(),
+            "httpbin 500 response should have empty content body"
         );
     }
 

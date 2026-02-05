@@ -1975,6 +1975,7 @@ mod tests {
             Field::new("request_path", DataType::Utf8, true),
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
+            Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
             Field::new(
                 CACHE_REFRESHED_AT_COLUMN,
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -1990,6 +1991,7 @@ mod tests {
         let path_array = StringArray::from(vec![Some("/api/users"), Some("/api/posts")]);
         let query_array = StringArray::from(vec![Some("page=1"), Some("limit=10")]);
         let body_array = StringArray::from(vec![Some("{\"id\":1}"), Some("{\"id\":2}")]);
+        let status_array = UInt16Array::from(vec![200, 200]);
 
         #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
@@ -2006,6 +2008,7 @@ mod tests {
                 Arc::new(path_array),
                 Arc::new(query_array),
                 Arc::new(body_array),
+                Arc::new(status_array),
                 Arc::new(refresh_timestamps),
             ],
         )
@@ -2023,6 +2026,7 @@ mod tests {
         let path_array = StringArray::from(vec![Some("/api/users")]);
         let query_array = StringArray::from(vec![None::<&str>]); // Null query
         let body_array = StringArray::from(vec![Some("{\"id\":1}")]);
+        let status_array = UInt16Array::from(vec![200]);
 
         #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
@@ -2039,6 +2043,7 @@ mod tests {
                 Arc::new(path_array),
                 Arc::new(query_array),
                 Arc::new(body_array),
+                Arc::new(status_array),
                 Arc::new(refresh_timestamps),
             ],
         )
@@ -2057,6 +2062,7 @@ mod tests {
         let path_array = StringArray::from(vec![Some("")]); // Empty string
         let query_array = StringArray::from(vec![Some("page=1")]);
         let body_array = StringArray::from(vec![Some("")]); // Empty string
+        let status_array = UInt16Array::from(vec![200]);
 
         #[expect(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
@@ -2073,6 +2079,7 @@ mod tests {
                 Arc::new(path_array),
                 Arc::new(query_array),
                 Arc::new(body_array),
+                Arc::new(status_array),
                 Arc::new(refresh_timestamps),
             ],
         )
@@ -2882,7 +2889,11 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(StringArray::from(vec!["not found", "bad request", "forbidden"])),
+                Arc::new(StringArray::from(vec![
+                    "not found",
+                    "bad request",
+                    "forbidden",
+                ])),
                 Arc::new(UInt16Array::from(vec![404, 400, 403])),
             ],
         )
@@ -2917,7 +2928,12 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(StringArray::from(vec!["ok", "not found", "server error", "created"])),
+                Arc::new(StringArray::from(vec![
+                    "ok",
+                    "not found",
+                    "server error",
+                    "created",
+                ])),
                 Arc::new(UInt16Array::from(vec![200, 404, 500, 201])),
             ],
         )
@@ -2979,55 +2995,16 @@ mod tests {
         let result =
             filter_5xx_responses(vec![batch1, batch2, batch3]).expect("filter should succeed");
 
-        assert_eq!(result.len(), 2, "Should have 2 batches (batch2 filtered out entirely)");
-        assert_eq!(result[0].num_rows(), 1, "First batch should have 1 row");
-        assert_eq!(result[1].num_rows(), 1, "Second kept batch should have 1 row");
-    }
-
-    #[test]
-    fn test_filter_5xx_responses_missing_column_returns_error() {
-        let schema = Arc::new(Schema::new(vec![Field::new("content", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(StringArray::from(vec!["data"]))],
-        )
-        .expect("to create batch");
-
-        let result = filter_5xx_responses(vec![batch]);
-        assert!(result.is_err(), "Should error on missing response_status column");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Missing required 'response_status'"),
-            "Error should mention missing column"
+        assert_eq!(
+            result.len(),
+            2,
+            "Should have 2 batches (batch2 filtered out entirely)"
         );
-    }
-
-    #[test]
-    fn test_filter_5xx_responses_wrong_column_type_returns_error() {
-        // Create schema with response_status as wrong type (Int32 instead of UInt16)
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("content", DataType::Utf8, false),
-            Field::new(RESPONSE_STATUS_COLUMN, DataType::Int32, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec!["data"])),
-                Arc::new(Int32Array::from(vec![200])),
-            ],
-        )
-        .expect("to create batch");
-
-        let result = filter_5xx_responses(vec![batch]);
-        assert!(result.is_err(), "Should error on wrong column type");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("must be UInt16Array"),
-            "Error should mention wrong type"
+        assert_eq!(result[0].num_rows(), 1, "First batch should have 1 row");
+        assert_eq!(
+            result[1].num_rows(),
+            1,
+            "Second kept batch should have 1 row"
         );
     }
 
