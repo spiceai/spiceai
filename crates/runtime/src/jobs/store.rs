@@ -24,7 +24,7 @@ use arrow_ipc::writer::StreamWriter;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore};
+use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions, UpdateVersion};
 use snafu::prelude::*;
 use uuid::Uuid;
 
@@ -33,7 +33,7 @@ use crate::jobs::state::JobErrorCode;
 
 use super::error::{
     DeserializeChunkSnafu, DeserializeStateSnafu, ObjectStoreDeleteSnafu, ObjectStoreListSnafu,
-    ObjectStoreReadSnafu, ObjectStoreWriteSnafu, Result, SerializeChunkSnafu, SerializeStateSnafu,
+    ObjectStoreReadSnafu, Result, SerializeChunkSnafu, SerializeStateSnafu,
 };
 use super::state::{
     ColumnSchema, DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobResult, JobResultManifest, JobSchema,
@@ -132,10 +132,10 @@ impl JobStore {
     /// Creates a new pending job and stores it.
     pub async fn create_job(&self, request: SubmitQueryRequest) -> Result<JobState> {
         let job_id = Self::generate_job_id();
-        let state = JobState::new_pending(job_id, request.sql, request.parameters)
+        let mut state = JobState::new_pending(job_id, request.sql, request.parameters)
             .with_timeout_seconds(request.timeout_seconds)
             .with_maximum_size(request.maximum_size);
-        self.write_job_state(&state).await?;
+        self.write_job_state(&mut state).await?;
         Ok(state)
     }
 
@@ -149,8 +149,17 @@ impl JobStore {
             other => super::error::Error::ObjectStoreRead { source: other },
         })?;
 
+        // Extract version information for conditional writes
+        let version = UpdateVersion {
+            e_tag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
+
         let bytes = result.bytes().await.context(ObjectStoreReadSnafu)?;
-        let state: JobState = serde_json::from_slice(&bytes).context(DeserializeStateSnafu)?;
+        let mut state: JobState = serde_json::from_slice(&bytes).context(DeserializeStateSnafu)?;
+
+        // Store the version for conditional writes
+        state.version = Some(version);
 
         // Check if expired
         if state.is_expired() {
@@ -163,7 +172,7 @@ impl JobStore {
     }
 
     /// Updates the job state with conditional write for consistency.
-    pub async fn update_job(&self, state: &JobState) -> Result<()> {
+    pub async fn update_job(&self, state: &mut JobState) -> Result<()> {
         self.write_job_state(state).await
     }
 
@@ -171,7 +180,7 @@ impl JobStore {
     pub async fn set_job_running(&self, job_id: &str) -> Result<JobState> {
         let mut state = self.get_job(job_id).await?;
         state.set_running(self.node_id.clone());
-        self.write_job_state(&state).await?;
+        self.write_job_state(&mut state).await?;
         Ok(state)
     }
 
@@ -183,7 +192,7 @@ impl JobStore {
             return Ok(state);
         }
         state.set_cancelled();
-        self.write_job_state(&state).await?;
+        self.write_job_state(&mut state).await?;
         Ok(state)
     }
 
@@ -374,10 +383,18 @@ impl JobStore {
         let path = self.chunk_path(job_id, chunk_index);
         let bytes_len = buffer.len();
 
+        // Use PutMode::Create to ensure chunks are only written once.
+        // If another scheduler already wrote this chunk, we'll get an AlreadyExists error.
         self.store
-            .put(&path, buffer.into())
+            .put_opts(&path, buffer.into(), PutOptions::from(PutMode::Create))
             .await
-            .context(ObjectStoreWriteSnafu)?;
+            .map_err(|e| match e {
+                ObjectStoreError::AlreadyExists { .. } => super::error::Error::ChunkAlreadyExists {
+                    job_id: job_id.to_string(),
+                    chunk_index,
+                },
+                other => super::error::Error::ObjectStoreWrite { source: other },
+            })?;
 
         Ok(bytes_len)
     }
@@ -410,7 +427,7 @@ impl JobStore {
     pub async fn complete_job(&self, job_id: &str, result: JobResult) -> Result<JobState> {
         let mut state = self.get_job(job_id).await?;
         state.set_succeeded(result, self.result_ttl);
-        self.write_job_state(&state).await?;
+        self.write_job_state(&mut state).await?;
         Ok(state)
     }
 
@@ -427,7 +444,7 @@ impl JobStore {
             message: message.into(),
             sql_state: None,
         });
-        self.write_job_state(&state).await?;
+        self.write_job_state(&mut state).await?;
         Ok(state)
     }
 
@@ -632,14 +649,30 @@ impl JobStore {
         )
     }
 
-    async fn write_job_state(&self, state: &JobState) -> Result<()> {
+    async fn write_job_state(&self, state: &mut JobState) -> Result<()> {
         let path = self.job_state_path(&state.job_id);
         let payload = serde_json::to_vec(state).context(SerializeStateSnafu)?;
 
-        self.store
-            .put(&path, payload.into())
+        let put_mode = match &state.version {
+            Some(version) => PutMode::Update(version.clone()),
+            None => PutMode::Create,
+        };
+
+        let result = self
+            .store
+            .put_opts(&path, payload.into(), PutOptions::from(put_mode))
             .await
-            .context(ObjectStoreWriteSnafu)?;
+            .map_err(|e| match e {
+                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
+                    super::error::Error::ConcurrentModification {
+                        job_id: state.job_id.clone(),
+                    }
+                }
+                other => super::error::Error::ObjectStoreWrite { source: other },
+            })?;
+
+        // Update the version for future writes
+        state.version = Some(UpdateVersion::from(result));
 
         Ok(())
     }
@@ -1163,6 +1196,217 @@ mod tests {
 
             assert_eq!(result.manifest.total_row_count, 1000);
             assert!(result.manifest.total_byte_count > 0);
+        }
+    }
+
+    mod conditional_writes {
+        use super::*;
+        use crate::jobs::Error;
+
+        #[tokio::test]
+        async fn test_create_job_sets_version() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1");
+
+            let state = job_store
+                .create_job(make_request("SELECT 1"))
+                .await
+                .expect("to create job");
+
+            // Version should be set after creation
+            assert!(
+                state.version.is_some(),
+                "Version should be set after job creation"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_get_job_sets_version() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1");
+
+            let created = job_store
+                .create_job(make_request("SELECT 1"))
+                .await
+                .expect("to create job");
+
+            let retrieved = job_store
+                .get_job(&created.job_id)
+                .await
+                .expect("to get job");
+
+            // Version should be set after retrieval
+            assert!(
+                retrieved.version.is_some(),
+                "Version should be set after job retrieval"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_update_preserves_version_tracking() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1");
+
+            // Create job
+            let created = job_store
+                .create_job(make_request("SELECT 1"))
+                .await
+                .expect("to create job");
+            let job_id = created.job_id.clone();
+
+            // Get the job (which retrieves the version)
+            let retrieved = job_store.get_job(&job_id).await.expect("to get job");
+            let original_version = retrieved.version.clone();
+            assert!(original_version.is_some(), "Version should be set");
+
+            // Update via set_job_running
+            let updated = job_store
+                .set_job_running(&job_id)
+                .await
+                .expect("to set running");
+
+            // Version should be updated after write
+            assert!(updated.version.is_some(), "Version should still be set");
+            // The version should have changed
+            assert_ne!(
+                updated.version, original_version,
+                "Version should change after update"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_version_not_serialized() {
+            // Verify that version is not included in serialized JSON
+            let state = JobState::new_pending("test-123".to_string(), "SELECT 1".to_string(), None);
+
+            let json = serde_json::to_string(&state).expect("to serialize");
+            // Check that the UpdateVersion-related fields are not serialized
+            // Note: "schema_version" is a valid field, so we check for the specific pattern
+            assert!(
+                !json.contains("\"version\""),
+                "version field should not be serialized: {json}"
+            );
+            assert!(
+                !json.contains("\"e_tag\""),
+                "e_tag field should not be serialized: {json}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_concurrent_modification_detection() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let job_store = JobStore::new(Arc::clone(&store), "test", "node-1");
+
+            // Create job
+            let created = job_store
+                .create_job(make_request("SELECT 1"))
+                .await
+                .expect("to create job");
+            let job_id = created.job_id.clone();
+
+            // Simulate two schedulers getting the job concurrently
+            let mut state1 = job_store.get_job(&job_id).await.expect("to get job");
+            let mut state2 = job_store.get_job(&job_id).await.expect("to get job");
+
+            // First update should succeed
+            state1.set_running("node-1".to_string());
+            job_store
+                .update_job(&mut state1)
+                .await
+                .expect("first update should succeed");
+
+            // Second update should fail with concurrent modification
+            state2.set_running("node-2".to_string());
+            let result = job_store.update_job(&mut state2).await;
+
+            assert!(
+                matches!(result, Err(Error::ConcurrentModification { .. })),
+                "Expected ConcurrentModification error, got: {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_sequential_updates_succeed() {
+            let store = Arc::new(InMemory::new());
+            let job_store = JobStore::new(store, "test", "node-1");
+
+            // Create job
+            let created = job_store
+                .create_job(make_request("SELECT 1"))
+                .await
+                .expect("to create job");
+            let job_id = created.job_id.clone();
+
+            // Get and update - should succeed
+            let mut state = job_store.get_job(&job_id).await.expect("to get job");
+            state.set_running("node-1".to_string());
+            job_store
+                .update_job(&mut state)
+                .await
+                .expect("first update should succeed");
+
+            // Get again with new version and update - should succeed
+            let mut state2 = job_store.get_job(&job_id).await.expect("to get job");
+            state2.set_cancelled();
+            job_store
+                .update_job(&mut state2)
+                .await
+                .expect("second update should succeed with fresh version");
+
+            // Verify final state
+            let final_state = job_store.get_job(&job_id).await.expect("to get job");
+            assert_eq!(final_state.status, JobStatus::Cancelled);
+        }
+
+        #[tokio::test]
+        async fn test_chunk_already_exists_error() {
+            use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+            use futures::stream;
+
+            let store = Arc::new(InMemory::new());
+            // Use small chunk size to ensure we write multiple chunks
+            let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
+
+            // Create first job and write chunks
+            let state1 = job_store
+                .create_job(make_request("SELECT * FROM test"))
+                .await
+                .expect("to create first job");
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            )
+            .expect("to create batch");
+
+            let stream1 = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(vec![Ok(batch.clone())]),
+            ));
+
+            // Write chunks for first job - should succeed
+            job_store
+                .write_result_chunks_from_stream(&state1.job_id, stream1)
+                .await
+                .expect("first write should succeed");
+
+            // Now try to write the same chunks again for the same job
+            // This simulates another scheduler trying to write results for the same job
+            let stream2 = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                stream::iter(vec![Ok(batch)]),
+            ));
+
+            let result = job_store
+                .write_result_chunks_from_stream(&state1.job_id, stream2)
+                .await;
+
+            assert!(
+                matches!(result, Err(Error::ChunkAlreadyExists { .. })),
+                "Expected ChunkAlreadyExists error when writing duplicate chunk, got: {result:?}"
+            );
         }
     }
 }

@@ -75,7 +75,7 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
-use crate::cluster::SchedulerPeers;
+use crate::cluster::{DistributedNode, SchedulerPeers};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 pub mod accelerated_table;
@@ -496,11 +496,9 @@ pub struct Runtime {
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
-    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 
-    /// Job executor for async SQL query jobs (only available in cluster mode with scheduler config)
-    job_executor: Arc<RwLock<Option<Arc<jobs::JobExecutor>>>>,
-
+    /// When the runtime is part of a distributed cluster, this holds the node-specific information. It is `None` for stand-alone runtimes.
+    distributed: Option<DistributedNode>,
     resource_monitor: resource_monitor::ResourceMonitor,
 
     config: Arc<Config>,
@@ -590,8 +588,11 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn scheduler_peers(&self) -> Arc<RwLock<SchedulerPeers>> {
-        Arc::clone(&self.scheduler_peers)
+    pub fn scheduler_peers(&self) -> Option<Arc<RwLock<SchedulerPeers>>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { peers, .. }) => Some(Arc::clone(peers)),
+            _ => None,
+        }
     }
 
     /// Returns the metrics reader for on-demand OTLP metrics collection.
@@ -613,16 +614,39 @@ impl Runtime {
     /// 2. The executor is being initialized (rare, transient condition)
     #[must_use]
     pub fn job_executor(&self) -> Option<Arc<jobs::JobExecutor>> {
-        self.job_executor
-            .try_read()
-            .ok()
-            .and_then(|guard| guard.clone())
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { job_executor, .. }) => {
+                if let Ok(guard) = job_executor.try_read() {
+                    guard.clone()
+                } else {
+                    tracing::debug!(
+                        "Job executor is currently being initialized. Returning None. This is a transient condition during startup."
+                    );
+                    None
+                }
+            }
+            None | Some(DistributedNode::Executor) => None,
+        }
     }
 
     /// Sets the job executor for async SQL queries.
     pub async fn set_job_executor(&self, executor: Arc<jobs::JobExecutor>) {
-        let mut guard = self.job_executor.write().await;
-        *guard = Some(executor);
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { job_executor, .. }) => {
+                let mut guard = job_executor.write().await;
+                *guard = Some(executor);
+            }
+            Some(DistributedNode::Executor) => {
+                tracing::warn!(
+                    "Attempted to set job executor on an executor node. This should only be set on the scheduler. Ignoring."
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "Attempted to set job executor on a non-cluster runtime. This should only be set in cluster mode on the scheduler node. Ignoring."
+                );
+            }
+        }
     }
 
     #[must_use]
@@ -721,97 +745,47 @@ impl Runtime {
         )]
         type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
 
-        // Create executor registry for scheduler mode (will be None for non-scheduler)
-        let scheduler_executor_registry: Option<Arc<cluster::ExecutorRegistry>> = if matches!(
-            self.df.cluster_config.effective_role(),
-            Some(ClusterRole::Scheduler)
-        ) {
-            Some(Arc::new(cluster::ExecutorRegistry::new()))
-        } else {
-            None
-        };
+        // For distributed cluster mode, start the appropriate additional cluster components.
+        // For scheduler, this includes cluster-wide metrics collection.
+        let (maybe_cluster_future, cluster_collector): (
+            Option<BoxedClusterFuture>,
+            Option<Arc<metrics_server::cluster::ClusterMetricsCollector>>,
+        ) = match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                executor_registry,
+                peers,
+                ..
+            }) => {
+                let fut = cluster::initialize_cluster_scheduler_future(
+                    &self,
+                    Arc::clone(executor_registry),
+                    Arc::clone(peers),
+                )
+                .await?;
 
-        let maybe_cluster_future: Option<BoxedClusterFuture> = match self
-            .df
-            .cluster_config
-            .effective_role()
-        {
-            Some(ClusterRole::Scheduler) => {
-                cluster::initialize_cluster_scheduler(&self).await?;
-                // Start internal cluster server for scheduler on separate port
-                let internal_server_shutdown = CancellationToken::new();
-                let self_ref = Arc::clone(&self);
-                let cloned_shutdown = internal_server_shutdown.clone();
-                let executor_registry = Arc::clone(
-                    scheduler_executor_registry
-                        .as_ref()
-                        .context(MissingSchedulerExecutorRegistrySnafu)?,
-                );
-                let internal_server_fut = async move {
-                    cluster::start_internal_cluster_server(
-                        Arc::clone(&self_ref),
-                        Some(cloned_shutdown),
-                        executor_registry,
-                    )
-                    .await
-                    .context(UnableToStartClusterServerSnafu)
-                };
-                let self_for_task = Arc::clone(&self);
-                let internal_server_future = self_for_task
-                    .start_runtime_task(
-                        CLUSTER_INTERNAL_SERVER,
-                        Some(internal_server_shutdown),
-                        internal_server_fut,
-                    )
-                    .await;
-
-                let scheduler_registry_future = {
-                    let app = self.app.read().await;
-                    let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
-                    if let Some(config) = config {
-                        let registry_shutdown = CancellationToken::new();
-                        let registry_shutdown_for_task = registry_shutdown.clone();
-                        let peers = self.scheduler_peers();
-                        let self_ref = Arc::clone(&self);
-                        let registry_task = async move {
-                            cluster::start_scheduler_registry(
-                                self_ref,
-                                &config,
-                                registry_shutdown.clone(),
-                                peers,
-                            )
-                            .await
-                            .map_err(|err| {
-                                Error::FailedToRegisterScheduler {
-                                    source: Box::new(err),
-                                }
-                            })
-                        };
-                        Some(
-                            self_for_task
-                                .start_runtime_task(
-                                    CLUSTER_SCHEDULER_REGISTRY,
-                                    Some(registry_shutdown_for_task),
-                                    registry_task,
-                                )
-                                .await,
-                        )
-                    } else {
-                        None
-                    }
-                };
-
-                let cluster_future = async move {
-                    if let Some(registry_future) = scheduler_registry_future {
-                        tokio::try_join!(internal_server_future, registry_future).map(|_| ())
-                    } else {
-                        internal_server_future.await
-                    }
-                };
-
-                Some(Box::pin(cluster_future))
+                // Create local metrics collector closure that uses MetricsReader
+                let metrics_reader_for_collector = self.metrics_reader.clone();
+                let local_metrics_collector: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
+                    Arc::new(move || {
+                        metrics_reader_for_collector
+                            .as_ref()
+                            .map(metrics_reader::MetricsReader::collect_otlp)
+                            .unwrap_or_default()
+                    });
+                (
+                    fut,
+                    Some(Arc::new(
+                        metrics_server::cluster::ClusterMetricsCollector::new(
+                            Arc::clone(peers),
+                            Arc::clone(executor_registry),
+                            self.df.cluster_config.client_tls_config().cloned(),
+                            self.df.cluster_config.node_id(),
+                            local_metrics_collector,
+                        ),
+                    )),
+                )
             }
-            Some(ClusterRole::Executor) => {
+            Some(DistributedNode::Executor) => {
                 let executor_shutdown = CancellationToken::new();
                 let executor_fut = cluster::initialize_cluster_executor(
                     Arc::clone(&self),
@@ -819,13 +793,20 @@ impl Runtime {
                 )
                 .await?;
                 let self_ref = Arc::clone(&self);
-                Some(Box::pin(
-                    self_ref
-                        .start_runtime_task(CLUSTER_EXECUTOR, Some(executor_shutdown), executor_fut)
-                        .await,
-                ))
+                (
+                    Some(Box::pin(
+                        self_ref
+                            .start_runtime_task(
+                                CLUSTER_EXECUTOR,
+                                Some(executor_shutdown),
+                                executor_fut,
+                            )
+                            .await,
+                    )),
+                    None,
+                )
             }
-            _ => None,
+            None => (None, None),
         };
 
         if self.df.cluster_config.effective_role().is_some() {
@@ -882,7 +863,8 @@ impl Runtime {
                 )
             };
 
-        // If this is an executor, we only need the shutdown signal, flight server, and health endpoint
+        // If this is an executor, we only need the shutdown signal, flight server, and health endpoint.
+        // Early exit to avoid starting unneeded servers: http server, metrics server, pods watcher, etc.
         if matches!(
             self.df.cluster_config.effective_role(),
             Some(ClusterRole::Executor)
@@ -897,12 +879,11 @@ impl Runtime {
 
             // Start health-only HTTP server for executor
             let http_shutdown = CancellationToken::new();
-            let http_bind_address = config.http_bind_address;
             let health_http_future = self
                 .start_runtime_task(
                     HTTP_SERVER,
                     Some(http_shutdown.clone()),
-                    http::start_health_only(http_bind_address, Some(http_shutdown))
+                    http::start_health_only(config.http_bind_address, Some(http_shutdown))
                         .map_err(Error::from),
                 )
                 .await;
@@ -943,46 +924,6 @@ impl Runtime {
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
-
-        // Create ClusterMetricsCollector for scheduler mode
-        let cluster_collector: Option<Arc<metrics_server::cluster::ClusterMetricsCollector>> =
-            if let Some(ref executor_registry) = scheduler_executor_registry {
-                // Get the node's advertise address for node identification
-                let node_id = self
-                    .df
-                    .cluster_config
-                    .scheduler_url_string()
-                    .map(str::to_string)
-                    .or_else(|| {
-                        self.df
-                            .cluster_config
-                            .node_advertise_address()
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| self.df.cluster_config.node_bind_address().to_string());
-
-                // Create local metrics collector closure that uses MetricsReader
-                let metrics_reader_for_collector = self.metrics_reader.clone();
-                let local_metrics_collector: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
-                    Arc::new(move || {
-                        metrics_reader_for_collector
-                            .as_ref()
-                            .map(metrics_reader::MetricsReader::collect_otlp)
-                            .unwrap_or_default()
-                    });
-
-                Some(Arc::new(
-                    metrics_server::cluster::ClusterMetricsCollector::new(
-                        self.scheduler_peers(),
-                        Arc::clone(executor_registry),
-                        self.df.cluster_config.client_tls_config().cloned(),
-                        node_id,
-                        local_metrics_collector,
-                    ),
-                ))
-            } else {
-                None
-            };
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {

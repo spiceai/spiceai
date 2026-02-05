@@ -108,7 +108,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-type FlightSqlClient = FlightSqlServiceClient<CookieService<Channel>>;
+pub type FlightSqlClient = FlightSqlServiceClient<CookieService<Channel>>;
 
 #[derive(Debug, Clone)]
 pub struct FlightSQLFactory {

@@ -19,7 +19,9 @@ pub(crate) mod s3;
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use regex::Regex;
 
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
@@ -95,6 +97,15 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Regex pattern for partition values that are not supported on local filesystem.
+/// Partition values matching `.*#\d+` (e.g., "abcdef#123") are only supported on S3 Express
+/// One Zone locations, not on local filesystem paths.
+static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| match Regex::new(r".*#\d+$") {
+        Ok(compiled) => compiled,
+        Err(e) => unreachable!("Unable to compile regexp: {e}"),
+    });
 
 /// Check if a data type is supported by Vortex natively
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
@@ -1337,13 +1348,6 @@ impl PartitionCreator for CayennePartitionCreator {
         let partition_dir = self.partition_dir(&partition_values)?;
         let partition_path = partition_dir.to_string_lossy().to_string();
 
-        tracing::debug!("creating Cayenne partition at {partition_path}");
-
-        // Create the partition directory (including nested directories for composite partitions)
-        std::fs::create_dir_all(&partition_dir)
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
         // Encode partition values as strings for metadata storage
         let partition_value_strings: Vec<String> = partition_values
             .iter()
@@ -1351,6 +1355,32 @@ impl PartitionCreator for CayennePartitionCreator {
             .collect::<Result<Vec<_>, _>>()
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
+
+        // Validate partition values for local filesystem compatibility.
+        // Partition values matching the pattern `.*#\d+` (e.g., "abcdef#123") are not supported
+        // on local filesystem paths but are supported on remote Object Store locations.
+        if self.object_store_config.is_none() {
+            for value in &partition_value_strings {
+                if UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(value) {
+                    return Err(creator::Error::CreatePartition {
+                        source: format!(
+                            "Partition value '{value}' is not supported for local filesystem locations. \
+                            Values matching the pattern '*#<digits>' (e.g., 'abcdef#123') are only supported \
+                            for S3 Express One Zone locations."
+                        )
+                        .into(),
+                    });
+                }
+            }
+        }
+
+        tracing::debug!("creating Cayenne partition at {partition_path}");
+
+        // Create the partition directory (including nested directories for composite partitions)
+        std::fs::create_dir_all(&partition_dir)
+            .boxed()
+            .context(creator::CreatePartitionSnafu)?;
+
         let partition_column_names = self.partition_column_labels();
 
         // Create composite key for table naming (slash-separated values)
@@ -1690,6 +1720,72 @@ mod tests {
         assert_eq!(
             CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
             "/persistent/data/metadata"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_local_partition_pattern() {
+        // Pattern should match values ending with `#<digits>` (e.g., "abcdef#123")
+        // These are only supported on S3 Express One Zone, not local filesystem.
+
+        // Values that should match (unsupported on local filesystem)
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abcdef#123"),
+            "Expected 'abcdef#123' to match unsupported pattern"
+        );
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#1"),
+            "Expected 'test#1' to match unsupported pattern"
+        );
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("some_value#999999"),
+            "Expected 'some_value#999999' to match unsupported pattern"
+        );
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("#0"),
+            "Expected '#0' to match unsupported pattern"
+        );
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("a#1"),
+            "Expected 'a#1' to match unsupported pattern"
+        );
+
+        // Values that should NOT match (supported on local filesystem)
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abcdef"),
+            "Expected 'abcdef' to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test_123"),
+            "Expected 'test_123' to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("2024-01-01"),
+            "Expected '2024-01-01' to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("partition_value"),
+            "Expected 'partition_value' to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("123"),
+            "Expected '123' (pure digits) to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abc#def"),
+            "Expected 'abc#def' (# not followed by only digits) to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#"),
+            "Expected 'test#' (# with no digits) to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#abc"),
+            "Expected 'test#abc' (# followed by non-digits) to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#123abc"),
+            "Expected 'test#123abc' (digits followed by non-digits) to not match unsupported pattern"
         );
     }
 }
