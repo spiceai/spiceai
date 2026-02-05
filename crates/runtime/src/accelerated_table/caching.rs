@@ -422,7 +422,6 @@ fn as_timestamp_nanosecond_array(array: &ArrayRef) -> DataFusionResult<ArrayRef>
         DataFusionError::Execution(format!("Failed to cast timestamp to nanoseconds: {e}"))
     })
 }
-
 const RESPONSE_STATUS_COLUMN: &str = "response_status";
 
 /// Helper functions for cache refresh operations
@@ -1281,7 +1280,8 @@ impl CacheRefreshHelper {
                 // Return ALL data to user (including 5xx responses)
                 let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
                 let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                Box::pin(adapter)
+                let stream: SendableRecordBatchStream = Box::pin(adapter);
+                stream
             }
             Ok(_) => {
                 // Source returned empty data (no error, just no rows)
@@ -1291,7 +1291,8 @@ impl CacheRefreshHelper {
                 );
                 let empty_stream =
                     RecordBatchStreamAdapter::new(fallback_schema, futures::stream::empty());
-                Box::pin(empty_stream)
+                let stream: SendableRecordBatchStream = Box::pin(empty_stream);
+                stream
             }
             Err(e) => {
                 // Check if we should serve stale (expired) data on error
@@ -1307,7 +1308,8 @@ impl CacheRefreshHelper {
                     let batch_schema = batches[0].schema();
                     let batch_stream = futures::stream::iter(batches.into_iter().map(Ok));
                     let adapter = RecordBatchStreamAdapter::new(batch_schema, batch_stream);
-                    return Box::pin(adapter);
+                    let stream: SendableRecordBatchStream = Box::pin(adapter);
+                    return stream;
                 }
 
                 tracing::error!(
@@ -1319,7 +1321,8 @@ impl CacheRefreshHelper {
                     fallback_schema,
                     futures::stream::once(async move { Err(e) }),
                 );
-                Box::pin(error_stream)
+                let stream: SendableRecordBatchStream = Box::pin(error_stream);
+                stream
             }
         }
     }
