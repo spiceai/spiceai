@@ -1250,19 +1250,22 @@ fn transform_spicepod(
                 // engine: "cayenne" -> set cayenne_file_path
                 let engine = accel.engine.as_deref();
 
-                std::fs::create_dir_all(format!("/tmp/benchmarks/{run_id}")).expect("Failed to create benchmark directory");
+                std::fs::create_dir_all(format!("/tmp/benchmarks/{run_id}"))
+                    .expect("Failed to create benchmark directory");
 
                 match engine {
                     None | Some("duckdb") => {
-                        let duckdb_file =
-                            format!("/tmp/benchmarks/{run_id}/{config_name}_{dataset_name}_{phase_suffix}.db");
+                        let duckdb_file = format!(
+                            "/tmp/benchmarks/{run_id}/{config_name}_{dataset_name}_{phase_suffix}.db"
+                        );
                         params
                             .data
                             .insert("duckdb_file".to_string(), ParamValue::String(duckdb_file));
                     }
                     Some("cayenne") => {
-                        let cayenne_dir =
-                            format!("/tmp/benchmarks/{run_id}/{config_name}_{dataset_name}_{phase_suffix}_cayenne/");
+                        let cayenne_dir = format!(
+                            "/tmp/benchmarks/{run_id}/{config_name}_{dataset_name}_{phase_suffix}_cayenne/"
+                        );
                         params.data.insert(
                             "cayenne_file_path".to_string(),
                             ParamValue::String(cayenne_dir),
