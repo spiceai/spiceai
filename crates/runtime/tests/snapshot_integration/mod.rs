@@ -121,7 +121,7 @@ impl SnapshotS3Context {
                 Path::new(filename)
                     .extension()
                     .and_then(std::ffi::OsStr::to_str)
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("duckdb"))
                     && meta
                         .location
                         .as_ref()
