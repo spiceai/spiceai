@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use object_store::UpdateVersion;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -177,6 +178,10 @@ pub struct JobState {
     /// Optional maximum size of results for the job in bytes
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_size: Option<u64>,
+    /// Object store version for conditional writes (e-tag tracking).
+    /// This is not serialized - it's set after reading from object store.
+    #[serde(skip)]
+    pub version: Option<UpdateVersion>,
 }
 
 impl JobState {
@@ -199,6 +204,7 @@ impl JobState {
             expires_at_ms: None,
             timeout_seconds: None,
             maximum_size: None,
+            version: None,
         }
     }
 

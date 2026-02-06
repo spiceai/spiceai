@@ -1,4 +1,5 @@
----source: crates/runtime/tests/search/mod.rs
+---
+source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 ---
 {
@@ -38,7 +39,7 @@ expression: normalize_search_response(resp)
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%\u201310% of patients."
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
         ],
         "question": [
           "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"

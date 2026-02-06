@@ -26,22 +26,34 @@ use std::sync::Arc;
 
 use app::App;
 use arrow::array::RecordBatch;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
-use ballista_core::serde::protobuf::ExecutorStoppedParams;
-use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpc;
-use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
-use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::sqlparser::parser::Parser;
+use data_components::flightsql::FlightSqlClient;
+
+use datafusion::sql::{
+    TableReference,
+    sqlparser::{
+        ast::{Ident, ObjectNamePart, visit_relations_mut},
+        dialect::PostgreSqlDialect,
+        parser::Parser,
+    },
+};
+
+use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
+
+use flight_client::cookie::{CookieService, CookieStore};
+use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
-use runtime_proto::cluster_service_server::ClusterService;
-use runtime_proto::executor_control_message::Message as ExecutorMessage;
-use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
-    ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
-    GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
-    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand,
-    SchedulerControlMessage, SchedulerInstance,
+    AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, ExecutorControlMessage,
+    ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
+    GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest, GetSchedulersResponse,
+    GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand, SchedulerControlMessage,
+    SchedulerInstance, StringArray, cluster_service_server::ClusterService,
+    executor_control_message::Message as ExecutorMessage,
+    scheduler_control_message::Message as SchedulerMessage,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -51,7 +63,8 @@ use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, Response, Status, Streaming};
+
+use tonic::{Request, Response, Status, Streaming, transport::Endpoint};
 
 use crate::cluster::SchedulerPeers;
 use crate::cluster::executor_registry::ExecutorRegistry;
@@ -529,6 +542,78 @@ impl ClusterService for ClusterServiceImpl {
 
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn allocate_initial_partitions(
+        &self,
+        request: Request<AllocateInitialPartitionsRequest>,
+    ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
+        let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
+
+        match create_executor_flight_client(&executor_id) {
+            Ok(client) => {
+                let mut flight_client_registry =
+                    self.executor_registry.flight_sql_clients.write().await;
+                flight_client_registry.insert(executor_id.clone(), client);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to create Flight SQL client for executor {executor_id}: {e}"
+                );
+            }
+        }
+
+        let table_partitions: HashMap<TableReference, StringArray> = (*self.app.read().await)
+            .as_ref()
+            .map(|app| {
+                app.datasets
+                    .iter()
+                    .map(|ds| {
+                        (
+                            TableReference::parse_str(&ds.name),
+                            StringArray { items: vec![] },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut executor_partitions = self.executor_registry.partitions.write().await;
+        executor_partitions.insert(
+            executor_id.clone(),
+            table_partitions
+                .keys()
+                .map(|tbl| (tbl.clone(), vec![]))
+                .collect(),
+        );
+
+        Ok(Response::new(AllocateInitialPartitionsResponse {
+            table_partitions: table_partitions
+                .into_iter()
+                .map(|(tbl, x)| (tbl.to_string(), x))
+                .collect(),
+        }))
+    }
+}
+
+fn create_executor_flight_client(
+    endpoint: &str,
+) -> Result<FlightSqlClient, tonic::transport::Error> {
+    let executor_address = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+
+    // TODO support for mTLS certificates per executor.
+    let flight_channel = Endpoint::from_shared(executor_address)?.connect_lazy();
+
+    Ok(FlightSqlServiceClient::new_from_inner(
+        FlightServiceClient::new(CookieService::new(
+            flight_channel,
+            Arc::new(CookieStore::new()),
+        ))
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
+    ))
 }
 
 /// Handles an executor control message (heartbeat, shutdown, etc.)

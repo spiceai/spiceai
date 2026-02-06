@@ -15,3 +15,6 @@ limitations under the License.
 */
 pub mod duplicate_plan_node;
 pub use duplicate_plan_node::*;
+
+pub mod partitioned_table_scan_rewrite;
+pub use partitioned_table_scan_rewrite::*;
