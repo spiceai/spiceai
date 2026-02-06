@@ -287,6 +287,9 @@ pub(crate) fn temporality_to_i32(temporality: opentelemetry_sdk::metrics::Tempor
     match temporality {
         opentelemetry_sdk::metrics::Temporality::Delta => 1,
         opentelemetry_sdk::metrics::Temporality::Cumulative => 2,
-        _ => panic!("Invalid temporality"),
+        _ => {
+            tracing::warn!("Unknown temporality variant, using UNSPECIFIED (0)");
+            0 // AGGREGATION_TEMPORALITY_UNSPECIFIED
+        }
     }
 }

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use opentelemetry::metrics::Meter;
+use opentelemetry::metrics::{Meter, MeterProvider};
 
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::reader::MetricReader;
@@ -33,7 +33,8 @@ use opentelemetry_sdk::{
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use secrecy::SecretString;
 use telemetry::exporter::TelemetryExporterBuilder;
-pub use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
+pub use telemetry::meter::METER_PROVIDER_ONCE;
+use telemetry::noop::NoopMeterProvider;
 use telemetry::reader::InitialReader;
 
 const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
@@ -44,7 +45,19 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
         .into()
 });
 
-pub static METER: LazyLock<Meter> = LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
+/// The global meter for benchmark telemetry.
+///
+/// Resolves from `METER_PROVIDER_ONCE` if set, otherwise falls back to a noop meter.
+/// The testoperator is a sequential CLI tool, so the `LazyLock` resolution race
+/// that affects the concurrent runtime does not apply here.
+pub static METER: LazyLock<Meter> = LazyLock::new(|| {
+    METER_PROVIDER_ONCE
+        .get()
+        .map_or_else(
+            || NoopMeterProvider::new().meter("benchmarks_telemetry"),
+            |p| p.meter("benchmarks_telemetry"),
+        )
+});
 
 #[derive(Debug, Clone)]
 pub struct OtlpExporterConfig {
@@ -88,7 +101,8 @@ impl Telemetry {
             .with_reader(reader.clone())
             .build();
 
-        let setup = METER_PROVIDER_ONCE.set(Arc::new(provider)).is_ok();
+        let provider: Arc<dyn MeterProvider + Send + Sync> = Arc::new(provider);
+        let setup = METER_PROVIDER_ONCE.set(Arc::clone(&provider)).is_ok();
         if !setup {
             println!("Telemetry disabled");
         }
@@ -124,7 +138,8 @@ impl Telemetry {
             .with_reader(reader.clone())
             .build();
 
-        let setup = METER_PROVIDER_ONCE.set(Arc::new(provider)).is_ok();
+        let provider: Arc<dyn MeterProvider + Send + Sync> = Arc::new(provider);
+        let setup = METER_PROVIDER_ONCE.set(Arc::clone(&provider)).is_ok();
         if !setup {
             println!("Telemetry disabled");
         }

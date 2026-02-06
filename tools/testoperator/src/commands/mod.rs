@@ -135,8 +135,7 @@ pub(crate) async fn get_app_and_start_request(
     args: &CommonArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
     if !args.metrics {
-        // call the meter to set telemetry to no-op, because the OnceLock hasn't been set yet
-        test_framework::telemetry::METER_PROVIDER.meter("benchmarks_telemetry");
+        // METER is OnceLock-based: when left uninitialized, all metric ops are no-ops.
     }
 
     let mut spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;

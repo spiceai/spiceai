@@ -104,11 +104,9 @@ impl DataNumberBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                if cfg!(feature = "dev") {
-                    panic!("Could not convert number: {e}")
-                } else {
-                    None
-                }
+                debug_assert!(false, "Could not convert number: {e}");
+                tracing::error!("Could not convert number: {e}");
+                None
             }
         }
     }
@@ -172,11 +170,9 @@ impl DataHistogramBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                if cfg!(feature = "dev") {
-                    panic!("Could not convert histogram data: {e}")
-                } else {
-                    None
-                }
+                debug_assert!(false, "Could not convert histogram data: {e}");
+                tracing::error!("Could not convert histogram data: {e}");
+                None
             }
         }
     }
@@ -216,11 +212,9 @@ impl ResourceBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                if cfg!(feature = "dev") {
-                    panic!("Could not convert resource: {e}")
-                } else {
-                    None
-                }
+                debug_assert!(false, "Could not convert resource: {e}");
+                tracing::error!("Could not convert resource: {e}");
+                None
             }
         }
     }
@@ -263,11 +257,9 @@ impl ScopeBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                if cfg!(feature = "dev") {
-                    panic!("Could not convert scope: {e}")
-                } else {
-                    None
-                }
+                debug_assert!(false, "Could not convert scope: {e}");
+                tracing::error!("Could not convert scope: {e}");
+                None
             }
         }
     }
@@ -311,11 +303,12 @@ impl AttributesBuilder {
         self.null_buffer_builder.append(is_valid);
     }
 
-    #[expect(clippy::cast_possible_wrap)]
-    #[expect(clippy::cast_possible_truncation)]
     fn append(&mut self, is_valid: bool) {
-        self.list_offsets_builder
-            .append(self.key_builder.len() as i32);
+        let offset = i32::try_from(self.key_builder.len()).unwrap_or_else(|_| {
+            tracing::warn!("Attribute count exceeds i32::MAX, clamping offset");
+            i32::MAX
+        });
+        self.list_offsets_builder.append(offset);
         self.list_null_buffer_builder.append(is_valid);
     }
 
@@ -337,11 +330,9 @@ impl AttributesBuilder {
         ) {
             Ok(array) => array,
             Err(e) => {
-                if cfg!(feature = "dev") {
-                    panic!("Could not convert attributes: {e}")
-                } else {
-                    return None;
-                }
+                debug_assert!(false, "Could not convert attributes: {e}");
+                tracing::error!("Could not convert attributes: {e}");
+                return None;
             }
         };
 
@@ -358,11 +349,9 @@ impl AttributesBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                if cfg!(feature = "dev") {
-                    panic!("Could not convert attributes: {e}")
-                } else {
-                    None
-                }
+                debug_assert!(false, "Could not convert attributes: {e}");
+                tracing::error!("Could not convert attributes: {e}");
+                None
             }
         }
     }
@@ -791,6 +780,8 @@ impl AppendFloat64 for f64 {
 }
 
 impl AppendFloat64 for i64 {
+    /// Note: Precision loss is possible for values with magnitude > 2^53.
+    /// This is inherent to the f64 representation used by the `OTel` histogram schema.
     #[expect(clippy::cast_precision_loss)]
     fn append(&self, builder: &mut Float64Builder) {
         builder.append_value(*self as f64);
@@ -798,6 +789,8 @@ impl AppendFloat64 for i64 {
 }
 
 impl AppendFloat64 for u64 {
+    /// Note: Precision loss is possible for values > 2^53.
+    /// This is inherent to the f64 representation used by the `OTel` histogram schema.
     #[expect(clippy::cast_precision_loss)]
     fn append(&self, builder: &mut Float64Builder) {
         builder.append_value(*self as f64);
@@ -809,9 +802,12 @@ trait AppendDataNumber {
 }
 
 impl AppendDataNumber for u64 {
-    #[expect(clippy::cast_possible_wrap)]
     fn append(&self, builder: &mut DataNumberBuilder) {
-        builder.int_builder.append_value(*self as i64);
+        let value = i64::try_from(*self).unwrap_or_else(|_| {
+            tracing::warn!("u64 metric value {} exceeds i64::MAX, clamping", self);
+            i64::MAX
+        });
+        builder.int_builder.append_value(value);
         builder.double_builder.append_null();
 
         builder.append(true);
@@ -836,10 +832,14 @@ impl AppendDataNumber for f64 {
     }
 }
 
-#[expect(clippy::cast_possible_truncation)]
 fn system_time_to_nanos(time: SystemTime) -> i64 {
     let Ok(duration) = time.duration_since(UNIX_EPOCH) else {
-        panic!("SystemTime before UNIX EPOCH!");
+        tracing::warn!("SystemTime before UNIX EPOCH, using 0");
+        return 0;
     };
-    duration.as_nanos() as i64
+    let nanos = duration.as_nanos();
+    i64::try_from(nanos).unwrap_or_else(|_| {
+        tracing::warn!("SystemTime nanoseconds {nanos} exceeds i64::MAX, clamping");
+        i64::MAX
+    })
 }
