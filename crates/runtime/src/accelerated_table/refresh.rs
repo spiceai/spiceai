@@ -719,6 +719,7 @@ impl Refresher {
                             Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
+                            Some(Arc::clone(&self.accelerator)),
                         ),
                         None,
                     ),
@@ -734,6 +735,7 @@ impl Refresher {
                             Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
+                            Some(Arc::clone(&self.accelerator)),
                         ),
                     ),
                 };
@@ -789,6 +791,7 @@ impl Refresher {
 
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
         let last_updated_at = Arc::clone(&self.last_updated_at);
+        let accelerator = Arc::clone(&self.accelerator);
 
         let synchronize_with = self.synchronize_with.clone();
 
@@ -810,6 +813,7 @@ impl Refresher {
                         Arc::clone(&self.runtime_status),
                         self.bootstrap_status.clone(),
                         Arc::clone(&self.last_updated_at),
+                        Some(Arc::clone(&self.accelerator)),
                     ),
                     false,
                 ),
@@ -836,6 +840,7 @@ impl Refresher {
                 let accelerator_write_mutex_clone = Arc::clone(&self.accelerator_write_mutex);
                 let dataset_name_clone = dataset_name.clone();
                 let last_updated_at_clone = Arc::clone(&self.last_updated_at);
+                let accelerator_clone = Arc::clone(&self.accelerator);
 
                 tokio::spawn(async move {
                     runtime_status_clone.wait_for_ready().await;
@@ -848,6 +853,7 @@ impl Refresher {
                             &dataset_name_clone,
                             &last_updated_at_clone,
                             ForceCreate(true),
+                            Some(&accelerator_clone),
                         )
                         .await;
                     }
@@ -927,6 +933,7 @@ impl Refresher {
                                     &dataset_name,
                                     &last_updated_at,
                                     ForceCreate(false),
+                                    Some(&accelerator),
                                 ).await;
                             }
                         }

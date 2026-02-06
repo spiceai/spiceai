@@ -297,7 +297,6 @@ impl JobExecutor {
     /// Converts a `QueryHandleError` to an error code string and message.
     fn handle_error_to_code_and_msg(e: &QueryHandleError) -> (JobErrorCode, String) {
         match e {
-            QueryHandleError::JobTimeout { .. } => (JobErrorCode::Timeout, e.to_string()),
             QueryHandleError::JobCancelled => (JobErrorCode::Cancelled, e.to_string()),
             QueryHandleError::JobFailed { message } => {
                 (JobErrorCode::ExecutionFailed, message.clone())
