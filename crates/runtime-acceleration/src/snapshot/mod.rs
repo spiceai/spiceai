@@ -4181,6 +4181,13 @@ mod tests {
 
         write_metadata(&store, &metadata_path, &metadata).await;
 
+        // Create the actual snapshot file so it passes the existence check
+        let snapshot_path = Path::from("snapshots/test_snapshot.db");
+        store
+            .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
+            .await
+            .expect("write snapshot file");
+
         let manager = build_manager_for_api_tests(Arc::clone(&store));
         let summary = manager
             .get_snapshot_summary()
@@ -4354,6 +4361,22 @@ mod tests {
         };
 
         write_metadata(&store, &metadata_path, &metadata).await;
+
+        // Create the actual snapshot files so they pass the existence check
+        store
+            .put(
+                &Path::from("snapshots/snapshot1.db"),
+                Bytes::from_static(b"snapshot data 1").into(),
+            )
+            .await
+            .expect("write snapshot file 1");
+        store
+            .put(
+                &Path::from("snapshots/snapshot2.db"),
+                Bytes::from_static(b"snapshot data 2").into(),
+            )
+            .await
+            .expect("write snapshot file 2");
 
         let manager = build_manager_for_api_tests(Arc::clone(&store));
 
