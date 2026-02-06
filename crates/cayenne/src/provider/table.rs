@@ -20,7 +20,8 @@ limitations under the License.
 //! `DataFusion`'s `TableProvider` trait for Cayenne tables.
 
 use super::constants::{
-    DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED,
+    COMPACTION_DELETED_ROWS_THRESHOLD, DEFAULT_DATA_FILE_ID, DELETION_CACHE_LOCK_POISONED,
+    LISTING_TABLE_LOCK_POISONED,
 };
 use super::delete::{
     is_pk_visible_i64, is_pk_visible_row_key, CayenneDeletionSink, DeletionIdentifier,
@@ -1218,6 +1219,9 @@ impl CayenneTableProvider {
             self.apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
                 .await?;
 
+            // Check if streaming compaction should be triggered after the insert
+            self.maybe_compact().await;
+
             return Ok(total_rows);
         }
 
@@ -1310,6 +1314,9 @@ impl CayenneTableProvider {
         // happens after all parallel chunk writes are complete and no other insert
         // can interfere.
         self.refresh_listing_table()?;
+
+        // Check if streaming compaction should be triggered after the insert
+        self.maybe_compact().await;
 
         // Write lock is released here, allowing the next insert to proceed
         Ok(total_rows)
@@ -1503,9 +1510,11 @@ impl CayenneTableProvider {
                 write_tasks.spawn(async move {
                     let result = self_clone.write_chunk(chunk_to_write).await;
 
+                    // Always track bytes for compaction threshold detection
+                    total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
+
                     // Track progress for S3 uploads
                     if is_s3 {
-                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
                         let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
 
                         // Log progress every 10 seconds or when a file completes
@@ -1565,9 +1574,11 @@ impl CayenneTableProvider {
             write_tasks.spawn(async move {
                 let result = self_clone.write_chunk(current_chunk).await;
 
+                // Always track bytes for compaction threshold detection
+                total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
+
                 // Track final chunk for S3 uploads
                 if is_s3 {
-                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
                     files_count.fetch_add(1, Ordering::Relaxed);
                 }
 
@@ -1734,8 +1745,10 @@ impl CayenneTableProvider {
                         Self::write_chunk_to_listing_table(&listing_table_clone, chunk_to_write)
                             .await;
 
+                    // Always track bytes for compaction threshold detection
+                    total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
+
                     if is_s3 {
-                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
                         let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
 
                         let elapsed = start.elapsed();
@@ -1794,8 +1807,10 @@ impl CayenneTableProvider {
                 let result =
                     Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk).await;
 
+                // Always track bytes for compaction threshold detection
+                total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
+
                 if is_s3 {
-                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
                     files_count.fetch_add(1, Ordering::Relaxed);
                 }
 
@@ -3440,6 +3455,211 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Returns the total count of pending deleted rows across all deletion caches.
+    ///
+    /// Each deletion strategy uses a different cache:
+    /// - `PositionBased`: Sums the cardinality of all `RoaringBitmap` entries in `cached_deleted_row_ids`
+    /// - `Int64Pk`: Returns the entry count in `cached_deleted_pk_i64`
+    /// - `RowConverterBased`: Returns the entry count in `cached_deleted_row_keys`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deletion cache lock is poisoned.
+    pub fn deleted_rows_count(&self) -> CatalogResult<u64> {
+        match self.pk_deletion_strategy {
+            PkDeletionStrategy::PositionBased => {
+                let guard =
+                    self.cached_deleted_row_ids
+                        .read()
+                        .map_err(|_| CatalogError::LockPoisoned {
+                            operation: "count position-based deleted rows".to_string(),
+                        })?;
+                Ok(guard.values().map(RoaringBitmap::len).sum())
+            }
+            PkDeletionStrategy::Int64Pk => {
+                let guard =
+                    self.cached_deleted_pk_i64
+                        .read()
+                        .map_err(|_| CatalogError::LockPoisoned {
+                            operation: "count Int64 PK deleted rows".to_string(),
+                        })?;
+                Ok(u64::try_from(guard.len()).unwrap_or(u64::MAX))
+            }
+            PkDeletionStrategy::RowConverterBased => {
+                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                    CatalogError::LockPoisoned {
+                        operation: "count key-based deleted rows".to_string(),
+                    }
+                })?;
+                Ok(u64::try_from(guard.len()).unwrap_or(u64::MAX))
+            }
+        }
+    }
+
+    /// Determines whether streaming compaction should be triggered.
+    ///
+    /// Compaction is triggered when the total count of pending deleted rows exceeds
+    /// [`COMPACTION_DELETED_ROWS_THRESHOLD`]. Accumulated deletions progressively degrade
+    /// scan performance and increase memory usage, so compacting them away is essential.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deletion cache locks are poisoned.
+    pub fn should_compact(&self) -> CatalogResult<bool> {
+        let deleted_count = self.deleted_rows_count()?;
+        Ok(deleted_count >= COMPACTION_DELETED_ROWS_THRESHOLD)
+    }
+
+    /// Check if streaming compaction should be triggered and run it if so.
+    ///
+    /// This is a best-effort operation: compaction failures are logged as warnings
+    /// but do not fail the calling operation (insert or delete). This ensures that
+    /// data writes remain reliable even if compaction encounters transient issues.
+    ///
+    /// ## Caller Requirements
+    ///
+    /// The caller **must** hold `write_lock` before invoking this method.
+    async fn maybe_compact(&self) {
+        match self.should_compact() {
+            Ok(true) => {
+                if let Err(e) = self.streaming_compact().await {
+                    tracing::warn!(
+                        "Streaming compaction failed for table {}: {e}",
+                        self.table_metadata.table_name,
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to check compaction threshold for table {}: {e}",
+                    self.table_metadata.table_name,
+                );
+            }
+        }
+    }
+
+    /// Perform streaming compaction of the table data.
+    ///
+    /// This replaces the current snapshot with a new one that has all pending deletions
+    /// applied, compacting the data on disk without loading all data into memory at once.
+    ///
+    /// ## Steps
+    ///
+    /// 1. Generate a new snapshot ID
+    /// 2. Scan all current data through the `CayenneTableProvider::scan()` method, which
+    ///    automatically applies deletion filters (position-based, Int64 PK, or RowConverter-based)
+    ///    and includes protected snapshot data via UNION
+    /// 3. Optionally sort the stream if sort columns are configured
+    /// 4. Stream chunks to the new snapshot directory via `chunk_and_write_parallel_to_snapshot`
+    /// 5. Sync to disk for durability (local paths only)
+    /// 6. Atomically commit the compaction to the catalog (updates snapshot + clears delete files)
+    /// 7. Update in-memory state: snapshot ID, listing table, clear deletion caches
+    /// 8. Trigger cleanup of old snapshot directories
+    ///
+    /// ## Memory Bounds
+    ///
+    /// Memory usage is bounded by `target_file_size × upload_concurrency`, the same
+    /// mechanism used by `chunk_and_write_parallel_to_snapshot`. Data is never fully
+    /// materialized in memory.
+    ///
+    /// ## Caller Requirements
+    ///
+    /// The caller **must** hold `write_lock` before invoking this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if scanning, writing, committing, or updating state fails.
+    pub async fn streaming_compact(&self) -> CatalogResult<()> {
+        let deleted_count = self.deleted_rows_count()?;
+
+        tracing::info!(
+            "Starting streaming compaction for table {} ({} pending deleted rows)",
+            self.table_metadata.table_name,
+            deleted_count,
+        );
+
+        // 1. Generate a new snapshot ID
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+
+        // 2. For local paths, ensure the new snapshot directory exists
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::ensure_snapshot_dir_exists(&snapshot_dir)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to create snapshot directory for compaction.".to_string(),
+                    source: Box::new(e),
+                })?;
+        }
+
+        // 3. Scan all current data with deletion filters applied.
+        //    Use a clone of self registered as a table provider so that `scan()` is invoked,
+        //    which handles deletion filtering and protected snapshot unions automatically.
+        let compaction_view = Arc::new(self.clone_for_write());
+        let ctx = self.create_session_context();
+        let df = ctx
+            .read_table(compaction_view)
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to read table for streaming compaction.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to execute stream for streaming compaction.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 4. Optionally sort the stream if sort columns are configured
+        let stream = if self.context.sort_columns().is_empty() {
+            stream
+        } else {
+            self.sort_stream(stream)?
+        };
+
+        // 5. Write to new snapshot via streaming chunked writes (memory-bounded)
+        let target_size = self.context.target_file_size_bytes();
+        let (total_rows, files_written) = self
+            .chunk_and_write_parallel_to_snapshot(stream, target_size, &new_snapshot_id)
+            .await?;
+
+        tracing::info!(
+            "Streaming compaction wrote {} rows in {} file(s) for table {}",
+            total_rows,
+            files_written,
+            self.table_metadata.table_name,
+        );
+
+        // 6. Sync the snapshot directory for durability (local paths only)
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::sync_snapshot_dir(&snapshot_dir).await?;
+        }
+
+        // 7. Atomically commit the compaction to the catalog.
+        //    This updates the snapshot ID and clears all delete files in one atomic operation.
+        self.commit_overwrite(&new_snapshot_id).await?;
+
+        // 8. Update in-memory state
+        self.update_current_snapshot_id(&new_snapshot_id)?;
+        self.clear_all_deletion_caches()?;
+        self.update_listing_table_for_snapshot(&new_snapshot_id)?;
+
+        // 8. Trigger cleanup of old snapshot directories
+        self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
+
+        tracing::info!(
+            "Streaming compaction completed for table {}",
+            self.table_metadata.table_name,
+        );
+
+        Ok(())
+    }
+
     /// Clear all cached deletion vectors and insert records.
     ///
     /// This should be called after compaction operations that have applied all deletions
@@ -3529,7 +3749,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the lock is poisoned.
-    fn get_current_snapshot_id(&self) -> CatalogResult<String> {
+    pub fn get_current_snapshot_id(&self) -> CatalogResult<String> {
         let guard = self
             .current_snapshot_id
             .read()

@@ -36,3 +36,15 @@ pub const DELETION_CACHE_LOCK_POISONED: &str =
 ///
 /// In Cayenne, this represents the single data file in a non-partitioned table.
 pub const DEFAULT_DATA_FILE_ID: i64 = 0;
+
+/// Number of deleted rows that triggers automatic streaming compaction.
+///
+/// When the total number of pending deletions (across all deletion strategies)
+/// exceeds this threshold, a streaming compaction is triggered after the next
+/// insert or delete operation. This applies the deletion vectors to produce
+/// clean data files, freeing memory used by the in-memory deletion caches.
+///
+/// Set to 50,000 as a balance between:
+/// - Avoiding unnecessary compaction for small deletion sets
+/// - Preventing unbounded growth of in-memory deletion vectors
+pub const COMPACTION_DELETED_ROWS_THRESHOLD: u64 = 50_000;

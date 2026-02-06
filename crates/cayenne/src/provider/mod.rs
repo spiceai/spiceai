@@ -53,6 +53,7 @@ pub(crate) mod utils;
 pub(crate) mod vortex_format;
 
 // Re-export the main type at the module level for convenience
+pub use constants::COMPACTION_DELETED_ROWS_THRESHOLD;
 pub use context::CayenneContext;
 pub use scan::CayenneAccelerationExec;
 pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
