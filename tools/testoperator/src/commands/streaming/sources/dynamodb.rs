@@ -1250,6 +1250,7 @@ fn transform_spicepod(
                 // engine: "cayenne" -> set cayenne_file_path
                 let engine = accel.engine.as_deref();
 
+                #[expect(clippy::expect_used)]
                 std::fs::create_dir_all(format!("/tmp/benchmarks/{run_id}"))
                     .expect("Failed to create benchmark directory");
 
