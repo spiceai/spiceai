@@ -11,6 +11,7 @@ runs:
   using: 'composite'
   steps:
     - name: Set sccache environment variables
+      if: inputs.minio_endpoint != ''
       shell: bash
       run: |
         echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
@@ -20,7 +21,7 @@ runs:
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
     - name: Set up sccache (Linux)
-      if: runner.os == 'Linux'
+      if: runner.os == 'Linux' && inputs.minio_endpoint != ''
       shell: bash
       run: |
         sudo apt-get update && sudo apt-get install wget -y
