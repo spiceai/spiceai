@@ -359,7 +359,7 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "50944286d02f23d77fd3bf311ddd101566e2300b" }               # spiceai-51
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "50944286d02f23d77fd3bf311ddd101566e2300b" }                   # spiceai-51
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "801510b2d7e3c168780ad0e6c1c6b35b32baefde" } # spiceai-51
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "330a4d790b892dd6be23b71589ec60b620bf29f5" } # spiceai-51
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "68afffbdb36e056cb5ad0cef0830c6ef6f04e859" }      # spiceai-51
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "68afffbdb36e056cb5ad0cef0830c6ef6f04e859" } # spiceai-51
