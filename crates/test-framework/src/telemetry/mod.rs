@@ -51,12 +51,10 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 /// The testoperator is a sequential CLI tool, so the `LazyLock` resolution race
 /// that affects the concurrent runtime does not apply here.
 pub static METER: LazyLock<Meter> = LazyLock::new(|| {
-    METER_PROVIDER_ONCE
-        .get()
-        .map_or_else(
-            || NoopMeterProvider::new().meter("benchmarks_telemetry"),
-            |p| p.meter("benchmarks_telemetry"),
-        )
+    METER_PROVIDER_ONCE.get().map_or_else(
+        || NoopMeterProvider::new().meter("benchmarks_telemetry"),
+        |p| p.meter("benchmarks_telemetry"),
+    )
 });
 
 #[derive(Debug, Clone)]

@@ -186,10 +186,7 @@ mod tests {
     #[test]
     fn test_usize_to_i64_telemetry_max_i64() {
         let max_i64_as_usize = i64::MAX as usize;
-        assert_eq!(
-            usize_to_i64_telemetry(max_i64_as_usize, "test"),
-            i64::MAX
-        );
+        assert_eq!(usize_to_i64_telemetry(max_i64_as_usize, "test"), i64::MAX);
     }
 
     #[test]
@@ -236,7 +233,11 @@ mod tests {
             .find(|(k, _)| k.as_str() == "service.instance.id")
             .map(|(_, v)| v.to_string())
             .expect("resource should have service.instance.id");
-        assert_eq!(instance_id.len(), 64, "instance_id should be a SHA256 hex string");
+        assert_eq!(
+            instance_id.len(),
+            64,
+            "instance_id should be a SHA256 hex string"
+        );
         assert!(
             instance_id.chars().all(|c| c.is_ascii_hexdigit()),
             "instance_id should contain only hex characters"
@@ -251,7 +252,10 @@ mod tests {
         let mut expected_hasher = Sha256::new();
         expected_hasher.update("test-spicepod");
         let expected_hash = format!("{:x}", expected_hasher.finalize());
-        assert_eq!(spicepod_id, expected_hash, "spicepod_id should be SHA256 of the spicepod name");
+        assert_eq!(
+            spicepod_id, expected_hash,
+            "spicepod_id should be SHA256 of the spicepod name"
+        );
     }
 
     #[tokio::test]
