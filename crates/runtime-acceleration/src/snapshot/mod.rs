@@ -515,7 +515,7 @@ impl AccelerationEngine {
     #[must_use]
     pub fn snapshot_extension(&self) -> &'static str {
         match self {
-            Self::Cayenne => ".cayenne.tar",
+            Self::Cayenne => ".cayenne",
             #[cfg(feature = "duckdb")]
             Self::DuckDB => ".duckdb",
             #[cfg(feature = "sqlite")]
