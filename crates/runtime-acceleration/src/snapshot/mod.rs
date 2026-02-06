@@ -2109,7 +2109,7 @@ impl SnapshotManager {
                         checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
                         size_bytes: entry.snapshot_size,
                         engine: entry.snapshot_engine.clone(),
-                row_count: entry.snapshot_row_count,
+                        row_count: entry.snapshot_row_count,
                         is_current: Some(entry.snapshot_id) == current_snapshot_id,
                     })
                 } else {

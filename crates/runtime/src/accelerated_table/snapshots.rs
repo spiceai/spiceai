@@ -112,10 +112,9 @@ pub fn spawn_snapshot_interval_task(
             // losing snapshots due to potential object storage retention policy.
             // Consider use case: periodic
             ForceCreate(initial_delay.is_zero()),
-                accelerator.as_ref(),
-            )
-            .await;
-
+            accelerator.as_ref(),
+        )
+        .await;
 
         let mut ticker = interval(interval_duration);
         // Consume the first tick which returns immediately per tokio::time::interval behavior
