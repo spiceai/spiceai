@@ -90,7 +90,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
         if let Some(timeout_str) = &self.shutdown_timeout {
-            let duration = fundu::parse_duration(timeout_str)
+            let duration = duration_parse::parse_duration(timeout_str)
                 .map_err(|e| format!("Failed to parse 'shutdown_timeout': {e}"))?;
 
             if duration.is_zero() {
@@ -239,7 +239,7 @@ impl OtelExporterConfig {
     pub fn push_interval_duration(
         &self,
     ) -> Result<std::time::Duration, Box<dyn Error + Send + Sync>> {
-        let duration = fundu::parse_duration(&self.push_interval).map_err(|e| {
+        let duration = duration_parse::parse_duration(&self.push_interval).map_err(|e| {
             format!(
                 "Failed to parse 'push_interval' value '{}': {e}",
                 self.push_interval
@@ -404,7 +404,7 @@ impl TaskHistory {
         value: &str,
         field: &str,
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let duration = fundu::parse_duration(value).map_err(|e| e.to_string())?;
+        let duration = duration_parse::parse_duration(value).map_err(|e| e.to_string())?;
 
         if duration.as_secs() < TASK_HISTORY_RETENTION_MINIMUM {
             return Err(format!(
@@ -434,7 +434,7 @@ impl TaskHistory {
         };
 
         let duration =
-            fundu::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
+            duration_parse::parse_duration(min_sql_duration.as_ref()).map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
@@ -450,7 +450,7 @@ impl TaskHistory {
         };
 
         let duration =
-            fundu::parse_duration(min_plan_duration.as_ref()).map_err(|e| e.to_string())?;
+            duration_parse::parse_duration(min_plan_duration.as_ref()).map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
