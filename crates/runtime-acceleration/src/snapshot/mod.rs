@@ -70,6 +70,8 @@ pub mod api {
         pub location: String,
         pub last_updated_ms: i64,
         #[serde(skip_serializing_if = "Option::is_none")]
+        pub engine: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         pub current_snapshot_id: Option<u64>,
         pub snapshots: Vec<SnapshotInfo>,
     }
@@ -83,6 +85,8 @@ pub mod api {
         pub checksum: String,
         pub checksum_algorithm: String,
         pub size_bytes: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub engine: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub row_count: Option<u64>,
         pub is_current: bool,
@@ -117,6 +121,8 @@ struct SnapshotMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DatasetMetadata {
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engine: Option<String>,
     #[serde(default)]
     schemas: Vec<SchemaMetadata>,
     #[serde(rename = "current-schema-id")]
@@ -149,6 +155,18 @@ struct SnapshotEntry {
     snapshot_checksum_algorithm: String,
     #[serde(rename = "snapshot-size")]
     snapshot_size: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "snapshot-engine"
+    )]
+    snapshot_engine: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "snapshot-row-count"
+    )]
+    snapshot_row_count: Option<u64>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -309,6 +327,14 @@ pub enum SnapshotDownloadError {
     },
     #[snafu(display("Snapshot schema mismatch for dataset {dataset}"))]
     SchemaMismatch { dataset: String },
+    #[snafu(display(
+        "Snapshot engine mismatch for dataset {dataset}. snapshot_engine={snapshot_engine} current_engine={current_engine}"
+    ))]
+    EngineMismatch {
+        dataset: String,
+        snapshot_engine: String,
+        current_engine: String,
+    },
     #[snafu(display("Snapshots are disabled for dataset {dataset}"))]
     SnapshotDisabled { dataset: String },
     #[snafu(display("Failed to extract snapshot archive at {}: {source}", path.display()))]
@@ -479,6 +505,20 @@ pub enum AccelerationEngine {
     Turso,
 }
 
+impl std::fmt::Display for AccelerationEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cayenne => write!(f, "cayenne"),
+            #[cfg(feature = "duckdb")]
+            Self::DuckDB => write!(f, "duckdb"),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite => write!(f, "sqlite"),
+            #[cfg(feature = "turso")]
+            Self::Turso => write!(f, "turso"),
+        }
+    }
+}
+
 /// Manages snapshots for a specific accelerated dataset.
 #[derive(Clone)]
 pub struct SnapshotManager {
@@ -487,6 +527,8 @@ pub struct SnapshotManager {
     snapshot_location_uri: String,
     /// The acceleration layout defining the storage paths for this accelerator.
     layout: AccelerationLayout,
+    /// The acceleration engine type (duckdb, sqlite, cayenne, etc.).
+    engine: AccelerationEngine,
     snapshot_engine: Arc<dyn SnapshotEngine>,
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
@@ -733,6 +775,7 @@ impl SnapshotManager {
             snapshots_location: path,
             snapshot_location_uri,
             layout,
+            engine,
             snapshot_engine,
             object_store: store,
             checkpointer_factory: None,
@@ -816,6 +859,7 @@ impl SnapshotManager {
             snapshots_location: path,
             snapshot_location_uri,
             layout: AccelerationLayout::None,
+            engine: AccelerationEngine::Cayenne,
             snapshot_engine,
             object_store: store,
             checkpointer_factory: None,
@@ -851,6 +895,7 @@ impl SnapshotManager {
     /// * `schema` - The schema of the dataset.
     /// * `lock_guard` - Lock guard protecting accelerator writes during snapshot.
     /// * `last_updated_at` - Optional timestamp (ms since epoch) of the last `insert_into`.
+    /// * `row_count` - Optional number of rows in the accelerated dataset at snapshot time.
     ///
     /// # Returns
     /// * `Ok(Some(path))` - Snapshot was created at the given path.
@@ -865,6 +910,7 @@ impl SnapshotManager {
         schema: &SchemaRef,
         lock_guard: OwnedMutexGuard<()>,
         last_updated_at: Option<i64>,
+        row_count: Option<u64>,
         force_create: ForceCreate,
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
         // If no existing snapshots (in metadata or as actual files), treat as force_create.
@@ -943,6 +989,7 @@ impl SnapshotManager {
             timestamp_ms,
             schema,
             last_updated_at,
+            row_count,
         )
         .await?;
 
@@ -1441,6 +1488,25 @@ impl SnapshotManager {
         dataset_metadata: &DatasetMetadata,
         checkpointer_factory: DatasetCheckpointerFactory,
     ) -> Result<SnapshotDownloadInfo, SnapshotDownloadError> {
+        // Validate engine matches before downloading - fail fast if engines are incompatible
+        if let Some(snapshot_engine) = &entry.snapshot_engine {
+            let current_engine = self.engine.to_string();
+            if !snapshot_engine.eq_ignore_ascii_case(&current_engine) {
+                return Err(SnapshotDownloadError::EngineMismatch {
+                    dataset: self.dataset_name.clone(),
+                    snapshot_engine: snapshot_engine.clone(),
+                    current_engine,
+                });
+            }
+        } else {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                snapshot = %entry.snapshot,
+                snapshot_id = entry.snapshot_id,
+                "Downloading snapshot without engine metadata; skipping engine compatibility validation which may restore an incompatible snapshot"
+            );
+        }
+
         let object_path = self.snapshot_uri_to_object_path(&entry.snapshot)?;
         let path_display = object_path.to_string();
 
@@ -1775,6 +1841,7 @@ impl SnapshotManager {
         Ok(actual_checksum)
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn update_metadata_after_upload(
         &self,
         location: &ObjectPath,
@@ -1783,6 +1850,7 @@ impl SnapshotManager {
         timestamp_ms: i64,
         schema: &SchemaRef,
         last_updated_at: Option<i64>,
+        row_count: Option<u64>,
     ) -> Result<(), SnapshotUploadError> {
         let metadata_path = self.metadata_path();
         let metadata_path_display = metadata_path.to_string();
@@ -1808,14 +1876,18 @@ impl SnapshotManager {
             }
             metadata.last_updated_ms = now_ms;
 
+            let engine_str = self.engine.to_string();
             let dataset_entry = metadata
                 .datasets
                 .entry(dataset_name.clone())
                 .or_insert_with(|| DatasetMetadata {
                     name: dataset_name.clone(),
+                    engine: Some(engine_str.clone()),
                     ..Default::default()
                 });
             dataset_entry.name.clone_from(&dataset_name);
+            // Always update engine to match the current engine
+            dataset_entry.engine = Some(engine_str);
 
             if dataset_entry.schemas.is_empty() {
                 let schema_metadata = SchemaMetadata::from_schema(0, schema).map_err(|source| {
@@ -1862,6 +1934,8 @@ impl SnapshotManager {
                 snapshot_checksum: checksum_for_metadata,
                 snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
                 snapshot_size: size,
+                snapshot_engine: Some(self.engine.to_string()),
+                snapshot_row_count: row_count,
                 snapshot_last_updated_at_ms: last_updated_at,
             };
 
@@ -1966,6 +2040,7 @@ impl SnapshotManager {
         });
 
         let current_snapshot_id = dataset_metadata.current_snapshot_id;
+        let dataset_engine = dataset_metadata.engine.clone();
         let snapshots: Vec<api::SnapshotInfo> = dataset_metadata
             .snapshots
             .iter()
@@ -1976,7 +2051,8 @@ impl SnapshotManager {
                 checksum: entry.snapshot_checksum.clone(),
                 checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
                 size_bytes: entry.snapshot_size,
-                row_count: None, // Not stored in current metadata format
+                engine: entry.snapshot_engine.clone(),
+                row_count: entry.snapshot_row_count,
                 is_current: Some(entry.snapshot_id) == current_snapshot_id,
             })
             .collect();
@@ -1985,6 +2061,7 @@ impl SnapshotManager {
             dataset_name: self.dataset_name.clone(),
             location,
             last_updated_ms,
+            engine: dataset_engine,
             current_snapshot_id,
             snapshots,
         })
@@ -2045,7 +2122,8 @@ impl SnapshotManager {
             checksum: entry.snapshot_checksum.clone(),
             checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
             size_bytes: entry.snapshot_size,
-            row_count: None,
+            engine: entry.snapshot_engine.clone(),
+            row_count: entry.snapshot_row_count,
             is_current: Some(entry.snapshot_id) == dataset_metadata.current_snapshot_id,
         })
     }
@@ -2337,6 +2415,7 @@ mod tests {
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             layout: AccelerationLayout::File { path: local_path },
+            engine: engine.clone(),
             snapshot_engine,
             object_store,
             bootstrap_failure_behavior: behavior,
@@ -2392,6 +2471,7 @@ mod tests {
     ) -> DatasetMetadata {
         DatasetMetadata {
             name: DATASET_NAME.to_string(),
+            engine: None,
             schemas: vec![SchemaMetadata::from_schema(0, schema).expect("serialize schema")],
             current_schema_id: 0,
             snapshots,
@@ -2449,6 +2529,8 @@ mod tests {
             snapshot_checksum: checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
 
@@ -2527,6 +2609,8 @@ mod tests {
             snapshot_checksum: "0000".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: first_contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
 
@@ -2538,6 +2622,8 @@ mod tests {
             snapshot_checksum: valid_checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: second_contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
 
@@ -2604,7 +2690,7 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, ForceCreate(true))
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -2680,7 +2766,13 @@ mod tests {
         let last_updated_at = Some(1_704_153_600_000_i64); // 2024-01-02 00:00:00 UTC
 
         let _uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, last_updated_at, ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                last_updated_at,
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -2734,7 +2826,7 @@ mod tests {
 
         // Create snapshot with None updated_at
         let _uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, ForceCreate(true))
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -2786,10 +2878,13 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
+            engine: None,
             schemas: vec![SchemaMetadata::from_schema(0, &schema).expect("serialize schema")],
             current_schema_id: 0,
             snapshots: vec![entry.clone()],
@@ -2851,10 +2946,13 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64 + 1,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
+            engine: None,
             schemas: vec![SchemaMetadata::from_schema(0, &schema).expect("serialize schema")],
             current_schema_id: 0,
             snapshots: vec![entry.clone()],
@@ -2916,10 +3014,13 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: "MD5".to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
+            engine: None,
             schemas: vec![SchemaMetadata::from_schema(0, &schema).expect("serialize schema")],
             current_schema_id: 0,
             snapshots: vec![entry.clone()],
@@ -2986,10 +3087,13 @@ mod tests {
             snapshot_checksum: checksum,
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
         let metadata = DatasetMetadata {
             name: DATASET_NAME.to_string(),
+            engine: None,
             schemas: vec![
                 SchemaMetadata::from_schema(0, &metadata_schema).expect("serialize schema"),
             ],
@@ -3024,6 +3128,79 @@ mod tests {
             result,
             Err(SnapshotDownloadError::SchemaMismatch { .. })
         ));
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn download_snapshot_entry_rejects_engine_mismatch() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let instant = Utc
+            .with_ymd_and_hms(2025, 6, 1, 12, 0, 0)
+            .single()
+            .expect("valid time");
+        let location = layout.build_location(&base, instant);
+
+        let contents = Bytes::from_static(b"engine-mismatch-bytes");
+        store
+            .put(&location, contents.clone().into())
+            .await
+            .expect("write snapshot");
+
+        let schema = sample_schema();
+        let checksum = compute_sha256_hex(contents.as_ref());
+        // Snapshot was created with SQLite engine, but we're trying to load with DuckDB
+        let entry = SnapshotEntry {
+            snapshot_id: 4,
+            timestamp_ms: instant.timestamp_millis(),
+            snapshot: snapshot_uri(&location),
+            snapshot_checksum: checksum,
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: contents.len() as u64,
+            snapshot_engine: Some("sqlite".to_string()),
+            snapshot_row_count: Some(100),
+            snapshot_last_updated_at_ms: None,
+        };
+        let metadata = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            engine: Some("sqlite".to_string()),
+            schemas: vec![SchemaMetadata::from_schema(0, &schema).expect("serialize schema")],
+            current_schema_id: 0,
+            snapshots: vec![entry.clone()],
+            current_snapshot_id: Some(4),
+            ..Default::default()
+        };
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let local_path = temp_dir.path().join("snapshot.db");
+
+        // Build manager with DuckDB engine (mismatches SQLite snapshot)
+        let manager = build_manager(
+            Arc::clone(&store),
+            local_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            false,
+        );
+        let factory = Arc::clone(
+            manager
+                .checkpointer_factory
+                .as_ref()
+                .expect("factory present"),
+        );
+
+        let result = manager
+            .download_snapshot_entry(&entry, &metadata, factory)
+            .await;
+
+        assert!(
+            matches!(result, Err(SnapshotDownloadError::EngineMismatch { ref dataset, ref snapshot_engine, ref current_engine }) if dataset == DATASET_NAME && snapshot_engine == "sqlite" && current_engine == "duckdb"),
+            "expected EngineMismatch error, got: {result:?}"
+        );
+
+        // Ensure no file was written (validation failed before download)
+        assert!(!local_path.exists());
     }
 
     #[test]
@@ -3118,7 +3295,7 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, ForceCreate(true))
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
             .await
             .expect("create snapshot")
             .expect("snapshot should be created");
@@ -3233,7 +3410,7 @@ mod tests {
         let lock_guard = mutex.lock_owned().await;
 
         let uploaded_path = manager
-            .create_snapshot(&schema, lock_guard, None, ForceCreate(true))
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
             .await
             .expect("create snapshot")
             .expect("path");
@@ -3296,6 +3473,8 @@ mod tests {
             snapshot_checksum: checksum.clone(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: contents.len() as u64,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
 
@@ -3497,6 +3676,7 @@ mod tests {
                 &schema,
                 lock_guard,
                 Some(1_704_153_600_000_i64),
+                None,
                 ForceCreate(true),
             )
             .await
@@ -3507,7 +3687,7 @@ mod tests {
         // because there are existing snapshots but no new writes
         let lock_guard2 = Arc::clone(&mutex).lock_owned().await;
         let result = manager
-            .create_snapshot(&schema, lock_guard2, None, ForceCreate(false))
+            .create_snapshot(&schema, lock_guard2, None, None, ForceCreate(false))
             .await
             .expect("create_snapshot should not error");
 
@@ -3544,7 +3724,13 @@ mod tests {
         let timestamp = 1_704_153_600_000_i64; // 2024-01-02 00:00:00 UTC
 
         let first_result = manager_always
-            .create_snapshot(&schema, lock_guard, Some(timestamp), ForceCreate(true))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                Some(timestamp),
+                None,
+                ForceCreate(true),
+            )
             .await
             .expect("first snapshot");
         assert!(first_result.is_some(), "First snapshot should be created");
@@ -3554,7 +3740,13 @@ mod tests {
 
         let lock_guard2 = Arc::clone(&mutex).lock_owned().await;
         let second_result = manager_on_change
-            .create_snapshot(&schema, lock_guard2, Some(timestamp), ForceCreate(false))
+            .create_snapshot(
+                &schema,
+                lock_guard2,
+                Some(timestamp),
+                None,
+                ForceCreate(false),
+            )
             .await
             .expect("second snapshot should not error");
 
@@ -3586,7 +3778,13 @@ mod tests {
         // First snapshot with valid timestamp should be created even with OnChange policy
         // (no existing snapshots means force_create is automatically set to true)
         let result = manager
-            .create_snapshot(&schema, lock_guard, Some(timestamp), ForceCreate(false))
+            .create_snapshot(
+                &schema,
+                lock_guard,
+                Some(timestamp),
+                None,
+                ForceCreate(false),
+            )
             .await
             .expect("create_snapshot should not error");
 
@@ -3627,6 +3825,7 @@ mod tests {
                 &schema,
                 lock_guard,
                 Some(first_timestamp),
+                None,
                 ForceCreate(true),
             )
             .await
@@ -3644,6 +3843,7 @@ mod tests {
                 &schema,
                 lock_guard2,
                 Some(second_timestamp),
+                None,
                 ForceCreate(false),
             )
             .await
@@ -3681,7 +3881,7 @@ mod tests {
         // With Always policy, snapshot should be created even with None last_updated_at
         // (also, no existing snapshots means force_create is automatically set)
         let result = manager
-            .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
             .await
             .expect("create_snapshot should not error");
 
@@ -3712,7 +3912,7 @@ mod tests {
         // Even with OnChange policy and None last_updated_at, snapshot should be created
         // because no metadata exists (no prior snapshots)
         let result = manager
-            .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
             .await
             .expect("create_snapshot should not error");
 
@@ -3754,7 +3954,7 @@ mod tests {
         // Even with OnChange policy and None last_updated_at, snapshot should be created
         // because metadata exists but has no snapshots for THIS dataset
         let result = manager
-            .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
             .await
             .expect("create_snapshot should not error");
 
@@ -3785,6 +3985,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
+                engine: None,
                 schemas: vec![schema_metadata],
                 current_schema_id: 0,
                 snapshots: vec![SnapshotEntry {
@@ -3794,6 +3995,8 @@ mod tests {
                     snapshot_checksum: "fake_checksum".to_string(),
                     snapshot_checksum_algorithm: "sha256".to_string(),
                     snapshot_size: 1000,
+                    snapshot_engine: None,
+                    snapshot_row_count: None,
                     snapshot_last_updated_at_ms: Some(1_704_153_600_000),
                 }],
                 current_snapshot_id: Some(0),
@@ -3811,7 +4014,7 @@ mod tests {
         // Even with OnChange policy and None last_updated_at, snapshot should be created
         // because metadata has snapshots but actual files don't exist
         let result = manager
-            .create_snapshot(&schema, lock_guard, None, ForceCreate(false))
+            .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
             .await
             .expect("create_snapshot should not error");
 
@@ -3834,6 +4037,7 @@ mod tests {
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             layout: AccelerationLayout::None,
+            engine: AccelerationEngine::Cayenne,
             snapshot_engine,
             object_store,
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
@@ -3872,6 +4076,8 @@ mod tests {
             snapshot_checksum: "abc123".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: 1024,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: Some(1_704_153_600_000),
         };
 
@@ -3880,6 +4086,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![snapshot_entry],
@@ -3929,6 +4136,8 @@ mod tests {
             snapshot_checksum: "def456".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: 2048,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
 
@@ -3937,6 +4146,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![snapshot_entry],
@@ -3977,6 +4187,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![],
@@ -4027,6 +4238,8 @@ mod tests {
             snapshot_checksum: "abc123".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: 1024,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
 
@@ -4037,6 +4250,8 @@ mod tests {
             snapshot_checksum: "def456".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: 2048,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
 
@@ -4045,6 +4260,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![snapshot_entry1, snapshot_entry2],
@@ -4107,6 +4323,8 @@ mod tests {
             snapshot_checksum: "abc123".to_string(),
             snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
             snapshot_size: 1024,
+            snapshot_engine: None,
+            snapshot_row_count: None,
             snapshot_last_updated_at_ms: None,
         };
 
@@ -4115,6 +4333,7 @@ mod tests {
             DATASET_NAME.to_string(),
             DatasetMetadata {
                 name: DATASET_NAME.to_string(),
+                engine: None,
                 schemas: vec![],
                 current_schema_id: 0,
                 snapshots: vec![snapshot_entry],
@@ -4223,6 +4442,7 @@ mod tests {
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             layout: AccelerationLayout::None,
+            engine: AccelerationEngine::Cayenne,
             snapshot_engine,
             object_store,
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
@@ -4288,6 +4508,8 @@ mod tests {
                     snapshot_checksum: "abc123".to_string(),
                     snapshot_checksum_algorithm: "SHA256".to_string(),
                     snapshot_size: 1024,
+                    snapshot_engine: None,
+                    snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -4337,6 +4559,8 @@ mod tests {
                     snapshot_checksum: "abc123".to_string(),
                     snapshot_checksum_algorithm: "SHA256".to_string(),
                     snapshot_size: 1024,
+                    snapshot_engine: None,
+                    snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -4393,6 +4617,8 @@ mod tests {
                     snapshot_checksum: "abc123".to_string(),
                     snapshot_checksum_algorithm: "SHA256".to_string(),
                     snapshot_size: 1024,
+                    snapshot_engine: None,
+                    snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -4413,6 +4639,8 @@ mod tests {
                     snapshot_checksum: "def456".to_string(),
                     snapshot_checksum_algorithm: "SHA256".to_string(),
                     snapshot_size: 2048,
+                    snapshot_engine: None,
+                    snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -4477,6 +4705,8 @@ mod tests {
                     snapshot_checksum: "abc123".to_string(),
                     snapshot_checksum_algorithm: "SHA256".to_string(),
                     snapshot_size: 1024,
+                    snapshot_engine: None,
+                    snapshot_row_count: None,
                     snapshot_last_updated_at_ms: None,
                 }],
                 current_snapshot_id: Some(0),
@@ -4491,6 +4721,158 @@ mod tests {
         assert!(
             !result_bar,
             "Should return false for 'bar' dataset - must not match 'dataset=foobar' path"
+        );
+    }
+
+    /// Verify backward compatibility: metadata without `engine` and `row_count` fields
+    /// should deserialize correctly with those fields set to `None`.
+    #[test]
+    fn metadata_deserializes_without_new_fields() {
+        // Simulate old metadata format without engine or row_count fields
+        // Note: datasets are flattened at the top level (not under a "datasets" key)
+        let old_metadata_json = serde_json::json!({
+            "format-version": SNAPSHOT_METADATA_FORMAT_VERSION,
+            "location": "s3://bucket/snapshots",
+            "last-updated-ms": 1_704_240_000_000_i64,
+            "my_dataset": {
+                "name": "my_dataset",
+                "schemas": [],
+                "current-schema-id": 0,
+                "snapshots": [{
+                    "snapshot-id": 1,
+                    "timestamp-ms": 1_704_240_000_000_i64,
+                    "snapshot": "s3://bucket/snapshots/snapshot.db",
+                    "snapshot-checksum": "abc123",
+                    "snapshot-checksum-algorithm": "SHA256",
+                    "snapshot-size": 1024
+                }],
+                "current-snapshot-id": 1,
+                "properties": {}
+            }
+        });
+
+        let metadata: SnapshotMetadata =
+            serde_json::from_value(old_metadata_json).expect("deserialize old metadata");
+
+        let dataset = metadata.datasets.get("my_dataset").expect("dataset exists");
+        assert!(dataset.engine.is_none(), "engine should default to None");
+
+        let snapshot = dataset.snapshots.first().expect("snapshot exists");
+        assert!(
+            snapshot.snapshot_engine.is_none(),
+            "snapshot_engine should default to None"
+        );
+        assert!(
+            snapshot.snapshot_row_count.is_none(),
+            "snapshot_row_count should default to None"
+        );
+    }
+
+    /// Verify that when old metadata is updated, the new fields are properly added.
+    #[tokio::test]
+    async fn metadata_updates_in_place_with_new_fields() {
+        let store = Arc::new(InMemory::new());
+        let base = Path::from(SNAPSHOT_BASE_PATH);
+        let metadata_path = base.child(METADATA_FILE_NAME);
+
+        // Create old-format metadata without engine fields
+        // Note: datasets are flattened at the top level
+        let old_metadata_json = serde_json::json!({
+            "format-version": SNAPSHOT_METADATA_FORMAT_VERSION,
+            "location": SNAPSHOT_URI_PREFIX,
+            "last-updated-ms": 1_704_240_000_000_i64,
+            DATASET_NAME: {
+                "name": DATASET_NAME,
+                "schemas": [],
+                "current-schema-id": 0,
+                "snapshots": [],
+                "current-snapshot-id": null,
+                "properties": {}
+            }
+        });
+
+        let bytes = serde_json::to_vec_pretty(&old_metadata_json).expect("serialize");
+        store
+            .put(&metadata_path, bytes.into())
+            .await
+            .expect("write metadata");
+
+        // Verify the metadata loads correctly
+        let metadata_bytes = store
+            .get(&metadata_path)
+            .await
+            .expect("get metadata")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let loaded: SnapshotMetadata =
+            serde_json::from_slice(&metadata_bytes).expect("parse metadata");
+
+        assert!(
+            loaded
+                .datasets
+                .get(DATASET_NAME)
+                .expect("dataset")
+                .engine
+                .is_none(),
+            "engine should be None initially"
+        );
+
+        // Simulate creating a new snapshot (would add engine field)
+        let mut updated = loaded;
+        if let Some(dataset) = updated.datasets.get_mut(DATASET_NAME) {
+            dataset.engine = Some("duckdb".to_string());
+            dataset.snapshots.push(SnapshotEntry {
+                snapshot_id: 1,
+                timestamp_ms: 1_704_240_000_000,
+                snapshot: format!("{SNAPSHOT_URI_PREFIX}/snapshot.db"),
+                snapshot_checksum: "abc123".to_string(),
+                snapshot_checksum_algorithm: "SHA256".to_string(),
+                snapshot_size: 1024,
+                snapshot_engine: Some("duckdb".to_string()),
+                snapshot_row_count: Some(100),
+                snapshot_last_updated_at_ms: Some(1_704_240_000_000),
+            });
+            dataset.current_snapshot_id = Some(1);
+        }
+
+        // Write updated metadata back
+        let updated_bytes = serde_json::to_vec_pretty(&updated).expect("serialize updated");
+        store
+            .put(&metadata_path, updated_bytes.into())
+            .await
+            .expect("write updated metadata");
+
+        // Read back and verify new fields are present
+        let final_bytes = store
+            .get(&metadata_path)
+            .await
+            .expect("get metadata")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let final_json: serde_json::Value =
+            serde_json::from_slice(&final_bytes).expect("parse as json");
+
+        // Verify the new fields appear in the JSON
+        // Note: datasets are flattened at the top level (not under a "datasets" key)
+        let dataset_json = &final_json[DATASET_NAME];
+        assert_eq!(
+            dataset_json["engine"],
+            serde_json::json!("duckdb"),
+            "engine should be serialized"
+        );
+
+        let snapshot_json = &dataset_json["snapshots"][0];
+        assert_eq!(
+            snapshot_json["snapshot-engine"],
+            serde_json::json!("duckdb"),
+            "snapshot-engine should be serialized"
+        );
+        assert_eq!(
+            snapshot_json["snapshot-row-count"],
+            serde_json::json!(100),
+            "snapshot-row-count should be serialized"
         );
     }
 }

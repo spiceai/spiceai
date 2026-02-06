@@ -98,10 +98,12 @@ pub enum DistributedNode {
 }
 
 impl DistributedNode {
+    #[must_use]
     pub fn is_scheduler(&self) -> bool {
         matches!(self, DistributedNode::Scheduler { .. })
     }
 
+    #[must_use]
     pub fn is_executor(&self) -> bool {
         matches!(self, DistributedNode::Executor)
     }

@@ -1,6 +1,6 @@
----source: crates/runtime/tests/search/mod.rs
+---
+source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -45,7 +45,7 @@ snapshot_kind: text
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%\u201310% of patients."
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
         ]
       },
       "primary_key": {

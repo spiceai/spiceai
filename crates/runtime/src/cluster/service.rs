@@ -31,13 +31,15 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
 
-use datafusion::prelude::{Expr, col, lit};
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        ast::{Ident, ObjectNamePart, visit_relations_mut},
-        dialect::PostgreSqlDialect,
-        parser::Parser,
+use datafusion::{
+    prelude::{Expr, col, lit},
+    sql::{
+        TableReference,
+        sqlparser::{
+            ast::{Ident, ObjectNamePart, visit_relations_mut},
+            dialect::PostgreSqlDialect,
+            parser::Parser,
+        },
     },
 };
 
