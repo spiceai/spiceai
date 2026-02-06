@@ -55,7 +55,7 @@ impl Dialect for DatabricksDialect {
         IntervalStyle::MySQL
     }
 
-    /// Override scalar functions to translate DataFusion functions to Spark SQL equivalents.
+    /// Override scalar functions to translate `DataFusion` functions to Spark SQL equivalents.
     fn scalar_function_to_sql_overrides(
         &self,
         unparser: &Unparser<'_>,
@@ -69,7 +69,7 @@ impl Dialect for DatabricksDialect {
     }
 }
 
-/// Converts DataFusion's `array_has(array, element)` to Spark SQL's `array_contains(array, element)`.
+/// Converts `DataFusion`'s `array_has(array, element)` to Spark SQL's `array_contains(array, element)`.
 ///
 /// Both functions have the same argument order, so this is a simple name translation.
 fn array_has_to_array_contains(
@@ -349,8 +349,7 @@ mod tests {
             .expect("to convert expr to sql")
             .to_string();
         assert_eq!(
-            sql_str,
-            "array_contains([1, 2, 3], 2)",
+            sql_str, "array_contains([1, 2, 3], 2)",
             "Expected full SQL string match"
         );
     }
