@@ -31,6 +31,7 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
 
+use datafusion::prelude::{Expr, col, lit};
 use datafusion::sql::{
     TableReference,
     sqlparser::{
@@ -42,6 +43,7 @@ use datafusion::sql::{
 
 use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
 
+use datafusion_proto::bytes::Serializeable;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -68,6 +70,7 @@ use tonic::{Request, Response, Status, Streaming, transport::Endpoint};
 
 use crate::cluster::SchedulerPeers;
 use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::partition::PartitionManager;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
@@ -155,6 +158,8 @@ pub struct ClusterServiceImpl {
     executor_registry: Arc<ExecutorRegistry>,
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
+    /// Manager for partition metadata (scheduler only).
+    partition_manager: Option<Arc<PartitionManager>>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
 }
@@ -162,6 +167,7 @@ pub struct ClusterServiceImpl {
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -170,6 +176,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        partition_manager: Option<Arc<PartitionManager>>,
     ) -> Self {
         Self {
             app,
@@ -179,6 +186,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            partition_manager,
             executor_streams: ExecutorControlStreamRegistry::new(),
         }
     }
@@ -197,6 +205,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        partition_manager: Option<Arc<PartitionManager>>,
         executor_streams: ExecutorControlStreamRegistry,
     ) -> Self {
         Self {
@@ -207,6 +216,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            partition_manager,
             executor_streams,
         }
     }
@@ -562,34 +572,101 @@ impl ClusterService for ClusterServiceImpl {
             }
         }
 
-        let table_partitions: HashMap<TableReference, StringArray> = (*self.app.read().await)
-            .as_ref()
-            .map(|app| {
-                app.datasets
+        let mut table_partitions: HashMap<String, StringArray> = HashMap::new();
+
+        if let Some(partition_manager) = &self.partition_manager {
+            let app_guard = self.app.read().await;
+            if let Some(app) = app_guard.as_ref() {
+                // Find accelerated datasets with partitioning
+                let datasets: Vec<_> = app
+                    .datasets
                     .iter()
-                    .map(|ds| {
-                        (
-                            TableReference::parse_str(&ds.name),
-                            StringArray { items: vec![] },
-                        )
+                    .filter(|ds| {
+                        ds.acceleration
+                            .as_ref()
+                            .is_some_and(|acc| !acc.partition_by.is_empty())
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut executor_partitions = self.executor_registry.partitions.write().await;
-        executor_partitions.insert(
-            executor_id.clone(),
-            table_partitions
-                .keys()
-                .map(|tbl| (tbl.clone(), vec![]))
-                .collect(),
-        );
+                    .collect();
+
+                for table_ref in super::partition::accelerated_tables(&app).keys() {
+                    match partition_manager
+                        .allocate_partitions(&table_ref, &executor_id, 10)
+                        .await
+                    {
+                        Ok(partitions) => {
+                            if partitions.is_empty() {
+                                continue;
+                            }
+                            let mut serialized_items = Vec::new();
+                            for p in partitions {
+                                let mut expr: Option<Expr> = None;
+                                for (col_name, val) in p {
+                                    let e = col(col_name).eq(lit(val));
+                                    expr = match expr {
+                                        Some(existing) => Some(existing.and(e)),
+                                        None => Some(e),
+                                    };
+                                }
+
+                                if let Some(e) = expr {
+                                    match e.to_bytes() {
+                                        Ok(bytes) => serialized_items.push(bytes.to_vec()),
+                                        Err(err) => {
+                                            tracing::error!(
+                                                "Failed to serialize partition expression for table {}: {err}",
+                                                table_ref.to_string()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            table_partitions.insert(
+                                table_ref.to_string(),
+                                StringArray {
+                                    items: serialized_items,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to allocate partitions for table {} to executor {}: {}",
+                                table_ref.to_string(),
+                                executor_id,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register the allocated partitions in the executor registry so the scheduler knows where they are
+        {
+            let mut executor_partitions = self.executor_registry.partitions.write().await;
+            executor_partitions.insert(
+                executor_id.clone(),
+                table_partitions
+                    .iter()
+                    .map(|(tbl, sa)| {
+                        let exprs = sa
+                            .items
+                            .iter()
+                            .filter_map(|bytes| match Expr::from_bytes(bytes) {
+                                Ok(expr) => Some(expr),
+                                Err(e) => {
+                                    tracing::error!("Failed to deserialize expr: {e}");
+                                    None
+                                }
+                            })
+                            .collect();
+                        (TableReference::parse_str(tbl), exprs)
+                    })
+                    .collect(),
+            );
+        }
 
         Ok(Response::new(AllocateInitialPartitionsResponse {
-            table_partitions: table_partitions
-                .into_iter()
-                .map(|(tbl, x)| (tbl.to_string(), x))
-                .collect(),
+            table_partitions,
         }))
     }
 }

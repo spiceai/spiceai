@@ -249,6 +249,7 @@ impl RuntimeBuilder {
                 // Initialized later when scheduler registry starts
                 job_executor: Arc::new(RwLock::new(None)),
                 executor_registry: Arc::new(ExecutorRegistry::new()),
+                partition_manager: Arc::new(RwLock::new(None)),
             }),
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {}),
             None => None, // No cluster config means we're running in standalone mode

@@ -122,7 +122,7 @@ message AllocateInitialPartitionsRequest {
 }
 
 message StringArray {
-  repeated string items = 1;
+  repeated bytes items = 1;
 }
 
 // Response message for AllocateInitialPartitions RPC.

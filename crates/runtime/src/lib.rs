@@ -75,7 +75,7 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
-use crate::cluster::{DistributedNode, SchedulerPeers};
+use crate::cluster::{DistributedNode, PartitionManager, SchedulerPeers};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 pub mod accelerated_table;
@@ -593,6 +593,48 @@ impl Runtime {
             Some(DistributedNode::Scheduler { peers, .. }) => Some(Arc::clone(peers)),
             _ => None,
         }
+    }
+
+    /// Returns the partition manager for accelerated table partition metadata (scheduler only).
+    ///
+    /// This uses `try_read()` to avoid blocking the caller. If another thread holds
+    /// a write lock (e.g., during initialization), this returns `None`.
+    #[must_use]
+    pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                partition_manager, ..
+            }) => match partition_manager.try_read() {
+                Ok(guard) => guard.clone(),
+                Err(_) => {
+                    tracing::debug!(
+                        "Partition manager is currently being initialized. Returning None."
+                    );
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+
+    /// Sets the partition manager for accelerated table partition metadata.
+    pub async fn set_partition_manager(&self, manager: Arc<PartitionManager>) {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                partition_manager, ..
+            }) => {
+                let mut guard = partition_manager.write().await;
+                *guard = Some(manager);
+            }
+            Some(DistributedNode::Executor {}) => {
+                tracing::warn!("Attempted to set partition manager on an executor node. Ignoring.");
+            }
+            None => {
+                tracing::warn!(
+                    "Attempted to set partition manager on a non-cluster runtime. Ignoring."
+                );
+            }
+        };
     }
 
     /// Returns the metrics reader for on-demand OTLP metrics collection.

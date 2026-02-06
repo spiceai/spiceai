@@ -90,6 +90,9 @@ pub enum DistributedNode {
 
         /// Registry of connected executors for `FlightSQL`.
         executor_registry: Arc<ExecutorRegistry>,
+
+        /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
+        partition_manager: Arc<RwLock<Option<Arc<PartitionManager>>>>,
     },
     Executor,
 }
@@ -383,12 +386,14 @@ mod control_stream_client;
 pub mod datafusion;
 mod executor_registry;
 pub mod metrics_collector;
+pub mod partition;
 mod scheduler_registry;
 mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
 pub use executor_registry::ExecutorRegistry;
+pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -789,6 +794,28 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         let app = rt.app.read().await;
         let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
         if let Some(config) = config {
+            // Initialize partition manager with the configured object store
+            match partition::build_partition_metadata_store(rt, &config).await {
+                Ok(store) => {
+                    let partition_manager = Arc::new(PartitionManager::new(store));
+                    rt.set_partition_manager(Arc::clone(&partition_manager))
+                        .await;
+                    tracing::info!("Partition manager initialized for scheduler");
+
+                    // Initialize partition metadata for all accelerated tables
+                    if let Err(err) =
+                        partition::initialize_partition_metadata(rt, &partition_manager).await
+                    {
+                        tracing::warn!(
+                            "Failed to initialize partition metadata during scheduler startup: {err}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("Failed to build partition metadata store: {err}");
+                }
+            }
+
             let registry_shutdown = CancellationToken::new();
             let registry_shutdown_for_task = registry_shutdown.clone();
             let peers = Arc::clone(&scheduler_peers);
@@ -1240,7 +1267,7 @@ pub async fn initialize_cluster_executor(
                     partitions
                         .items
                         .into_iter()
-                        .map(|e| Expr::from_bytes(&e.into_bytes()))
+                        .map(|e| Expr::from_bytes(&e))
                         .collect::<Result<Vec<Expr>, _>>()?,
                 ))
             })
