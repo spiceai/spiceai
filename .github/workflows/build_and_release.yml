@@ -39,6 +39,16 @@ on:
           - 'Windows x64'
           - 'macOS x64 (Intel)'
         default: 'all'
+      variant_option:
+        description: 'Which variant to build? (Default is all)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'default'
+          - 'odbc'
+          - 'metal'
+        default: 'all'
       profile_option:
         description: 'Which Rust build profile to use? (Default is release)'
         required: false
@@ -134,12 +144,25 @@ jobs:
             // If running via workflow_dispatch, filter based on input
             if (isManualDispatch) {
               const platform_option = context.payload.inputs.platform_option;
+              const variant_option = context.payload.inputs.variant_option;
 
-              if (platform_option === 'all') {
-                return matrix;
+              let resultMatrix = matrix;
+
+              if (platform_option !== 'all') {
+                resultMatrix = matrix.filter(m => m.name === platform_option);
               }
 
-              return matrix.filter(m => m.name === platform_option);
+              if (variant_option !== 'all') {
+                resultMatrix.forEach(m => {
+                  if (m.tags.includes(variant_option)) {
+                    m.tags = [variant_option];
+                  } else {
+                    m.tags = [];
+                  }
+                });
+              }
+
+              return resultMatrix;
             }
 
             return matrix;
@@ -275,23 +298,23 @@ jobs:
 
       ## Metal variant (macOS with Metal GPU acceleration, models included by default)
       - name: Build spiced (metal)
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin' && contains(matrix.target.tags, 'metal')
         working-directory: bin/spiced
         run: cargo build --release --features release,models,metal --target-dir ../../target
 
       - name: tar binary (metal)
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin' && contains(matrix.target.tags, 'metal')
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
           tar czf spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
 
       - name: Print version (metal)
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin' && contains(matrix.target.tags, 'metal')
         run: ./spiced --version
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin' && contains(matrix.target.tags, 'metal')
         with:
           name: spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
