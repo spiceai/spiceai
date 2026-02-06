@@ -595,6 +595,35 @@ impl Runtime {
         }
     }
 
+    #[must_use]
+    pub fn partition_assignments(
+        &self,
+    ) -> Option<Arc<RwLock<HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>>>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Executor {
+                partition_assignments,
+            }) => Some(Arc::clone(partition_assignments)),
+            _ => None,
+        }
+    }
+
+    pub async fn set_partition_assignments(
+        &self,
+        assignments: HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>,
+    ) {
+        if let Some(DistributedNode::Executor {
+            partition_assignments,
+        }) = self.distributed.as_ref()
+        {
+            let mut guard = partition_assignments.write().await;
+            *guard = assignments;
+        } else {
+            tracing::warn!(
+                "Attempted to set partition assignments on a non-executor node. Ignoring."
+            );
+        }
+    }
+
     /// Returns the partition manager for accelerated table partition metadata (scheduler only).
     ///
     /// This uses `try_read()` to avoid blocking the caller. If another thread holds
@@ -626,7 +655,7 @@ impl Runtime {
                 let mut guard = partition_manager.write().await;
                 *guard = Some(manager);
             }
-            Some(DistributedNode::Executor {}) => {
+            Some(DistributedNode::Executor { .. }) => {
                 tracing::warn!("Attempted to set partition manager on an executor node. Ignoring.");
             }
             None => {
@@ -667,7 +696,7 @@ impl Runtime {
                     None
                 }
             }
-            None | Some(DistributedNode::Executor) => None,
+            None | Some(DistributedNode::Executor { .. }) => None,
         }
     }
 
@@ -678,7 +707,7 @@ impl Runtime {
                 let mut guard = job_executor.write().await;
                 *guard = Some(executor);
             }
-            Some(DistributedNode::Executor) => {
+            Some(DistributedNode::Executor { .. }) => {
                 tracing::warn!(
                     "Attempted to set job executor on an executor node. This should only be set on the scheduler. Ignoring."
                 );
@@ -827,7 +856,7 @@ impl Runtime {
                     )),
                 )
             }
-            Some(DistributedNode::Executor) => {
+            Some(DistributedNode::Executor { .. }) => {
                 let executor_shutdown = CancellationToken::new();
                 let executor_fut = cluster::initialize_cluster_executor(
                     Arc::clone(&self),

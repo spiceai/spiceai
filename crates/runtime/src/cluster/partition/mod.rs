@@ -21,5 +21,6 @@ mod startup;
 pub use manager::PartitionManager;
 pub use metadata::{PartitionMetadata, TablePartitionMetadata};
 pub use startup::{
-    accelerated_tables, build_partition_metadata_store, initialize_partition_metadata,
+    accelerated_tables, build_partition_metadata_store, executor_request_initial_partitions,
+    initialize_partition_metadata,
 };
