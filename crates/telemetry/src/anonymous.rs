@@ -185,6 +185,7 @@ mod tests {
 
     #[test]
     fn test_usize_to_i64_telemetry_max_i64() {
+        #[expect(clippy::cast_sign_loss)]
         let max_i64_as_usize = i64::MAX as usize;
         assert_eq!(usize_to_i64_telemetry(max_i64_as_usize, "test"), i64::MAX);
     }
@@ -192,6 +193,7 @@ mod tests {
     #[test]
     fn test_usize_to_i64_telemetry_overflow_clamps() {
         // Values above i64::MAX should clamp to i64::MAX
+        #[expect(clippy::cast_sign_loss)]
         let overflow_value = (i64::MAX as usize).saturating_add(1);
         assert_eq!(
             usize_to_i64_telemetry(overflow_value, "test"),
@@ -263,7 +265,7 @@ mod tests {
         let resource = resource("my-secret-project", vec![]).await;
 
         // Verify the raw spicepod name doesn't appear in any attribute value
-        for (key, value) in resource.iter() {
+        for (key, value) in &resource {
             let value_str = value.to_string();
             assert!(
                 !value_str.contains("my-secret-project"),
@@ -316,30 +318,30 @@ mod tests {
         let r1 = resource("deterministic-test", vec![]).await;
         let r2 = resource("deterministic-test", vec![]).await;
 
-        let id1 = r1
+        let spicepod_id_1 = r1
             .iter()
             .find(|(k, _)| k.as_str() == "spicepod.id")
             .map(|(_, v)| v.to_string())
             .expect("should have spicepod.id");
-        let id2 = r2
+        let spicepod_id_2 = r2
             .iter()
             .find(|(k, _)| k.as_str() == "spicepod.id")
             .map(|(_, v)| v.to_string())
             .expect("should have spicepod.id");
-        assert_eq!(id1, id2, "Same inputs should produce same spicepod_id");
+        assert_eq!(spicepod_id_1, spicepod_id_2, "Same inputs should produce same spicepod_id");
 
-        let iid1 = r1
+        let instance_id_1 = r1
             .iter()
             .find(|(k, _)| k.as_str() == "service.instance.id")
             .map(|(_, v)| v.to_string())
             .expect("should have service.instance.id");
-        let iid2 = r2
+        let instance_id_2 = r2
             .iter()
             .find(|(k, _)| k.as_str() == "service.instance.id")
             .map(|(_, v)| v.to_string())
             .expect("should have service.instance.id");
         assert_eq!(
-            iid1, iid2,
+            instance_id_1, instance_id_2,
             "Same inputs on same host should produce same instance_id"
         );
     }
