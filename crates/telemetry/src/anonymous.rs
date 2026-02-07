@@ -328,7 +328,10 @@ mod tests {
             .find(|(k, _)| k.as_str() == "spicepod.id")
             .map(|(_, v)| v.to_string())
             .expect("should have spicepod.id");
-        assert_eq!(spicepod_id_1, spicepod_id_2, "Same inputs should produce same spicepod_id");
+        assert_eq!(
+            spicepod_id_1, spicepod_id_2,
+            "Same inputs should produce same spicepod_id"
+        );
 
         let instance_id_1 = r1
             .iter()
