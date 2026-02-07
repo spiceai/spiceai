@@ -65,7 +65,7 @@ impl DynamoDBSys {
         let dataset_name = self.dataset_name.clone();
         let conn = pool.connect().await.ok()?;
         let query = format!(
-            "SELECT checkpoint_data FROM {DYNAMODB_STREAMS_TABLE_NAME} WHERE dataset_name = ?"
+            "SELECT checkpoint_data, strftime('%s', updated_at) FROM {DYNAMODB_STREAMS_TABLE_NAME} WHERE dataset_name = ?"
         );
 
         let mut rows = conn
@@ -75,7 +75,16 @@ impl DynamoDBSys {
         let row = rows.next().await.ok()??;
 
         let checkpoint_data = row.get::<String>(0).ok()?;
+        let updated_at_epoch: Option<i64> = row.get::<i64>(1).ok();
+        let updated_at = updated_at_epoch.and_then(|epoch| {
+            u64::try_from(epoch)
+                .ok()
+                .and_then(|e| std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(e)))
+        });
 
-        Some(DynamoDBCheckpointMetadata { checkpoint_data })
+        Some(DynamoDBCheckpointMetadata {
+            checkpoint_data,
+            updated_at,
+        })
     }
 }
