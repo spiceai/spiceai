@@ -240,7 +240,10 @@ fn parse_number(input: &str) -> Result<(ParsedNumber, &str), ParseError> {
     ))
 }
 
-/// Apply an exponent (e.g., `e2`, `e-3`, `e+1`) to the parsed number.
+/// Apply an exponent (e.g., `e2`, `e-3`, `e+1`) to the parsed number using integer arithmetic.
+///
+/// Shifts the decimal point by the exponent value without converting to floating point,
+/// preserving exact precision for all representable values.
 fn apply_exponent(
     integer: u64,
     frac_value: u64,
@@ -278,45 +281,77 @@ fn apply_exponent(
         .map_err(|_| ParseError::invalid_input("Exponent too large"))?;
     let exp = if exp_negative { -exp_val } else { exp_val };
 
-    // Reconstruct the full number as a string, shift decimal point by exp
-    // For simplicity, convert to f64 for exponent handling
-    let mut full_str = integer.to_string();
-    if frac_digits > 0 {
-        full_str.push('.');
-        // Pad with leading zeros if needed
-        let frac_str = frac_value.to_string();
-        for _ in 0..frac_digits.saturating_sub(u32::try_from(frac_str.len()).unwrap_or(u32::MAX)) {
-            full_str.push('0');
+    // Build the full digit string: integer digits + fractional digits
+    // e.g., integer=1, frac_value=5, frac_digits=1 -> digits="15", decimal_pos=1
+    // The decimal point is `frac_digits` positions from the right end of the digit string.
+    let int_str = integer.to_string();
+    let frac_str = if frac_digits > 0 {
+        let raw = frac_value.to_string();
+        let pad = frac_digits.saturating_sub(u32::try_from(raw.len()).unwrap_or(u32::MAX));
+        "0".repeat(pad as usize) + &raw
+    } else {
+        String::new()
+    };
+    let all_digits = format!("{int_str}{frac_str}");
+
+    // Current decimal position from the right = frac_digits
+    // After applying exponent, new decimal position from the right = frac_digits - exp
+    // (positive exp shifts decimal right, reducing frac digits)
+    let new_frac_digits_i64 = i64::from(frac_digits) - i64::from(exp);
+
+    if new_frac_digits_i64 <= 0 {
+        // All digits become integer part, possibly with trailing zeros
+        let trailing_zeros = new_frac_digits_i64.unsigned_abs();
+        let new_integer = all_digits
+            .parse::<u128>()
+            .map_err(|_| ParseError::invalid_input("Number too large"))?;
+        let multiplier = 10u128.checked_pow(u32::try_from(trailing_zeros).unwrap_or(u32::MAX));
+        match multiplier {
+            Some(m) => match new_integer.checked_mul(m) {
+                Some(result) if result <= u128::from(u64::MAX) => {
+                    #[expect(clippy::cast_possible_truncation)]
+                    let result_u64 = result as u64;
+                    Ok((result_u64, 0, 0, &input[pos..]))
+                }
+                _ => Ok((u64::MAX, 0, 0, &input[pos..])),
+            },
+            None => Ok((u64::MAX, 0, 0, &input[pos..])),
         }
-        full_str.push_str(&frac_str);
+    } else {
+        // Split all_digits into integer part and fractional part
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let new_frac_count = new_frac_digits_i64 as usize;
+        let total_len = all_digits.len();
+
+        if new_frac_count >= total_len {
+            // All digits are fractional (e.g., 1e-3 -> 0.001)
+            let leading_zeros = new_frac_count - total_len;
+            let padded_frac = "0".repeat(leading_zeros) + &all_digits;
+            let new_frac_val = padded_frac
+                .parse::<u64>()
+                .map_err(|_| ParseError::invalid_input("Fractional part too large"))?;
+            #[expect(clippy::cast_possible_truncation)]
+            let new_frac_dig = padded_frac.len() as u32;
+            Ok((0, new_frac_val, new_frac_dig, &input[pos..]))
+        } else {
+            let split_at = total_len - new_frac_count;
+            let int_part = &all_digits[..split_at];
+            let frac_part = &all_digits[split_at..];
+            let new_integer = int_part
+                .parse::<u64>()
+                .map_err(|_| ParseError::invalid_input("Number too large"))?;
+            let new_frac_val = if frac_part.is_empty() {
+                0
+            } else {
+                frac_part
+                    .parse::<u64>()
+                    .map_err(|_| ParseError::invalid_input("Fractional part too large"))?
+            };
+            #[expect(clippy::cast_possible_truncation)]
+            let new_frac_dig = frac_part.len() as u32;
+            Ok((new_integer, new_frac_val, new_frac_dig, &input[pos..]))
+        }
     }
-
-    let base: f64 = full_str
-        .parse()
-        .map_err(|_| ParseError::invalid_input("Invalid number"))?;
-    let multiplied = base * 10f64.powi(exp);
-
-    if multiplied < 0.0 {
-        return Err(ParseError::invalid_input(
-            "Negative durations are not supported",
-        ));
-    }
-    #[expect(clippy::cast_precision_loss)]
-    let max_f64 = u64::MAX as f64;
-    if multiplied.is_infinite() || multiplied > max_f64 {
-        return Ok((u64::MAX, 0, 0, &input[pos..]));
-    }
-
-    // SAFETY: multiplied is checked to be non-negative and within u64 range above
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let new_integer = multiplied.trunc() as u64;
-    let frac_part = multiplied.fract();
-    // Preserve up to 9 decimal digits (nanosecond precision)
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let new_frac_value = (frac_part * 1_000_000_000.0).round() as u64;
-    let new_frac_digits = 9;
-
-    Ok((new_integer, new_frac_value, new_frac_digits, &input[pos..]))
 }
 
 /// Parse a time unit suffix, returning (`nanoseconds_per_unit`, `remaining_input`).
