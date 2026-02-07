@@ -121,7 +121,11 @@ impl SnapshotS3Context {
                 Path::new(filename)
                     .extension()
                     .and_then(std::ffi::OsStr::to_str)
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("duckdb")
+                            || ext.eq_ignore_ascii_case("sqlite")
+                            || ext.eq_ignore_ascii_case("cayenne")
+                    })
                     && meta
                         .location
                         .as_ref()
@@ -140,7 +144,6 @@ impl SnapshotS3Context {
         max_wait: Duration,
     ) -> Result<Vec<ObjectMeta>> {
         let deadline = Instant::now() + max_wait;
-
         loop {
             if Instant::now() >= deadline {
                 return Err(anyhow!(
