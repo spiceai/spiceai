@@ -47,7 +47,7 @@ use tokio::{
     sync::RwLock,
 };
 use url::Url;
-use util::{RetryError, fibonacci_backoff::FibonacciBackoff, retry};
+use util::{RetryError, retry, retry_strategy::RetryBackoffBuilder};
 
 use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
@@ -105,6 +105,7 @@ const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const SNAPSHOT_METADATA_FORMAT_VERSION: u32 = 1;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
+const NETWORK_RETRY_MAX: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -540,6 +541,17 @@ impl std::fmt::Display for AccelerationEngine {
     }
 }
 
+/// Returns `true` if the given object store error is likely transient and worth retrying.
+fn is_retriable_object_store_error(err: &object_store::Error) -> bool {
+    !matches!(
+        err,
+        object_store::Error::NotFound { .. }
+            | object_store::Error::NotSupported { .. }
+            | object_store::Error::AlreadyExists { .. }
+            | object_store::Error::Precondition { .. }
+    )
+}
+
 /// Manages snapshots for a specific accelerated dataset.
 #[derive(Clone)]
 pub struct SnapshotManager {
@@ -625,49 +637,67 @@ impl SnapshotManager {
         let metadata_path = self.metadata_path();
         let metadata_path_display = metadata_path.to_string();
 
-        let get_result = match self.object_store.get(&metadata_path).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(source) => {
-                return Err(MetadataLoadError::Read {
-                    path: metadata_path_display,
-                    source,
-                });
-            }
-        };
+        retry(
+            RetryBackoffBuilder::new()
+                .max_retries(Some(NETWORK_RETRY_MAX))
+                .build(),
+            || async {
+                let get_result = match self.object_store.get(&metadata_path).await {
+                    Ok(result) => result,
+                    Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                    Err(source) => {
+                        tracing::warn!(
+                            "Transient error reading snapshot metadata, retrying. path={metadata_path_display} error={source}"
+                        );
+                        return Err(RetryError::transient(MetadataLoadError::Read {
+                            path: metadata_path_display.clone(),
+                            source,
+                        }));
+                    }
+                };
 
-        let meta = get_result.meta.clone();
-        let bytes = get_result
-            .bytes()
-            .await
-            .map_err(|source| MetadataLoadError::Read {
-                path: metadata_path_display.clone(),
-                source,
-            })?;
+                let meta = get_result.meta.clone();
+                let bytes = get_result.bytes().await.map_err(|source| {
+                    tracing::warn!(
+                        "Transient error reading snapshot metadata bytes, retrying. path={metadata_path_display} error={source}"
+                    );
+                    RetryError::transient(MetadataLoadError::Read {
+                        path: metadata_path_display.clone(),
+                        source,
+                    })
+                })?;
 
-        let metadata: SnapshotMetadata =
-            serde_json::from_slice(&bytes).map_err(|source| MetadataLoadError::Parse {
-                path: metadata_path_display.clone(),
-                source,
-            })?;
+                let metadata: SnapshotMetadata = serde_json::from_slice(&bytes).map_err(
+                    |source| {
+                        RetryError::permanent(MetadataLoadError::Parse {
+                            path: metadata_path_display.clone(),
+                            source,
+                        })
+                    },
+                )?;
 
-        if metadata.format_version != SNAPSHOT_METADATA_FORMAT_VERSION {
-            return Err(MetadataLoadError::UnsupportedVersion {
-                path: metadata_path_display,
-                version: metadata.format_version,
-            });
-        }
+                if metadata.format_version != SNAPSHOT_METADATA_FORMAT_VERSION {
+                    return Err(RetryError::permanent(
+                        MetadataLoadError::UnsupportedVersion {
+                            path: metadata_path_display.clone(),
+                            version: metadata.format_version,
+                        },
+                    ));
+                }
 
-        let version = if meta.e_tag.is_some() || meta.version.is_some() {
-            Some(UpdateVersion {
-                e_tag: meta.e_tag.clone(),
-                version: meta.version.clone(),
-            })
-        } else {
-            None
-        };
+                let version = if meta.e_tag.is_some() || meta.version.is_some() {
+                    Some(UpdateVersion {
+                        e_tag: meta.e_tag.clone(),
+                        version: meta.version.clone(),
+                    })
+                } else {
+                    None
+                };
 
-        Ok(Some(MetadataHandle { metadata, version }))
+                Ok(Some(MetadataHandle { metadata, version }))
+            },
+        )
+        .await
     }
 
     /// Checks if there are any existing snapshots for this dataset.
@@ -1066,10 +1096,30 @@ impl SnapshotManager {
             .await
             .context(PrepareUploadSnafu)?;
 
-        // Step 4: Upload the file
-        let upload_result = self
-            .upload_snapshot_file(&final_source_local_path, destination_location)
-            .await;
+        // Step 4: Upload the file (with retry for transient network errors)
+        let upload_result = retry(
+            RetryBackoffBuilder::new()
+                .max_retries(Some(NETWORK_RETRY_MAX))
+                .build(),
+            || async {
+                self.upload_snapshot_file(&final_source_local_path, destination_location)
+                    .await
+                    .map_err(|err| match &err {
+                        SnapshotUploadError::StartUpload { .. }
+                        | SnapshotUploadError::UploadPart { .. }
+                        | SnapshotUploadError::CompleteUpload { .. }
+                        | SnapshotUploadError::AbortUpload { .. } => {
+                            tracing::warn!(
+                                "Transient error uploading snapshot, retrying. dataset={} error={err}",
+                                self.dataset_name,
+                            );
+                            RetryError::transient(err)
+                        }
+                        _ => RetryError::permanent(err),
+                    })
+            },
+        )
+        .await;
 
         // Step 5: Cleanup temp files
         let _ = fs::remove_file(&temp_copy_path).await;
@@ -1126,10 +1176,30 @@ impl SnapshotManager {
             self.dataset_name
         );
 
-        // Step 3: Upload the tar archive
-        let upload_result = self
-            .upload_snapshot_file(&temp_archive_path, destination_location)
-            .await;
+        // Step 3: Upload the tar archive (with retry for transient network errors)
+        let upload_result = retry(
+            RetryBackoffBuilder::new()
+                .max_retries(Some(NETWORK_RETRY_MAX))
+                .build(),
+            || async {
+                self.upload_snapshot_file(&temp_archive_path, destination_location)
+                    .await
+                    .map_err(|err| match &err {
+                        SnapshotUploadError::StartUpload { .. }
+                        | SnapshotUploadError::UploadPart { .. }
+                        | SnapshotUploadError::CompleteUpload { .. }
+                        | SnapshotUploadError::AbortUpload { .. } => {
+                            tracing::warn!(
+                                "Transient error uploading snapshot, retrying. dataset={} error={err}",
+                                self.dataset_name,
+                            );
+                            RetryError::transient(err)
+                        }
+                        _ => RetryError::permanent(err),
+                    })
+            },
+        )
+        .await;
 
         // Step 4: Cleanup temp archive
         let _ = fs::remove_file(&temp_archive_path).await;
@@ -1291,7 +1361,7 @@ impl SnapshotManager {
                 }
             }
             BootstrapOnFailureBehavior::Retry => {
-                let retry_strategy = FibonacciBackoff::default();
+                let retry_strategy = RetryBackoffBuilder::new().build();
                 let dataset_name = self.dataset_name.clone();
                 let location = self.snapshots_location.to_string();
 
@@ -1532,38 +1602,69 @@ impl SnapshotManager {
         let object_path = self.snapshot_uri_to_object_path(&entry.snapshot)?;
         let path_display = object_path.to_string();
 
-        let get_result = self
-            .object_store
-            .get(&object_path)
-            .await
-            .map_err(|source| SnapshotDownloadError::Download {
-                path: path_display.clone(),
-                source,
-            })?;
+        // Retry the network portion (get + download stream) with backoff
+        let (actual_size, actual_checksum) = retry(
+            RetryBackoffBuilder::new()
+                .max_retries(Some(NETWORK_RETRY_MAX))
+                .build(),
+            || async {
+                let get_result = self
+                    .object_store
+                    .get(&object_path)
+                    .await
+                    .map_err(|source| {
+                        tracing::warn!(
+                            "Transient error downloading snapshot, retrying. dataset={} snapshot={} error={source}",
+                            self.dataset_name,
+                            entry.snapshot,
+                        );
+                        RetryError::transient(SnapshotDownloadError::Download {
+                            path: path_display.clone(),
+                            source,
+                        })
+                    })?;
 
-        tracing::debug!(
-            dataset = %self.dataset_name,
-            snapshot = %entry.snapshot,
-            snapshot_id = entry.snapshot_id,
-            sha = %entry.snapshot_checksum,
-            "Downloading snapshot"
-        );
+                tracing::debug!(
+                    dataset = %self.dataset_name,
+                    snapshot = %entry.snapshot,
+                    snapshot_id = entry.snapshot_id,
+                    sha = %entry.snapshot_checksum,
+                    "Downloading snapshot"
+                );
 
-        let (actual_size, actual_checksum) = match &self.layout {
-            AccelerationLayout::None => {
-                return Err(SnapshotDownloadError::SnapshotDisabled {
-                    dataset: self.dataset_name.clone(),
-                });
-            }
-            AccelerationLayout::File { path } => {
-                self.download_to_file(path, get_result, entry, &path_display)
-                    .await?
-            }
-            AccelerationLayout::Directories { dirs } => {
-                self.download_to_directories(dirs, get_result, entry, &path_display)
-                    .await?
-            }
-        };
+                let result = match &self.layout {
+                    AccelerationLayout::None => {
+                        return Err(RetryError::permanent(
+                            SnapshotDownloadError::SnapshotDisabled {
+                                dataset: self.dataset_name.clone(),
+                            },
+                        ));
+                    }
+                    AccelerationLayout::File { path } => {
+                        self.download_to_file(path, get_result, entry, &path_display)
+                            .await
+                    }
+                    AccelerationLayout::Directories { dirs } => {
+                        self.download_to_directories(dirs, get_result, entry, &path_display)
+                            .await
+                    }
+                };
+
+                result.map_err(|err| match &err {
+                    SnapshotDownloadError::Download { .. }
+                    | SnapshotDownloadError::DownloadBytes { .. } => {
+                        tracing::warn!(
+                            "Transient error during snapshot download stream, retrying. dataset={} snapshot={} error={err}",
+                            self.dataset_name,
+                            entry.snapshot,
+                        );
+                        RetryError::transient(err)
+                    }
+                    _ => RetryError::permanent(err),
+                })
+            },
+        )
+        .await?;
 
         let checkpointer = (checkpointer_factory)()
             .await
@@ -1991,8 +2092,7 @@ impl SnapshotManager {
             let payload = PutPayload::from(serialized);
 
             match self
-                .object_store
-                .put_opts(&metadata_path, payload.clone(), put_mode.clone().into())
+                .put_opts_with_retry(&metadata_path, payload.clone(), put_mode.clone())
                 .await
             {
                 Ok(_) => return Ok(()),
@@ -2003,8 +2103,7 @@ impl SnapshotManager {
                     if matches!(put_mode, PutMode::Update(_)) =>
                 {
                     match self
-                        .object_store
-                        .put_opts(&metadata_path, payload, PutMode::Overwrite.into())
+                        .put_opts_with_retry(&metadata_path, payload, PutMode::Overwrite)
                         .await
                     {
                         Ok(_) => return Ok(()),
@@ -2139,14 +2238,75 @@ impl SnapshotManager {
         })
     }
 
-    /// Checks if a snapshot exists in the object store.
+    /// Wraps `object_store.put_opts()` with retry for transient network errors.
+    ///
+    /// Non-retriable errors (`NotFound`, `AlreadyExists`, `Precondition`, `NotSupported`)
+    /// are returned immediately so callers can handle them (e.g., OCC retry loops).
+    async fn put_opts_with_retry(
+        &self,
+        path: &ObjectPath,
+        payload: PutPayload,
+        put_mode: PutMode,
+    ) -> Result<object_store::PutResult, object_store::Error> {
+        let mut backoff = RetryBackoffBuilder::new()
+            .max_retries(Some(NETWORK_RETRY_MAX))
+            .build();
+
+        loop {
+            match self
+                .object_store
+                .put_opts(path, payload.clone(), put_mode.clone().into())
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    if is_retriable_object_store_error(&err)
+                        && let Some(duration) = backoff.next_duration()
+                    {
+                        tracing::warn!(
+                            "Transient error writing to object store, retrying. dataset={} path={path} error={err}",
+                            self.dataset_name,
+                        );
+                        tokio::time::sleep(duration).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Checks if a snapshot exists in the object store, with retry for transient errors.
     async fn snapshot_exists(&self, snapshot_uri: &str) -> bool {
         let Ok(object_path) = self.snapshot_uri_to_object_path(snapshot_uri) else {
             return false;
         };
 
-        // Use head() for a lightweight existence check without downloading content
-        self.object_store.head(&object_path).await.is_ok()
+        let mut backoff = RetryBackoffBuilder::new()
+            .max_retries(Some(NETWORK_RETRY_MAX))
+            .build();
+
+        loop {
+            match self.object_store.head(&object_path).await {
+                Ok(_) => return true,
+                Err(object_store::Error::NotFound { .. }) => return false,
+                Err(err) => {
+                    if let Some(duration) = backoff.next_duration() {
+                        tracing::warn!(
+                            "Transient error checking snapshot existence, retrying. dataset={} path={object_path} error={err}",
+                            self.dataset_name,
+                        );
+                        tokio::time::sleep(duration).await;
+                    } else {
+                        tracing::warn!(
+                            "Failed to check snapshot existence after retries. dataset={} path={object_path} error={err}",
+                            self.dataset_name,
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
     }
 
     /// Compacts dataset metadata by removing entries whose snapshot files no longer
@@ -2333,8 +2493,7 @@ impl SnapshotManager {
             let payload = PutPayload::from(serialized);
 
             match self
-                .object_store
-                .put_opts(&metadata_path, payload.clone(), put_mode.clone().into())
+                .put_opts_with_retry(&metadata_path, payload.clone(), put_mode.clone())
                 .await
             {
                 Ok(_) => return Ok(()),
@@ -2346,8 +2505,7 @@ impl SnapshotManager {
                 {
                     // Object store doesn't support conditional updates, fall back to overwrite
                     match self
-                        .object_store
-                        .put_opts(&metadata_path, payload, PutMode::Overwrite.into())
+                        .put_opts_with_retry(&metadata_path, payload, PutMode::Overwrite)
                         .await
                     {
                         Ok(_) => return Ok(()),
