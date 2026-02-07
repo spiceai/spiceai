@@ -55,6 +55,20 @@ pub fn track_query_count(dimensions: &[KeyValue]) {
         .add(1, dimensions);
 }
 
+/// Register the query counter instrument so it appears in the initial export
+/// without recording a phantom count.
+pub fn register_query_counter(dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    QUERY_COUNT
+        .get_or_init(|| {
+            m.u64_counter("query_executions")
+                .with_description("Number of query executions.")
+                .with_unit("queries")
+                .build()
+        })
+        .add(0, dimensions);
+}
+
 static QUERY_ACTIVE_COUNT: OnceLock<UpDownCounter<i64>> = OnceLock::new();
 
 pub fn inc_query_active_count(dimensions: &[KeyValue]) {

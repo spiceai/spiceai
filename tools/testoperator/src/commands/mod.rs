@@ -134,9 +134,8 @@ pub(crate) async fn run_or_connect_spiced(
 pub(crate) async fn get_app_and_start_request(
     args: &CommonArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
-    if !args.metrics {
-        // METER is OnceLock-based: when left uninitialized, all metric ops are no-ops.
-    }
+    // When metrics are disabled, no Telemetry is created, so METER_PROVIDER_ONCE
+    // remains unset and all metric operations are no-ops.
 
     let mut spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
     let mut app_builder = AppBuilder::new(spicepod.name.clone()).with_spicepod(spicepod.clone());

@@ -154,7 +154,7 @@ pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
 
     // Register the query counter so it appears in the initial export.
     // Recording 0 avoids phantom counts while still registering the instrument.
-    crate::track_query_count(&[]);
+    crate::register_query_counter(&[]);
 
     let mut rm = ResourceMetrics::default();
 
@@ -185,16 +185,16 @@ mod tests {
 
     #[test]
     fn test_usize_to_i64_telemetry_max_i64() {
-        #[expect(clippy::cast_sign_loss)]
-        let max_i64_as_usize = i64::MAX as usize;
+        let max_i64_as_usize = usize::try_from(i64::MAX).expect("i64::MAX fits in usize on 64-bit");
         assert_eq!(usize_to_i64_telemetry(max_i64_as_usize, "test"), i64::MAX);
     }
 
     #[test]
     fn test_usize_to_i64_telemetry_overflow_clamps() {
         // Values above i64::MAX should clamp to i64::MAX
-        #[expect(clippy::cast_sign_loss)]
-        let overflow_value = (i64::MAX as usize).saturating_add(1);
+        let overflow_value = usize::try_from(i64::MAX)
+            .expect("i64::MAX fits in usize on 64-bit")
+            .saturating_add(1);
         assert_eq!(
             usize_to_i64_telemetry(overflow_value, "test"),
             i64::MAX,

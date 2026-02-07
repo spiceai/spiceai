@@ -16,7 +16,7 @@ limitations under the License.
 
 pub mod streaming;
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -47,15 +47,23 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 
 /// The global meter for benchmark telemetry.
 ///
-/// Resolves from `METER_PROVIDER_ONCE` if set, otherwise falls back to a noop meter.
-/// The testoperator is a sequential CLI tool, so the `LazyLock` resolution race
-/// that affects the concurrent runtime does not apply here.
-pub static METER: LazyLock<Meter> = LazyLock::new(|| {
-    METER_PROVIDER_ONCE.get().map_or_else(
-        || NoopMeterProvider::new().meter("benchmarks_telemetry"),
-        |p| p.meter("benchmarks_telemetry"),
-    )
-});
+/// Initialized explicitly by [`Telemetry::new_with_resource()`] or
+/// [`Telemetry::with_otlp_resource()`] after the provider is set.
+/// Using `OnceLock` prevents the ordering issue where early access
+/// with `LazyLock` would permanently lock the meter to a noop provider.
+///
+/// When metrics are disabled and `METER` is never initialized, all
+/// metric operations fall through to noop via the `meter()` helper.
+pub static METER: OnceLock<Meter> = OnceLock::new();
+
+/// Returns the initialized meter, or a noop meter if not yet initialized.
+#[must_use]
+pub fn meter() -> Meter {
+    METER
+        .get()
+        .cloned()
+        .unwrap_or_else(|| NoopMeterProvider::new().meter("benchmarks_telemetry"))
+}
 
 #[derive(Debug, Clone)]
 pub struct OtlpExporterConfig {
@@ -105,6 +113,9 @@ impl Telemetry {
             println!("Telemetry disabled");
         }
 
+        // Initialize METER after the provider is set to avoid binding to a noop meter.
+        let _ = METER.set(provider.meter("benchmarks_telemetry"));
+
         let api_key = std::env::var(api_key_name)
             .ok()
             .as_deref()
@@ -141,6 +152,9 @@ impl Telemetry {
         if !setup {
             println!("Telemetry disabled");
         }
+
+        // Initialize METER after the provider is set to avoid binding to a noop meter.
+        let _ = METER.set(provider.meter("benchmarks_telemetry"));
 
         Self {
             reader,
