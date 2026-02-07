@@ -361,9 +361,9 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "509
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "330a4d790b892dd6be23b71589ec60b620bf29f5" } # spiceai-51
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "68afffbdb36e056cb5ad0cef0830c6ef6f04e859" }      # spiceai-51
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "68afffbdb36e056cb5ad0cef0830c6ef6f04e859" } # spiceai-51
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "68afffbdb36e056cb5ad0cef0830c6ef6f04e859" } # spiceai-51
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "56225b2a66868462d4f75a7881490118c43db9b6" }      # spiceai-51
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "56225b2a66868462d4f75a7881490118c43db9b6" } # spiceai-51
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "56225b2a66868462d4f75a7881490118c43db9b6" } # spiceai-51
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
