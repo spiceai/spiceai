@@ -148,8 +148,11 @@ macro_rules! register_data_connector {
 }
 
 pub mod abfs;
+#[cfg(feature = "debezium")]
 pub mod debezium;
+#[cfg(feature = "duckdb")]
 pub mod ducklake;
+#[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
 
