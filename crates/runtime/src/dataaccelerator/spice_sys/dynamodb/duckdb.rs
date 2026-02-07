@@ -60,21 +60,29 @@ impl DynamoDBSys {
         &self,
         pool: &Arc<DuckDbConnectionPool>,
     ) -> Option<DynamoDBCheckpointMetadata> {
+        use std::time::{Duration, UNIX_EPOCH};
+
         let mut db_conn = Arc::clone(pool).connect_sync().ok()?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
             .ok()?
             .get_underlying_conn_mut();
 
         let query = format!(
-            "SELECT checkpoint_data FROM {DYNAMODB_STREAMS_TABLE_NAME} WHERE dataset_name = ?"
+            "SELECT checkpoint_data, epoch(updated_at) FROM {DYNAMODB_STREAMS_TABLE_NAME} WHERE dataset_name = ?"
         );
         let mut stmt = duckdb_conn.prepare(&query).ok()?;
         let mut rows = stmt.query([&self.dataset_name]).ok()?;
 
         if let Some(row) = rows.next().ok()? {
             let checkpoint_data: String = row.get(0).ok()?;
+            let updated_at_epoch: Option<f64> = row.get(1).ok();
+            let updated_at = updated_at_epoch
+                .and_then(|epoch| UNIX_EPOCH.checked_add(Duration::from_secs_f64(epoch)));
 
-            Some(DynamoDBCheckpointMetadata { checkpoint_data })
+            Some(DynamoDBCheckpointMetadata {
+                checkpoint_data,
+                updated_at,
+            })
         } else {
             None
         }

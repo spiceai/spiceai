@@ -234,20 +234,13 @@ impl TableProvider for FederatedTaskHistoryTable {
 
         // Execute local query directly on the stored table provider
         let local_table = Arc::clone(&self.local_table);
-        let local_projection = projection.cloned();
         let local_filters: Vec<Expr> = filters.to_vec();
         let local_limit = limit;
 
-        // We need to clone the state for the local query
-        // Since Session is not Clone, we'll execute the local query inline
-        let local_result = Self::query_local(
-            local_table,
-            state,
-            local_projection.as_ref(),
-            &local_filters,
-            local_limit,
-        )
-        .await;
+        // Query local batches with the full schema and apply projection once after
+        // federating local + peer results.
+        let local_result =
+            Self::query_local(local_table, state, None, &local_filters, local_limit).await;
 
         // Wait for all peer results
         let peer_results = join_all(peer_futures).await;
@@ -276,20 +269,14 @@ impl TableProvider for FederatedTaskHistoryTable {
             )));
         }
 
-        // Build the execution plan from the collected batches
+        // Build the execution plan from the collected batches. Keep the source
+        // schema unprojected and let MemorySourceConfig apply projection once.
         let schema = Arc::clone(&self.schema);
 
-        // Apply projection if specified
-        let projected_schema = if let Some(proj) = projection {
-            Arc::new(schema.project(proj)?)
-        } else {
-            schema
-        };
-
         let memory_source = if all_batches.is_empty() {
-            MemorySourceConfig::try_new(&[], projected_schema, projection.cloned())?
+            MemorySourceConfig::try_new(&[], Arc::clone(&schema), projection.cloned())?
         } else {
-            MemorySourceConfig::try_new(&[all_batches], projected_schema, projection.cloned())?
+            MemorySourceConfig::try_new(&[all_batches], schema, projection.cloned())?
         };
 
         let exec = DataSourceExec::new(Arc::new(memory_source));
@@ -347,6 +334,11 @@ fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
 
     #[test]
     fn test_normalize_scheduler_endpoint() {
@@ -412,5 +404,74 @@ mod tests {
             build_peer_sql(table_ref, &[filter1, filter2], None),
             "SELECT * FROM \"runtime\".\"task_history\" WHERE status = Utf8(\"running\") AND execution_time > Int32(100)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_sparse_projection_does_not_double_project_local_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col0", DataType::Utf8, false),
+            Field::new("col1", DataType::Utf8, false),
+            Field::new("col2", DataType::Utf8, false),
+            Field::new("col3", DataType::Utf8, false),
+            Field::new("col4", DataType::Utf8, false),
+            Field::new("col5", DataType::Utf8, false),
+            Field::new("col6", DataType::Utf8, false),
+            Field::new("col7", DataType::Utf8, false),
+            Field::new("col8", DataType::Utf8, false),
+            Field::new("col9", DataType::Utf8, false),
+            Field::new("col10", DataType::Utf8, false),
+        ]));
+
+        let columns: Vec<ArrayRef> = (0..11)
+            .map(|i| Arc::new(StringArray::from(vec![format!("value_{i}")])) as ArrayRef)
+            .collect();
+
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+            .expect("record batch with full schema should build");
+        let local_table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+            .expect("local memtable should build");
+
+        let table = FederatedTaskHistoryTable::new(
+            Arc::clone(&schema),
+            Arc::new(local_table),
+            Arc::new(RwLock::new(SchedulerPeers::new())),
+            None,
+            "local-scheduler".to_string(),
+        );
+
+        let ctx = SessionContext::new();
+        let projection = vec![7, 10];
+        let plan = table
+            .scan(&ctx.state(), Some(&projection), &[], None)
+            .await
+            .expect("scan with sparse projection should succeed");
+
+        let results = collect(plan, ctx.task_ctx())
+            .await
+            .expect("collecting projected federated results should succeed");
+
+        assert_eq!(results.len(), 1, "expected a single result batch");
+        assert_eq!(results[0].num_rows(), 1, "expected one row in result batch");
+        assert_eq!(
+            results[0].schema().fields().len(),
+            2,
+            "projection should return exactly two columns"
+        );
+        assert_eq!(results[0].schema().field(0).name(), "col7");
+        assert_eq!(results[0].schema().field(1).name(), "col10");
+
+        let projected_col_0 = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("projected column 0 should be a StringArray");
+        let projected_col_1 = results[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("projected column 1 should be a StringArray");
+
+        assert_eq!(projected_col_0.value(0), "value_7");
+        assert_eq!(projected_col_1.value(0), "value_10");
     }
 }

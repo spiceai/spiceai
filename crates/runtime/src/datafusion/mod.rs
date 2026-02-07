@@ -101,7 +101,7 @@ use spicepod::acceleration::SnapshotsTrigger;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
@@ -1154,9 +1154,11 @@ impl DataFusion {
             // For append refreshes that rely on a time column (i.e. file-based appends) that have
             // snapshotting enabled, we delay readiness until the first refresh completes so that
             // the append window is initialized with newly ingested data rather than pre-existing checkpoint files.
+            // Additionally, for CDC we let connector/stream to decide when dataset is ready.
             let delay_initial_ready = matches!(refresh_mode, RefreshMode::Append)
                 && dataset.time_column.is_some()
-                && acceleration_settings.snapshot_behavior.bootstrap_enabled();
+                && acceleration_settings.snapshot_behavior.bootstrap_enabled()
+                || matches!(refresh_mode, RefreshMode::Changes);
 
             if !delay_initial_ready {
                 self.runtime_status
@@ -1207,17 +1209,21 @@ impl DataFusion {
             .validate_time_format(dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
+        // Create the accelerator write mutex early so it can be shared between the DataConnector, Refresher and the AcceleratedTable.
+        let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
         let mut accelerated_table_builder = AcceleratedTable::builder(
             Arc::clone(&self.runtime_status),
             dataset.name.clone(),
             Arc::clone(&source_table_provider),
             dataset.source().to_string(),
-            accelerated_table_provider,
+            Arc::clone(&accelerated_table_provider),
             refresh,
             self.io_runtime.clone(),
         );
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
+        accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
 
         let retention_delete_expr = match dataset.retention_sql() {
             Some(retention_sql) => {
@@ -1347,7 +1353,12 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
-            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
+            let changes_stream = source.changes_stream(
+                Arc::clone(&source_table_provider),
+                dataset,
+                Arc::clone(&accelerated_table_provider),
+                Arc::clone(&accelerator_write_mutex),
+            );
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);

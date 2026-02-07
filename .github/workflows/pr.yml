@@ -227,7 +227,7 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
