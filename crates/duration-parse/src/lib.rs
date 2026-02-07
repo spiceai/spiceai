@@ -395,8 +395,16 @@ fn multiply_to_nanos(number: ParsedNumber, unit_nanos: u64) -> u128 {
 
     let frac_nanos = if number.frac_digits > 0 && number.frac_value > 0 {
         // frac_value / 10^frac_digits * unit_nanos
-        let denominator = 10u128.pow(number.frac_digits);
-        (u128::from(number.frac_value) * u128::from(unit_nanos)) / denominator
+        // Use checked arithmetic to avoid overflow and division-by-zero.
+        let denominator = match 10u128.checked_pow(number.frac_digits) {
+            Some(d) if d != 0 => d,
+            _ => return integer_nanos,
+        };
+
+        u128::from(number.frac_value)
+            .checked_mul(u128::from(unit_nanos))
+            .and_then(|numerator| numerator.checked_div(denominator))
+            .unwrap_or_default()
     } else {
         0
     };
@@ -719,5 +727,15 @@ mod tests {
                 parse_duration(input).unwrap_or_else(|e| panic!("Failed to parse '{input}': {e}"));
             assert!(parsed > Duration::ZERO, "'{input}' should be positive");
         }
+    }
+
+    #[test]
+    fn test_extreme_fractional_precision_does_not_panic() {
+        // A very large number of fractional digits should not panic due to
+        // 10u128.pow() overflow. The parser gracefully falls back to the integer part.
+        let huge_frac = format!("1.{}s", "0".repeat(200));
+        let result = parse_duration(&huge_frac);
+        // Should succeed (fractional contribution is effectively zero)
+        assert_eq!(result.expect("extreme precision"), Duration::from_secs(1));
     }
 }

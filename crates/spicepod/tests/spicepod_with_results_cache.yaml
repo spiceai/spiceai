@@ -1,8 +1,7 @@
 version: v1
 kind: Spicepod
-name: spicepod_with_only_search_results
+name: spicepod_with_results_cache
 runtime:
-  caching:
-    sql_results:
-      enabled: true
-      item_ttl: 1s
+  results_cache:
+    enabled: true
+    item_ttl: 1s

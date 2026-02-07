@@ -19,8 +19,8 @@ use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
 use super::{
-    caching::{Caching, ResultsCache},
-    default_true, is_default, is_default_or_none,
+    caching::{Caching, ResultsCache, SQLResultsCacheConfig},
+    default_true, is_default,
 };
 use crate::metric::Metrics;
 use crate::param::Params;
@@ -669,7 +669,7 @@ pub struct Scheduler {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeDeserializer {
-    #[serde(default, skip_serializing_if = "is_default_or_none")]
+    #[serde(default)]
     #[deprecated(since = "2.0.0", note = "Use `runtime.caching.sql_results` instead.")]
     pub results_cache: Option<ResultsCache>,
     #[serde(default, skip_serializing_if = "is_default")]
@@ -763,8 +763,13 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             tracing::warn!(
                 "`runtime.results_cache` is deprecated, use `runtime.caching.sql_results` instead"
             );
-            // Only apply if caching.sql_results wasn't explicitly set (prefer the new field)
-            if caching.sql_results.is_none() {
+            // Only apply if caching.sql_results wasn't explicitly set (prefer the new field).
+            // When `caching` is absent from YAML, serde uses `Caching::default()` which
+            // populates sql_results with `Some(SQLResultsCacheConfig::default())`. We also
+            // check against the default to detect this case and apply the deprecated value.
+            if caching.sql_results.is_none()
+                || caching.sql_results.as_ref() == Some(&SQLResultsCacheConfig::default())
+            {
                 caching.sql_results = Some(results_cache.into());
             }
         }
@@ -1628,5 +1633,43 @@ mod tests {
             .expect("otel_exporter should be present");
         assert_eq!(otel_config.endpoint, "otel-collector:4317");
         assert_eq!(otel_config.push_interval, "45s");
+    }
+
+    #[test]
+    fn test_results_cache_backward_compat_migration() {
+        // Test that deprecated `results_cache` is migrated to `caching.sql_results`
+        let yaml = r"
+            results_cache:
+                enabled: true
+                item_ttl: 5s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let sql_results = runtime
+            .caching
+            .sql_results
+            .expect("sql_results should be migrated from results_cache");
+        assert!(sql_results.enabled);
+        assert_eq!(sql_results.item_ttl, Some("5s".to_string()));
+
+        // Test that `caching.sql_results` takes priority over deprecated `results_cache`
+        let yaml = r"
+            results_cache:
+                enabled: false
+                item_ttl: 10s
+            caching:
+                sql_results:
+                    enabled: true
+                    item_ttl: 30s
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let sql_results = runtime
+            .caching
+            .sql_results
+            .expect("sql_results should be present");
+        assert!(
+            sql_results.enabled,
+            "caching.sql_results should take priority"
+        );
+        assert_eq!(sql_results.item_ttl, Some("30s".to_string()));
     }
 }
