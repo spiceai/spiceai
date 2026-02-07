@@ -61,7 +61,7 @@ pub fn spawn_snapshot_interval_task(
     dataset_name: TableReference,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
-    bootstrap_status: crate::dataaccelerator::BootstrapStatus,
+    _bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
