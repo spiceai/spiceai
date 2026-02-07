@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 mod credential_provider;
-use std::{sync::Arc, time::Duration};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
-use aws_config::{BehaviorVersion, SdkConfig};
+use aws_config::{AppName, BehaviorVersion, SdkConfig};
 use aws_credential_types::provider::error::CredentialsError;
 use aws_sdk_s3::{config::ProvideCredentials, error::ConnectorError};
 use aws_smithy_runtime_api::client::runtime_components::BuildError;
@@ -26,6 +27,27 @@ use object_store::{ObjectStore, aws::AmazonS3Builder, client::SpawnedReqwestConn
 use tokio::{runtime::Handle, sync::OnceCell, time::sleep};
 use url::Url;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
+
+/// The APN user-agent string for Spice.
+///
+/// This is set on all AWS SDK configurations to identify Spice as an AWS Partner Network (APN)
+/// application in the user-agent header of AWS API requests.
+///
+/// The `AppName::new` call is infallible for this input: the name contains only alphanumeric
+/// characters plus `.` and `-`, all of which are permitted.
+static APN_APP_NAME: LazyLock<AppName> = LazyLock::new(|| {
+    let version = env!("CARGO_PKG_VERSION");
+    match AppName::new(format!("Spice-{version}")) {
+        Ok(name) => name,
+        Err(_) => unreachable!("Spice version string should always be a valid AppName"),
+    }
+});
+
+/// Returns the APN [`AppName`] for Spice, suitable for use in AWS SDK configurations.
+#[must_use]
+pub fn apn_app_name() -> &'static AppName {
+    &APN_APP_NAME
+}
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
@@ -63,13 +85,14 @@ pub enum LoadError {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Returns a default AWS SDK configuration with the latest behavior version.
+/// Returns a default AWS SDK configuration with the latest behavior version and
+/// the Spice APN user-agent.
 ///
 /// This is a convenience function to ensure all AWS SDK configuration uses
-/// the same behavior version consistently across the codebase.
+/// the same behavior version and APN identification consistently across the codebase.
 #[must_use]
 pub fn default_aws_config() -> aws_config::ConfigLoader {
-    aws_config::defaults(BehaviorVersion::v2025_08_07())
+    aws_config::defaults(BehaviorVersion::v2025_08_07()).app_name(APN_APP_NAME.clone())
 }
 
 static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();
@@ -666,6 +689,28 @@ mod tests {
         assert_eq!(
             config.region().map(std::convert::AsRef::as_ref),
             Some("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn test_apn_app_name_is_valid() {
+        let name: &AppName = &APN_APP_NAME;
+        let name_str: &str = name.as_ref();
+        assert!(
+            name_str.starts_with("Spice-"),
+            "APN app name should start with 'Spice-', got: {name_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_aws_config_includes_app_name() {
+        let config = default_aws_config().load().await;
+        let app_name = config.app_name();
+        assert!(app_name.is_some(), "default_aws_config should set app_name");
+        let name_str: &str = app_name.expect("already asserted").as_ref();
+        assert!(
+            name_str.starts_with("Spice-"),
+            "APN app name should start with 'Spice-', got: {name_str}"
         );
     }
 }
