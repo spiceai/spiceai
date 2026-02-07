@@ -222,7 +222,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_cron_cannot_go_faster_than_second() {
-        let cron_expression = "* * * * * * *".into(); // expression attempting to run every millisecond
+        // With Year::Optional, "* * * * * * *" (7 fields) is valid cron that runs every
+        // second of every year. An 8-field expression, however, should be invalid.
+        let cron_expression = "* * * * * * * *".into();
         let channel = CronRequestChannel::new(&cron_expression);
         assert!(channel.is_err(), "Cron expression should be invalid");
     }
