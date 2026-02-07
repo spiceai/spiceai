@@ -138,7 +138,7 @@ fn parse_compound_duration(input: &str) -> Result<Duration, ParseError> {
         // Parse unit suffix
         let (unit_nanos, rest) = parse_time_unit(rest);
 
-        let nanos = multiply_to_nanos(number, unit_nanos)?;
+        let nanos = multiply_to_nanos(number, unit_nanos);
         total = total.saturating_add(nanos_to_duration(nanos));
         parsed_any = true;
         remaining = rest;
@@ -160,11 +160,11 @@ struct ParsedNumber {
     integer: u64,
     /// The fractional part as a count of digits after the decimal point.
     frac_digits: u32,
-    /// The fractional part numerator (e.g., for "1.5", frac_value=5, frac_digits=1).
+    /// The fractional part numerator (e.g., for "1.5", `frac_value=5`, `frac_digits=1`).
     frac_value: u64,
 }
 
-/// Parse a number from the start of the string, returning (parsed_number, remaining).
+/// Parse a number from the start of the string, returning (`parsed_number`, remaining).
 fn parse_number(input: &str) -> Result<(ParsedNumber, &str), ParseError> {
     let bytes = input.as_bytes();
     if bytes.is_empty() {
@@ -189,7 +189,7 @@ fn parse_number(input: &str) -> Result<(ParsedNumber, &str), ParseError> {
         while pos < bytes.len() && bytes[pos].is_ascii_digit() {
             pos += 1;
         }
-        frac_digits = (pos - frac_start) as u32;
+        frac_digits = u32::try_from(pos - frac_start).unwrap_or(u32::MAX);
         if frac_digits > 0 {
             frac_value = input[frac_start..pos]
                 .parse::<u64>()
@@ -285,7 +285,7 @@ fn apply_exponent(
         full_str.push('.');
         // Pad with leading zeros if needed
         let frac_str = frac_value.to_string();
-        for _ in 0..frac_digits.saturating_sub(frac_str.len() as u32) {
+        for _ in 0..frac_digits.saturating_sub(u32::try_from(frac_str.len()).unwrap_or(u32::MAX)) {
             full_str.push('0');
         }
         full_str.push_str(&frac_str);
@@ -301,20 +301,25 @@ fn apply_exponent(
             "Negative durations are not supported",
         ));
     }
-    if multiplied.is_infinite() || multiplied > u64::MAX as f64 {
+    #[expect(clippy::cast_precision_loss)]
+    let max_f64 = u64::MAX as f64;
+    if multiplied.is_infinite() || multiplied > max_f64 {
         return Ok((u64::MAX, 0, 0, &input[pos..]));
     }
 
+    // SAFETY: multiplied is checked to be non-negative and within u64 range above
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let new_integer = multiplied.trunc() as u64;
     let frac_part = multiplied.fract();
     // Preserve up to 9 decimal digits (nanosecond precision)
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let new_frac_value = (frac_part * 1_000_000_000.0).round() as u64;
     let new_frac_digits = 9;
 
     Ok((new_integer, new_frac_value, new_frac_digits, &input[pos..]))
 }
 
-/// Parse a time unit suffix, returning (nanoseconds_per_unit, remaining_input).
+/// Parse a time unit suffix, returning (`nanoseconds_per_unit`, `remaining_input`).
 /// If no unit is found, defaults to seconds.
 fn parse_time_unit(input: &str) -> (u64, &str) {
     // Order matters: try longest prefixes first to avoid ambiguity (e.g., "ms" before "m")
@@ -350,7 +355,7 @@ fn parse_time_unit(input: &str) -> (u64, &str) {
 }
 
 /// Multiply a parsed number by nanoseconds-per-unit without floating point loss.
-fn multiply_to_nanos(number: ParsedNumber, unit_nanos: u64) -> Result<u128, ParseError> {
+fn multiply_to_nanos(number: ParsedNumber, unit_nanos: u64) -> u128 {
     let integer_nanos = u128::from(number.integer) * u128::from(unit_nanos);
 
     let frac_nanos = if number.frac_digits > 0 && number.frac_value > 0 {
@@ -361,18 +366,18 @@ fn multiply_to_nanos(number: ParsedNumber, unit_nanos: u64) -> Result<u128, Pars
         0
     };
 
-    Ok(integer_nanos + frac_nanos)
+    integer_nanos + frac_nanos
 }
 
-/// Convert nanoseconds to Duration, saturating at Duration::MAX.
+/// Convert nanoseconds to Duration, saturating at `Duration::MAX`.
 fn nanos_to_duration(nanos: u128) -> Duration {
     let secs = nanos / 1_000_000_000;
     let subsec_nanos = (nanos % 1_000_000_000) as u32;
 
-    if secs > u64::MAX as u128 {
-        Duration::MAX
+    if let Ok(secs) = u64::try_from(secs) {
+        Duration::new(secs, subsec_nanos)
     } else {
-        Duration::new(secs as u64, subsec_nanos)
+        Duration::MAX
     }
 }
 
@@ -522,7 +527,7 @@ mod tests {
         );
         assert_eq!(
             parse_duration("1w").expect("1w"),
-            Duration::from_secs(604800)
+            Duration::from_secs(604_800)
         );
         assert_eq!(
             parse_duration("500ms").expect("500ms"),
@@ -590,7 +595,7 @@ mod tests {
             parse_duration("+10s").expect("+10s"),
             Duration::from_secs(10)
         );
-        assert!(parse_duration("-10s").is_err());
+        parse_duration("-10s").expect_err("negative duration should fail");
     }
 
     #[test]
@@ -622,9 +627,9 @@ mod tests {
 
     #[test]
     fn test_parse_errors() {
-        assert!(parse_duration("").is_err());
-        assert!(parse_duration("abc").is_err());
-        assert!(parse_duration("-5s").is_err());
+        parse_duration("").expect_err("empty string should fail");
+        parse_duration("abc").expect_err("non-numeric input should fail");
+        parse_duration("-5s").expect_err("negative duration should fail");
     }
 
     #[test]
@@ -643,7 +648,7 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(3661)), "1h 1m 1s");
         assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
         assert_eq!(
-            format_duration(Duration::from_secs(86400 + 3600 + 60 + 1)),
+            format_duration(Duration::from_secs(86_400 + 3600 + 60 + 1)),
             "1d 1h 1m 1s"
         );
     }
@@ -658,9 +663,9 @@ mod tests {
 
     #[test]
     fn test_format_weeks() {
-        assert_eq!(format_duration(Duration::from_secs(604800)), "1w");
+        assert_eq!(format_duration(Duration::from_secs(604_800)), "1w");
         assert_eq!(
-            format_duration(Duration::from_secs(604800 + 86400)),
+            format_duration(Duration::from_secs(604_800 + 86_400)),
             "1w 1d"
         );
     }

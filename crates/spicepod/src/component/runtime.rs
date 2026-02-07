@@ -19,8 +19,8 @@ use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
 use super::{
-    caching::{Caching, ResultsCache, SQLResultsCacheConfig},
-    default_true, is_default,
+    caching::{Caching, ResultsCache},
+    default_true, is_default, is_default_or_none,
 };
 use crate::metric::Metrics;
 use crate::param::Params;
@@ -449,8 +449,8 @@ impl TaskHistory {
             return Ok(None);
         };
 
-        let duration =
-            duration_parse::parse_duration(min_plan_duration.as_ref()).map_err(|e| e.to_string())?;
+        let duration = duration_parse::parse_duration(min_plan_duration.as_ref())
+            .map_err(|e| e.to_string())?;
 
         Ok(Some(duration.as_secs_f64() * 1000.0))
     }
@@ -764,9 +764,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
                 "`runtime.results_cache` is deprecated, use `runtime.caching.sql_results` instead"
             );
             // Only apply if caching.sql_results wasn't explicitly set (prefer the new field)
-            if caching.sql_results.is_none()
-                || caching.sql_results == Some(SQLResultsCacheConfig::default())
-            {
+            if caching.sql_results.is_none() {
                 caching.sql_results = Some(results_cache.into());
             }
         }

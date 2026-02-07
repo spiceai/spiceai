@@ -178,20 +178,26 @@ mod tests {
         // Create test App instances
         let app_with_plan = AppBuilder::new("app_with_plan")
             .with_runtime(spicepod::component::runtime::Runtime {
-                results_cache: Some(spicepod::component::caching::ResultsCache {
-                    cache_key_type: spicepod::component::caching::CacheKeyType::Plan,
+                caching: spicepod::component::caching::Caching {
+                    sql_results: Some(spicepod::component::caching::SQLResultsCacheConfig {
+                        cache_key_type: spicepod::component::caching::CacheKeyType::Plan,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             })
             .build();
 
         let app_with_sql = AppBuilder::new("app_with_sql")
             .with_runtime(spicepod::component::runtime::Runtime {
-                results_cache: Some(spicepod::component::caching::ResultsCache {
-                    cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+                caching: spicepod::component::caching::Caching {
+                    sql_results: Some(spicepod::component::caching::SQLResultsCacheConfig {
+                        cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             })
             .build();

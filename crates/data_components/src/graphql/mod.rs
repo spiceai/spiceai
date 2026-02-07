@@ -43,7 +43,9 @@ pub enum Error {
         message: String,
     },
 
-    #[snafu(display("GraphQL JSON pointer could not be inferred. Specify a 'json_pointer' parameter in the dataset configuration."))]
+    #[snafu(display(
+        "GraphQL JSON pointer could not be inferred. Specify a 'json_pointer' parameter in the dataset configuration."
+    ))]
     NoJsonPointerFound {},
 
     #[snafu(display("Invalid GraphQL 'json_pointer': '{pointer}'"))]

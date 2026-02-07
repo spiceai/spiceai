@@ -53,7 +53,9 @@ pub enum Error {
     #[snafu(display("Failed to retrieve table schema from SQL Server"))]
     SchemaRetrieval,
 
-    #[snafu(display("Unable to retrieve schema: table '{table}' does not exist in the SQL Server database"))]
+    #[snafu(display(
+        "Unable to retrieve schema: table '{table}' does not exist in the SQL Server database"
+    ))]
     SchemaRetrievalTableNotFound { table: String },
 
     #[snafu(display("Unsupported SQL Server data type: {data_type}"))]

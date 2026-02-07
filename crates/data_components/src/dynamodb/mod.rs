@@ -53,7 +53,9 @@ pub enum Error {
     #[snafu(display("DynamoDB table '{table_name}' does not exist"))]
     TableDoesNotExist { table_name: Arc<str> },
 
-    #[snafu(display("DynamoDB table is not in 'ACTIVE' status. Verify the table status and try again."))]
+    #[snafu(display(
+        "DynamoDB table is not in 'ACTIVE' status. Verify the table status and try again."
+    ))]
     TableStatusIsNotActive,
 
     #[snafu(display("Failed to infer schema: {source}"))]

@@ -67,10 +67,14 @@ pub enum Error {
     #[snafu(display("Invalid endpoint URL '{endpoint}'. Provide a valid HTTP or HTTPS URL."))]
     InvalidEndpoint { endpoint: String },
 
-    #[snafu(display("Insecure HTTP endpoint '{endpoint}' requires 'allow_http: true' in the dataset parameters."))]
+    #[snafu(display(
+        "Insecure HTTP endpoint '{endpoint}' requires 'allow_http: true' in the dataset parameters."
+    ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 
-    #[snafu(display("Invalid AWS region '{region}'. Specify a valid AWS region (e.g., 'us-east-1')."))]
+    #[snafu(display(
+        "Invalid AWS region '{region}'. Specify a valid AWS region (e.g., 'us-east-1')."
+    ))]
     InvalidRegion { region: String },
 
     #[snafu(display("Invalid AWS region corrected to '{region}'."))]
@@ -90,10 +94,14 @@ pub enum Error {
     #[snafu(display("Missing required AWS access key. Set the 'aws_access_key_id' parameter."))]
     NoAccessKey,
 
-    #[snafu(display("Missing required AWS secret access key. Set the 'aws_secret_access_key' parameter."))]
+    #[snafu(display(
+        "Missing required AWS secret access key. Set the 'aws_secret_access_key' parameter."
+    ))]
     NoAccessSecret,
 
-    #[snafu(display("Unsupported authentication method '{method}'. Supported methods: 'key', 'iam_role', 'public'."))]
+    #[snafu(display(
+        "Unsupported authentication method '{method}'. Supported methods: 'key', 'iam_role', 'public'."
+    ))]
     UnsupportedAuthenticationMethod { method: String },
 
     #[snafu(display("Invalid {key}: {method}. Valid values are 'auto', 'metadata' and 'env'"))]

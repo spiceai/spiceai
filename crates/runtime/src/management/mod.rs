@@ -64,7 +64,9 @@ pub enum Error {
     #[snafu(display("Missing required secret: {name}. Specify a value."))]
     MissingRequiredSecret { name: String },
 
-    #[snafu(display("Dataset does not support read-write mode. Ensure the acceleration engine supports writes."))]
+    #[snafu(display(
+        "Dataset does not support read-write mode. Ensure the acceleration engine supports writes."
+    ))]
     NoReadWriteProvider {},
 
     #[snafu(display(

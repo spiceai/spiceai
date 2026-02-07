@@ -44,7 +44,9 @@ pub enum Error {
     #[snafu(display("Failed to process ClickHouse query result: no column at index {index}"))]
     NoBuilderForIndex { index: usize },
 
-    #[snafu(display("Failed to process ClickHouse query result: unsupported type '{clickhouse_type}'"))]
+    #[snafu(display(
+        "Failed to process ClickHouse query result: unsupported type '{clickhouse_type}'"
+    ))]
     FailedToDowncastBuilder { clickhouse_type: SqlType },
 
     #[snafu(display("Failed to get a row value for {clickhouse_type}: {source}"))]

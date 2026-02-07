@@ -184,7 +184,9 @@ pub enum Error {
     #[snafu(display("No acceleration connection available"))]
     NoAccelerationConnection,
 
-    #[snafu(display("Failed to process accelerated data: internal type conversion error for '{target}'"))]
+    #[snafu(display(
+        "Failed to process accelerated data: internal type conversion error for '{target}'"
+    ))]
     DowncastFailed { target: &'static str },
 
     #[snafu(display("Acceleration error: {source}"))]
