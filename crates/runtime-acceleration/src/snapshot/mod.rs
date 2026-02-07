@@ -2076,16 +2076,23 @@ impl SnapshotManager {
         let current_snapshot_id = dataset_metadata.current_snapshot_id;
         let dataset_engine = dataset_metadata.engine.clone();
 
-        // Check which snapshots actually exist in the object store (with bounded concurrency)
-        let existence_results: HashMap<u64, bool> =
-            futures::stream::iter(dataset_metadata.snapshots.iter().map(|entry| {
+        // Check which snapshots actually exist in the object store (with bounded concurrency).
+        // Eagerly collect futures into a Vec so the closure doesn't capture `&self` lazily,
+        // which would cause higher-ranked lifetime issues with axum handlers.
+        let existence_futures: Vec<_> = dataset_metadata
+            .snapshots
+            .iter()
+            .map(|entry| {
                 let snapshot_uri = entry.snapshot.clone();
                 let snapshot_id = entry.snapshot_id;
                 async move {
                     let exists = self.snapshot_exists(&snapshot_uri).await;
                     (snapshot_id, exists)
                 }
-            }))
+            })
+            .collect();
+
+        let existence_results: HashMap<u64, bool> = futures::stream::iter(existence_futures)
             .buffer_unordered(10)
             .collect()
             .await;
@@ -2158,11 +2165,15 @@ impl SnapshotManager {
             return;
         }
 
-        let existence_results: HashMap<u64, bool> = futures::stream::iter(entries_to_check)
+        let existence_futures: Vec<_> = entries_to_check
+            .into_iter()
             .map(|(id, uri)| async move {
                 let exists = self.snapshot_exists(&uri).await;
                 (id, exists)
             })
+            .collect();
+
+        let existence_results: HashMap<u64, bool> = futures::stream::iter(existence_futures)
             .buffer_unordered(10)
             .collect()
             .await;
