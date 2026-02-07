@@ -435,21 +435,26 @@ pub enum SnapshotUploadError {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SnapshotPathLayout<'a> {
     dataset_name: &'a str,
+    engine: &'a AccelerationEngine,
 }
 
 impl<'a> SnapshotPathLayout<'a> {
-    fn new(dataset_name: &'a str) -> Self {
-        Self { dataset_name }
+    fn new(dataset_name: &'a str, engine: &'a AccelerationEngine) -> Self {
+        Self {
+            dataset_name,
+            engine,
+        }
     }
 
     fn snapshot_filename(&self, instant: DateTime<Utc>) -> String {
         format!(
-            "{}_{}.db",
+            "{}_{}{}",
             self.dataset_name,
-            instant.format(SNAPSHOT_TIMESTAMP_FORMAT)
+            instant.format(SNAPSHOT_TIMESTAMP_FORMAT),
+            self.engine.snapshot_extension()
         )
     }
 
@@ -479,6 +484,36 @@ pub enum AccelerationEngine {
     Turso,
 }
 
+impl AccelerationEngine {
+    /// Returns the file extension for snapshot files of this engine type.
+    #[must_use]
+    pub fn snapshot_extension(&self) -> &'static str {
+        match self {
+            Self::Cayenne => ".cayenne",
+            #[cfg(feature = "duckdb")]
+            Self::DuckDB => ".duckdb",
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite => ".sqlite",
+            #[cfg(feature = "turso")]
+            Self::Turso => ".turso",
+        }
+    }
+}
+
+impl std::fmt::Display for AccelerationEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cayenne => write!(f, "cayenne"),
+            #[cfg(feature = "duckdb")]
+            Self::DuckDB => write!(f, "duckdb"),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite => write!(f, "sqlite"),
+            #[cfg(feature = "turso")]
+            Self::Turso => write!(f, "turso"),
+        }
+    }
+}
+
 /// Manages snapshots for a specific accelerated dataset.
 #[derive(Clone)]
 pub struct SnapshotManager {
@@ -487,6 +522,7 @@ pub struct SnapshotManager {
     snapshot_location_uri: String,
     /// The acceleration layout defining the storage paths for this accelerator.
     layout: AccelerationLayout,
+    engine: AccelerationEngine,
     snapshot_engine: Arc<dyn SnapshotEngine>,
     object_store: Arc<dyn ObjectStore>,
     bootstrap_failure_behavior: BootstrapOnFailureBehavior,
@@ -501,6 +537,7 @@ impl std::fmt::Debug for SnapshotManager {
             .field("snapshots_location", &self.snapshots_location)
             .field("snapshot_location_uri", &self.snapshot_location_uri)
             .field("layout", &self.layout)
+            .field("engine", &self.engine)
             .field(
                 "bootstrap_failure_behavior",
                 &self.bootstrap_failure_behavior,
@@ -629,7 +666,7 @@ impl SnapshotManager {
         }
 
         // Check if actual snapshot files exist in object store
-        let layout = SnapshotPathLayout::new(&self.dataset_name);
+        let layout = SnapshotPathLayout::new(&self.dataset_name, &self.engine);
         let dataset_partition = layout.dataset_partition_raw();
 
         let mut list_stream = self.object_store.list(Some(&self.snapshots_location));
@@ -737,6 +774,7 @@ impl SnapshotManager {
             snapshots_location: path,
             snapshot_location_uri,
             layout,
+            engine,
             snapshot_engine,
             object_store: store,
             checkpointer_factory: None,
@@ -824,6 +862,7 @@ impl SnapshotManager {
             snapshots_location: path,
             snapshot_location_uri,
             layout: AccelerationLayout::None,
+            engine: AccelerationEngine::Cayenne,
             snapshot_engine,
             object_store: store,
             checkpointer_factory: None,
@@ -925,7 +964,7 @@ impl SnapshotManager {
 
         let start_time = Instant::now();
         let now = Utc::now();
-        let layout = SnapshotPathLayout::new(&self.dataset_name);
+        let layout = SnapshotPathLayout::new(&self.dataset_name, &self.engine);
         let destination_location = layout.build_location(&self.snapshots_location, now);
         let timestamp_ms = now.timestamp_millis();
 
@@ -1716,16 +1755,23 @@ impl SnapshotManager {
             }
         })?;
 
-        extract_archive_with_options(
-            archive_file,
-            extract_target,
-            ExtractOptions::skip_existing(),
-        )
-        .await
-        .map_err(|source| SnapshotDownloadError::ArchiveExtract {
-            path: temp_archive_path.clone(),
-            source: std::io::Error::other(source.to_string()),
-        })?;
+        // Build prefix mappings from dirs: map archive prefixes to target directories.
+        // This ensures files archived with prefix "data/" are extracted to the actual
+        // data directory (e.g., /spice/data/my_table/) rather than a literal "data/" subdirectory.
+        let prefix_mappings: Vec<(String, PathBuf)> = dirs
+            .iter()
+            .map(|(target_dir, prefix)| (prefix.clone(), target_dir.clone()))
+            .collect();
+
+        let mut extract_options = ExtractOptions::skip_existing();
+        extract_options.prefix_mappings = Some(prefix_mappings);
+
+        extract_archive_with_options(archive_file, extract_target, extract_options)
+            .await
+            .map_err(|source| SnapshotDownloadError::ArchiveExtract {
+                path: temp_archive_path.clone(),
+                source: std::io::Error::other(source.to_string()),
+            })?;
 
         // Cleanup temp archive
         let _ = fs::remove_file(&temp_archive_path).await;
@@ -1877,6 +1923,9 @@ impl SnapshotManager {
             dataset_entry.snapshots.push(snapshot_entry);
             dataset_entry.current_snapshot_id = Some(next_snapshot_id);
 
+            // Remove metadata entries whose snapshot files no longer exist.
+            self.compact_metadata(dataset_entry).await;
+
             let serialized = serde_json::to_vec_pretty(&metadata).map_err(|source| {
                 SnapshotUploadError::UploadSerializeMetadata {
                     path: metadata_path_display.clone(),
@@ -1943,6 +1992,8 @@ impl SnapshotManager {
 
     /// Retrieves the snapshot summary for this dataset, including all available snapshots.
     ///
+    /// Only snapshots that actually exist in the object store are returned.
+    ///
     /// # Errors
     ///
     /// Returns an error if reading or parsing the metadata fails.
@@ -1975,18 +2026,56 @@ impl SnapshotManager {
         });
 
         let current_snapshot_id = dataset_metadata.current_snapshot_id;
+
+        // Check which snapshots actually exist in the object store (with bounded concurrency).
+        // Eagerly collect futures into a Vec so the closure doesn't capture `&self` lazily,
+        // which would cause higher-ranked lifetime issues with axum handlers.
+        let existence_futures: Vec<_> = dataset_metadata
+            .snapshots
+            .iter()
+            .map(|entry| {
+                let snapshot_uri = entry.snapshot.clone();
+                let snapshot_id = entry.snapshot_id;
+                async move {
+                    let exists = self.snapshot_exists(&snapshot_uri).await;
+                    (snapshot_id, exists)
+                }
+            })
+            .collect();
+
+        let existence_results: HashMap<u64, bool> = futures::stream::iter(existence_futures)
+            .buffer_unordered(10)
+            .collect()
+            .await;
+
         let snapshots: Vec<api::SnapshotInfo> = dataset_metadata
             .snapshots
             .iter()
-            .map(|entry| api::SnapshotInfo {
-                snapshot_id: entry.snapshot_id,
-                timestamp_ms: entry.timestamp_ms,
-                location: entry.snapshot.clone(),
-                checksum: entry.snapshot_checksum.clone(),
-                checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
-                size_bytes: entry.snapshot_size,
-                row_count: None, // Not stored in current metadata format
-                is_current: Some(entry.snapshot_id) == current_snapshot_id,
+            .filter_map(|entry| {
+                let exists = existence_results
+                    .get(&entry.snapshot_id)
+                    .copied()
+                    .unwrap_or(false);
+                if exists {
+                    Some(api::SnapshotInfo {
+                        snapshot_id: entry.snapshot_id,
+                        timestamp_ms: entry.timestamp_ms,
+                        location: entry.snapshot.clone(),
+                        checksum: entry.snapshot_checksum.clone(),
+                        checksum_algorithm: entry.snapshot_checksum_algorithm.clone(),
+                        size_bytes: entry.snapshot_size,
+                        row_count: None,
+                        is_current: Some(entry.snapshot_id) == current_snapshot_id,
+                    })
+                } else {
+                    tracing::debug!(
+                        dataset = %self.dataset_name,
+                        snapshot_id = entry.snapshot_id,
+                        location = %entry.snapshot,
+                        "Snapshot referenced in metadata does not exist in object store"
+                    );
+                    None
+                }
             })
             .collect();
 
@@ -1997,6 +2086,64 @@ impl SnapshotManager {
             current_snapshot_id,
             snapshots,
         })
+    }
+
+    /// Checks if a snapshot exists in the object store.
+    async fn snapshot_exists(&self, snapshot_uri: &str) -> bool {
+        let Ok(object_path) = self.snapshot_uri_to_object_path(snapshot_uri) else {
+            return false;
+        };
+
+        // Use head() for a lightweight existence check without downloading content
+        self.object_store.head(&object_path).await.is_ok()
+    }
+
+    /// Compacts dataset metadata by removing entries whose snapshot files no longer
+    /// exist in the object store. The current snapshot entry is always preserved.
+    async fn compact_metadata(&self, dataset_entry: &mut DatasetMetadata) {
+        let current_id = dataset_entry.current_snapshot_id;
+
+        let entries_to_check: Vec<_> = dataset_entry
+            .snapshots
+            .iter()
+            .filter(|e| Some(e.snapshot_id) != current_id)
+            .map(|e| (e.snapshot_id, e.snapshot.clone()))
+            .collect();
+
+        if entries_to_check.is_empty() {
+            return;
+        }
+
+        let existence_futures: Vec<_> = entries_to_check
+            .into_iter()
+            .map(|(id, uri)| async move {
+                let exists = self.snapshot_exists(&uri).await;
+                (id, exists)
+            })
+            .collect();
+
+        let existence_results: HashMap<u64, bool> = futures::stream::iter(existence_futures)
+            .buffer_unordered(10)
+            .collect()
+            .await;
+
+        let before = dataset_entry.snapshots.len();
+        dataset_entry.snapshots.retain(|e| {
+            Some(e.snapshot_id) == current_id
+                || existence_results
+                    .get(&e.snapshot_id)
+                    .copied()
+                    .unwrap_or(true)
+        });
+        let removed = before - dataset_entry.snapshots.len();
+
+        if removed > 0 {
+            tracing::info!(
+                dataset = %dataset_entry.name,
+                removed_count = removed,
+                "Compacted snapshot metadata: removed entries for non-existent snapshots"
+            );
+        }
     }
 
     /// Retrieves information about a specific snapshot by ID.
@@ -2437,7 +2584,7 @@ mod tests {
     async fn download_latest_snapshot_downloads_current_snapshot() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
         let instant = Utc
             .with_ymd_and_hms(2025, 1, 2, 3, 4, 5)
             .single()
@@ -2505,7 +2652,7 @@ mod tests {
     async fn download_with_fallback_uses_next_snapshot_on_integrity_failure() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
 
         let first_instant = Utc
             .with_ymd_and_hms(2025, 2, 1, 0, 0, 0)
@@ -2773,7 +2920,7 @@ mod tests {
     async fn download_snapshot_entry_rejects_checksum_mismatch() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
         let instant = Utc
             .with_ymd_and_hms(2025, 3, 1, 12, 0, 0)
             .single()
@@ -2838,7 +2985,7 @@ mod tests {
     async fn download_snapshot_entry_rejects_size_mismatch() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
         let instant = Utc
             .with_ymd_and_hms(2025, 4, 1, 12, 0, 0)
             .single()
@@ -2903,7 +3050,7 @@ mod tests {
     async fn download_snapshot_entry_rejects_unsupported_checksum_algorithm() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
         let instant = Utc
             .with_ymd_and_hms(2025, 5, 1, 12, 0, 0)
             .single()
@@ -2968,7 +3115,7 @@ mod tests {
     async fn download_snapshot_entry_rejects_schema_mismatch() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
         let instant = Utc
             .with_ymd_and_hms(2025, 6, 1, 12, 0, 0)
             .single()
@@ -3034,6 +3181,7 @@ mod tests {
             Err(SnapshotDownloadError::SchemaMismatch { .. })
         ));
     }
+
 
     #[test]
     fn snapshot_uri_to_object_path_handles_relative_uris() {
@@ -3284,7 +3432,7 @@ mod tests {
     async fn generic_download_snapshot_with_valid_metadata(engine: &AccelerationEngine) {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let layout = SnapshotPathLayout::new(DATASET_NAME);
+        let layout = SnapshotPathLayout::new(DATASET_NAME, &AccelerationEngine::DuckDB);
         let instant = Utc
             .with_ymd_and_hms(2025, 3, 15, 10, 30, 0)
             .single()
@@ -3906,6 +4054,13 @@ mod tests {
 
         write_metadata(&store, &metadata_path, &metadata).await;
 
+        // Create the actual snapshot file so it passes the existence check
+        let snapshot_path = Path::from("snapshots/test_snapshot.db");
+        store
+            .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
+            .await
+            .expect("write snapshot file");
+
         let manager = build_manager_for_api_tests(Arc::clone(&store));
         let summary = manager
             .get_snapshot_summary()
@@ -4070,6 +4225,22 @@ mod tests {
         };
 
         write_metadata(&store, &metadata_path, &metadata).await;
+
+        // Create the actual snapshot files so they pass the existence check
+        store
+            .put(
+                &Path::from("snapshots/snapshot1.db"),
+                Bytes::from_static(b"snapshot data 1").into(),
+            )
+            .await
+            .expect("write snapshot file 1");
+        store
+            .put(
+                &Path::from("snapshots/snapshot2.db"),
+                Bytes::from_static(b"snapshot data 2").into(),
+            )
+            .await
+            .expect("write snapshot file 2");
 
         let manager = build_manager_for_api_tests(Arc::clone(&store));
 
