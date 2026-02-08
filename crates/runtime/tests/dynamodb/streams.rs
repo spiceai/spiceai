@@ -941,7 +941,7 @@ pub fn make_dynamodb_dataset_with_cayenne_acceleration(
             format!("http://localhost:{port}"),
         ),
     ]);
-    let temp_dir = tempfile::tempdir().unwrap().keep();
+    let temp_dir = tempfile::tempdir().expect("failed to create temp directory").keep();
     let cayenne_path = temp_dir.join("cayenne_data");
     let metadata_dir = temp_dir.join("cayenne_metadata");
     dataset.params = Some(DatasetParams::from_string_map(params));
@@ -953,11 +953,11 @@ pub fn make_dynamodb_dataset_with_cayenne_acceleration(
         params: Some(DatasetParams::from_string_map(HashMap::from([
             (
                 "cayenne_file_path".to_string(),
-                cayenne_path.to_str().unwrap().to_string(),
+                cayenne_path.to_str().expect("cayenne_path should be valid UTF-8").to_string(),
             ),
             (
                 "cayenne_metadata_dir".to_string(),
-                metadata_dir.to_str().unwrap().to_string(),
+                metadata_dir.to_str().expect("metadata_dir should be valid UTF-8").to_string(),
             ),
         ]))),
         ..Acceleration::default()
@@ -998,12 +998,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
 
             sleep(Duration::from_secs(2)).await;
 
-            let temp_dir = tempfile::tempdir()?;
-            let cayenne_path = temp_dir.path().join("cayenne_data");
-            let metadata_dir = temp_dir.path().join("cayenne_metadata");
-
-            let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
+            let _temp_dir = tempfile::tempdir()?;
 
             let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
                 .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
