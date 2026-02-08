@@ -427,49 +427,6 @@ pub fn make_dynamodb_dataset_with_file_accel(
     dataset
 }
 
-pub fn make_dynamodb_dataset_with_cayenne_accel(
-    table_name: &str,
-    port: u16,
-    access_key: &str,
-    secret_key: &str,
-    cayenne_file_path: &str,
-    cayenne_metadata_dir: &str,
-) -> Dataset {
-    let mut dataset = Dataset::new(format!("dynamodb:{table_name}"), table_name.to_string());
-    let params = HashMap::from([
-        (
-            "dynamodb_aws_access_key_id".to_string(),
-            access_key.to_string(),
-        ),
-        (
-            "dynamodb_aws_secret_access_key".to_string(),
-            secret_key.to_string(),
-        ),
-        ("dynamodb_aws_region".to_string(), "us-east-1".to_string()),
-        ("dynamodb_aws_auth".to_string(), "key".to_string()),
-        (
-            "endpoint_url".to_string(),
-            format!("http://localhost:{port}"),
-        ),
-    ]);
-    println!("params: {:#?}", params);
-    dataset.params = Some(DatasetParams::from_string_map(params));
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        mode: Mode::File,
-        refresh_mode: Some(RefreshMode::Changes),
-        engine: Some("cayenne".to_string()),
-        params: Some(DatasetParams::from_string_map(HashMap::from([
-            (
-                "duckdb_file".to_string(),
-                cayenne_file_path.to_string(),
-            ),
-        ]))),
-        ..Acceleration::default()
-    });
-    dataset
-}
-
 /// Creates a mock checkpoint with fake shard IDs from scratch.
 /// Used when no real checkpoint exists yet (e.g., testing fresh checkpoint error propagation).
 fn create_mock_checkpoint(duckdb_path: &str, dataset_name: &str, hours_ago: u64) {
@@ -962,105 +919,57 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
         .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn dynamodb_streams_duckdb_file_acceleration() -> anyhow::Result<()> {
-    let _tracing = init_tracing(Some(
-        "integration=debug,runtime=debug,data_components=debug,dynamodb_streams=debug,info",
-    ));
-
-    let table_name = "test_table_duckdb";
-    let access_key = "foo";
-    let secret_key = "bar";
-
-    test_request_context()
-        .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT7).await?;
-
-            let client = get_client(PORT7, access_key, secret_key);
-
-            create_table(&client, table_name).await;
-
-            // Insert a single record with created_at timestamp
-            client
-                .put_item()
-                .table_name(table_name)
-                .item("id", AttributeValue::S("1".to_string()))
-                .item(
-                    "created_at",
-                    AttributeValue::S("2025-10-12T23:37:16.345Z".to_string()),
-                )
-                .send()
-                .await
-                .expect("Failed to insert item");
-
-            sleep(Duration::from_secs(2)).await;
-
-            let temp_dir = tempfile::tempdir()?;
-            let duckdb_path = temp_dir.path().join("test.duckdb");
-            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
-
-            let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
-                .with_dataset(make_dynamodb_dataset_with_file_accel(
-                    table_name,
-                    PORT7,
-                    access_key,
-                    secret_key,
-                    duckdb_path_str,
-                    None,
-                ))
-                .with_results_cache(ResultsCache {
-                    enabled: false,
-                    ..Default::default()
-                })
-                .build();
-
-            configure_test_datafusion();
-            let rt = Runtime::builder().with_app(app).build().await;
-
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
-                }
-                () = cloned_rt.load_components() => {}
-            }
-
-            runtime_ready_check(&rt).await;
-            sleep(Duration::from_secs(2)).await;
-            run_and_snapshot_query(
-                &rt,
-                &format!("SELECT * FROM {table_name} ORDER BY id"),
-                "duckdb_file_accel_test1",
+pub fn make_dynamodb_dataset_with_accele(
+    table_name: &str,
+    port: u16,
+    access_key: &str,
+    secret_key: &str,
+    engine: &str,
+) -> Dataset {
+    let mut dataset = Dataset::new(format!("dynamodb:{table_name}"), table_name.to_string());
+    let params = HashMap::from([
+        (
+            "dynamodb_aws_access_key_id".to_string(),
+            access_key.to_string(),
+        ),
+        (
+            "dynamodb_aws_secret_access_key".to_string(),
+            secret_key.to_string(),
+        ),
+        ("dynamodb_aws_region".to_string(), "us-east-1".to_string()),
+        ("dynamodb_aws_auth".to_string(), "key".to_string()),
+        (
+            "endpoint_url".to_string(),
+            format!("http://localhost:{port}"),
+        ),
+    ]);
+    let temp_dir = tempfile::tempdir().unwrap().keep();
+    let cayenne_path = temp_dir.join("cayenne_data");
+    let metadata_dir = temp_dir.join("cayenne_metadata");
+    let duckdb_path = temp_dir.join("test.duckdb");
+    dataset.params = Some(DatasetParams::from_string_map(params));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Changes),
+        engine: Some(engine.to_string()),
+        params: Some(DatasetParams::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                cayenne_path.to_str().unwrap().to_string(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.to_str().unwrap().to_string(),
+            ),
+            (
+                "duckdb_file".to_string(),
+                duckdb_path.to_str().unwrap().to_string(),
             )
-            .await?;
-
-            insert_rows(&client, table_name, 5..7).await;
-            sleep(Duration::from_secs(2)).await;
-            run_and_snapshot_query(
-                &rt,
-                &format!("SELECT * FROM {table_name} ORDER BY id"),
-                "duckdb_file_accel_test2",
-            )
-            .await?;
-
-            insert_rows(&client, table_name, 7..10).await;
-            sleep(Duration::from_secs(2)).await;
-            run_and_snapshot_query(
-                &rt,
-                &format!("SELECT * FROM {table_name} ORDER BY id"),
-                "duckdb_file_accel_test3",
-            )
-            .await?;
-
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
-
-            Ok(())
-        })
-        .await
+        ]))),
+        ..Acceleration::default()
+    });
+    dataset
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1100,14 +1009,16 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
             let cayenne_path = temp_dir.path().join("cayenne_data");
             let metadata_dir = temp_dir.path().join("cayenne_metadata");
 
-            let app = AppBuilder::new("dynamodb_cayenne_file_accel_test")
-                .with_dataset(make_dynamodb_dataset_with_cayenne_accel(
+            let duckdb_path = temp_dir.path().join("test.duckdb");
+            let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
+
+            let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
+                .with_dataset(make_dynamodb_dataset_with_accele(
                     table_name,
                     PORT6,
                     access_key,
                     secret_key,
-                    cayenne_path.to_str().expect("path should be valid UTF-8"),
-                    metadata_dir.to_str().expect("path should be valid UTF-8"),
+                    "cayenne",
                 ))
                 .with_results_cache(ResultsCache {
                     enabled: false,
@@ -1125,21 +1036,19 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
                 }
                 () = cloned_rt.load_components() => {}
             }
-            println!("!!!!!!!!");
             runtime_ready_check(&rt).await;
             sleep(Duration::from_secs(2)).await;
 
             run_and_snapshot_query(
                 &rt,
-                &format!("SELECT created_at FROM {table_name}"),
-                "cayenne_file_accel_created_at",
-            )
-            .await?;
+                &format!("SELECT * FROM {table_name}"),
+                "dynamodb_streams_cayenne_file_acceleration",
+            ).await?;
 
-            // running_container.remove().await.map_err(|e| {
-            //     tracing::error!("running_container.remove: {e}");
-            //     anyhow::Error::msg(e.to_string())
-            // })?;
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
 
             Ok(())
         })
