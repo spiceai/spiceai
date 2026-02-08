@@ -51,7 +51,6 @@ const PORT3: u16 = 8003;
 const PORT4: u16 = 8004;
 const PORT5: u16 = 8005;
 const PORT6: u16 = 8006;
-const PORT7: u16 = 8007;
 
 #[instrument]
 pub async fn start_dynamodb_docker_container(
@@ -919,12 +918,11 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
         .await
 }
 
-pub fn make_dynamodb_dataset_with_accele(
+pub fn make_dynamodb_dataset_with_cayenne_acceleration(
     table_name: &str,
     port: u16,
     access_key: &str,
     secret_key: &str,
-    engine: &str,
 ) -> Dataset {
     let mut dataset = Dataset::new(format!("dynamodb:{table_name}"), table_name.to_string());
     let params = HashMap::from([
@@ -946,13 +944,12 @@ pub fn make_dynamodb_dataset_with_accele(
     let temp_dir = tempfile::tempdir().unwrap().keep();
     let cayenne_path = temp_dir.join("cayenne_data");
     let metadata_dir = temp_dir.join("cayenne_metadata");
-    let duckdb_path = temp_dir.join("test.duckdb");
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Changes),
-        engine: Some(engine.to_string()),
+        engine: Some("cayenne".to_string()),
         params: Some(DatasetParams::from_string_map(HashMap::from([
             (
                 "cayenne_file_path".to_string(),
@@ -962,10 +959,6 @@ pub fn make_dynamodb_dataset_with_accele(
                 "cayenne_metadata_dir".to_string(),
                 metadata_dir.to_str().unwrap().to_string(),
             ),
-            (
-                "duckdb_file".to_string(),
-                duckdb_path.to_str().unwrap().to_string(),
-            )
         ]))),
         ..Acceleration::default()
     });
@@ -1013,12 +1006,8 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
             let duckdb_path_str = duckdb_path.to_str().expect("path should be valid UTF-8");
 
             let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
-                .with_dataset(make_dynamodb_dataset_with_accele(
-                    table_name,
-                    PORT6,
-                    access_key,
-                    secret_key,
-                    "cayenne",
+                .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
+                    table_name, PORT6, access_key, secret_key,
                 ))
                 .with_results_cache(ResultsCache {
                     enabled: false,
@@ -1043,7 +1032,8 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
                 &rt,
                 &format!("SELECT * FROM {table_name}"),
                 "dynamodb_streams_cayenne_file_acceleration",
-            ).await?;
+            )
+            .await?;
 
             running_container.remove().await.map_err(|e| {
                 tracing::error!("running_container.remove: {e}");
