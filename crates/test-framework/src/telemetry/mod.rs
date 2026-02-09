@@ -16,12 +16,12 @@ limitations under the License.
 
 pub mod streaming;
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use anyhow::Result;
 
-use opentelemetry::metrics::Meter;
+use opentelemetry::metrics::{Meter, MeterProvider};
 
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::reader::MetricReader;
@@ -33,7 +33,8 @@ use opentelemetry_sdk::{
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use secrecy::SecretString;
 use telemetry::exporter::TelemetryExporterBuilder;
-pub use telemetry::meter::{METER_PROVIDER, METER_PROVIDER_ONCE};
+pub use telemetry::meter::METER_PROVIDER_ONCE;
+use telemetry::noop::NoopMeterProvider;
 use telemetry::reader::InitialReader;
 
 const ENDPOINT_CONST: &str = "https://telemetry.spiceai.io";
@@ -44,7 +45,27 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
         .into()
 });
 
-pub static METER: LazyLock<Meter> = LazyLock::new(|| METER_PROVIDER.meter("benchmarks_telemetry"));
+/// The global meter for benchmark telemetry.
+///
+/// Initialized explicitly by [`Telemetry::new_with_resource()`] or
+/// [`Telemetry::with_otlp_resource()`] after the provider is set.
+/// Using `OnceLock` prevents the ordering issue where early access
+/// with `LazyLock` would permanently lock the meter to a noop provider.
+///
+/// When metrics are disabled and `METER` is never initialized, all
+/// metric operations fall through to noop via the `meter()` helper.
+pub static METER: OnceLock<Meter> = OnceLock::new();
+
+/// Shared noop meter used when `METER` has not been initialized.
+/// This avoids allocating a new `NoopMeterProvider` on every `meter()` call.
+static NOOP_METER: LazyLock<Meter> =
+    LazyLock::new(|| NoopMeterProvider::new().meter("benchmarks_telemetry"));
+
+/// Returns the initialized meter, or a shared noop meter if not yet initialized.
+#[must_use]
+pub fn meter() -> Meter {
+    METER.get().cloned().unwrap_or_else(|| NOOP_METER.clone())
+}
 
 #[derive(Debug, Clone)]
 pub struct OtlpExporterConfig {
@@ -88,10 +109,14 @@ impl Telemetry {
             .with_reader(reader.clone())
             .build();
 
-        let setup = METER_PROVIDER_ONCE.set(Arc::new(provider)).is_ok();
+        let provider: Arc<dyn MeterProvider + Send + Sync> = Arc::new(provider);
+        let setup = METER_PROVIDER_ONCE.set(Arc::clone(&provider)).is_ok();
         if !setup {
             println!("Telemetry disabled");
         }
+
+        // Initialize METER after the provider is set to avoid binding to a noop meter.
+        let _ = METER.set(provider.meter("benchmarks_telemetry"));
 
         let api_key = std::env::var(api_key_name)
             .ok()
@@ -124,10 +149,14 @@ impl Telemetry {
             .with_reader(reader.clone())
             .build();
 
-        let setup = METER_PROVIDER_ONCE.set(Arc::new(provider)).is_ok();
+        let provider: Arc<dyn MeterProvider + Send + Sync> = Arc::new(provider);
+        let setup = METER_PROVIDER_ONCE.set(Arc::clone(&provider)).is_ok();
         if !setup {
             println!("Telemetry disabled");
         }
+
+        // Initialize METER after the provider is set to avoid binding to a noop meter.
+        let _ = METER.set(provider.meter("benchmarks_telemetry"));
 
         Self {
             reader,

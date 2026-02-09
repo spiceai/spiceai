@@ -46,12 +46,12 @@ pub type SnapshotCallback =
 
 /// Spawns a task that periodically creates snapshots at the specified interval.
 ///
-/// If `runtime_status` is provided, the task will wait for the dataset to be ready
-/// before starting the snapshot interval loop. This prevents creating snapshots before
-/// the dataset has finished its initial load or bootstrap.
+/// The task uses the checkpointer's `last_checkpoint_time()` to determine when the next
+/// snapshot should be created:
+/// - If `snapshots_create_interval` has passed since the last checkpoint, create immediately
+/// - Otherwise, schedule the first snapshot at `last_checkpoint_time + snapshots_create_interval`
 ///
-/// If `bootstrap_status` indicates the dataset was bootstrapped, the first snapshot will be delayed
-/// by the full interval after the dataset becomes ready (to avoid creating a snapshot immediately after bootstrap).
+/// If no previous checkpoint exists, a snapshot is created immediately after the runtime is ready.
 #[expect(clippy::too_many_arguments)]
 pub fn spawn_snapshot_interval_task(
     snapshots_create_interval: Option<Duration>,
@@ -61,7 +61,7 @@ pub fn spawn_snapshot_interval_task(
     dataset_name: TableReference,
     federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
-    bootstrap_status: crate::dataaccelerator::BootstrapStatus,
+    _bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -78,20 +78,43 @@ pub fn spawn_snapshot_interval_task(
         // Wait for the runtime to become ready
         runtime_status.wait_for_ready().await;
 
-        if !bootstrap_status.is_bootstrapped() {
-            // Force create initial snapshot immediately after runtime is ready unless it was bootstrapped
-            create_checkpoint_and_snapshot(
-                &checkpointer,
-                Some(&snapshot_manager),
-                &federated_schema,
-                &accelerator_write_mutex,
-                &dataset_name,
-                &last_updated_at,
-                ForceCreate(true),
-                accelerator.as_ref(),
-            )
-            .await;
+        // Determine the initial delay based on last checkpoint time
+        let initial_delay = match checkpointer.last_checkpoint_time().await {
+            Ok(Some(last_checkpoint)) => {
+                let elapsed = last_checkpoint.elapsed().unwrap_or(Duration::ZERO);
+                if elapsed >= interval_duration {
+                    // Enough time has passed, create snapshot immediately
+                    Duration::ZERO
+                } else {
+                    // Wait until interval_duration has passed since last checkpoint
+                    interval_duration - elapsed
+                }
+            }
+            Ok(None) | Err(_) => {
+                // No previous checkpoint or error getting it, create immediately
+                Duration::ZERO
+            }
+        };
+
+        if !initial_delay.is_zero() {
+            tokio::time::sleep(initial_delay).await;
         }
+
+        create_checkpoint_and_snapshot(
+            &checkpointer,
+            Some(&snapshot_manager),
+            &federated_schema,
+            &accelerator_write_mutex,
+            &dataset_name,
+            &last_updated_at,
+            // Force creation when interval already elapsed.
+            // Even though this may create a snapshot identical to the last one, we do this to avoid
+            // losing snapshots due to potential object storage retention policy.
+            // Consider use case: periodic
+            ForceCreate(initial_delay.is_zero()),
+            accelerator.as_ref(),
+        )
+        .await;
 
         let mut ticker = interval(interval_duration);
         // Consume the first tick which returns immediately per tokio::time::interval behavior
