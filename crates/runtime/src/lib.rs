@@ -664,17 +664,17 @@ impl Runtime {
             (ds.clone(), Arc::clone(app_arc))
         };
 
-        let Ok(dataset) = crate::component::dataset::builder::DatasetBuilder::try_from(
-            dataset_component,
-        )
-        .and_then(|mut b| {
-            b = b.with_app(app_arc);
-            b.with_runtime(Arc::new(self.clone()))
-                .build()
-                .context(UnableToBuildDatasetSnafu {
-                    dataset: table.to_string(),
+        let Ok(dataset) =
+            crate::component::dataset::builder::DatasetBuilder::try_from(dataset_component)
+                .and_then(|mut b| {
+                    b = b.with_app(app_arc);
+                    b.with_runtime(Arc::new(self.clone())).build().context(
+                        UnableToBuildDatasetSnafu {
+                            dataset: table.to_string(),
+                        },
+                    )
                 })
-        }) else {
+        else {
             tracing::warn!("Failed to build dataset {table} when updating partitions");
             return Ok(());
         };
@@ -720,14 +720,16 @@ impl Runtime {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
                 partition_manager, ..
-            }) => if let Ok(guard) = partition_manager.try_read() {
-                guard.clone()
-            } else {
-                tracing::debug!(
-                    "Partition manager is currently being initialized. Returning None."
-                );
-                None
-            },
+            }) => {
+                if let Ok(guard) = partition_manager.try_read() {
+                    guard.clone()
+                } else {
+                    tracing::debug!(
+                        "Partition manager is currently being initialized. Returning None."
+                    );
+                    None
+                }
+            }
             _ => None,
         }
     }
