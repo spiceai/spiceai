@@ -12290,6 +12290,7 @@ dependencies = [
  "async-trait",
  "opentelemetry",
  "opentelemetry_sdk",
+ "tracing",
 ]
 
 [[package]]
