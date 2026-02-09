@@ -1006,8 +1006,6 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
 
             sleep(Duration::from_secs(2)).await;
 
-            let _temp_dir = tempfile::tempdir()?;
-
             let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
                 .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
                     table_name, PORT6, access_key, secret_key,
