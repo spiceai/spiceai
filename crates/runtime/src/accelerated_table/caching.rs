@@ -1801,29 +1801,17 @@ fn filter_5xx_responses(batches: Vec<RecordBatch>) -> DataFusionResult<Vec<Recor
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "duckdb")]
-    use crate::dataaccelerator::duckdb::create_table_provider;
-    #[cfg(feature = "duckdb")]
-    use datafusion::logical_expr::CreateExternalTable;
-    #[cfg(feature = "duckdb")]
-    use datafusion_table_providers::duckdb::DuckDBTableProviderFactory;
-    #[cfg(feature = "duckdb")]
-    use duckdb::AccessMode;
-
     use super::*;
     use arrow::array::{Int32Array, RecordBatch, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use async_trait::async_trait;
     use datafusion::catalog::Session;
-    use datafusion::common::{Constraint, Constraints, ToDFSchema};
     use datafusion::datasource::TableType;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::sql::TableReference;
     use parking_lot::RwLock;
     use std::any::Any;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 

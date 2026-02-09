@@ -1945,7 +1945,9 @@ impl DataAccelerator for CayenneAccelerator {
         let on_conflict = cmd
             .options
             .get("on_conflict")
-            .map(|s| datafusion_table_providers::util::on_conflict::OnConflict::try_from(s.as_str()))
+            .map(|s| {
+                datafusion_table_providers::util::on_conflict::OnConflict::try_from(s.as_str())
+            })
             .transpose()
             .map_err(|e| Error::InvalidConfiguration {
                 detail: Arc::from(format!("on_conflict invalid: {e}")),

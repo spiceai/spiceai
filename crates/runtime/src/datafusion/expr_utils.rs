@@ -48,8 +48,7 @@ pub(crate) fn simplify_expr(expr: Expr, schema: &SchemaRef) -> Result<Expr, Data
     let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
 
     // Required to correctly evaluate `now()` during simplification.
-    let execution_props =
-        ExecutionProps::new().with_query_execution_start_time(chrono::Utc::now());
+    let execution_props = ExecutionProps::new().with_query_execution_start_time(chrono::Utc::now());
     let simplify_context = SimplifyContext::new(&execution_props).with_schema(Arc::new(df_schema));
     let simplifier = ExprSimplifier::new(simplify_context);
 

@@ -2606,6 +2606,7 @@ mod tests {
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             layout: AccelerationLayout::File { path: local_path },
+            engine: engine.clone(),
             snapshot_engine,
             object_store,
             bootstrap_failure_behavior: behavior,
@@ -3297,7 +3298,6 @@ mod tests {
             Err(SnapshotDownloadError::SchemaMismatch { .. })
         ));
     }
-
 
     #[test]
     fn snapshot_uri_to_object_path_handles_relative_uris() {
@@ -4107,6 +4107,7 @@ mod tests {
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             layout: AccelerationLayout::None,
+            engine: AccelerationEngine::Cayenne,
             snapshot_engine,
             object_store,
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
@@ -4522,6 +4523,7 @@ mod tests {
             snapshots_location: Path::from(SNAPSHOT_BASE_PATH),
             snapshot_location_uri: SNAPSHOT_URI_PREFIX.to_string(),
             layout: AccelerationLayout::None,
+            engine: AccelerationEngine::Cayenne,
             snapshot_engine,
             object_store,
             bootstrap_failure_behavior: BootstrapOnFailureBehavior::Warn,
