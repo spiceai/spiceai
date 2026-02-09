@@ -42,6 +42,11 @@ impl PartitionMetadata {
     }
 
     #[must_use]
+    pub fn is_assigned_to(&self, executor_url: &str) -> bool {
+        self.assigned_executors.contains(&executor_url.to_string())
+    }
+
+    #[must_use]
     pub fn is_assigned(&self) -> bool {
         !self.assigned_executors.is_empty()
     }

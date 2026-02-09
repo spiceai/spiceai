@@ -54,7 +54,8 @@ use crate::{
     warn_spaced,
 };
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::sql::{TableReference, unparser::expr_to_sql};
+use datafusion_expr::Expr;
 #[cfg(any(feature = "duckdb", feature = "sqlite"))]
 use futures::StreamExt;
 use futures::future::join_all;
@@ -738,6 +739,70 @@ impl Runtime {
                 .update_dataset(&ds_name, status::ComponentStatus::Ready);
 
             return Ok(());
+        }
+
+        // Apply partition filters if assigned (Executor mode)
+        let mut ds = ds;
+        // Only apply partition logic if the dataset is configured for partitioning
+        if ds
+            .acceleration
+            .as_ref()
+            .is_some_and(|acc| !acc.partition_by.is_empty())
+        {
+            tracing::info!("git a table to partition={:?}", ds.name.clone());
+            if let Some(assignments) = self.partition_assignments() {
+                let assignments = assignments.read().await;
+                if let Some(filters) = assignments.get(&ds.name) {
+                    tracing::info!("assignments={:?}", ds.name.clone());
+                    if !filters.is_empty() {
+                        tracing::info!(
+                            "Applying {} partition filters to dataset {}",
+                            filters.len(),
+                            ds.name
+                        );
+
+                        let mut ds_mod = (*ds).clone();
+                        if let Some(acc) = &mut ds_mod.acceleration {
+                            let filter_expr =
+                                filters.iter().cloned().reduce(Expr::or).unwrap_or_else(|| {
+                                    unreachable!("filters is not empty checked above")
+                                });
+
+                            let filter_sql = expr_to_sql(&filter_expr)
+                                .map(|ast| ast.to_string())
+                                .context(crate::UnableToConvertPartitionExprSnafu)?;
+
+                            let new_sql = if let Some(sql) = &acc.refresh_sql {
+                                format!(
+                                    "SELECT * FROM ({sql}) AS _partitioned_source WHERE {filter_sql}"
+                                )
+                            } else {
+                                format!("SELECT * FROM {name} WHERE {filter_sql}", name = ds.name)
+                            };
+                            tracing::error!("NEW refresh_sql={new_sql}");
+
+                            acc.refresh_sql = Some(new_sql);
+                        }
+                        ds = Arc::new(ds_mod);
+                    }
+                } else {
+                    // Executor has no assignments for this partitioned dataset -> Load nothing (1=0)
+                    tracing::info!(
+                        "No partition assignments for partitioned dataset {}. Initializing with empty result set.",
+                        ds.name
+                    );
+                    let mut ds_mod = (*ds).clone();
+                    if let Some(acc) = &mut ds_mod.acceleration {
+                        let new_sql = if let Some(sql) = &acc.refresh_sql {
+                            format!("SELECT * FROM ({sql}) AS _partitioned_source WHERE 1=0")
+                        } else {
+                            format!("SELECT * FROM {name} WHERE 1=0", name = ds.name)
+                        };
+                        acc.refresh_sql = Some(new_sql);
+                    }
+                    ds = Arc::new(ds_mod);
+                }
+            }
         }
 
         // ACCELERATED TABLE

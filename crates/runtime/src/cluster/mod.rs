@@ -1254,6 +1254,7 @@ pub async fn initialize_cluster_executor(
         // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
         //
         // This must be done after executor's flight service is ready to accept connections. Otherwise the scheduler will attempt to make connection and fail. Waiting until after `rx_ready` (which is done after the executor has established a network connection to the Scheduler's control plane), should give enough time for executor to bind locally for flight.
+        // //Jeadie
         let initial_partitions = executor_request_initial_partitions(
             cluster_client.clone(),
             rt.datafusion().cluster_config.node_advertise_url(),
@@ -1263,6 +1264,7 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to allocate initial partitions from scheduler: {status}")
                 .into(),
         })?;
+        tracing::warn!("initial_partitions={:?}", initial_partitions);
         rt.set_partition_assignments(initial_partitions).await;
 
         // Bind the already-fetched app and initialize secrets for object store configuration
@@ -1611,6 +1613,7 @@ async fn executor_bind_app(
     rt.load_embeddings().await;
     Arc::clone(rt).load_models().await;
     Arc::clone(rt).load_tools().await;
+    Arc::clone(rt).load_datasets().await;
 
     Ok(())
 }

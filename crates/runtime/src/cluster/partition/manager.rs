@@ -204,6 +204,7 @@ impl PartitionManager {
         executor_id: &str,
         limit: usize,
     ) -> Result<Vec<HashMap<String, String>>> {
+        tracing::warn!("table={table:?}. executor_id={executor_id:?}.");
         let key = table.to_string();
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
@@ -218,8 +219,19 @@ impl PartitionManager {
                         table: key.clone(),
                         partition: "any".to_string(),
                     })?;
+            tracing::warn!("metadata={metadata:?}");
 
-            let mut allocated = Vec::new();
+            let mut allocated: Vec<_> = metadata
+                .partitions
+                .iter()
+                .filter_map(|p| {
+                    if p.is_assigned_to(executor_id) {
+                        Some(p.partition_value.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             let mut changes = false;
 
             for partition in &mut metadata.partitions {
@@ -235,7 +247,8 @@ impl PartitionManager {
             }
 
             if !changes {
-                return Ok(Vec::new());
+                tracing::info!("No changes for allocate_partitions");
+                return Ok(allocated);
             }
 
             metadata.updated_at = now_ms;

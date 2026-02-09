@@ -580,15 +580,6 @@ impl ClusterService for ClusterServiceImpl {
             let app_guard = self.app.read().await;
             if let Some(app) = app_guard.as_ref() {
                 // Find accelerated datasets with partitioning
-                let datasets: Vec<_> = app
-                    .datasets
-                    .iter()
-                    .filter(|ds| {
-                        ds.acceleration
-                            .as_ref()
-                            .is_some_and(|acc| !acc.partition_by.is_empty())
-                    })
-                    .collect();
 
                 for table_ref in super::partition::accelerated_tables(&app).keys() {
                     match partition_manager
@@ -597,6 +588,7 @@ impl ClusterService for ClusterServiceImpl {
                     {
                         Ok(partitions) => {
                             if partitions.is_empty() {
+                                tracing::warn!("partitions.is_empty");
                                 continue;
                             }
                             let mut serialized_items = Vec::new();
@@ -622,6 +614,7 @@ impl ClusterService for ClusterServiceImpl {
                                     }
                                 }
                             }
+                            tracing::warn!("serialized_items={serialized_items:?}");
                             table_partitions.insert(
                                 table_ref.to_string(),
                                 StringArray {
