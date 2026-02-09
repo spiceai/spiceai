@@ -32,7 +32,7 @@ use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
 
 use datafusion::{
-    prelude::{Expr, col, lit},
+    prelude::Expr,
     sql::{
         TableReference,
         sqlparser::{
@@ -70,9 +70,9 @@ use tokio_util::sync::CancellationToken;
 
 use tonic::{Request, Response, Status, Streaming, transport::Endpoint};
 
-use crate::cluster::SchedulerPeers;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::cluster::partition::PartitionManager;
+use crate::cluster::{SchedulerPeers, partition::partition_value_to_bytes};
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
@@ -590,33 +590,13 @@ impl ClusterService for ClusterServiceImpl {
                             if partitions.is_empty() {
                                 continue;
                             }
-                            let mut serialized_items = Vec::new();
-                            for p in partitions {
-                                let mut expr: Option<Expr> = None;
-                                for (col_name, val) in p {
-                                    let e = col(col_name).eq(lit(val));
-                                    expr = match expr {
-                                        Some(existing) => Some(existing.and(e)),
-                                        None => Some(e),
-                                    };
-                                }
-
-                                if let Some(e) = expr {
-                                    match e.to_bytes() {
-                                        Ok(bytes) => serialized_items.push(bytes.to_vec()),
-                                        Err(err) => {
-                                            tracing::error!(
-                                                "Failed to serialize partition expression for table {}: {err}",
-                                                table_ref.to_string()
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                            let serialized_items = partitions.into_iter().map(partition_value_to_bytes).collect::<Result<Vec<_>, _>>().map_err(
+                                |e| Status::internal(format!("Failed to serialize partition expression for table {}: {e}", table_ref))
+                            )?;
                             table_partitions.insert(
                                 table_ref.to_string(),
                                 StringArray {
-                                    items: serialized_items,
+                                    items: serialized_items.iter().map(|b| b.to_vec()).collect(),
                                 },
                             );
                         }

@@ -16,13 +16,21 @@ limitations under the License.
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
+use datafusion::error::DataFusionError;
+use datafusion_expr::{Expr, col, lit};
+use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
+
+/// A specific set of values for partitioning keys.
+/// For example, if a table is partitioned by "date" and "region", a PartitionValue might be {"date": "2024-01-01", "region": "us-east"}.
+pub type PartitionValue = HashMap<String, String>;
 
 /// Metadata for a single partition of an accelerated table
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartitionMetadata {
     /// Partition value/identifier (e.g., date, id range)
-    pub partition_value: HashMap<String, String>,
+    pub partition_value: PartitionValue,
     /// List of executor URLs assigned to this partition
     #[serde(default)]
     pub assigned_executors: Vec<String>,
@@ -61,6 +69,19 @@ impl PartitionMetadata {
     pub fn unassign_from(&mut self, executor_url: &str) {
         self.assigned_executors.retain(|e| e != executor_url);
     }
+}
+
+pub fn partition_value_to_bytes(p: PartitionValue) -> Result<Bytes, DataFusionError> {
+    let mut expr: Option<Expr> = None;
+    for (col_name, val) in p {
+        let e = col(col_name).eq(lit(val));
+        expr = match expr {
+            Some(existing) => Some(existing.and(e)),
+            None => Some(e),
+        };
+    }
+    expr.ok_or_else(|| DataFusionError::Plan(format!("partition value is empty")))?
+        .to_bytes()
 }
 
 /// Metadata for a database table with an acceleration.

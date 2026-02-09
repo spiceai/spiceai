@@ -659,9 +659,11 @@ impl Runtime {
         let Ok(dataset) = crate::component::dataset::builder::DatasetBuilder::try_from(
             dataset.clone(),
         )
-        .and_then(|b| {
-            b.with_app(Arc::clone(app.as_ref().expect("checked above")))
-                .with_runtime(Arc::new(self.clone()))
+        .and_then(|mut b| {
+            if let Some(app) = app.as_ref() {
+                b = b.with_app(Arc::clone(app));
+            };
+            b.with_runtime(Arc::new(self.clone()))
                 .build()
                 .context(UnableToBuildDatasetSnafu {
                     dataset: table.to_string(),
@@ -672,13 +674,15 @@ impl Runtime {
         };
 
         // 2. Construct the new SQL
-        let base_sql = dataset
-            .acceleration
-            .as_ref()
-            .and_then(|a| a.refresh_sql.clone());
-        let new_sql =
-            update_partitioning_filter_in_refresh_sql(base_sql.as_deref(), &table, &assignments)
-                .context(UnableToConvertPartitionExprSnafu)?;
+        let new_sql = update_partitioning_filter_in_refresh_sql(
+            dataset
+                .acceleration
+                .as_ref()
+                .and_then(|a| a.refresh_sql.as_deref()),
+            &table,
+            &assignments,
+        )
+        .context(UnableToConvertPartitionExprSnafu)?;
 
         // 3. Update the AcceleratedTable
         match self

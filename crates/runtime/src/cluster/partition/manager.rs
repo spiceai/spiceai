@@ -22,6 +22,8 @@ use object_store::ObjectStore;
 use object_store_occ::{InsertResult, ObjectState, WriteResult};
 use snafu::prelude::*;
 
+use crate::cluster::partition::metadata::PartitionValue;
+
 use super::metadata::{PartitionMetadata, TablePartitionMetadata};
 
 #[derive(Debug, Snafu)]
@@ -141,7 +143,7 @@ impl PartitionManager {
         table: &TableReference,
         executor_id: &str,
         limit: usize,
-    ) -> Result<Vec<HashMap<String, String>>> {
+    ) -> Result<Vec<PartitionValue>> {
         let key = table.to_string();
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
