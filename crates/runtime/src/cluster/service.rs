@@ -581,9 +581,9 @@ impl ClusterService for ClusterServiceImpl {
             if let Some(app) = app_guard.as_ref() {
                 // Find accelerated datasets with partitioning
 
-                for table_ref in super::partition::accelerated_tables(&app).keys() {
+                for table_ref in super::partition::accelerated_tables(app).keys() {
                     match partition_manager
-                        .allocate_partitions(&table_ref, &executor_id, 10)
+                        .allocate_partitions(table_ref, &executor_id, 10)
                         .await
                     {
                         Ok(partitions) => {
@@ -591,7 +591,7 @@ impl ClusterService for ClusterServiceImpl {
                                 continue;
                             }
                             let serialized_items = partitions.into_iter().map(partition_value_to_bytes).collect::<Result<Vec<_>, _>>().map_err(
-                                |e| Status::internal(format!("Failed to serialize partition expression for table {}: {e}", table_ref))
+                                |e| Status::internal(format!("Failed to serialize partition expression for table {table_ref}: {e}"))
                             )?;
                             table_partitions.insert(
                                 table_ref.to_string(),

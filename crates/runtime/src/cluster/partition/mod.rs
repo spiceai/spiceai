@@ -29,6 +29,7 @@ pub use startup::{
     initialize_partition_metadata,
 };
 
+#[allow(clippy::implicit_hasher)]
 pub fn update_partitioning_filter_in_refresh_sql(
     current_sql: Option<&str>,
     tbl: &TableReference,
@@ -41,7 +42,7 @@ pub fn update_partitioning_filter_in_refresh_sql(
     let filter_expr = partitions
         .iter()
         .cloned()
-        .reduce(|acc, expr| acc.or(expr))
+        .reduce(Expr::or)
         .unwrap_or_else(|| unreachable!("partitions is not empty"));
 
     let filter_sql = expr_to_sql(&filter_expr).map(|ast| ast.to_string())?;

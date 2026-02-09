@@ -23,7 +23,7 @@ use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
 
 /// A specific set of values for partitioning keys.
-/// For example, if a table is partitioned by "date" and "region", a PartitionValue might be {"date": "2024-01-01", "region": "us-east"}.
+/// For example, if a table is partitioned by "date" and "region", a `PartitionValue` might be {"date": "2024-01-01", "region": "us-east"}.
 pub type PartitionValue = HashMap<String, String>;
 
 /// Metadata for a single partition of an accelerated table
@@ -80,7 +80,7 @@ pub fn partition_value_to_bytes(p: PartitionValue) -> Result<Bytes, DataFusionEr
             None => Some(e),
         };
     }
-    expr.ok_or_else(|| DataFusionError::Plan(format!("partition value is empty")))?
+    expr.ok_or_else(|| DataFusionError::Plan("partition value is empty".to_string()))?
         .to_bytes()
 }
 

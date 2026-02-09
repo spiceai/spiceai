@@ -602,9 +602,7 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn partition_assignments(
-        &self,
-    ) -> Option<Arc<RwLock<PartitionAssignments>>> {
+    pub fn partition_assignments(&self) -> Option<Arc<RwLock<PartitionAssignments>>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Executor {
                 partition_assignments,
@@ -613,10 +611,7 @@ impl Runtime {
         }
     }
 
-    pub async fn set_partition_assignments(
-        &self,
-        assignments: PartitionAssignments,
-    ) {
+    pub async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
         if let Some(DistributedNode::Executor {
             partition_assignments,
         }) = self.distributed.as_ref()

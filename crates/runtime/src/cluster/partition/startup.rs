@@ -210,8 +210,9 @@ async fn table_partition_values(
     // For multiple columns: SELECT DISTINCT partition_col1, partition_col2, ... FROM table
     let partition_exprs: Vec<String> = partitioning
         .iter()
-        .map(|p| match p {
-            PartitionedBy { name, expression } => format!("{expression} AS {name}"),
+        .map(|p| {
+            let PartitionedBy { name, expression } = p;
+            format!("{expression} AS {name}")
         })
         .collect();
 
@@ -272,9 +273,9 @@ async fn wait_for_table(table: &TableReference, rt: &Arc<Runtime>) -> bool {
         if rt.datafusion().table_exists(table.clone()) {
             return true;
         }
-        let _ = tokio::time::sleep(Duration::from_secs(1)).await;
+        let () = tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    return false;
+    false
 }
 
 /// Executes a SQL query against the underlying table source of an accelerated dataset to discover partition values.
@@ -299,7 +300,7 @@ async fn execute_partition_discovery_query(
     let Some(acc) = rt.datafusion().get_table(table).await.and_then(|t| {
         t.as_any()
             .downcast_ref::<AcceleratedTable>()
-            .map(|acc| acc.get_federated_table())
+            .map(AcceleratedTable::get_federated_table)
     }) else {
         return Err(Error::NotAcceleratedTable {
             table: table.to_string(),
@@ -340,6 +341,7 @@ async fn execute_partition_discovery_query(
 }
 
 /// Helper to find all tables with acceleration partitioning configured, along with their partitioning columns.
+#[must_use]
 pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<PartitionedBy>> {
     let ds = app.datasets.iter().filter_map(|ds| {
         if let Some(acc) = &ds.acceleration {
@@ -353,14 +355,15 @@ pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<Partiti
         None
     });
     let views = app.views.iter().filter_map(|view| {
-        if let Some(acc) = &view.acceleration {
-            if !acc.partition_by.is_empty() {
-                return Some((
-                    TableReference::parse_str(&view.name),
-                    acc.partition_by.clone(),
-                ));
-            }
+        if let Some(acc) = &view.acceleration
+            && !acc.partition_by.is_empty()
+        {
+            return Some((
+                TableReference::parse_str(&view.name),
+                acc.partition_by.clone(),
+            ));
         }
+
         None
     });
     ds.chain(views).collect()

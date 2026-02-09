@@ -26,6 +26,7 @@ use crate::cluster::partition::metadata::PartitionValue;
 
 use super::metadata::{PartitionMetadata, TablePartitionMetadata};
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to access partition metadata for table {table}: {source}"))]
@@ -197,9 +198,7 @@ impl PartitionManager {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    return Err(Error::ConcurrentModification {
-                        table: key.to_string(),
-                    });
+                    return Err(Error::ConcurrentModification { table: key.clone() });
                 }
                 Err(e) => return Err(e),
             }
@@ -220,7 +219,7 @@ impl PartitionManager {
         })
     }
 
-    /// Write metadata using insert_or_update with conflict handling.
+    /// Write metadata using `insert_or_update` with conflict handling.
     async fn write_metadata(&self, key: &str, metadata: TablePartitionMetadata) -> Result<()> {
         match self
             .state
@@ -237,6 +236,7 @@ impl PartitionManager {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
