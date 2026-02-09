@@ -1203,6 +1203,10 @@ fn transform_spicepod(
         _ => "unknown",
     };
 
+    #[expect(clippy::expect_used)]
+    std::fs::create_dir_all(format!("/tmp/benchmarks/{run_id}"))
+        .expect("Failed to create benchmark directory");
+
     // 1. Update dataset `from` field with prefixed table name, keep `name` unchanged
     for dataset in &mut spicepod.datasets {
         if let ComponentOrReference::Component(d) = dataset {
@@ -1252,15 +1256,17 @@ fn transform_spicepod(
 
                 match engine {
                     None | Some("duckdb") => {
-                        let duckdb_file =
-                            format!("/tmp/{config_name}_{dataset_name}_{phase_suffix}.db");
+                        let duckdb_file = format!(
+                            "/tmp/benchmarks/{run_id}/{config_name}_{dataset_name}_{phase_suffix}.db"
+                        );
                         params
                             .data
                             .insert("duckdb_file".to_string(), ParamValue::String(duckdb_file));
                     }
                     Some("cayenne") => {
-                        let cayenne_dir =
-                            format!("/tmp/{config_name}_{dataset_name}_{phase_suffix}_cayenne/");
+                        let cayenne_dir = format!(
+                            "/tmp/benchmarks/{run_id}/{config_name}_{dataset_name}_{phase_suffix}_cayenne/"
+                        );
                         params.data.insert(
                             "cayenne_file_path".to_string(),
                             ParamValue::String(cayenne_dir),
