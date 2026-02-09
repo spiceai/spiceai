@@ -44,12 +44,12 @@ pub type SnapshotCallback =
 
 /// Spawns a task that periodically creates snapshots at the specified interval.
 ///
-/// If `runtime_status` is provided, the task will wait for the dataset to be ready
-/// before starting the snapshot interval loop. This prevents creating snapshots before
-/// the dataset has finished its initial load or bootstrap.
+/// The task uses the checkpointer's `last_checkpoint_time()` to determine when the next
+/// snapshot should be created:
+/// - If `snapshots_create_interval` has passed since the last checkpoint, create immediately
+/// - Otherwise, schedule the first snapshot at `last_checkpoint_time + snapshots_create_interval`
 ///
-/// If `bootstrap_status` indicates the dataset was bootstrapped, the first snapshot will be delayed
-/// by the full interval after the dataset becomes ready (to avoid creating a snapshot immediately after bootstrap).
+/// If no previous checkpoint exists, a snapshot is created immediately after the runtime is ready.
 #[expect(clippy::too_many_arguments)]
 pub fn spawn_snapshot_interval_task(
     snapshots_create_interval: Option<Duration>,
@@ -75,26 +75,44 @@ pub fn spawn_snapshot_interval_task(
         // Wait for the runtime to become ready
         runtime_status.wait_for_ready().await;
 
-        if !bootstrap_status.is_bootstrapped() {
-            // Force create initial snapshot immediately after runtime is ready unless it was bootstrapped
-            create_checkpoint_and_snapshot(
-                &checkpointer,
-                Some(&snapshot_manager),
-                &federated_schema,
-                &accelerator_write_mutex,
-                &dataset_name,
-                &last_updated_at,
-                ForceCreate(true),
-            )
-            .await;
+        // Determine the initial delay based on last checkpoint time.
+        let mut initial_delay = match checkpointer.last_checkpoint_time().await {
+            Ok(Some(last_checkpoint)) => {
+                let elapsed = last_checkpoint.elapsed().unwrap_or(Duration::ZERO);
+                if elapsed >= interval_duration {
+                    Duration::ZERO
+                } else {
+                    interval_duration - elapsed
+                }
+            }
+            Ok(None) | Err(_) => Duration::ZERO,
+        };
+
+        // Preserve release-branch behavior: if this dataset was bootstrapped, don't create
+        // an immediate snapshot after startup when no delay is otherwise required.
+        if bootstrap_status.is_bootstrapped() && initial_delay.is_zero() {
+            initial_delay = interval_duration;
         }
 
+        if !initial_delay.is_zero() {
+            tokio::time::sleep(initial_delay).await;
+        }
+
+        create_checkpoint_and_snapshot(
+            &checkpointer,
+            Some(&snapshot_manager),
+            &federated_schema,
+            &accelerator_write_mutex,
+            &dataset_name,
+            &last_updated_at,
+            ForceCreate(initial_delay.is_zero()),
+        )
+        .await;
+
         let mut ticker = interval(interval_duration);
-        // Consume the first tick which returns immediately per tokio::time::interval behavior
         ticker.tick().await;
 
         loop {
-            // Wait for the next snapshot interval (accounting for time spent during previous snapshot creation)
             ticker.tick().await;
 
             create_checkpoint_and_snapshot(

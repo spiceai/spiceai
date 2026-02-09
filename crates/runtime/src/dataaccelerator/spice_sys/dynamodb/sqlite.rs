@@ -78,15 +78,22 @@ impl DynamoDBSys {
         conn.conn
             .call(move |conn: &mut rusqlite::Connection| -> Result<DynamoDBCheckpointMetadata, rusqlite::Error> {
                 let query = format!(
-                    "SELECT checkpoint_data FROM {DYNAMODB_STREAMS_TABLE_NAME} WHERE dataset_name = ?"
+                    "SELECT checkpoint_data, strftime('%s', updated_at) FROM {DYNAMODB_STREAMS_TABLE_NAME} WHERE dataset_name = ?"
                 );
                 let mut stmt = conn.prepare(&query)?;
                 let mut rows = stmt.query([dataset_name])?;
 
                 if let Some(row) = rows.next()? {
                     let checkpoint_data: String = row.get(0)?;
+                    let updated_at_epoch: Option<i64> = row.get(1).ok();
+                    let updated_at = updated_at_epoch.and_then(|epoch| {
+                        u64::try_from(epoch).ok().and_then(|e| std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(e)))
+                    });
 
-                    Ok(DynamoDBCheckpointMetadata { checkpoint_data })
+                    Ok(DynamoDBCheckpointMetadata {
+                        checkpoint_data,
+                        updated_at,
+                    })
                 } else {
                     Err(rusqlite::Error::QueryReturnedNoRows)
                 }

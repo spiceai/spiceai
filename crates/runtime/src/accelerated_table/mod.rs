@@ -64,7 +64,7 @@ pub mod refresh;
 pub mod refresh_task;
 mod refresh_task_runner;
 mod retention;
-mod sink;
+pub(crate) mod sink;
 mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
@@ -326,6 +326,7 @@ pub struct Builder {
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
+    accelerator_write_mutex: Arc<Mutex<()>>,
 }
 
 impl Builder {
@@ -369,6 +370,7 @@ impl Builder {
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
             is_s3_express_acceleration: false,
+            accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
         }
     }
 
@@ -553,6 +555,16 @@ impl Builder {
         self
     }
 
+    /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
+    /// Shared with `DataConnector`, `Refresher` and `CachingAccelerationScanExec`.
+    pub fn accelerator_write_mutex(
+        &mut self,
+        accelerator_write_mutex: Arc<Mutex<()>>,
+    ) -> &mut Self {
+        self.accelerator_write_mutex = accelerator_write_mutex;
+        self
+    }
+
     /// Build the accelerated table
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
@@ -686,8 +698,6 @@ impl Builder {
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_mode = self.refresh.mode;
         let refresh_params = Arc::new(RwLock::new(self.refresh));
-        // Create the accelerator write mutex early so it can be shared between the Refresher and the AcceleratedTable.
-        let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         // Create the in-flight revalidations tracker to avoid duplicate upstream requests during SWR window.
         let in_flight_revalidations: caching::InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
@@ -707,7 +717,7 @@ impl Builder {
             Arc::clone(&self.accelerator),
             self.cpu_runtime.clone(),
             self.io_runtime.clone(),
-            Arc::clone(&accelerator_write_mutex),
+            Arc::clone(&self.accelerator_write_mutex),
         );
         refresher.with_completion_notifier(Arc::clone(&on_complete_notification));
         refresher.caching(&self.caching);
@@ -748,7 +758,7 @@ impl Builder {
                 rx,
                 Arc::clone(&self.accelerator),
                 self.dataset_name.to_string(),
-                Arc::clone(&accelerator_write_mutex),
+                Arc::clone(&self.accelerator_write_mutex),
                 Arc::clone(&in_flight_revalidations),
                 Arc::clone(&last_updated_at),
             );
@@ -766,7 +776,7 @@ impl Builder {
                 retention,
                 self.caching.clone(),
                 self.io_runtime.clone(),
-                Arc::clone(&accelerator_write_mutex),
+                Arc::clone(&self.accelerator_write_mutex),
             ));
             handlers.push(retention_check_handle);
         }
@@ -857,7 +867,7 @@ impl Builder {
             cache_stale_while_revalidate_ttl: self.caching_stale_while_revalidate_ttl,
             cache_stale_if_error: self.caching_stale_if_error,
             io_runtime: self.io_runtime,
-            accelerator_write_mutex,
+            accelerator_write_mutex: self.accelerator_write_mutex,
             in_flight_revalidations,
             last_updated_at,
             batch_write_tx,

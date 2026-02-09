@@ -32,6 +32,9 @@ mod turso;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DynamoDBCheckpointMetadata {
     pub checkpoint_data: String,
+    /// When the checkpoint was last updated. Used to determine if shards may have expired.
+    #[serde(default)]
+    pub updated_at: Option<std::time::SystemTime>,
 }
 
 pub struct DynamoDBSys {
