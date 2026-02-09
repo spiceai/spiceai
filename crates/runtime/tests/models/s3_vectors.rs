@@ -422,13 +422,13 @@ pub(crate) mod search {
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_match",
                     SearchTestType::from_sql(
-                        "SELECT id, match, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
+                        "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_view_vector_search_sql_match",
                     SearchTestType::from_sql(
-                        "SELECT id, match, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
+                        "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
@@ -446,13 +446,13 @@ pub(crate) mod search {
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
-                        "SELECT id, match, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
+                        "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vector_chunking_metadata_view_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
-                        "SELECT id, match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
+                        "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
                 )]].concat(),
             true
@@ -496,13 +496,13 @@ pub(crate) mod search {
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match",
                     SearchTestType::from_sql(
-                        "SELECT id, match, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
+                        "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vector_chunking_view_vector_search_sql_match",
                     SearchTestType::from_sql(
-                        "SELECT id, match, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
+                        "SELECT id, _match, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
@@ -522,13 +522,13 @@ pub(crate) mod search {
                 SearchTestCase::new(
                     "s3vector_chunking_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
-                        "SELECT id, match, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
+                        "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs, 'second') order by _score desc, id LIMIT 4",
                     ),
                 ),
                 SearchTestCase::new(
                     "s3vector_chunking_view_vector_search_sql_match_and_underlying",
                     SearchTestType::from_sql(
-                        "SELECT id, match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
+                        "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
                 )]].concat(),
             true

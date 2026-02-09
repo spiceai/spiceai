@@ -19,7 +19,7 @@ use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
 use super::{
-    caching::{Caching, ResultsCache, SQLResultsCacheConfig},
+    caching::{Caching, ResultsCache},
     default_true, is_default,
 };
 use crate::metric::Metrics;
@@ -672,8 +672,8 @@ pub struct RuntimeDeserializer {
     #[serde(default)]
     #[deprecated(since = "2.0.0", note = "Use `runtime.caching.sql_results` instead.")]
     pub results_cache: Option<ResultsCache>,
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub caching: Caching,
+    #[serde(default)]
+    pub caching: Option<Caching>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset_load_parallelism: Option<usize>,
     /// If set, the runtime will configure all endpoints to use TLS
@@ -758,18 +758,18 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
         };
 
         // Convert deprecated runtime.results_cache to runtime.caching.sql_results
-        let mut caching = deserializer.caching;
+        let caching_was_explicit = deserializer.caching.is_some();
+        let mut caching = deserializer.caching.unwrap_or_default();
         if let Some(results_cache) = deserializer.results_cache {
             tracing::warn!(
                 "`runtime.results_cache` is deprecated, use `runtime.caching.sql_results` instead"
             );
-            // Only apply if caching.sql_results wasn't explicitly set (prefer the new field).
-            // When `caching` is absent from YAML, serde uses `Caching::default()` which
-            // populates sql_results with `Some(SQLResultsCacheConfig::default())`. We also
-            // check against the default to detect this case and apply the deprecated value.
-            if caching.sql_results.is_none()
-                || caching.sql_results.as_ref() == Some(&SQLResultsCacheConfig::default())
-            {
+            // Only apply the deprecated value if `caching.sql_results` wasn't explicitly set.
+            // When `caching` is absent from YAML, `caching_was_explicit` is false, so we
+            // apply the deprecated value. When `caching` IS in the YAML, we check whether
+            // `sql_results` was also present (non-None) — if so, the new field takes priority.
+            let sql_results_explicit = caching_was_explicit && caching.sql_results.is_some();
+            if !sql_results_explicit {
                 caching.sql_results = Some(results_cache.into());
             }
         }

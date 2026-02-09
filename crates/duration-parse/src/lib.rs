@@ -133,6 +133,12 @@ fn parse_compound_duration(input: &str) -> Result<Duration, ParseError> {
     let mut parsed_any = false;
 
     while !remaining.is_empty() {
+        // Skip whitespace between segments (e.g. "1h 30m 10s")
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+
         // Parse numeric part
         let (number, rest) = parse_number(remaining)?;
         // Parse unit suffix
@@ -726,6 +732,40 @@ mod tests {
             let parsed =
                 parse_duration(input).unwrap_or_else(|e| panic!("Failed to parse '{input}': {e}"));
             assert!(parsed > Duration::ZERO, "'{input}' should be positive");
+        }
+    }
+
+    #[test]
+    fn test_parse_with_whitespace_between_segments() {
+        // format_duration produces space-separated segments like "1h 1m 1s"
+        assert_eq!(
+            parse_duration("1h 30m").expect("1h 30m"),
+            Duration::from_secs(5400),
+        );
+        assert_eq!(
+            parse_duration("1h 1m 1s").expect("1h 1m 1s"),
+            Duration::from_secs(3661),
+        );
+        assert_eq!(
+            parse_duration("1d  2h   3m").expect("multi-space"),
+            Duration::from_secs(86_400 + 7200 + 180),
+        );
+    }
+
+    #[test]
+    fn test_format_then_parse_roundtrip() {
+        // Ensure format_duration output is parseable back to the same duration
+        let durations = vec![
+            Duration::from_secs(3661),
+            Duration::from_secs(86_400 + 3600 + 60 + 1),
+            Duration::from_millis(1500),
+            Duration::from_secs(604_800 + 86_400),
+        ];
+        for d in durations {
+            let formatted = format_duration(d);
+            let reparsed = parse_duration(&formatted)
+                .unwrap_or_else(|e| panic!("Failed to parse formatted '{formatted}': {e}"));
+            assert_eq!(d, reparsed, "Roundtrip failed for '{formatted}'");
         }
     }
 
