@@ -941,7 +941,9 @@ pub fn make_dynamodb_dataset_with_cayenne_acceleration(
             format!("http://localhost:{port}"),
         ),
     ]);
-    let temp_dir = tempfile::tempdir().expect("failed to create temp directory").keep();
+    let temp_dir = tempfile::tempdir()
+        .expect("failed to create temp directory")
+        .keep();
     let cayenne_path = temp_dir.join("cayenne_data");
     let metadata_dir = temp_dir.join("cayenne_metadata");
     dataset.params = Some(DatasetParams::from_string_map(params));
@@ -953,11 +955,17 @@ pub fn make_dynamodb_dataset_with_cayenne_acceleration(
         params: Some(DatasetParams::from_string_map(HashMap::from([
             (
                 "cayenne_file_path".to_string(),
-                cayenne_path.to_str().expect("cayenne_path should be valid UTF-8").to_string(),
+                cayenne_path
+                    .to_str()
+                    .expect("cayenne_path should be valid UTF-8")
+                    .to_string(),
             ),
             (
                 "cayenne_metadata_dir".to_string(),
-                metadata_dir.to_str().expect("metadata_dir should be valid UTF-8").to_string(),
+                metadata_dir
+                    .to_str()
+                    .expect("metadata_dir should be valid UTF-8")
+                    .to_string(),
             ),
         ]))),
         ..Acceleration::default()

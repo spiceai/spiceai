@@ -580,6 +580,7 @@ impl CayenneAccelerator {
             .map(Arc::clone)
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn create_cayenne_table_provider(
         &self,
         table_name: &str,
