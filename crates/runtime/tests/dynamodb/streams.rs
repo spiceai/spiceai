@@ -50,6 +50,7 @@ const PORT2: u16 = 8002;
 const PORT3: u16 = 8003;
 const PORT4: u16 = 8004;
 const PORT5: u16 = 8005;
+const PORT6: u16 = 8006;
 
 #[instrument]
 pub async fn start_dynamodb_docker_container(
@@ -906,6 +907,134 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
 
                 runtime_ready_check(&rt).await;
             }
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+pub fn make_dynamodb_dataset_with_cayenne_acceleration(
+    table_name: &str,
+    port: u16,
+    access_key: &str,
+    secret_key: &str,
+) -> Dataset {
+    let mut dataset = Dataset::new(format!("dynamodb:{table_name}"), table_name.to_string());
+    let params = HashMap::from([
+        (
+            "dynamodb_aws_access_key_id".to_string(),
+            access_key.to_string(),
+        ),
+        (
+            "dynamodb_aws_secret_access_key".to_string(),
+            secret_key.to_string(),
+        ),
+        ("dynamodb_aws_region".to_string(), "us-east-1".to_string()),
+        ("dynamodb_aws_auth".to_string(), "key".to_string()),
+        (
+            "endpoint_url".to_string(),
+            format!("http://localhost:{port}"),
+        ),
+    ]);
+    let temp_dir = tempfile::tempdir()
+        .expect("failed to create temp directory")
+        .keep();
+    let cayenne_path = temp_dir.join("cayenne_data");
+    let metadata_dir = temp_dir.join("cayenne_metadata");
+    dataset.params = Some(DatasetParams::from_string_map(params));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Changes),
+        engine: Some("cayenne".to_string()),
+        params: Some(DatasetParams::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                cayenne_path
+                    .to_str()
+                    .expect("cayenne_path should be valid UTF-8")
+                    .to_string(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir
+                    .to_str()
+                    .expect("metadata_dir should be valid UTF-8")
+                    .to_string(),
+            ),
+        ]))),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=debug,dynamodb_streams=debug,info",
+    ));
+
+    let table_name = "cayenne_created_at_test";
+    let access_key = "foo";
+    let secret_key = "bar";
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_dynamodb_docker_container(PORT6).await?;
+            let client = get_client(PORT6, access_key, secret_key);
+
+            // Create table with just `id` as hash key (created_at is a non-key attribute)
+            create_table(&client, table_name).await;
+
+            // Insert a single record with created_at timestamp
+            client
+                .put_item()
+                .table_name(table_name)
+                .item("id", AttributeValue::S("1".to_string()))
+                .item(
+                    "created_at",
+                    AttributeValue::S("2025-10-12T23:37:16.345Z".to_string()),
+                )
+                .send()
+                .await
+                .expect("Failed to insert item");
+
+            sleep(Duration::from_secs(2)).await;
+
+            let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
+                .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
+                    table_name, PORT6, access_key, secret_key,
+                ))
+                .with_results_cache(ResultsCache {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+            sleep(Duration::from_secs(2)).await;
+
+            run_and_snapshot_query(
+                &rt,
+                &format!("SELECT * FROM {table_name}"),
+                "dynamodb_streams_cayenne_file_acceleration",
+            )
+            .await?;
 
             running_container.remove().await.map_err(|e| {
                 tracing::error!("running_container.remove: {e}");
