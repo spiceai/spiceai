@@ -158,7 +158,7 @@ datafusion-physical-expr-common = "51.0.0"
 datafusion-physical-plan = "51.0.0"
 datafusion-proto = { version = "51.0.0", features = ["json"] }
 datafusion-pruning = "51.0.0"
-datafusion-spark = "51.0.0"
+datafusion-spark = "52.1.0"
 datafusion-table-providers = "0.1.0"  # Placeholder version; actual crate is provided via [patch.crates-io] from spiceai fork with DF51 support
 delta_kernel = { version = "0.17.0", features = [
     "default-engine-rustls",
