@@ -748,26 +748,25 @@ impl Runtime {
             .acceleration
             .as_ref()
             .is_some_and(|acc| !acc.partition_by.is_empty())
+            && let Some(assignments) = self.partition_assignments()
         {
-            if let Some(assignments) = self.partition_assignments() {
-                let assignments = assignments.read().await;
-                let mut ds_mod = (*ds).clone();
-                if let Some(new_sql) = update_partitioning_filter_in_refresh_sql(
-                    ds.acceleration
-                        .as_ref()
-                        .and_then(|acc| acc.refresh_sql.as_deref()),
-                    &ds.name,
-                    &assignments,
-                )
-                .context(crate::UnableToConvertPartitionExprSnafu)?
-                {
-                    ds_mod
-                        .acceleration
-                        .as_mut()
-                        .map(|acc| acc.refresh_sql = Some(new_sql));
-                    ds = Arc::new(ds_mod);
-                };
-            }
+            let assignments = assignments.read().await;
+            let mut ds_mod = (*ds).clone();
+            if let Some(new_sql) = update_partitioning_filter_in_refresh_sql(
+                ds.acceleration
+                    .as_ref()
+                    .and_then(|acc| acc.refresh_sql.as_deref()),
+                &ds.name,
+                &assignments,
+            )
+            .context(crate::UnableToConvertPartitionExprSnafu)?
+            {
+                ds_mod
+                    .acceleration
+                    .as_mut()
+                    .map(|acc| acc.refresh_sql = Some(new_sql));
+                ds = Arc::new(ds_mod);
+            };
         }
 
         // ACCELERATED TABLE

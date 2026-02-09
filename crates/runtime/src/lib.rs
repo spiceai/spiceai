@@ -646,23 +646,29 @@ impl Runtime {
     ) -> Result<()> {
         // Re-construct the refresh SQL with the new partitions
         // 1. Get the dataset to find the base refresh SQL
-        let app = self.app.read().await;
-        let Some(dataset) = app.as_ref().and_then(|app| {
-            app.datasets
+        let (dataset_component, app_arc) = {
+            let app_lock = self.app.read().await;
+            let Some(app_arc) = app_lock.as_ref() else {
+                tracing::debug!("App not initialized when updating partitions for {table}");
+                return Ok(());
+            };
+
+            let Some(ds) = app_arc
+                .datasets
                 .iter()
                 .find(|ds| resolved_equality(ds.name.clone().into(), table.clone()))
-        }) else {
-            tracing::debug!("Dataset {table} not found in App when updating partitions");
-            return Ok(());
+            else {
+                tracing::debug!("Dataset {table} not found in App when updating partitions");
+                return Ok(());
+            };
+            (ds.clone(), Arc::clone(app_arc))
         };
 
         let Ok(dataset) = crate::component::dataset::builder::DatasetBuilder::try_from(
-            dataset.clone(),
+            dataset_component,
         )
         .and_then(|mut b| {
-            if let Some(app) = app.as_ref() {
-                b = b.with_app(Arc::clone(app));
-            };
+            b = b.with_app(app_arc);
             b.with_runtime(Arc::new(self.clone()))
                 .build()
                 .context(UnableToBuildDatasetSnafu {
@@ -700,7 +706,7 @@ impl Runtime {
                     );
                 }
             }
-        };
+        }
 
         Ok(())
     }
@@ -714,14 +720,13 @@ impl Runtime {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
                 partition_manager, ..
-            }) => match partition_manager.try_read() {
-                Ok(guard) => guard.clone(),
-                Err(_) => {
-                    tracing::debug!(
-                        "Partition manager is currently being initialized. Returning None."
-                    );
-                    None
-                }
+            }) => if let Ok(guard) = partition_manager.try_read() {
+                guard.clone()
+            } else {
+                tracing::debug!(
+                    "Partition manager is currently being initialized. Returning None."
+                );
+                None
             },
             _ => None,
         }
