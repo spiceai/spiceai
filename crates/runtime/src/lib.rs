@@ -600,6 +600,7 @@ impl Runtime {
     }
 
     #[must_use]
+    #[allow(clippy::type_complexity)]
     pub fn partition_assignments(
         &self,
     ) -> Option<Arc<RwLock<HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>>>> {
@@ -620,7 +621,7 @@ impl Runtime {
         }) = self.distributed.as_ref()
         {
             let mut guard = partition_assignments.write().await;
-            *guard = assignments.clone();
+            guard.clone_from(&assignments);
             drop(guard); // drop lock before updating tables
 
             // Update all assigned tables
@@ -686,25 +687,24 @@ impl Runtime {
                 .as_ref()
                 .and_then(|a| a.refresh_sql.as_deref()),
             &table,
-            &assignments,
+            assignments,
         )
         .context(UnableToConvertPartitionExprSnafu)?;
 
         // 3. Update the AcceleratedTable
-        match self
+        if let Err(e) = self
             .datafusion()
             .update_refresh_sql(table.clone(), new_sql)
             .await
         {
-            Err(e) => tracing::error!("Failed to update refresh SQL for {table}: {e}"),
-            Ok(()) => {
-                tracing::info!("Updated partition assignments for {table}");
-                // Trigger a refresh to load the data for the new partitions
-                if let Err(e) = self.datafusion().refresh_table(&table, None).await {
-                    tracing::warn!(
-                        "Failed to trigger refresh for {table} after updating partitions: {e}"
-                    );
-                }
+            tracing::error!("Failed to update refresh SQL for {table}: {e}");
+        } else {
+            tracing::info!("Updated partition assignments for {table}");
+            // Trigger a refresh to load the data for the new partitions
+            if let Err(e) = self.datafusion().refresh_table(&table, None).await {
+                tracing::warn!(
+                    "Failed to trigger refresh for {table} after updating partitions: {e}"
+                );
             }
         }
 
@@ -751,7 +751,7 @@ impl Runtime {
                     "Attempted to set partition manager on a non-cluster runtime. Ignoring."
                 );
             }
-        };
+        }
     }
 
     /// Returns the metrics reader for on-demand OTLP metrics collection.

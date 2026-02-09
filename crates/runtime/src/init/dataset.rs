@@ -761,12 +761,11 @@ impl Runtime {
             )
             .context(crate::UnableToConvertPartitionExprSnafu)?
             {
-                ds_mod
-                    .acceleration
-                    .as_mut()
-                    .map(|acc| acc.refresh_sql = Some(new_sql));
+                if let Some(acc) = ds_mod.acceleration.as_mut() {
+                    acc.refresh_sql = Some(new_sql);
+                }
                 ds = Arc::new(ds_mod);
-            };
+            }
         }
 
         // ACCELERATED TABLE
