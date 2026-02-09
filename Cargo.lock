@@ -14988,6 +14988,7 @@ dependencies = [
  "snafu",
  "spicepod",
  "tar",
+ "telemetry",
  "tempfile",
  "tokio",
  "tracing",

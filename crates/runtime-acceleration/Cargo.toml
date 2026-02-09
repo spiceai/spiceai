@@ -25,6 +25,7 @@ fundu.workspace = true
 futures.workspace = true
 object_store.workspace = true
 opentelemetry.workspace = true
+telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-secrets = { path = "../runtime-secrets" }
 serde.workspace = true
