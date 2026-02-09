@@ -139,6 +139,8 @@ mod udtfs;
 mod view;
 mod worker;
 
+pub type PartitionAssignments = HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
@@ -600,10 +602,9 @@ impl Runtime {
     }
 
     #[must_use]
-    #[allow(clippy::type_complexity)]
     pub fn partition_assignments(
         &self,
-    ) -> Option<Arc<RwLock<HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>>>> {
+    ) -> Option<Arc<RwLock<PartitionAssignments>>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Executor {
                 partition_assignments,
@@ -614,7 +615,7 @@ impl Runtime {
 
     pub async fn set_partition_assignments(
         &self,
-        assignments: HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>,
+        assignments: PartitionAssignments,
     ) {
         if let Some(DistributedNode::Executor {
             partition_assignments,
@@ -643,7 +644,7 @@ impl Runtime {
     async fn update_partition_refresh_sql(
         &self,
         table: TableReference,
-        assignments: &HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>,
+        assignments: &PartitionAssignments,
     ) -> Result<()> {
         // Re-construct the refresh SQL with the new partitions
         // 1. Get the dataset to find the base refresh SQL
