@@ -282,11 +282,15 @@ impl std::fmt::Display for AttributeValueType {
     }
 }
 
-pub(crate) fn temporality_to_i32(temporality: opentelemetry_sdk::metrics::Temporality) -> i32 {
+pub(crate) fn temporality_to_i32(
+    temporality: opentelemetry_sdk::metrics::Temporality,
+) -> Result<i32, String> {
     // Based on https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto#L278
     match temporality {
-        opentelemetry_sdk::metrics::Temporality::Delta => 1,
-        opentelemetry_sdk::metrics::Temporality::Cumulative => 2,
-        _ => panic!("Invalid temporality"),
+        opentelemetry_sdk::metrics::Temporality::Delta => Ok(1),
+        opentelemetry_sdk::metrics::Temporality::Cumulative => Ok(2),
+        _ => Err(format!(
+            "Unknown temporality variant: {temporality:?}. Cannot represent as a valid OTel aggregation temporality"
+        )),
     }
 }
