@@ -588,7 +588,6 @@ impl ClusterService for ClusterServiceImpl {
                     {
                         Ok(partitions) => {
                             if partitions.is_empty() {
-                                tracing::warn!("partitions.is_empty");
                                 continue;
                             }
                             let mut serialized_items = Vec::new();
@@ -614,7 +613,6 @@ impl ClusterService for ClusterServiceImpl {
                                     }
                                 }
                             }
-                            tracing::warn!("serialized_items={serialized_items:?}");
                             table_partitions.insert(
                                 table_ref.to_string(),
                                 StringArray {

@@ -132,68 +132,6 @@ impl PartitionManager {
         self.write_metadata(&key, metadata).await
     }
 
-    // /// Assign a partition to an executor.
-    // pub async fn assign_partition(
-    //     &self,
-    //     table: &TableReference,
-    //     partition_value: &str,
-    //     executor_url: &str,
-    // ) -> Result<()> {
-    //     let key = table.to_string();
-    //     let now_ms = now_ms()?;
-
-    //     let mut metadata =
-    //         self.get_table_metadata(table)
-    //             .await?
-    //             .ok_or_else(|| Error::PartitionNotFound {
-    //                 table: table.to_string(),
-    //                 partition: partition_value.to_string(),
-    //             })?;
-
-    //     let partition = metadata
-    //         .find_partition_mut(partition_value)
-    //         .ok_or_else(|| Error::PartitionNotFound {
-    //             table: table.to_string(),
-    //             partition: partition_value.to_string(),
-    //         })?;
-
-    //     partition.assign_to(executor_url.to_string(), now_ms);
-    //     metadata.updated_at = now_ms;
-
-    //     self.write_metadata(&key, metadata).await
-    // }
-
-    // /// Unassign a partition from an executor.
-    // pub async fn unassign_partition(
-    //     &self,
-    //     table: &TableReference,
-    //     partition_value: &str,
-    //     executor_url: &str,
-    // ) -> Result<()> {
-    //     let key = table.to_string();
-    //     let now_ms = now_ms()?;
-
-    //     let mut metadata =
-    //         self.get_table_metadata(table)
-    //             .await?
-    //             .ok_or_else(|| Error::PartitionNotFound {
-    //                 table: table.to_string(),
-    //                 partition: partition_value.to_string(),
-    //             })?;
-
-    //     let partition = metadata
-    //         .find_partition_mut(partition_value)
-    //         .ok_or_else(|| Error::PartitionNotFound {
-    //             table: table.to_string(),
-    //             partition: partition_value.to_string(),
-    //         })?;
-
-    //     partition.unassign_from(executor_url);
-    //     metadata.updated_at = now_ms;
-
-    //     self.write_metadata(&key, metadata).await
-    // }
-
     /// Allocates unassigned partitions to an executor.
     ///
     /// Returns the list of allocated partitions.
@@ -204,7 +142,6 @@ impl PartitionManager {
         executor_id: &str,
         limit: usize,
     ) -> Result<Vec<HashMap<String, String>>> {
-        tracing::warn!("table={table:?}. executor_id={executor_id:?}.");
         let key = table.to_string();
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
@@ -219,7 +156,6 @@ impl PartitionManager {
                         table: key.clone(),
                         partition: "any".to_string(),
                     })?;
-            tracing::warn!("metadata={metadata:?}");
 
             let mut allocated: Vec<_> = metadata
                 .partitions
@@ -247,7 +183,6 @@ impl PartitionManager {
             }
 
             if !changes {
-                tracing::info!("No changes for allocate_partitions");
                 return Ok(allocated);
             }
 

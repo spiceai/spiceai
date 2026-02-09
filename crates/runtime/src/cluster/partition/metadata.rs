@@ -98,13 +98,6 @@ impl TablePartitionMetadata {
         self.partitions.push(partition);
     }
 
-    // pub fn find_partition_mut(
-    //     &mut self,
-    //     partition_value: &HashMap<String, String>,
-    // ) -> Option<&mut PartitionMetadata> {
-
-    // }
-
     #[must_use]
     pub fn unassigned_partitions(&self) -> Vec<&PartitionMetadata> {
         self.partitions

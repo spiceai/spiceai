@@ -34,13 +34,13 @@ use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
+use crate::cluster::partition::update_refresh_sql;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::datafusion::{DataFusion, resolved_equality};
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
-use crate::datafusion::{DataFusion, resolved_equality};
 use crate::{
-    auth::EndpointAuth, dataconnector::DataConnector,
-    internal_table::Error as InternalTableError,
+    auth::EndpointAuth, dataconnector::DataConnector, internal_table::Error as InternalTableError,
 };
 
 use ::datafusion::error::DataFusionError;
@@ -624,9 +624,12 @@ impl Runtime {
             drop(guard); // drop lock before updating tables
 
             // Update all assigned tables
-            for (table, partitions) in assignments {
-                if let Err(e) = self.update_partition_refresh_sql(table.clone(), partitions).await {
-                     tracing::warn!("Failed to update partition refresh SQL for {table}: {e}");
+            for table in assignments.keys() {
+                if let Err(e) = self
+                    .update_partition_refresh_sql(table.clone(), &assignments)
+                    .await
+                {
+                    tracing::warn!("Failed to update partition refresh SQL for {table}: {e}");
                 }
             }
         } else {
@@ -636,31 +639,10 @@ impl Runtime {
         }
     }
 
-    pub async fn update_partition_assignments(
-        &self,
-        table: TableReference,
-        partitions: Vec<::datafusion::logical_expr::Expr>,
-    ) -> Result<()> {
-        if let Some(DistributedNode::Executor {
-            partition_assignments,
-        }) = self.distributed.as_ref()
-        {
-            let mut guard = partition_assignments.write().await;
-            guard.insert(table.clone(), partitions.clone());
-        } else {
-            tracing::warn!(
-                "Attempted to update partition assignments on a non-executor node. Ignoring."
-            );
-            return Ok(());
-        }
-
-        self.update_partition_refresh_sql(table, partitions).await
-    }
-
     async fn update_partition_refresh_sql(
         &self,
         table: TableReference,
-        partitions: Vec<::datafusion::logical_expr::Expr>,
+        assignments: &HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>,
     ) -> Result<()> {
         // Re-construct the refresh SQL with the new partitions
         // 1. Get the dataset to find the base refresh SQL
@@ -674,47 +656,43 @@ impl Runtime {
             return Ok(());
         };
 
-        let Ok(dataset) = crate::component::dataset::builder::DatasetBuilder::try_from(dataset.clone())
-            .and_then(|b| b.with_app(Arc::clone(app.as_ref().expect("checked above")))
+        let Ok(dataset) = crate::component::dataset::builder::DatasetBuilder::try_from(
+            dataset.clone(),
+        )
+        .and_then(|b| {
+            b.with_app(Arc::clone(app.as_ref().expect("checked above")))
                 .with_runtime(Arc::new(self.clone()))
                 .build()
                 .context(UnableToBuildDatasetSnafu {
                     dataset: table.to_string(),
-                })) else {
-             tracing::warn!("Failed to build dataset {table} when updating partitions");
-             return Ok(());
+                })
+        }) else {
+            tracing::warn!("Failed to build dataset {table} when updating partitions");
+            return Ok(());
         };
 
         // 2. Construct the new SQL
-        let base_sql = dataset.acceleration.as_ref().and_then(|a| a.refresh_sql.clone());
-        let new_sql = if partitions.is_empty() {
-             base_sql
-        } else {
-            let filter_expr = partitions
-                .iter()
-                .cloned()
-                .reduce(|acc, expr| acc.and(expr))
-                .unwrap_or_else(|| unreachable!("partitions is not empty"));
-
-            let filter_sql = ::datafusion::sql::unparser::expr_to_sql(&filter_expr)
-                .map(|ast| ast.to_string())
-                .context(UnableToConvertPartitionExprSnafu)?;
-
-            if let Some(sql) = base_sql {
-                Some(format!("SELECT * FROM ({sql}) AS _partitioned_source WHERE {filter_sql}"))
-            } else {
-                Some(format!("SELECT * FROM {name} WHERE {filter_sql}", name = dataset.name))
-            }
-        };
+        let base_sql = dataset
+            .acceleration
+            .as_ref()
+            .and_then(|a| a.refresh_sql.clone());
+        let new_sql = update_refresh_sql(base_sql.as_deref(), &table, &assignments)
+            .context(UnableToConvertPartitionExprSnafu)?;
 
         // 3. Update the AcceleratedTable
-        if let Err(e) = self.datafusion().update_refresh_sql(table.clone(), new_sql).await {
+        if let Err(e) = self
+            .datafusion()
+            .update_refresh_sql(table.clone(), new_sql)
+            .await
+        {
             tracing::error!("Failed to update refresh SQL for {table}: {e}");
         } else {
             tracing::info!("Updated partition assignments for {table}");
             // Trigger a refresh to load the data for the new partitions
             if let Err(e) = self.datafusion().refresh_table(&table, None).await {
-                tracing::warn!("Failed to trigger refresh for {table} after updating partitions: {e}");
+                tracing::warn!(
+                    "Failed to trigger refresh for {table} after updating partitions: {e}"
+                );
             }
         }
 

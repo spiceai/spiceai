@@ -120,7 +120,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 // Combine partitions with OR.
                 if let Some(partition_filter) = partition_filters.into_iter().reduce(Expr::or) {
                     filters.push(partition_filter);
-                };
+                }
                 let plan = LogicalPlanBuilder::scan_with_filters(
                     scan.table_name.clone(),
                     Arc::new(source),

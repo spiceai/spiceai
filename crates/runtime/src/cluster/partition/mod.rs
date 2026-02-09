@@ -18,9 +18,38 @@ mod manager;
 mod metadata;
 mod startup;
 
+use std::collections::HashMap;
+
+use datafusion::sql::{TableReference, unparser::expr_to_sql};
+use datafusion_expr::Expr;
 pub use manager::PartitionManager;
 pub use metadata::{PartitionMetadata, TablePartitionMetadata};
 pub use startup::{
     accelerated_tables, build_partition_metadata_store, executor_request_initial_partitions,
     initialize_partition_metadata,
 };
+
+pub fn update_refresh_sql(
+    current_sql: Option<&str>,
+    tbl: &TableReference,
+    assignments: &HashMap<TableReference, Vec<Expr>>,
+) -> Result<Option<String>, datafusion::error::DataFusionError> {
+    let partitions = assignments.get(tbl).unwrap_or_default();
+    if partitions.is_empty() {
+        return Ok(current_sql.map(ToString::to_string));
+    }
+    let filter_expr = partitions
+        .iter()
+        .cloned()
+        .reduce(|acc, expr| acc.or(expr))
+        .unwrap_or_else(|| unreachable!("partitions is not empty"));
+
+    let filter_sql = expr_to_sql(&filter_expr).map(|ast| ast.to_string())?;
+
+    let sql = if let Some(sql) = current_sql {
+        format!("SELECT * FROM ({sql}) AS _partitioned_source WHERE {filter_sql}")
+    } else {
+        format!("SELECT * FROM {tbl} WHERE {filter_sql}")
+    };
+    Ok(Some(sql))
+}

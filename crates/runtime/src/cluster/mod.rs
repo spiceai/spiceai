@@ -805,7 +805,6 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                     let partition_manager = Arc::new(PartitionManager::new(store));
                     rt.set_partition_manager(Arc::clone(&partition_manager))
                         .await;
-                    tracing::info!("Partition manager initialized for scheduler");
 
                     // Initialize partition metadata for all accelerated tables
                     if let Err(err) =
@@ -1264,7 +1263,6 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to allocate initial partitions from scheduler: {status}")
                 .into(),
         })?;
-        tracing::warn!("initial_partitions={:?}", initial_partitions);
         rt.set_partition_assignments(initial_partitions).await;
 
         // Bind the already-fetched app and initialize secrets for object store configuration
