@@ -104,7 +104,11 @@ fn dataset_label(dataset: &str) -> KeyValue {
 pub fn record_bootstrap_metrics(dataset: &str, duration_ms: f64, bytes: u64, checksum: &str) {
     let dataset_attr = dataset_label(dataset);
 
-    telemetry::record_snapshot_bootstrap_metrics(duration_ms, bytes, &[dataset_attr.clone()]);
+    telemetry::record_snapshot_bootstrap_metrics(
+        duration_ms,
+        bytes,
+        std::slice::from_ref(&dataset_attr),
+    );
 
     let duration_labels = [dataset_attr.clone()];
     SNAPSHOT_BOOTSTRAP_DURATION_MS.add(duration_ms, &duration_labels);
@@ -134,7 +138,11 @@ pub fn record_write_metrics(
 ) {
     let dataset_attr = dataset_label(dataset);
 
-    telemetry::record_snapshot_write_metrics(duration_ms, bytes, &[dataset_attr.clone()]);
+    telemetry::record_snapshot_write_metrics(
+        duration_ms,
+        bytes,
+        std::slice::from_ref(&dataset_attr),
+    );
 
     let timestamp_labels = [dataset_attr.clone()];
     SNAPSHOT_WRITE_TIMESTAMP.record(timestamp_secs, &timestamp_labels);
