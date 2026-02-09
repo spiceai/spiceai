@@ -221,12 +221,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cron_cannot_go_faster_than_second() {
+    async fn test_cron_rejects_eight_field_expression() {
         // With Year::Optional, "* * * * * * *" (7 fields) is valid cron that runs every
-        // second of every year. An 8-field expression, however, should be invalid.
+        // second of every year. An 8-field expression, however, should be rejected.
         let cron_expression = "* * * * * * * *".into();
         let channel = CronRequestChannel::new(&cron_expression);
-        assert!(channel.is_err(), "Cron expression should be invalid");
+        assert!(
+            channel.is_err(),
+            "8-field cron expression should be rejected"
+        );
     }
 
     #[tokio::test]
@@ -339,17 +342,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_cron_year_optional() {
-        // Test that a 7-field cron expression with a year is supported
-        let cron = Arc::from("0 0 0 1 1 * 2030");
+        // Test that a 7-field cron expression with a year is supported.
+        // Use a year relative to now so the test doesn't become flaky once a
+        // hard-coded year is in the past.
+        let now = Local::now();
+        let target_year = now.year() + 5;
+        let cron_expr = format!("0 0 0 1 1 * {target_year}");
+        let cron: Arc<str> = Arc::from(cron_expr.as_str());
         let channel = CronRequestChannel::new(&cron).expect("Should parse cron with year");
 
-        let now = Local::now();
         let next = channel
             .cron
             .find_next_occurrence(&now, false)
             .expect("Should find next occurrence");
 
-        // The year should be 2030
-        assert_eq!(next.year(), 2030, "Cron should schedule in year 2030");
+        assert_eq!(
+            next.year(),
+            target_year,
+            "Cron should schedule in the target year"
+        );
     }
 }

@@ -287,6 +287,16 @@ fn apply_exponent(
         .map_err(|_| ParseError::invalid_input("Exponent too large"))?;
     let exp = if exp_negative { -exp_val } else { exp_val };
 
+    // Cap exponent magnitude to prevent excessive memory allocation from
+    // building large intermediate strings (e.g., "1e-1000000000" would try
+    // to allocate a multi-GB string of leading zeros).
+    if exp.abs() > MAX_EXPONENT_MAGNITUDE {
+        return Err(ParseError::invalid_input(format!(
+            "Exponent magnitude {} exceeds maximum ({MAX_EXPONENT_MAGNITUDE})",
+            exp.abs()
+        )));
+    }
+
     // Build the full digit string: integer digits + fractional digits
     // e.g., integer=1, frac_value=5, frac_digits=1 -> digits="15", decimal_pos=1
     // The decimal point is `frac_digits` positions from the right end of the digit string.
@@ -439,6 +449,10 @@ const NANOS_PER_MINUTE: u64 = 60 * NANOS_PER_SECOND;
 const NANOS_PER_HOUR: u64 = 60 * NANOS_PER_MINUTE;
 const NANOS_PER_DAY: u64 = 24 * NANOS_PER_HOUR;
 const NANOS_PER_WEEK: u64 = 7 * NANOS_PER_DAY;
+
+/// Maximum allowed exponent magnitude for scientific notation in duration strings.
+/// This prevents excessive memory allocation from building large intermediate strings.
+const MAX_EXPONENT_MAGNITUDE: i32 = 20;
 
 /// Format a [`Duration`] into a human-readable string.
 ///
@@ -664,6 +678,15 @@ mod tests {
             parse_duration("1.5e1s").expect("1.5e1s"),
             Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn test_parse_scientific_notation_extreme_exponent_rejected() {
+        // Extremely large exponents should be rejected to prevent DoS via
+        // excessive memory allocation in intermediate string construction.
+        parse_duration("1e100s").expect_err("extreme positive exponent should fail");
+        parse_duration("1e-100s").expect_err("extreme negative exponent should fail");
+        parse_duration("1e1000000000s").expect_err("huge exponent should fail");
     }
 
     #[test]
