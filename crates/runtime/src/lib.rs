@@ -34,7 +34,7 @@ use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
-use crate::cluster::partition::update_refresh_sql;
+use crate::cluster::partition::update_partitioning_filter_in_refresh_sql;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::{DataFusion, resolved_equality};
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
@@ -676,25 +676,27 @@ impl Runtime {
             .acceleration
             .as_ref()
             .and_then(|a| a.refresh_sql.clone());
-        let new_sql = update_refresh_sql(base_sql.as_deref(), &table, &assignments)
-            .context(UnableToConvertPartitionExprSnafu)?;
+        let new_sql =
+            update_partitioning_filter_in_refresh_sql(base_sql.as_deref(), &table, &assignments)
+                .context(UnableToConvertPartitionExprSnafu)?;
 
         // 3. Update the AcceleratedTable
-        if let Err(e) = self
+        match self
             .datafusion()
             .update_refresh_sql(table.clone(), new_sql)
             .await
         {
-            tracing::error!("Failed to update refresh SQL for {table}: {e}");
-        } else {
-            tracing::info!("Updated partition assignments for {table}");
-            // Trigger a refresh to load the data for the new partitions
-            if let Err(e) = self.datafusion().refresh_table(&table, None).await {
-                tracing::warn!(
-                    "Failed to trigger refresh for {table} after updating partitions: {e}"
-                );
+            Err(e) => tracing::error!("Failed to update refresh SQL for {table}: {e}"),
+            Ok(()) => {
+                tracing::info!("Updated partition assignments for {table}");
+                // Trigger a refresh to load the data for the new partitions
+                if let Err(e) = self.datafusion().refresh_table(&table, None).await {
+                    tracing::warn!(
+                        "Failed to trigger refresh for {table} after updating partitions: {e}"
+                    );
+                }
             }
-        }
+        };
 
         Ok(())
     }

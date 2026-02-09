@@ -29,12 +29,12 @@ pub use startup::{
     initialize_partition_metadata,
 };
 
-pub fn update_refresh_sql(
+pub fn update_partitioning_filter_in_refresh_sql(
     current_sql: Option<&str>,
     tbl: &TableReference,
     assignments: &HashMap<TableReference, Vec<Expr>>,
 ) -> Result<Option<String>, datafusion::error::DataFusionError> {
-    let partitions = assignments.get(tbl).unwrap_or_default();
+    let partitions = assignments.get(tbl).cloned().unwrap_or_default();
     if partitions.is_empty() {
         return Ok(current_sql.map(ToString::to_string));
     }

@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use crate::cluster::partition::update_refresh_sql;
+use crate::cluster::partition::update_partitioning_filter_in_refresh_sql;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
@@ -752,7 +752,7 @@ impl Runtime {
             if let Some(assignments) = self.partition_assignments() {
                 let assignments = assignments.read().await;
                 let mut ds_mod = (*ds).clone();
-                if let Some(new_sql) = update_refresh_sql(
+                if let Some(new_sql) = update_partitioning_filter_in_refresh_sql(
                     ds.acceleration
                         .as_ref()
                         .and_then(|acc| acc.refresh_sql.as_deref()),
