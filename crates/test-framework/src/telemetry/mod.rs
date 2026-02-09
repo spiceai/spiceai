@@ -56,13 +56,15 @@ pub static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
 /// metric operations fall through to noop via the `meter()` helper.
 pub static METER: OnceLock<Meter> = OnceLock::new();
 
-/// Returns the initialized meter, or a noop meter if not yet initialized.
+/// Shared noop meter used when `METER` has not been initialized.
+/// This avoids allocating a new `NoopMeterProvider` on every `meter()` call.
+static NOOP_METER: LazyLock<Meter> =
+    LazyLock::new(|| NoopMeterProvider::new().meter("benchmarks_telemetry"));
+
+/// Returns the initialized meter, or a shared noop meter if not yet initialized.
 #[must_use]
 pub fn meter() -> Meter {
-    METER
-        .get()
-        .cloned()
-        .unwrap_or_else(|| NoopMeterProvider::new().meter("benchmarks_telemetry"))
+    METER.get().cloned().unwrap_or_else(|| NOOP_METER.clone())
 }
 
 #[derive(Debug, Clone)]

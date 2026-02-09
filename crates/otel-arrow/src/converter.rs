@@ -92,6 +92,10 @@ impl DataNumberBuilder {
         }
     }
 
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.int_builder.finish()),
@@ -104,7 +108,9 @@ impl DataNumberBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                debug_assert!(false, "Could not convert number: {e}");
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert number: {e}");
+                }
                 tracing::error!("Could not convert number: {e}");
                 None
             }
@@ -154,6 +160,10 @@ impl DataHistogramBuilder {
         }
     }
 
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.count_builder.finish()),
@@ -170,7 +180,9 @@ impl DataHistogramBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                debug_assert!(false, "Could not convert histogram data: {e}");
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert histogram data: {e}");
+                }
                 tracing::error!("Could not convert histogram data: {e}");
                 None
             }
@@ -199,6 +211,10 @@ impl ResourceBuilder {
         self.null_buffer_builder.append(is_valid);
     }
 
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.schema_url_builder.finish()),
@@ -212,7 +228,9 @@ impl ResourceBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                debug_assert!(false, "Could not convert resource: {e}");
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert resource: {e}");
+                }
                 tracing::error!("Could not convert resource: {e}");
                 None
             }
@@ -243,6 +261,10 @@ impl ScopeBuilder {
         self.null_buffer_builder.append(is_valid);
     }
 
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.name_builder.finish()),
@@ -257,7 +279,9 @@ impl ScopeBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                debug_assert!(false, "Could not convert scope: {e}");
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert scope: {e}");
+                }
                 tracing::error!("Could not convert scope: {e}");
                 None
             }
@@ -315,6 +339,10 @@ impl AttributesBuilder {
         Ok(())
     }
 
+    #[expect(
+        clippy::manual_assert,
+        reason = "if cfg!(...) is intentionally conditional on feature flag"
+    )]
     fn finish(&mut self) -> Option<ListArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.key_builder.finish()),
@@ -333,7 +361,9 @@ impl AttributesBuilder {
         ) {
             Ok(array) => array,
             Err(e) => {
-                debug_assert!(false, "Could not convert attributes: {e}");
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert attributes: {e}");
+                }
                 tracing::error!("Could not convert attributes: {e}");
                 return None;
             }
@@ -352,7 +382,9 @@ impl AttributesBuilder {
         ) {
             Ok(array) => Some(array),
             Err(e) => {
-                debug_assert!(false, "Could not convert attributes: {e}");
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert attributes: {e}");
+                }
                 tracing::error!("Could not convert attributes: {e}");
                 None
             }
@@ -817,6 +849,7 @@ trait AppendDataNumber {
 impl AppendDataNumber for u64 {
     fn append(&self, builder: &mut DataNumberBuilder) -> Result<(), ConversionError> {
         let value = i64::try_from(*self).map_err(|_| {
+            tracing::error!("u64 metric value {self} exceeds i64::MAX; failing conversion to preserve data correctness");
             ConversionError(format!(
                 "u64 metric value {self} exceeds i64::MAX and cannot be represented as i64",
             ))

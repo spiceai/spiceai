@@ -63,9 +63,12 @@ async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> R
         .unwrap_or_else(|_| "unknown".into())
         .into_encoded_bytes();
 
-    // instance_id = SHA256(hostname + spicepod_name)
+    // instance_id = SHA256(hostname + ":" + spicepod_name)
+    // The ":" separator prevents collisions between different (hostname, spicepod_name)
+    // pairs (e.g., "ab"+"c" vs "a"+"bc").
     let mut instance_id_hasher = Sha256::new();
     instance_id_hasher.update(hostname);
+    instance_id_hasher.update(b":");
     instance_id_hasher.update(spicepod_name);
     let instance_id = format!("{:x}", instance_id_hasher.finalize());
 
