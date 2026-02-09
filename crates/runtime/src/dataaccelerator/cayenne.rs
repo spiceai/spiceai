@@ -49,7 +49,10 @@ use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
+use super::{
+    AccelerationSource, BootstrapStatus, DataAccelerator, get_primary_keys_from_constraints,
+    upsert_dedup,
+};
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
@@ -1495,6 +1498,7 @@ impl CayenneAccelerator {
             .map(Arc::clone)
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn create_cayenne_table_provider(
         &self,
         table_name: &str,
@@ -1502,6 +1506,8 @@ impl CayenneAccelerator {
         schema: Arc<Schema>,
         source: &dyn AccelerationSource,
         retention_filters: Vec<Expr>,
+        primary_keys: Vec<String>,
+        on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
     ) -> Result<Arc<cayenne::CayenneTableProvider>> {
         use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
 
@@ -1540,44 +1546,6 @@ impl CayenneAccelerator {
                 vortex_config.target_vortex_file_size_mb
             );
         }
-
-        let (primary_keys, on_conflict) = if let Some(acceleration) = source.acceleration() {
-            // Use configured primary key if provided.
-            let pk_vec = acceleration
-                .primary_key
-                .as_ref()
-                .map(|pk| pk.iter().map(std::string::ToString::to_string).collect())
-                .unwrap_or_default();
-
-            // Derive on_conflict from acceleration settings.
-            let on_conflict = acceleration
-                .on_conflict
-                .iter()
-                .map(|(col_ref, behavior)| {
-                    let col =
-                        datafusion_table_providers::util::column_reference::ColumnReference::new(
-                            col_ref
-                                .iter()
-                                .map(std::string::ToString::to_string)
-                                .collect(),
-                        );
-                    match behavior {
-                        crate::component::dataset::acceleration::OnConflictBehavior::Drop => {
-                            datafusion_table_providers::util::on_conflict::OnConflict::DoNothing(
-                                col,
-                            )
-                        }
-                        crate::component::dataset::acceleration::OnConflictBehavior::Upsert(
-                            _options,
-                        ) => datafusion_table_providers::util::on_conflict::OnConflict::Upsert(col),
-                    }
-                })
-                .next();
-
-            (pk_vec, on_conflict)
-        } else {
-            (Vec::new(), None)
-        };
 
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
@@ -1960,6 +1928,29 @@ impl DataAccelerator for CayenneAccelerator {
             Vec::new()
         };
 
+        // Extract primary keys and on_conflict once, used by both partitioned and non-partitioned paths.
+        // Uses explicit user config if provided, otherwise falls back to federated table constraints
+        // (e.g. DynamoDB partition key) and on_conflict from options populated by create_accelerator_table.
+        let primary_keys = source
+            .acceleration()
+            .and_then(|a| a.primary_key.as_ref())
+            .map(|pk| {
+                pk.iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|pk| !pk.is_empty())
+            .unwrap_or_else(|| get_primary_keys_from_constraints(&cmd.constraints, &arrow_schema));
+
+        let on_conflict = cmd
+            .options
+            .get("on_conflict")
+            .map(|s| datafusion_table_providers::util::on_conflict::OnConflict::try_from(s.as_str()))
+            .transpose()
+            .map_err(|e| Error::InvalidConfiguration {
+                detail: Arc::from(format!("on_conflict invalid: {e}")),
+            })?;
+
         // Always create the base Cayenne table provider
         let cayenne_table = self
             .create_cayenne_table_provider(
@@ -1968,6 +1959,8 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::clone(&arrow_schema),
                 source,
                 retention_filters.clone(),
+                primary_keys.clone(),
+                on_conflict.clone(),
             )
             .await
             .boxed()?;
@@ -2050,43 +2043,6 @@ impl DataAccelerator for CayenneAccelerator {
                     vortex_config.target_vortex_file_size_mb
                 );
             }
-
-            // Extract primary_key and on_conflict from acceleration settings for partitioned tables
-            let (primary_keys, on_conflict) = if let Some(acceleration) = source.acceleration() {
-                let pk_vec = acceleration
-                    .primary_key
-                    .as_ref()
-                    .map(|pk| pk.iter().map(std::string::ToString::to_string).collect())
-                    .unwrap_or_default();
-
-                let on_conflict = acceleration
-                    .on_conflict
-                    .iter()
-                    .map(|(col_ref, behavior)| {
-                        let col =
-                            datafusion_table_providers::util::column_reference::ColumnReference::new(
-                                col_ref
-                                    .iter()
-                                    .map(std::string::ToString::to_string)
-                                    .collect(),
-                            );
-                        match behavior {
-                            crate::component::dataset::acceleration::OnConflictBehavior::Drop => {
-                                datafusion_table_providers::util::on_conflict::OnConflict::DoNothing(
-                                    col,
-                                )
-                            }
-                            crate::component::dataset::acceleration::OnConflictBehavior::Upsert(
-                                _options,
-                            ) => datafusion_table_providers::util::on_conflict::OnConflict::Upsert(col),
-                        }
-                    })
-                    .next();
-
-                (pk_vec, on_conflict)
-            } else {
-                (Vec::new(), None)
-            };
 
             let creator = Arc::new(CayennePartitionCreator::new(
                 table_name,
