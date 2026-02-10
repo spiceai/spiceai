@@ -810,6 +810,14 @@ fn error_to_response(error: &crate::jobs::Error) -> Response {
             Json(serde_json::json!({"error": error.to_string()})),
         )
             .into_response(),
+        Error::NoRowsReturned { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": error.to_string(),
+                "error_code": "NO_ROWS_RETURNED"
+            })),
+        )
+            .into_response(),
         Error::JobResultsExpired { .. } => (
             StatusCode::GONE,
             Json(serde_json::json!({"error": error.to_string()})),
