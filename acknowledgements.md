@@ -216,7 +216,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - clickhouse-rs 1.1.0-alpha.1, MIT 
   <br/>https://github.com/suharev7/clickhouse-rs
 
-- comfy-table 7.1.4, MIT 
+- comfy-table 7.1.2, MIT 
   <br/>https://github.com/nukesor/comfy-table
 
 - criterion 0.5.1, Apache-2.0 OR MIT 
@@ -306,7 +306,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - dotenvy 0.15.7, MIT 
   <br/>https://github.com/allan2/dotenvy
 
-- duckdb 1.4.3, MIT 
+- duckdb 1.4.4, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
 - dyn-clone 1.0.20, Apache-2.0 OR MIT 
@@ -723,7 +723,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - spiceai 3.2.0, Apache-2.0 
   <br/>
 
-- spicepod-validator 1.11.0, Apache-2.0 
+- spicepod-validator 1.11.1, Apache-2.0 
   <br/>
 
 - ssh2 0.9.5, Apache-2.0 OR MIT 
@@ -877,6 +877,9 @@ Spice.ai acknowledges the following open source projects for making this project
   <br/>https://github.com/spiraldb/vortex
 
 - vortex-datafusion 0.1.0, Apache-2.0 
+  <br/>https://github.com/spiraldb/vortex
+
+- vortex-scan 0.1.0, Apache-2.0 
   <br/>https://github.com/spiraldb/vortex
 
 - vortex-session 0.1.0, Apache-2.0 
