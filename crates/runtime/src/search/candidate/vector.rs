@@ -237,8 +237,11 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
                 .concat(),
             )?
             .filter(
-                LogicalExpr::ScalarFunction(ScalarFunction::new_udf(isnan(), vec![ident(SEARCH_SCORE_COLUMN_NAME)]))
-                    .is_false(),
+                LogicalExpr::ScalarFunction(ScalarFunction::new_udf(
+                    isnan(),
+                    vec![ident(SEARCH_SCORE_COLUMN_NAME)],
+                ))
+                .is_false(),
             )?;
 
         // Filter out primary keys from additional columns if duplicated
@@ -267,7 +270,10 @@ impl CandidateGeneration for ChunkedNonIndexVectorGeneration {
             .window(vec![window_expr])?
             .alias("rank")?
             .filter(col("chunk_rank").eq(lit(1)))?
-            .sort(vec![LogicalExpr::Column(Column::new(Some("rank"), SEARCH_SCORE_COLUMN_NAME)).sort(false, false)])?
+            .sort(vec![
+                LogicalExpr::Column(Column::new(Some("rank"), SEARCH_SCORE_COLUMN_NAME))
+                    .sort(false, false),
+            ])?
             .join(
                 additional_table,
                 JoinType::Left,
