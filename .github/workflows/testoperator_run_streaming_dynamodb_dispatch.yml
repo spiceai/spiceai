@@ -20,11 +20,6 @@ on:
         required: true
         default: '0.01'
         type: string
-      ingestion_timeout:
-        description: 'Timeout in seconds to wait for ingestion'
-        required: true
-        default: '600'
-        type: string
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -119,7 +114,6 @@ jobs:
             -p ./test/spicepods/streaming/dynamodb \
             --queryset ${{ github.event.inputs.queryset }} \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
-            --ingestion-timeout ${{ github.event.inputs.ingestion_timeout }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --mutation-ratio ${{ github.event.inputs.mutation_ratio }} \
             --workflow testoperator_run_streaming_dynamodb.yml \
