@@ -70,6 +70,7 @@ use tokio::task;
 use vortex_datafusion::VortexFormat;
 
 use super::context::CayenneContext;
+use super::deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
 use super::vortex_format::DeletionFilteringVortexFormat;
 
 /// Extension trait to extract `UpsertOptions` from `OnConflict`.
@@ -86,23 +87,6 @@ impl OnConflictExt for OnConflict {
     fn get_upsert_options(&self) -> UpsertOptions {
         UpsertOptions::default()
     }
-}
-
-/// Strategy for primary key-based deletion filtering.
-///
-/// Determines which cache and filter execution plan to use at query time.
-/// Chosen based on the table's primary key configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PkDeletionStrategy {
-    /// No primary key - use position-based deletion with `RoaringBitmap`.
-    /// Requires `CoalescePartitionsExec` to ensure consistent ordering.
-    PositionBased,
-    /// Single-column Int64 primary key - use direct `HashSet<i64>` lookup.
-    /// Most efficient: no serialization, 8 bytes per key, parallel reads.
-    Int64Pk,
-    /// Composite or non-integer primary key - use `RowConverter` + `HashSet<Box<[u8]>>`.
-    /// Handles all PK types but has serialization overhead.
-    RowConverterBased,
 }
 
 /// Cayenne table provider that reads from Vortex virtual files.
@@ -133,53 +117,9 @@ pub struct CayenneTableProvider {
     /// If the same context is reused across multiple instances, all internal operations
     /// share the same footer and segment caches, enabling shared memory management.
     context: Arc<CayenneContext>,
-    /// Cached deletion vectors (deleted row IDs) for position-based deletion.
-    /// Used for tables WITHOUT a primary key.
-    ///
-    /// Maps data file path -> `RoaringBitmap` of file-local row positions.
-    /// This per-file structure ensures deletion correctness regardless of file scan order.
-    ///
-    /// Loaded once during table provider initialization and invalidated when delete files change.
-    /// Using `RwLock` for concurrent reads during scans with occasional writes on updates.
-    /// The inner `Arc<HashMap>` enables zero-copy sharing: scans clone the Arc (cheap ref count
-    /// increment) rather than cloning the entire map, aligning with zero-copy principles.
-    ///
-    /// `RoaringBitmap` provides 50-90% memory savings vs `HashSet` for sparse deletions and SIMD-optimized
-    /// contains operations. Limited to u32 row IDs (4 billion rows per file). Tables with excessive deleted rows
-    /// (approaching billions) should trigger compaction to maintain query performance and clear deletion vectors.
-    cached_deleted_row_ids: Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>,
-    /// Cached deletion vectors for Int64 primary key-based deletion.
-    /// Used for tables with a single-column Int64 primary key.
-    ///
-    /// This is the most efficient deletion strategy - direct i64 comparison without
-    /// any serialization overhead. 8 bytes per deleted key.
-    /// Maps PK -> `delete_sequence_number` for sequence-based ordering.
-    cached_deleted_pk_i64: Arc<RwLock<Arc<std::collections::HashMap<i64, i64>>>>,
-    /// Cached deletion vectors (deleted row keys) for key-based deletion.
-    /// Used for tables with composite or non-integer primary keys.
-    ///
-    /// Keys are the byte representation of primary key columns via Arrow's `RowConverter`.
-    /// Maps PK bytes -> `delete_sequence_number` for sequence-based ordering.
-    #[expect(clippy::type_complexity)]
-    cached_deleted_row_keys: Arc<RwLock<Arc<std::collections::HashMap<Box<[u8]>, i64>>>>,
-    /// Cached insert records for Int64 primary key-based deletion.
-    /// Used for tables with a single-column Int64 primary key.
-    ///
-    /// Insert records track PKs that were re-inserted after being deleted (upserted).
-    /// Maps PK -> `insert_sequence_number`.
-    /// During scan: delete applies only if `delete_sequence` > `insert_sequence` for that PK.
-    cached_insert_records_pk_i64: Arc<RwLock<Arc<std::collections::HashMap<i64, i64>>>>,
-    /// Cached insert records (row keys) for key-based deletion.
-    /// Used for tables with composite or non-integer primary keys.
-    ///
-    /// Insert records track PKs that were re-inserted after being deleted (upserted).
-    /// Maps PK bytes -> `insert_sequence_number`.
-    /// During scan: delete applies only if `delete_sequence` > `insert_sequence` for that PK.
-    #[expect(clippy::type_complexity)]
-    cached_insert_records_row_keys: Arc<RwLock<Arc<std::collections::HashMap<Box<[u8]>, i64>>>>,
     /// Strategy for primary key-based deletion filtering.
-    /// Determines which cache and filter exec to use at query time.
-    pk_deletion_strategy: PkDeletionStrategy,
+    /// Contains the deletion caches specific to each strategy variant.
+    pk_deletion_strategy: PkDeletionStrategyWithCache,
     /// `RowConverter` for converting primary key columns to byte representation.
     /// Only set for tables with composite or non-integer primary keys.
     pk_row_converter: Option<Arc<RowConverter>>,
@@ -412,8 +352,7 @@ impl CayenneTableProvider {
             &snapshot_dir_url,
             Arc::clone(&self.table_metadata.schema),
             self.context.file_format(),
-            self.pk_deletion_strategy,
-            &self.cached_deleted_row_ids,
+            &self.pk_deletion_strategy,
         )?;
 
         let mut listing_table_guard =
@@ -648,8 +587,7 @@ impl CayenneTableProvider {
     /// * `snapshot_dir_url` - URL string for the snapshot directory (local path or S3 URL)
     /// * `schema` - Arrow schema for the table
     /// * `vortex_format` - Vortex format
-    /// * `pk_deletion_strategy` - The deletion strategy for this table
-    /// * `deletion_cache` - Optional per-file deletion cache for position-based deletions
+    /// * `strategy` - The deletion strategy for this table (contains embedded caches)
     ///
     /// # Errors
     ///
@@ -658,8 +596,7 @@ impl CayenneTableProvider {
         snapshot_dir_url: &str,
         schema: SchemaRef,
         vortex_format: &Arc<VortexFormat>,
-        pk_deletion_strategy: PkDeletionStrategy,
-        deletion_cache: &Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>,
+        strategy: &PkDeletionStrategyWithCache,
     ) -> CatalogResult<Arc<ListingTable>> {
         let table_url = ListingTableUrl::parse(snapshot_dir_url).map_err(|e| {
             CatalogError::InvalidOperation {
@@ -668,8 +605,7 @@ impl CayenneTableProvider {
             }
         })?;
 
-        let listing_options =
-            Self::create_listing_options(vortex_format, pk_deletion_strategy, deletion_cache);
+        let listing_options = Self::create_listing_options(vortex_format, strategy);
 
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
@@ -691,15 +627,17 @@ impl CayenneTableProvider {
     /// filter at the `ExecutionPlan` level, not during file reading.
     fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
-        pk_deletion_strategy: PkDeletionStrategy,
-        deletion_cache: &Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>,
+        strategy: &PkDeletionStrategyWithCache,
     ) -> ListingOptions {
-        let file_format: Arc<dyn FileFormat> = match pk_deletion_strategy {
-            PkDeletionStrategy::PositionBased => Arc::new(DeletionFilteringVortexFormat::new(
+        let file_format: Arc<dyn FileFormat> = match strategy {
+            PkDeletionStrategyWithCache::PositionBased {
+                cached_deleted_row_ids,
+            } => Arc::new(DeletionFilteringVortexFormat::new(
                 Arc::clone(vortex_format),
-                Arc::clone(deletion_cache),
+                Arc::clone(cached_deleted_row_ids),
             )),
-            PkDeletionStrategy::Int64Pk | PkDeletionStrategy::RowConverterBased => {
+            PkDeletionStrategyWithCache::Int64Pk { .. }
+            | PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 Arc::clone(vortex_format) as Arc<dyn FileFormat>
             }
         };
@@ -937,8 +875,8 @@ impl CayenneTableProvider {
         // Determine if this table has a primary key for key-based deletion
         let has_primary_key = !table_metadata.primary_key.is_empty();
 
-        // Determine PK deletion strategy and build RowConverter if needed
-        let (pk_deletion_strategy, pk_row_converter, pk_column_indices) = if has_primary_key {
+        // Determine PK deletion strategy kind and build RowConverter if needed
+        let (pk_deletion_strategy_kind, pk_row_converter, pk_column_indices) = if has_primary_key {
             let schema = &table_metadata.schema;
             let mut indices = Vec::with_capacity(table_metadata.primary_key.len());
             let mut pk_fields = Vec::with_capacity(table_metadata.primary_key.len());
@@ -989,41 +927,27 @@ impl CayenneTableProvider {
         };
 
         // Load deletion vectors and insert records once at initialization
-        // to avoid repeated SQLite queries on every scan
+        // to avoid repeated SQLite queries on every scan.
+        // Returns the fully constructed PkDeletionStrategy with embedded caches.
         let table_id = table_metadata.table_id;
         let catalog_for_load = Arc::clone(&catalog);
-        let (
-            deleted_row_ids,
-            deleted_pk_i64,
-            deleted_row_keys,
-            insert_records_pk_i64,
-            insert_records_row_keys,
-        ) = Self::load_deletion_vectors_all(table_id, catalog_for_load, pk_deletion_strategy)
-            .await?;
-
-        // Create the deletion cache upfront so CayenneVortexFormat can apply deletions.
-        // The cache is shared via Arc<RwLock<...>> so updates are visible to subsequent queries.
-        let cached_deleted_row_ids = Arc::new(RwLock::new(Arc::new(deleted_row_ids)));
+        let pk_deletion_strategy =
+            Self::load_deletion_vectors_all(table_id, catalog_for_load, pk_deletion_strategy_kind)
+                .await?;
 
         let listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&table_metadata.schema),
             context.file_format(),
-            pk_deletion_strategy,
-            &cached_deleted_row_ids,
+            &pk_deletion_strategy,
         )?;
 
         // Load protected snapshots from catalog.
         // Protected snapshots are those with sequence > max_delete_sequence.
         // They contain data written after deletions and should skip deletion filtering.
-        let protected_snapshots = Self::load_protected_snapshots(
-            Arc::clone(&catalog),
-            table_id,
-            &deleted_pk_i64,
-            &deleted_row_keys,
-            pk_deletion_strategy,
-        )
-        .await?;
+        let protected_snapshots =
+            Self::load_protected_snapshots(Arc::clone(&catalog), table_id, &pk_deletion_strategy)
+                .await?;
 
         Ok(Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
@@ -1032,14 +956,6 @@ impl CayenneTableProvider {
             listing_table: Arc::new(RwLock::new(listing_table)),
             retention_filters,
             context,
-            // Use the already-created cached_deleted_row_ids (shared with listing table's CayenneVortexFormat)
-            cached_deleted_row_ids,
-            cached_deleted_pk_i64: Arc::new(RwLock::new(Arc::new(deleted_pk_i64))),
-            cached_deleted_row_keys: Arc::new(RwLock::new(Arc::new(deleted_row_keys))),
-            cached_insert_records_pk_i64: Arc::new(RwLock::new(Arc::new(insert_records_pk_i64))),
-            cached_insert_records_row_keys: Arc::new(RwLock::new(Arc::new(
-                insert_records_row_keys,
-            ))),
             pk_deletion_strategy,
             pk_row_converter,
             pk_column_indices,
@@ -1189,7 +1105,7 @@ impl CayenneTableProvider {
         // NOTE: This block only applies to PK-based strategies. PositionBased strategy
         // doesn't need special handling - new files are simply added to the current snapshot
         // and existing per-file deletion vectors remain valid.
-        if has_pending_deletions && self.pk_deletion_strategy != PkDeletionStrategy::PositionBased {
+        if has_pending_deletions && !self.pk_deletion_strategy.is_position_based() {
             let new_sequence = self
                 .catalog
                 .increment_sequence_number(self.table_metadata.table_id)
@@ -1379,25 +1295,30 @@ impl CayenneTableProvider {
 
     /// Get the maximum delete sequence number from the cached deletions.
     fn get_max_delete_sequence(&self) -> CatalogResult<i64> {
-        match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk, ..
+            } => {
+                let guard = cached_deleted_pk
+                    .read()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "read Int64 PK deletions for max sequence".to_string(),
+                    })?;
+                Ok(guard.values().max().copied().unwrap_or(0))
+            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                ..
+            } => {
                 let guard =
-                    self.cached_deleted_pk_i64
+                    cached_deleted_row_keys
                         .read()
                         .map_err(|_| CatalogError::LockPoisoned {
-                            operation: "read Int64 PK deletions for max sequence".to_string(),
+                            operation: "read row key deletions for max sequence".to_string(),
                         })?;
                 Ok(guard.values().max().copied().unwrap_or(0))
             }
-            PkDeletionStrategy::RowConverterBased => {
-                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
-                    CatalogError::LockPoisoned {
-                        operation: "read row key deletions for max sequence".to_string(),
-                    }
-                })?;
-                Ok(guard.values().max().copied().unwrap_or(0))
-            }
-            PkDeletionStrategy::PositionBased => Ok(0),
+            PkDeletionStrategyWithCache::PositionBased { .. } => Ok(0),
         }
     }
 
@@ -1652,8 +1573,7 @@ impl CayenneTableProvider {
             &snapshot_dir_url,
             Arc::clone(&self.table_metadata.schema),
             self.context.file_format(),
-            self.pk_deletion_strategy,
-            &self.cached_deleted_row_ids,
+            &self.pk_deletion_strategy,
         )?;
 
         // Bounded parallelism: configurable concurrent writes to optimize I/O
@@ -1907,12 +1827,7 @@ impl CayenneTableProvider {
             listing_table: Arc::clone(&self.listing_table),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
-            cached_deleted_row_ids: Arc::clone(&self.cached_deleted_row_ids),
-            cached_deleted_pk_i64: Arc::clone(&self.cached_deleted_pk_i64),
-            cached_deleted_row_keys: Arc::clone(&self.cached_deleted_row_keys),
-            cached_insert_records_pk_i64: Arc::clone(&self.cached_insert_records_pk_i64),
-            cached_insert_records_row_keys: Arc::clone(&self.cached_insert_records_row_keys),
-            pk_deletion_strategy: self.pk_deletion_strategy,
+            pk_deletion_strategy: self.pk_deletion_strategy.clone(),
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
@@ -2027,8 +1942,7 @@ impl CayenneTableProvider {
                 &snapshot_url,
                 Arc::clone(&self.table_metadata.schema),
                 self.context.file_format(),
-                self.pk_deletion_strategy,
-                &self.cached_deleted_row_ids,
+                &self.pk_deletion_strategy,
             )?;
 
             // Only read PK columns - no need to load all columns for keyset building
@@ -2056,53 +1970,51 @@ impl CayenneTableProvider {
         // This ensures keys that were previously deleted are not considered as conflicts.
         // Note: PositionBased strategy is never used here since it implies no primary key,
         // and this function is only called for tables with primary keys.
-        let deleted_pk_i64 = if self.pk_deletion_strategy == PkDeletionStrategy::Int64Pk {
-            let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
-                CatalogError::InvalidOperationNoSource {
-                    message: DELETION_CACHE_LOCK_POISONED.to_string(),
-                }
-            })?;
-            Some(Arc::clone(&guard))
-        } else {
-            None
-        };
-
-        // Load insert records cache for Int64Pk strategy to check re-insertions
-        let insert_records_pk_i64 = if self.pk_deletion_strategy == PkDeletionStrategy::Int64Pk {
-            let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
-                CatalogError::InvalidOperationNoSource {
-                    message: DELETION_CACHE_LOCK_POISONED.to_string(),
-                }
-            })?;
-            Some(Arc::clone(&guard))
-        } else {
-            None
-        };
-
-        let deleted_row_keys = if self.pk_deletion_strategy == PkDeletionStrategy::RowConverterBased
-        {
-            let guard = self.cached_deleted_row_keys.read().map_err(|_| {
-                CatalogError::InvalidOperationNoSource {
-                    message: DELETION_CACHE_LOCK_POISONED.to_string(),
-                }
-            })?;
-            Some(Arc::clone(&guard))
-        } else {
-            None
-        };
-
-        // Load insert records cache for RowConverterBased strategy to check re-insertions
-        let insert_records_row_keys =
-            if self.pk_deletion_strategy == PkDeletionStrategy::RowConverterBased {
-                let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
+        let (deleted_pk_i64, insert_records_pk_i64) = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk,
+                cached_insert_records,
+            } => {
+                let deleted_guard = cached_deleted_pk.read().map_err(|_| {
                     CatalogError::InvalidOperationNoSource {
                         message: DELETION_CACHE_LOCK_POISONED.to_string(),
                     }
                 })?;
-                Some(Arc::clone(&guard))
-            } else {
-                None
-            };
+                let insert_guard = cached_insert_records.read().map_err(|_| {
+                    CatalogError::InvalidOperationNoSource {
+                        message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                    }
+                })?;
+                (
+                    Some(Arc::clone(&deleted_guard)),
+                    Some(Arc::clone(&insert_guard)),
+                )
+            }
+            _ => (None, None),
+        };
+
+        let (deleted_row_keys, insert_records_row_keys) = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                cached_insert_records,
+            } => {
+                let deleted_guard = cached_deleted_row_keys.read().map_err(|_| {
+                    CatalogError::InvalidOperationNoSource {
+                        message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                    }
+                })?;
+                let insert_guard = cached_insert_records.read().map_err(|_| {
+                    CatalogError::InvalidOperationNoSource {
+                        message: DELETION_CACHE_LOCK_POISONED.to_string(),
+                    }
+                })?;
+                (
+                    Some(Arc::clone(&deleted_guard)),
+                    Some(Arc::clone(&insert_guard)),
+                )
+            }
+            _ => (None, None),
+        };
 
         let mut keyset = HashMap::with_capacity(1024);
         let mut row_id_base: i64 = 0;
@@ -2123,14 +2035,12 @@ impl CayenneTableProvider {
             })?;
 
             // For Int64Pk strategy, get the PK column as Int64Array for efficient lookup
-            let int64_pk_array: Option<&arrow::array::Int64Array> = if self.pk_deletion_strategy
-                == PkDeletionStrategy::Int64Pk
-                && pk_indices.len() == 1
-            {
-                batch.column(0).as_any().downcast_ref()
-            } else {
-                None
-            };
+            let int64_pk_array: Option<&arrow::array::Int64Array> =
+                if self.pk_deletion_strategy.is_int64_pk() && pk_indices.len() == 1 {
+                    batch.column(0).as_any().downcast_ref()
+                } else {
+                    None
+                };
 
             for row_idx in 0..batch.num_rows() {
                 let row_id = row_id_base
@@ -2142,8 +2052,8 @@ impl CayenneTableProvider {
                     })?;
 
                 // Check if row is deleted based on pk_deletion_strategy
-                let is_deleted = match self.pk_deletion_strategy {
-                    PkDeletionStrategy::Int64Pk => {
+                let is_deleted = match &self.pk_deletion_strategy {
+                    PkDeletionStrategyWithCache::Int64Pk { .. } => {
                         if let (Some(pk_array), Some(deleted_pks)) =
                             (int64_pk_array, &deleted_pk_i64)
                         {
@@ -2157,7 +2067,7 @@ impl CayenneTableProvider {
                             false
                         }
                     }
-                    PkDeletionStrategy::RowConverterBased => {
+                    PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                         if let Some(deleted_keys) = &deleted_row_keys {
                             let key = rows.row(row_idx);
                             !is_pk_visible_row_key(
@@ -2170,7 +2080,7 @@ impl CayenneTableProvider {
                         }
                     }
                     // PositionBased implies no primary key, but this function requires PKs
-                    PkDeletionStrategy::PositionBased => {
+                    PkDeletionStrategyWithCache::PositionBased { .. } => {
                         unreachable!("PositionBased strategy should not reach load_existing_keyset")
                     }
                 };
@@ -2363,7 +2273,7 @@ impl CayenneTableProvider {
 
         // For Int64Pk strategy, get direct access to the PK column for value extraction
         let int64_pk_array: Option<&Int64Array> =
-            if self.pk_deletion_strategy == PkDeletionStrategy::Int64Pk && pk_columns.len() == 1 {
+            if self.pk_deletion_strategy.is_int64_pk() && pk_columns.len() == 1 {
                 pk_columns[0].as_any().downcast_ref::<Int64Array>()
             } else {
                 None
@@ -2408,16 +2318,16 @@ impl CayenneTableProvider {
                             .push(existing.row_id);
 
                         // Track the PK value being deleted for cache updates
-                        match self.pk_deletion_strategy {
-                            PkDeletionStrategy::Int64Pk => {
+                        match &self.pk_deletion_strategy {
+                            PkDeletionStrategyWithCache::Int64Pk { .. } => {
                                 if let Some(arr) = int64_pk_array {
                                     deleted_pk_i64.push(arr.value(row_idx));
                                 }
                             }
-                            PkDeletionStrategy::RowConverterBased => {
+                            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                                 deleted_row_keys.push(key.as_ref().to_vec().into_boxed_slice());
                             }
-                            PkDeletionStrategy::PositionBased => {
+                            PkDeletionStrategyWithCache::PositionBased { .. } => {
                                 // Position-based doesn't need PK values
                             }
                         }
@@ -2575,13 +2485,13 @@ impl CayenneTableProvider {
         // Build the row keys based on the deletion strategy:
         // - Int64Pk: Convert i64 values to 8-byte big-endian representations
         // - RowConverterBased: Use the provided row keys directly
-        let row_keys_for_deletion: Vec<Box<[u8]>> = match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => deleted_pk_i64
+        let row_keys_for_deletion: Vec<Box<[u8]>> = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => deleted_pk_i64
                 .iter()
                 .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
                 .collect(),
-            PkDeletionStrategy::RowConverterBased => deleted_row_keys.clone(),
-            PkDeletionStrategy::PositionBased => {
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys.clone(),
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based tables don't support upserts
                 vec![]
             }
@@ -2643,11 +2553,14 @@ impl CayenneTableProvider {
         // Update the appropriate cache based on deletion strategy.
         // This follows Iceberg's pattern where deletes are tracked by PK + sequence number.
         // For upserts, we also update insert records so the new row isn't filtered out.
-        match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk,
+                cached_insert_records,
+            } => {
                 // Update Int64 PK deletion cache with delete sequence
                 {
-                    let mut guard = self.cached_deleted_pk_i64.write().map_err(|_| {
+                    let mut guard = cached_deleted_pk.write().map_err(|_| {
                         CatalogError::InvalidOperationNoSource {
                             message: DELETION_CACHE_LOCK_POISONED.to_string(),
                         }
@@ -2674,7 +2587,7 @@ impl CayenneTableProvider {
                 // Update Int64 PK insert records cache with insert sequence (higher than delete)
                 // This ensures the newly inserted row isn't filtered out by the deletion filter.
                 {
-                    let mut guard = self.cached_insert_records_pk_i64.write().map_err(|_| {
+                    let mut guard = cached_insert_records.write().map_err(|_| {
                         CatalogError::InvalidOperationNoSource {
                             message: DELETION_CACHE_LOCK_POISONED.to_string(),
                         }
@@ -2698,10 +2611,13 @@ impl CayenneTableProvider {
                     );
                 }
             }
-            PkDeletionStrategy::RowConverterBased => {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                cached_insert_records,
+            } => {
                 // Update row key deletion cache with delete sequence
                 {
-                    let mut guard = self.cached_deleted_row_keys.write().map_err(|_| {
+                    let mut guard = cached_deleted_row_keys.write().map_err(|_| {
                         CatalogError::InvalidOperationNoSource {
                             message: DELETION_CACHE_LOCK_POISONED.to_string(),
                         }
@@ -2727,7 +2643,7 @@ impl CayenneTableProvider {
 
                 // Update row key insert records cache with insert sequence
                 {
-                    let mut guard = self.cached_insert_records_row_keys.write().map_err(|_| {
+                    let mut guard = cached_insert_records.write().map_err(|_| {
                         CatalogError::InvalidOperationNoSource {
                             message: DELETION_CACHE_LOCK_POISONED.to_string(),
                         }
@@ -2751,7 +2667,7 @@ impl CayenneTableProvider {
                     );
                 }
             }
-            PkDeletionStrategy::PositionBased => {
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // This branch should never be reached - position-based tables don't have PKs
                 // and don't support upserts.
                 unreachable!(
@@ -3041,10 +2957,7 @@ impl CayenneTableProvider {
             Arc::clone(&self.listing_table),
             Arc::clone(&self.table_metadata.schema),
             &filters,
-            Arc::clone(&self.cached_deleted_row_ids),
-            Arc::clone(&self.cached_deleted_pk_i64),
-            Arc::clone(&self.cached_deleted_row_keys),
-            self.pk_deletion_strategy,
+            self.pk_deletion_strategy.clone(),
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
             Vec::new(), // Retention filters don't need to scan protected snapshots
@@ -3077,76 +2990,19 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if deletion vectors cannot be loaded from the catalog.
     async fn refresh_deletion_cache(&self) -> CatalogResult<()> {
-        let (
-            deleted_row_ids,
-            deleted_pk_i64,
-            deleted_row_keys,
-            insert_records_pk_i64,
-            insert_records_row_keys,
-        ) = Self::load_deletion_vectors_all(
+        let fresh_strategy = Self::load_deletion_vectors_all(
             self.table_metadata.table_id,
             Arc::clone(&self.catalog),
-            self.pk_deletion_strategy,
+            self.pk_deletion_strategy.strategy(),
         )
         .await?;
 
-        // Update position-based cache
-        {
-            let mut guard =
-                self.cached_deleted_row_ids
-                    .write()
-                    .map_err(|_| CatalogError::LockPoisoned {
-                        operation: "refresh deletion cache (position write)".to_string(),
-                    })?;
-            *guard = Arc::new(deleted_row_ids);
-        }
-
-        // Update Int64 PK-based cache
-        {
-            let mut guard =
-                self.cached_deleted_pk_i64
-                    .write()
-                    .map_err(|_| CatalogError::LockPoisoned {
-                        operation: "refresh deletion cache (pk_i64 write)".to_string(),
-                    })?;
-            *guard = Arc::new(deleted_pk_i64);
-        }
-
-        // Update row key-based cache
-        {
-            let mut guard =
-                self.cached_deleted_row_keys
-                    .write()
-                    .map_err(|_| CatalogError::LockPoisoned {
-                        operation: "refresh deletion cache (row_keys write)".to_string(),
-                    })?;
-            *guard = Arc::new(deleted_row_keys);
-        }
-
-        // Update Int64 PK insert records cache
-        {
-            let mut guard = self.cached_insert_records_pk_i64.write().map_err(|_| {
-                CatalogError::LockPoisoned {
-                    operation: "refresh deletion cache (insert_pk_i64 write)".to_string(),
-                }
-            })?;
-            *guard = Arc::new(insert_records_pk_i64);
-        }
-
-        // Update row key insert records cache
-        {
-            let mut guard = self.cached_insert_records_row_keys.write().map_err(|_| {
-                CatalogError::LockPoisoned {
-                    operation: "refresh deletion cache (insert_row_keys write)".to_string(),
-                }
-            })?;
-            *guard = Arc::new(insert_records_row_keys);
-        }
+        self.pk_deletion_strategy.refresh_from(&fresh_strategy)?;
 
         tracing::debug!(
             "Refreshed deletion cache for table {} (strategy: {:?})",
             self.table_metadata.table_name,
-            self.pk_deletion_strategy,
+            self.pk_deletion_strategy.strategy(),
         );
 
         Ok(())
@@ -3209,16 +3065,16 @@ impl CayenneTableProvider {
             .await?;
 
         // Extract PKs and add insert records based on strategy
-        match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
                 self.add_insert_records_int64(&batches, insert_sequence)
                     .await?;
             }
-            PkDeletionStrategy::RowConverterBased => {
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 self.add_insert_records_row_converter(&batches, insert_sequence)
                     .await?;
             }
-            PkDeletionStrategy::PositionBased => {
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based uses per-file deletion vectors and doesn't need insert records
                 unreachable!("Position-based strategy doesn't track insert records");
             }
@@ -3300,11 +3156,9 @@ impl CayenneTableProvider {
             .await?;
 
         // Update in-memory cache
-        {
-            let mut guard = self.cached_insert_records_pk_i64.write().map_err(|_| {
-                CatalogError::LockPoisoned {
-                    operation: "update Int64 insert records cache".to_string(),
-                }
+        if let Some(cache) = self.pk_deletion_strategy.int64_insert_records_cache() {
+            let mut guard = cache.write().map_err(|_| CatalogError::LockPoisoned {
+                operation: "update Int64 insert records cache".to_string(),
             })?;
             let mut new_map = (**guard).clone();
             for pk in pks_to_record {
@@ -3384,11 +3238,9 @@ impl CayenneTableProvider {
             .await?;
 
         // Update in-memory cache
-        {
-            let mut guard = self.cached_insert_records_row_keys.write().map_err(|_| {
-                CatalogError::LockPoisoned {
-                    operation: "update key-based insert records cache".to_string(),
-                }
+        if let Some(cache) = self.pk_deletion_strategy.row_keys_insert_records_cache() {
+            let mut guard = cache.write().map_err(|_| CatalogError::LockPoisoned {
+                operation: "update key-based insert records cache".to_string(),
             })?;
             let mut new_map = (**guard).clone();
             for key in keys_to_record {
@@ -3410,31 +3262,38 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the deletion cache lock is poisoned.
     fn has_pending_deletions(&self) -> CatalogResult<bool> {
-        match self.pk_deletion_strategy {
-            PkDeletionStrategy::PositionBased => {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::PositionBased {
+                cached_deleted_row_ids,
+            } => {
                 let guard =
-                    self.cached_deleted_row_ids
+                    cached_deleted_row_ids
                         .read()
                         .map_err(|_| CatalogError::LockPoisoned {
                             operation: "check position-based deletion cache".to_string(),
                         })?;
                 Ok(!guard.is_empty())
             }
-            PkDeletionStrategy::Int64Pk => {
-                let guard =
-                    self.cached_deleted_pk_i64
-                        .read()
-                        .map_err(|_| CatalogError::LockPoisoned {
-                            operation: "check Int64 PK deletion cache".to_string(),
-                        })?;
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk, ..
+            } => {
+                let guard = cached_deleted_pk
+                    .read()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "check Int64 PK deletion cache".to_string(),
+                    })?;
                 Ok(!guard.is_empty())
             }
-            PkDeletionStrategy::RowConverterBased => {
-                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
-                    CatalogError::LockPoisoned {
-                        operation: "check key-based deletion cache".to_string(),
-                    }
-                })?;
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                ..
+            } => {
+                let guard =
+                    cached_deleted_row_keys
+                        .read()
+                        .map_err(|_| CatalogError::LockPoisoned {
+                            operation: "check key-based deletion cache".to_string(),
+                        })?;
                 Ok(!guard.is_empty())
             }
         }
@@ -3449,57 +3308,64 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if any cache lock is poisoned.
     pub(crate) fn clear_all_deletion_caches(&self) -> CatalogResult<()> {
-        // Clear position-based cache (now HashMap<String, RoaringBitmap>)
-        {
-            let mut guard =
-                self.cached_deleted_row_ids
-                    .write()
-                    .map_err(|_| CatalogError::LockPoisoned {
-                        operation: "clear position-based deletion cache".to_string(),
-                    })?;
-            *guard = Arc::new(HashMap::new());
-        }
-
-        // Clear Int64 PK cache
-        {
-            let mut guard =
-                self.cached_deleted_pk_i64
-                    .write()
-                    .map_err(|_| CatalogError::LockPoisoned {
-                        operation: "clear Int64 PK deletion cache".to_string(),
-                    })?;
-            *guard = Arc::new(HashMap::new());
-        }
-
-        // Clear key-based cache
-        {
-            let mut guard =
-                self.cached_deleted_row_keys
-                    .write()
-                    .map_err(|_| CatalogError::LockPoisoned {
-                        operation: "clear key-based deletion cache".to_string(),
-                    })?;
-            *guard = Arc::new(HashMap::new());
-        }
-
-        // Clear Int64 insert records cache
-        {
-            let mut guard = self.cached_insert_records_pk_i64.write().map_err(|_| {
-                CatalogError::LockPoisoned {
-                    operation: "clear Int64 insert records cache".to_string(),
+        // Clear caches based on the current strategy
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::PositionBased {
+                cached_deleted_row_ids,
+            } => {
+                let mut guard =
+                    cached_deleted_row_ids
+                        .write()
+                        .map_err(|_| CatalogError::LockPoisoned {
+                            operation: "clear position-based deletion cache".to_string(),
+                        })?;
+                *guard = Arc::new(HashMap::new());
+            }
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk,
+                cached_insert_records,
+            } => {
+                {
+                    let mut guard =
+                        cached_deleted_pk
+                            .write()
+                            .map_err(|_| CatalogError::LockPoisoned {
+                                operation: "clear Int64 PK deletion cache".to_string(),
+                            })?;
+                    *guard = Arc::new(HashMap::new());
                 }
-            })?;
-            *guard = Arc::new(HashMap::new());
-        }
-
-        // Clear key-based insert records cache
-        {
-            let mut guard = self.cached_insert_records_row_keys.write().map_err(|_| {
-                CatalogError::LockPoisoned {
-                    operation: "clear key-based insert records cache".to_string(),
+                {
+                    let mut guard =
+                        cached_insert_records
+                            .write()
+                            .map_err(|_| CatalogError::LockPoisoned {
+                                operation: "clear Int64 insert records cache".to_string(),
+                            })?;
+                    *guard = Arc::new(HashMap::new());
                 }
-            })?;
-            *guard = Arc::new(HashMap::new());
+            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                cached_insert_records,
+            } => {
+                {
+                    let mut guard = cached_deleted_row_keys.write().map_err(|_| {
+                        CatalogError::LockPoisoned {
+                            operation: "clear key-based deletion cache".to_string(),
+                        }
+                    })?;
+                    *guard = Arc::new(HashMap::new());
+                }
+                {
+                    let mut guard =
+                        cached_insert_records
+                            .write()
+                            .map_err(|_| CatalogError::LockPoisoned {
+                                operation: "clear key-based insert records cache".to_string(),
+                            })?;
+                    *guard = Arc::new(HashMap::new());
+                }
+            }
         }
 
         // Clear protected snapshots - after compaction all data is in the main snapshot
@@ -3633,8 +3499,7 @@ impl CayenneTableProvider {
             &snapshot_dir_url,
             Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
             self.context.file_format(),
-            self.pk_deletion_strategy,
-            &self.cached_deleted_row_ids,
+            &self.pk_deletion_strategy,
         )?;
 
         // Update the listing table with write lock
@@ -3657,32 +3522,19 @@ impl CayenneTableProvider {
     /// Load both position-based and key-based deletion vectors from the catalog.
     ///
     /// This method queries the catalog for delete files and loads them into memory,
-    /// routing to the appropriate cache based on the PK deletion strategy:
-    /// - `PositionBased`: Load into `HashMap<String, RoaringBitmap>` (file path -> row positions)
-    /// - `Int64Pk`: Load into `HashMap<i64, i64>` (PK -> max delete sequence)
-    /// - `RowConverterBased`: Load into `HashMap<Box<[u8]>, i64>` (serialized PK bytes -> max delete sequence)
-    ///
-    /// Also loads insert records for sequence-based ordering of upserts.
+    /// constructing the appropriate `PkDeletionStrategy` variant with embedded caches:
+    /// - `PositionBased`: Cache of `HashMap<String, RoaringBitmap>` (file path -> row positions)
+    /// - `Int64Pk`: Cache of `HashMap<i64, i64>` (PK -> max delete sequence) + insert records
+    /// - `RowConverterBased`: Cache of `HashMap<Box<[u8]>, i64>` (serialized PK bytes -> max delete sequence) + insert records
     ///
     /// # Returns
     ///
-    /// A tuple of:
-    /// - `per_file_row_ids`: `HashMap<String, RoaringBitmap>` for per-file position-based deletions
-    /// - `deleted_pk_i64`: `HashMap<i64, i64>` mapping PK -> max delete sequence
-    /// - `deleted_row_keys`: `HashMap<Box<[u8]>, i64>` mapping PK bytes -> max delete sequence
-    /// - `insert_records_pk_i64`: `HashMap<i64, i64>` mapping PK -> insert sequence
-    /// - `insert_records_row_keys`: `HashMap<Box<[u8]>, i64>` mapping PK bytes -> insert sequence
+    /// The fully constructed `PkDeletionStrategy` with all caches populated.
     async fn load_deletion_vectors_all(
         table_id: i64,
         catalog: Arc<dyn MetadataCatalog>,
         strategy: PkDeletionStrategy,
-    ) -> CatalogResult<(
-        HashMap<String, RoaringBitmap>,
-        HashMap<i64, i64>,
-        HashMap<Box<[u8]>, i64>,
-        HashMap<i64, i64>,
-        HashMap<Box<[u8]>, i64>,
-    )> {
+    ) -> CatalogResult<PkDeletionStrategyWithCache> {
         use super::delete::detect_deletion_type_and_read;
 
         // Query catalog for delete files
@@ -3706,14 +3558,23 @@ impl CayenneTableProvider {
             })?
         };
 
+        // Early return for empty case - construct strategy with empty caches
         if delete_files.is_empty() && insert_records_bytes.is_empty() {
-            return Ok((
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-            ));
+            return Ok(match strategy {
+                PkDeletionStrategy::PositionBased => PkDeletionStrategyWithCache::PositionBased {
+                    cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+                },
+                PkDeletionStrategy::Int64Pk => PkDeletionStrategyWithCache::Int64Pk {
+                    cached_deleted_pk: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+                    cached_insert_records: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+                },
+                PkDeletionStrategy::RowConverterBased => {
+                    PkDeletionStrategyWithCache::RowConverterBased {
+                        cached_deleted_row_keys: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+                        cached_insert_records: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+                    }
+                }
+            });
         }
 
         // Parse insert records based on strategy
@@ -3745,14 +3606,25 @@ impl CayenneTableProvider {
             }
         };
 
+        // Early return if only insert records exist (no delete files)
         if delete_files.is_empty() {
-            return Ok((
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                insert_records_pk_i64,
-                insert_records_row_keys,
-            ));
+            return Ok(match strategy {
+                PkDeletionStrategy::PositionBased => PkDeletionStrategyWithCache::PositionBased {
+                    cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+                },
+                PkDeletionStrategy::Int64Pk => PkDeletionStrategyWithCache::Int64Pk {
+                    cached_deleted_pk: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+                    cached_insert_records: Arc::new(RwLock::new(Arc::new(insert_records_pk_i64))),
+                },
+                PkDeletionStrategy::RowConverterBased => {
+                    PkDeletionStrategyWithCache::RowConverterBased {
+                        cached_deleted_row_keys: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+                        cached_insert_records: Arc::new(RwLock::new(Arc::new(
+                            insert_records_row_keys,
+                        ))),
+                    }
+                }
+            });
         }
 
         // Read deletion vector files in a blocking task, detecting type from schema
@@ -3773,11 +3645,18 @@ impl CayenneTableProvider {
                     })
                 })?;
 
-        // Route data to appropriate caches based on strategy
-        let (position_ids, int64_pks, row_keys) = match strategy {
+        // Construct the appropriate cache variant with populated caches
+        let cache = match strategy {
             PkDeletionStrategy::PositionBased => {
-                // Position-based uses per-file HashMap<String, RoaringBitmap>
-                (per_file_row_ids, HashMap::new(), HashMap::new())
+                let total_deletions: u64 = per_file_row_ids.values().map(RoaringBitmap::len).sum();
+                tracing::debug!(
+                    "Cached deletion vectors for table_id {table_id}: {} position-based deletions across {} files",
+                    total_deletions,
+                    per_file_row_ids.len(),
+                );
+                PkDeletionStrategyWithCache::PositionBased {
+                    cached_deleted_row_ids: Arc::new(RwLock::new(Arc::new(per_file_row_ids))),
+                }
             }
             PkDeletionStrategy::Int64Pk => {
                 // Int64 PK - convert row_keys (which contain Int64 bytes) to i64
@@ -3799,32 +3678,30 @@ impl CayenneTableProvider {
                         }
                     })
                     .collect();
-                (HashMap::new(), int64_pks, HashMap::new())
+                tracing::debug!(
+                    "Cached deletion vectors for table_id {table_id}: {} int64-pk, {} int64-insert",
+                    int64_pks.len(),
+                    insert_records_pk_i64.len(),
+                );
+                PkDeletionStrategyWithCache::Int64Pk {
+                    cached_deleted_pk: Arc::new(RwLock::new(Arc::new(int64_pks))),
+                    cached_insert_records: Arc::new(RwLock::new(Arc::new(insert_records_pk_i64))),
+                }
             }
             PkDeletionStrategy::RowConverterBased => {
-                // RowConverter-based uses the byte keys directly
-                (HashMap::new(), HashMap::new(), deleted_row_keys)
+                tracing::debug!(
+                    "Cached deletion vectors for table_id {table_id}: {} key-based, {} key-insert",
+                    deleted_row_keys.len(),
+                    insert_records_row_keys.len(),
+                );
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    cached_deleted_row_keys: Arc::new(RwLock::new(Arc::new(deleted_row_keys))),
+                    cached_insert_records: Arc::new(RwLock::new(Arc::new(insert_records_row_keys))),
+                }
             }
         };
 
-        let total_position_based: u64 = position_ids.values().map(RoaringBitmap::len).sum();
-        tracing::debug!(
-            "Cached deletion vectors for table_id {table_id}: {} position-based deletions across {} files, {} int64-pk, {} key-based, {} int64-insert, {} key-insert",
-            total_position_based,
-            position_ids.len(),
-            int64_pks.len(),
-            row_keys.len(),
-            insert_records_pk_i64.len(),
-            insert_records_row_keys.len(),
-        );
-
-        Ok((
-            position_ids,
-            int64_pks,
-            row_keys,
-            insert_records_pk_i64,
-            insert_records_row_keys,
-        ))
+        Ok(cache)
     }
 
     /// Load protected snapshots from the catalog.
@@ -3834,29 +3711,42 @@ impl CayenneTableProvider {
     async fn load_protected_snapshots(
         catalog: Arc<dyn MetadataCatalog>,
         table_id: i64,
-        deleted_pk_i64: &HashMap<i64, i64>,
-        deleted_row_keys: &HashMap<Box<[u8]>, i64>,
-        strategy: PkDeletionStrategy,
+        strategy: &PkDeletionStrategyWithCache,
     ) -> CatalogResult<HashMap<String, i64>> {
-        // Check if there are any pending deletions
-        let has_deletions = match strategy {
-            PkDeletionStrategy::Int64Pk => !deleted_pk_i64.is_empty(),
-            PkDeletionStrategy::RowConverterBased => !deleted_row_keys.is_empty(),
-            PkDeletionStrategy::PositionBased => false, // Per-file deletion vectors don't need protected snapshots
-        };
-
-        if !has_deletions {
-            // No deletions, no protected snapshots needed
-            return Ok(HashMap::new());
-        }
-
-        // Get the maximum delete sequence from the current deletions
+        // Check if there are any pending deletions and get max delete sequence
         let max_delete_seq = match strategy {
-            PkDeletionStrategy::Int64Pk => deleted_pk_i64.values().max().copied().unwrap_or(0),
-            PkDeletionStrategy::RowConverterBased => {
-                deleted_row_keys.values().max().copied().unwrap_or(0)
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk, ..
+            } => {
+                let guard = cached_deleted_pk
+                    .read()
+                    .map_err(|_| CatalogError::LockPoisoned {
+                        operation: "read Int64 PK deletions for protected snapshots".to_string(),
+                    })?;
+                if guard.is_empty() {
+                    return Ok(HashMap::new());
+                }
+                guard.values().max().copied().unwrap_or(0)
             }
-            PkDeletionStrategy::PositionBased => 0,
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                ..
+            } => {
+                let guard =
+                    cached_deleted_row_keys
+                        .read()
+                        .map_err(|_| CatalogError::LockPoisoned {
+                            operation: "read row key deletions for protected snapshots".to_string(),
+                        })?;
+                if guard.is_empty() {
+                    return Ok(HashMap::new());
+                }
+                guard.values().max().copied().unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
+                // Per-file deletion vectors don't need protected snapshots
+                return Ok(HashMap::new());
+            }
         };
 
         // Get all snapshot sequences from catalog
@@ -3949,8 +3839,7 @@ impl CayenneTableProvider {
                 &snapshot_url,
                 Arc::clone(&self.table_metadata.schema),
                 self.context.file_format(),
-                self.pk_deletion_strategy,
-                &self.cached_deleted_row_ids,
+                &self.pk_deletion_strategy,
             )
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -3985,10 +3874,12 @@ impl CayenneTableProvider {
         pk_indices_in_projection: &[usize],
         min_delete_seq_to_apply: i64,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk, ..
+            } => {
                 let all_deleted_pks = {
-                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                    let guard = cached_deleted_pk.read().map_err(|_| {
                         datafusion_common::DataFusionError::Execution(
                             super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                         )
@@ -4023,11 +3914,14 @@ impl CayenneTableProvider {
                     pk_column_index,
                 )))
             }
-            PkDeletionStrategy::RowConverterBased => {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                ..
+            } => {
                 // Similar logic for RowConverter-based strategy
                 if let Some(ref row_converter) = self.pk_row_converter {
                     let all_deleted_keys = {
-                        let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                        let guard = cached_deleted_row_keys.read().map_err(|_| {
                             datafusion_common::DataFusionError::Execution(
                                 super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                             )
@@ -4058,7 +3952,7 @@ impl CayenneTableProvider {
                     Ok(Arc::new(CayenneAccelerationExec::new(plan)))
                 }
             }
-            PkDeletionStrategy::PositionBased => {
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based doesn't use protected snapshots
                 Ok(Arc::new(CayenneAccelerationExec::new(plan)))
             }
@@ -4071,10 +3965,12 @@ impl CayenneTableProvider {
         plan: Arc<dyn ExecutionPlan>,
         pk_indices_in_projection: &[usize],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk, ..
+            } => {
                 let deleted_pk_values = {
-                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                    let guard = cached_deleted_pk.read().map_err(|_| {
                         datafusion_common::DataFusionError::Execution(
                             super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                         )
@@ -4102,10 +3998,13 @@ impl CayenneTableProvider {
                     )));
                 }
             }
-            PkDeletionStrategy::RowConverterBased => {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                ..
+            } => {
                 if let Some(ref row_converter) = self.pk_row_converter {
                     let deleted_row_keys = {
-                        let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                        let guard = cached_deleted_row_keys.read().map_err(|_| {
                             datafusion_common::DataFusionError::Execution(
                                 super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                             )
@@ -4127,7 +4026,7 @@ impl CayenneTableProvider {
                     }
                 }
             }
-            PkDeletionStrategy::PositionBased => {
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // TODO: Implement Vortex-native deletion support by attaching per-file deletion
                 // vectors via VortexAccessPlan in PartitionedFile.extensions. This allows Vortex
                 // to skip decompressing deleted rows entirely using Selection::ExcludeRoaring.
@@ -4172,24 +4071,29 @@ impl TableProvider for CayenneTableProvider {
         }
 
         // Determine if we need PK-based deletion (Int64 or RowConverter based)
-        let need_pk_deletion = match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => {
-                let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+        let need_pk_deletion = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk, ..
+            } => {
+                let guard = cached_deleted_pk.read().map_err(|_| {
                     datafusion_common::DataFusionError::Execution(
                         super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                     )
                 })?;
                 !guard.is_empty()
             }
-            PkDeletionStrategy::RowConverterBased => {
-                let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                ..
+            } => {
+                let guard = cached_deleted_row_keys.read().map_err(|_| {
                     datafusion_common::DataFusionError::Execution(
                         super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                     )
                 })?;
                 !guard.is_empty()
             }
-            PkDeletionStrategy::PositionBased => false,
+            PkDeletionStrategyWithCache::PositionBased { .. } => false,
         };
 
         // For PK-based deletion, we need to ensure PK columns are included in the projection
@@ -4289,11 +4193,14 @@ impl TableProvider for CayenneTableProvider {
         };
 
         // Apply deletion filter based on strategy (original logic for when no protected snapshots)
-        match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk,
+                cached_insert_records,
+            } => {
                 // Optimized Int64 PK deletion - direct HashSet<i64> lookup
                 let deleted_pk_values = {
-                    let guard = self.cached_deleted_pk_i64.read().map_err(|_| {
+                    let guard = cached_deleted_pk.read().map_err(|_| {
                         datafusion_common::DataFusionError::Execution(
                             super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                         )
@@ -4301,7 +4208,7 @@ impl TableProvider for CayenneTableProvider {
                     Arc::clone(&guard)
                 };
                 let insert_records_pk_values = {
-                    let guard = self.cached_insert_records_pk_i64.read().map_err(|_| {
+                    let guard = cached_insert_records.read().map_err(|_| {
                         datafusion_common::DataFusionError::Execution(
                             super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                         )
@@ -4343,11 +4250,14 @@ impl TableProvider for CayenneTableProvider {
                     return Ok(deletion_filter);
                 }
             }
-            PkDeletionStrategy::RowConverterBased => {
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                cached_insert_records,
+            } => {
                 // RowConverter-based deletion for composite/non-integer PKs
                 if let Some(ref row_converter) = self.pk_row_converter {
                     let deleted_row_keys = {
-                        let guard = self.cached_deleted_row_keys.read().map_err(|_| {
+                        let guard = cached_deleted_row_keys.read().map_err(|_| {
                             datafusion_common::DataFusionError::Execution(
                                 super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                             )
@@ -4355,7 +4265,7 @@ impl TableProvider for CayenneTableProvider {
                         Arc::clone(&guard)
                     };
                     let insert_records_row_keys = {
-                        let guard = self.cached_insert_records_row_keys.read().map_err(|_| {
+                        let guard = cached_insert_records.read().map_err(|_| {
                             datafusion_common::DataFusionError::Execution(
                                 super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
                             )
@@ -4391,7 +4301,7 @@ impl TableProvider for CayenneTableProvider {
                     }
                 }
             }
-            PkDeletionStrategy::PositionBased => {
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // TODO: Implement Vortex-native deletion support by attaching per-file deletion
                 // vectors via VortexAccessPlan in PartitionedFile.extensions. This allows Vortex
                 // to skip decompressing deleted rows entirely using Selection::ExcludeRoaring.
@@ -4723,8 +4633,7 @@ impl DeletionTableProvider for CayenneTableProvider {
                     &snapshot_url,
                     Arc::clone(&self.table_metadata.schema),
                     self.context.file_format(),
-                    self.pk_deletion_strategy,
-                    &self.cached_deleted_row_ids,
+                    &self.pk_deletion_strategy,
                 )
                 .map_err(|e| {
                     datafusion_common::DataFusionError::Execution(format!(
@@ -4743,10 +4652,7 @@ impl DeletionTableProvider for CayenneTableProvider {
                 Arc::clone(&self.listing_table),
                 Arc::clone(&self.table_metadata.schema),
                 filters,
-                Arc::clone(&self.cached_deleted_row_ids),
-                Arc::clone(&self.cached_deleted_pk_i64),
-                Arc::clone(&self.cached_deleted_row_keys),
-                self.pk_deletion_strategy,
+                self.pk_deletion_strategy.clone(),
                 self.pk_row_converter.as_ref().map(Arc::clone),
                 self.pk_column_indices.clone(),
                 protected_snapshot_tables,
