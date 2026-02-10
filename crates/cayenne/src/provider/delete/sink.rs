@@ -46,7 +46,7 @@ limitations under the License.
 //! 6. Update in-memory caches for immediate query consistency
 
 use super::super::constants::{DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
-use super::super::table::PkDeletionStrategy;
+use super::super::deletion_strategy::PkDeletionStrategyWithCache;
 use super::super::utils::{convert_to_i64_box, convert_to_u64_box};
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::{CatalogError, MetadataCatalog};
@@ -64,8 +64,6 @@ use datafusion_common::tree_node::TreeNode;
 use datafusion_common::DFSchema;
 use datafusion_expr::Expr;
 use datafusion_physical_plan::collect;
-use roaring::RoaringBitmap;
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 // Position-based deletion methods implemented in sink/position_based.rs
@@ -84,19 +82,8 @@ pub struct CayenneDeletionSink {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     schema: SchemaRef,
     filters: Vec<Expr>,
-    /// Reference to the cached position-based deletion vectors.
-    /// Maps data file path -> `RoaringBitmap` of file-local row positions.
-    /// Uses Arc-wrapped `HashMap` for zero-copy sharing across concurrent operations.
-    cached_deleted_row_ids: Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>,
-    /// Reference to the cached Int64 PK deletion vectors.
-    /// Uses Arc-wrapped `HashMap<i64, i64>` for direct PK lookup (PK -> `delete_sequence`).
-    cached_deleted_pk_i64: Arc<RwLock<Arc<HashMap<i64, i64>>>>,
-    /// Reference to the cached key-based deletion vectors.
-    /// Uses Arc-wrapped `HashMap<Box<[u8]>, i64>` for zero-copy sharing (PK bytes -> `delete_sequence`).
-    #[expect(clippy::type_complexity)]
-    cached_deleted_row_keys: Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>,
-    /// Deletion strategy for this table.
-    pk_deletion_strategy: PkDeletionStrategy,
+    /// Deletion strategy for this table, with embedded caches.
+    pk_deletion_strategy: PkDeletionStrategyWithCache,
     /// `RowConverter` for converting primary key columns to byte representation.
     /// Only set for tables with composite or non-integer primary keys.
     pk_row_converter: Option<Arc<RowConverter>>,
@@ -109,17 +96,13 @@ pub struct CayenneDeletionSink {
 impl CayenneDeletionSink {
     /// Create a new deletion sink.
     #[expect(clippy::too_many_arguments)]
-    #[expect(clippy::type_complexity)]
     pub fn new(
         table_metadata: TableMetadata,
         catalog: Arc<dyn MetadataCatalog>,
         listing_table: Arc<RwLock<Arc<ListingTable>>>,
         schema: SchemaRef,
         filters: &[Expr],
-        cached_deleted_row_ids: Arc<RwLock<Arc<HashMap<String, RoaringBitmap>>>>,
-        cached_deleted_pk_i64: Arc<RwLock<Arc<HashMap<i64, i64>>>>,
-        cached_deleted_row_keys: Arc<RwLock<Arc<HashMap<Box<[u8]>, i64>>>>,
-        pk_deletion_strategy: PkDeletionStrategy,
+        pk_deletion_strategy: PkDeletionStrategyWithCache,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
         protected_snapshot_tables: Vec<Arc<ListingTable>>,
@@ -130,9 +113,6 @@ impl CayenneDeletionSink {
             listing_table,
             schema,
             filters: filters.to_vec(),
-            cached_deleted_row_ids,
-            cached_deleted_pk_i64,
-            cached_deleted_row_keys,
             pk_deletion_strategy,
             pk_row_converter,
             pk_column_indices,
@@ -147,8 +127,8 @@ impl CayenneDeletionSink {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // For position-based deletions, we need per-file row tracking
         // For PK-based deletions, we can still batch across all files
-        match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
                 // Int64 PK deletion - collect all batches and extract PK values
                 let mut all_batches = Vec::new();
                 for table in tables {
@@ -166,7 +146,7 @@ impl CayenneDeletionSink {
                 let pk_values = self.extract_int64_pk_values(&concatenated_batch)?;
                 self.persist_int64_pk_deletions(pk_values).await
             }
-            PkDeletionStrategy::RowConverterBased => {
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 // RowConverter-based deletion for composite/non-integer PKs
                 let Some(ref row_converter) = self.pk_row_converter else {
                     return Err("RowConverter not available for RowConverterBased strategy".into());
@@ -188,7 +168,7 @@ impl CayenneDeletionSink {
                 let row_keys = self.extract_row_keys(&concatenated_batch, row_converter)?;
                 self.persist_key_based_deletions(row_keys).await
             }
-            PkDeletionStrategy::PositionBased => {
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // Position-based deletion for "delete all" (delete w/o filters)
                 // Note: Delete all is NOT available using retention so this is unreachable
                 Err("Position-based deletion without primary key is not yet supported for delete-all operations".into())
@@ -258,7 +238,7 @@ impl CayenneDeletionSink {
 
         // For position-based deletion, use the streaming per-file approach directly.
         // This avoids loading all data into memory and provides correct file-local row IDs.
-        if self.pk_deletion_strategy == PkDeletionStrategy::PositionBased {
+        if self.pk_deletion_strategy.is_position_based() {
             return self.delete_filtered_rows_position_based(ctx, tables).await;
         }
 
@@ -328,8 +308,8 @@ impl CayenneDeletionSink {
         }
 
         // Use the appropriate deletion strategy based on table configuration
-        match self.pk_deletion_strategy {
-            PkDeletionStrategy::Int64Pk => {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => {
                 // Int64 PK deletion - extract PK values directly
                 // Note: column indices are offset by 1 because __row_id is at index 0
                 let first_batch = filtered_batches
@@ -358,7 +338,7 @@ impl CayenneDeletionSink {
                 let pk_values: Vec<i64> = pk_array.values().iter().copied().collect();
                 self.persist_int64_pk_deletions(pk_values).await
             }
-            PkDeletionStrategy::RowConverterBased => {
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 // RowConverter-based deletion for composite/non-integer PKs
                 if let Some(ref row_converter) = self.pk_row_converter {
                     let filtered_concat = arrow::compute::concat_batches(
@@ -383,7 +363,7 @@ impl CayenneDeletionSink {
                     Err("RowConverter not available for RowConverterBased strategy".into())
                 }
             }
-            PkDeletionStrategy::PositionBased => {
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
                 unreachable!("PositionBased strategy should have returned early via delete_filtered_rows_streaming_position_based")
             }
         }
@@ -393,6 +373,12 @@ impl CayenneDeletionSink {
         &self,
         row_keys: Vec<Box<[u8]>>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Get the row keys cache from the PkDeletionStrategy (only valid for RowConverterBased)
+        let cached_deleted_row_keys = self
+            .pk_deletion_strategy
+            .row_keys_cache()
+            .ok_or("persist_key_based_deletions called with incompatible PkDeletionStrategy")?;
+
         let filtered_row_keys = Self::filter_existing_key_deletions(row_keys);
 
         if filtered_row_keys.is_empty() {
@@ -402,8 +388,7 @@ impl CayenneDeletionSink {
         // Count how many keys are NEW deletions (not already in the cache).
         // This gives an accurate count of newly deleted rows for the return value.
         let new_deletion_count = {
-            let guard = self
-                .cached_deleted_row_keys
+            let guard = cached_deleted_row_keys
                 .read()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
             filtered_row_keys
@@ -452,8 +437,7 @@ impl CayenneDeletionSink {
 
         // Update the cached deletion keys with sequence number
         {
-            let mut guard = self
-                .cached_deleted_row_keys
+            let mut guard = cached_deleted_row_keys
                 .write()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
 
@@ -485,6 +469,12 @@ impl CayenneDeletionSink {
         &self,
         pk_values: Vec<i64>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Get the int64 pk cache from the PkDeletionStrategy (only valid for Int64Pk)
+        let cached_deleted_pk_i64 = self
+            .pk_deletion_strategy
+            .int64_pk_cache()
+            .ok_or("persist_int64_pk_deletions called with incompatible PkDeletionStrategy")?;
+
         let filtered_pk_values = Self::filter_existing_int64_pk_deletions(pk_values);
 
         if filtered_pk_values.is_empty() {
@@ -494,8 +484,7 @@ impl CayenneDeletionSink {
         // Count how many PKs are NEW deletions (not already in the cache).
         // This gives an accurate count of newly deleted rows for the return value.
         let new_deletion_count = {
-            let guard = self
-                .cached_deleted_pk_i64
+            let guard = cached_deleted_pk_i64
                 .read()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
             filtered_pk_values
@@ -542,8 +531,7 @@ impl CayenneDeletionSink {
 
         // Update the cached Int64 PK deletion map with sequence number
         {
-            let mut guard = self
-                .cached_deleted_pk_i64
+            let mut guard = cached_deleted_pk_i64
                 .write()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
 
