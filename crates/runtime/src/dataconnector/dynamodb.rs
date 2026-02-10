@@ -421,12 +421,12 @@ impl DataConnector for DynamoDB {
                 match LagExceedsShardRetentionBehavior::from_str(value_str) {
                     Ok(behavior) => behavior,
                     Err(e) => {
-                        tracing::error!(
+                        tracing::warn!(
                             dataset = %dataset.name,
                             error = %e,
-                            "Failed to parse 'lag_exceeds_shard_retention_behavior' parameter"
+                            "Failed to parse 'lag_exceeds_shard_retention_behavior' parameter. Defaulting to 'error'"
                         );
-                        return None;
+                        LagExceedsShardRetentionBehavior::default()
                     }
                 }
             }
