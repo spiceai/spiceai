@@ -669,7 +669,7 @@ fn create_executor_flight_client(
 
     let mut flight_channel = Endpoint::from_shared(executor_address)?;
     if let Some(tls_config) = client_tls_config {
-        flight_channel = flight_channel.tls_config(tls_config)?
+        flight_channel = flight_channel.tls_config(tls_config)?;
     }
 
     Ok(FlightSqlServiceClient::new_from_inner(
