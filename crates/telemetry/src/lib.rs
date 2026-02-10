@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 pub use opentelemetry::KeyValue;
-use opentelemetry::metrics::UpDownCounter;
 use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::metrics::{Gauge, UpDownCounter};
 use std::{sync::OnceLock, time::Duration};
 
 #[cfg(feature = "anonymous_telemetry")]
@@ -359,4 +359,80 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
                 .build()
         })
         .add(rows, dimensions);
+}
+
+static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();
+static SNAPSHOT_BOOTSTRAP_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+pub fn record_snapshot_bootstrap_metrics(duration_ms: f64, bytes: u64, dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    SNAPSHOT_BOOTSTRAP_DURATION_MS
+        .get_or_init(|| {
+            m.f64_counter("dataset_acceleration_snapshot_bootstrap_duration_ms")
+                .with_description(
+                    "Time in milliseconds taken to download the snapshot used to bootstrap acceleration.",
+                )
+                .build()
+        })
+        .add(duration_ms, dimensions);
+    SNAPSHOT_BOOTSTRAP_BYTES
+        .get_or_init(|| {
+            m.u64_gauge("dataset_acceleration_snapshot_bootstrap_bytes")
+                .with_description(
+                    "Number of bytes downloaded when bootstrapping the acceleration from a snapshot.",
+                )
+                .build()
+        })
+        .record(bytes, dimensions);
+}
+
+static SNAPSHOT_FAILURE_COUNT: OnceLock<Counter<u64>> = OnceLock::new();
+
+pub fn record_snapshot_failure(dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    SNAPSHOT_FAILURE_COUNT
+        .get_or_init(|| {
+            m.u64_counter("dataset_acceleration_snapshot_failure_count")
+                .with_description("Number of failures encountered while writing snapshots.")
+                .build()
+        })
+        .add(1, dimensions);
+}
+
+static SNAPSHOT_WRITE_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+static SNAPSHOT_WRITE_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+pub fn record_snapshot_write_metrics(duration_ms: f64, bytes: u64, dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    SNAPSHOT_WRITE_DURATION_MS
+        .get_or_init(|| {
+            m.f64_histogram("dataset_acceleration_snapshot_write_duration_ms")
+                .with_description(
+                    "Time in milliseconds taken to write the latest snapshot to object storage.",
+                )
+                .with_unit("ms")
+                .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration_ms, dimensions);
+    SNAPSHOT_WRITE_BYTES
+        .get_or_init(|| {
+            m.u64_gauge("dataset_acceleration_snapshot_write_bytes")
+                .with_description("Number of bytes written for the most recent snapshot.")
+                .build()
+        })
+        .record(bytes, dimensions);
+}
+
+static SNAPSHOT_SKIPPED_COUNT: OnceLock<Counter<u64>> = OnceLock::new();
+
+pub fn record_snapshot_skipped(dimensions: &[KeyValue]) {
+    let Some(m) = meter::METER.get() else { return };
+    SNAPSHOT_SKIPPED_COUNT
+        .get_or_init(|| {
+            m.u64_counter("dataset_acceleration_snapshot_skipped_count")
+                .with_description("Number of snapshot creations skipped due to no data updates.")
+                .build()
+        })
+        .add(1, dimensions);
 }

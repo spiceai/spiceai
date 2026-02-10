@@ -109,7 +109,7 @@ async fn test_retention_filters_apply_on_insert_impl(
             .column(0)
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .expect("row_id column");
+            .expect("row_id column (UInt64)");
         for idx in 0..row_id_array.len() {
             deleted_row_ids.push(row_id_array.value(idx));
         }

@@ -1,0 +1,68 @@
+name: 'Load AWS Secrets'
+description: 'Authenticate to AWS via OIDC and load secrets from SSM Parameter Store into environment variables'
+inputs:
+  ssm_path:
+    description: 'SSM parameter path prefix to fetch secrets from'
+    required: false
+    default: '/github-actions/'
+runs:
+  using: 'composite'
+  steps:
+    - name: Authorize with AWS
+      uses: ./.github/actions/aws-authorize
+      with:
+        environment: sandbox
+        region: us-east-1
+        role_name: spiceai-github-actions-sandbox
+
+    - name: Fetch and export secrets from SSM
+      shell: bash
+      run: |
+        NEXT_TOKEN=""
+        PARAM_COUNT=0
+
+        while true; do
+          if [ -z "$NEXT_TOKEN" ]; then
+            RESPONSE=$(aws ssm get-parameters-by-path \
+              --path "${{ inputs.ssm_path }}" \
+              --with-decryption \
+              --recursive \
+              --output json)
+          else
+            RESPONSE=$(aws ssm get-parameters-by-path \
+              --path "${{ inputs.ssm_path }}" \
+              --with-decryption \
+              --recursive \
+              --starting-token "$NEXT_TOKEN" \
+              --output json)
+          fi
+
+          # Process each parameter in the current page using array indices
+          # to safely handle values containing tabs or newlines
+          PARAM_LENGTH=$(echo "$RESPONSE" | jq '.Parameters | length')
+          for ((i=0; i<PARAM_LENGTH; i++)); do
+            name=$(echo "$RESPONSE" | jq -r ".Parameters[$i].Name")
+            value=$(echo "$RESPONSE" | jq -r ".Parameters[$i].Value")
+            var_name="${name##*/}"
+
+            # Mask the value so it won't appear in logs
+            echo "::add-mask::$value"
+
+            # Export as environment variable for subsequent steps
+            echo "$var_name=$value" >> "$GITHUB_ENV"
+
+            PARAM_COUNT=$((PARAM_COUNT + 1))
+          done
+
+          # Check for pagination
+          NEXT_TOKEN=$(echo "$RESPONSE" | jq -r '.NextToken // empty')
+          if [ -z "$NEXT_TOKEN" ]; then
+            break
+          fi
+        done
+
+        if [ "$PARAM_COUNT" -eq 0 ]; then
+          echo "::warning::No parameters found under ${{ inputs.ssm_path }}"
+        else
+          echo "Loaded $PARAM_COUNT secrets from SSM"
+        fi
