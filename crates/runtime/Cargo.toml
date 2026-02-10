@@ -72,14 +72,14 @@ http.workspace = true
 http-body-util = "0.1.3"
 humantime = { workspace = true, optional = true }
 hyper = "1.7.0"
-hyper-util = { version = "0.1.19", features = ["service"] }
+hyper-util = { version = "0.1.20", features = ["service"] }
 iceberg = { workspace = true, features = ["storage-gcs", "storage-s3"] }
 iceberg-catalog-glue.workspace = true
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
-jsonwebtoken = "9.3.0"
+jsonwebtoken = "10.3.0"
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 mediatype = "0.21.0"

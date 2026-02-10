@@ -38,7 +38,7 @@ limitations under the License.
 //! ```
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SanType,
 };
 use std::fs;
@@ -174,8 +174,7 @@ impl PkiConfig {
         let ca_key_pem = fs::read_to_string(&self.ca_key_path)?;
 
         let ca_key_pair = KeyPair::from_pem(&ca_key_pem)?;
-        let ca_params = CertificateParams::from_ca_cert_pem(&ca_cert_pem)?;
-        let ca_cert = ca_params.self_signed(&ca_key_pair)?;
+        let ca_issuer = Issuer::from_ca_cert_pem(&ca_cert_pem, ca_key_pair)?;
 
         // Generate client certificate
         let not_before = OffsetDateTime::now_utc();
@@ -225,7 +224,7 @@ impl PkiConfig {
         }
 
         let client_key_pair = KeyPair::generate()?;
-        let client_cert = client_params.signed_by(&client_key_pair, &ca_cert, &ca_key_pair)?;
+        let client_cert = client_params.signed_by(&client_key_pair, &ca_issuer)?;
 
         // Write client certificate and key
         fs::write(&client_cert_path, client_cert.pem())?;
