@@ -51,11 +51,11 @@ use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use runtime_proto::{
-    AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, ExecutorControlMessage,
-    ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
-    GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest, GetSchedulersResponse,
-    GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand, SchedulerControlMessage,
-    SchedulerInstance, StringArray, cluster_service_server::ClusterService,
+    AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, BytesArray,
+    ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
+    GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
+    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand,
+    SchedulerControlMessage, SchedulerInstance, cluster_service_server::ClusterService,
     executor_control_message::Message as ExecutorMessage,
     scheduler_control_message::Message as SchedulerMessage,
 };
@@ -574,7 +574,7 @@ impl ClusterService for ClusterServiceImpl {
             }
         }
 
-        let mut table_partitions: HashMap<String, StringArray> = HashMap::new();
+        let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
 
         if let Some(partition_manager) = &self.partition_manager {
             let app_guard = self.app.read().await;
@@ -607,7 +607,7 @@ impl ClusterService for ClusterServiceImpl {
                                     }
                                 }
                             }
-                            table_partitions.insert(table_ref.to_string(), StringArray { items });
+                            table_partitions.insert(table_ref.to_string(), BytesArray { items });
                         }
                         Err(e) => {
                             tracing::error!(
