@@ -40,8 +40,3 @@ runs:
         role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
         role-session-name: ${{ env.ROLE_SESSION_NAME }}
         aws-region: ${{ inputs.region }}
-
-    - name: Validate access
-      shell: bash
-      run: |
-        aws sts get-caller-identity
