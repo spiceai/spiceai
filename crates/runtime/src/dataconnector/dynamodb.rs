@@ -423,7 +423,8 @@ impl DataConnector for DynamoDB {
                     Err(e) => {
                         tracing::error!(
                             dataset = %dataset.name,
-                            "Invalid lag_exceeds_shard_retention_behavior: {value_str}. Valid values: error, ready_before_load, ready_after_load. {e}"
+                            error = %e,
+                            "Failed to parse 'lag_exceeds_shard_retention_behavior' parameter"
                         );
                         return None;
                     }
