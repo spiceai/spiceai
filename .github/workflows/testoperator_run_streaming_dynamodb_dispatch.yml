@@ -59,8 +59,14 @@ jobs:
     name: Run DynamoDB streaming dispatch
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 180
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Load secrets from AWS
+        uses: ./.github/actions/load-aws-secrets
 
       - name: Validate spicepod directory exists
         run: |
