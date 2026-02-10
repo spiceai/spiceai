@@ -332,9 +332,7 @@ pub async fn handle_get_async_query_result(body: &[u8]) -> Result<Vec<u8>, Statu
             | crate::jobs::Error::ChunkNotFound { .. }
             | crate::jobs::Error::JobNotFound { .. }
             | crate::jobs::Error::JobResultsExpired { .. } => Status::not_found(e.to_string()),
-            crate::jobs::Error::JobNotComplete { .. } => {
-                Status::failed_precondition(e.to_string())
-            }
+            crate::jobs::Error::JobNotComplete { .. } => Status::failed_precondition(e.to_string()),
             _ => Status::internal(format!("Failed to get result chunk: {e}")),
         })?;
 
