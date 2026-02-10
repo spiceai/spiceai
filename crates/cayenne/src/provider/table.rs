@@ -58,6 +58,7 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
@@ -4064,8 +4065,8 @@ impl CayenneTableProvider {
             }
         }
 
-        // No deletions to apply (position-based deletions are handled at Vortex scan level)
-        Ok(Arc::new(CayenneAccelerationExec::new(plan)))
+        // No deletions to apply (position-based deletions are handled at Vortex scan level).
+        Ok(plan)
     }
 
     /// Apply deletion filter including insert records (for main scan path, not protected snapshots).
@@ -4167,7 +4168,7 @@ impl CayenneTableProvider {
             }
         }
 
-        Ok(Arc::new(CayenneAccelerationExec::new(plan)))
+        Ok(plan)
     }
 }
 
@@ -4349,8 +4350,6 @@ impl TableProvider for CayenneTableProvider {
         let plan = if protected_snapshot_plans.is_empty() {
             self.apply_deletion_filter_with_insert_records(main_plan, &pk_indices_in_projection)?
         } else {
-            use datafusion_physical_plan::union::UnionExec;
-
             let filtered_main_plan =
                 self.apply_deletion_filter(main_plan, &pk_indices_in_projection)?;
 
