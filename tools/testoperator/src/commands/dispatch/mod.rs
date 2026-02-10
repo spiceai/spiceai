@@ -125,6 +125,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         return Ok(());
     }
 
+    let mut failed_dispatches = Vec::new();
     let total_tests = tests_to_dispatch.len();
     for (index, (path, mut payload)) in tests_to_dispatch.into_iter().enumerate() {
         payload = map_numbers_to_strings(payload);
@@ -136,6 +137,29 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             path.display(),
         );
 
+        if args.dry_run {
+            let url = format!(
+                "https://api.github.com/repos/spiceai/spiceai/actions/workflows/{}/dispatches",
+                test_type.workflow()
+            );
+
+            let body = serde_json::json!({
+                "ref": &args.workflow_commit,
+                "inputs": payload
+            });
+
+            println!(
+                "curl -L \\
+  -X POST \\
+  -H \"Accept: application/vnd.github+json\" \\
+  -H \"Authorization: Bearer <GITHUB_TOKEN>\" \\
+  -H \"X-GitHub-Api-Version: 2022-11-28\" \\
+  {url} \\
+  -d '{body}'"
+            );
+            continue;
+        }
+
         let workflow = GitHubWorkflow::new(
             "spiceai",
             "spiceai",
@@ -143,7 +167,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             &args.workflow_commit,
         );
 
-        match args.max_concurrent {
+        let result = match args.max_concurrent {
             Some(max_concurrent) => {
                 // Dispatch workflow while waiting for an available slot, limiting to max_concurrent parallel runs
                 dispatch_workflow_with_concurrency(
@@ -152,17 +176,30 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     Some(payload),
                     max_concurrent,
                 )
-                .await?;
+                .await
             }
             None => {
                 // Dispatch workflow without concurrency limit
-                workflow.send(octo_client.actions(), Some(payload)).await?;
+                workflow.send(octo_client.actions(), Some(payload)).await
             }
+        };
+
+        if let Err(e) = result {
+            failed_dispatches.push((path.display().to_string(), e));
+            continue;
         }
 
         // sleep to space out runs
         println!("Waiting for next run...");
         tokio::time::sleep(std::time::Duration::from_secs(80)).await;
+    }
+
+    if !failed_dispatches.is_empty() {
+        println!("\nFailed to dispatch {} tests:", failed_dispatches.len());
+        for (path, error) in &failed_dispatches {
+            println!("  - {path}: {error}");
+        }
+        return Err(anyhow::anyhow!("Some workflow requests failed"));
     }
 
     Ok(())

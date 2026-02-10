@@ -49,6 +49,10 @@ pub struct DispatchArgs {
     /// Maximum number of concurrent workflow runs allowed
     #[arg(long)]
     pub(crate) max_concurrent: Option<usize>,
+
+    /// Dry run mode - print the workflow dispatch request without sending it
+    #[arg(long, default_value = "false")]
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
