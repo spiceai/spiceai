@@ -412,13 +412,22 @@ impl DataConnector for DynamoDB {
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
 
-        let lag_exceeds_behavior = self
+        let lag_exceeds_behavior = match self
             .params
             .get("lag_exceeds_shard_retention_behavior")
             .expose()
-            .ok()
-            .and_then(|v| LagExceedsShardRetentionBehavior::from_str(v).ok())
-            .unwrap_or_default();
+        {
+            ExposedParamLookup::Present(value_str) => {
+                LagExceedsShardRetentionBehavior::from_str(value_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+                    dataconnector: "dynamodb".to_string(),
+                    message: format!(
+                        "Invalid lag_exceeds_shard_retention_behavior: {value_str}. Valid values: error, ready_before_load, ready_after_load"
+                    ),
+                    connector_component: ConnectorComponent::from(&dataset),
+                })?
+            }
+            ExposedParamLookup::Absent(_) => LagExceedsShardRetentionBehavior::default(),
+        };
 
         let metrics_collector = Arc::clone(&self.metrics_collector);
 
