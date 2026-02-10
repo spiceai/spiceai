@@ -184,6 +184,31 @@ impl ExecutorRegistry {
         connections.keys().cloned().collect()
     }
 
+    /// Sends a control message to a specific executor.
+    pub async fn send_command(
+        &self,
+        executor_id: &str,
+        command: SchedulerControlMessage,
+    ) -> Result<()> {
+        let connections = self.connections.read().await;
+
+        if let Some(connection) = connections.get(executor_id) {
+            connection
+                .request_tx
+                .send(command)
+                .await
+                // TODO: these errors are only about metrics. See snafu: "Failed to send metrics request to executor {executor_id}: channel closed"
+                .map_err(|_| Error::SendFailed {
+                    executor_id: executor_id.to_string(),
+                })?;
+            Ok(())
+        } else {
+            Err(Error::SendFailed {
+                executor_id: executor_id.to_string(),
+            })
+        }
+    }
+
     /// Requests metrics from all connected executors.
     ///
     /// Returns a list of (`executor_id`, `otlp_metrics`) tuples for successful responses.

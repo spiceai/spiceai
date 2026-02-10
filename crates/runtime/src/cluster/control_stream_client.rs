@@ -22,6 +22,8 @@ limitations under the License.
 //! to trigger immediate work polling.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +45,16 @@ use crate::metrics_reader::MetricsReader;
 
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+// TODO: Docs/comment here.
+pub type PartitionUpdateHandler = Arc<
+    dyn Fn(
+            HashMap<String, Vec<Vec<u8>>>,
+            HashMap<String, Vec<Vec<u8>>>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Handle for a single control stream connection to a scheduler.
 struct ControlStreamHandle {
@@ -66,10 +78,12 @@ fn spawn_control_stream(
     metrics_reader: Option<Arc<MetricsReader>>,
     poll_now_notify: Arc<Notify>,
     outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
+    partition_update_handler: Option<PartitionUpdateHandler>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
     let outbound_tx_state_for_task = Arc::clone(&outbound_tx_state);
+    let partition_update_handler = partition_update_handler.clone();
 
     let task = tokio::spawn(async move {
         let tls_enabled = client_tls_config.is_some();
@@ -245,6 +259,7 @@ fn spawn_control_stream(
                                         &outbound_tx,
                                         metrics_reader.as_deref(),
                                         &poll_now_notify,
+                                        partition_update_handler.clone(),
                                     )
                                     .await;
                                 }
@@ -297,6 +312,7 @@ async fn handle_scheduler_message(
     outbound_tx: &mpsc::Sender<ExecutorControlMessage>,
     metrics_reader: Option<&MetricsReader>,
     poll_now_notify: &Notify,
+    partition_update_handler: Option<PartitionUpdateHandler>,
 ) {
     match message {
         SchedulerMessage::RequestMetrics(request) => {
@@ -332,6 +348,27 @@ async fn handle_scheduler_message(
             );
             poll_now_notify.notify_one();
         }
+        SchedulerMessage::UpdatePartitions(update) => {
+            tracing::debug!(
+                "Received UpdatePartitions from scheduler {scheduler_address}: {} new, {} removed",
+                update.new_partitions.len(),
+                update.removed_partitions.len()
+            );
+
+            if let Some(handler) = partition_update_handler {
+                let new_partitions = update
+                    .new_partitions
+                    .into_iter()
+                    .map(|(k, v)| (k, v.items))
+                    .collect();
+                let removed_partitions = update
+                    .removed_partitions
+                    .into_iter()
+                    .map(|(k, v)| (k, v.items))
+                    .collect();
+                handler(new_partitions, removed_partitions).await;
+            }
+        }
     }
 }
 
@@ -359,6 +396,8 @@ pub struct ControlStreamManager {
     known_schedulers: HashSet<String>,
     /// Shared notify handle signaled when any scheduler sends `PollNow`.
     poll_now_notify: Arc<Notify>,
+    /// Callback handler for partition updates.
+    partition_update_handler: Option<PartitionUpdateHandler>,
 }
 
 impl ControlStreamManager {
@@ -369,6 +408,7 @@ impl ControlStreamManager {
         ballista_executor_id: String,
         client_tls_config: Option<ClientTlsConfig>,
         metrics_reader: Option<MetricsReader>,
+        partition_update_handler: Option<PartitionUpdateHandler>,
     ) -> Self {
         Self {
             executor_id,
@@ -378,6 +418,7 @@ impl ControlStreamManager {
             streams: HashMap::new(),
             known_schedulers: HashSet::new(),
             poll_now_notify: Arc::new(Notify::new()),
+            partition_update_handler,
         }
     }
 
@@ -458,6 +499,7 @@ impl ControlStreamManager {
                 self.metrics_reader.clone(),
                 Arc::clone(&self.poll_now_notify),
                 Arc::clone(&outbound_tx_state),
+                self.partition_update_handler.clone(),
             );
             self.streams.insert(address, handle);
         }
@@ -538,6 +580,7 @@ mod tests {
             "executor-1".to_string(),
             None, // no TLS
             None, // no metrics reader
+            Arc::new(RwLock::new(HashMap::new())),
         );
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -552,6 +595,7 @@ mod tests {
             "executor-2".to_string(),
             None,
             Some(reader),
+            Arc::new(RwLock::new(HashMap::new())),
         );
         assert!(manager.metrics_reader.is_some());
     }
@@ -563,6 +607,7 @@ mod tests {
             "executor-1".to_string(),
             None,
             None,
+            Arc::new(RwLock::new(HashMap::new())),
         );
         manager.update_schedulers(vec![]);
         assert!(manager.known_schedulers.is_empty());
@@ -576,6 +621,7 @@ mod tests {
             "executor-1".to_string(),
             None,
             None,
+            Arc::new(RwLock::new(HashMap::new())),
         );
         // Should not panic on empty manager
         manager.shutdown();

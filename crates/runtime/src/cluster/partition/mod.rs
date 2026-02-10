@@ -16,6 +16,7 @@ limitations under the License.
 
 mod manager;
 mod metadata;
+pub mod scheduler_task;
 mod startup;
 
 use std::collections::HashMap;
@@ -23,7 +24,9 @@ use std::collections::HashMap;
 use datafusion::sql::{TableReference, unparser::expr_to_sql};
 use datafusion_expr::Expr;
 pub use manager::PartitionManager;
-pub use metadata::{PartitionMetadata, TablePartitionMetadata, partition_value_to_bytes};
+pub use metadata::{
+    PartitionMetadata, PartitionValue, TablePartitionMetadata, partition_value_to_bytes,
+};
 pub use startup::{
     accelerated_tables, build_partition_metadata_store, executor_request_initial_partitions,
     initialize_partition_metadata,

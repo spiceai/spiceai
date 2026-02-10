@@ -18,6 +18,7 @@ limitations under the License.
 use ::tools::SpiceModelTool;
 use ::tools::rename::with_name;
 use async_stream::stream;
+use datafusion_expr::Expr;
 use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -46,6 +47,7 @@ use crate::{
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
+use datafusion_proto::bytes::Serializeable;
 
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
@@ -140,6 +142,7 @@ mod view;
 mod worker;
 
 pub type PartitionAssignments = HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>;
+pub type SharedPartitionAssignments = Arc<RwLock<PartitionAssignments>>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -452,6 +455,7 @@ pub enum Error {
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
 const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
 const CLUSTER_SCHEDULER_REGISTRY: &str = "cluster_scheduler_registry";
+const CLUSTER_PARTITION_MANAGEMENT_TASK: &str = "cluster_partition_management_task";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
@@ -636,7 +640,83 @@ impl Runtime {
         }
     }
 
-    async fn update_partition_refresh_sql(
+    pub async fn update_partition_assignments(
+        &self,
+        new_partitions: HashMap<String, Vec<Vec<u8>>>,
+        removed_partitions: HashMap<String, Vec<Vec<u8>>>,
+    ) {
+        if let Some(DistributedNode::Executor {
+            partition_assignments,
+        }) = self.distributed.as_ref()
+        {
+            let mut guard = partition_assignments.write().await;
+
+            // Handle removed partitions
+            for (table_name, partitions) in &removed_partitions {
+                let table_ref = TableReference::parse_str(table_name);
+                if let Some(current_partitions) = guard.get_mut(&table_ref) {
+                    for partition_bytes in partitions {
+                        if let Ok(partition_expr) =
+                            Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
+                        {
+                            current_partitions.retain(|p| *p != partition_expr);
+                        } else {
+                            tracing::warn!(
+                                "Failed to deserialize removed partition expression for table {table_name}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Handle new partitions
+            for (table_name, partitions) in &new_partitions {
+                let table_ref = TableReference::parse_str(table_name);
+                let current_partitions = guard.entry(table_ref.clone()).or_default();
+                for partition_bytes in partitions {
+                    if let Ok(partition_expr) = ::datafusion_expr::Expr::from_bytes_with_registry(
+                        partition_bytes,
+                        self.df.ctx.as_ref(),
+                    ) {
+                        if !current_partitions.contains(&partition_expr) {
+                            current_partitions.push(partition_expr);
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Failed to deserialize new partition expression for table {table_name}"
+                        );
+                    }
+                }
+            }
+
+            // Identify all affected tables
+            let affected_tables: HashSet<_> = new_partitions
+                .keys()
+                .chain(removed_partitions.keys())
+                .collect();
+            drop(guard); // drop lock before updating tables
+
+            // Update all affected tables
+            for table_name in affected_tables {
+                let table_ref = TableReference::parse_str(table_name);
+                // Re-acquire lock to get current assignments for this table
+                let assignments = partition_assignments.read().await;
+
+                if let Err(e) = self
+                    .update_partition_refresh_sql(table_ref.clone(), &assignments)
+                    .await
+                {
+                    tracing::warn!("Failed to update partition refresh SQL for {table_name}: {e}");
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Attempted to update partition assignments on a non-executor node. Ignoring."
+            );
+        }
+    }
+
+    pub(crate) async fn update_partition_refresh_sql(
         &self,
         table: TableReference,
         assignments: &PartitionAssignments,

@@ -112,7 +112,15 @@ message SchedulerControlMessage {
     oneof message {
         MetricsRequest request_metrics = 1;
         PollNowCommand poll_now = 2;
+        UpdatePartitions update_partitions = 3;
     }
+}
+
+message UpdatePartitions {
+    // Map of table name to list of NEW partition expressions to add.
+    map<string, BytesArray> new_partitions = 1;
+    // Map of table name to list of REMOVED partition expressions to remove.
+    map<string, BytesArray> removed_partitions = 2;
 }
 
 // Request message for AllocateInitialPartitions RPC.

@@ -200,7 +200,7 @@ pub async fn initialize_partition_metadata(
 /// Query the source table provider for partition values for a given table.
 ///
 /// This builds a SQL query to get distinct values from the partition columns.
-async fn table_partition_values(
+pub async fn table_partition_values(
     table: &TableReference,
     partitioning: &[PartitionedBy],
     rt: &Arc<Runtime>,

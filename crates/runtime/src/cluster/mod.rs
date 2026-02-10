@@ -17,14 +17,18 @@ limitations under the License.
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::cluster::partition::executor_request_initial_partitions;
+use crate::cluster::partition::scheduler_task::{
+    PartitionManagementConfig, PartitionManagementTask,
+};
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::jobs::JobExecutor;
 use crate::status::ComponentStatus;
 use crate::{
-    CLUSTER_INTERNAL_SERVER, CLUSTER_SCHEDULER_REGISTRY, FailedToStartClusterExecutorSnafu,
-    FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
+    CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_MANAGEMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
+    FailedToStartClusterExecutorSnafu, FailedToStartClusterSchedulerSnafu, LogErrors, Runtime,
+    UnableToStartClusterServerSnafu,
 };
 use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::prelude::SessionConfig;
@@ -776,11 +780,12 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     let cloned_shutdown = internal_server_shutdown.clone();
     let internal_server_rt = Arc::clone(rt);
     let internal_server_peers = Arc::clone(&scheduler_peers);
+    let scheduler_executor_registry_clone = Arc::clone(&scheduler_executor_registry);
     let internal_server_fut = async move {
         start_internal_cluster_server(
             internal_server_rt,
             Some(cloned_shutdown),
-            Arc::clone(&scheduler_executor_registry),
+            scheduler_executor_registry_clone,
             internal_server_peers,
         )
         .await
@@ -814,6 +819,37 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                             "Failed to initialize partition metadata during scheduler startup: {err}"
                         );
                     }
+
+                    // Start partition management task
+                    let pm_shutdown = CancellationToken::new();
+                    let pm_shutdown_for_task = pm_shutdown.clone();
+                    let pm_config = config
+                        .partition_management
+                        .clone()
+                        .map(PartitionManagementConfig::from)
+                        .unwrap_or_default();
+
+                    let pm_task = PartitionManagementTask::new(
+                        Arc::clone(rt),
+                        Arc::clone(&partition_manager),
+                        Arc::clone(&scheduler_executor_registry),
+                        pm_config,
+                        pm_shutdown_for_task,
+                    );
+
+                    let _ = self_for_task
+                        .start_runtime_task(
+                            CLUSTER_PARTITION_MANAGEMENT_TASK,
+                            Some(pm_shutdown),
+                            async move {
+                                pm_task.run().await.map_err(|e| {
+                                    crate::Error::FailedToStartClusterScheduler {
+                                        source: Box::new(e),
+                                    }
+                                })
+                            },
+                        )
+                        .await;
                 }
                 Err(err) => {
                     tracing::error!("Failed to build partition metadata store: {err}");
@@ -1152,6 +1188,17 @@ pub async fn initialize_cluster_executor(
     let control_stream_metrics_reader = rt.metrics_reader().cloned();
     let shutdown_token_for_manager = shutdown_token.clone();
 
+    let partition_update_handler_rt = Arc::clone(&rt);
+    let partition_update_handler: Option<
+        crate::cluster::control_stream_client::PartitionUpdateHandler,
+    > = Some(Arc::new(move |new_partitions, removed_partitions| {
+        let rt = Arc::clone(&partition_update_handler_rt);
+        Box::pin(async move {
+            rt.update_partition_assignments(new_partitions, removed_partitions)
+                .await;
+        })
+    }));
+
     // Thread to handle:
     //  - periodic refresh of scheduler membership
     //  - spawning/stopping scheduler poll loops as membership changes
@@ -1166,6 +1213,7 @@ pub async fn initialize_cluster_executor(
             control_stream_ballista_id,
             control_stream_tls_config,
             control_stream_metrics_reader,
+            partition_update_handler,
         );
 
         // Get the shared poll_now notify handle from the control stream manager.
