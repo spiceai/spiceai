@@ -185,6 +185,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         };
 
         if let Err(e) = result {
+            eprintln!("Failed to dispatch {path}. Error: {e}");
             failed_dispatches.push((path.display().to_string(), e));
             continue;
         }
