@@ -761,8 +761,14 @@ impl Runtime {
             )
             .context(crate::UnableToConvertPartitionExprSnafu)?
             {
+                tracing::debug!(
+                    "For table={}, adding filters to refresh_sql for assigned partitions. New refresh_sql={new_sql}",
+                    ds.name,
+                );
                 if let Some(acc) = ds_mod.acceleration.as_mut() {
                     acc.refresh_sql = Some(new_sql);
+                    acc.partition_by = vec![];
+                    acc.engine = acc.engine.to_unpartitioned();
                 }
                 ds = Arc::new(ds_mod);
             }

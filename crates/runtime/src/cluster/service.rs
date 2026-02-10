@@ -590,15 +590,24 @@ impl ClusterService for ClusterServiceImpl {
                             if partitions.is_empty() {
                                 continue;
                             }
-                            let serialized_items = partitions.into_iter().map(partition_value_to_bytes).collect::<Result<Vec<_>, _>>().map_err(
-                                |e| Status::internal(format!("Failed to serialize partition expression for table {table_ref}: {e}"))
-                            )?;
-                            table_partitions.insert(
-                                table_ref.to_string(),
-                                StringArray {
-                                    items: serialized_items.iter().map(|b| b.to_vec()).collect(),
-                                },
-                            );
+                            let mut items = Vec::with_capacity(partitions.len());
+                            for partition in partitions {
+                                match partition_value_to_bytes(
+                                    partition,
+                                    table_ref,
+                                    &self.datafusion,
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => items.push(bytes.to_vec()),
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to serialize partition expression for table {table_ref}: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            table_partitions.insert(table_ref.to_string(), StringArray { items });
                         }
                         Err(e) => {
                             tracing::error!(

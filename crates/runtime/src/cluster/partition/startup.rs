@@ -40,7 +40,9 @@ use spicepod::partitioning::PartitionedBy;
 use tonic::transport::Channel;
 
 use super::PartitionManager;
-use crate::{Runtime, accelerated_table::AcceleratedTable};
+use crate::{
+    Runtime, accelerated_table::AcceleratedTable, cluster::partition::metadata::PartitionValue,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -202,7 +204,7 @@ async fn table_partition_values(
     table: &TableReference,
     partitioning: &[PartitionedBy],
     rt: &Arc<Runtime>,
-) -> Result<Vec<HashMap<String, String>>> {
+) -> Result<Vec<PartitionValue>> {
     let table_name = table.to_string();
 
     // Build SQL query to get distinct partition values
@@ -249,7 +251,7 @@ async fn table_partition_values(
                     .context(PartitionDiscoverySnafu {
                         table: table_name.clone(),
                     })?;
-                if let Some(pname) = partitioning.get(col_idx).map(|p| p.name.clone()) {
+                if let Some(pname) = partitioning.get(col_idx).map(|p| p.expression.clone()) {
                     value_parts.insert(pname, value_str);
                 }
             }

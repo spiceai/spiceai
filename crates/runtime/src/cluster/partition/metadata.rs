@@ -14,13 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
-use datafusion::error::DataFusionError;
-use datafusion_expr::{Expr, col, lit};
+use datafusion::{error::DataFusionError, sql::TableReference};
+use datafusion_expr::{Expr, lit};
 use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
+
+use crate::datafusion::DataFusion;
 
 /// A specific set of values for partitioning keys.
 /// For example, if a table is partitioned by "date" and "region", a `PartitionValue` might be {"date": "2024-01-01", "region": "us-east"}.
@@ -71,10 +73,15 @@ impl PartitionMetadata {
     }
 }
 
-pub fn partition_value_to_bytes(p: PartitionValue) -> Result<Bytes, DataFusionError> {
+pub async fn partition_value_to_bytes(
+    p: PartitionValue,
+    tbl: &TableReference,
+    df: &Arc<DataFusion>,
+) -> Result<Bytes, DataFusionError> {
     let mut expr: Option<Expr> = None;
-    for (col_name, val) in p {
-        let e = col(col_name).eq(lit(val));
+    for (partition_expr, val) in p {
+        let partition_by = df.try_parse_expr(tbl, &partition_expr).await?;
+        let e = partition_by.eq(lit(val));
         expr = match expr {
             Some(existing) => Some(existing.and(e)),
             None => Some(e),

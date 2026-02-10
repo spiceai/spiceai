@@ -1262,6 +1262,11 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to allocate initial partitions from scheduler: {status}")
                 .into(),
         })?;
+        tracing::debug!(
+            "For executor={:?}, initial accelerated table partitions={:?}",
+            rt.datafusion().cluster_config.node_advertise_url(),
+            initial_partitions.clone()
+        );
         rt.set_partition_assignments(initial_partitions).await;
 
         // Bind the already-fetched app and initialize secrets for object store configuration

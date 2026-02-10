@@ -47,7 +47,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-static PARTITION_PREFIX: &str = "partitions/";
+static PARTITION_PREFIX: &str = "accelerations/partitions/";
 
 /// Manages partition metadata for accelerated tables in object storage.
 ///
