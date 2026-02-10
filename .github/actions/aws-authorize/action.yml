@@ -1,0 +1,47 @@
+name: 'Authorize with AWS'
+description: 'Authorize with an AWS account and role'
+inputs:
+  region:
+    description: 'The AWS region to authorize with'
+    required: true
+  environment:
+    description: 'The environment to deploy to (e.g. dev, sandbox, production)'
+    required: true
+  role_name:
+    description: 'The name of the role to assume'
+    required: true
+outputs:
+  account_id:
+    description: 'The AWS account ID for the environment'
+    value: ${{ steps.set_account_id.outputs.ACCOUNT_ID }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Set Account ID for environment
+      id: set_account_id
+      shell: bash
+      run: |
+        echo "ACCOUNT_ID=211125479522" >> $GITHUB_ENV
+        echo "ACCOUNT_ID=211125479522" >> $GITHUB_OUTPUT
+
+    - name: Set AWS Role to Assume
+      shell: bash
+      run: |
+        echo "AWS_ROLE_TO_ASSUME=arn:aws:iam::${{ env.ACCOUNT_ID }}:role/${{ inputs.role_name }}" >> $GITHUB_ENV
+
+    - name: Set Role Session Name with uuidgen
+      shell: bash
+      run: |
+        echo "ROLE_SESSION_NAME=gha-${{ inputs.environment }}-${{ github.run_id }}" >> $GITHUB_ENV
+
+    - name: Acquire role
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+        role-session-name: ${{ env.ROLE_SESSION_NAME }}
+        aws-region: ${{ inputs.region }}
+
+    - name: Validate access
+      shell: bash
+      run: |
+        aws sts get-caller-identity

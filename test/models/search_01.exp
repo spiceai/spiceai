@@ -30,10 +30,10 @@ proc perform_search {search_term expected_term} {
     }
 }
 expect "search>"
-perform_search "Spice runtime error" {\| 1 .*\| .* \| [0-9]+\.[0-9]+ \| spice\.public\.issues +\|}
+perform_search "Spice runtime error" {1 +[0-9]+ +.* +[0-9]+\.[0-9]+ +spice\.public\.issues}
 
 expect "search>"
-perform_search "friends" {\| 1 .*\| .* \| [0-9]+\.[0-9]+ \| spice\.public\.catalog_page +\|}
+perform_search "friends" {1 +[0-9]+ +.* +[0-9]+\.[0-9]+ +spice\.public\.catalog_page}
 
 # Signal to exit (Ctrl+C)
 send \x03
