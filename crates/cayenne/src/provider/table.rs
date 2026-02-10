@@ -2460,25 +2460,12 @@ impl CayenneTableProvider {
         // isn't filtered out. We use delete_sequence + 1 for the re-insertion.
         let insert_sequence = delete_sequence + 1;
 
-        // Capture existing delete files so we can replace them atomically.
-        let existing_delete_files = self
-            .catalog
-            .get_table_delete_files(self.table_metadata.table_id)
-            .await
-            .map_err(|err| CatalogError::InvalidOperationNoSource {
-                message: format!("Failed to load existing delete files: {err}"),
-            })?;
-
-        let existing_ids: Vec<i64> = existing_delete_files
-            .iter()
-            .map(|f| f.delete_file_id)
-            .collect();
-        let existing_paths: Vec<std::path::PathBuf> = existing_delete_files
-            .iter()
-            .map(|f| f.path.clone().into())
-            .collect();
-
-        let writer = DeletionVectorWriter::new(&self.table_metadata);
+        // Create a temporary metadata with the fresh delete sequence number.
+        // The table_metadata's current_sequence_number is stale (set at table open time),
+        // so we must use the actual delete_sequence from increment_sequence_number().
+        let mut temp_metadata = self.table_metadata.clone();
+        temp_metadata.current_sequence_number = delete_sequence;
+        let writer = DeletionVectorWriter::new(&temp_metadata);
 
         // For on-conflict (upsert) handling, use key-based deletion vectors.
         // Position-based tables don't support upserts, so we always use row keys here.
@@ -2530,25 +2517,9 @@ impl CayenneTableProvider {
             }
         }
 
-        // Remove old delete files after new ones are registered.
-        if !existing_ids.is_empty() {
-            self.catalog
-                .remove_delete_files(self.table_metadata.table_id, &existing_ids)
-                .await
-                .map_err(|err| CatalogError::InvalidOperationNoSource {
-                    message: format!("Failed to remove old delete files: {err}"),
-                })?;
-
-            // Best-effort cleanup of old files on disk.
-            for path in existing_paths {
-                if let Err(err) = tokio::fs::remove_file(&path).await {
-                    tracing::debug!(
-                        "Failed to delete obsolete deletion vector file {:?}: {err}",
-                        path
-                    );
-                }
-            }
-        }
+        // For PK-based strategies, keep old delete files to preserve deletion history.
+        // Each upsert round may affect a different subset of PKs, so removing old files
+        // would lose deletion records for PKs not in the current round.
 
         // Update the appropriate cache based on deletion strategy.
         // This follows Iceberg's pattern where deletes are tracked by PK + sequence number.
@@ -3713,62 +3684,42 @@ impl CayenneTableProvider {
         table_id: i64,
         strategy: &PkDeletionStrategyWithCache,
     ) -> CatalogResult<HashMap<String, i64>> {
-        // Check if there are any pending deletions and get max delete sequence
-        let max_delete_seq = match strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk, ..
-            } => {
-                let guard = cached_deleted_pk
-                    .read()
-                    .map_err(|_| CatalogError::LockPoisoned {
-                        operation: "read Int64 PK deletions for protected snapshots".to_string(),
-                    })?;
-                if guard.is_empty() {
-                    return Ok(HashMap::new());
-                }
-                guard.values().max().copied().unwrap_or(0)
-            }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                ..
-            } => {
-                let guard =
-                    cached_deleted_row_keys
-                        .read()
-                        .map_err(|_| CatalogError::LockPoisoned {
-                            operation: "read row key deletions for protected snapshots".to_string(),
-                        })?;
-                if guard.is_empty() {
-                    return Ok(HashMap::new());
-                }
-                guard.values().max().copied().unwrap_or(0)
-            }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
-                // Per-file deletion vectors don't need protected snapshots
-                return Ok(HashMap::new());
-            }
-        };
-
-        // Get all snapshot sequences from catalog
-        let snapshot_sequences = catalog.get_all_snapshot_sequences(table_id).await?;
-
-        // Filter to only protected snapshots (those with seq > max_delete_seq)
-        let protected: HashMap<String, i64> = snapshot_sequences
-            .into_iter()
-            .filter(|(_snapshot_id, seq)| *seq > max_delete_seq)
-            .map(|(snapshot_id, _seq)| (snapshot_id, max_delete_seq)) // Store max_delete_seq for reference
-            .collect();
-
-        if !protected.is_empty() {
-            tracing::debug!(
-                "Loaded {} protected snapshot(s) for table_id {} with max_delete_seq={}",
-                protected.len(),
-                table_id,
-                max_delete_seq
-            );
+        // Only PK-based strategies support sequence-ordered snapshot protection.
+        // Position-based deletion vectors are per-file and don't need protected snapshots.
+        if strategy.is_position_based() {
+            return Ok(HashMap::new());
         }
 
-        Ok(protected)
+        let snapshot_sequences = catalog.get_all_snapshot_sequences(table_id).await?;
+
+        if snapshot_sequences.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Treat ALL snapshots as protected, using each snapshot's own persisted
+        // `sequence_number` as its deletion threshold.
+        //
+        // Each snapshot's `sequence_number` was allocated (via `increment_sequence_number`)
+        // BEFORE the same round's deletions were created. Therefore:
+        // - All deletions from PRIOR rounds have `delete_seq < sequence_number`
+        // - All deletions from the SAME or LATER rounds have `delete_seq > sequence_number`
+        //
+        // The partial deletion filter uses `delete_seq > threshold`, so setting the
+        // threshold to `sequence_number` correctly:
+        // - Skips deletions from prior rounds (already accounted for at snapshot creation)
+        // - Applies deletions from the same or later rounds
+        //
+        // Previously, this function computed a single global `max_delete_seq` from ALL
+        // deletions and filtered out snapshots where `seq <= max_delete_seq`. This was
+        // incorrect because later rounds' deletions raised the global max, causing earlier
+        // snapshots to be incorrectly dropped and their data lost on restart.
+
+        tracing::debug!(
+            "Loaded {} protected snapshot(s) for table_id {table_id}",
+            snapshot_sequences.len(),
+        );
+
+        Ok(snapshot_sequences)
     }
 
     /// Creates a projection that strips additional columns added for deletion filtering.

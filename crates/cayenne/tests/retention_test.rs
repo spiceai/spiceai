@@ -116,7 +116,7 @@ async fn test_retention_filters_apply_on_insert_impl(
     }
     assert_eq!(
         deleted_row_ids,
-        vec![0, 1],
+        vec![0u64, 1],
         "Retention should delete the first two logical rows"
     );
 
