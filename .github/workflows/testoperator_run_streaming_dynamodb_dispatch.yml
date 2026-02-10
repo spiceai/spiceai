@@ -132,7 +132,7 @@ jobs:
           DYNAMODB_AWS_ACCESS_KEY_ID: ${{ env.AWS_DYNAMODB_ACCESS_KEY_ID }}
           DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ env.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           # Snapshot storage
-          SNAPSHOT_S3_LOCATION: s3://streaming-benchmark-snapshots
+          SNAPSHOT_S3_LOCATION: s3://spice-streaming-benchmark-snapshots
           SNAPSHOT_S3_ACCESS_KEY_ID: ${{ env.STREAMING_SNAPSHOT_S3_ACCESS_KEY_ID }}
           SNAPSHOT_S3_SECRET_ACCESS_KEY: ${{ env.STREAMING_SNAPSHOT_S3_SECRET_ACCESS_KEY }}
           SNAPSHOT_S3_REGION: us-east-1
