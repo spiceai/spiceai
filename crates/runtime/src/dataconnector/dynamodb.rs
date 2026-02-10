@@ -418,13 +418,16 @@ impl DataConnector for DynamoDB {
             .expose()
         {
             ExposedParamLookup::Present(value_str) => {
-                LagExceedsShardRetentionBehavior::from_str(value_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
-                    dataconnector: "dynamodb".to_string(),
-                    message: format!(
-                        "Invalid lag_exceeds_shard_retention_behavior: {value_str}. Valid values: error, ready_before_load, ready_after_load"
-                    ),
-                    connector_component: ConnectorComponent::from(&dataset),
-                })?
+                match LagExceedsShardRetentionBehavior::from_str(value_str) {
+                    Ok(behavior) => behavior,
+                    Err(e) => {
+                        tracing::error!(
+                            dataset = %dataset.name,
+                            "Invalid lag_exceeds_shard_retention_behavior: {value_str}. Valid values: error, ready_before_load, ready_after_load. {e}"
+                        );
+                        return None;
+                    }
+                }
             }
             ExposedParamLookup::Absent(_) => LagExceedsShardRetentionBehavior::default(),
         };
