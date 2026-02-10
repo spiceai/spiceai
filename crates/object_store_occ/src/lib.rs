@@ -41,9 +41,10 @@ pub enum Error {
         source: serde_json::Error,
     },
 
-    #[snafu(display("Object store operation failed for key {key}: {source}"))]
+    #[snafu(display("Object store operation '{operation}' failed for key {key}: {source}"))]
     ObjectStore {
         key: String,
+        operation: &'static str,
         source: object_store::Error,
     },
     #[snafu(display("Unexpected deletion of object with key {key}"))]

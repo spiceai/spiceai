@@ -64,6 +64,7 @@ use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
+use datafusion::common::ToDFSchema;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
@@ -74,6 +75,7 @@ use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{ResolvedTableReference, TableReference};
+use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::find_datafusion_root;
 use itertools::Itertools;
@@ -2150,6 +2152,23 @@ impl DataFusion {
             .map_err(|_| Error::UnableToLockWritableExecutorHandle {})?;
         *executor_handle = Some(executor);
         Ok(())
+    }
+
+    /// Parse a given [`Expr`] from a SQL string.
+    ///
+    /// The entire `expr` must only contain expressions from the provided [`TableReference`], which itself should be a registered table (i.e. [`DataFusion::register_table`]).
+    pub async fn try_parse_expr(
+        &self,
+        tbl: &TableReference,
+        expr: &str,
+    ) -> Result<Expr, DataFusionError> {
+        let Some(tbl_provider) = self.get_table(tbl).await else {
+            return Err(DataFusionError::Plan(format!(
+                "Table {tbl} not found when parsing expression"
+            )));
+        };
+        self.ctx
+            .parse_sql_expr(expr, &tbl_provider.schema().to_dfschema()?)
     }
 }
 

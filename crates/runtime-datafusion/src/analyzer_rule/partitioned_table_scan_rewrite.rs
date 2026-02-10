@@ -116,7 +116,11 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
             for (provider, partition_filters) in providers {
                 let source = DefaultTableSource::new(Arc::clone(&provider));
                 let mut filters = scan.filters.clone();
-                filters.extend_from_slice(&partition_filters);
+
+                // Combine partitions with OR.
+                if let Some(partition_filter) = partition_filters.into_iter().reduce(Expr::or) {
+                    filters.push(partition_filter);
+                }
                 let plan = LogicalPlanBuilder::scan_with_filters(
                     scan.table_name.clone(),
                     Arc::new(source),

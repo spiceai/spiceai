@@ -31,27 +31,31 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
 
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        ast::{Ident, ObjectNamePart, visit_relations_mut},
-        dialect::PostgreSqlDialect,
-        parser::Parser,
+use datafusion::{
+    prelude::Expr,
+    sql::{
+        TableReference,
+        sqlparser::{
+            ast::{Ident, ObjectNamePart, visit_relations_mut},
+            dialect::PostgreSqlDialect,
+            parser::Parser,
+        },
     },
 };
 
 use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
 
+use datafusion_proto::bytes::Serializeable;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use runtime_proto::{
-    AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, ExecutorControlMessage,
-    ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest, GetAppDefinitionResponse,
-    GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest, GetSchedulersResponse,
-    GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand, SchedulerControlMessage,
-    SchedulerInstance, StringArray, cluster_service_server::ClusterService,
+    AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, BytesArray,
+    ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
+    GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
+    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand,
+    SchedulerControlMessage, SchedulerInstance, cluster_service_server::ClusterService,
     executor_control_message::Message as ExecutorMessage,
     scheduler_control_message::Message as SchedulerMessage,
 };
@@ -64,10 +68,14 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use tonic::{Request, Response, Status, Streaming, transport::Endpoint};
+use tonic::{
+    Request, Response, Status, Streaming,
+    transport::{ClientTlsConfig, Endpoint},
+};
 
-use crate::cluster::SchedulerPeers;
 use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::partition::PartitionManager;
+use crate::cluster::{SchedulerPeers, partition::partition_value_to_bytes};
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
@@ -155,6 +163,8 @@ pub struct ClusterServiceImpl {
     executor_registry: Arc<ExecutorRegistry>,
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
+    /// Manager for partition metadata (scheduler only).
+    partition_manager: Option<Arc<PartitionManager>>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
 }
@@ -162,6 +172,7 @@ pub struct ClusterServiceImpl {
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -170,6 +181,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        partition_manager: Option<Arc<PartitionManager>>,
     ) -> Self {
         Self {
             app,
@@ -179,6 +191,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            partition_manager,
             executor_streams: ExecutorControlStreamRegistry::new(),
         }
     }
@@ -197,6 +210,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        partition_manager: Option<Arc<PartitionManager>>,
         executor_streams: ExecutorControlStreamRegistry,
     ) -> Self {
         Self {
@@ -207,6 +221,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            partition_manager,
             executor_streams,
         }
     }
@@ -549,7 +564,8 @@ impl ClusterService for ClusterServiceImpl {
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
         let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
 
-        match create_executor_flight_client(&executor_id) {
+        let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
+        match create_executor_flight_client(&executor_id, tls_config_opt) {
             Ok(client) => {
                 let mut flight_client_registry =
                     self.executor_registry.flight_sql_clients.write().await;
@@ -562,40 +578,88 @@ impl ClusterService for ClusterServiceImpl {
             }
         }
 
-        let table_partitions: HashMap<TableReference, StringArray> = (*self.app.read().await)
-            .as_ref()
-            .map(|app| {
-                app.datasets
+        let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
+
+        if let Some(partition_manager) = &self.partition_manager {
+            let app_guard = self.app.read().await;
+            if let Some(app) = app_guard.as_ref() {
+                // Find accelerated datasets with partitioning
+
+                for table_ref in super::partition::accelerated_tables(app).keys() {
+                    match partition_manager
+                        .allocate_partitions(table_ref, &executor_id, 10)
+                        .await
+                    {
+                        Ok(partitions) => {
+                            if partitions.is_empty() {
+                                continue;
+                            }
+                            let mut items = Vec::with_capacity(partitions.len());
+                            for partition in partitions {
+                                match partition_value_to_bytes(
+                                    partition,
+                                    table_ref,
+                                    &self.datafusion,
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => items.push(bytes.to_vec()),
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to serialize partition expression for table {table_ref}: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            table_partitions.insert(table_ref.to_string(), BytesArray { items });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to allocate partitions for table {} to executor {}: {}",
+                                table_ref.to_string(),
+                                executor_id,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register the allocated partitions in the executor registry so the scheduler knows where they are
+        {
+            let mut executor_partitions = self.executor_registry.partitions.write().await;
+            executor_partitions.insert(
+                executor_id.clone(),
+                table_partitions
                     .iter()
-                    .map(|ds| {
-                        (
-                            TableReference::parse_str(&ds.name),
-                            StringArray { items: vec![] },
-                        )
+                    .map(|(tbl, sa)| {
+                        let exprs = sa
+                            .items
+                            .iter()
+                            .filter_map(|bytes| match Expr::from_bytes(bytes) {
+                                Ok(expr) => Some(expr),
+                                Err(e) => {
+                                    tracing::error!("Failed to deserialize expr: {e}");
+                                    None
+                                }
+                            })
+                            .collect();
+                        (TableReference::parse_str(tbl), exprs)
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut executor_partitions = self.executor_registry.partitions.write().await;
-        executor_partitions.insert(
-            executor_id.clone(),
-            table_partitions
-                .keys()
-                .map(|tbl| (tbl.clone(), vec![]))
-                .collect(),
-        );
+                    .collect(),
+            );
+        }
 
         Ok(Response::new(AllocateInitialPartitionsResponse {
-            table_partitions: table_partitions
-                .into_iter()
-                .map(|(tbl, x)| (tbl.to_string(), x))
-                .collect(),
+            table_partitions,
         }))
     }
 }
 
 fn create_executor_flight_client(
     endpoint: &str,
+    client_tls_config: Option<ClientTlsConfig>,
 ) -> Result<FlightSqlClient, tonic::transport::Error> {
     let executor_address = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         endpoint.to_string()
@@ -603,12 +667,14 @@ fn create_executor_flight_client(
         format!("http://{endpoint}")
     };
 
-    // TODO support for mTLS certificates per executor.
-    let flight_channel = Endpoint::from_shared(executor_address)?.connect_lazy();
+    let mut flight_channel = Endpoint::from_shared(executor_address)?;
+    if let Some(tls_config) = client_tls_config {
+        flight_channel = flight_channel.tls_config(tls_config)?;
+    }
 
     Ok(FlightSqlServiceClient::new_from_inner(
         FlightServiceClient::new(CookieService::new(
-            flight_channel,
+            flight_channel.connect_lazy(),
             Arc::new(CookieStore::new()),
         ))
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
