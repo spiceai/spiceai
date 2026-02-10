@@ -21,7 +21,8 @@ limitations under the License.
 //! supported time column types.
 
 use arrow_schema::SchemaRef;
-use datafusion::logical_expr::{Expr, Operator};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion_common::ScalarValue;
 use snafu::prelude::*;
 use util::timestamp_filter::{data_type_to_timestamp_format, TimestampFilterConvert};
 
@@ -44,6 +45,13 @@ pub enum Error {
         time_column: String,
         /// The unsupported Arrow data type.
         data_type: arrow_schema::DataType,
+    },
+
+    /// The retention filter expression could not be parsed.
+    #[snafu(display("Failed to parse retention filter expression: {detail}"))]
+    ExpressionParse {
+        /// Description of the parse failure.
+        detail: String,
     },
 }
 
@@ -110,10 +118,55 @@ impl TimeRetentionFilterBuilder {
     }
 }
 
+/// Extract column name and threshold from a simplified retention filter expression.
+///
+/// Expects the expression to be a binary comparison of the form
+/// `column >= literal` or `column < literal` (after simplification). Returns
+/// `(column_name, operator, threshold_scalar)` on success.
+///
+/// # Errors
+///
+/// Returns an error if the expression is not a binary comparison between
+/// a column reference and a scalar literal.
+pub(crate) fn extract_retention_column_and_threshold(
+    expr: &Expr,
+) -> Result<(String, Operator, ScalarValue)> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return Err(Error::ExpressionParse {
+            detail: format!("Expected a binary expression for retention filter, got: {expr}"),
+        });
+    };
+
+    let col_name = match left.as_ref() {
+        Expr::Column(c) => c.name.clone(),
+        other => {
+            return Err(Error::ExpressionParse {
+                detail: format!(
+                    "Expected column reference on left side of retention filter, got: {other}"
+                ),
+            });
+        }
+    };
+
+    let threshold = match right.as_ref() {
+        Expr::Literal(scalar, _) => scalar.clone(),
+        other => {
+            return Err(Error::ExpressionParse {
+                detail: format!(
+                    "Expected scalar literal on right side of retention filter, got: {other}"
+                ),
+            });
+        }
+    };
+
+    Ok((col_name, *op, threshold))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::logical_expr::col;
     use std::sync::Arc;
 
     #[test]
@@ -178,6 +231,69 @@ mod tests {
         assert!(
             matches!(err, Error::ColumnNotFound { .. }),
             "expected ColumnNotFound, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_extract_retention_column_and_threshold_lt() {
+        let expr = col("event_time").lt(Expr::Literal(
+            ScalarValue::TimestampNanosecond(Some(1_000_000), None),
+            None,
+        ));
+        let (col_name, op, threshold) =
+            extract_retention_column_and_threshold(&expr).expect("should parse col < literal");
+        assert_eq!(col_name, "event_time");
+        assert_eq!(op, Operator::Lt);
+        assert_eq!(
+            threshold,
+            ScalarValue::TimestampNanosecond(Some(1_000_000), None)
+        );
+    }
+
+    #[test]
+    fn test_extract_retention_column_and_threshold_gte() {
+        let expr = col("ts").gt_eq(Expr::Literal(ScalarValue::Int64(Some(42)), None));
+        let (col_name, op, _threshold) =
+            extract_retention_column_and_threshold(&expr).expect("should parse col >= literal");
+        assert_eq!(col_name, "ts");
+        assert_eq!(op, Operator::GtEq);
+    }
+
+    /// Roundtrip: build a filter via [`TimeRetentionFilterBuilder`],
+    /// simplify it (as the runtime does), then parse it back with
+    /// [`extract_retention_column_and_threshold`].
+    #[test]
+    fn test_roundtrip_build_simplify_parse() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]));
+
+        let builder = TimeRetentionFilterBuilder::try_new("event_time", 3600, &schema)
+            .expect("should create builder");
+
+        // 1. Build the filter (col >= cutoff)
+        let filter = builder.keep_filter();
+
+        // 2. Simplify — mirrors what the runtime does before calling delete_from
+        let simplified =
+            util::expr::simplify_expr(filter, &schema).expect("simplification should succeed");
+
+        // 3. Parse the simplified expression back
+        let (col_name, op, threshold) = extract_retention_column_and_threshold(&simplified)
+            .expect("should parse simplified keep filter");
+
+        assert_eq!(
+            col_name, "event_time",
+            "column name should survive roundtrip"
+        );
+        assert_eq!(op, Operator::GtEq, "keep filter uses >=");
+
+        // The threshold must be a concrete timestamp scalar (now() evaluated away)
+        assert!(
+            matches!(threshold, ScalarValue::TimestampMicrosecond(Some(_), _)),
+            "threshold should be a resolved TimestampMicrosecond, got: {threshold}"
         );
     }
 }
