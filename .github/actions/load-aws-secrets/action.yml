@@ -76,3 +76,14 @@ runs:
         else
           echo "Loaded $PARAM_COUNT secrets from SSM"
         fi
+
+    - name: Clear OIDC credentials
+      shell: bash
+      run: |
+        # Remove temporary AWS credentials so they don't interfere with
+        # other steps that use AWS_ACCESS_KEY_ID/SECRET for different services (e.g. sccache/MinIO)
+        echo "AWS_ACCESS_KEY_ID=" >> "$GITHUB_ENV"
+        echo "AWS_SECRET_ACCESS_KEY=" >> "$GITHUB_ENV"
+        echo "AWS_SESSION_TOKEN=" >> "$GITHUB_ENV"
+        echo "AWS_DEFAULT_REGION=" >> "$GITHUB_ENV"
+        echo "AWS_REGION=" >> "$GITHUB_ENV"
