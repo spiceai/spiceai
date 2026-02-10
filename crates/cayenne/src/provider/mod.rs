@@ -782,7 +782,7 @@ mod tests {
             "{}",
             pretty_format_batches(&pre_batches).expect("format pre-restart results")
         );
-        insta::assert_snapshot!("pre_restart", pre_results);
+        insta::assert_snapshot!("restart_after_upserts_before_restart", pre_results);
 
         // ---- Restart: drop provider, re-open from fresh catalog ----
         drop(provider);
@@ -818,7 +818,7 @@ mod tests {
             "{}",
             pretty_format_batches(&post_batches).expect("format post-restart results")
         );
-        insta::assert_snapshot!("post_restart", post_results);
+        insta::assert_snapshot!("restart_after_upserts_after_restart", post_results);
 
         tracing::info!("✓ Multi-round upsert data survives restart correctly");
     }
