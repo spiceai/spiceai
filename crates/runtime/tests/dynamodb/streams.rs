@@ -1010,7 +1010,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
                 .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
                     table_name, PORT6, access_key, secret_key,
                 ))
-                .with_results_cache(ResultsCache {
+                .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
                 })
