@@ -28,6 +28,7 @@ pub enum Engine {
 
 impl Engine {
     /// Returns the unpartitioned version of the engine. If an engine is not partitioned, it returns itself.
+    #[must_use]
     pub fn to_unpartitioned(&self) -> Engine {
         match self {
             Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => Engine::DuckDB,
