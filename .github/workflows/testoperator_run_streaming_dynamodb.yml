@@ -71,8 +71,14 @@ jobs:
     name: Run DynamoDB streaming benchmark - ${{ github.event.inputs.config_name }}
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 120
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Load secrets from AWS
+        uses: ./.github/actions/load-aws-secrets
 
       - name: Set spicepod path
         id: set_spicepod_path
@@ -148,12 +154,12 @@ jobs:
         env:
           # DynamoDB credentials
           DYNAMODB_AWS_REGION: us-east-1
-          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
-          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ env.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ env.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           # Snapshot storage
           SNAPSHOT_S3_LOCATION: s3://streaming-benchmark-snapshots
-          SNAPSHOT_S3_ACCESS_KEY_ID: ${{ secrets.STREAMING_SNAPSHOT_S3_ACCESS_KEY_ID }}
-          SNAPSHOT_S3_SECRET_ACCESS_KEY: ${{ secrets.STREAMING_SNAPSHOT_S3_SECRET_ACCESS_KEY }}
+          SNAPSHOT_S3_ACCESS_KEY_ID: ${{ env.STREAMING_SNAPSHOT_S3_ACCESS_KEY_ID }}
+          SNAPSHOT_S3_SECRET_ACCESS_KEY: ${{ env.STREAMING_SNAPSHOT_S3_SECRET_ACCESS_KEY }}
           SNAPSHOT_S3_REGION: us-east-1
           # Metrics
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
