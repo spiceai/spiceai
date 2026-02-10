@@ -845,7 +845,9 @@ impl MetadataCatalog for CayenneCatalog {
         // Order matters for crash safety:
         // 1. Clear delete files first - they reference the old snapshot's data
         // 2. Clear insert records - they correspond to the cleared delete files
-        // 3. Update snapshot pointer - commits the new snapshot as active
+        // 3. Clear snapshot sequences - protected snapshots are no longer needed
+        //    after compaction since all data is merged into the new snapshot
+        // 4. Update snapshot pointer - commits the new snapshot as active
         //
         // If interrupted between these, the old snapshot remains active with
         // no delete files, which is safe (just loses the pending deletions,
@@ -854,6 +856,7 @@ impl MetadataCatalog for CayenneCatalog {
             "BEGIN TRANSACTION; \
              DELETE FROM cayenne_delete_file WHERE table_id = {table_id}; \
              DELETE FROM cayenne_insert_record WHERE table_id = {table_id}; \
+             DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id}; \
              UPDATE cayenne_table SET current_snapshot_id = '{new_snapshot_id}' WHERE table_id = {table_id}; \
              COMMIT;"
         );
