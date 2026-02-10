@@ -26,7 +26,7 @@ use crate::cluster::partition::metadata::PartitionValue;
 
 use super::metadata::{PartitionMetadata, TablePartitionMetadata};
 
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to access partition metadata for table {table}: {source}"))]
@@ -236,7 +236,7 @@ impl PartitionManager {
     }
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

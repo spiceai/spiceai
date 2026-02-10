@@ -68,7 +68,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use tonic::{Request, Response, Status, Streaming, transport::Endpoint};
+use tonic::{
+    Request, Response, Status, Streaming,
+    transport::{ClientTlsConfig, Endpoint},
+};
 
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::cluster::partition::PartitionManager;
@@ -561,7 +564,8 @@ impl ClusterService for ClusterServiceImpl {
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
         let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
 
-        match create_executor_flight_client(&executor_id) {
+        let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
+        match create_executor_flight_client(&executor_id, tls_config_opt) {
             Ok(client) => {
                 let mut flight_client_registry =
                     self.executor_registry.flight_sql_clients.write().await;
@@ -655,6 +659,7 @@ impl ClusterService for ClusterServiceImpl {
 
 fn create_executor_flight_client(
     endpoint: &str,
+    client_tls_config: Option<ClientTlsConfig>,
 ) -> Result<FlightSqlClient, tonic::transport::Error> {
     let executor_address = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         endpoint.to_string()
@@ -662,12 +667,14 @@ fn create_executor_flight_client(
         format!("http://{endpoint}")
     };
 
-    // TODO support for mTLS certificates per executor.
-    let flight_channel = Endpoint::from_shared(executor_address)?.connect_lazy();
+    let mut flight_channel = Endpoint::from_shared(executor_address)?;
+    if let Some(tls_config) = client_tls_config {
+        flight_channel = flight_channel.tls_config(tls_config)?
+    }
 
     Ok(FlightSqlServiceClient::new_from_inner(
         FlightServiceClient::new(CookieService::new(
-            flight_channel,
+            flight_channel.connect_lazy(),
             Arc::new(CookieStore::new()),
         ))
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)

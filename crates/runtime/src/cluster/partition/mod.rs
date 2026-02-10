@@ -29,7 +29,7 @@ pub use startup::{
     initialize_partition_metadata,
 };
 
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn update_partitioning_filter_in_refresh_sql(
     current_sql: Option<&str>,
     tbl: &TableReference,

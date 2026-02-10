@@ -64,7 +64,7 @@ use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
-use datafusion::common::{DFSchema, ToDFSchema};
+use datafusion::common::ToDFSchema;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;

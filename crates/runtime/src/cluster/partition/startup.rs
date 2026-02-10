@@ -346,14 +346,15 @@ async fn execute_partition_discovery_query(
 #[must_use]
 pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<PartitionedBy>> {
     let ds = app.datasets.iter().filter_map(|ds| {
-        if let Some(acc) = &ds.acceleration {
-            if !acc.partition_by.is_empty() {
-                return Some((
-                    TableReference::parse_str(&ds.name),
-                    acc.partition_by.clone(),
-                ));
-            }
+        if let Some(acc) = &ds.acceleration
+            && !acc.partition_by.is_empty()
+        {
+            return Some((
+                TableReference::parse_str(&ds.name),
+                acc.partition_by.clone(),
+            ));
         }
+
         None
     });
     let views = app.views.iter().filter_map(|view| {
