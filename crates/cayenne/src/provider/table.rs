@@ -3684,19 +3684,12 @@ impl CayenneTableProvider {
         table_id: i64,
         strategy: &PkDeletionStrategyWithCache,
     ) -> CatalogResult<HashMap<String, i64>> {
-        // Check if there are any pending deletions
-        let has_deletions = match strategy {
-            PkDeletionStrategy::Int64Pk => !deleted_pk_i64.is_empty(),
-            PkDeletionStrategy::RowConverterBased => !deleted_row_keys.is_empty(),
-            PkDeletionStrategy::PositionBased => false, // Per-file deletion vectors don't need protected snapshots
-        };
-
-        if !has_deletions {
-            // No deletions, no protected snapshots needed
+        // Only PK-based strategies support sequence-ordered snapshot protection.
+        // Position-based deletion vectors are per-file and don't need protected snapshots.
+        if strategy.is_position_based() {
             return Ok(HashMap::new());
         }
 
-        // Get all snapshot sequences from catalog
         let snapshot_sequences = catalog.get_all_snapshot_sequences(table_id).await?;
 
         if snapshot_sequences.is_empty() {

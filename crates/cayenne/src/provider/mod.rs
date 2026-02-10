@@ -679,8 +679,8 @@ mod tests {
     ///
     /// Scenario:
     ///   Round 1: insert alice(100), bob(200), clint(300)
-    ///   Round 2: upsert alice(101), bob(201)  — creates delete (seq=1), snapshot A (seq=2)
-    ///   Round 3: upsert clint(301)            — creates delete (seq=3), snapshot B (seq=4)
+    ///   Round 2: upsert alice(101), bob(201)  — creates a delete and new snapshot A
+    ///   Round 3: upsert clint(301)            — creates a delete and new snapshot B
     ///   Restart → should still have exactly 3 rows: alice(101), bob(201), clint(301)
     #[tokio::test]
     async fn test_multi_upsert_rounds_survive_restart() {
