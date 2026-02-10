@@ -48,8 +48,12 @@ runs:
             # Mask the value so it won't appear in logs
             echo "::add-mask::$value"
 
-            # Export as environment variable for subsequent steps
-            echo "$var_name=$value" >> "$GITHUB_ENV"
+            # Export as environment variable for subsequent steps using multiline env-file syntax
+            {
+              echo "$var_name<<EOF"
+              echo "$value"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
 
             PARAM_COUNT=$((PARAM_COUNT + 1))
           done
