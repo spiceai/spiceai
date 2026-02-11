@@ -46,7 +46,11 @@ use crate::metrics_reader::MetricsReader;
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-// TODO: Docs/comment here.
+/// Callback type for when an executor has recieved an update to its partitions (via the control stream).
+///
+/// The handler takes two arguments:
+/// 1. `new_partitions`: A map of dataset names to a list of partition values (as byte vectors) that have been assigned.
+/// 2. `removed_partitions`: A map of dataset names to a list of partition values (as byte vectors) that should be unloaded.
 pub type PartitionUpdateHandler = Arc<
     dyn Fn(
             HashMap<String, Vec<Vec<u8>>>,
@@ -580,7 +584,7 @@ mod tests {
             "executor-1".to_string(),
             None, // no TLS
             None, // no metrics reader
-            Arc::new(RwLock::new(HashMap::new())),
+            None,
         );
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -595,7 +599,7 @@ mod tests {
             "executor-2".to_string(),
             None,
             Some(reader),
-            Arc::new(RwLock::new(HashMap::new())),
+            None,
         );
         assert!(manager.metrics_reader.is_some());
     }
@@ -607,7 +611,7 @@ mod tests {
             "executor-1".to_string(),
             None,
             None,
-            Arc::new(RwLock::new(HashMap::new())),
+            None,
         );
         manager.update_schedulers(vec![]);
         assert!(manager.known_schedulers.is_empty());
@@ -621,7 +625,7 @@ mod tests {
             "executor-1".to_string(),
             None,
             None,
-            Arc::new(RwLock::new(HashMap::new())),
+            None,
         );
         // Should not panic on empty manager
         manager.shutdown();

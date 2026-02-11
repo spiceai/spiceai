@@ -20,18 +20,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use datafusion::sql::TableReference;
 use futures::future::join_all;
+use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_proto::scheduler_control_message::Message as SchedulerControlMessageEnum;
 use runtime_proto::{BytesArray, SchedulerControlMessage, UpdatePartitions};
 use snafu::prelude::*;
 use tokio::time::{MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::Runtime;
 use crate::cluster::executor_registry::{self, ExecutorRegistry};
 use crate::cluster::partition::discovery::table_partition_values;
 use crate::cluster::partition::{
     PartitionManager, PartitionMetadata, PartitionValue, partition_value_to_bytes,
 };
+use crate::datafusion::DataFusion;
+use app::App;
+use tokio::runtime::Handle;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -136,8 +140,9 @@ impl Default for PartitionManagementConfig {
 /// 3. Removing partitions that no longer exist in the source and notifying executors to unload them.
 /// 4. Assigning unassigned partitions to executors.
 pub struct PartitionManagementTask {
-    // TODO: just provide app and DF directly.
-    runtime: Arc<Runtime>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
+    df: Arc<DataFusion>,
+    io_runtime: Handle,
     partition_manager: Arc<PartitionManager>,
     executor_registry: Arc<ExecutorRegistry>,
 
@@ -192,14 +197,18 @@ struct DiscoveryResult {
 
 impl PartitionManagementTask {
     pub fn new(
-        runtime: Arc<Runtime>,
+        app: Arc<RwLock<Option<Arc<App>>>>,
+        df: Arc<DataFusion>,
+        io_runtime: Handle,
         partition_manager: Arc<PartitionManager>,
         executor_registry: Arc<ExecutorRegistry>,
         config: PartitionManagementConfig,
         cancel: CancellationToken,
     ) -> Self {
         Self {
-            runtime,
+            app,
+            df,
+            io_runtime,
             partition_manager,
             executor_registry,
             config,
@@ -338,7 +347,7 @@ impl PartitionManagementTask {
 
             // Discover partitions from source using shared logic from startup.rs
             let source_partitions_list = 'discovery: {
-                let app_ref = self.runtime.app();
+                let app_ref = &self.app;
                 let app_lock = app_ref.read().await;
                 if let Some(app) = app_lock.as_ref() {
                     if let Some(ds) = app.datasets.iter().find(|d| d.name == table_ref.table()) {
@@ -348,7 +357,10 @@ impl PartitionManagementTask {
                                 table_partition_values(
                                     &table_ref,
                                     &acceleration.partition_by,
-                                    &self.runtime,
+                                    &self.df,
+                                    Arc::new(SpiceObjectStoreRegistry::new(
+                                        self.io_runtime.clone(),
+                                    )),
                                 ),
                             )
                             .await
@@ -666,7 +678,7 @@ impl PartitionManagementTask {
         table: &TableReference,
         partitions: Vec<PartitionValue>,
     ) -> Result<()> {
-        let df = self.runtime.datafusion();
+        let df = self.df.clone();
         let mut removed_partitions_map = HashMap::new();
 
         let mut partitions_bytes = Vec::new();
@@ -1009,10 +1021,9 @@ impl PartitionManagementTask {
             .into_iter()
             .map(|(executor_id, assignments)| {
                 let registry = self.executor_registry.clone();
-                let runtime = self.runtime.clone();
+                let df = self.df.clone();
                 async move {
-                    notify_executor_of_assignments(registry, runtime, executor_id, assignments)
-                        .await
+                    notify_executor_of_assignments(registry, df, executor_id, assignments).await
                 }
             })
             .collect();
@@ -1044,7 +1055,7 @@ impl PartitionManagementTask {
 
 async fn notify_executor_of_assignments(
     registry: Arc<ExecutorRegistry>,
-    runtime: Arc<Runtime>,
+    df: Arc<DataFusion>,
     executor_id: String,
     assignments: Vec<Assignment>,
 ) -> Result<()> {
@@ -1056,8 +1067,6 @@ async fn notify_executor_of_assignments(
             .or_default()
             .push(assignment.partition_value);
     }
-
-    let df = runtime.datafusion();
 
     // Send UpdatePartitions command via control stream
     for (table, partition_values) in by_table {

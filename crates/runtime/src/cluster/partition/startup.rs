@@ -25,6 +25,7 @@ use datafusion::{logical_expr::Expr, sql::TableReference};
 use datafusion_proto::bytes::Serializeable;
 use object_store::ObjectStore;
 use object_store::prefix::PrefixStore;
+use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
@@ -100,18 +101,24 @@ pub async fn initialize_partition_metadata(
             continue;
         }
 
-        let partition_values =
-            match discovery::table_partition_values(&table, &partitioning, rt).await {
-                Ok(values) => values,
-                Err(e) => {
-                    tracing::warn!(
-                        table = %table_name,
-                        error = %e,
-                        "Failed to discover partition values, leaving blank metadata"
-                    );
-                    continue;
-                }
-            };
+        let partition_values = match discovery::table_partition_values(
+            &table,
+            &partitioning,
+            &rt.datafusion(),
+            Arc::new(SpiceObjectStoreRegistry::new(rt.tokio_io_runtime())),
+        )
+        .await
+        {
+            Ok(values) => values,
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_name,
+                    error = %e,
+                    "Failed to discover partition values, leaving blank metadata"
+                );
+                continue;
+            }
+        };
 
         match partition_manager
             .set_unassigned_partitions(&table, partition_values)

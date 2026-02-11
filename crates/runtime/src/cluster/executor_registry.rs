@@ -39,7 +39,7 @@ use crate::accelerated_table::AcceleratedTable;
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to send metrics request to executor {executor_id}: channel closed"))]
+    #[snafu(display("Failed to send control message to executor {executor_id}: channel closed"))]
     SendFailed { executor_id: String },
 
     #[snafu(display("Failed to receive metrics response from executor {executor_id}: {reason}"))]
@@ -197,7 +197,6 @@ impl ExecutorRegistry {
                 .request_tx
                 .send(command)
                 .await
-                // TODO: these errors are only about metrics. See snafu: "Failed to send metrics request to executor {executor_id}: channel closed"
                 .map_err(|_| Error::SendFailed {
                     executor_id: executor_id.to_string(),
                 })?;

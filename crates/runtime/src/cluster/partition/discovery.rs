@@ -17,20 +17,20 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
-    Runtime,
     accelerated_table::AcceleratedTable,
     cluster::partition::{
         Error, PartitionDiscoverySnafu, RegisterTableSnafu, Result, RuntimeEnvBuildSnafu,
         metadata::PartitionValue,
     },
+    datafusion::DataFusion,
 };
 use datafusion::{
-    execution::{SessionStateBuilder, runtime_env::RuntimeEnvBuilder},
+    execution::{
+        SessionStateBuilder, object_store::ObjectStoreRegistry, runtime_env::RuntimeEnvBuilder,
+    },
     prelude::SessionContext,
     sql::TableReference,
 };
-use object_store::ObjectStore;
-use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 
@@ -40,7 +40,8 @@ use spicepod::partitioning::PartitionedBy;
 pub async fn table_partition_values(
     table: &TableReference,
     partitioning: &[PartitionedBy],
-    rt: &Arc<Runtime>,
+    df: &Arc<DataFusion>,
+    object_store_registry: Arc<dyn ObjectStoreRegistry>,
 ) -> Result<Vec<PartitionValue>> {
     let table_name = table.to_string();
 
@@ -68,7 +69,7 @@ pub async fn table_partition_values(
         "Querying for partition values"
     );
 
-    let batches = execute_partition_discovery_query(rt, table, &sql).await?;
+    let batches = execute_partition_discovery_query(df, object_store_registry, table, &sql).await?;
 
     // Convert record batches to partition value strings
     let mut partition_values = Vec::new();
@@ -112,7 +113,8 @@ pub async fn table_partition_values(
 /// to query the *federated* table (the source) rather than the accelerated table itself, as the
 /// acceleration will be empty (for schedulers).
 async fn execute_partition_discovery_query(
-    rt: &Arc<Runtime>,
+    df: &Arc<DataFusion>,
+    object_store_registry: Arc<dyn ObjectStoreRegistry>,
     table: &TableReference,
     sql: &str,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>> {
@@ -120,12 +122,12 @@ async fn execute_partition_discovery_query(
 
     // Wait for table to be registered.
     // TODO: we should call `initialize_partition_metadata` after all datasets registered.
-    if !wait_for_table(table, rt).await {
+    if !wait_for_table(table, df).await {
         return Err(Error::TableRegistrationTimeout { table: table_name });
     }
 
     // Must get table source of `AcceleratedTable` to get true value of partition.
-    let Some(acc) = rt.datafusion().get_table(table).await.and_then(|t| {
+    let Some(acc) = df.get_table(table).await.and_then(|t| {
         t.as_any()
             .downcast_ref::<AcceleratedTable>()
             .map(AcceleratedTable::get_federated_table)
@@ -139,9 +141,7 @@ async fn execute_partition_discovery_query(
         SessionStateBuilder::default()
             .with_runtime_env(
                 RuntimeEnvBuilder::default()
-                    .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(
-                        rt.tokio_io_runtime(),
-                    )))
+                    .with_object_store_registry(object_store_registry)
                     .build_arc()
                     .context(RuntimeEnvBuildSnafu)?,
             )
@@ -169,9 +169,9 @@ async fn execute_partition_discovery_query(
 }
 
 /// Wait for the [`TableReference`] to be registered in Runtime.
-async fn wait_for_table(table: &TableReference, rt: &Arc<Runtime>) -> bool {
+async fn wait_for_table(table: &TableReference, df: &Arc<DataFusion>) -> bool {
     for _ in 0..5 {
-        if rt.datafusion().table_exists(table.clone()) {
+        if df.table_exists(table.clone()) {
             return true;
         }
         let () = tokio::time::sleep(Duration::from_secs(1)).await;
