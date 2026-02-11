@@ -20,8 +20,9 @@ use crate::{
     accelerated_table::{DataRetentionFilter, Retention, refresh},
     component::dataset::TimeFormat,
     datafusion::{
-        builder::get_df_default_config, expr_utils::simplify_expr,
-        filter_converter::TimestampFilterConvert, is_spice_internal_dataset,
+        builder::get_df_default_config,
+        filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert},
+        is_spice_internal_dataset,
     },
 };
 use arrow::array::UInt64Array;
@@ -119,7 +120,7 @@ impl super::AcceleratedTable {
 
                 tracing::trace!("[retention] Expr before simplification: {expr:?}");
 
-                let expr = match simplify_expr(expr.clone(), &accelerator.schema()) {
+                let expr = match util::expr::simplify_expr(expr.clone(), &accelerator.schema()) {
                     Ok(simplified) => simplified,
                     Err(e) => {
                         tracing::error!(
@@ -194,7 +195,7 @@ fn create_timestamp_filter_converter(
                 .map(|(_, f)| f)
         });
 
-    TimestampFilterConvert::create(
+    create_timestamp_filter_convert(
         field.cloned(),
         Some(time_column.to_string()),
         time_format,

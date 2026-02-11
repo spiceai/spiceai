@@ -24,6 +24,7 @@ use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_i
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
+use crate::datafusion::filter_converter::create_timestamp_filter_convert;
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
 use crate::datafusion::schema::BaseSchema;
@@ -1014,7 +1015,7 @@ impl RefreshTask {
             .map(|(_, f)| f)
             .cloned();
 
-        TimestampFilterConvert::create(
+        create_timestamp_filter_convert(
             field,
             refresh.time_column.clone(),
             refresh.time_format,
