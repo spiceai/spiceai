@@ -316,7 +316,7 @@ fn parse_repo(repo: Option<&str>) -> (&str, &str) {
 }
 
 /// Trigger a GitHub workflow for a specific config using Octocrab.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn trigger_workflow(
     octo: &Octocrab,
     workflow: &str,
