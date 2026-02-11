@@ -369,6 +369,29 @@ impl MetastoreBackend for SqliteMetastore {
             },
         )?;
 
+        // Validate that existing tables match the expected schema.
+        // This catches incompatible metadata databases from previous versions.
+        let validate_conn = self.get_conn().await?;
+        super::validate_existing_schema(|table_name| {
+            let conn = validate_conn.clone();
+            async move {
+                conn.call(move |conn| {
+                    let mut stmt = conn.prepare(&format!("PRAGMA table_info('{table_name}')"))?;
+                    let columns: Vec<String> = stmt
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<Vec<String>, rusqlite::Error>(columns)
+                })
+                .await
+                .map_err(
+                    |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                        message: format!("Failed to read table schema for validation: {e}"),
+                    },
+                )
+            }
+        })
+        .await?;
+
         Ok(())
     }
 
