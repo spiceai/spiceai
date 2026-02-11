@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Runtime;
 use crate::cluster::executor_registry::{self, ExecutorRegistry};
-use crate::cluster::partition::startup::table_partition_values;
+use crate::cluster::partition::discovery::table_partition_values;
 use crate::cluster::partition::{
     PartitionManager, PartitionMetadata, PartitionValue, partition_value_to_bytes,
 };
@@ -130,7 +130,13 @@ impl Default for PartitionManagementConfig {
     }
 }
 
+/// Background task responsible for managing the assignment of accelerated table partitions to executors. Responsible for
+/// 1. Discovering new partition values from tables that are accelerated (by querying the underlying source).
+/// 2. Adding new partitions to the partition metadata (initially unassigned).
+/// 3. Removing partitions that no longer exist in the source and notifying executors to unload them.
+/// 4. Assigning unassigned partitions to executors.
 pub struct PartitionManagementTask {
+    // TODO: just provide app and DF directly.
     runtime: Arc<Runtime>,
     partition_manager: Arc<PartitionManager>,
     executor_registry: Arc<ExecutorRegistry>,
@@ -159,7 +165,6 @@ struct ExecutorInfo {
 struct UnassignedPartition {
     table: TableReference,
     partition_value: PartitionValue,
-    priority: u32,
 }
 
 struct Assignment {
@@ -223,8 +228,6 @@ impl PartitionManagementTask {
                     }
 
                     let cycle_duration = cycle_start.elapsed();
-                    // record_cycle_duration(cycle_duration); // TODO: Add metrics
-
                     if cycle_duration > self.config.interval {
                         tracing::warn!(
                             duration_ms = cycle_duration.as_millis(),
@@ -239,38 +242,31 @@ impl PartitionManagementTask {
         Ok(())
     }
 
+    /// Underlying logic for a single management cycle.
     async fn run_management_cycle(&self) -> Result<()> {
-        // Step 1: Refresh state
         let state = self.refresh_state().await?;
 
-        // Step 2: Discover partition changes
         let discovery_result = self.discover_and_sync_partitions(&state).await?;
 
-        // Step 3: Add new partitions (adds them as unassigned)
         if !discovery_result.new_partitions.is_empty() {
             self.add_new_partitions(discovery_result.new_partitions)
                 .await?;
         }
 
-        // Step 4: Remove stale partitions & notify executors
         if !discovery_result.removed_partitions.is_empty() {
             self.remove_stale_partitions(discovery_result.removed_partitions)
                 .await?;
         }
 
-        // Step 5: Find unassigned partitions (now includes newly added ones)
         let unassigned = self.find_unassigned_partitions(&state).await?;
 
-        // Step 6: Assign partitions if any exist
         if !unassigned.is_empty() {
             let assignments = self
                 .assign_unassigned_partitions(unassigned, &state)
                 .await?;
 
-            // Step 7: Commit assignments to metadata
             let commit_result = self.commit_assignments(assignments).await?;
 
-            // Step 8: Notify executors
             self.notify_executors(commit_result.committed).await?;
         }
 
@@ -687,19 +683,18 @@ impl PartitionManagementTask {
             },
         );
 
-        let update_message = UpdatePartitions {
-            new_partitions: HashMap::new(),
-            removed_partitions: removed_partitions_map,
-        };
-
-        let command = SchedulerControlMessage {
-            message: Some(SchedulerControlMessageEnum::UpdatePartitions(
-                update_message,
-            )),
-        };
-
         self.executor_registry
-            .send_command(executor_id, command)
+            .send_command(
+                executor_id,
+                SchedulerControlMessage {
+                    message: Some(SchedulerControlMessageEnum::UpdatePartitions(
+                        UpdatePartitions {
+                            new_partitions: HashMap::new(),
+                            removed_partitions: removed_partitions_map,
+                        },
+                    )),
+                },
+            )
             .await
             .context(SendCommandSnafu {
                 executor_id: executor_id.to_string(),
@@ -717,22 +712,21 @@ impl PartitionManagementTask {
         for table_name in &state.tables {
             let table_ref = TableReference::parse_str(table_name);
 
-            let metadata = if let Some(m) = self.partition_manager.get_cached_table_metadata(&table_ref) { m } else {
-                tracing::warn!(table = %table_name, "No cached metadata, skipping");
-                continue;
-            };
+            let metadata =
+                if let Some(m) = self.partition_manager.get_cached_table_metadata(&table_ref) {
+                    m
+                } else {
+                    tracing::warn!(table = %table_name, "No cached metadata, skipping");
+                    continue;
+                };
 
             for partition in metadata.unassigned_partitions() {
                 unassigned.push(UnassignedPartition {
                     table: table_ref.clone(),
                     partition_value: partition.partition_value.clone(),
-                    priority: calculate_priority(&table_ref, partition),
                 });
             }
         }
-
-        // Sort by priority (higher first)
-        unassigned.sort_by_key(|p| std::cmp::Reverse(p.priority));
 
         tracing::info!(
             unassigned_count = unassigned.len(),
@@ -770,7 +764,10 @@ impl PartitionManagementTask {
             // Select best executor for this partition
             let executor = if let Some(e) = self
                 .select_executor_for_partition(&unassigned_partition, &executor_loads, state)
-                .await? { e } else {
+                .await?
+            {
+                e
+            } else {
                 tracing::warn!(
                     table = %unassigned_partition.table,
                     partition = ?unassigned_partition.partition_value,
@@ -875,6 +872,9 @@ impl PartitionManagementTask {
             .map(|(executor, _)| (*executor).clone()))
     }
 
+    // Simple scoring function that considers:
+    // 1. Data locality (if executor already has partitions for this table)
+    // 2. Current load (number of partitions assigned) for load balancing
     fn score_executor_for_partition(
         &self,
         executor: &ExecutorInfo,
@@ -888,19 +888,16 @@ impl PartitionManagementTask {
 
         let mut score = 100.0;
 
-        // 1. Prefer executors already serving this table (data locality)
+        // Data locality
         let table_name = partition.table.to_string();
         if load.tables.contains(&table_name) {
             score += 50.0;
         }
 
-        // 2. Load balancing: penalize executors with more partitions
+        // Load balancing
         let load_factor =
             load.partition_count as f64 / self.config.max_partitions_per_executor as f64;
         score -= load_factor * 40.0;
-
-        // 3. Prefer executors with more available slots (not available yet)
-        // score += (executor.available_slots as f64 / 100.0) * 20.0;
 
         score.max(0.0)
     }
@@ -1099,14 +1096,6 @@ async fn notify_executor_of_assignments(
     }
 
     Ok(())
-}
-
-fn calculate_priority(_table: &TableReference, _partition: &PartitionMetadata) -> u32 {
-    
-    // Future implementation:
-    // Prioritize older partitions (FIFO)
-    // Boost priority for tables with queries waiting
-    100u32
 }
 
 fn now_ms() -> u128 {
