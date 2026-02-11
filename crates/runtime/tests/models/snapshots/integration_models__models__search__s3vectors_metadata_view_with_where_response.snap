@@ -16,7 +16,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 1015
       },
-      "score": 0.28
+      "_score": 0.28
     },
     {
       "dataset": "qs_view",
@@ -28,7 +28,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 821
       },
-      "score": 0.24
+      "_score": 0.24
     },
     {
       "dataset": "qs_view",
@@ -40,7 +40,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 449
       },
-      "score": 0.23
+      "_score": 0.23
     },
     {
       "dataset": "qs_view",
@@ -52,7 +52,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 1193
       },
-      "score": 0.2
+      "_score": 0.2
     }
   ]
 }

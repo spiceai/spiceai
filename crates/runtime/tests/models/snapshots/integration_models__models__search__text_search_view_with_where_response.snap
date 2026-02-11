@@ -15,7 +15,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 890
       },
-      "score": 7.521658420562744
+      "_score": 7.521658420562744
     }
   ]
 }

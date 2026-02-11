@@ -20,7 +20,7 @@ snapshot_kind: text
       "primary_key": {
         "i_item_sk": 19
       },
-      "score": 0.99
+      "_score": 0.99
     },
     {
       "data": {
@@ -36,7 +36,7 @@ snapshot_kind: text
       "primary_key": {
         "i_item_sk": 7
       },
-      "score": 0.98
+      "_score": 0.98
     }
   ]
 }

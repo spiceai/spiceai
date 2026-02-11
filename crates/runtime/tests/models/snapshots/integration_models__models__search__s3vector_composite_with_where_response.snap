@@ -17,7 +17,7 @@ snapshot_kind: text
         "id": 863,
         "question": "What is created by making a choice?"
       },
-      "score": 0.87
+      "_score": 0.87
     },
     {
       "dataset": "qs",
@@ -30,7 +30,7 @@ snapshot_kind: text
         "id": 6,
         "question": "<refined question>"
       },
-      "score": 0.82
+      "_score": 0.82
     }
   ]
 }

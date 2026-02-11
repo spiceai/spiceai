@@ -15,7 +15,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 11
       },
-      "score": 0.6104534802776935
+      "_score": 0.6104534802776935
     },
     {
       "dataset": "spice.public.cached_search_bypass",
@@ -27,7 +27,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 8
       },
-      "score": 0.598324036315461
+      "_score": 0.598324036315461
     }
   ]
 }

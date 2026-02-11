@@ -15,7 +15,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
       },
-      "score": 0.01639344262295082
+      "_score": 0.01639344262295082
     },
     {
       "dataset": "qs",
@@ -27,7 +27,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "answer": "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\)."
       },
-      "score": 0.01639344262295082
+      "_score": 0.01639344262295082
     },
     {
       "dataset": "qs",
@@ -39,7 +39,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\)."
       },
-      "score": 0.016129032258064516
+      "_score": 0.016129032258064516
     }
   ]
 }
