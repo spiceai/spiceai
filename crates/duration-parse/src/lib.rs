@@ -104,8 +104,7 @@ pub fn parse_duration(input: &str) -> Result<Duration, ParseError> {
     let (input, _positive) = if let Some(rest) = input.strip_prefix('+') {
         (rest, true)
     } else if input.strip_prefix('-').is_some() {
-        // We parse negative but return zero-clamped since std::time::Duration can't be negative.
-        // Match fundu behavior: negative durations without allow_negative return error.
+        // Negative durations are rejected since std::time::Duration can't represent them.
         return Err(ParseError::invalid_input(
             "Negative durations are not supported",
         ));
