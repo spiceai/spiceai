@@ -125,10 +125,8 @@ pub async fn start_scheduler_registry(
     cancel: CancellationToken,
     peers: Arc<RwLock<SchedulerPeers>>,
 ) -> Result<()> {
-    let state_url = Url::parse(&config.state_location).context(InvalidStateLocationSnafu {
-        location: config.state_location.clone(),
-    })?;
-    let (store, base_prefix) = build_object_store(rt.as_ref(), &state_url, config).await?;
+    let (store, base_prefix) =
+        build_object_store(rt.as_ref(), &config.state_location, config).await?;
 
     let datafusion = rt.datafusion();
     let advertise_host = datafusion
@@ -399,11 +397,14 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     ]
 });
 
-async fn build_object_store(
+pub(super) async fn build_object_store(
     rt: &Runtime,
-    url: &Url,
+    state_location: &str,
     config: &SchedulerConfig,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
+    let url = Url::parse(state_location).context(InvalidStateLocationSnafu {
+        location: state_location,
+    })?;
     let base_prefix = url.path().trim_matches('/').to_string();
     let io_runtime = rt.tokio_io_runtime();
 
@@ -414,7 +415,7 @@ async fn build_object_store(
             .map(spicepod::param::Params::as_string_map);
         let s3_params = build_s3_parameters(rt.secrets(), params.as_ref()).await;
 
-        S3ObjectStoreBuilder::from_url(url, io_runtime)
+        S3ObjectStoreBuilder::from_url(&url, io_runtime)
             .context(S3ObjectStoreInitSnafu {
                 location: url.to_string(),
             })?
@@ -429,7 +430,7 @@ async fn build_object_store(
             })?
     } else {
         SpiceObjectStoreRegistry::new(io_runtime)
-            .get_store(url)
+            .get_store(&url)
             .context(ObjectStoreInitSnafu {
                 location: url.to_string(),
             })?

@@ -126,6 +126,7 @@ where
             Err(ObjectStoreError::AlreadyExists { .. }) => Ok(InsertResult::AlreadyExists),
             Err(source) => Err(Error::ObjectStore {
                 key: key.to_string(),
+                operation: "insert",
                 source,
             }),
         }
@@ -171,6 +172,7 @@ where
                 // Conflict - fetch the current value
                 let current = self.get(key).await?.ok_or_else(|| Error::ObjectStore {
                     key: key.to_string(),
+                    operation: "get",
                     source: ObjectStoreError::NotFound {
                         path: path.to_string(),
                         source: "Object deleted during update".into(),
@@ -180,6 +182,7 @@ where
             }
             Err(source) => Err(Error::ObjectStore {
                 key: key.to_string(),
+                operation: "update",
                 source,
             }),
         }
@@ -234,18 +237,21 @@ where
             }
             Err(source) => {
                 return Err(Error::ObjectStore {
+                    operation: "get",
                     key: key.to_string(),
                     source,
                 });
             }
         };
-
         let version = UpdateVersion {
             e_tag: result.meta.e_tag.clone(),
             version: result.meta.version.clone(),
         };
+        let bytes = result.bytes().await.context(ObjectStoreSnafu {
+            key,
+            operation: "get",
+        })?;
 
-        let bytes = result.bytes().await.context(ObjectStoreSnafu { key })?;
         let value: T = serde_json::from_slice(&bytes).context(DeserializationSnafu { key })?;
 
         self.update_cache(key, value.clone(), version.clone());
@@ -288,6 +294,7 @@ where
         while let Some(entry) = stream.next().await {
             let meta = entry.map_err(|source| Error::ObjectStore {
                 key: String::new(),
+                operation: "list",
                 source,
             })?;
 

@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
+use crate::cluster::partition::executor_request_initial_partitions;
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
@@ -25,7 +26,6 @@ use crate::{
     CLUSTER_INTERNAL_SERVER, CLUSTER_SCHEDULER_REGISTRY, FailedToStartClusterExecutorSnafu,
     FailedToStartClusterSchedulerSnafu, LogErrors, Runtime, UnableToStartClusterServerSnafu,
 };
-use ::datafusion::error::DataFusionError;
 use ::datafusion::execution::SessionStateBuilder;
 use ::datafusion::prelude::SessionConfig;
 use ::datafusion::sql::TableReference;
@@ -52,14 +52,11 @@ use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_expr::Expr;
-use datafusion_proto::bytes::Serializeable;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
-use runtime_proto::{
-    AllocateInitialPartitionsRequest, GetAppDefinitionRequest, GetSchedulersRequest,
-};
+use runtime_proto::{GetAppDefinitionRequest, GetSchedulersRequest};
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
@@ -90,8 +87,17 @@ pub enum DistributedNode {
 
         /// Registry of connected executors for `FlightSQL`.
         executor_registry: Arc<ExecutorRegistry>,
+
+        /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
+        partition_manager: Arc<RwLock<Option<Arc<PartitionManager>>>>,
     },
-    Executor,
+    Executor {
+        /// Partition assignments for this runtime (executor) for each table.
+        ///
+        /// This is populated during startup when the executor registers with the scheduler.
+        /// It contains the list of partition filters (expressions) that this executor is responsible for.
+        partition_assignments: Arc<RwLock<HashMap<TableReference, Vec<Expr>>>>,
+    },
 }
 
 impl DistributedNode {
@@ -102,7 +108,7 @@ impl DistributedNode {
 
     #[must_use]
     pub fn is_executor(&self) -> bool {
-        matches!(self, DistributedNode::Executor)
+        matches!(self, DistributedNode::Executor { .. })
     }
 }
 
@@ -385,12 +391,14 @@ mod control_stream_client;
 pub mod datafusion;
 mod executor_registry;
 pub mod metrics_collector;
+pub mod partition;
 mod scheduler_registry;
 mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
 pub use executor_registry::ExecutorRegistry;
+pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -791,6 +799,27 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         let app = rt.app.read().await;
         let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
         if let Some(config) = config {
+            // Initialize partition manager with the configured object store
+            match partition::build_partition_metadata_store(rt, &config).await {
+                Ok(store) => {
+                    let partition_manager = Arc::new(PartitionManager::new(store));
+                    rt.set_partition_manager(Arc::clone(&partition_manager))
+                        .await;
+
+                    // Initialize partition metadata for all accelerated tables
+                    if let Err(err) =
+                        partition::initialize_partition_metadata(rt, &partition_manager).await
+                    {
+                        tracing::warn!(
+                            "Failed to initialize partition metadata during scheduler startup: {err}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("Failed to build partition metadata store: {err}");
+                }
+            }
+
             let registry_shutdown = CancellationToken::new();
             let registry_shutdown_for_task = registry_shutdown.clone();
             let peers = Arc::clone(&scheduler_peers);
@@ -1224,31 +1253,21 @@ pub async fn initialize_cluster_executor(
         // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
         //
         // This must be done after executor's flight service is ready to accept connections. Otherwise the scheduler will attempt to make connection and fail. Waiting until after `rx_ready` (which is done after the executor has established a network connection to the Scheduler's control plane), should give enough time for executor to bind locally for flight.
-        let _ = cluster_client
-            .allocate_initial_partitions(AllocateInitialPartitionsRequest {
-                executor_id: rt.datafusion().cluster_config.node_advertise_url(),
-            })
-            .await
-            .map_err(|status| FailedToStartClusterExecutor {
-                source: format!("Failed to allocate initial partitions from scheduler: {status}")
-                    .into(),
-            })?
-            .into_inner()
-            .table_partitions
-            .into_iter()
-            .map(|(table_id, partitions)| {
-                Ok((
-                    TableReference::parse_str(&table_id),
-                    partitions
-                        .items
-                        .into_iter()
-                        .map(|e| Expr::from_bytes(&e.into_bytes()))
-                        .collect::<Result<Vec<Expr>, _>>()?,
-                ))
-            })
-            .collect::<Result<HashMap<TableReference, Vec<Expr>>, DataFusionError>>()
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
+        let initial_partitions = executor_request_initial_partitions(
+            cluster_client.clone(),
+            rt.datafusion().cluster_config.node_advertise_url(),
+        )
+        .await
+        .map_err(|status| FailedToStartClusterExecutor {
+            source: format!("Failed to allocate initial partitions from scheduler: {status}")
+                .into(),
+        })?;
+        tracing::debug!(
+            "For executor={:?}, initial accelerated table partitions={:?}",
+            rt.datafusion().cluster_config.node_advertise_url(),
+            initial_partitions.clone()
+        );
+        rt.set_partition_assignments(initial_partitions).await;
 
         // Bind the already-fetched app and initialize secrets for object store configuration
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
@@ -1596,6 +1615,7 @@ async fn executor_bind_app(
     rt.load_embeddings().await;
     Arc::clone(rt).load_models().await;
     Arc::clone(rt).load_tools().await;
+    Arc::clone(rt).load_datasets().await;
 
     Ok(())
 }

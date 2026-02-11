@@ -34,12 +34,13 @@ use tools::factory::{ToolFactory, default_catalog_names};
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
+use crate::cluster::partition::update_partitioning_filter_in_refresh_sql;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::datafusion::{DataFusion, resolved_equality};
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
 use crate::{
-    auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
-    internal_table::Error as InternalTableError,
+    auth::EndpointAuth, dataconnector::DataConnector, internal_table::Error as InternalTableError,
 };
 
 use ::datafusion::error::DataFusionError;
@@ -75,7 +76,7 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
-use crate::cluster::{DistributedNode, SchedulerPeers};
+use crate::cluster::{DistributedNode, PartitionManager, SchedulerPeers};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 pub mod accelerated_table;
@@ -137,6 +138,8 @@ mod tracing_util;
 mod udtfs;
 mod view;
 mod worker;
+
+pub type PartitionAssignments = HashMap<TableReference, Vec<::datafusion::logical_expr::Expr>>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -441,6 +444,9 @@ pub enum Error {
     FailedToRegisterScheduler {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Failed to convert partition expression to SQL: {source}"))]
+    UnableToConvertPartitionExpr { source: DataFusionError },
 }
 
 const CLUSTER_EXECUTOR: &str = "cluster_executor";
@@ -595,6 +601,155 @@ impl Runtime {
         }
     }
 
+    #[must_use]
+    pub fn partition_assignments(&self) -> Option<Arc<RwLock<PartitionAssignments>>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Executor {
+                partition_assignments,
+            }) => Some(Arc::clone(partition_assignments)),
+            _ => None,
+        }
+    }
+
+    pub async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
+        if let Some(DistributedNode::Executor {
+            partition_assignments,
+        }) = self.distributed.as_ref()
+        {
+            let mut guard = partition_assignments.write().await;
+            guard.clone_from(&assignments);
+            drop(guard); // drop lock before updating tables
+
+            // Update all assigned tables
+            for table in assignments.keys() {
+                if let Err(e) = self
+                    .update_partition_refresh_sql(table.clone(), &assignments)
+                    .await
+                {
+                    tracing::warn!("Failed to update partition refresh SQL for {table}: {e}");
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Attempted to set partition assignments on a non-executor node. Ignoring."
+            );
+        }
+    }
+
+    async fn update_partition_refresh_sql(
+        &self,
+        table: TableReference,
+        assignments: &PartitionAssignments,
+    ) -> Result<()> {
+        // Re-construct the refresh SQL with the new partitions
+        // 1. Get the dataset to find the base refresh SQL
+        let (dataset_component, app_arc) = {
+            let app_lock = self.app.read().await;
+            let Some(app_arc) = app_lock.as_ref() else {
+                tracing::debug!("App not initialized when updating partitions for {table}");
+                return Ok(());
+            };
+
+            let Some(ds) = app_arc
+                .datasets
+                .iter()
+                .find(|ds| resolved_equality(ds.name.clone().into(), table.clone()))
+            else {
+                tracing::debug!("Dataset {table} not found in App when updating partitions");
+                return Ok(());
+            };
+            (ds.clone(), Arc::clone(app_arc))
+        };
+
+        let Ok(dataset) =
+            crate::component::dataset::builder::DatasetBuilder::try_from(dataset_component)
+                .and_then(|mut b| {
+                    b = b.with_app(app_arc);
+                    b.with_runtime(Arc::new(self.clone())).build().context(
+                        UnableToBuildDatasetSnafu {
+                            dataset: table.to_string(),
+                        },
+                    )
+                })
+        else {
+            tracing::warn!("Failed to build dataset {table} when updating partitions");
+            return Ok(());
+        };
+
+        // 2. Construct the new SQL
+        let new_sql = update_partitioning_filter_in_refresh_sql(
+            dataset
+                .acceleration
+                .as_ref()
+                .and_then(|a| a.refresh_sql.as_deref()),
+            &table,
+            assignments,
+        )
+        .context(UnableToConvertPartitionExprSnafu)?;
+
+        // 3. Update the AcceleratedTable
+        if let Err(e) = self
+            .datafusion()
+            .update_refresh_sql(table.clone(), new_sql)
+            .await
+        {
+            tracing::error!("Failed to update refresh SQL for {table}: {e}");
+        } else {
+            tracing::info!("Updated partition assignments for {table}");
+            // Trigger a refresh to load the data for the new partitions
+            if let Err(e) = self.datafusion().refresh_table(&table, None).await {
+                tracing::warn!(
+                    "Failed to trigger refresh for {table} after updating partitions: {e}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the partition manager for accelerated table partition metadata (scheduler only).
+    ///
+    /// This uses `try_read()` to avoid blocking the caller. If another thread holds
+    /// a write lock (e.g., during initialization), this returns `None`.
+    #[must_use]
+    pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                partition_manager, ..
+            }) => {
+                if let Ok(guard) = partition_manager.try_read() {
+                    guard.clone()
+                } else {
+                    tracing::debug!(
+                        "Partition manager is currently being initialized. Returning None."
+                    );
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Sets the partition manager for accelerated table partition metadata.
+    pub async fn set_partition_manager(&self, manager: Arc<PartitionManager>) {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                partition_manager, ..
+            }) => {
+                let mut guard = partition_manager.write().await;
+                *guard = Some(manager);
+            }
+            Some(DistributedNode::Executor { .. }) => {
+                tracing::warn!("Attempted to set partition manager on an executor node. Ignoring.");
+            }
+            None => {
+                tracing::warn!(
+                    "Attempted to set partition manager on a non-cluster runtime. Ignoring."
+                );
+            }
+        }
+    }
+
     /// Returns the metrics reader for on-demand OTLP metrics collection.
     ///
     /// This is used in cluster mode by:
@@ -625,7 +780,7 @@ impl Runtime {
                     None
                 }
             }
-            None | Some(DistributedNode::Executor) => None,
+            None | Some(DistributedNode::Executor { .. }) => None,
         }
     }
 
@@ -636,7 +791,7 @@ impl Runtime {
                 let mut guard = job_executor.write().await;
                 *guard = Some(executor);
             }
-            Some(DistributedNode::Executor) => {
+            Some(DistributedNode::Executor { .. }) => {
                 tracing::warn!(
                     "Attempted to set job executor on an executor node. This should only be set on the scheduler. Ignoring."
                 );
@@ -785,7 +940,7 @@ impl Runtime {
                     )),
                 )
             }
-            Some(DistributedNode::Executor) => {
+            Some(DistributedNode::Executor { .. }) => {
                 let executor_shutdown = CancellationToken::new();
                 let executor_fut = cluster::initialize_cluster_executor(
                     Arc::clone(&self),

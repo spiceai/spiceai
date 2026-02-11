@@ -348,6 +348,59 @@ impl MetastoreBackend for TursoMetastore {
             )
             .await;
 
+        // Validate that existing tables match the expected schema.
+        // This catches incompatible metadata databases from previous versions.
+        // We query table_info for each expected table using a fresh connection per table
+        // since turso::Connection is not Clone.
+        for expected in super::EXPECTED_TABLES {
+            let table_conn = self.get_conn().await?;
+            let mut rows = table_conn
+                .query(&format!("PRAGMA table_info('{}')", expected.name), ())
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to read table schema for validation: {e}"),
+                })?;
+
+            let mut actual_columns = Vec::new();
+            loop {
+                match rows.next().await {
+                    Ok(Some(row)) => {
+                        // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+                        // Column name is at index 1.
+                        if let Ok(turso::Value::Text(name)) = row.get_value(1) {
+                            actual_columns.push(name);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(CatalogError::Database {
+                            message: format!("Failed to read table schema for validation: {e}"),
+                        });
+                    }
+                }
+            }
+
+            // Skip validation for freshly created tables (no columns = table didn't exist before).
+            if actual_columns.is_empty() {
+                continue;
+            }
+
+            let expected_columns: Vec<&str> = expected.columns.to_vec();
+            let actual_refs: Vec<&str> = actual_columns.iter().map(String::as_str).collect();
+
+            if expected_columns != actual_refs {
+                tracing::debug!(
+                    "Cayenne schema mismatch for '{}': expected columns [{}], found [{}]",
+                    expected.name,
+                    expected_columns.join(", "),
+                    actual_refs.join(", ")
+                );
+                return Err(CatalogError::SchemaMismatch {
+                    table: expected.name.to_string(),
+                });
+            }
+        }
+
         Ok(())
     }
 

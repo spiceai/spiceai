@@ -805,7 +805,7 @@ fn error_to_response(error: &crate::jobs::Error) -> Response {
     use crate::jobs::Error;
 
     match error {
-        Error::JobNotFound { .. } | Error::ChunkNotFound { .. } => (
+        Error::JobNotFound { .. } | Error::ChunkNotFound { .. } | Error::NoRowsReturned { .. } => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": error.to_string()})),
         )

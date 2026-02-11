@@ -20,11 +20,6 @@ on:
         required: true
         default: '0.01'
         type: string
-      ingestion_timeout:
-        description: 'Timeout in seconds to wait for ingestion'
-        required: true
-        default: '600'
-        type: string
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -119,7 +114,6 @@ jobs:
             -p ./test/spicepods/streaming/dynamodb \
             --queryset ${{ github.event.inputs.queryset }} \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
-            --ingestion-timeout ${{ github.event.inputs.ingestion_timeout }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --mutation-ratio ${{ github.event.inputs.mutation_ratio }} \
             --workflow testoperator_run_streaming_dynamodb.yml \
@@ -132,7 +126,7 @@ jobs:
           DYNAMODB_AWS_ACCESS_KEY_ID: ${{ env.AWS_DYNAMODB_ACCESS_KEY_ID }}
           DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ env.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           # Snapshot storage
-          SNAPSHOT_S3_LOCATION: s3://streaming-benchmark-snapshots
+          SNAPSHOT_S3_LOCATION: s3://spice-streaming-benchmark-snapshots
           SNAPSHOT_S3_ACCESS_KEY_ID: ${{ env.STREAMING_SNAPSHOT_S3_ACCESS_KEY_ID }}
           SNAPSHOT_S3_SECRET_ACCESS_KEY: ${{ env.STREAMING_SNAPSHOT_S3_SECRET_ACCESS_KEY }}
           SNAPSHOT_S3_REGION: us-east-1
