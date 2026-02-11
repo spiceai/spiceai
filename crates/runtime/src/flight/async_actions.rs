@@ -327,7 +327,14 @@ pub async fn handle_get_async_query_result(body: &[u8]) -> Result<Vec<u8>, Statu
     let batches = executor
         .get_chunk(request.query_id.as_str(), request.chunk_index)
         .await
-        .map_err(|e| Status::internal(format!("Failed to get result chunk: {e}")))?;
+        .map_err(|e| match &e {
+            crate::jobs::Error::NoRowsReturned { .. }
+            | crate::jobs::Error::ChunkNotFound { .. }
+            | crate::jobs::Error::JobNotFound { .. }
+            | crate::jobs::Error::JobResultsExpired { .. } => Status::not_found(e.to_string()),
+            crate::jobs::Error::JobNotComplete { .. } => Status::failed_precondition(e.to_string()),
+            _ => Status::internal(format!("Failed to get result chunk: {e}")),
+        })?;
 
     // Serialize to Arrow IPC
     serialize_batches_to_ipc(&batches)

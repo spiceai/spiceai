@@ -22,7 +22,7 @@ use crate::error::{
 use ansi_colors::Color;
 use clap::{Args, Subcommand};
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SanType,
 };
 use snafu::{ResultExt, ensure};
@@ -327,25 +327,16 @@ fn execute_tls_add(client_name: &str, host: Option<&str>) -> Result<()> {
         path: ca_key_path,
     })?;
 
-    // Parse the CA key
+    // Parse the CA key and certificate for signing
     let ca_key_pair =
         KeyPair::from_pem(&ca_key_pem).map_err(|e| crate::error::Error::InvalidArgument {
             message: format!("Failed to parse CA private key: {e}"),
         })?;
-
-    // Parse the CA certificate from PEM to reconstruct it for signing
-    let ca_params = CertificateParams::from_ca_cert_pem(&ca_cert_pem).map_err(|e| {
+    let ca_issuer = Issuer::from_ca_cert_pem(&ca_cert_pem, ca_key_pair).map_err(|e| {
         crate::error::Error::InvalidArgument {
             message: format!("Failed to parse CA certificate: {e}"),
         }
     })?;
-
-    let ca_cert =
-        ca_params
-            .self_signed(&ca_key_pair)
-            .map_err(|e| crate::error::Error::InvalidArgument {
-                message: format!("Failed to reconstruct CA certificate: {e}"),
-            })?;
 
     // Generate client certificate
     let not_before = OffsetDateTime::now_utc();
@@ -402,7 +393,7 @@ fn execute_tls_add(client_name: &str, host: Option<&str>) -> Result<()> {
         })?;
 
     let client_cert = client_params
-        .signed_by(&client_key_pair, &ca_cert, &ca_key_pair)
+        .signed_by(&client_key_pair, &ca_issuer)
         .map_err(|e| crate::error::Error::InvalidArgument {
             message: format!("Failed to create client certificate: {e}"),
         })?;

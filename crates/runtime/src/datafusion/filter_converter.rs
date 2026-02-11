@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,161 +14,62 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Runtime-specific helpers for creating [`TimestampFilterConvert`] instances
+//! from spicepod configuration types.
+//!
+//! The core conversion logic lives in [`util::timestamp_filter`].
+
 use crate::component::dataset::TimeFormat;
-use arrow::datatypes::DataType;
-use datafusion::{
-    logical_expr::{Expr, Operator, binary_expr, cast, col, lit},
-    prelude::and,
-    scalar::ScalarValue,
-};
-use std::sync::Arc;
+pub use util::timestamp_filter::TimestampFilterConvert;
+use util::timestamp_filter::data_type_to_timestamp_format;
 
-#[derive(Debug, Clone)]
-enum ExprTimeFormat {
-    ISO8601,
-    UnixTimestamp(ExprUnixTimestamp),
-    Timestamp,
-    Timestamptz(Option<Arc<str>>),
-    Date,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ExprUnixTimestamp {
-    scale: u128,
-}
-
-#[expect(clippy::struct_field_names)]
-#[derive(Clone, Debug)]
-pub(crate) struct TimestampFilterConvert {
-    time_column: String,
-    time_format: ExprTimeFormat,
-
-    // An optional column that represents the same time as `time_column` but is used for partitioning
-    time_partition_column: Option<String>,
-    time_partition_format: Option<ExprTimeFormat>,
-}
-
+/// Create a [`TimestampFilterConvert`] from runtime configuration types.
+///
+/// This is the runtime-specific entry point that maps [`TimeFormat`] config
+/// values to the unix timestamp scale, then delegates to the shared util logic.
 #[expect(clippy::needless_pass_by_value)]
-impl TimestampFilterConvert {
-    pub(crate) fn create(
-        field: Option<arrow::datatypes::Field>,
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        partition_field: Option<arrow::datatypes::Field>,
-        time_partition_column: Option<String>,
-        time_partition_format: Option<TimeFormat>,
-    ) -> Option<Self> {
-        let field = field?;
-        let time_column = time_column?;
-
-        let time_format = data_type_to_time_format(field.data_type(), time_format)?;
-        let time_partition_format = partition_field
-            .as_ref()
-            .and_then(|f| data_type_to_time_format(f.data_type(), time_partition_format));
-
-        Some(Self {
-            time_column,
-            time_format,
-            time_partition_column,
-            time_partition_format,
-        })
-    }
-
-    pub(crate) fn convert(&self, timestamp_in_nanos: u128, op: Operator) -> Expr {
-        let time_expr =
-            convert_to_expr(timestamp_in_nanos, &self.time_column, &self.time_format, op);
-        match (&self.time_partition_column, &self.time_partition_format) {
-            (Some(time_partition_column), Some(time_partition_format)) => {
-                let time_partition_expr = convert_to_expr(
-                    timestamp_in_nanos,
-                    time_partition_column,
-                    time_partition_format,
-                    op,
-                );
-                and(time_expr, time_partition_expr)
-            }
-            _ => time_expr,
-        }
-    }
-}
-
-#[expect(clippy::cast_possible_truncation)]
-fn convert_to_expr(
-    timestamp_in_nanos: u128,
-    time_column: &str,
-    time_format: &ExprTimeFormat,
-    op: Operator,
-) -> Expr {
-    let time_column: &str = &format!(r#""{}""#, &time_column);
-    match time_format {
-        ExprTimeFormat::UnixTimestamp(format) => binary_expr(
-            col(time_column),
-            op,
-            lit((timestamp_in_nanos / format.scale) as u64),
-        ),
-        ExprTimeFormat::Date | ExprTimeFormat::Timestamp | ExprTimeFormat::ISO8601 => {
-            binary_expr(
-                // The time unit of timestamp is unknown before filtering
-                // Convert the left and right expr to same unit for safe comparison
-                cast(
-                    col(time_column),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                ),
-                op,
-                Expr::Literal(
-                    ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), None),
-                    None,
-                ),
-            )
-        }
-        ExprTimeFormat::Timestamptz(tz) => binary_expr(
-            cast(
-                col(time_column),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, tz.clone()),
-            ),
-            op,
-            Expr::Literal(
-                ScalarValue::TimestampNanosecond(Some(timestamp_in_nanos as i64), tz.to_owned()),
-                None,
-            ),
-        ),
-    }
-}
-
-fn data_type_to_time_format(
-    data_type: &DataType,
+pub(crate) fn create_timestamp_filter_convert(
+    field: Option<arrow::datatypes::Field>,
+    time_column: Option<String>,
     time_format: Option<TimeFormat>,
-) -> Option<ExprTimeFormat> {
-    match data_type {
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float16
-        | DataType::Float32
-        | DataType::Float64 => {
-            let mut scale = 1_000_000_000;
-            if let Some(time_format) = time_format
-                && time_format == TimeFormat::UnixMillis
-            {
-                scale = 1_000_000;
-            }
-            Some(ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale }))
-        }
-        DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) => {
-            Some(ExprTimeFormat::Timestamp)
-        }
-        DataType::Timestamp(_, tz) => Some(ExprTimeFormat::Timestamptz(tz.to_owned())),
-        DataType::Utf8 | DataType::LargeUtf8 => Some(ExprTimeFormat::ISO8601),
-        DataType::Date32 => Some(ExprTimeFormat::Date),
-        _ => {
-            tracing::warn!("Date type is not handled yet: {}", data_type);
-            None
-        }
+    partition_field: Option<arrow::datatypes::Field>,
+    time_partition_column: Option<String>,
+    time_partition_format: Option<TimeFormat>,
+) -> Option<TimestampFilterConvert> {
+    let field = field?;
+    let time_column = time_column?;
+
+    let unix_scale = time_format_to_unix_scale(time_format);
+    let format = data_type_to_timestamp_format(field.data_type(), unix_scale)?;
+
+    let partition_fmt = partition_field.as_ref().and_then(|f| {
+        let partition_scale = time_format_to_unix_scale(time_partition_format);
+        data_type_to_timestamp_format(f.data_type(), partition_scale)
+    });
+
+    Some(TimestampFilterConvert::new(
+        time_column,
+        format,
+        time_partition_column,
+        partition_fmt,
+    ))
+}
+
+/// Map the runtime `TimeFormat` config to the unix timestamp scale used by
+/// [`data_type_to_timestamp_format`] for integer columns.
+///
+/// Returns `None` for formats that don't represent unix epoch integers.
+fn time_format_to_unix_scale(time_format: Option<TimeFormat>) -> Option<u128> {
+    match time_format {
+        Some(TimeFormat::UnixSeconds) => Some(1_000_000_000),
+        Some(TimeFormat::UnixMillis) => Some(1_000_000),
+        Some(
+            TimeFormat::Timestamp
+            | TimeFormat::Timestamptz
+            | TimeFormat::ISO8601
+            | TimeFormat::Date,
+        )
+        | None => None,
     }
 }
 
@@ -176,6 +77,7 @@ fn data_type_to_time_format(
 mod test {
     use super::*;
     use arrow::datatypes::{DataType, Field, TimeUnit};
+    use datafusion::logical_expr::Operator;
 
     #[test]
     fn test_timestamp_filter_convert() {
@@ -215,7 +117,7 @@ mod test {
         let time_field = Field::new("timestamp", DataType::Int64, false);
         let partition_field = Field::new("partition_ts", DataType::Int64, false);
 
-        let converter = TimestampFilterConvert::create(
+        let converter = create_timestamp_filter_convert(
             Some(time_field),
             Some("timestamp".to_string()),
             Some(TimeFormat::UnixMillis),
@@ -242,7 +144,7 @@ mod test {
             false,
         );
 
-        let converter = TimestampFilterConvert::create(
+        let converter = create_timestamp_filter_convert(
             Some(time_field),
             Some("timestamp".to_string()),
             Some(TimeFormat::UnixMillis),
@@ -270,7 +172,7 @@ mod test {
             false,
         );
 
-        let converter = TimestampFilterConvert::create(
+        let converter = create_timestamp_filter_convert(
             Some(time_field),
             Some("timestamp".to_string()),
             None,
@@ -292,7 +194,7 @@ mod test {
 
     fn test(field: Field, time_format: TimeFormat, timestamp: u128, expected: &str) {
         let time_column = "timestamp".to_string();
-        let timestamp_filter_convert = TimestampFilterConvert::create(
+        let timestamp_filter_convert = create_timestamp_filter_convert(
             Some(field),
             Some(time_column),
             Some(time_format),

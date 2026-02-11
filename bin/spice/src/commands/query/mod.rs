@@ -176,7 +176,7 @@ async fn execute_subcommand(client: &Arc<Client>, cmd: &QuerySubcommand) -> Resu
                 };
                 table.add_row(vec![
                     q.query_id.clone(),
-                    q.state.clone(),
+                    q.status.to_string(),
                     q.created_at.clone(),
                     sql,
                 ]);

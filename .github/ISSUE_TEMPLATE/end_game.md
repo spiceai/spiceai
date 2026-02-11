@@ -91,7 +91,6 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [HTTP](https://github.com/spiceai/cookbook/blob/trunk/http/README.md)
      - [ ] [MSSQL](https://github.com/spiceai/cookbook/blob/trunk/mssql/README.md)
      - [ ] [MySQL](https://github.com/spiceai/cookbook/blob/trunk/mysql/connector/README.md)
-     - [ ] [ODBC](https://github.com/spiceai/cookbook/blob/trunk/odbc/README.md)
      - [ ] [PostgreSQL](https://github.com/spiceai/cookbook/blob/trunk/postgres/connector/README.md)
      - [ ] [S3](https://github.com/spiceai/cookbook/blob/trunk/s3/README.md)
      - [ ] [SharePoint](https://github.com/spiceai/cookbook/blob/trunk/sharepoint/README.md)
