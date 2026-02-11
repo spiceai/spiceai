@@ -201,7 +201,15 @@ impl DeletionSink for FileBasedDeletionSink {
         for (meta, num_rows) in &eligible_files {
             match object_store.delete(&meta.location).await {
                 Ok(()) => {
-                    let rows = u64::try_from(num_rows.unwrap_or(0)).unwrap_or(u64::MAX);
+                    let row_count = num_rows.unwrap_or(0);
+                    let Ok(rows) = u64::try_from(row_count) else {
+                        return Err(format!(
+                            "Retention: invalid row count {row_count} for file {} (cannot convert to u64)",
+                            meta.location
+                        )
+                        .into());
+                    };
+
                     total_rows = total_rows.saturating_add(rows);
                     deleted_files += 1;
 
@@ -233,13 +241,7 @@ impl DeletionSink for FileBasedDeletionSink {
             }
         }
 
-        tracing::info!(
-            table = %self.table_name,
-            deleted_files = deleted_files,
-            total_rows = total_rows,
-            threshold = %threshold,
-            "File-based retention deletion complete"
-        );
+        tracing::info!("Evicted {deleted_files} files for {}", self.table_name);
 
         Ok(total_rows)
     }

@@ -65,6 +65,8 @@ pub struct TimeRetentionFilterBuilder {
     converter: TimestampFilterConvert,
     /// Retention period in seconds.
     retention_seconds: u64,
+    /// Name of the time column used for retention filtering.
+    column_name: String,
 }
 
 impl TimeRetentionFilterBuilder {
@@ -92,12 +94,19 @@ impl TimeRetentionFilterBuilder {
                 data_type: field.data_type().clone(),
             },
         )?;
-        let converter = TimestampFilterConvert::new(time_column, time_format, None, None);
+        let converter = TimestampFilterConvert::new(time_column.clone(), time_format, None, None);
 
         Ok(Self {
             converter,
             retention_seconds,
+            column_name: time_column,
         })
+    }
+
+    /// Returns the name of the time column used for retention filtering.
+    #[must_use]
+    pub fn column_name(&self) -> &str {
+        &self.column_name
     }
 
     /// Build a **keep** filter: `col >= cutoff` (rows to retain at scan time).
@@ -118,16 +127,23 @@ impl TimeRetentionFilterBuilder {
     }
 }
 
+/// Comparison operators valid for retention filter expressions.
+const RETENTION_COMPARISON_OPS: [Operator; 4] =
+    [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq];
+
 /// Extract column name and threshold from a simplified retention filter expression.
 ///
 /// Expects the expression to be a binary comparison of the form
-/// `column >= literal` or `column < literal` (after simplification). Returns
+/// `column {<,<=,>,>=} literal` (after simplification). Returns
 /// `(column_name, operator, threshold_scalar)` on success.
 ///
 /// # Errors
 ///
-/// Returns an error if the expression is not a binary comparison between
-/// a column reference and a scalar literal.
+/// Returns an error if:
+/// - The expression is not a binary comparison.
+/// - The left side is not a column reference.
+/// - The right side is not a scalar literal.
+/// - The operator is not a supported comparison (`<`, `<=`, `>`, `>=`).
 pub(crate) fn extract_retention_column_and_threshold(
     expr: &Expr,
 ) -> Result<(String, Operator, ScalarValue)> {
@@ -136,6 +152,14 @@ pub(crate) fn extract_retention_column_and_threshold(
             detail: format!("Expected a binary expression for retention filter, got: {expr}"),
         });
     };
+
+    if !RETENTION_COMPARISON_OPS.contains(op) {
+        return Err(Error::ExpressionParse {
+            detail: format!(
+                "Unsupported operator '{op}' in retention filter. Expected one of: <, <=, >, >="
+            ),
+        });
+    }
 
     let col_name = match left.as_ref() {
         Expr::Column(c) => c.name.clone(),
@@ -257,6 +281,43 @@ mod tests {
             extract_retention_column_and_threshold(&expr).expect("should parse col >= literal");
         assert_eq!(col_name, "ts");
         assert_eq!(op, Operator::GtEq);
+    }
+
+    #[test]
+    fn test_extract_retention_rejects_unsupported_operator() {
+        // Equality is not a valid retention comparison operator
+        let expr = col("event_time").eq(Expr::Literal(ScalarValue::Int64(Some(42)), None));
+        let err =
+            extract_retention_column_and_threshold(&expr).expect_err("equality should be rejected");
+        assert!(
+            matches!(err, Error::ExpressionParse { .. }),
+            "expected ExpressionParse, got: {err}"
+        );
+
+        // AND is not a comparison operator
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("a")),
+            op: Operator::And,
+            right: Box::new(Expr::Literal(ScalarValue::Boolean(Some(true)), None)),
+        });
+        let err =
+            extract_retention_column_and_threshold(&expr).expect_err("AND should be rejected");
+        assert!(
+            matches!(err, Error::ExpressionParse { .. }),
+            "expected ExpressionParse for AND, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_column_name_accessor() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        )]));
+        let builder = TimeRetentionFilterBuilder::try_new("event_time", 60, &schema)
+            .expect("should create builder");
+        assert_eq!(builder.column_name(), "event_time");
     }
 
     /// Roundtrip: build a filter via [`TimeRetentionFilterBuilder`],
