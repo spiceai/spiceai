@@ -198,9 +198,12 @@ impl CayenneDeletionSink {
         vortex_filter: Option<&vortex::expr::Expression>,
     ) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
         // Get existing deletions for this file to exclude from scan
+        let cached_deleted_row_ids = self
+            .pk_deletion_strategy
+            .position_based_cache()
+            .ok_or("scan_file_for_deletions called with incompatible PkDeletionStrategy")?;
         let already_deleted = {
-            let guard = self
-                .cached_deleted_row_ids
+            let guard = cached_deleted_row_ids
                 .read()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
 
@@ -292,10 +295,14 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
+        // Get the position-based cache from the PkDeletionStrategy (only valid for PositionBased)
+        let cached_deleted_row_ids = self.pk_deletion_strategy.position_based_cache().ok_or(
+            "persist_position_based_deletions called with incompatible PkDeletionStrategy",
+        )?;
+
         // Read existing deletions to merge with new ones
         let existing_deletions: Arc<HashMap<String, RoaringBitmap>> = {
-            let guard = self
-                .cached_deleted_row_ids
+            let guard = cached_deleted_row_ids
                 .read()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
             Arc::clone(&*guard)
@@ -360,8 +367,7 @@ impl CayenneDeletionSink {
 
         // Quick write lock - just insert pre-built entries
         {
-            let mut guard = self
-                .cached_deleted_row_ids
+            let mut guard = cached_deleted_row_ids
                 .write()
                 .map_err(|_| DELETION_CACHE_LOCK_POISONED.to_string())?;
 

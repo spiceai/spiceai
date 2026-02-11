@@ -317,7 +317,7 @@ vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "5093499
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "5093499e6f8da6e945acd1552d5bf424898e97d3" } # spiceai-51
 
 x509-certificate = "0.25.0"
-spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "7815fb062ba508636abeff85ade93f93edff5a7e" } # branch: lukim/query
+spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "4c63970cf1d78c71eb69e2f4346d5d4795631b47" } # branch: trunk
 
 [profile.release-lto]
 inherits = "release"

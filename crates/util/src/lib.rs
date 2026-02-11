@@ -35,6 +35,7 @@ pub mod arrow;
 pub mod expr;
 pub mod stream_utils;
 pub mod time_format;
+pub mod timestamp_filter;
 
 #[expect(clippy::cast_precision_loss)]
 #[expect(clippy::cast_sign_loss)]

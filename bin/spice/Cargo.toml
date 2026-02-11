@@ -85,7 +85,7 @@ urlencoding = "2"
 
 # Certificate generation for cluster TLS
 pem = "3"
-rcgen = { version = "0.13", features = ["x509-parser"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
 time = "0.3"
 
 # Internal crates

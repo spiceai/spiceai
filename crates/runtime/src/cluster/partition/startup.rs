@@ -23,7 +23,7 @@ use std::{
 use app::{App, spicepod::component::runtime::Scheduler as SchedulerConfig};
 
 use datafusion::{
-    execution::SessionStateBuilder,
+    execution::{SessionStateBuilder, runtime_env::RuntimeEnvBuilder},
     logical_expr::Expr,
     prelude::SessionContext,
     sql::TableReference,
