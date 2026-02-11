@@ -15,7 +15,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 1
       },
-      "score": 0.94
+      "score": 0.9400963357009336
     },
     {
       "dataset": "spice.public.cached_search",
@@ -27,7 +27,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 15
       },
-      "score": 0.93
+      "score": 0.9398291716774164
     },
     {
       "dataset": "spice.public.cached_search",
@@ -39,7 +39,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 3
       },
-      "score": 0.93
+      "score": 0.9375262525348972
     },
     {
       "dataset": "spice.public.cached_search",
@@ -51,7 +51,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 7
       },
-      "score": 0.92
+      "score": 0.9273301161037488
     },
     {
       "dataset": "spice.public.cached_search",
@@ -63,7 +63,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 10
       },
-      "score": 0.91
+      "score": 0.9159284526262208
     },
     {
       "dataset": "spice.public.cached_search",
@@ -75,7 +75,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 2
       },
-      "score": 0.91
+      "score": 0.9117962035409471
     },
     {
       "dataset": "spice.public.cached_search",
@@ -87,7 +87,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 17
       },
-      "score": 0.91
+      "score": 0.9109729176536489
     },
     {
       "dataset": "spice.public.cached_search",
@@ -99,7 +99,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 8
       },
-      "score": 0.9
+      "score": 0.909036715319305
     },
     {
       "dataset": "spice.public.cached_search",
@@ -111,7 +111,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 19
       },
-      "score": 0.9
+      "score": 0.907636856948916
     },
     {
       "dataset": "spice.public.cached_search",
@@ -123,7 +123,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 14
       },
-      "score": 0.9
+      "score": 0.9068648214701052
     },
     {
       "dataset": "spice.public.cached_search",
@@ -135,7 +135,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 18
       },
-      "score": 0.89
+      "score": 0.8959976326549786
     },
     {
       "dataset": "spice.public.cached_search",
@@ -147,7 +147,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 11
       },
-      "score": 0.89
+      "score": 0.8958621526213884
     },
     {
       "dataset": "spice.public.cached_search",
@@ -159,7 +159,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 13
       },
-      "score": 0.89
+      "score": 0.8957666947546759
     },
     {
       "dataset": "spice.public.cached_search",
@@ -171,7 +171,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 12
       },
-      "score": 0.88
+      "score": 0.8879877705913609
     },
     {
       "dataset": "spice.public.cached_search",
@@ -183,7 +183,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 20
       },
-      "score": 0.87
+      "score": 0.8784471135747325
     },
     {
       "dataset": "spice.public.cached_search",
@@ -195,7 +195,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 5
       },
-      "score": 0.87
+      "score": 0.8733924987803368
     },
     {
       "dataset": "spice.public.cached_search",
@@ -207,7 +207,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 9
       },
-      "score": 0.86
+      "score": 0.8611566533290982
     },
     {
       "dataset": "spice.public.cached_search",
@@ -219,7 +219,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 16
       },
-      "score": 0.84
+      "score": 0.8453847500877436
     },
     {
       "dataset": "spice.public.cached_search",
@@ -231,7 +231,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 6
       },
-      "score": 0.82
+      "score": 0.8262181184660475
     }
   ]
 }

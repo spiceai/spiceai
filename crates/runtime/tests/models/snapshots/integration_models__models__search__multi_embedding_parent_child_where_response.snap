@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -19,7 +18,7 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 20
       },
-      "score": 0.03
+      "score": 0.03278688524590164
     }
   ]
 }
