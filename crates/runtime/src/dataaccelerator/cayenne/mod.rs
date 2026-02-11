@@ -580,6 +580,49 @@ impl CayenneAccelerator {
             .map(Arc::clone)
     }
 
+    /// Builds a [`cayenne::TimeRetentionFilterBuilder`] from the acceleration
+    /// `retention_period` and `time_column` configuration.
+    ///
+    /// Returns `Ok(None)` when `retention_period` or `time_column` is not
+    /// configured.  Returns `Err` when the configuration is present but
+    /// invalid (unparseable duration, missing/unsupported column).
+    fn build_time_retention_filter_builder(
+        source: &dyn AccelerationSource,
+        schema: &SchemaRef,
+    ) -> Result<Option<cayenne::TimeRetentionFilterBuilder>> {
+        let Some(acceleration) = source.acceleration() else {
+            return Ok(None);
+        };
+        let Some(retention_period_str) = acceleration.retention_period.as_deref() else {
+            return Ok(None);
+        };
+        let Some(time_column) = source.time_column() else {
+            return Ok(None);
+        };
+
+        let retention_duration = fundu::parse_duration(retention_period_str).map_err(|e| {
+            Error::InvalidConfiguration {
+                detail: Arc::from(format!(
+                    "Failed to parse retention_period '{retention_period_str}': {e}"
+                )),
+            }
+        })?;
+
+        let retention_seconds = retention_duration.as_secs();
+
+        let builder =
+            cayenne::TimeRetentionFilterBuilder::try_new(time_column, retention_seconds, schema)
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?;
+
+        tracing::debug!(
+            dataset = %source.name(),
+            "Built time retention filter builder for column '{time_column}' with {retention_seconds}s retention"
+        );
+
+        Ok(Some(builder))
+    }
+
     #[expect(clippy::too_many_arguments)]
     async fn create_cayenne_table_provider(
         &self,
@@ -588,6 +631,7 @@ impl CayenneAccelerator {
         schema: Arc<Schema>,
         source: &dyn AccelerationSource,
         retention_filters: Vec<Expr>,
+        time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
         primary_keys: Vec<String>,
         on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
     ) -> Result<Arc<cayenne::CayenneTableProvider>> {
@@ -645,6 +689,9 @@ impl CayenneAccelerator {
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder =
             CayenneTableProviderBuilder::new(catalog).with_retention_filters(retention_filters);
+        if let Some(retention_builder) = time_retention_filter_builder {
+            builder = builder.with_time_retention_filter_builder(retention_builder);
+        }
         if let Some(object_store) = object_store {
             tracing::info!(
                 "Using S3 Express One Zone storage for {} acceleration: {}",
@@ -945,6 +992,10 @@ impl DataAccelerator for CayenneAccelerator {
         // Get the table name from the source
         let table_name = source.name().to_string();
 
+        // Build the time-based retention filter builder (e.g., retention_period: 30d)
+        let time_retention_filter_builder =
+            Self::build_time_retention_filter_builder(source, &arrow_schema)?;
+
         // Parse retention SQL once so it can be reused for partitioned tables.
         let retention_filters = if let Some(acceleration) = source.acceleration() {
             acceleration
@@ -1006,6 +1057,7 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::clone(&arrow_schema),
                 source,
                 retention_filters.clone(),
+                time_retention_filter_builder.clone(),
                 primary_keys.clone(),
                 on_conflict.clone(),
             )
@@ -1096,6 +1148,7 @@ impl DataAccelerator for CayenneAccelerator {
                 table_metadata.table_id,
                 unsupported_type_action,
                 retention_filters,
+                time_retention_filter_builder,
                 vortex_config,
                 object_store_config,
                 primary_keys,
@@ -1178,6 +1231,7 @@ struct CayennePartitionCreator {
     table_id: i64,
     unsupported_type_action: UnsupportedTypeAction,
     retention_filters: Vec<Expr>,
+    time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
     vortex_config: cayenne::metadata::VortexConfig,
     object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
     primary_key: Vec<String>,
@@ -1197,6 +1251,10 @@ impl std::fmt::Debug for CayennePartitionCreator {
             .field("table_id", &self.table_id)
             .field("unsupported_type_action", &self.unsupported_type_action)
             .field("retention_filters", &self.retention_filters.len())
+            .field(
+                "time_retention_filter_builder",
+                &self.time_retention_filter_builder.is_some(),
+            )
             .field("vortex_config", &"<VortexConfig>")
             .field("object_store_config", &self.object_store_config.is_some())
             .field("primary_key", &self.primary_key)
@@ -1217,6 +1275,7 @@ impl CayennePartitionCreator {
         table_id: i64,
         unsupported_type_action: UnsupportedTypeAction,
         retention_filters: Vec<Expr>,
+        time_retention_filter_builder: Option<cayenne::TimeRetentionFilterBuilder>,
         vortex_config: cayenne::metadata::VortexConfig,
         object_store_config: Option<cayenne::metadata::ObjectStoreConfig>,
         primary_key: Vec<String>,
@@ -1236,6 +1295,7 @@ impl CayennePartitionCreator {
             table_id,
             unsupported_type_action,
             retention_filters,
+            time_retention_filter_builder,
             vortex_config,
             object_store_config,
             primary_key,
@@ -1375,6 +1435,9 @@ impl PartitionCreator for CayennePartitionCreator {
         let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&self.catalog))
             .with_retention_filters(self.retention_filters.clone())
             .with_context(Arc::clone(&self.context));
+        if let Some(ref retention_builder) = self.time_retention_filter_builder {
+            builder = builder.with_time_retention_filter_builder(retention_builder.clone());
+        }
         if let Some(ref object_store) = self.object_store_config {
             builder = builder.with_object_store(object_store.clone());
         }
@@ -1442,6 +1505,9 @@ impl PartitionCreator for CayennePartitionCreator {
             let mut builder = cayenne::CayenneTableProviderBuilder::new(Arc::clone(&self.catalog))
                 .with_retention_filters(self.retention_filters.clone())
                 .with_context(Arc::clone(&self.context));
+            if let Some(ref retention_builder) = self.time_retention_filter_builder {
+                builder = builder.with_time_retention_filter_builder(retention_builder.clone());
+            }
             if let Some(ref object_store) = self.object_store_config {
                 builder = builder.with_object_store(object_store.clone());
             }

@@ -16,7 +16,46 @@ limitations under the License.
 
 //! `DataFusion` expression utilities.
 
-use datafusion::logical_expr::Expr;
+use std::sync::Arc;
+
+use arrow::datatypes::SchemaRef;
+use chrono::Utc;
+use datafusion::{
+    common::DFSchema,
+    error::DataFusionError,
+    execution::context::ExecutionProps,
+    logical_expr::Expr,
+    optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext},
+};
+
+/// Simplify an expression by evaluating constant sub-expressions.
+///
+/// Uses `DataFusion`'s [`ExprSimplifier`] which performs:
+/// - **Constant folding**: Evaluates constant expressions at plan time (e.g., `now()` → literal timestamp, `1 + 2` → `3`)
+/// - **Cast folding**: Folds nested casts around literals (e.g., `l_created_at < CAST(Utf8("2026-02-01 12:34:56.123456789") AS Timestamp(ns, "UTC"))` -> `l_created_at < TimestampMicrosecond(1769949296123456, Some("UTC"))`)
+/// - **Algebraic simplification**: Simplifies boolean logic (e.g., `expr AND true` → `expr`, `!!expr` → `expr`)
+/// - **Canonicalization**: Normalizes comparisons (e.g., `5 < x` → `x > 5`)
+///
+/// # Benefits for retention/refresh filters
+///
+/// - **Faster filter evaluation**: No function calls or type conversions at runtime
+/// - **Works with Vortex**: Which doesn't currently support timestamp casts
+/// - **Better predicate pushdown**: Storage engines can use indexes/stats directly
+///
+/// # Errors
+///
+/// Returns an error if schema conversion or expression simplification fails.
+pub fn simplify_expr(expr: Expr, schema: &SchemaRef) -> Result<Expr, DataFusionError> {
+    let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
+
+    // Set query_execution_start_time so that NOW() and other time-dependent
+    // functions can be evaluated during simplification
+    let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
+    let simplify_context = SimplifyContext::new(&execution_props).with_schema(Arc::new(df_schema));
+    let simplifier = ExprSimplifier::new(simplify_context);
+
+    simplifier.simplify(expr)
+}
 
 /// Combine expressions using a balanced binary tree structure.
 ///
@@ -71,7 +110,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::logical_expr::{col, lit};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::logical_expr::{Operator, binary_expr, cast, col, lit};
+    use datafusion::scalar::ScalarValue;
 
     #[test]
     fn test_combine_empty_returns_none() {
@@ -126,5 +167,69 @@ mod tests {
         let expr2 = col("b").eq(lit(2));
         let result = combine_exprs_balanced(vec![expr1.clone(), expr2.clone()], Expr::or);
         assert_eq!(result, Some(expr1.or(expr2)));
+    }
+
+    /// Tests that `simplify_expr` folds casts around timestamp literals.
+    #[test]
+    fn test_simplify_folds_timestamp_cast_to_column_type() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l_created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let expr = binary_expr(
+            col("l_created_at"),
+            Operator::Lt,
+            cast(
+                Expr::Literal(
+                    ScalarValue::TimestampNanosecond(
+                        Some(1_620_000_000_000_000_000),
+                        Some("UTC".into()),
+                    ),
+                    None,
+                ),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+        );
+
+        let simplified = simplify_expr(expr, &schema).expect("simplification should succeed");
+
+        assert_eq!(
+            simplified.to_string(),
+            r#"l_created_at < TimestampMicrosecond(1620000000000000, Some("UTC"))"#
+        );
+    }
+
+    /// Tests nanosecond precision handling when casting to microseconds.
+    #[test]
+    fn test_simplify_timestamp_cast_truncates_nanoseconds() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l_created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let expr = binary_expr(
+            col("l_created_at"),
+            Operator::Lt,
+            cast(
+                Expr::Literal(
+                    ScalarValue::TimestampNanosecond(
+                        Some(1_620_000_000_000_000_001),
+                        Some("UTC".into()),
+                    ),
+                    None,
+                ),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+        );
+
+        let simplified = simplify_expr(expr, &schema).expect("simplification should succeed");
+
+        assert_eq!(
+            simplified.to_string(),
+            r#"l_created_at < TimestampMicrosecond(1620000000000000, Some("UTC"))"#
+        );
     }
 }

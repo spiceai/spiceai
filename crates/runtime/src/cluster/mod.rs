@@ -16,10 +16,9 @@ limitations under the License.
 
 use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
-use crate::cluster::partition::executor_request_initial_partitions;
-use crate::cluster::partition::scheduler_task::{
+use crate::cluster::partition::{executor_request_initial_partitions, scheduler_task::{
     PartitionManagementConfig, PartitionManagementTask,
-};
+}};
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::dataconnector::listing;
 use crate::dataconnector::parameters::ConnectorParamsBuilder;
@@ -850,6 +849,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                             },
                         )
                         .await;
+
                 }
                 Err(err) => {
                     tracing::error!("Failed to build partition metadata store: {err}");

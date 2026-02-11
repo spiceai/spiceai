@@ -107,6 +107,9 @@ pub enum CatalogError {
     #[snafu(display("The function '{function}' is not implemented"))]
     NotImplemented { function: String },
 
+    #[snafu(display("Cayenne metadata schema mismatch for table '{table}'. The metadata database format has changed and is incompatible with this version. To continue, clear your acceleration data (delete the Cayenne metadata directory) so it can be recreated. Existing accelerated data will be re-synced from the source."))]
+    SchemaMismatch { table: String },
+
     #[snafu(display(
         "Deletion vectors require non-negative row IDs, found negative values: {row_ids}"
     ))]

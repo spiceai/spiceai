@@ -36,13 +36,14 @@ limitations under the License.
 //! When `--workflow` is not specified, benchmarks run locally (sequential).
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
 use futures::future::try_join_all;
 use test_framework::anyhow::{self, Result};
+use test_framework::gh_utils::GitHubWorkflow;
+use test_framework::octocrab::{self, Octocrab};
 use test_framework::spiced::{SpicedInstance, StartRequest};
 
 use super::datasets::DatasetType;
@@ -252,6 +253,16 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
     if let Some(ref workflow) = args.workflow {
         println!("Phase 7: Triggering GitHub workflows for each config");
 
+        let gh_token = std::env::var("GH_TOKEN").map_err(|_| {
+            anyhow::anyhow!("GH_TOKEN environment variable is required for workflow dispatch")
+        })?;
+        let octo_client = octocrab::instance().user_access_token(gh_token)?;
+        let (org, repo_name) = parse_repo(args.repo.as_deref());
+        let git_ref = args
+            .git_ref
+            .clone()
+            .unwrap_or_else(|| std::env::var("GITHUB_REF").unwrap_or_else(|_| "trunk".to_string()));
+
         for (idx, spicepod_path) in spicepod_paths.iter().enumerate() {
             let config_name = spicepod_path
                 .file_stem()
@@ -266,25 +277,26 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
             );
 
             trigger_workflow(
+                &octo_client,
                 workflow,
-                args.repo.as_deref(),
-                args.git_ref.as_deref(),
+                org,
+                repo_name,
+                &git_ref,
                 &run_id,
                 &config_name,
                 spicepod_path,
                 args,
-            )?;
+            )
+            .await?;
 
             if args.wait_for_workflows {
-                wait_for_workflow_completion(workflow, args.repo.as_deref())?;
+                let gh_workflow = GitHubWorkflow::new(org, repo_name, workflow, &git_ref);
+                wait_for_workflow_completion(&octo_client, &gh_workflow).await?;
             }
         }
 
         println!("Run ID: {run_id}");
-        println!(
-            "Monitor workflows at: https://github.com/{}/actions",
-            args.repo.as_deref().unwrap_or("spiceai/spiceai")
-        );
+        println!("Monitor workflows at: https://github.com/{org}/{repo_name}/actions",);
         println!("Note: DynamoDB tables preserved for workflow execution");
     }
 
@@ -296,105 +308,90 @@ pub async fn run_dispatch(args: &StreamingDynamodbDispatchArgs) -> Result<()> {
     Ok(())
 }
 
-/// Trigger a GitHub workflow for a specific config.
-fn trigger_workflow(
+/// Parse a repo string like "spiceai/spiceai" into (org, repo).
+/// Defaults to ("spiceai", "spiceai") if not provided.
+fn parse_repo(repo: Option<&str>) -> (&str, &str) {
+    repo.and_then(|r| r.split_once('/'))
+        .unwrap_or(("spiceai", "spiceai"))
+}
+
+/// Trigger a GitHub workflow for a specific config using Octocrab.
+#[expect(clippy::too_many_arguments)]
+async fn trigger_workflow(
+    octo: &Octocrab,
     workflow: &str,
-    repo: Option<&str>,
-    git_ref: Option<&str>,
+    org: &str,
+    repo: &str,
+    git_ref: &str,
     run_id: &str,
     config_name: &str,
     spicepod_path: &Path,
     args: &StreamingDynamodbDispatchArgs,
 ) -> Result<()> {
-    let mut cmd = Command::new("gh");
-    cmd.args(["workflow", "run", workflow]);
-
-    if let Some(repo) = repo {
-        cmd.args(["--repo", repo]);
-    }
-
-    if let Some(git_ref) = git_ref {
-        cmd.args(["--ref", git_ref]);
-    }
-
-    // Pass workflow inputs
-    cmd.args(["-f", &format!("run_id={run_id}")]);
-    cmd.args(["-f", &format!("config_name={config_name}")]);
-    cmd.args(["-f", &format!("spicepod_path={}", spicepod_path.display())]);
-    cmd.args(["-f", &format!("queryset={}", args.queryset)]);
-    cmd.args(["-f", &format!("scale_factor={}", args.scale_factor)]);
-    cmd.args(["-f", &format!("ready_wait={}", args.ready_wait)]);
+    let mut inputs = serde_json::json!({
+        "run_id": run_id,
+        "config_name": config_name,
+        "spicepod_path": spicepod_path.display().to_string(),
+        "queryset": args.queryset.to_string(),
+        "scale_factor": args.scale_factor.to_string(),
+        "ready_wait": args.ready_wait.to_string(),
+    });
 
     if args.verify {
-        cmd.args(["-f", "verify=true"]);
+        inputs["verify"] = serde_json::json!("true");
     }
 
-    let output = cmd.output().map_err(|e| {
-        anyhow::anyhow!("Failed to run gh workflow command: {e}. Is GitHub CLI installed?")
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "Failed to trigger workflow for {config_name}: {stderr}"
-        ));
-    }
+    let gh_workflow = GitHubWorkflow::new(org, repo, workflow, git_ref);
+    gh_workflow.send(octo.actions(), Some(inputs)).await?;
 
     println!("    Workflow triggered for {config_name}");
     Ok(())
 }
 
-/// Wait for a workflow run to complete.
-fn wait_for_workflow_completion(workflow: &str, repo: Option<&str>) -> Result<()> {
+/// Wait for the most recent workflow run to complete using Octocrab.
+async fn wait_for_workflow_completion(octo: &Octocrab, workflow: &GitHubWorkflow) -> Result<()> {
     println!("    Waiting for workflow to complete...");
 
-    let mut cmd = Command::new("gh");
-    cmd.args(["run", "watch", "--exit-status"]);
+    let timeout = Duration::from_secs(7200); // 2 hours
+    let start = Instant::now();
 
-    if let Some(repo) = repo {
-        cmd.args(["--repo", repo]);
+    loop {
+        let page = octo
+            .workflows(&workflow.org, &workflow.repo)
+            .list_runs(&workflow.workflow_file)
+            .per_page(1)
+            .send()
+            .await?;
+
+        if let Some(run) = page.items.first() {
+            match run.status.as_str() {
+                "completed" => {
+                    if run.conclusion.as_deref() == Some("success") {
+                        println!("    Workflow completed successfully");
+                        return Ok(());
+                    }
+                    return Err(anyhow::anyhow!(
+                        "Workflow failed with conclusion: {}",
+                        run.conclusion.as_deref().unwrap_or("unknown")
+                    ));
+                }
+                status => {
+                    if start.elapsed() >= timeout {
+                        return Err(anyhow::anyhow!(
+                            "Timeout waiting for workflow (status: {status})"
+                        ));
+                    }
+                    println!(
+                        "    Workflow status: {status}, waiting... ({:.0}s elapsed)",
+                        start.elapsed().as_secs_f64()
+                    );
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("No workflow runs found"));
+        }
     }
-
-    // Get the most recent run of this workflow
-    let mut list_cmd = Command::new("gh");
-    list_cmd.args([
-        "run",
-        "list",
-        "--workflow",
-        workflow,
-        "--limit",
-        "1",
-        "--json",
-        "databaseId",
-        "--jq",
-        ".[0].databaseId",
-    ]);
-
-    if let Some(repo) = repo {
-        list_cmd.args(["--repo", repo]);
-    }
-
-    let list_output = list_cmd.output()?;
-    if !list_output.status.success() {
-        return Err(anyhow::anyhow!("Failed to get workflow run ID"));
-    }
-
-    let run_id = String::from_utf8_lossy(&list_output.stdout)
-        .trim()
-        .to_string();
-    if run_id.is_empty() {
-        return Err(anyhow::anyhow!("No workflow runs found"));
-    }
-
-    cmd.arg(&run_id);
-
-    let status = cmd.status()?;
-    if !status.success() {
-        return Err(anyhow::anyhow!("Workflow failed"));
-    }
-
-    println!("    Workflow completed successfully");
-    Ok(())
 }
 
 /// Capture a checkpoint snapshot for a single configuration.

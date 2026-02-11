@@ -27,16 +27,25 @@ use test_framework::{
 use crate::args::dispatch::{DispatchArgs, DispatchTestFile, WorkflowArgs};
 
 pub async fn dispatch(args: DispatchArgs) -> Result<()> {
-    if !args.path.is_dir() && !args.path.is_file() {
+    let DispatchArgs {
+        path,
+        workflow,
+        workflow_commit,
+        github_token,
+        spiced_commit,
+        update_snapshots,
+        max_concurrent,
+        ..
+    } = args;
+    if !path.is_dir() && !path.is_file() {
         return Err(anyhow::anyhow!("Path must be a directory or a file"));
     }
 
-    let octo_client = octocrab::instance().user_access_token(args.github_token)?;
-    let test_type: TestType = args.workflow.into();
-    let yaml_files = if args.path.is_dir() {
-        scan_directory_for_yamls(&args.path)?
+    let test_type: TestType = workflow.into();
+    let yaml_files = if path.is_dir() {
+        scan_directory_for_yamls(&path)?
     } else {
-        vec![args.path]
+        vec![path]
     };
 
     println!("Found {} YAML files to load", yaml_files.len());
@@ -64,8 +73,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                         serde_json::json!(WorkflowArgs {
                             specific_args: bench
                                 .clone()
-                                .with_update_snapshots(args.update_snapshots.into()),
-                            spiced_commit: args.spiced_commit.clone(),
+                                .with_update_snapshots(update_snapshots.into()),
+                            spiced_commit: spiced_commit.clone(),
                         }),
                     ));
                 }
@@ -76,7 +85,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                         path,
                         serde_json::json!(WorkflowArgs {
                             specific_args: load.clone(),
-                            spiced_commit: args.spiced_commit.clone(),
+                            spiced_commit: spiced_commit.clone(),
                         }),
                     ));
                 }
@@ -87,7 +96,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                         path,
                         serde_json::json!(WorkflowArgs {
                             specific_args: throughput.clone(),
-                            spiced_commit: args.spiced_commit.clone(),
+                            spiced_commit: spiced_commit.clone(),
                         }),
                     ));
                 }
@@ -98,7 +107,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                         path,
                         serde_json::json!(WorkflowArgs {
                             specific_args: append.clone(),
-                            spiced_commit: args.spiced_commit.clone(),
+                            spiced_commit: spiced_commit.clone(),
                         }),
                     ));
                 }
@@ -109,7 +118,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                         path,
                         serde_json::json!(WorkflowArgs {
                             specific_args: text_to_sql.clone(),
-                            spiced_commit: args.spiced_commit.clone(),
+                            spiced_commit: spiced_commit.clone(),
                         }),
                     ));
                 }
@@ -125,6 +134,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         return Ok(());
     }
 
+    let mut failed_dispatches = Vec::new();
     let total_tests = tests_to_dispatch.len();
     for (index, (path, mut payload)) in tests_to_dispatch.into_iter().enumerate() {
         payload = map_numbers_to_strings(payload);
@@ -136,14 +146,35 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             path.display(),
         );
 
-        let workflow = GitHubWorkflow::new(
-            "spiceai",
-            "spiceai",
-            test_type.workflow(),
-            &args.workflow_commit,
-        );
+        // If github token is none, `--dry-run true` is forced by `clap`'s `required_if_eq` constraint.
+        let Some(gh_token) = github_token.as_deref() else {
+            let url = format!(
+                "https://api.github.com/repos/spiceai/spiceai/actions/workflows/{}/dispatches",
+                test_type.workflow()
+            );
 
-        match args.max_concurrent {
+            let body = serde_json::json!({
+                "ref": &workflow_commit,
+                "inputs": payload
+            });
+
+            println!(
+                "curl -L \\
+  -X POST \\
+  -H \"Accept: application/vnd.github+json\" \\
+  -H \"Authorization: Bearer $GH_TOKEN\" \\
+  -H \"X-GitHub-Api-Version: 2022-11-28\" \\
+  {url} \\
+  -d '{body}'"
+            );
+            continue;
+        };
+
+        let octo_client = octocrab::instance().user_access_token(gh_token)?;
+        let workflow =
+            GitHubWorkflow::new("spiceai", "spiceai", test_type.workflow(), &workflow_commit);
+
+        let result = match max_concurrent {
             Some(max_concurrent) => {
                 // Dispatch workflow while waiting for an available slot, limiting to max_concurrent parallel runs
                 dispatch_workflow_with_concurrency(
@@ -152,17 +183,31 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                     Some(payload),
                     max_concurrent,
                 )
-                .await?;
+                .await
             }
             None => {
                 // Dispatch workflow without concurrency limit
-                workflow.send(octo_client.actions(), Some(payload)).await?;
+                workflow.send(octo_client.actions(), Some(payload)).await
             }
+        };
+
+        if let Err(e) = result {
+            eprintln!("Failed to dispatch {}. Error: {e}", path.display());
+            failed_dispatches.push((path.display().to_string(), e));
+            continue;
         }
 
         // sleep to space out runs
         println!("Waiting for next run...");
         tokio::time::sleep(std::time::Duration::from_secs(80)).await;
+    }
+
+    if !failed_dispatches.is_empty() {
+        eprintln!("\nFailed to dispatch {} tests:", failed_dispatches.len());
+        for (path, error) in &failed_dispatches {
+            eprintln!("  - {path}: {error}");
+        }
+        return Err(anyhow::anyhow!("Some workflow requests failed"));
     }
 
     Ok(())
