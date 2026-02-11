@@ -149,6 +149,15 @@ impl JobExecutor {
             });
         }
 
+        // If the job completed with no rows, there are no chunks to read.
+        if let Some(result) = &state.result
+            && result.manifest.total_chunk_count == 0
+        {
+            return Err(super::error::Error::NoRowsReturned {
+                job_id: job_id.to_string(),
+            });
+        }
+
         self.job_store.read_chunk(job_id, chunk_index).await
     }
 
