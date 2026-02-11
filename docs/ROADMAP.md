@@ -15,14 +15,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v1.11 (Jan 2026)
-
-**Focus:** Distributed Query Foundation.
-
-- **Spice Cayenne (Beta)**: High-performance columnar storage format for accelerated datasets.
-- **Distributed Query (Beta)**: Multi-node query execution with Apache Ballista integration.
-- **Active-Active HA (Preview)**: Multi-node active-active deployment with automatic failover.
-
 ### v1.12 (Feb 2026)
 
 **Focus:** Distributed Query & Search Maturity.
