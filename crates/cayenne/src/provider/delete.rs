@@ -44,6 +44,7 @@ mod sink;
 mod vector_io;
 
 // Public API - re-exported in provider/mod.rs
+pub(crate) use sink::file_based::FileBasedDeletionSink;
 pub use sink::CayenneDeletionSink;
 
 // Crate-internal types used by table.rs

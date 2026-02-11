@@ -24,8 +24,8 @@ use super::constants::{
 };
 use super::delete::{
     is_pk_visible_i64, is_pk_visible_row_key, CayenneDeletionSink, DeletionIdentifier,
-    DeletionVectorWriteSpec, DeletionVectorWriter, Int64PkDeletionFilterExec,
-    KeyBasedDeletionFilterExec,
+    DeletionVectorWriteSpec, DeletionVectorWriter, FileBasedDeletionSink,
+    Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
@@ -51,7 +51,7 @@ use datafusion_common::{Constraints, DFSchema};
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
-use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
+use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalExpr;
@@ -4677,6 +4677,51 @@ impl DeletionTableProvider for CayenneTableProvider {
         _state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if self.file_based_deletes_preferred(filters) {
+            tracing::debug!(
+                "Table '{}': using file-based retention delete path",
+                self.table_metadata.table_name,
+            );
+            return self.delete_using_files(filters);
+        }
+
+        // Default path: deletion vectors via CayenneDeletionSink
+        self.delete_using_deletion_vectors(filters)
+    }
+}
+
+impl CayenneTableProvider {
+    /// File-level delete path.
+    ///
+    /// Creates a [`FileBasedDeletionSink`] that discovers eligible files
+    /// (where `max(col) < threshold_value`) and deletes them.
+    fn delete_using_files(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if filters.len() != 1 {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "delete_using_files requires exactly one filter, got {}",
+                filters.len(),
+            )));
+        }
+        let filter = &filters[0];
+
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(FileBasedDeletionSink::new(
+                Arc::clone(&self.listing_table),
+                filter.clone(),
+                self.table_metadata.table_name.clone(),
+            )),
+            &self.table_metadata.schema,
+        )))
+    }
+
+    /// Main deletion-vector path via [`CayenneDeletionSink`].
+    fn delete_using_deletion_vectors(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // Collect protected snapshot listing tables for deletion scanning
         let protected_snapshot_tables = {
             let protected_snapshots = {
@@ -4726,6 +4771,44 @@ impl DeletionTableProvider for CayenneTableProvider {
             )),
             &self.table_metadata.schema,
         )))
+    }
+
+    /// Returns `true` if deletes can use whole-file deletion instead of per-row deletion vectors.
+    ///
+    /// Requirements:
+    /// - Time-based retention is configured (`time_retention_filter_builder`).
+    /// - The table uses a position-based deletion strategy.
+    /// - The table is **not** backed by S3 storage.
+    /// - The filter is a single `retention_col < threshold` expression matching
+    ///   the configured retention column. Non-retention deletes (e.g. CDC
+    ///   change-batch `DELETE WHERE pk = value`) fall through to the
+    ///   deletion-vector path to preserve correct DELETE semantics.
+    fn file_based_deletes_preferred(&self, filters: &[Expr]) -> bool {
+        let Some(ref builder) = self.time_retention_filter_builder else {
+            return false;
+        };
+
+        if !self.pk_deletion_strategy.is_position_based()
+            || self.table_metadata.path.starts_with("s3://")
+        {
+            return false;
+        }
+
+        // Only use file-based path when the filter is a retention-pattern delete
+        // on the configured retention column: `col < threshold`.
+        let is_retention_filter = filters.len() == 1
+            && super::retention::extract_retention_column_and_threshold(&filters[0])
+                .is_ok_and(|(col, op, _)| col == builder.column_name() && op == Operator::Lt);
+
+        if !is_retention_filter {
+            tracing::debug!(
+                "Table '{}': delete filter does not match retention pattern (`{} < threshold`)",
+                self.table_metadata.table_name,
+                builder.column_name(),
+            );
+        }
+
+        is_retention_filter
     }
 }
 
