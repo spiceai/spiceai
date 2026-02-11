@@ -50,6 +50,13 @@ use std::sync::{Arc, RwLock};
 ///    file is eligible for deletion (all rows are expired).
 /// 4. Delete eligible files from the filesystem.
 /// 5. Return the total number of deleted rows (from per-file stats).
+///
+/// # Notes
+///
+/// Unlike [`CayenneDeletionSink`](super::CayenneDeletionSink), this sink does
+/// not currently scan protected snapshots. File-based deletes are only enabled for the
+/// position-based strategy (no primary key), which does not use protected
+/// snapshots
 pub struct FileBasedDeletionSink {
     /// Listing table to enumerate files and collect per-file statistics.
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
@@ -86,22 +93,11 @@ impl FileBasedDeletionSink {
     /// listed, or the retention column is not found in the schema.
     async fn retention_eligible_files(
         &self,
+        ctx: &SessionContext,
+        listing_table: &ListingTable,
         retention_col: &str,
         retention_threshold: &ScalarValue,
     ) -> CatalogResult<Vec<(ObjectMeta, Option<usize>)>> {
-        // Clone listing table to avoid holding locks across await points
-        let listing_table = {
-            self.listing_table
-                .read()
-                .map_err(|_| CatalogError::LockPoisoned {
-                    operation: "retention_eligible_files".to_string(),
-                })?
-                .clone()
-        };
-
-        // Create a throwaway SessionContext (same pattern as load_existing_keyset)
-        let ctx = SessionContext::new();
-
         // Call list_files_for_scan — lists all files + collects per-file stats.
         // collect_stat is true by default via SessionConfig::default().
         let (file_groups, _aggregate_stats) = listing_table
@@ -157,7 +153,7 @@ impl DeletionSink for FileBasedDeletionSink {
             "File-based retention: discovering eligible files"
         );
 
-        // Clone listing table to avoid holding locks across await points
+        // Clone listing table once to avoid holding locks across await points
         let listing_table = {
             self.listing_table
                 .read()
@@ -165,9 +161,15 @@ impl DeletionSink for FileBasedDeletionSink {
                 .clone()
         };
 
+        // A single throwaway SessionContext for the entire operation. It only
+        // provides the object-store registry.
+        // Vortex footer/segment caches live inside the VortexFormat embedded in the
+        // shared ListingTable and are unaffected by this SessionContext.
+        let ctx = SessionContext::new();
+
         // 2. Discover eligible files
         let eligible_files = self
-            .retention_eligible_files(&col_name, &threshold)
+            .retention_eligible_files(&ctx, &listing_table, &col_name, &threshold)
             .await
             .map_err(|e| format!("Failed to discover retention-eligible files: {e}"))?;
 
@@ -180,7 +182,6 @@ impl DeletionSink for FileBasedDeletionSink {
         }
 
         // 3. Get the object store for file deletion
-        let ctx = SessionContext::new();
         let object_store_url = listing_table
             .table_paths()
             .first()
