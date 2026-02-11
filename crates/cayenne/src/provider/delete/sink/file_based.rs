@@ -241,7 +241,7 @@ impl DeletionSink for FileBasedDeletionSink {
             }
         }
 
-        tracing::info!("Evicted {deleted_files} files for {}", self.table_name);
+        tracing::debug!("Evicted {deleted_files} files for {}", self.table_name);
 
         Ok(total_rows)
     }
