@@ -173,10 +173,10 @@ async fn test_file_based_retention_deletes_all_files_impl(fixture: TestFixture) 
 ///   - file 2: expired only — id=3 (10s ago)                    → deleted
 ///
 /// After deletion:
-/// - File 1 is preserved (1 live + 1 expired row in the same file).
+/// - File 1 is preserved (1 live + 1 expired row remain in the same file).
 /// - File 2 is deleted.
-/// - count(*) = 2, ids = [1, 2] (scan-time retention filter hides id=2 from queries
-///   but the file itself is not deleted.
+/// - At query time, the scan-time retention filter hides the expired row (id=2),
+///   so only the fresh row (id=1) is visible.
 async fn test_file_based_retention_mixed_file_not_deleted_impl(fixture: TestFixture) -> TestResult {
     let retention_seconds = 3;
     let table_name = "file_ret_mixed";
