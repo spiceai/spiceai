@@ -30,6 +30,9 @@ pub enum Error {
     #[snafu(display("Result chunk {chunk_index} not found for job {job_id}"))]
     ChunkNotFound { job_id: String, chunk_index: usize },
 
+    #[snafu(display("Job {job_id} completed with no rows returned"))]
+    NoRowsReturned { job_id: String },
+
     #[snafu(display("Job {job_id} is not yet complete (status: {status})"))]
     JobNotComplete { job_id: String, status: String },
 
