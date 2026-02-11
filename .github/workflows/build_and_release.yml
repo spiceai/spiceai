@@ -195,6 +195,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install build-essential libssl-dev pkg-config cmake unixodbc unixodbc-dev unzip -y
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> $GITHUB_ENV
 
       # The x86_64 runner does not unixodbc pre-installed
       - name: Install missing tools (Linux x86_64)
