@@ -23,9 +23,7 @@ use std::{
 use app::{App, spicepod::component::runtime::Scheduler as SchedulerConfig};
 
 use datafusion::{
-    execution::{SessionStateBuilder, runtime_env::RuntimeEnvBuilder},
-    logical_expr::Expr,
-    prelude::SessionContext,
+    execution::SessionStateBuilder, logical_expr::Expr, prelude::SessionContext,
     sql::TableReference,
 };
 use datafusion_proto::bytes::Serializeable;
@@ -306,6 +304,9 @@ async fn execute_partition_discovery_query(
     let ctx = SessionContext::new_with_state(
         SessionStateBuilder::new_from_existing(rt.datafusion().ctx.state()).build(),
     );
+
+    // Must deregister table in this context before registering source table.
+    let _ = ctx.deregister_table(table.clone());
     ctx.register_table(table.clone(), acc.table_provider().await)
         .context(RegisterTableSnafu {
             table: table_name.clone(),
