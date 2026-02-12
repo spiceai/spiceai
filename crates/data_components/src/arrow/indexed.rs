@@ -590,10 +590,24 @@ impl TableProvider for IndexedMemTable {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         let owned_filters: Vec<Expr> = filters.iter().map(|&e| e.clone()).collect();
 
-        // If we have a primary key index and the filter is a simple PK equality,
-        // we can fully push it down (exact match)
+        // If we have a primary key index and the filter includes a PK equality,
+        // mark only the PK filter as Exact. Non-PK filters must be Inexact so
+        // DataFusion still applies them after the indexed lookup. Returning Exact
+        // for all filters would silently drop non-PK predicates (e.g.
+        // `WHERE id=10 AND version=101` would ignore `version=101` and return
+        // the row for id=10 regardless of its version).
         if self.index.is_some() && self.extract_pk_equality_value(&owned_filters).is_some() {
-            return Ok(vec![TableProviderFilterPushDown::Exact; filters.len()]);
+            let pk_column = &self.primary_key_columns[0];
+            return Ok(filters
+                .iter()
+                .map(|f| {
+                    if Self::extract_equality_value(f, pk_column).is_some() {
+                        TableProviderFilterPushDown::Exact
+                    } else {
+                        TableProviderFilterPushDown::Inexact
+                    }
+                })
+                .collect());
         }
 
         // Check if a secondary index can handle this filter
@@ -3181,5 +3195,93 @@ mod tests {
 
         // Verify total count: 300 initial + 2 (insert1) + 1 (insert2) = 303
         assert_eq!(table.index().map(|i| i.len()), Some(303));
+    }
+
+    // =========================================================================
+    // PK + Non-PK Filter Correctness Tests
+    // =========================================================================
+
+    /// Test that `WHERE pk = X AND non_pk_col = Y` correctly applies both filters.
+    ///
+    /// Regression test: previously `supports_filters_pushdown` returned `Exact` for
+    /// ALL filters when a PK equality was present, causing `DataFusion` to drop the
+    /// non-PK filter entirely. The indexed lookup would return the row matching the
+    /// PK without checking the additional predicate.
+    #[tokio::test]
+    async fn test_pk_and_non_pk_filter_returns_correct_data() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(schema, vec![vec![batch]], vec!["id".to_string()])
+            .expect("failed to create table");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", Arc::new(table))
+            .expect("failed to register");
+
+        // Row id=42 exists with name='name_42'. Filtering with a wrong name value
+        // must return zero rows.
+        let df = ctx
+            .sql("SELECT id, name FROM test WHERE id = 42 AND name = 'nonexistent'")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        assert_eq!(
+            total_rows, 0,
+            "PK match with non-matching additional filter must return 0 rows, got {total_rows}"
+        );
+
+        // Same PK but correct name value must still return the row.
+        let df = ctx
+            .sql("SELECT id, name FROM test WHERE id = 42 AND name = 'name_42'")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+
+        assert_eq!(
+            total_rows, 1,
+            "PK match with matching additional filter must return 1 row, got {total_rows}"
+        );
+
+        let name_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("expected string");
+        assert_eq!(name_col.value(0), "name_42");
+    }
+
+    /// Test that `supports_filters_pushdown` returns per-filter pushdown types
+    /// when a PK equality is combined with other predicates.
+    #[test]
+    fn test_filter_pushdown_pk_and_non_pk_filters() {
+        let batch = create_large_test_batch(300);
+        let schema = batch.schema();
+
+        let table = create_test_indexed_table(
+            Arc::clone(&schema),
+            vec![vec![batch]],
+            vec!["id".to_string()],
+        )
+        .expect("failed to create table");
+
+        let pk_filter = col("id").eq(lit(42_i64));
+        let non_pk_filter = col("name").eq(lit("name_42"));
+
+        let pushdown = table
+            .supports_filters_pushdown(&[&pk_filter, &non_pk_filter])
+            .expect("pushdown check failed");
+
+        assert_eq!(
+            pushdown,
+            vec![
+                TableProviderFilterPushDown::Exact,   // PK filter handled by index
+                TableProviderFilterPushDown::Inexact, // non-PK filter must still be applied
+            ],
+            "PK filter should be Exact, non-PK filter should be Inexact"
+        );
     }
 }
