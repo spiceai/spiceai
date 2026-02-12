@@ -9,7 +9,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
       },
       "primary_key": {
         "id": 361
@@ -19,7 +21,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
+        "question": [
+          "There are 22 female students and 18 male students in a classroom. Find the total number \\( t \\) of students."
+        ]
       },
       "primary_key": {
         "id": 787
@@ -29,7 +33,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "How many numbers between 0 and 60 are even multiples of 5?"
+        "question": [
+          "How many numbers between 0 and 60 are even multiples of 5?"
+        ]
       },
       "primary_key": {
         "id": 470
@@ -39,7 +45,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "question": "Find the number of groups of 7 in 21."
+        "question": [
+          "Find the number of groups of 7 in 21."
+        ]
       },
       "primary_key": {
         "id": 359

@@ -193,6 +193,15 @@ pub struct ExtractOptions {
     /// If provided and `verify_existing_checksums` is true, existing files are verified
     /// against these checksums.
     pub expected_checksums: Option<HashMap<String, String>>,
+
+    /// Mapping from archive prefixes to target directories.
+    /// When set, archive entries starting with a prefix will be extracted to the
+    /// corresponding target directory instead of `target_dir`.
+    ///
+    /// For example, if the mapping contains `("data/", "/spice/data/my_table")`,
+    /// an archive entry `data/file.parquet` will be extracted to
+    /// `/spice/data/my_table/file.parquet` instead of `{target_dir}/data/file.parquet`.
+    pub prefix_mappings: Option<Vec<(String, PathBuf)>>,
 }
 
 impl ExtractOptions {
@@ -205,6 +214,7 @@ impl ExtractOptions {
             skip_if_exists: true,
             verify_existing_checksums: true,
             expected_checksums: None, // Checksums will be computed from archive contents
+            prefix_mappings: None,
         }
     }
 
@@ -216,6 +226,7 @@ impl ExtractOptions {
             skip_if_exists: true,
             verify_existing_checksums: false,
             expected_checksums: None,
+            prefix_mappings: None,
         }
     }
 }
@@ -369,6 +380,34 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
+/// Remap an archive entry path to its destination path using prefix mappings.
+///
+/// If `prefix_mappings` is provided and the entry path starts with one of the prefixes,
+/// the prefix is replaced with the corresponding target directory. Otherwise, the entry
+/// is extracted to `default_target_dir`.
+fn remap_entry_path(
+    entry_path: &Path,
+    default_target_dir: &Path,
+    prefix_mappings: Option<&Vec<(String, PathBuf)>>,
+) -> PathBuf {
+    let entry_path_str = entry_path.to_string_lossy();
+
+    if let Some(mappings) = prefix_mappings {
+        for (prefix, target_dir) in mappings {
+            if entry_path_str.starts_with(prefix) {
+                // Strip the prefix and join with the target directory
+                let relative = entry_path_str
+                    .strip_prefix(prefix)
+                    .unwrap_or(&entry_path_str);
+                return target_dir.join(relative);
+            }
+        }
+    }
+
+    // No matching prefix, use default target directory
+    default_target_dir.join(entry_path)
+}
+
 /// Extract archive entries, skipping files that already exist with optional checksum verification.
 ///
 /// When `options.verify_existing_checksums` is enabled, this function computes the checksum
@@ -390,7 +429,7 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
         let entry_path = entry
             .path()
             .map_err(|source| ArchiveError::ReadArchive { source })?;
-        let dest_path = target_dir.join(&entry_path);
+        let dest_path = remap_entry_path(&entry_path, target_dir, options.prefix_mappings.as_ref());
 
         let entry_type = entry.header().entry_type();
 
@@ -1129,6 +1168,81 @@ mod tests {
         assert_eq!(
             content, "new_content",
             "File should be overwritten without skip_if_exists"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extract_with_prefix_mapping() -> Result<()> {
+        // Test that prefix_mappings correctly remaps archive paths to different target directories.
+        // This is critical for Cayenne snapshot restore where the archive has "data/" prefix
+        // but the actual data directory might be named after the dataset (e.g., "my_table").
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let metadata_dir = test_dir.path().join("metadata");
+        let data_dir = test_dir.path().join("my_table"); // Different from archive prefix "data/"
+        std::fs::create_dir_all(&metadata_dir).expect("Failed to create metadata dir");
+        std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+
+        // Create test files
+        std::fs::write(metadata_dir.join("catalog.db"), b"metadata content")
+            .expect("Failed to write catalog");
+        std::fs::write(data_dir.join("table.parquet"), b"table data")
+            .expect("Failed to write table");
+
+        // Archive with standard prefixes (metadata/ and data/)
+        let mut archive_buffer = Vec::new();
+        let dirs = vec![
+            (metadata_dir.clone(), "metadata/".to_string()),
+            (data_dir.clone(), "data/".to_string()), // Archive prefix is "data/" but dir is "my_table"
+        ];
+        archive_directories(&dirs, Cursor::new(&mut archive_buffer)).await?;
+
+        // Extract to a new location with prefix mappings
+        let extract_base = TempDir::new().expect("Failed to create extract dir");
+        let extract_metadata = extract_base.path().join("metadata");
+        let extract_data = extract_base.path().join("restored_table"); // Different name again
+
+        // Create prefix mappings: archive "data/" -> extract to "restored_table/"
+        let prefix_mappings = vec![
+            ("metadata/".to_string(), extract_metadata.clone()),
+            ("data/".to_string(), extract_data.clone()),
+        ];
+
+        let mut options = ExtractOptions::skip_existing();
+        options.prefix_mappings = Some(prefix_mappings);
+
+        extract_archive_with_options(
+            Cursor::new(archive_buffer),
+            extract_base.path(), // This is the fallback, but prefix mappings should override
+            options,
+        )
+        .await?;
+
+        // Verify files are extracted to the mapped directories, not the archive prefix paths
+        assert!(
+            extract_metadata.join("catalog.db").exists(),
+            "metadata/catalog.db should be extracted to mapped metadata dir"
+        );
+        assert!(
+            extract_data.join("table.parquet").exists(),
+            "data/table.parquet should be extracted to mapped data dir (restored_table), not literal 'data/'"
+        );
+
+        // Verify the content is correct
+        let catalog_content =
+            std::fs::read_to_string(extract_metadata.join("catalog.db")).expect("read catalog");
+        assert_eq!(catalog_content, "metadata content");
+
+        let table_content =
+            std::fs::read_to_string(extract_data.join("table.parquet")).expect("read table");
+        assert_eq!(table_content, "table data");
+
+        // Verify that without prefix mapping, files would go to wrong location
+        // (This is what was broken before the fix)
+        assert!(
+            !extract_base.path().join("data/table.parquet").exists(),
+            "data/table.parquet should NOT exist at literal archive path"
         );
 
         Ok(())

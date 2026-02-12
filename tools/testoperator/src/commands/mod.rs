@@ -38,6 +38,7 @@ pub(crate) mod evals;
 pub(crate) mod load;
 pub(crate) mod query;
 pub(crate) mod search;
+pub(crate) mod streaming;
 pub(crate) mod text_to_sql;
 pub(crate) mod throughput;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
@@ -133,10 +134,8 @@ pub(crate) async fn run_or_connect_spiced(
 pub(crate) async fn get_app_and_start_request(
     args: &CommonArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
-    if !args.metrics {
-        // call the meter to set telemetry to no-op, because the OnceLock hasn't been set yet
-        test_framework::telemetry::METER_PROVIDER.meter("benchmarks_telemetry");
-    }
+    // When metrics are disabled, no Telemetry is created, so METER_PROVIDER_ONCE
+    // remains unset and all metric operations are no-ops.
 
     let mut spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
     let mut app_builder = AppBuilder::new(spicepod.name.clone()).with_spicepod(spicepod.clone());

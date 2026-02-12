@@ -34,7 +34,7 @@ pub struct DuplicateLogicalPlanNode {
 }
 
 impl DuplicateLogicalPlanNode {
-    #[must_use] 
+    #[must_use]
     pub fn extension_nodes(extension_name: &'static str) -> Self {
         Self {
             is_duplicate: Arc::new(make_duplicate_extension_checker(extension_name)),

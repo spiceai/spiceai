@@ -43,8 +43,8 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util" }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", optional = true }
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", package = "mistralrs-core", optional = true }
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "4d40be8a2bd5b44710728124d0c32bc13d79beaa", optional = true } # branch: spiceai-upgrade
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "4d40be8a2bd5b44710728124d0c32bc13d79beaa", package = "mistralrs-core", optional = true } # branch: spiceai-upgrade
 rand.workspace = true
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", features = [

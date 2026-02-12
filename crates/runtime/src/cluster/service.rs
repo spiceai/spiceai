@@ -26,20 +26,38 @@ use std::sync::Arc;
 
 use app::App;
 use arrow::array::RecordBatch;
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
-use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
-use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::sqlparser::parser::Parser;
+use data_components::flightsql::FlightSqlClient;
+
+use datafusion::{
+    prelude::Expr,
+    sql::{
+        TableReference,
+        sqlparser::{
+            ast::{Ident, ObjectNamePart, visit_relations_mut},
+            dialect::PostgreSqlDialect,
+            parser::Parser,
+        },
+    },
+};
+
+use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
+
+use datafusion_proto::bytes::Serializeable;
+use flight_client::cookie::{CookieService, CookieStore};
+use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
-use runtime_proto::cluster_service_server::ClusterService;
-use runtime_proto::executor_control_message::Message as ExecutorMessage;
-use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
+    AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, BytesArray,
     ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
     GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
     GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand,
-    SchedulerControlMessage, SchedulerInstance,
+    SchedulerControlMessage, SchedulerInstance, cluster_service_server::ClusterService,
+    executor_control_message::Message as ExecutorMessage,
+    scheduler_control_message::Message as SchedulerMessage,
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
@@ -49,10 +67,15 @@ use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, Response, Status, Streaming};
 
-use crate::cluster::SchedulerPeers;
+use tonic::{
+    Request, Response, Status, Streaming,
+    transport::{ClientTlsConfig, Endpoint},
+};
+
 use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::partition::PartitionManager;
+use crate::cluster::{SchedulerPeers, partition::partition_value_to_bytes};
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
@@ -140,6 +163,8 @@ pub struct ClusterServiceImpl {
     executor_registry: Arc<ExecutorRegistry>,
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
+    /// Manager for partition metadata (scheduler only).
+    partition_manager: Option<Arc<PartitionManager>>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
 }
@@ -147,6 +172,7 @@ pub struct ClusterServiceImpl {
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -155,6 +181,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        partition_manager: Option<Arc<PartitionManager>>,
     ) -> Self {
         Self {
             app,
@@ -164,6 +191,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            partition_manager,
             executor_streams: ExecutorControlStreamRegistry::new(),
         }
     }
@@ -182,6 +210,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        partition_manager: Option<Arc<PartitionManager>>,
         executor_streams: ExecutorControlStreamRegistry,
     ) -> Self {
         Self {
@@ -192,6 +221,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            partition_manager,
             executor_streams,
         }
     }
@@ -429,6 +459,7 @@ impl ClusterService for ClusterServiceImpl {
         // We need to identify the executor from its first message.
         // Spawn a task to handle the bidirectional stream.
         let executor_registry = Arc::clone(&self.executor_registry);
+        let datafusion = Arc::clone(&self.datafusion);
         let outbound_tx_for_registry = outbound_tx.clone();
         let inbound_task = tokio::spawn(async move {
             let executor_id = match inbound.next().await {
@@ -442,7 +473,7 @@ impl ClusterService for ClusterServiceImpl {
 
                     // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, &message, &executor_registry);
+                        handle_executor_message(&executor_id, &message, &datafusion).await;
                     }
                     executor_id
                 }
@@ -489,8 +520,9 @@ impl ClusterService for ClusterServiceImpl {
                                         handle_executor_message(
                                             &executor_id,
                                             &message,
-                                            &executor_registry,
-                                        );
+                                            &datafusion,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -525,13 +557,136 @@ impl ClusterService for ClusterServiceImpl {
 
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn allocate_initial_partitions(
+        &self,
+        request: Request<AllocateInitialPartitionsRequest>,
+    ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
+        let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
+
+        let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
+        match create_executor_flight_client(&executor_id, tls_config_opt) {
+            Ok(client) => {
+                let mut flight_client_registry =
+                    self.executor_registry.flight_sql_clients.write().await;
+                flight_client_registry.insert(executor_id.clone(), client);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to create Flight SQL client for executor {executor_id}: {e}"
+                );
+            }
+        }
+
+        let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
+
+        if let Some(partition_manager) = &self.partition_manager {
+            let app_guard = self.app.read().await;
+            if let Some(app) = app_guard.as_ref() {
+                // Find accelerated datasets with partitioning
+
+                for table_ref in super::partition::accelerated_tables(app).keys() {
+                    match partition_manager
+                        .allocate_partitions(table_ref, &executor_id, 10)
+                        .await
+                    {
+                        Ok(partitions) => {
+                            if partitions.is_empty() {
+                                continue;
+                            }
+                            let mut items = Vec::with_capacity(partitions.len());
+                            for partition in partitions {
+                                match partition_value_to_bytes(
+                                    partition,
+                                    table_ref,
+                                    &self.datafusion,
+                                )
+                                .await
+                                {
+                                    Ok(bytes) => items.push(bytes.to_vec()),
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to serialize partition expression for table {table_ref}: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            table_partitions.insert(table_ref.to_string(), BytesArray { items });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to allocate partitions for table {} to executor {}: {}",
+                                table_ref.to_string(),
+                                executor_id,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register the allocated partitions in the executor registry so the scheduler knows where they are
+        {
+            let mut executor_partitions = self.executor_registry.partitions.write().await;
+            executor_partitions.insert(
+                executor_id.clone(),
+                table_partitions
+                    .iter()
+                    .map(|(tbl, sa)| {
+                        let exprs = sa
+                            .items
+                            .iter()
+                            .filter_map(|bytes| match Expr::from_bytes(bytes) {
+                                Ok(expr) => Some(expr),
+                                Err(e) => {
+                                    tracing::error!("Failed to deserialize expr: {e}");
+                                    None
+                                }
+                            })
+                            .collect();
+                        (TableReference::parse_str(tbl), exprs)
+                    })
+                    .collect(),
+            );
+        }
+
+        Ok(Response::new(AllocateInitialPartitionsResponse {
+            table_partitions,
+        }))
+    }
 }
 
-/// Handles an executor control message (heartbeat, etc.)
-fn handle_executor_message(
+fn create_executor_flight_client(
+    endpoint: &str,
+    client_tls_config: Option<ClientTlsConfig>,
+) -> Result<FlightSqlClient, tonic::transport::Error> {
+    let executor_address = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+
+    let mut flight_channel = Endpoint::from_shared(executor_address)?;
+    if let Some(tls_config) = client_tls_config {
+        flight_channel = flight_channel.tls_config(tls_config)?;
+    }
+
+    Ok(FlightSqlServiceClient::new_from_inner(
+        FlightServiceClient::new(CookieService::new(
+            flight_channel.connect_lazy(),
+            Arc::new(CookieStore::new()),
+        ))
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
+    ))
+}
+
+/// Handles an executor control message (heartbeat, shutdown, etc.)
+async fn handle_executor_message(
     executor_id: &str,
     message: &ExecutorMessage,
-    _registry: &ExecutorRegistry,
+    datafusion: &DataFusion,
 ) {
     match message {
         ExecutorMessage::Heartbeat(heartbeat) => {
@@ -547,7 +702,55 @@ fn handle_executor_message(
                 "Unexpected metrics response in handle_executor_message for {executor_id}"
             );
         }
+        ExecutorMessage::Shutdown(shutdown) => {
+            let reason = if shutdown.reason.is_empty() {
+                "executor shutdown".to_string()
+            } else {
+                shutdown.reason.clone()
+            };
+            let ballista_executor_id = if shutdown.ballista_executor_id.is_empty() {
+                executor_id
+            } else {
+                shutdown.ballista_executor_id.as_str()
+            };
+            tracing::info!(
+                executor_id = %executor_id,
+                ballista_executor_id = %ballista_executor_id,
+                reason = %reason,
+                "Executor shutdown requested"
+            );
+            if let Err(err) =
+                notify_scheduler_executor_shutdown(datafusion, ballista_executor_id, &reason).await
+            {
+                tracing::warn!(
+                    "Failed to notify scheduler about executor shutdown for {ballista_executor_id}: {err}"
+                );
+            }
+        }
     }
+}
+
+async fn notify_scheduler_executor_shutdown(
+    datafusion: &DataFusion,
+    executor_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let scheduler = datafusion
+        .scheduler_server
+        .read()
+        .map_err(|_| "Failed to lock scheduler server".to_string())?
+        .clone()
+        .ok_or_else(|| "Scheduler server not initialized".to_string())?;
+
+    scheduler
+        .executor_stopped(Request::new(ExecutorStoppedParams {
+            executor_id: executor_id.to_string(),
+            reason: reason.to_string(),
+        }))
+        .await
+        .map_err(|e| format!("Failed to notify scheduler about executor shutdown: {e}"))?;
+
+    Ok(())
 }
 /// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
 ///

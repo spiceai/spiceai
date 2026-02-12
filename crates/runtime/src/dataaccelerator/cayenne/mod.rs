@@ -19,7 +19,9 @@ pub(crate) mod s3;
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use regex::Regex;
 
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
@@ -45,7 +47,10 @@ use snafu::prelude::*;
 use tokio::sync::OnceCell;
 use util::concat_arrays;
 
-use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
+use super::{
+    AccelerationSource, BootstrapStatus, DataAccelerator, get_primary_keys_from_constraints,
+    upsert_dedup,
+};
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode};
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
@@ -95,6 +100,15 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Regex pattern for partition values that are not supported on local filesystem.
+/// Partition values matching `.*#\d+` (e.g., "abcdef#123") are only supported on S3 Express
+/// One Zone locations, not on local filesystem paths.
+static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| match Regex::new(r".*#\d+$") {
+        Ok(compiled) => compiled,
+        Err(e) => unreachable!("Unable to compile regexp: {e}"),
+    });
 
 /// Check if a data type is supported by Vortex natively
 fn is_vortex_supported_type(data_type: &DataType) -> bool {
@@ -566,6 +580,7 @@ impl CayenneAccelerator {
             .map(Arc::clone)
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn create_cayenne_table_provider(
         &self,
         table_name: &str,
@@ -573,6 +588,8 @@ impl CayenneAccelerator {
         schema: Arc<Schema>,
         source: &dyn AccelerationSource,
         retention_filters: Vec<Expr>,
+        primary_keys: Vec<String>,
+        on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
     ) -> Result<Arc<cayenne::CayenneTableProvider>> {
         use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
 
@@ -614,44 +631,6 @@ impl CayenneAccelerator {
                 vortex_config.target_vortex_file_size_mb
             );
         }
-
-        let (primary_keys, on_conflict) = if let Some(acceleration) = source.acceleration() {
-            // Use configured primary key if provided.
-            let pk_vec = acceleration
-                .primary_key
-                .as_ref()
-                .map(|pk| pk.iter().map(std::string::ToString::to_string).collect())
-                .unwrap_or_default();
-
-            // Derive on_conflict from acceleration settings.
-            let on_conflict = acceleration
-                .on_conflict
-                .iter()
-                .map(|(col_ref, behavior)| {
-                    let col =
-                        datafusion_table_providers::util::column_reference::ColumnReference::new(
-                            col_ref
-                                .iter()
-                                .map(std::string::ToString::to_string)
-                                .collect(),
-                        );
-                    match behavior {
-                        crate::component::dataset::acceleration::OnConflictBehavior::Drop => {
-                            datafusion_table_providers::util::on_conflict::OnConflict::DoNothing(
-                                col,
-                            )
-                        }
-                        crate::component::dataset::acceleration::OnConflictBehavior::Upsert(
-                            _options,
-                        ) => datafusion_table_providers::util::on_conflict::OnConflict::Upsert(col),
-                    }
-                })
-                .next();
-
-            (pk_vec, on_conflict)
-        } else {
-            (Vec::new(), None)
-        };
 
         let table_options = CreateTableOptions {
             table_name: table_name.to_string(),
@@ -994,6 +973,31 @@ impl DataAccelerator for CayenneAccelerator {
             Vec::new()
         };
 
+        // Extract primary keys and on_conflict once, used by both partitioned and non-partitioned paths.
+        // Uses explicit user config if provided, otherwise falls back to federated table constraints
+        // (e.g. DynamoDB partition key) and on_conflict from options populated by create_accelerator_table.
+        let primary_keys = source
+            .acceleration()
+            .and_then(|a| a.primary_key.as_ref())
+            .map(|pk| {
+                pk.iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|pk| !pk.is_empty())
+            .unwrap_or_else(|| get_primary_keys_from_constraints(&cmd.constraints, &arrow_schema));
+
+        let on_conflict = cmd
+            .options
+            .get("on_conflict")
+            .map(|s| {
+                datafusion_table_providers::util::on_conflict::OnConflict::try_from(s.as_str())
+            })
+            .transpose()
+            .map_err(|e| Error::InvalidConfiguration {
+                detail: Arc::from(format!("on_conflict invalid: {e}")),
+            })?;
+
         // Always create the base Cayenne table provider
         let cayenne_table = self
             .create_cayenne_table_provider(
@@ -1002,6 +1006,8 @@ impl DataAccelerator for CayenneAccelerator {
                 Arc::clone(&arrow_schema),
                 source,
                 retention_filters.clone(),
+                primary_keys.clone(),
+                on_conflict.clone(),
             )
             .await
             .boxed()?;
@@ -1080,43 +1086,6 @@ impl DataAccelerator for CayenneAccelerator {
                     vortex_config.target_vortex_file_size_mb
                 );
             }
-
-            // Extract primary_key and on_conflict from acceleration settings for partitioned tables
-            let (primary_keys, on_conflict) = if let Some(acceleration) = source.acceleration() {
-                let pk_vec = acceleration
-                    .primary_key
-                    .as_ref()
-                    .map(|pk| pk.iter().map(std::string::ToString::to_string).collect())
-                    .unwrap_or_default();
-
-                let on_conflict = acceleration
-                    .on_conflict
-                    .iter()
-                    .map(|(col_ref, behavior)| {
-                        let col =
-                            datafusion_table_providers::util::column_reference::ColumnReference::new(
-                                col_ref
-                                    .iter()
-                                    .map(std::string::ToString::to_string)
-                                    .collect(),
-                            );
-                        match behavior {
-                            crate::component::dataset::acceleration::OnConflictBehavior::Drop => {
-                                datafusion_table_providers::util::on_conflict::OnConflict::DoNothing(
-                                    col,
-                                )
-                            }
-                            crate::component::dataset::acceleration::OnConflictBehavior::Upsert(
-                                _options,
-                            ) => datafusion_table_providers::util::on_conflict::OnConflict::Upsert(col),
-                        }
-                    })
-                    .next();
-
-                (pk_vec, on_conflict)
-            } else {
-                (Vec::new(), None)
-            };
 
             let creator = Arc::new(CayennePartitionCreator::new(
                 table_name,
@@ -1337,13 +1306,6 @@ impl PartitionCreator for CayennePartitionCreator {
         let partition_dir = self.partition_dir(&partition_values)?;
         let partition_path = partition_dir.to_string_lossy().to_string();
 
-        tracing::debug!("creating Cayenne partition at {partition_path}");
-
-        // Create the partition directory (including nested directories for composite partitions)
-        std::fs::create_dir_all(&partition_dir)
-            .boxed()
-            .context(creator::CreatePartitionSnafu)?;
-
         // Encode partition values as strings for metadata storage
         let partition_value_strings: Vec<String> = partition_values
             .iter()
@@ -1351,6 +1313,32 @@ impl PartitionCreator for CayennePartitionCreator {
             .collect::<Result<Vec<_>, _>>()
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
+
+        // Validate partition values for local filesystem compatibility.
+        // Partition values matching the pattern `.*#\d+` (e.g., "abcdef#123") are not supported
+        // on local filesystem paths but are supported on remote Object Store locations.
+        if self.object_store_config.is_none() {
+            for value in &partition_value_strings {
+                if UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(value) {
+                    return Err(creator::Error::CreatePartition {
+                        source: format!(
+                            "Partition value '{value}' is not supported for local filesystem locations. \
+                            Values matching the pattern '*#<digits>' (e.g., 'abcdef#123') are only supported \
+                            for S3 Express One Zone locations."
+                        )
+                        .into(),
+                    });
+                }
+            }
+        }
+
+        tracing::debug!("creating Cayenne partition at {partition_path}");
+
+        // Create the partition directory (including nested directories for composite partitions)
+        std::fs::create_dir_all(&partition_dir)
+            .boxed()
+            .context(creator::CreatePartitionSnafu)?;
+
         let partition_column_names = self.partition_column_labels();
 
         // Create composite key for table naming (slash-separated values)
@@ -1690,6 +1678,72 @@ mod tests {
         assert_eq!(
             CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
             "/persistent/data/metadata"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_local_partition_pattern() {
+        // Pattern should match values ending with `#<digits>` (e.g., "abcdef#123")
+        // These are only supported on S3 Express One Zone, not local filesystem.
+
+        // Values that should match (unsupported on local filesystem)
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abcdef#123"),
+            "Expected 'abcdef#123' to match unsupported pattern"
+        );
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#1"),
+            "Expected 'test#1' to match unsupported pattern"
+        );
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("some_value#999999"),
+            "Expected 'some_value#999999' to match unsupported pattern"
+        );
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("#0"),
+            "Expected '#0' to match unsupported pattern"
+        );
+        assert!(
+            UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("a#1"),
+            "Expected 'a#1' to match unsupported pattern"
+        );
+
+        // Values that should NOT match (supported on local filesystem)
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abcdef"),
+            "Expected 'abcdef' to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test_123"),
+            "Expected 'test_123' to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("2024-01-01"),
+            "Expected '2024-01-01' to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("partition_value"),
+            "Expected 'partition_value' to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("123"),
+            "Expected '123' (pure digits) to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("abc#def"),
+            "Expected 'abc#def' (# not followed by only digits) to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#"),
+            "Expected 'test#' (# with no digits) to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#abc"),
+            "Expected 'test#abc' (# followed by non-digits) to not match unsupported pattern"
+        );
+        assert!(
+            !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match("test#123abc"),
+            "Expected 'test#123abc' (digits followed by non-digits) to not match unsupported pattern"
         );
     }
 }

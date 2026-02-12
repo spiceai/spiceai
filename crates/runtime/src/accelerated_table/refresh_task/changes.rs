@@ -33,10 +33,12 @@ use data_components::kafka::{
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
+use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -243,13 +245,18 @@ impl RefreshTask {
         ));
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
+
+        // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
+        // (e.g., timestamp precision conversion from Millisecond to Microsecond for Cayenne)
+        let target_schema = self.accelerator.schema();
+        let streaming_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream));
+        let cast_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
+
         let insert_plan = self
             .accelerator
-            .insert_into(
-                &session_state,
-                Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream)),
-                InsertOp::Append,
-            )
+            .insert_into(&session_state, cast_plan, InsertOp::Append)
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;

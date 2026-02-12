@@ -9,7 +9,9 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        "answer": [
+          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        ]
       },
       "primary_key": {
         "id": 890

@@ -16,8 +16,8 @@ limitations under the License.
 
 use super::ClusterTlsConfig;
 use super::composite_flight_service::CompositeFlightService;
-use crate::cluster::ClusterServiceImpl;
 use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
 use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
 use crate::flight::{Error, RateLimits, Service as SpiceFlightService, is_address_in_use_error};
 use crate::{Runtime, metrics as runtime_metrics};
@@ -26,6 +26,7 @@ use governor::RateLimiter;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Server, ServerTlsConfig};
 
@@ -57,6 +58,7 @@ pub async fn start_internal_cluster_server(
     rt: Arc<Runtime>,
     shutdown_signal: Option<CancellationToken>,
     executor_registry: Arc<ExecutorRegistry>,
+    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 ) -> ClusterServerResult<()> {
     let bind_address = rt.df.cluster_config.node_bind_address();
 
@@ -105,6 +107,9 @@ pub async fn start_internal_cluster_server(
         })
         .unwrap_or_else(|| bind_address.to_string());
 
+    // Get partition manager if available (scheduler only)
+    let partition_manager = rt.partition_manager();
+
     // Use the shared executor stream registry if available (created during scheduler init).
     // This allows the scheduler callback to broadcast PollNow to connected executors.
     let cluster_service = if let Some(executor_streams) = rt.df.executor_stream_registry() {
@@ -112,10 +117,11 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&rt.app),
             Arc::clone(&rt.secrets),
             advertise_address,
-            rt.scheduler_peers(),
+            scheduler_peers,
             Arc::clone(&rt.df),
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
+            partition_manager,
             executor_streams,
         )
     } else {
@@ -123,10 +129,11 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&rt.app),
             Arc::clone(&rt.secrets),
             advertise_address,
-            rt.scheduler_peers(),
+            scheduler_peers,
             Arc::clone(&rt.df),
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
+            partition_manager,
         )
     };
     let cluster_service_server = ClusterServiceServer::new(cluster_service);

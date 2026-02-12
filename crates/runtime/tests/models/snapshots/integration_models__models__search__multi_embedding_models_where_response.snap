@@ -9,8 +9,12 @@ snapshot_kind: text
     {
       "dataset": "multi_embedding_models",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "Even democratic stairs would know happy investigations. Histo"
+        "cp_department": [
+          "DEPARTMENT"
+        ],
+        "cp_description": [
+          "Even democratic stairs would know happy investigations. Histo"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 2
@@ -20,8 +24,12 @@ snapshot_kind: text
     {
       "dataset": "multi_embedding_models",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch to"
+        "cp_department": [
+          "DEPARTMENT"
+        ],
+        "cp_description": [
+          "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch to"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 6
@@ -31,8 +39,12 @@ snapshot_kind: text
     {
       "dataset": "multi_embedding_models",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make a"
+        "cp_department": [
+          "DEPARTMENT"
+        ],
+        "cp_description": [
+          "Heavily direct problems try eventually on a nurses. Courses may make a"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 8
