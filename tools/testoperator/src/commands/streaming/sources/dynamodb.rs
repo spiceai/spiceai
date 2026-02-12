@@ -1298,12 +1298,12 @@ fn transform_spicepod(
             .insert("s3_auth".to_string(), ParamValue::String("key".to_string()));
         params
             .data
-            .insert("s3_key".to_string(), ParamValue::String(key.clone()));
+            .insert("s3_key".to_string(), ParamValue::String("${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}".to_string()));
     }
     if let Some(ref secret) = snapshot_config.secret_access_key {
         params
             .data
-            .insert("s3_secret".to_string(), ParamValue::String(secret.clone()));
+            .insert("s3_secret".to_string(), ParamValue::String("${secrets:SNAPSHOT_S3_SECRET_ACCESS_KEY}".to_string()));
     }
     if let Some(ref region) = snapshot_config.region {
         params
