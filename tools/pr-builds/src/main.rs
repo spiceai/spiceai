@@ -53,7 +53,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Trigger a build for the current (or specified) branch
+    /// Trigger a build for the current (or specified) branch.
+    ///
+    /// If an active build exists for the latest commit, it will be reused.
+    /// If a successful build exists, no action is taken.
     Trigger {
         /// Branch to trigger build for. Defaults to current branch.
         #[arg(short, long)]
@@ -63,7 +66,9 @@ enum Commands {
         #[arg(short, long)]
         pr: Option<u64>,
 
-        /// Wait for the build to complete
+        /// Wait for the build to complete.
+        ///
+        /// If an existing build is reused, this will wait for that build.
         #[arg(short, long)]
         wait: bool,
     },
