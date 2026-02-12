@@ -189,117 +189,172 @@ fn get_current_branch() -> Result<String> {
 fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()> {
     let branch = resolve_branch_or_pr(branch, pr)?;
 
-    println!("Triggering build for branch: {}...", branch);
-
-    // Determine platform option based on current OS and Arch
-    let platform_option = match env::consts::OS {
-        "linux" => match env::consts::ARCH {
-            "aarch64" => "Linux aarch64",
-            _ => "Linux x64",
-        },
-        // Only Apple Silicon is supported for macOS in the CI matrix
-        "macos" => "macOS aarch64 (Apple Silicon)",
-        // Fallback for others
-        _ => "Linux x64",
-    };
-
-    println!("Requesting platform: {}", platform_option);
-
-    let status = Command::new("gh")
+    // Get the latest commit SHA for the branch
+    println!("Fetching latest commit SHA for branch '{}'...", branch);
+    let output = Command::new("gh")
         .args([
-            "workflow",
-            "run",
-            "build_and_release.yml",
-            "--ref",
-            &branch,
-            "-f",
-            &format!("platform_option={}", platform_option),
+            "api",
+            &format!("repos/spiceai/spiceai/branches/{}", branch),
+            "--jq",
+            ".commit.sha",
         ])
-        .status()
-        .context("Failed to execute gh workflow run")?;
+        .output()
+        .context("Failed to fetch branch SHA")?;
 
-    if status.success() {
-        println!("Build triggered successfully.");
-        
-        if wait {
-            println!("Waiting for build to start...");
-            
-            // We need to find the run that was just created.
-            // Since we just triggered it, it should be the newest one (created very recently).
-            // We'll poll for a short period to find a run created *after* we started.
-            // But 'gh run list' doesn't let us filter by exact time easily, just order.
-            // The previous code failed because it picked up an OLD run (already completed).
-            
-            let mut found_run_id: Option<u64> = None;
-            
-            // Poll for up to 30 seconds to find the new run
-            for _ in 0..10 {
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                
-                let output = Command::new("gh")
-                    .args([
-                        "run",
-                        "list",
-                        "--workflow",
-                        "build_and_release.yml",
-                        "--branch",
-                        &branch,
-                        "--limit",
-                        "1",
-                        "--json",
-                        "databaseId,status,createdAt",
-                    ])
-                    .output()
-                    .context("Failed to fetch latest run ID")?;
+    if !output.status.success() {
+        anyhow::bail!("Failed to get branch SHA: {}", String::from_utf8_lossy(&output.stderr));
+    }
 
-                if output.status.success() {
-                    let runs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
-                    if let Some(run) = runs.first() {
-                         // Check if this run is actually new (e.g. in_progress or queued, or created just now)
-                         // A simple heuristic: if it's "completed" and we just triggered it, it's probably the OLD one.
-                         // unless our build is instant (unlikely).
-                         // Better: check status != completed, OR check createdAt is recent.
-                         // For now, let's rely on status. If we just triggered it, it shouldn't be completed yet.
-                         
-                         let status = run["status"].as_str().unwrap_or("");
-                         // let created_at = run["createdAt"].as_str().unwrap_or("");
-                         
-                         if status == "queued" || status == "in_progress" || status == "requested" || status == "waiting" {
-                             found_run_id = run["databaseId"].as_u64();
+    let latest_sha = String::from_utf8(output.stdout)?.trim().to_string();
+    println!("Latest SHA: {}", latest_sha);
+
+    // Check for existing runs for this SHA
+    println!("Checking for existing builds for this SHA...");
+    let output = Command::new("gh")
+        .args([
+            "run",
+            "list",
+            "--workflow",
+            "build_and_release.yml",
+            "--branch",
+            &branch,
+            "--limit",
+            "5", // Check a few recent runs
+            "--json",
+            "databaseId,headSha,status,conclusion",
+        ])
+        .output()
+        .context("Failed to list recent runs")?;
+
+    let mut existing_run_id: Option<u64> = None;
+
+    if output.status.success() {
+        let runs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+        for run in runs {
+            if let Some(run_sha) = run["headSha"].as_str() {
+                if run_sha == latest_sha {
+                    // Found a run for the same SHA
+                    let status = run["status"].as_str().unwrap_or("");
+                    let conclusion = run["conclusion"].as_str().unwrap_or("");
+                    let id = run["databaseId"].as_u64();
+
+                    if let Some(id) = id {
+                        if status == "completed" && conclusion == "success" {
+                            println!("Found successful build for this SHA (Run ID: {}). No need to trigger.", id);
+                            return Ok(());
+                        } else if status != "completed" {
+                             println!("Found active build for this SHA (Run ID: {}). Reusing it.", id);
+                             existing_run_id = Some(id);
                              break;
-                         }
+                        } else {
+                            println!("Found failed/cancelled build for this SHA (Run ID: {}). Retrying...", id);
+                            // If failed, we probably want to trigger a new one, so continue loop or stop?
+                            // Default behavior: trigger new if latest is failed.
+                        }
                     }
                 }
             }
+        }
+    }
 
-            if let Some(run_id) = found_run_id {
-                println!("Waiting for Run ID: {}...", run_id);
-                let status = Command::new("gh")
-                    .args(["run", "watch", &run_id.to_string()])
-                    .status()
-                    .context("Failed to watch run")?;
-                
-                if status.success() {
-                    println!("Build completed successfully!");
-                } else {
-                    anyhow::bail!("Build failed or was cancelled.");
-                }
-            } else {
-                 println!("Warning: Could not find the new run ID (or it completed instantly). You'll need to check manually.");
-                 println!(
-                     "  gh run list --workflow build_and_release.yml --branch \"{}\"",
-                     branch
-                 );
-            }
-        } else {
+    let run_id_to_watch = if let Some(id) = existing_run_id {
+        id
+    } else {
+        println!("No active build found for latest SHA. Triggering new build...");
+        
+        let platform_option = match env::consts::OS {
+            "linux" => match env::consts::ARCH {
+                "aarch64" => "Linux aarch64",
+                _ => "Linux x64",
+            },
+            "macos" => "macOS aarch64 (Apple Silicon)",
+            _ => "Linux x64",
+        };
+
+        println!("Requesting platform: {}", platform_option);
+
+        let status = Command::new("gh")
+            .args([
+                "workflow",
+                "run",
+                "build_and_release.yml",
+                "--ref",
+                &branch,
+                "-f",
+                &format!("platform_option={}", platform_option),
+            ])
+            .status()
+            .context("Failed to execute gh workflow run")?;
+
+        if !status.success() {
+            anyhow::bail!("Failed to trigger build");
+        }
+        
+        println!("Build triggered successfully.");
+        
+        if !wait {
              println!("You can check the status with:");
              println!(
                  "  gh run list --workflow build_and_release.yml --branch \"{}\"",
                  branch
              );
+             return Ok(());
         }
-    } else {
-        anyhow::bail!("Failed to trigger build");
+
+        println!("Waiting for build to start...");
+        
+        let mut found_new_run_id: Option<u64> = None;
+        
+        // Poll for up to 30 seconds to find the new run
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            
+            let output = Command::new("gh")
+                .args([
+                    "run",
+                    "list",
+                    "--workflow",
+                    "build_and_release.yml",
+                    "--branch",
+                    &branch,
+                    "--limit",
+                    "1",
+                    "--json",
+                    "databaseId,status,createdAt,headSha",
+                ])
+                .output()
+                .context("Failed to fetch latest run ID")?;
+
+            if output.status.success() {
+                let runs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+                if let Some(run) = runs.first() {
+                     let status = run["status"].as_str().unwrap_or("");
+                     let run_sha = run["headSha"].as_str().unwrap_or("");
+                     
+                     // Ensure we picked up a run for the correct SHA that is active
+                     if (status == "queued" || status == "in_progress" || status == "requested" || status == "waiting") && run_sha == latest_sha {
+                         found_new_run_id = run["databaseId"].as_u64();
+                         break;
+                     }
+                }
+            }
+        }
+        
+        found_new_run_id.context("Could not find the newly triggered run (or it completed instantly).")?
+    };
+
+    if wait {
+        println!("Waiting for Run ID: {}...", run_id_to_watch);
+        let status = Command::new("gh")
+            .args(["run", "watch", &run_id_to_watch.to_string()])
+            .status()
+            .context("Failed to watch run")?;
+        
+        if status.success() {
+            println!("Build completed successfully!");
+        } else {
+            anyhow::bail!("Build failed or was cancelled.");
+        }
     }
 
     Ok(())
