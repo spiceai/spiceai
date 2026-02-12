@@ -14,22 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-/*
-Copyright 2024-2026 The Spice.ai OSS Authors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
@@ -197,16 +181,56 @@ fn get_current_branch() -> Result<String> {
     Ok(branch)
 }
 
+fn validate_branch_name(branch: &str) -> Result<()> {
+    if branch.is_empty() {
+        anyhow::bail!("Branch name cannot be empty");
+    }
+    if branch.contains("..") {
+        anyhow::bail!("Branch name cannot contain '..'");
+    }
+    if branch.starts_with('/') || branch.contains(":") {
+        anyhow::bail!("Branch name contains invalid characters");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn get_repo_owner_name() -> Result<String> {
+    let output = Command::new("gh")
+        .args(["repo", "view", "--json", "nameWithOwner"])
+        .output()
+        .context("Failed to determine current repository via gh repo view")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "gh repo view failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct GhRepo {
+        #[serde(rename = "nameWithOwner")]
+        name_with_owner: String,
+    }
+
+    let gh_repo: GhRepo =
+        serde_json::from_slice(&output.stdout).context("Failed to parse gh repo view output")?;
+    Ok(gh_repo.name_with_owner)
+}
+
 #[cfg(unix)]
 fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()> {
     let branch = resolve_branch_or_pr(branch, pr)?;
+    validate_branch_name(&branch)?;
+    let repo_owner_name = get_repo_owner_name()?;
 
     // Get the latest commit SHA for the branch
     println!("Fetching latest commit SHA for branch '{}'...", branch);
     let output = Command::new("gh")
         .args([
             "api",
-            &format!("repos/spiceai/spiceai/branches/{}", branch),
+            &format!("repos/{}/branches/{}", repo_owner_name, branch),
             "--jq",
             ".commit.sha",
         ])
@@ -239,10 +263,17 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
         .context("Failed to list recent runs")?;
 
     let mut existing_run_id: Option<u64> = None;
+    let mut max_seen_id: u64 = 0;
 
     if output.status.success() {
         let runs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
         for run in runs {
+            if let Some(id) = run["databaseId"].as_u64() {
+                if id > max_seen_id {
+                    max_seen_id = id;
+                }
+            }
+
             if let Some(run_sha) = run["headSha"].as_str() {
                 if run_sha == latest_sha {
                     // Found a run for the same SHA
@@ -274,13 +305,26 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
     } else {
         println!("No active build found for latest SHA. Triggering new build...");
 
-        let platform_option = match env::consts::OS {
-            "linux" => match env::consts::ARCH {
-                "aarch64" => "Linux aarch64",
-                _ => "Linux x64",
-            },
-            "macos" => "macOS aarch64 (Apple Silicon)",
-            _ => "Linux x64",
+        let platform_option = {
+            let os = env::consts::OS;
+            let arch = env::consts::ARCH;
+            match (os, arch) {
+                ("linux", "aarch64") => "Linux aarch64".to_string(),
+                ("linux", "x86_64") => "Linux x64".to_string(),
+                ("macos", "aarch64") => "macOS aarch64 (Apple Silicon)".to_string(),
+                ("macos", "x86_64") => {
+                    anyhow::bail!(
+                        "Failed to determine build platform for OS macOS and architecture x86_64: Intel macOS is not supported by the build_and_release workflow. Use an Apple Silicon macOS or supported Linux machine to trigger this build."
+                    );
+                }
+                (other_os, other_arch) => {
+                    anyhow::bail!(
+                        "Failed to determine build platform for OS {} and architecture {}: Unsupported combination for build_and_release workflow. Supported combinations are: linux/aarch64, linux/x86_64, macos/aarch64.",
+                        other_os,
+                        other_arch
+                    );
+                }
+            }
         };
 
         println!("Requesting platform: {}", platform_option);
@@ -342,11 +386,14 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
                 if let Some(run) = runs.first() {
                      let status = run["status"].as_str().unwrap_or("");
                      let run_sha = run["headSha"].as_str().unwrap_or("");
+                     let id = run["databaseId"].as_u64();
 
-                     // Ensure we picked up a run for the correct SHA that is active
-                     if (status == "queued" || status == "in_progress" || status == "requested" || status == "waiting") && run_sha == latest_sha {
-                         found_new_run_id = run["databaseId"].as_u64();
-                         break;
+                     // Ensure we picked up a run for the correct SHA that is active and NEW (id > max_seen_id)
+                     if let Some(id) = id {
+                         if id > max_seen_id && (status == "queued" || status == "in_progress" || status == "requested" || status == "waiting") && run_sha == latest_sha {
+                             found_new_run_id = Some(id);
+                             break;
+                         }
                      }
                 }
             }
@@ -372,14 +419,19 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
     Ok(())
 }
 
-fn get_artifact_names() -> Vec<String> {
+fn get_artifact_names() -> Result<Vec<String>> {
     let (os, arch) = match env::consts::OS {
         // CI only builds aarch64 for macOS (Apple Silicon)
         "macos" => ("darwin", "aarch64"),
         // For Linux, the CI uses standard architecture names (x86_64, aarch64)
         "linux" => ("linux", env::consts::ARCH),
         // Fallback/Default
-        _ => ("linux", "x86_64"),
+        other => {
+            anyhow::bail!(
+                "Unsupported OS '{}' for PR build artifacts; only 'macos' and 'linux' are supported",
+                other
+            );
+        }
     };
 
     // Prioritize metal for darwin
@@ -389,7 +441,7 @@ fn get_artifact_names() -> Vec<String> {
     }
     names.push(format!("spiced_{}_{}", os, arch));
 
-    names
+    Ok(names)
 }
 
 #[derive(Deserialize, Debug)]
@@ -405,6 +457,8 @@ struct ArtifactList {
 #[cfg(unix)]
 fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
     let branch = resolve_branch_or_pr(branch, pr)?;
+    validate_branch_name(&branch)?;
+    let repo_owner_name = get_repo_owner_name()?;
 
     let target_dir = dirs::home_dir()
         .context("Could not find home directory")?
@@ -452,13 +506,16 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
     let output = Command::new("gh")
         .args([
             "api",
-            &format!("repos/spiceai/spiceai/actions/runs/{}/artifacts", run_id),
+            &format!("repos/{}/actions/runs/{}/artifacts", repo_owner_name, run_id),
         ])
         .output()
         .context("Failed to fetch artifacts list")?;
 
     if !output.status.success() {
-        anyhow::bail!("Failed to list artifacts");
+        anyhow::bail!(
+            "Failed to list artifacts: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     let artifact_list: ArtifactList = serde_json::from_slice(&output.stdout)?;
@@ -468,7 +525,7 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
         .map(|a| a.name)
         .collect();
 
-    let wanted_artifacts = get_artifact_names();
+    let wanted_artifacts = get_artifact_names()?;
     let artifact_to_download = wanted_artifacts
         .iter()
         .find(|name| available_artifacts.contains(name))
@@ -592,6 +649,7 @@ fn run_build(branch: Option<&str>, pr: Option<u64>, interactive: bool, args: &[S
     } else {
         resolve_branch_or_pr(branch, pr)?
     };
+    validate_branch_name(&branch)?;
 
     let binary_path = dirs::home_dir()
         .context("Could not find home directory")?
@@ -631,7 +689,7 @@ fn select_branch() -> Result<String> {
     let mut branches = Vec::new();
 
     // Walk directory to find all 'spiced' binaries
-    for entry in WalkDir::new(&base_dir).min_depth(1).max_depth(5) {
+    for entry in WalkDir::new(&base_dir).min_depth(1) {
         let entry = entry.ok();
         if let Some(entry) = entry {
             if entry.file_type().is_file() && entry.file_name() == "spiced" {
