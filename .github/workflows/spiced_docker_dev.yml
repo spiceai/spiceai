@@ -148,7 +148,7 @@ jobs:
   build-amd64:
     needs: setup
     if: needs.setup.outputs.run_amd64 == 'true'
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     env:
       RUST_PROFILE: release
 

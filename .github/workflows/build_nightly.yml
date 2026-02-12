@@ -376,7 +376,7 @@ jobs:
     needs: [check_commits, setup, build-linux-x64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: spicehq-dev-runners
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6

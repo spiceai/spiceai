@@ -3,5 +3,5 @@ tests:
     spicepod_path: accelerated/on_zero_results/file[parquet]-duckdb[memory]-on_zero_results_small.yaml
     query_set: clickbench
     query_overrides: duckdb
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
     ready_wait: 1800

@@ -108,7 +108,7 @@ async fn test_cayenne_with_partitioned_tpch() -> Result<(), String> {
             let queries = QuerySet::Tpch
                 .get_queries(None, None, None)
                 .await
-                .expect("to get queries");
+                .expect("should get TPCH queries");
 
             let queries = vec![
                 queries.get(1).expect("TPCH q2 missing"),

@@ -120,6 +120,9 @@ pub enum QuerySetArg {
     #[value(name = "tpch[parameterized]")]
     #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
+    #[value(name = "saffron[parameterized]")]
+    #[serde(rename = "saffron[parameterized]")]
+    ParameterizedSaffron,
     /// Scenario query set loaded from a file (use --scenario-query-file)
     Scenario,
 }
@@ -162,6 +165,10 @@ pub enum QueryOverridesArg {
     DatabricksCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
+    #[serde(rename = "saffron-views")]
+    SaffronViews,
+    #[serde(rename = "saffron-duckdb-cte")]
+    SaffronDuckdbCTE,
     #[serde(rename = "dynamodb")]
     #[value(name = "dynamodb")]
     DynamoDB,
@@ -174,6 +181,7 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
             QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
+            QuerySetArg::ParameterizedSaffron => QuerySet::ParameterizedSaffron,
             QuerySetArg::Scenario => {
                 // This should never be reached - callers must use DatasetTestArgs::load_query_set()
                 // for Scenario query sets as they require loading from a file.
@@ -193,6 +201,10 @@ impl PartialEq<QuerySet> for QuerySetArg {
                 | (QuerySetArg::Tpcds, QuerySet::Tpcds)
                 | (QuerySetArg::Clickbench, QuerySet::Clickbench)
                 | (QuerySetArg::ParameterizedTpch, QuerySet::ParameterizedTpch)
+                | (
+                    QuerySetArg::ParameterizedSaffron,
+                    QuerySet::ParameterizedSaffron
+                )
                 | (QuerySetArg::Scenario, QuerySet::Scenario { .. })
         )
     }
@@ -272,6 +284,8 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
             QueryOverridesArg::IcebergHadoop => QueryOverrides::IcebergHadoop,
+            QueryOverridesArg::SaffronViews => QueryOverrides::SaffronViews,
+            QueryOverridesArg::SaffronDuckdbCTE => QueryOverrides::SaffronDuckdbCTE,
             QueryOverridesArg::DynamoDB => QueryOverrides::DynamoDB,
         }
     }
