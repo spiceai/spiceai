@@ -6435,6 +6435,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dialoguer"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25f104b501bf2364e78d0d3974cbc774f738f5865306ed128e1e0d7499c0ad96"
+dependencies = [
+ "console 0.16.2",
+ "shell-words",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7414,9 +7426,9 @@ dependencies = [
 
 [[package]]
 name = "flate2"
-version = "1.1.8"
+version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b375d6465b98090a5f25b1c7703f3859783755aa9a80433b36e0379a3ec2f369"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "libz-sys",
@@ -14064,6 +14076,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pr-builds"
+version = "2.0.0-unstable"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dialoguer 0.12.0",
+ "dirs",
+ "flate2",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15252,7 +15280,7 @@ dependencies = [
  "arrow-flight",
  "arrow-json",
  "clap",
- "dialoguer",
+ "dialoguer 0.11.0",
  "dirs",
  "flight_client",
  "futures",
@@ -17882,7 +17910,7 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
- "dialoguer",
+ "dialoguer 0.11.0",
  "dirs",
  "dotenvy",
  "flate2",
@@ -23264,9 +23292,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.5.5"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40990edd51aae2c2b6907af74ffb635029d5788228222c4bb811e9351c0caad3"
+checksum = "a7948af682ccbc3342b6e9420e8c51c1fe5d7bf7756002b4a3c6cabfe96a7e3c"
 
 [[package]]
 name = "zmij"
