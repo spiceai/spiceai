@@ -1297,7 +1297,7 @@ fn transform_spicepod(
         .insert("s3_auth".to_string(), ParamValue::String("key".to_string()));
     params.data.insert(
         "s3_key".to_string(),
-        ParamValue::String("${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}".to_string()),
+        ParamValue::String("${secrets:SNAPSHOT_S3_ACCESS_KEY_ID}".to_string()),
     );
     params.data.insert(
         "s3_secret".to_string(),
