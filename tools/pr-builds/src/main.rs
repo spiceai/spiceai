@@ -55,6 +55,7 @@ struct Cli {
 enum Commands {
     /// Trigger a build for the current (or specified) branch.
     ///
+    /// Triggers the 'build_and_release' workflow in GitHub Actions.
     /// If an active build exists for the latest commit (SHA-based), it will be reused.
     /// If a successful build exists (for this commit), no action is taken.
     Trigger {
@@ -72,7 +73,10 @@ enum Commands {
         #[arg(short, long)]
         wait: bool,
     },
-    /// Install the latest binary for the current (or specified) branch
+    /// Install the latest binary for the current (or specified) branch.
+    ///
+    /// Downloads and installs the 'spiced' binary from the latest successful
+    /// GitHub Actions run for the branch.
     Install {
         /// Branch to install binary for. Defaults to current branch.
         #[arg(short, long)]
@@ -82,7 +86,10 @@ enum Commands {
         #[arg(short, long)]
         pr: Option<u64>,
     },
-    /// Run the binary for the current (or specified) branch
+    /// Run the binary for the current (or specified) branch.
+    ///
+    /// If the binary is not installed locally, it will be automatically downloaded
+    /// and installed from the latest successful build.
     Run {
         /// Branch to run binary for. Defaults to current branch.
         #[arg(short, long)]
