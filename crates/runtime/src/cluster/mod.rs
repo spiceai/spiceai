@@ -801,19 +801,28 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         .await;
 
     let scheduler_registry_future = {
-        let app = rt.app.read().await;
-        let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
-        if let Some(config) = config {
+        let Some(app) = rt.app_read().await else {
+            tracing::warn!(
+                "No app found in runtime during cluster scheduler initialization; skipping scheduler registry and partition manager setup"
+            );
+            return Ok(None);
+        };
+
+        if let Some(ref config) = app.runtime.scheduler {
             // Initialize partition manager with the configured object store
-            match partition::build_partition_metadata_store(rt, &config).await {
+            match partition::build_partition_metadata_store(rt, config).await {
                 Ok(store) => {
                     let partition_manager = Arc::new(PartitionManager::new(store));
                     rt.set_partition_manager(Arc::clone(&partition_manager))
                         .await;
 
                     // Initialize partition metadata for all accelerated tables
-                    if let Err(err) =
-                        partition::initialize_partition_metadata(rt, &partition_manager).await
+                    if let Err(err) = partition::initialize_partition_metadata(
+                        rt.datafusion(),
+                        Arc::clone(&app),
+                        &partition_manager,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             "Failed to initialize partition metadata during scheduler startup: {err}"
@@ -830,7 +839,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                         .unwrap_or_default();
 
                     let pm_task = PartitionManagementTask::new(
-                        rt.app(),
+                        Arc::clone(&app),
                         rt.datafusion(),
                         rt.tokio_io_runtime(),
                         Arc::clone(&partition_manager),

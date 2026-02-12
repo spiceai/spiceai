@@ -19,18 +19,11 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use crate::{
     accelerated_table::AcceleratedTable,
     cluster::partition::{
-        Error, PartitionDiscoverySnafu, RegisterTableSnafu, Result, RuntimeEnvBuildSnafu,
-        metadata::PartitionValue,
+        Error, PartitionDiscoverySnafu, RegisterTableSnafu, Result, metadata::PartitionValue,
     },
     datafusion::DataFusion,
 };
-use datafusion::{
-    execution::{
-        SessionStateBuilder, object_store::ObjectStoreRegistry, runtime_env::RuntimeEnvBuilder,
-    },
-    prelude::SessionContext,
-    sql::TableReference,
-};
+use datafusion::{execution::SessionStateBuilder, prelude::SessionContext, sql::TableReference};
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 
@@ -41,7 +34,6 @@ pub async fn table_partition_values(
     table: &TableReference,
     partitioning: &[PartitionedBy],
     df: &Arc<DataFusion>,
-    object_store_registry: Arc<dyn ObjectStoreRegistry>,
 ) -> Result<Vec<PartitionValue>> {
     let table_name = table.to_string();
 
@@ -69,7 +61,7 @@ pub async fn table_partition_values(
         "Querying for partition values"
     );
 
-    let batches = execute_partition_discovery_query(df, object_store_registry, table, &sql).await?;
+    let batches = execute_partition_discovery_query(df, table, &sql).await?;
 
     // Convert record batches to partition value strings
     let mut partition_values = Vec::new();
@@ -114,7 +106,6 @@ pub async fn table_partition_values(
 /// acceleration will be empty (for schedulers).
 async fn execute_partition_discovery_query(
     df: &Arc<DataFusion>,
-    object_store_registry: Arc<dyn ObjectStoreRegistry>,
     table: &TableReference,
     sql: &str,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>> {
@@ -138,15 +129,11 @@ async fn execute_partition_discovery_query(
     };
 
     let ctx = SessionContext::new_with_state(
-        SessionStateBuilder::default()
-            .with_runtime_env(
-                RuntimeEnvBuilder::default()
-                    .with_object_store_registry(object_store_registry)
-                    .build_arc()
-                    .context(RuntimeEnvBuildSnafu)?,
-            )
-            .build(),
+        SessionStateBuilder::new_from_existing(df.ctx.state()).build(),
     );
+
+    // Must deregister table in this context before registering source table.
+    let _ = ctx.deregister_table(table.clone());
     ctx.register_table(table.clone(), acc.table_provider().await)
         .context(RegisterTableSnafu {
             table: table_name.clone(),

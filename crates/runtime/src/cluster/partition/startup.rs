@@ -25,7 +25,6 @@ use datafusion::{logical_expr::Expr, sql::TableReference};
 use datafusion_proto::bytes::Serializeable;
 use object_store::ObjectStore;
 use object_store::prefix::PrefixStore;
-use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
@@ -40,6 +39,7 @@ use crate::{
         ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
         PartitionExpressionDeserializationSnafu, PartitionMetadataInitSnafu, discovery,
     },
+    datafusion::DataFusion,
 };
 
 /// Builds an object store for partition metadata from scheduler configuration.
@@ -66,13 +66,10 @@ pub async fn build_partition_metadata_store(
 ///    - Discover all required partitions from source
 ///    - Update with all partitions marked as unassigned
 pub async fn initialize_partition_metadata(
-    rt: &Arc<Runtime>,
+    df: Arc<DataFusion>,
+    app: Arc<App>,
     partition_manager: &PartitionManager,
 ) -> Result<()> {
-    let Some(app) = rt.app().read().await.clone() else {
-        tracing::warn!("No application found in runtime during partition metadata initialization");
-        return Ok(());
-    };
     let tables = accelerated_tables(&app);
 
     if tables.is_empty() {
@@ -101,24 +98,18 @@ pub async fn initialize_partition_metadata(
             continue;
         }
 
-        let partition_values = match discovery::table_partition_values(
-            &table,
-            &partitioning,
-            &rt.datafusion(),
-            Arc::new(SpiceObjectStoreRegistry::new(rt.tokio_io_runtime())),
-        )
-        .await
-        {
-            Ok(values) => values,
-            Err(e) => {
-                tracing::warn!(
-                    table = %table_name,
-                    error = %e,
-                    "Failed to discover partition values, leaving blank metadata"
-                );
-                continue;
-            }
-        };
+        let partition_values =
+            match discovery::table_partition_values(&table, &partitioning, &df).await {
+                Ok(values) => values,
+                Err(e) => {
+                    tracing::warn!(
+                        table = %table_name,
+                        error = %e,
+                        "Failed to discover partition values, leaving blank metadata"
+                    );
+                    continue;
+                }
+            };
 
         match partition_manager
             .set_unassigned_partitions(&table, partition_values)
@@ -181,9 +172,7 @@ pub async fn executor_request_initial_partitions(
     executor_url: String,
 ) -> Result<HashMap<TableReference, Vec<Expr>>> {
     let response = client
-        .allocate_initial_partitions(AllocateInitialPartitionsRequest {
-            executor_id: executor_url,
-        })
+        .allocate_initial_partitions(AllocateInitialPartitionsRequest { executor_url })
         .await
         .context(PartitionAllocationRequestSnafu)?
         .into_inner();

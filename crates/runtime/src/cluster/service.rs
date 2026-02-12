@@ -562,14 +562,21 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<AllocateInitialPartitionsRequest>,
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
-        let AllocateInitialPartitionsRequest { executor_id } = request.into_inner();
+        let AllocateInitialPartitionsRequest { executor_url } = request.into_inner();
+
+        // Current standard is to have executor id be without scheme.
+        let executor_id = if let Some(index) = executor_url.find("://") {
+            &executor_url[index + 3..]
+        } else {
+            &executor_url
+        };
 
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
-        match create_executor_flight_client(&executor_id, tls_config_opt) {
+        match create_executor_flight_client(&executor_url, tls_config_opt) {
             Ok(client) => {
                 let mut flight_client_registry =
                     self.executor_registry.flight_sql_clients.write().await;
-                flight_client_registry.insert(executor_id.clone(), client);
+                flight_client_registry.insert(executor_id.to_string(), client);
             }
             Err(e) => {
                 tracing::warn!(
@@ -587,7 +594,7 @@ impl ClusterService for ClusterServiceImpl {
 
                 for table_ref in super::partition::accelerated_tables(app).keys() {
                     match partition_manager
-                        .allocate_partitions(table_ref, &executor_id, 10)
+                        .allocate_partitions(table_ref, &executor_url, 10)
                         .await
                     {
                         Ok(partitions) => {
@@ -630,7 +637,7 @@ impl ClusterService for ClusterServiceImpl {
         {
             let mut executor_partitions = self.executor_registry.partitions.write().await;
             executor_partitions.insert(
-                executor_id.clone(),
+                executor_id.to_string(),
                 table_partitions
                     .iter()
                     .map(|(tbl, sa)| {

@@ -572,6 +572,11 @@ impl Runtime {
         Arc::clone(&self.app)
     }
 
+    pub async fn read_app(&self) -> Option<Arc<App>> {
+        let guard = self.app.read().await;
+        guard.clone()
+    }
+
     #[must_use]
     pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
         Arc::clone(&self.tool_factories)
@@ -700,7 +705,11 @@ impl Runtime {
             for table_name in affected_tables {
                 let table_ref = TableReference::parse_str(table_name);
                 // Re-acquire lock to get current assignments for this table
-                let assignments = partition_assignments.read().await;
+                // Take a snapshot of the current assignments without holding the lock across .await
+                let assignments = {
+                    let assignments_guard = partition_assignments.read().await;
+                    assignments_guard.clone()
+                };
 
                 if let Err(e) = self
                     .update_partition_refresh_sql(table_ref.clone(), &assignments)

@@ -20,7 +20,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use datafusion::sql::TableReference;
 use futures::future::join_all;
-use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_proto::scheduler_control_message::Message as SchedulerControlMessageEnum;
 use runtime_proto::{BytesArray, SchedulerControlMessage, UpdatePartitions};
 use snafu::prelude::*;
@@ -33,9 +32,9 @@ use crate::cluster::partition::{
     PartitionManager, PartitionMetadata, PartitionValue, partition_value_to_bytes,
 };
 use crate::datafusion::DataFusion;
+use crate::datafusion::resolved_equality;
 use app::App;
 use tokio::runtime::Handle;
-use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -110,9 +109,23 @@ pub struct PartitionManagementConfig {
 
 impl From<spicepod::component::runtime::PartitionManagement> for PartitionManagementConfig {
     fn from(config: spicepod::component::runtime::PartitionManagement) -> Self {
-        let interval = fundu::parse_duration(&config.interval).unwrap_or(Duration::from_secs(30));
+        let interval = fundu::parse_duration(&config.interval).unwrap_or_else(|e| {
+            tracing::warn!(
+                "Invalid partition management interval '{}': {}. Using default 30s.",
+                config.interval,
+                e
+            );
+            Duration::from_secs(30)
+        });
         let discovery_timeout =
-            fundu::parse_duration(&config.discovery_timeout).unwrap_or(Duration::from_secs(60));
+            fundu::parse_duration(&config.discovery_timeout).unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Invalid partition management discovery timeout '{}': {}. Using default 60s.",
+                    config.discovery_timeout,
+                    e
+                );
+                Duration::from_secs(60)
+            });
 
         Self {
             interval,
@@ -140,7 +153,7 @@ impl Default for PartitionManagementConfig {
 /// 3. Removing partitions that no longer exist in the source and notifying executors to unload them.
 /// 4. Assigning unassigned partitions to executors.
 pub struct PartitionManagementTask {
-    app: Arc<RwLock<Option<Arc<App>>>>,
+    app: Arc<App>,
     df: Arc<DataFusion>,
     io_runtime: Handle,
     partition_manager: Arc<PartitionManager>,
@@ -197,7 +210,7 @@ struct DiscoveryResult {
 
 impl PartitionManagementTask {
     pub fn new(
-        app: Arc<RwLock<Option<Arc<App>>>>,
+        app: Arc<App>,
         df: Arc<DataFusion>,
         io_runtime: Handle,
         partition_manager: Arc<PartitionManager>,
@@ -347,52 +360,50 @@ impl PartitionManagementTask {
 
             // Discover partitions from source using shared logic from startup.rs
             let source_partitions_list = 'discovery: {
-                let app_ref = &self.app;
-                let app_lock = app_ref.read().await;
-                if let Some(app) = app_lock.as_ref() {
-                    if let Some(ds) = app.datasets.iter().find(|d| d.name == table_ref.table()) {
-                        if let Some(acceleration) = &ds.acceleration {
-                            match timeout(
-                                self.config.discovery_timeout,
-                                table_partition_values(
-                                    &table_ref,
-                                    &acceleration.partition_by,
-                                    &self.df,
-                                    Arc::new(SpiceObjectStoreRegistry::new(
-                                        self.io_runtime.clone(),
-                                    )),
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(Ok(partitions)) => break 'discovery Some(partitions),
-                                Ok(Err(e)) => {
-                                    tracing::warn!(
-                                        table = %table_ref,
-                                        error = %e,
-                                        "Failed to discover partitions from source"
-                                    );
-                                }
-                                Err(_) => {
-                                    tracing::warn!(
-                                        table = %table_ref,
-                                        timeout_secs = self.config.discovery_timeout.as_secs(),
-                                        "Partition discovery timed out"
-                                    );
-                                }
+                if let Some(ds) = self
+                    .app
+                    .datasets
+                    .iter()
+                    .find(|d| resolved_equality(d.name.clone().into(), table_ref.clone()))
+                {
+                    if let Some(acceleration) = &ds.acceleration {
+                        match timeout(
+                            self.config.discovery_timeout,
+                            table_partition_values(
+                                &table_ref,
+                                &acceleration.partition_by,
+                                &self.df,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(partitions)) => break 'discovery Some(partitions),
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    table = %table_ref,
+                                    error = %e,
+                                    "Failed to discover partitions from source"
+                                );
                             }
-                        } else {
-                            tracing::warn!(
-                                table = %table_ref,
-                                "Acceleration not configured for table"
-                            );
+                            Err(_) => {
+                                tracing::warn!(
+                                    table = %table_ref,
+                                    timeout_secs = self.config.discovery_timeout.as_secs(),
+                                    "Partition discovery timed out"
+                                );
+                            }
                         }
                     } else {
                         tracing::warn!(
                             table = %table_ref,
-                            "Dataset not found for table"
+                            "Acceleration not configured for table"
                         );
                     }
+                } else {
+                    tracing::debug!(
+                        table = %table_ref,
+                        "Dataset not found for table (might be a view or not accelerated)"
+                    );
                 }
                 None
             };
@@ -603,7 +614,7 @@ impl PartitionManagementTask {
                     // Track executors that had this partition
                     for executor_id in &partition.assigned_executors {
                         executors_to_notify
-                            .entry(executor_id.clone())
+                            .entry(executor_id.to_string())
                             .or_default()
                             .push(partition_value.clone());
                     }
@@ -829,7 +840,7 @@ impl PartitionManagementTask {
             if let Some(metadata) = self.partition_manager.get_cached_table_metadata(&table_ref) {
                 for partition in &metadata.partitions {
                     for executor_id in &partition.assigned_executors {
-                        let load = loads.entry(executor_id.clone()).or_default();
+                        let load = loads.entry(executor_id.to_string()).or_default();
                         load.partition_count += 1;
                         load.tables.insert(table_name.clone());
                     }
@@ -973,7 +984,7 @@ impl PartitionManagementTask {
         loop {
             match self
                 .partition_manager
-                .assign_partition(table, partition_value, executor_id)
+                .assign_partition(table, partition_value, &executor_id)
                 .await
             {
                 Ok(()) => return Ok(()),

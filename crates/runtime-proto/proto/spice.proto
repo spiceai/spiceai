@@ -126,7 +126,7 @@ message UpdatePartitions {
 // Request message for AllocateInitialPartitions RPC.
 message AllocateInitialPartitionsRequest {
   // Executor's advertise address (used as identifier).
-  string executor_id = 1;
+  string executor_url = 1;
 }
 
 message BytesArray {

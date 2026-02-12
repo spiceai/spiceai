@@ -73,11 +73,6 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Failed to build runtime environment: {source}"))]
-    RuntimeEnvBuild {
-        source: datafusion::error::DataFusionError,
-    },
-
     #[snafu(display("Failed to register table {table}: {source}"))]
     RegisterTable {
         table: String,
