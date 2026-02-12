@@ -193,13 +193,12 @@ impl ExecutorRegistry {
         let connections = self.connections.read().await;
 
         if let Some(connection) = connections.get(executor_id) {
-            connection
-                .request_tx
-                .send(command)
-                .await
-                .map_err(|_| Error::SendFailed {
-                    executor_id: executor_id.to_string(),
-                })?;
+            let tx = connection.request_tx.clone();
+            drop(connections);
+
+            tx.send(command).await.map_err(|_| Error::SendFailed {
+                executor_id: executor_id.to_string(),
+            })?;
             Ok(())
         } else {
             Err(Error::SendFailed {

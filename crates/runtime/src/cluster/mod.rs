@@ -846,9 +846,8 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                     };
 
                     let pm_task = PartitionManagementTask::new(
-                        Arc::clone(&app),
+                        rt.app(),
                         rt.datafusion(),
-                        rt.tokio_io_runtime(),
                         Arc::clone(&partition_manager),
                         Arc::clone(&scheduler_executor_registry),
                         pm_config,

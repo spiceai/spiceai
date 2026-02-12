@@ -23,6 +23,7 @@ use futures::future::join_all;
 use runtime_proto::scheduler_control_message::Message as SchedulerControlMessageEnum;
 use runtime_proto::{BytesArray, SchedulerControlMessage, UpdatePartitions};
 use snafu::prelude::*;
+use tokio::sync::RwLock;
 use tokio::time::{MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -178,9 +179,8 @@ impl Default for PartitionManagementConfig {
 /// 3. Removing partitions that no longer exist in the source and notifying executors to unload them.
 /// 4. Assigning unassigned partitions to executors.
 pub struct PartitionManagementTask {
-    app: Arc<App>,
+    app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
-    io_runtime: Handle,
     partition_manager: Arc<PartitionManager>,
     executor_registry: Arc<ExecutorRegistry>,
 
@@ -235,9 +235,8 @@ struct DiscoveryResult {
 
 impl PartitionManagementTask {
     pub fn new(
-        app: Arc<App>,
+        app: Arc<RwLock<Option<Arc<App>>>>,
         df: Arc<DataFusion>,
-        io_runtime: Handle,
         partition_manager: Arc<PartitionManager>,
         executor_registry: Arc<ExecutorRegistry>,
         config: PartitionManagementConfig,
@@ -246,7 +245,6 @@ impl PartitionManagementTask {
         Self {
             app,
             df,
-            io_runtime,
             partition_manager,
             executor_registry,
             config,
@@ -363,6 +361,13 @@ impl PartitionManagementTask {
         let mut new_partitions = Vec::new();
         let mut removed_partitions = Vec::new();
 
+        let Some(app) = &*self.app.read().await else {
+            tracing::warn!("App not initialized, skipping partition discovery");
+            return Ok(DiscoveryResult {
+                new_partitions,
+                removed_partitions,
+            });
+        };
         for table_name in &state.tables {
             let table_ref = TableReference::parse_str(table_name);
 
@@ -385,15 +390,13 @@ impl PartitionManagementTask {
 
             // Discover partitions from source using shared logic from startup.rs
             let source_partitions_list = 'discovery: {
-                let acceleration = self
-                    .app
+                let acceleration = app
                     .datasets
                     .iter()
                     .find(|d| resolved_equality(d.name.clone().into(), table_ref.clone()))
                     .and_then(|d| d.acceleration.as_ref())
                     .or_else(|| {
-                        self.app
-                            .views
+                        app.views
                             .iter()
                             .find(|v| resolved_equality(v.name.clone().into(), table_ref.clone()))
                             .and_then(|v| v.acceleration.as_ref())
@@ -424,11 +427,10 @@ impl PartitionManagementTask {
                     }
                 } else {
                     let exists =
-                        self.app
-                            .datasets
+                        app.datasets
                             .iter()
                             .any(|d| resolved_equality(d.name.clone().into(), table_ref.clone()))
-                            || self.app.views.iter().any(|v| {
+                            || app.views.iter().any(|v| {
                                 resolved_equality(v.name.clone().into(), table_ref.clone())
                             });
 

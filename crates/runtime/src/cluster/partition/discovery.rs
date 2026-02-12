@@ -23,11 +23,7 @@ use crate::{
     },
     datafusion::DataFusion,
 };
-use datafusion::{
-    execution::{SessionState, SessionStateBuilder},
-    prelude::SessionContext,
-    sql::TableReference,
-};
+use datafusion::{execution::SessionStateBuilder, prelude::SessionContext, sql::TableReference};
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 
