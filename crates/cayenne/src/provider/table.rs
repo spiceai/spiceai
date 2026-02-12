@@ -4708,8 +4708,13 @@ impl CayenneTableProvider {
         }
         let filter = &filters[0];
 
-        // Build protected snapshot listing tables for file-based scanning
-        let protected_snapshot_tables = self.build_protected_snapshot_listing_tables()?;
+        // Build protected snapshot listing tables for PK-based strategies only.
+        // Position-based tables have no protected snapshots.
+        let protected_snapshot_tables = if self.pk_deletion_strategy.is_position_based() {
+            None
+        } else {
+            Some(self.build_protected_snapshot_listing_tables()?)
+        };
 
         Ok(Arc::new(DeletionExec::new(
             Arc::new(FileBasedDeletionSink::new(

@@ -55,7 +55,7 @@ pub(crate) struct FileBasedDeletionResult {
 }
 
 /// Result of scanning a single listing table for retention-eligible files.
-struct DeletionScanResult {
+struct DeletionCheckScanResult {
     /// Files whose `max(retention_col) < threshold`.
     files: Vec<(ObjectMeta, Option<usize>)>,
     /// `true` when every file in the table matched — the table is fully expired.
@@ -82,8 +82,8 @@ pub struct FileBasedDeletionSink {
     /// Main listing table to enumerate files and collect per-file statistics.
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     /// Protected snapshot listing tables keyed by snapshot ID (PK-based strategies only).
-    /// Empty for position-based tables.
-    protected_snapshot_tables: Vec<(String, Arc<ListingTable>)>,
+    /// `None` for position-based tables.
+    protected_snapshot_tables: Option<Vec<(String, Arc<ListingTable>)>>,
     /// The retention filter expression (e.g., `event_time < literal`).
     filter: Expr,
     /// Table name for logging.
@@ -106,7 +106,7 @@ impl FileBasedDeletionSink {
     ///
     /// * `listing_table` - Main listing table for the current snapshot.
     /// * `protected_snapshot_tables` - Protected snapshot listing tables keyed
-    ///   by snapshot ID. Pass empty vec for position-based tables.
+    ///   by snapshot ID. `None` for position-based tables.
     /// * `filter` - Retention filter expression.
     /// * `table_name` - Table name for logging.
     /// * `catalog` - Metadata catalog for clearing snapshot sequence records.
@@ -116,7 +116,7 @@ impl FileBasedDeletionSink {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         listing_table: Arc<RwLock<Arc<ListingTable>>>,
-        protected_snapshot_tables: Vec<(String, Arc<ListingTable>)>,
+        protected_snapshot_tables: Option<Vec<(String, Arc<ListingTable>)>>,
         filter: Expr,
         table_name: String,
         catalog: Arc<dyn MetadataCatalog>,
@@ -157,7 +157,7 @@ impl FileBasedDeletionSink {
         listing_table: &ListingTable,
         retention_col: &str,
         retention_threshold: &ScalarValue,
-    ) -> CatalogResult<DeletionScanResult> {
+    ) -> CatalogResult<DeletionCheckScanResult> {
         // Call list_files_for_scan — lists all files + collects per-file stats.
         // collect_stat is true by default via SessionConfig::default().
         let (file_groups, _aggregate_stats) = listing_table
@@ -197,7 +197,7 @@ impl FileBasedDeletionSink {
             }
         }
 
-        Ok(DeletionScanResult {
+        Ok(DeletionCheckScanResult {
             all_matched: !eligible.is_empty() && eligible.len() == total_files,
             files: eligible,
         })
@@ -329,7 +329,7 @@ impl FileBasedDeletionSink {
         let mut emptied_snapshot_ids = Vec::new();
 
         for (idx, (snapshot_id, snapshot_table)) in
-            self.protected_snapshot_tables.iter().enumerate()
+            self.protected_snapshot_tables.iter().flatten().enumerate()
         {
             let scan_result = self
                 .retention_eligible_files(&ctx, snapshot_table, &col_name, &threshold)
