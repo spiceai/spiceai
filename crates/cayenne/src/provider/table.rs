@@ -4694,7 +4694,8 @@ impl CayenneTableProvider {
     /// File-level delete path.
     ///
     /// Creates a [`FileBasedDeletionSink`] that discovers eligible files
-    /// (where `max(col) < threshold_value`) and deletes them.
+    /// (where `max(col) < threshold_value`) and deletes them from the main
+    /// snapshot and all protected snapshot directories.
     fn delete_using_files(
         &self,
         filters: &[Expr],
@@ -4707,11 +4708,24 @@ impl CayenneTableProvider {
         }
         let filter = &filters[0];
 
+        // Build protected snapshot listing tables for PK-based strategies only.
+        // Position-based tables have no protected snapshots.
+        let protected_snapshot_tables = if self.pk_deletion_strategy.is_position_based() {
+            None
+        } else {
+            Some(self.build_protected_snapshot_listing_tables()?)
+        };
+
         Ok(Arc::new(DeletionExec::new(
             Arc::new(FileBasedDeletionSink::new(
                 Arc::clone(&self.listing_table),
+                protected_snapshot_tables,
                 filter.clone(),
                 self.table_metadata.table_name.clone(),
+                Arc::clone(&self.catalog),
+                Arc::clone(&self.protected_snapshots),
+                self.table_metadata.table_id,
+                self.table_metadata.path.clone(),
             )),
             &self.table_metadata.schema,
         )))
@@ -4722,40 +4736,11 @@ impl CayenneTableProvider {
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // Collect protected snapshot listing tables for deletion scanning
-        let protected_snapshot_tables = {
-            let protected_snapshots = {
-                let guard = self.protected_snapshots.read().map_err(|_| {
-                    datafusion_common::DataFusionError::Execution(
-                        "Protected snapshots lock poisoned".to_string(),
-                    )
-                })?;
-                guard.clone()
-            };
-
-            let mut tables = Vec::with_capacity(protected_snapshots.len());
-            for (snapshot_id, _) in protected_snapshots {
-                let snapshot_url = Self::snapshot_dir_url(
-                    &self.table_metadata.path,
-                    self.table_metadata.table_id,
-                    &snapshot_id,
-                );
-
-                let listing_table = Self::create_listing_table(
-                    &snapshot_url,
-                    Arc::clone(&self.table_metadata.schema),
-                    self.context.file_format(),
-                    &self.pk_deletion_strategy,
-                )
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
-                    ))
-                })?;
-                tables.push(listing_table);
-            }
-            tables
-        };
+        let snapshot_tables: Vec<Arc<ListingTable>> = self
+            .build_protected_snapshot_listing_tables()?
+            .into_iter()
+            .map(|(_, table)| table)
+            .collect();
 
         Ok(Arc::new(DeletionExec::new(
             Arc::new(CayenneDeletionSink::new(
@@ -4767,17 +4752,55 @@ impl CayenneTableProvider {
                 self.pk_deletion_strategy.clone(),
                 self.pk_row_converter.as_ref().map(Arc::clone),
                 self.pk_column_indices.clone(),
-                protected_snapshot_tables,
+                snapshot_tables,
             )),
             &self.table_metadata.schema,
         )))
+    }
+
+    /// Build listing tables for all protected snapshots.
+    ///
+    /// Returns a vec of `(snapshot_id, listing_table)` pairs.
+    fn build_protected_snapshot_listing_tables(
+        &self,
+    ) -> datafusion_common::Result<Vec<(String, Arc<ListingTable>)>> {
+        let protected_snapshots = {
+            let guard = self.protected_snapshots.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Protected snapshots lock poisoned".to_string(),
+                )
+            })?;
+            guard.clone()
+        };
+
+        let mut result = Vec::with_capacity(protected_snapshots.len());
+        for (snapshot_id, _) in protected_snapshots {
+            let snapshot_url = Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &snapshot_id,
+            );
+
+            let listing_table = Self::create_listing_table(
+                &snapshot_url,
+                Arc::clone(&self.table_metadata.schema),
+                self.context.file_format(),
+                &self.pk_deletion_strategy,
+            )
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
+                ))
+            })?;
+            result.push((snapshot_id, listing_table));
+        }
+        Ok(result)
     }
 
     /// Returns `true` if deletes can use whole-file deletion instead of per-row deletion vectors.
     ///
     /// Requirements:
     /// - Time-based retention is configured (`time_retention_filter_builder`).
-    /// - The table uses a position-based deletion strategy.
     /// - The table is **not** backed by S3 storage.
     /// - The filter is a single `retention_col < threshold` expression matching
     ///   the configured retention column. Non-retention deletes (e.g. CDC
@@ -4788,9 +4811,7 @@ impl CayenneTableProvider {
             return false;
         };
 
-        if !self.pk_deletion_strategy.is_position_based()
-            || self.table_metadata.path.starts_with("s3://")
-        {
+        if self.table_metadata.path.starts_with("s3://") {
             return false;
         }
 
