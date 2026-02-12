@@ -82,12 +82,12 @@ fn spawn_control_stream(
     metrics_reader: Option<Arc<MetricsReader>>,
     poll_now_notify: Arc<Notify>,
     outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
-    partition_update_handler: Option<PartitionUpdateHandler>,
+    partition_update_handler: Option<&PartitionUpdateHandler>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
     let outbound_tx_state_for_task = Arc::clone(&outbound_tx_state);
-    let partition_update_handler = partition_update_handler.clone();
+    let partition_update_handler = partition_update_handler.cloned();
 
     let task = tokio::spawn(async move {
         let tls_enabled = client_tls_config.is_some();
@@ -263,7 +263,7 @@ fn spawn_control_stream(
                                         &outbound_tx,
                                         metrics_reader.as_deref(),
                                         &poll_now_notify,
-                                        partition_update_handler.clone(),
+                                        partition_update_handler.as_ref(),
                                     )
                                     .await;
                                 }
@@ -316,7 +316,7 @@ async fn handle_scheduler_message(
     outbound_tx: &mpsc::Sender<ExecutorControlMessage>,
     metrics_reader: Option<&MetricsReader>,
     poll_now_notify: &Notify,
-    partition_update_handler: Option<PartitionUpdateHandler>,
+    partition_update_handler: Option<&PartitionUpdateHandler>,
 ) {
     match message {
         SchedulerMessage::RequestMetrics(request) => {
@@ -503,7 +503,7 @@ impl ControlStreamManager {
                 self.metrics_reader.clone(),
                 Arc::clone(&self.poll_now_notify),
                 Arc::clone(&outbound_tx_state),
-                self.partition_update_handler.clone(),
+                self.partition_update_handler.as_ref(),
             );
             self.streams.insert(address, handle);
         }

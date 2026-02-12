@@ -854,24 +854,23 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                         pm_shutdown_for_task,
                     );
 
-                    let _ = self_for_task
-                        .start_runtime_task(
-                            CLUSTER_PARTITION_MANAGEMENT_TASK,
-                            Some(pm_shutdown),
-                            async move {
-                                pm_task.run().await.map_err(|e| {
-                                    crate::Error::FailedToStartClusterScheduler {
-                                        source: Box::new(e),
-                                    }
-                                })
-                            },
-                        )
-                        .await;
+                    Some(self_for_task.start_runtime_task(
+                        CLUSTER_PARTITION_MANAGEMENT_TASK,
+                        Some(pm_shutdown),
+                        async move {
+                            pm_task.run().await.map_err(|err| {
+                                crate::Error::FailedToRegisterScheduler {
+                                    source: Box::new(err),
+                                }
+                            })
+                        },
+                    ))
                 }
                 Err(err) => {
                     tracing::error!("Failed to build partition metadata store: {err}");
+                    None
                 }
-            }
+            };
 
             let registry_shutdown = CancellationToken::new();
             let registry_shutdown_for_task = registry_shutdown.clone();

@@ -302,12 +302,10 @@ impl PartitionManagementTask {
                 .await?;
         }
 
-        let unassigned = self.find_unassigned_partitions(&state)?;
+        let unassigned = self.find_unassigned_partitions(&state);
 
         if !unassigned.is_empty() {
-            let assignments = self
-                .assign_unassigned_partitions(unassigned, &state)
-                .await?;
+            let assignments = self.assign_unassigned_partitions(unassigned, &state);
 
             let commit_result = self.commit_assignments(assignments).await?;
 
@@ -371,9 +369,9 @@ impl PartitionManagementTask {
             let table_ref = TableReference::parse_str(table_name);
 
             // Get current metadata
-            let metadata = match self.partition_manager.get_cached_table_metadata(&table_ref) {
-                Some(m) => m,
-                None => continue,
+            let Some(metadata) = self.partition_manager.get_cached_table_metadata(&table_ref)
+            else {
+                continue;
             };
 
             // Use HashMap for set comparison of partition values
@@ -653,7 +651,7 @@ impl PartitionManagementTask {
                     // Track executors that had this partition
                     for executor_id in &partition.assigned_executors {
                         executors_to_notify
-                            .entry(executor_id.to_string())
+                            .entry(executor_id.clone())
                             .or_default()
                             .push(partition_value.clone());
                     }
@@ -727,12 +725,11 @@ impl PartitionManagementTask {
         table: &TableReference,
         partitions: Vec<PartitionValue>,
     ) -> Result<()> {
-        let df = self.df.clone();
         let mut removed_partitions_map = HashMap::new();
 
         let mut partitions_bytes = Vec::new();
         for p in partitions {
-            let bytes = partition_value_to_bytes(p, table, &df)
+            let bytes = partition_value_to_bytes(p, table, &self.df)
                 .await
                 .context(PartitionValueConversionSnafu)?;
             partitions_bytes.push(bytes.to_vec());
@@ -764,19 +761,17 @@ impl PartitionManagementTask {
         Ok(())
     }
 
-    fn find_unassigned_partitions(&self, state: &CycleState) -> Result<Vec<UnassignedPartition>> {
+    fn find_unassigned_partitions(&self, state: &CycleState) -> Vec<UnassignedPartition> {
         let mut unassigned = Vec::new();
 
         for table_name in &state.tables {
             let table_ref = TableReference::parse_str(table_name);
 
-            let metadata =
-                if let Some(m) = self.partition_manager.get_cached_table_metadata(&table_ref) {
-                    m
-                } else {
-                    tracing::warn!(table = %table_name, "No cached metadata, skipping");
-                    continue;
-                };
+            let Some(metadata) = self.partition_manager.get_cached_table_metadata(&table_ref)
+            else {
+                tracing::warn!(table = %table_name, "No cached metadata, skipping");
+                continue;
+            };
 
             for partition in metadata.unassigned_partitions() {
                 unassigned.push(UnassignedPartition {
@@ -791,24 +786,24 @@ impl PartitionManagementTask {
             "Found unassigned partitions"
         );
 
-        Ok(unassigned)
+        unassigned
     }
 
-    async fn assign_unassigned_partitions(
+    fn assign_unassigned_partitions(
         &self,
         unassigned: Vec<UnassignedPartition>,
         state: &CycleState,
-    ) -> Result<Vec<Assignment>> {
+    ) -> Vec<Assignment> {
         if unassigned.is_empty() {
             tracing::debug!("No unassigned partitions to assign");
-            return Ok(Vec::new());
+            return Vec::new();
         }
 
         let mut assignments = Vec::new();
         let mut assignments_this_cycle = 0;
 
         // Build executor load map
-        let mut executor_loads = self.build_executor_loads(state)?;
+        let mut executor_loads = self.build_executor_loads(state);
 
         for unassigned_partition in unassigned {
             if assignments_this_cycle >= self.config.max_assignments_per_cycle {
@@ -820,15 +815,13 @@ impl PartitionManagementTask {
             }
 
             // Select best executor for this partition
-            let executor = if let Some(e) =
-                self.select_executor_for_partition(&unassigned_partition, &executor_loads, state)?
-            {
-                e
-            } else {
+            let Some(executor) =
+                self.select_executor_for_partition(&unassigned_partition, &executor_loads, state)
+            else {
                 tracing::warn!(
                     table = %unassigned_partition.table,
                     partition = ?unassigned_partition.partition_value,
-                    "No suitable executor found for partition"
+                    "No suitable executor found for partition, skipping assignment"
                 );
                 continue;
             };
@@ -853,10 +846,10 @@ impl PartitionManagementTask {
             "Generated partition assignments"
         );
 
-        Ok(assignments)
+        assignments
     }
 
-    fn build_executor_loads(&self, state: &CycleState) -> Result<HashMap<String, ExecutorLoad>> {
+    fn build_executor_loads(&self, state: &CycleState) -> HashMap<String, ExecutorLoad> {
         let mut loads = HashMap::new();
 
         // Initialize with empty loads
@@ -871,7 +864,7 @@ impl PartitionManagementTask {
             if let Some(metadata) = self.partition_manager.get_cached_table_metadata(&table_ref) {
                 for partition in &metadata.partitions {
                     for executor_id in &partition.assigned_executors {
-                        let load = loads.entry(executor_id.to_string()).or_default();
+                        let load = loads.entry(executor_id.clone()).or_default();
                         load.partition_count += 1;
                         load.tables.insert(table_name.clone());
                     }
@@ -879,7 +872,7 @@ impl PartitionManagementTask {
             }
         }
 
-        Ok(loads)
+        loads
     }
 
     fn select_executor_for_partition(
@@ -887,11 +880,11 @@ impl PartitionManagementTask {
         partition: &UnassignedPartition,
         executor_loads: &HashMap<String, ExecutorLoad>,
         state: &CycleState,
-    ) -> Result<Option<ExecutorInfo>> {
+    ) -> Option<ExecutorInfo> {
         let mut candidates: Vec<_> = state.executors.iter().collect();
 
         if candidates.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         // Filter out executors at capacity
@@ -904,7 +897,7 @@ impl PartitionManagementTask {
 
         if candidates.is_empty() {
             tracing::warn!("All executors at capacity");
-            return Ok(None);
+            return None;
         }
 
         // Score each candidate
@@ -921,14 +914,15 @@ impl PartitionManagementTask {
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Return best candidate
-        Ok(scored_candidates
+        scored_candidates
             .first()
-            .map(|(executor, _)| (*executor).clone()))
+            .map(|(executor, _)| (*executor).clone())
     }
 
     // Simple scoring function that considers:
     // 1. Data locality (if executor already has partitions for this table)
     // 2. Current load (number of partitions assigned) for load balancing
+    #[expect(clippy::cast_precision_loss)]
     fn score_executor_for_partition(
         &self,
         executor: &ExecutorInfo,
@@ -1015,7 +1009,7 @@ impl PartitionManagementTask {
         loop {
             match self
                 .partition_manager
-                .assign_partition(table, partition_value, &executor_id)
+                .assign_partition(table, partition_value, executor_id)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -1036,7 +1030,6 @@ impl PartitionManagementTask {
                         "Concurrent modification detected, retrying"
                     );
                     tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(retries))).await;
-                    continue;
                 }
                 Err(e) => {
                     return Err(Error::WriteMetadata {
@@ -1062,8 +1055,8 @@ impl PartitionManagementTask {
         let notifications: Vec<_> = by_executor
             .into_iter()
             .map(|(executor_id, assignments)| {
-                let registry = self.executor_registry.clone();
-                let df = self.df.clone();
+                let registry = Arc::clone(&self.executor_registry);
+                let df = Arc::clone(&self.df);
                 async move {
                     notify_executor_of_assignments(registry, df, executor_id, assignments).await
                 }
