@@ -78,7 +78,7 @@ pub fn write_temp_spicepod(
         .with_context(|| format!("Failed to write temp spicepod: {}", path.display()))?;
 
     println!("    Wrote transformed spicepod to {}", path.display());
-    println!("{}", content);
+    println!("{content}");
 
     Ok(path)
 }
