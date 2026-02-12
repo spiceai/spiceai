@@ -1303,9 +1303,11 @@ fn transform_spicepod(
         "s3_secret".to_string(),
         ParamValue::String("${secrets:SNAPSHOT_S3_SECRET_ACCESS_KEY}".to_string()),
     );
-    params
-        .data
-        .insert("s3_region".to_string(), ParamValue::String(region.clone()));
+    if let Some(ref region) = snapshot_config.region {
+        params
+            .data
+            .insert("s3_region".to_string(), ParamValue::String(region.clone()));
+    }
 
     spicepod.snapshots = Some(Snapshots {
         enabled: true,
