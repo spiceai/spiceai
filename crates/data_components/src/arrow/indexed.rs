@@ -3204,7 +3204,7 @@ mod tests {
     /// Test that `WHERE pk = X AND non_pk_col = Y` correctly applies both filters.
     ///
     /// Regression test: previously `supports_filters_pushdown` returned `Exact` for
-    /// ALL filters when a PK equality was present, causing DataFusion to drop the
+    /// ALL filters when a PK equality was present, causing `DataFusion` to drop the
     /// non-PK filter entirely. The indexed lookup would return the row matching the
     /// PK without checking the additional predicate.
     #[tokio::test]
