@@ -31,8 +31,8 @@ pub struct DispatchArgs {
     #[arg(long)]
     pub(crate) workflow: Workflow,
 
-    #[arg(long, env = "GH_TOKEN")]
-    pub(crate) github_token: String,
+    #[arg(long, env = "GH_TOKEN", required_if_eq("dry_run", "false"))]
+    pub(crate) github_token: Option<String>,
 
     #[arg(long, env = "SPICED_COMMIT", default_value = "")]
     pub(crate) spiced_commit: String,
@@ -43,12 +43,13 @@ pub struct DispatchArgs {
     #[arg(long, default_value = "false", action = ArgAction::Set)]
     pub(crate) update_snapshots: bool,
 
-    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
-    pub(crate) validate: bool,
-
     /// Maximum number of concurrent workflow runs allowed
     #[arg(long)]
     pub(crate) max_concurrent: Option<usize>,
+
+    /// Dry run mode - print the workflow dispatch request without sending it
+    #[arg(long, default_value = "false")]
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]

@@ -24,8 +24,8 @@ use super::constants::{
 };
 use super::delete::{
     is_pk_visible_i64, is_pk_visible_row_key, CayenneDeletionSink, DeletionIdentifier,
-    DeletionVectorWriteSpec, DeletionVectorWriter, Int64PkDeletionFilterExec,
-    KeyBasedDeletionFilterExec,
+    DeletionVectorWriteSpec, DeletionVectorWriter, FileBasedDeletionSink,
+    Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
 };
 use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog};
@@ -47,15 +47,18 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
-use datafusion_common::Constraints;
+use datafusion_common::{Constraints, DFSchema};
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
-use datafusion_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
+use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
+use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::collect;
+use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
@@ -113,6 +116,10 @@ pub struct CayenneTableProvider {
     listing_table: Arc<RwLock<Arc<ListingTable>>>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
+    /// Optional builder to construct time-based retention filter.
+    ///
+    /// Used for period-based retention (e.g. `retention_period: 30d`).
+    time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
     /// Context containing Vortex format with caches and configuration.
     /// If the same context is reused across multiple instances, all internal operations
     /// share the same footer and segment caches, enabling shared memory management.
@@ -178,6 +185,7 @@ pub struct CayenneTableProvider {
 pub struct CayenneTableProviderBuilder {
     catalog: Arc<dyn MetadataCatalog>,
     retention_filters: Vec<Expr>,
+    time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
     context: Option<Arc<CayenneContext>>,
 }
@@ -189,6 +197,7 @@ impl CayenneTableProviderBuilder {
         Self {
             catalog,
             retention_filters: Vec::new(),
+            time_retention_filter_builder: None,
             object_store_config: None,
             context: None,
         }
@@ -201,6 +210,18 @@ impl CayenneTableProviderBuilder {
     #[must_use]
     pub fn with_retention_filters(mut self, filters: Vec<Expr>) -> Self {
         self.retention_filters = filters;
+        self
+    }
+
+    /// Set a time-based retention filter builder.
+    ///
+    /// When set, this builder is used to apply time-based retention filter at scan time.
+    #[must_use]
+    pub fn with_time_retention_filter_builder(
+        mut self,
+        builder: super::retention::TimeRetentionFilterBuilder,
+    ) -> Self {
+        self.time_retention_filter_builder = Some(builder);
         self
     }
 
@@ -235,6 +256,7 @@ impl CayenneTableProviderBuilder {
             table_name,
             self.catalog,
             self.retention_filters,
+            self.time_retention_filter_builder,
             self.object_store_config,
             self.context,
         )
@@ -253,6 +275,7 @@ impl CayenneTableProviderBuilder {
             &table_name,
             self.catalog,
             self.retention_filters,
+            self.time_retention_filter_builder,
             self.object_store_config,
             self.context,
         )
@@ -846,6 +869,7 @@ impl CayenneTableProvider {
         table_name: &str,
         catalog: Arc<dyn MetadataCatalog>,
         retention_filters: Vec<Expr>,
+        time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
         object_store_config: Option<crate::metadata::ObjectStoreConfig>,
         context: Option<Arc<CayenneContext>>,
     ) -> CatalogResult<Self> {
@@ -955,6 +979,7 @@ impl CayenneTableProvider {
             catalog,
             listing_table: Arc::new(RwLock::new(listing_table)),
             retention_filters,
+            time_retention_filter_builder,
             context,
             pk_deletion_strategy,
             pk_row_converter,
@@ -1827,6 +1852,7 @@ impl CayenneTableProvider {
             listing_table: Arc::clone(&self.listing_table),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
+            time_retention_filter_builder: self.time_retention_filter_builder.clone(),
             pk_deletion_strategy: self.pk_deletion_strategy.clone(),
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
@@ -2914,6 +2940,39 @@ impl CayenneTableProvider {
         Ok(row_count)
     }
 
+    /// Wrap a plan with a `FilterExec` that enforces the retention filter.
+    ///
+    /// `ListingTable::scan()` drops non-partition filters — they only influence
+    /// the file-limit heuristic, not the actual scan. Adding a `FilterExec`
+    /// above `DataSourceExec` allows `DataFusion`'s physical optimizer to push
+    /// the predicate into `VortexSource::try_pushdown_filters`, enabling
+    /// file-level pruning via min/max stats and row-level filtering.
+    fn wrap_plan_with_retention_filter(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        retention_filter: &Expr,
+    ) -> Result<Arc<dyn ExecutionPlan>, datafusion_common::DataFusionError> {
+        let arrow_schema = plan.schema();
+        let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone())?;
+        let execution_props = ExecutionProps::new();
+
+        let physical_filter = datafusion_physical_expr::create_physical_expr(
+            retention_filter,
+            &df_schema,
+            &execution_props,
+        )?;
+
+        let filter_exec = FilterExec::try_new(physical_filter, plan)?;
+
+        tracing::trace!(
+            table = %self.table_metadata.table_name,
+            filter = %retention_filter,
+            "Applied retention_filter FilterExec at scan time"
+        );
+
+        Ok(Arc::new(filter_exec))
+    }
+
     async fn apply_retention_filters(&self) -> CatalogResult<u64> {
         use data_components::delete::DeletionSink;
 
@@ -3724,6 +3783,30 @@ impl CayenneTableProvider {
 
     /// Creates a projection that strips additional columns added for deletion filtering.
     ///
+    /// Extend the projection to include columns referenced by `filter` that aren't
+    /// already present. Returns the (possibly extended) projection and whether any
+    /// columns were added (meaning a projection strip is needed later).
+    fn extend_projection_for_retention_filter(
+        &self,
+        projection: Option<Vec<usize>>,
+        filter: &Expr,
+        already_extended: bool,
+    ) -> (Option<Vec<usize>>, bool) {
+        let Some(mut proj) = projection else {
+            return (None, already_extended);
+        };
+        let mut added = already_extended;
+        for col_ref in filter.column_refs() {
+            if let Some((idx, _)) = self.table_metadata.schema.column_with_name(col_ref.name()) {
+                if !proj.contains(&idx) {
+                    proj.push(idx);
+                    added = true;
+                }
+            }
+        }
+        (Some(proj), added)
+    }
+
     /// When filtering by PK, we may have added PK columns to the scan that weren't in the
     /// original projection. This creates a `ProjectionExec` that only outputs the originally
     /// requested columns.
@@ -3978,15 +4061,114 @@ impl CayenneTableProvider {
                 }
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
-                // TODO: Implement Vortex-native deletion support by attaching per-file deletion
-                // vectors via VortexAccessPlan in PartitionedFile.extensions. This allows Vortex
-                // to skip decompressing deleted rows entirely using Selection::ExcludeRoaring.
-                // See: vortex-datafusion VortexAccessPlan and VortexOpener::open()
+                // Position-based deletions are handled at the Vortex scan level; no manual filtering is needed
             }
         }
 
-        // No deletions to apply (position-based deletions are handled at Vortex scan level)
-        Ok(Arc::new(CayenneAccelerationExec::new(plan)))
+        // No deletions to apply (position-based deletions are handled at Vortex scan level).
+        Ok(plan)
+    }
+
+    /// Apply deletion filter including insert records (for main scan path, not protected snapshots).
+    /// Unlike `apply_deletion_filter` which uses empty insert records, this passes the full
+    /// cached insert records needed for the main plan.
+    fn apply_deletion_filter_with_insert_records(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        pk_indices_in_projection: &[usize],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                cached_deleted_pk,
+                cached_insert_records,
+            } => {
+                let deleted_pk_values = {
+                    let guard = cached_deleted_pk.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+                let insert_records_pk_values = {
+                    let guard = cached_insert_records.read().map_err(|_| {
+                        datafusion_common::DataFusionError::Execution(
+                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                        )
+                    })?;
+                    Arc::clone(&guard)
+                };
+
+                if !deleted_pk_values.is_empty() {
+                    tracing::debug!(
+                        "Applying Int64 PK deletion filter ({} deleted keys, {} insert records) to scan of table {}",
+                        deleted_pk_values.len(),
+                        insert_records_pk_values.len(),
+                        self.table_metadata.table_name
+                    );
+
+                    let pk_column_index =
+                        pk_indices_in_projection.first().copied().ok_or_else(|| {
+                            datafusion_common::DataFusionError::Internal(
+                                "Int64 PK strategy requires exactly one PK column index"
+                                    .to_string(),
+                            )
+                        })?;
+
+                    return Ok(Arc::new(Int64PkDeletionFilterExec::new(
+                        plan,
+                        deleted_pk_values,
+                        insert_records_pk_values,
+                        pk_column_index,
+                    )));
+                }
+            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                cached_deleted_row_keys,
+                cached_insert_records,
+            } => {
+                if let Some(ref row_converter) = self.pk_row_converter {
+                    let deleted_row_keys = {
+                        let guard = cached_deleted_row_keys.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
+                    let insert_records_row_keys = {
+                        let guard = cached_insert_records.read().map_err(|_| {
+                            datafusion_common::DataFusionError::Execution(
+                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
+                            )
+                        })?;
+                        Arc::clone(&guard)
+                    };
+
+                    if !deleted_row_keys.is_empty() {
+                        tracing::debug!(
+                            "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
+                            deleted_row_keys.len(),
+                            insert_records_row_keys.len(),
+                            self.table_metadata.table_name
+                        );
+
+                        return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
+                            plan,
+                            deleted_row_keys,
+                            insert_records_row_keys,
+                            pk_indices_in_projection.to_vec(),
+                            Arc::clone(row_converter),
+                        )));
+                    }
+                }
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
+                // Position-based deletions are handled at the Vortex scan level
+            }
+        }
+
+        Ok(plan)
     }
 }
 
@@ -4091,6 +4273,52 @@ impl TableProvider for CayenneTableProvider {
                 (projection.cloned(), pk_indices, false)
             };
 
+        // Time-based retention: build a keep filter at scan time.
+        // Prefer the builder (produces correctly-typed timestamps matching the
+        // column's timezone) over the legacy Expr+simplify path.
+        // Injected at two layers:
+        // 1. Appended to scan filters for file-level statistics pruning (Vortex should_prune)
+        // 2. Wrapped as a physical FilterExec for row-level filtering
+        let retention_keep_filter = if let Some(ref builder) = self.time_retention_filter_builder {
+            let filter = builder.keep_filter();
+            let filter = util::expr::simplify_expr(filter, &self.table_metadata.schema)?;
+            Some(filter)
+        } else {
+            None
+        };
+
+        // Ensure columns referenced by the retention filter are in the projection.
+        // Similar to PK column handling: if the user's query doesn't SELECT the time
+        // column, we add it for FilterExec and strip it afterward.
+        let (effective_projection, need_projection_strip) =
+            if let Some(ref keep_filter) = retention_keep_filter {
+                self.extend_projection_for_retention_filter(
+                    effective_projection,
+                    keep_filter,
+                    need_projection_strip,
+                )
+            } else {
+                (effective_projection, need_projection_strip)
+            };
+
+        // Build effective scan filters: user filters + optional retention filter.
+        let effective_filters: Vec<Expr>;
+        let scan_filters = if let Some(ref keep_filter) = retention_keep_filter {
+            effective_filters = filters
+                .iter()
+                .cloned()
+                .chain(std::iter::once(keep_filter.clone()))
+                .collect();
+            tracing::trace!(
+                table = %self.table_metadata.table_name,
+                total_filters = effective_filters.len(),
+                "Injected time_retention keep-filter into scan filters"
+            );
+            &effective_filters
+        } else {
+            filters
+        };
+
         // Delegate to the underlying listing table
         // Clone the Arc and drop the lock before awaiting to avoid holding locks across await points
         let listing_table = {
@@ -4102,161 +4330,49 @@ impl TableProvider for CayenneTableProvider {
             Arc::clone(&guard)
         };
         let main_plan = listing_table
-            .scan(state, effective_projection.as_ref(), filters, limit)
+            .scan(state, effective_projection.as_ref(), scan_filters, limit)
             .await?;
 
-        // Check for protected snapshots that need to be scanned with partial deletion filter
+        // Check for protected snapshots that need to be scanned with partial deletion filter.
         let protected_snapshot_plans = self
             .scan_protected_snapshots(
                 state,
                 effective_projection.as_ref(),
-                filters,
+                scan_filters,
                 limit,
                 &pk_indices_in_projection,
             )
             .await?;
 
-        // If there are protected snapshots, we need to:
-        // 1. Apply deletion filter to main plan
-        // 2. UNION with unfiltered protected snapshot plans
+        // Build the final plan:
+        // - If protected snapshots exist: deletion filter on main, UNION with snapshots
+        // - Otherwise: apply deletion filter directly to main plan
         let plan = if protected_snapshot_plans.is_empty() {
-            main_plan
+            self.apply_deletion_filter_with_insert_records(main_plan, &pk_indices_in_projection)?
         } else {
-            use datafusion_physical_plan::union::UnionExec;
-
-            // Apply deletion filter to main plan only
             let filtered_main_plan =
                 self.apply_deletion_filter(main_plan, &pk_indices_in_projection)?;
 
-            // UNION the filtered main plan with unfiltered protected snapshot plans
             let mut all_plans = vec![filtered_main_plan];
             all_plans.extend(protected_snapshot_plans);
-            let union_plan: Arc<dyn ExecutionPlan> = UnionExec::try_new(all_plans)?;
-
-            // Strip extra PK columns if needed
-            if need_projection_strip {
-                if let Some(orig_proj) = projection {
-                    return self.create_projection_strip(union_plan, orig_proj.len());
-                }
-            }
-
-            return Ok(union_plan);
+            UnionExec::try_new(all_plans)?
         };
 
-        // Apply deletion filter based on strategy (original logic for when no protected snapshots)
-        match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk {
-                cached_deleted_pk,
-                cached_insert_records,
-            } => {
-                // Optimized Int64 PK deletion - direct HashSet<i64> lookup
-                let deleted_pk_values = {
-                    let guard = cached_deleted_pk.read().map_err(|_| {
-                        datafusion_common::DataFusionError::Execution(
-                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
-                        )
-                    })?;
-                    Arc::clone(&guard)
-                };
-                let insert_records_pk_values = {
-                    let guard = cached_insert_records.read().map_err(|_| {
-                        datafusion_common::DataFusionError::Execution(
-                            super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
-                        )
-                    })?;
-                    Arc::clone(&guard)
-                };
+        // Wrap with FilterExec for time retention. DataFusion's physical optimizer
+        // pushes FilterExec predicates down through the plan tree (including through
+        // UnionExec) into each child's VortexSource via `try_pushdown_filters`,
+        // enabling file-level pruning via min/max stats and row-level filtering.
+        let plan: Arc<dyn ExecutionPlan> = if let Some(ref keep_filter) = retention_keep_filter {
+            self.wrap_plan_with_retention_filter(plan, keep_filter)?
+        } else {
+            plan
+        };
 
-                if !deleted_pk_values.is_empty() {
-                    tracing::debug!(
-                        "Applying Int64 PK deletion filter ({} deleted keys, {} insert records) to scan of table {}",
-                        deleted_pk_values.len(),
-                        insert_records_pk_values.len(),
-                        self.table_metadata.table_name
-                    );
-
-                    // For Int64 PK, we only have one PK column
-                    let pk_column_index =
-                        pk_indices_in_projection.first().copied().ok_or_else(|| {
-                            datafusion_common::DataFusionError::Internal(
-                                "Int64 PK strategy requires exactly one PK column index"
-                                    .to_string(),
-                            )
-                        })?;
-
-                    let deletion_filter = Arc::new(Int64PkDeletionFilterExec::new(
-                        plan,
-                        deleted_pk_values,
-                        insert_records_pk_values,
-                        pk_column_index,
-                    ));
-
-                    // Strip extra PK columns if needed
-                    if need_projection_strip {
-                        if let Some(orig_proj) = projection {
-                            return self.create_projection_strip(deletion_filter, orig_proj.len());
-                        }
-                    }
-
-                    return Ok(deletion_filter);
-                }
-            }
-            PkDeletionStrategyWithCache::RowConverterBased {
-                cached_deleted_row_keys,
-                cached_insert_records,
-            } => {
-                // RowConverter-based deletion for composite/non-integer PKs
-                if let Some(ref row_converter) = self.pk_row_converter {
-                    let deleted_row_keys = {
-                        let guard = cached_deleted_row_keys.read().map_err(|_| {
-                            datafusion_common::DataFusionError::Execution(
-                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
-                            )
-                        })?;
-                        Arc::clone(&guard)
-                    };
-                    let insert_records_row_keys = {
-                        let guard = cached_insert_records.read().map_err(|_| {
-                            datafusion_common::DataFusionError::Execution(
-                                super::constants::DELETION_CACHE_LOCK_POISONED.to_string(),
-                            )
-                        })?;
-                        Arc::clone(&guard)
-                    };
-
-                    if !deleted_row_keys.is_empty() {
-                        tracing::debug!(
-                            "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
-                            deleted_row_keys.len(),
-                            insert_records_row_keys.len(),
-                            self.table_metadata.table_name
-                        );
-
-                        let deletion_filter = Arc::new(KeyBasedDeletionFilterExec::new(
-                            plan,
-                            deleted_row_keys,
-                            insert_records_row_keys,
-                            pk_indices_in_projection.clone(),
-                            Arc::clone(row_converter),
-                        ));
-
-                        // Strip extra PK columns if needed
-                        if need_projection_strip {
-                            if let Some(orig_proj) = projection {
-                                return self
-                                    .create_projection_strip(deletion_filter, orig_proj.len());
-                            }
-                        }
-
-                        return Ok(deletion_filter);
-                    }
-                }
-            }
-            PkDeletionStrategyWithCache::PositionBased { .. } => {
-                // TODO: Implement Vortex-native deletion support by attaching per-file deletion
-                // vectors via VortexAccessPlan in PartitionedFile.extensions. This allows Vortex
-                // to skip decompressing deleted rows entirely using Selection::ExcludeRoaring.
-                // See: vortex-datafusion VortexAccessPlan and VortexOpener::open()
+        // Strip extra columns (PK or retention time column) added to the projection
+        // but not originally requested by the query.
+        if need_projection_strip {
+            if let Some(orig_proj) = projection {
+                return self.create_projection_strip(plan, orig_proj.len());
             }
         }
 
@@ -4561,40 +4677,70 @@ impl DeletionTableProvider for CayenneTableProvider {
         _state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // Collect protected snapshot listing tables for deletion scanning
-        let protected_snapshot_tables = {
-            let protected_snapshots = {
-                let guard = self.protected_snapshots.read().map_err(|_| {
-                    datafusion_common::DataFusionError::Execution(
-                        "Protected snapshots lock poisoned".to_string(),
-                    )
-                })?;
-                guard.clone()
-            };
+        if self.file_based_deletes_preferred(filters) {
+            tracing::debug!(
+                "Table '{}': using file-based retention delete path",
+                self.table_metadata.table_name,
+            );
+            return self.delete_using_files(filters);
+        }
 
-            let mut tables = Vec::with_capacity(protected_snapshots.len());
-            for (snapshot_id, _) in protected_snapshots {
-                let snapshot_url = Self::snapshot_dir_url(
-                    &self.table_metadata.path,
-                    self.table_metadata.table_id,
-                    &snapshot_id,
-                );
+        // Default path: deletion vectors via CayenneDeletionSink
+        self.delete_using_deletion_vectors(filters)
+    }
+}
 
-                let listing_table = Self::create_listing_table(
-                    &snapshot_url,
-                    Arc::clone(&self.table_metadata.schema),
-                    self.context.file_format(),
-                    &self.pk_deletion_strategy,
-                )
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
-                    ))
-                })?;
-                tables.push(listing_table);
-            }
-            tables
+impl CayenneTableProvider {
+    /// File-level delete path.
+    ///
+    /// Creates a [`FileBasedDeletionSink`] that discovers eligible files
+    /// (where `max(col) < threshold_value`) and deletes them from the main
+    /// snapshot and all protected snapshot directories.
+    fn delete_using_files(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if filters.len() != 1 {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "delete_using_files requires exactly one filter, got {}",
+                filters.len(),
+            )));
+        }
+        let filter = &filters[0];
+
+        // Build protected snapshot listing tables for PK-based strategies only.
+        // Position-based tables have no protected snapshots.
+        let protected_snapshot_tables = if self.pk_deletion_strategy.is_position_based() {
+            None
+        } else {
+            Some(self.build_protected_snapshot_listing_tables()?)
         };
+
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(FileBasedDeletionSink::new(
+                Arc::clone(&self.listing_table),
+                protected_snapshot_tables,
+                filter.clone(),
+                self.table_metadata.table_name.clone(),
+                Arc::clone(&self.catalog),
+                Arc::clone(&self.protected_snapshots),
+                self.table_metadata.table_id,
+                self.table_metadata.path.clone(),
+            )),
+            &self.table_metadata.schema,
+        )))
+    }
+
+    /// Main deletion-vector path via [`CayenneDeletionSink`].
+    fn delete_using_deletion_vectors(
+        &self,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let snapshot_tables: Vec<Arc<ListingTable>> = self
+            .build_protected_snapshot_listing_tables()?
+            .into_iter()
+            .map(|(_, table)| table)
+            .collect();
 
         Ok(Arc::new(DeletionExec::new(
             Arc::new(CayenneDeletionSink::new(
@@ -4606,10 +4752,84 @@ impl DeletionTableProvider for CayenneTableProvider {
                 self.pk_deletion_strategy.clone(),
                 self.pk_row_converter.as_ref().map(Arc::clone),
                 self.pk_column_indices.clone(),
-                protected_snapshot_tables,
+                snapshot_tables,
             )),
             &self.table_metadata.schema,
         )))
+    }
+
+    /// Build listing tables for all protected snapshots.
+    ///
+    /// Returns a vec of `(snapshot_id, listing_table)` pairs.
+    fn build_protected_snapshot_listing_tables(
+        &self,
+    ) -> datafusion_common::Result<Vec<(String, Arc<ListingTable>)>> {
+        let protected_snapshots = {
+            let guard = self.protected_snapshots.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    "Protected snapshots lock poisoned".to_string(),
+                )
+            })?;
+            guard.clone()
+        };
+
+        let mut result = Vec::with_capacity(protected_snapshots.len());
+        for (snapshot_id, _) in protected_snapshots {
+            let snapshot_url = Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                self.table_metadata.table_id,
+                &snapshot_id,
+            );
+
+            let listing_table = Self::create_listing_table(
+                &snapshot_url,
+                Arc::clone(&self.table_metadata.schema),
+                self.context.file_format(),
+                &self.pk_deletion_strategy,
+            )
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
+                ))
+            })?;
+            result.push((snapshot_id, listing_table));
+        }
+        Ok(result)
+    }
+
+    /// Returns `true` if deletes can use whole-file deletion instead of per-row deletion vectors.
+    ///
+    /// Requirements:
+    /// - Time-based retention is configured (`time_retention_filter_builder`).
+    /// - The table is **not** backed by S3 storage.
+    /// - The filter is a single `retention_col < threshold` expression matching
+    ///   the configured retention column. Non-retention deletes (e.g. CDC
+    ///   change-batch `DELETE WHERE pk = value`) fall through to the
+    ///   deletion-vector path to preserve correct DELETE semantics.
+    fn file_based_deletes_preferred(&self, filters: &[Expr]) -> bool {
+        let Some(ref builder) = self.time_retention_filter_builder else {
+            return false;
+        };
+
+        if self.table_metadata.path.starts_with("s3://") {
+            return false;
+        }
+
+        // Only use file-based path when the filter is a retention-pattern delete
+        // on the configured retention column: `col < threshold`.
+        let is_retention_filter = filters.len() == 1
+            && super::retention::extract_retention_column_and_threshold(&filters[0])
+                .is_ok_and(|(col, op, _)| col == builder.column_name() && op == Operator::Lt);
+
+        if !is_retention_filter {
+            tracing::debug!(
+                "Table '{}': delete filter does not match retention pattern (`{} < threshold`)",
+                self.table_metadata.table_name,
+                builder.column_name(),
+            );
+        }
+
+        is_retention_filter
     }
 }
 

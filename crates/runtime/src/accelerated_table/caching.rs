@@ -567,12 +567,12 @@ impl CacheRefreshHelper {
         // Fetch fresh data for this specific entry
         let batches = Self::fetch_from_source(&federated, dataset_name, filters, None).await?;
 
-        // Filter out 5xx responses - they are transient errors that should not be cached
-        let batches = filter_5xx_responses(batches)?;
+        // Filter out transient error responses (5xx/429) - they should not be cached
+        let batches = retain_cacheable_responses(batches)?;
 
         if batches.is_empty() {
             tracing::debug!(
-                "No cacheable data for dataset={dataset_name} (source returned empty or 5xx)"
+                "No cacheable data for dataset={dataset_name} (source returned empty or transient error)"
             );
             // Remove from in-flight since no data to write
             let mut in_flight = in_flight_revalidations.lock().await;
@@ -1215,13 +1215,13 @@ impl CacheRefreshHelper {
                 let batch_schema = batches[0].schema();
                 tracing::trace!("Fetched batch schema:\n{}", SchemaDisplay(&batch_schema));
 
-                // Filter out 5xx responses for caching - they are transient errors
-                // that should not be persisted. User still receives all data.
-                let batches_for_cache = match filter_5xx_responses(batches.clone()) {
+                // Filter out transient error responses (5xx/429) for caching - they
+                // should not be persisted. User still receives all data.
+                let batches_for_cache = match retain_cacheable_responses(batches.clone()) {
                     Ok(filtered) => filtered,
                     Err(e) => {
                         tracing::error!(
-                            "Failed to filter 5xx responses for caching for dataset={dataset_name}: {e}"
+                            "Failed to filter transient error responses for caching for dataset={dataset_name}: {e}"
                         );
                         Vec::new() // Skip caching on error, but still return data to user
                     }
@@ -1233,10 +1233,10 @@ impl CacheRefreshHelper {
                 let filters_clone: Vec<Expr> = filters.to_vec();
                 let cache_key = compute_cache_key_from_filters(filters);
 
-                // Only cache if we have non-5xx data to cache
+                // Only cache if we have cacheable (non-transient-error) data
                 if batches_for_cache.is_empty() {
                     tracing::debug!(
-                        "Fetch returned 5xx response, skipping cache write for dataset={dataset_name}"
+                        "Fetch returned transient error response, skipping cache write for dataset={dataset_name}"
                     );
                 } else {
                     let cache_rows: usize =
@@ -1748,16 +1748,17 @@ impl ExecutionPlan for CachingAccelerationScanExec {
     }
 }
 
-/// Filter out 5xx server error responses from batches before caching.
+/// Retain only cacheable responses (exclude 5xx server errors and 429 Too Many Requests)
+/// from batches before caching.
 ///
-/// 5xx errors are typically transient (e.g., server overload, temporary outage)
-/// and should not be persisted in the cache. This ensures that temporary
-/// failures don't pollute the cache with error responses that would be
+/// These errors are typically transient (e.g., server overload, temporary outage,
+/// rate limiting) and should not be persisted in the cache. This ensures that
+/// temporary failures don't pollute the cache with error responses that would be
 /// served to subsequent requests.
 ///
 /// Returns an error if the `response_status` column is missing or has the wrong type,
 /// as this indicates a schema bug in the HTTP connector code path.
-fn filter_5xx_responses(batches: Vec<RecordBatch>) -> DataFusionResult<Vec<RecordBatch>> {
+fn retain_cacheable_responses(batches: Vec<RecordBatch>) -> DataFusionResult<Vec<RecordBatch>> {
     let mut result = Vec::with_capacity(batches.len());
 
     for batch in batches {
@@ -1782,10 +1783,11 @@ fn filter_5xx_responses(batches: Vec<RecordBatch>) -> DataFusionResult<Vec<Recor
                 ))
             })?;
 
-        // Create boolean mask: true for non-5xx status codes
+        // Create boolean mask: true for status codes that should be cached
+        // (exclude 5xx server errors and 429 Too Many Requests)
         let mask: arrow::array::BooleanArray = status_array
             .iter()
-            .map(|status| status.map(|s| !(500..600).contains(&s)))
+            .map(|status| status.map(|s| !(500..600).contains(&s) && s != 429))
             .collect();
 
         // Apply filter
@@ -2725,7 +2727,7 @@ mod tests {
     #[tokio::test]
     async fn test_swr_handle_cache_hit_refreshes_only_accessed_entry() {
         // Create schema with request columns (HTTP connector cache pattern)
-        // Includes response_status column required by filter_5xx_responses
+        // Includes response_status column required by retain_cacheable_responses
         let schema = Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, true),
             Field::new("request_query", DataType::Utf8, true),
@@ -2743,7 +2745,7 @@ mod tests {
             let path = StringArray::from(vec!["/api/users"]);
             let query = StringArray::from(vec!["id=1"]);
             let data = StringArray::from(vec!["fresh_user_data"]);
-            let status = UInt16Array::from(vec![200]); // 200 OK - will pass filter_5xx_responses
+            let status = UInt16Array::from(vec![200]); // 200 OK - will pass retain_cacheable_responses
 
             #[expect(clippy::cast_possible_truncation)]
             let now = SystemTime::now()
@@ -2978,23 +2980,21 @@ mod tests {
         assert_eq!(total_rows, 3, "Should have 3 rows from 3 requests");
     }
 
-    /// Test that 5xx responses are returned to users but NOT written to the cache.
+    /// Test that 5xx and 429 responses are returned to users but NOT written to the cache.
     ///
-    /// Simulates cache miss flow:
-    /// 1. Create mock HTTP source (federated) and empty accelerator
-    /// 2. Call `handle_cache_miss` (called when accelerator has no data for query)
-    /// 3. Verify user receives 5xx response data (can see the error)
-    /// 4. Verify accelerator remains empty (transient errors not persisted)
+    /// Simulates cache miss flow for both transient error types:
+    /// 1. Send a 500 request through `handle_cache_miss` — verify user sees it
+    /// 2. Send a 429 request through `handle_cache_miss` — verify user sees it
+    /// 3. Verify accelerator remains empty (transient errors not persisted)
     #[tokio::test]
-    async fn test_5xx_responses_returned_to_user_but_not_cached() {
+    async fn test_transient_error_responses_returned_to_user_but_not_cached() {
         use futures::StreamExt;
 
-        // 1. Create mock HTTP source (returns 500) and empty accelerator
-        let http_source = Arc::new(MockHttpTableProvider::with_status(
+        let http_source_500 = Arc::new(MockHttpTableProvider::with_status(
             500,
             "Internal Server Error",
         ));
-        let schema = http_source.schema();
+        let schema = http_source_500.schema();
 
         let accelerator = Arc::new(MockAcceleratorTableProvider::new(
             Arc::clone(&schema),
@@ -3005,32 +3005,28 @@ mod tests {
 
         let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
-        // 2. Call handle_cache_miss - this is what happens when user queries and cache is empty
+        // --- 500 request ---
         let mut stream = CacheRefreshHelper::handle_cache_miss(
-            Arc::clone(&http_source) as Arc<dyn TableProvider>,
+            Arc::clone(&http_source_500) as Arc<dyn TableProvider>,
             "test_dataset",
-            &[col("content").eq(lit("test"))], // filters
-            None,                              // limit
+            &[col("content").eq(lit("test"))],
+            None,
             Arc::clone(&schema),
-            false, // is_expired
-            false, // stale_if_error
-            None,  // expired_batches
+            false,
+            false,
+            None,
             &tokio::runtime::Handle::current(),
-            Arc::new(vec![].into()), // synchronized_children
-            batch_write_tx,
+            Arc::new(vec![].into()),
+            batch_write_tx.clone(),
         )
         .await;
 
-        // Collect user-visible results
         let mut user_batches = Vec::new();
         while let Some(result) = stream.next().await {
             user_batches.push(result.expect("stream should not error"));
         }
 
-        // 3. Verify user receives the 500 response data
-        assert_eq!(user_batches.len(), 1, "User should receive 1 batch");
-        assert_eq!(user_batches[0].num_rows(), 1, "User should receive 1 row");
-
+        assert_eq!(user_batches.len(), 1, "User should receive 1 batch for 500");
         let status_col = user_batches[0]
             .column(
                 user_batches[0]
@@ -3043,14 +3039,51 @@ mod tests {
             .expect("status column");
         assert_eq!(status_col.value(0), 500, "User should see status 500");
 
+        // --- 429 request ---
+        let http_source_429 =
+            Arc::new(MockHttpTableProvider::with_status(429, "Too Many Requests"));
+
+        let mut stream = CacheRefreshHelper::handle_cache_miss(
+            Arc::clone(&http_source_429) as Arc<dyn TableProvider>,
+            "test_dataset",
+            &[col("content").eq(lit("test"))],
+            None,
+            Arc::clone(&schema),
+            false,
+            false,
+            None,
+            &tokio::runtime::Handle::current(),
+            Arc::new(vec![].into()),
+            batch_write_tx,
+        )
+        .await;
+
+        let mut user_batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            user_batches.push(result.expect("stream should not error"));
+        }
+
+        assert_eq!(user_batches.len(), 1, "User should receive 1 batch for 429");
+        let status_col = user_batches[0]
+            .column(
+                user_batches[0]
+                    .schema()
+                    .index_of(RESPONSE_STATUS_COLUMN)
+                    .expect("column exists"),
+            )
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("status column");
+        assert_eq!(status_col.value(0), 429, "User should see status 429");
+
         // Wait for cache write flush
         tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
 
-        // 4. Verify accelerator is empty (5xx was not cached)
+        // Verify accelerator is empty — neither 5xx nor 429 should be cached
         let cached_data = accelerator.get_data();
         assert!(
             cached_data.is_empty(),
-            "5xx responses should NOT be in accelerator"
+            "Transient error responses (5xx/429) should NOT be in accelerator"
         );
     }
 
@@ -3167,7 +3200,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = filter_5xx_responses(vec![batch]).expect("filter should succeed");
+        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
 
         assert_eq!(result.len(), 1, "Should have 1 batch");
         assert_eq!(result[0].num_rows(), 3, "All 2xx rows should be kept");
@@ -3189,7 +3222,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = filter_5xx_responses(vec![batch]).expect("filter should succeed");
+        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
 
         assert_eq!(result.len(), 1, "Should have 1 batch");
         assert_eq!(result[0].num_rows(), 3, "All 4xx rows should be kept");
@@ -3207,7 +3240,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = filter_5xx_responses(vec![batch]).expect("filter should succeed");
+        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
 
         assert!(result.is_empty(), "All 5xx rows should be filtered out");
     }
@@ -3229,7 +3262,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = filter_5xx_responses(vec![batch]).expect("filter should succeed");
+        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
 
         assert_eq!(result.len(), 1, "Should have 1 batch");
         assert_eq!(result[0].num_rows(), 3, "Should keep 3 non-5xx rows");
@@ -3247,7 +3280,7 @@ mod tests {
 
     #[test]
     fn test_filter_5xx_responses_empty_batches() {
-        let result = filter_5xx_responses(vec![]).expect("filter should succeed");
+        let result = retain_cacheable_responses(vec![]).expect("filter should succeed");
         assert!(result.is_empty(), "Empty input should return empty output");
     }
 
@@ -3282,8 +3315,8 @@ mod tests {
         )
         .expect("to create batch3");
 
-        let result =
-            filter_5xx_responses(vec![batch1, batch2, batch3]).expect("filter should succeed");
+        let result = retain_cacheable_responses(vec![batch1, batch2, batch3])
+            .expect("filter should succeed");
 
         assert_eq!(
             result.len(),
@@ -3311,7 +3344,7 @@ mod tests {
         )
         .expect("to create batch");
 
-        let result = filter_5xx_responses(vec![batch]).expect("filter should succeed");
+        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
 
         assert_eq!(result.len(), 1, "Should have 1 batch");
         assert_eq!(result[0].num_rows(), 2, "Should keep 499 and 600");
@@ -3323,6 +3356,61 @@ mod tests {
             .expect("status column");
         assert_eq!(status.value(0), 499);
         assert_eq!(status.value(1), 600);
+    }
+
+    #[test]
+    fn test_filter_transient_removes_429() {
+        let schema = create_http_response_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["rate limited"])),
+                Arc::new(UInt16Array::from(vec![429])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
+
+        assert!(
+            result.is_empty(),
+            "429 Too Many Requests should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_filter_transient_mixed_with_429() {
+        let schema = create_http_response_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "ok",
+                    "rate limited",
+                    "server error",
+                    "not found",
+                ])),
+                Arc::new(UInt16Array::from(vec![200, 429, 500, 404])),
+            ],
+        )
+        .expect("to create batch");
+
+        let result = retain_cacheable_responses(vec![batch]).expect("filter should succeed");
+
+        assert_eq!(result.len(), 1, "Should have 1 batch");
+        assert_eq!(
+            result[0].num_rows(),
+            2,
+            "Should keep only 200 and 404, filtering 429 and 500"
+        );
+
+        let status = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("status column");
+        assert_eq!(status.value(0), 200);
+        assert_eq!(status.value(1), 404);
     }
 
     /// Tests `overwrite_accelerator` with `DuckDB` in-memory accelerator.
