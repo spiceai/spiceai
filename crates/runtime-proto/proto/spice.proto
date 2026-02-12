@@ -112,6 +112,7 @@ message SchedulerControlMessage {
     oneof message {
         MetricsRequest request_metrics = 1;
         PollNowCommand poll_now = 2;
+        CancelTasksCommand cancel_tasks = 3;
     }
 }
 
@@ -138,6 +139,19 @@ message AllocateInitialPartitionsResponse {
 message PollNowCommand {
     // Optional reason for the immediate poll (for debugging/logging).
     string reason = 1;
+}
+
+// Command sent from scheduler to executor to cancel running tasks.
+message CancelTasksCommand {
+    repeated TaskCancelInfo tasks = 1;
+}
+
+// Identifies a single running task that should be cancelled.
+message TaskCancelInfo {
+    uint32 task_id = 1;
+    string job_id = 2;
+    uint32 stage_id = 3;
+    uint32 partition_id = 4;
 }
 
 // Heartbeat message sent by executor to scheduler.

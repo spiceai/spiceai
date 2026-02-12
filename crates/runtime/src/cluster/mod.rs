@@ -45,9 +45,10 @@ use ballista_executor::execution_loop;
 use ballista_executor::executor::Executor;
 use ballista_scheduler::cluster::memory::{InMemoryClusterState, InMemoryJobState};
 use ballista_scheduler::cluster::{BallistaCluster, ClusterState};
-use ballista_scheduler::config::SchedulerConfig;
+use ballista_scheduler::config::{OnCancelTasksFn, SchedulerConfig};
 use ballista_scheduler::scheduler_process;
 use ballista_scheduler::scheduler_server::SchedulerServer;
+use ballista_scheduler::state::execution_graph::RunningTaskInfo;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
@@ -56,7 +57,7 @@ use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
-use runtime_proto::{GetAppDefinitionRequest, GetSchedulersRequest};
+use runtime_proto::{GetAppDefinitionRequest, GetSchedulersRequest, TaskCancelInfo};
 use runtime_secrets::Secrets;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
@@ -1166,6 +1167,7 @@ pub async fn initialize_cluster_executor(
             control_stream_ballista_id,
             control_stream_tls_config,
             control_stream_metrics_reader,
+            Some(Arc::clone(&executor_for_manager)),
         );
 
         // Get the shared poll_now notify handle from the control stream manager.
@@ -1378,6 +1380,55 @@ async fn create_scheduler_server(
     let on_work_available: Arc<dyn Fn(&str) + Send + Sync> =
         Arc::new(move |reason: &str| registry_for_callback.broadcast_poll_now(reason));
 
+    let registry_for_cancel = executor_stream_registry.clone();
+    let on_cancel_tasks: OnCancelTasksFn =
+        Arc::new(move |executor_id: &str, tasks: Vec<RunningTaskInfo>| {
+            let tasks_to_cancel = tasks
+                .into_iter()
+                .filter_map(|task| {
+                    let Ok(task_id) = u32::try_from(task.task_id) else {
+                        tracing::warn!(
+                            executor_id,
+                            task_id = task.task_id,
+                            "Skipping cancel task with out-of-range task_id"
+                        );
+                        return None;
+                    };
+
+                    let Ok(stage_id) = u32::try_from(task.stage_id) else {
+                        tracing::warn!(
+                            executor_id,
+                            stage_id = task.stage_id,
+                            "Skipping cancel task with out-of-range stage_id"
+                        );
+                        return None;
+                    };
+
+                    let Ok(partition_id) = u32::try_from(task.partition_id) else {
+                        tracing::warn!(
+                            executor_id,
+                            partition_id = task.partition_id,
+                            "Skipping cancel task with out-of-range partition_id"
+                        );
+                        return None;
+                    };
+
+                    Some(TaskCancelInfo {
+                        task_id,
+                        job_id: task.job_id,
+                        stage_id,
+                        partition_id,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            if !registry_for_cancel.send_cancel_tasks(executor_id, tasks_to_cancel) {
+                tracing::warn!(
+                    "Failed to send cancel tasks to executor {executor_id}: no control stream"
+                );
+            }
+        });
+
     // Create InMemoryClusterState first so we can reference it in the config_producer
     let cluster_state: Arc<dyn ClusterState> = Arc::new(InMemoryClusterState::default());
 
@@ -1494,6 +1545,7 @@ async fn create_scheduler_server(
         override_create_grpc_client_endpoint,
         override_metrics_collector: Some(scheduler_metrics_collector),
         on_work_available: Some(on_work_available),
+        on_cancel_tasks: Some(on_cancel_tasks),
 
         // Faster failure detection: 30s timeout with 10s heartbeat interval
         executor_timeout_seconds: 30,
