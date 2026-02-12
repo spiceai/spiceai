@@ -594,7 +594,7 @@ impl ClusterService for ClusterServiceImpl {
 
                 for table_ref in super::partition::accelerated_tables(app).keys() {
                     match partition_manager
-                        .allocate_partitions(table_ref, &executor_url, 10)
+                        .allocate_partitions(table_ref, &executor_id, 10)
                         .await
                     {
                         Ok(partitions) => {

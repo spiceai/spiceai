@@ -31,13 +31,11 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     pub(crate) async fn load_catalogs(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(ref app) = self.read_app().await else {
             return;
         };
 
         let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(true));
-        drop(app_lock);
         let mut futures = vec![];
         for catalog in &valid_catalogs {
             self.status

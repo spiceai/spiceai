@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::Error::{FailedToStartClusterExecutor, FailedToStartClusterScheduler};
+use crate::Error::FailedToStartClusterExecutor;
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::cluster::partition::{
     executor_request_initial_partitions,
@@ -753,15 +753,13 @@ pub async fn initialize_cluster_scheduler(rt: &Arc<Runtime>) -> crate::Result<()
 
     rt.df
         .bind_scheduler_server(Arc::new(scheduler))
-        .map_err(|e| FailedToStartClusterScheduler {
-            source: Box::new(e),
-        })?;
+        .boxed()
+        .context(FailedToStartClusterSchedulerSnafu)?;
 
     rt.df
         .bind_executor_stream_registry(executor_stream_registry)
-        .map_err(|e| FailedToStartClusterScheduler {
-            source: Box::new(e),
-        })?;
+        .boxed()
+        .context(FailedToStartClusterSchedulerSnafu)?;
 
     rt.status
         .update_cluster("scheduler", ComponentStatus::Ready);
@@ -801,16 +799,16 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         .await;
 
     let scheduler_registry_future = {
-        let Some(app) = rt.app_read().await else {
+        let Some(app) = rt.read_app().await else {
             tracing::warn!(
                 "No app found in runtime during cluster scheduler initialization; skipping scheduler registry and partition manager setup"
             );
             return Ok(None);
         };
 
-        if let Some(ref config) = app.runtime.scheduler {
+        if let Some(config) = app.runtime.scheduler.clone() {
             // Initialize partition manager with the configured object store
-            match partition::build_partition_metadata_store(rt, config).await {
+            match partition::build_partition_metadata_store(rt, &config).await {
                 Ok(store) => {
                     let partition_manager = Arc::new(PartitionManager::new(store));
                     rt.set_partition_manager(Arc::clone(&partition_manager))

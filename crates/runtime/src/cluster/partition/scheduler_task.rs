@@ -360,50 +360,64 @@ impl PartitionManagementTask {
 
             // Discover partitions from source using shared logic from startup.rs
             let source_partitions_list = 'discovery: {
-                if let Some(ds) = self
+                let acceleration = self
                     .app
                     .datasets
                     .iter()
                     .find(|d| resolved_equality(d.name.clone().into(), table_ref.clone()))
-                {
-                    if let Some(acceleration) = &ds.acceleration {
-                        match timeout(
-                            self.config.discovery_timeout,
-                            table_partition_values(
-                                &table_ref,
-                                &acceleration.partition_by,
-                                &self.df,
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(Ok(partitions)) => break 'discovery Some(partitions),
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    table = %table_ref,
-                                    error = %e,
-                                    "Failed to discover partitions from source"
-                                );
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    table = %table_ref,
-                                    timeout_secs = self.config.discovery_timeout.as_secs(),
-                                    "Partition discovery timed out"
-                                );
-                            }
+                    .and_then(|d| d.acceleration.as_ref())
+                    .or_else(|| {
+                        self.app
+                            .views
+                            .iter()
+                            .find(|v| resolved_equality(v.name.clone().into(), table_ref.clone()))
+                            .and_then(|v| v.acceleration.as_ref())
+                    });
+
+                if let Some(acceleration) = acceleration {
+                    match timeout(
+                        self.config.discovery_timeout,
+                        table_partition_values(&table_ref, &acceleration.partition_by, &self.df),
+                    )
+                    .await
+                    {
+                        Ok(Ok(partitions)) => break 'discovery Some(partitions),
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                table = %table_ref,
+                                error = %e,
+                                "Failed to discover partitions from source"
+                            );
                         }
-                    } else {
+                        Err(_) => {
+                            tracing::warn!(
+                                table = %table_ref,
+                                timeout_secs = self.config.discovery_timeout.as_secs(),
+                                "Partition discovery timed out"
+                            );
+                        }
+                    }
+                } else {
+                    let exists =
+                        self.app
+                            .datasets
+                            .iter()
+                            .any(|d| resolved_equality(d.name.clone().into(), table_ref.clone()))
+                            || self.app.views.iter().any(|v| {
+                                resolved_equality(v.name.clone().into(), table_ref.clone())
+                            });
+
+                    if exists {
                         tracing::warn!(
                             table = %table_ref,
                             "Acceleration not configured for table"
                         );
+                    } else {
+                        tracing::debug!(
+                            table = %table_ref,
+                            "Dataset/View not found for table (might be not accelerated)"
+                        );
                     }
-                } else {
-                    tracing::debug!(
-                        table = %table_ref,
-                        "Dataset not found for table (might be a view or not accelerated)"
-                    );
                 }
                 None
             };

@@ -53,7 +53,7 @@ impl PartitionMetadata {
 
     #[must_use]
     pub fn is_assigned_to(&self, executor_id: &str) -> bool {
-        self.assigned_executors.contains(&executor_id.to_string())
+        self.assigned_executors.iter().any(|e| e == executor_id)
     }
 
     #[must_use]

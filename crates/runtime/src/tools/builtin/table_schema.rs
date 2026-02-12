@@ -108,7 +108,7 @@ impl TableSchemaTool {
         let TableSchemaToolParams { tables, output } = req;
 
         // Precompute extra column details only if needed (for `full` output).
-        let column_info = match (output, self.rt.app.read().await.clone()) {
+        let column_info = match (output, self.rt.read_app().await.clone()) {
             (OutputType::Full, Some(app)) => tables
                 .iter()
                 .map(|t| {

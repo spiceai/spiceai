@@ -664,7 +664,7 @@ impl Runtime {
                         if let Ok(partition_expr) =
                             Expr::from_bytes_with_registry(partition_bytes, self.df.ctx.as_ref())
                         {
-                            current_partitions.retain(|p| *p != partition_expr);
+                            current_partitions.retain(|p| p != &partition_expr);
                         } else {
                             tracing::warn!(
                                 "Failed to deserialize removed partition expression for table {table_name}"
@@ -701,15 +701,15 @@ impl Runtime {
                 .collect();
             drop(guard); // drop lock before updating tables
 
+            // Take a snapshot of the current assignments without holding the lock across .await
+            let assignments = {
+                let assignments_guard = partition_assignments.read().await;
+                assignments_guard.clone()
+            };
+
             // Update all affected tables
             for table_name in affected_tables {
                 let table_ref = TableReference::parse_str(table_name);
-                // Re-acquire lock to get current assignments for this table
-                // Take a snapshot of the current assignments without holding the lock across .await
-                let assignments = {
-                    let assignments_guard = partition_assignments.read().await;
-                    assignments_guard.clone()
-                };
 
                 if let Err(e) = self
                     .update_partition_refresh_sql(table_ref.clone(), &assignments)
@@ -733,8 +733,7 @@ impl Runtime {
         // Re-construct the refresh SQL with the new partitions
         // 1. Get the dataset to find the base refresh SQL
         let (dataset_component, app_arc) = {
-            let app_lock = self.app.read().await;
-            let Some(app_arc) = app_lock.as_ref() else {
+            let Some(app_arc) = self.read_app().await else {
                 tracing::debug!("App not initialized when updating partitions for {table}");
                 return Ok(());
             };
@@ -747,7 +746,7 @@ impl Runtime {
                 tracing::debug!("Dataset {table} not found in App when updating partitions");
                 return Ok(());
             };
-            (ds.clone(), Arc::clone(app_arc))
+            (ds.clone(), Arc::clone(&app_arc))
         };
 
         let Ok(dataset) =
@@ -1083,7 +1082,7 @@ impl Runtime {
                 )
             } else {
                 let cloned_endpoint_auth = endpoint_auth.clone();
-                let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
+                let cloned_app_ref = self.read_app().await;
 
                 Box::pin(
                     self.start_runtime_task(
@@ -1233,12 +1232,11 @@ impl Runtime {
 
     /// Updates all of the component statuses to `Initializing`.
     pub async fn set_components_initializing(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(app) = self.read_app().await else {
             return;
         };
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
@@ -1271,13 +1269,13 @@ impl Runtime {
             }
         }
 
-        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
         for catalog in valid_catalogs {
             self.status
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
         }
 
-        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
+        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(false));
         for validated_view in valid_views {
             self.status
                 .update_view(&validated_view.view.name, ComponentStatus::Initializing);
@@ -1424,11 +1422,11 @@ impl Runtime {
                             break;
                         }
                         if status.is_ready() {
-                            if let Some(app) = self.app.read().await.as_ref() {
+                            if let Some(app) = self.read_app().await {
                                 let valid_datasets =
-                                    Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+                                    Arc::clone(&self).get_valid_datasets(&app, LogErrors(false));
                                 let valid_catalogs =
-                                    Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+                                    Arc::clone(&self).get_valid_catalogs(&app, LogErrors(false));
                                 if valid_datasets.is_empty() && valid_catalogs.is_empty() {
                                     tracing::info!(
                                         "No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration."
@@ -1452,7 +1450,7 @@ impl Runtime {
 
         self.status.mark_shutdown();
 
-        let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
+        let shutdown_timeout: Duration = self.read_app().await.and_then(|app| {
             app.runtime.shutdown_timeout().unwrap_or_else(|err| {
                 tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
                 Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)

@@ -46,7 +46,7 @@ use crate::metrics_reader::MetricsReader;
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Callback type for when an executor has recieved an update to its partitions (via the control stream).
+/// Callback type for when an executor has received an update to its partitions (via the control stream).
 ///
 /// The handler takes two arguments:
 /// 1. `new_partitions`: A map of dataset names to a list of partition values (as byte vectors) that have been assigned.
