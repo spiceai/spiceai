@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
+use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tar::Archive;
 use walkdir::WalkDir;
@@ -77,7 +78,11 @@ fn get_current_branch() -> Result<String> {
         anyhow::bail!("git branch --show-current failed");
     }
 
-    let branch = String::from_utf8(output.stdout)?.trim().to_string();
+    let branch = String::from_utf8(output.stdout)
+        .context("Branch name is not valid UTF-8")?
+        .trim()
+        .to_string();
+
     if branch.is_empty() {
         anyhow::bail!("Could not determine current branch");
     }
@@ -90,7 +95,21 @@ fn trigger_build(branch: Option<&str>) -> Result<()> {
         None => get_current_branch()?,
     };
 
-    println!("Triggering build for branch: {} on macOS aarch64...", branch);
+    println!("Triggering build for branch: {}...", branch);
+
+    // Determine platform option based on current OS and Arch
+    let platform_option = match env::consts::OS {
+        "linux" => match env::consts::ARCH {
+            "aarch64" => "Linux aarch64",
+            _ => "Linux x64",
+        },
+        // Only Apple Silicon is supported for macOS in the CI matrix
+        "macos" => "macOS aarch64 (Apple Silicon)",
+        // Fallback for others
+        _ => "Linux x64",
+    };
+
+    println!("Requesting platform: {}", platform_option);
 
     let status = Command::new("gh")
         .args([
@@ -100,7 +119,7 @@ fn trigger_build(branch: Option<&str>) -> Result<()> {
             "--ref",
             &branch,
             "-f",
-            "platform_option=macOS aarch64 (Apple Silicon)",
+            &format!("platform_option={}", platform_option),
         ])
         .status()
         .context("Failed to execute gh workflow run")?;
@@ -117,6 +136,26 @@ fn trigger_build(branch: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn get_artifact_names() -> Vec<String> {
+    let (os, arch) = match env::consts::OS {
+        // CI only builds aarch64 for macOS (Apple Silicon)
+        "macos" => ("darwin", "aarch64"),
+        // For Linux, the CI uses standard architecture names (x86_64, aarch64)
+        "linux" => ("linux", env::consts::ARCH),
+        // Fallback/Default
+        _ => ("linux", "x86_64"),
+    };
+
+    // Prioritize metal for darwin
+    let mut names = Vec::new();
+    if os == "darwin" {
+        names.push(format!("spiced_metal_{}_{}", os, arch));
+    }
+    names.push(format!("spiced_{}_{}", os, arch));
+
+    names
 }
 
 fn install_build(branch: Option<&str>) -> Result<()> {
@@ -151,7 +190,10 @@ fn install_build(branch: Option<&str>) -> Result<()> {
         .context("Failed to execute gh run list")?;
 
     if !output.status.success() {
-        anyhow::bail!("gh run list failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "gh run list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     let runs: Vec<GhRun> = serde_json::from_slice(&output.stdout)?;
@@ -168,12 +210,16 @@ fn install_build(branch: Option<&str>) -> Result<()> {
 
     println!("Downloading artifact to {}...", temp_path.display());
 
-    // Try metal first, then default
-    let artifacts = ["spiced_metal_darwin_aarch64", "spiced_darwin_aarch64"];
+    let artifacts = get_artifact_names();
     let mut downloaded = false;
 
-    for artifact_name in artifacts {
+    for artifact_name in &artifacts {
         println!("Attempting to download artifact: {}", artifact_name);
+        // Using temp_path to convert to string safely
+        let temp_path_str = temp_path
+            .to_str()
+            .context("Temp path contains invalid UTF-8")?;
+
         let status = Command::new("gh")
             .args([
                 "run",
@@ -182,11 +228,12 @@ fn install_build(branch: Option<&str>) -> Result<()> {
                 "-n",
                 artifact_name,
                 "-D",
-                temp_path.to_str().unwrap(),
+                temp_path_str,
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .status()?;
+            .status()
+            .context("Failed to execute gh run download")?;
 
         if status.success() {
             downloaded = true;
@@ -195,7 +242,10 @@ fn install_build(branch: Option<&str>) -> Result<()> {
     }
 
     if !downloaded {
-        anyhow::bail!("Failed to download any compatible artifacts.");
+        anyhow::bail!(
+            "Failed to download any compatible artifacts. Tried: {:?}",
+            artifacts
+        );
     }
 
     println!("Installing to {}...", target_dir.display());
@@ -206,14 +256,17 @@ fn install_build(branch: Option<&str>) -> Result<()> {
     for entry in fs::read_dir(temp_path)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("gz") {
-            tar_file = Some(path);
-            break;
+        // Check for extension safely
+        if let Some(ext) = path.extension() {
+            if ext == "gz" {
+                tar_file = Some(path);
+                break;
+            }
         }
     }
 
     let tar_file = tar_file.context("No tar.gz file found in downloaded artifact")?;
-    
+
     // Extract
     let tar_gz = fs::File::open(&tar_file)?;
     let tar = GzDecoder::new(tar_gz);
@@ -223,10 +276,19 @@ fn install_build(branch: Option<&str>) -> Result<()> {
     // Find binary
     let spiced_path = temp_path.join("spiced");
     if !spiced_path.exists() {
-        anyhow::bail!("Could not find 'spiced' binary in extracted archive at {}", spiced_path.display());
+        anyhow::bail!(
+            "Could not find 'spiced' binary in extracted archive at {}",
+            spiced_path.display()
+        );
     }
 
     let target_binary = target_dir.join("spiced");
+    // Rename might fail if cross-device link, but unlikely for temp to home usually on same mount or different.
+    // fs::rename is atomic but platform specific. If it fails, we might need copy+delete.
+    // For now, assuming fs::rename works or fails loudly.
+    if target_binary.exists() {
+        fs::remove_file(&target_binary)?;
+    }
     fs::rename(&spiced_path, &target_binary)?;
 
     // Make executable
@@ -240,7 +302,7 @@ fn install_build(branch: Option<&str>) -> Result<()> {
     let symlink_path = dirs::home_dir()
         .context("Could not find home directory")?
         .join(".spice/bin/spiced-dev");
-    
+
     // Remove existing symlink if it exists
     if symlink_path.exists() || fs::symlink_metadata(&symlink_path).is_ok() {
         fs::remove_file(&symlink_path).ok();
@@ -248,7 +310,11 @@ fn install_build(branch: Option<&str>) -> Result<()> {
 
     std::os::unix::fs::symlink(&target_binary, &symlink_path)?;
 
-    println!("Updated symlink: {} -> {}", symlink_path.display(), target_binary.display());
+    println!(
+        "Updated symlink: {} -> {}",
+        symlink_path.display(),
+        target_binary.display()
+    );
     println!("You can now run it comfortably via: {}", symlink_path.display());
 
     Ok(())
@@ -271,7 +337,10 @@ fn run_build(branch: Option<&str>, interactive: bool, args: &[String]) -> Result
         .join("spiced");
 
     if !binary_path.exists() {
-        println!("Binary not found at {}. Installing...", binary_path.display());
+        println!(
+            "Binary not found at {}. Installing...",
+            binary_path.display()
+        );
         install_build(Some(&branch))?;
     }
 
@@ -296,20 +365,20 @@ fn select_branch() -> Result<String> {
     }
 
     let mut branches = Vec::new();
-    
+
     // Walk directory to find all 'spiced' binaries
     for entry in WalkDir::new(&base_dir).min_depth(1).max_depth(5) {
         let entry = entry.ok();
         if let Some(entry) = entry {
             if entry.file_type().is_file() && entry.file_name() == "spiced" {
-                //Found a spiced binary, the parent dir is the branch path
-                let branch_dir = entry.path().parent().unwrap();
-                
-                // Get relative path from base_dir to get the branch name
-                if let Ok(rel_path) = branch_dir.strip_prefix(&base_dir) {
-                    if let Some(branch_name) = rel_path.to_str() {
-                        if !branch_name.is_empty() {
-                            branches.push(branch_name.to_string());
+                // Found a spiced binary, the parent dir is the branch path
+                if let Some(branch_dir) = entry.path().parent() {
+                    // Get relative path from base_dir to get the branch name
+                    if let Ok(rel_path) = branch_dir.strip_prefix(&base_dir) {
+                        if let Some(branch_name) = rel_path.to_str() {
+                            if !branch_name.is_empty() {
+                                branches.push(branch_name.to_string());
+                            }
                         }
                     }
                 }
