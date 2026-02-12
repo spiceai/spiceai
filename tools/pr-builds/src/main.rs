@@ -55,8 +55,8 @@ struct Cli {
 enum Commands {
     /// Trigger a build for the current (or specified) branch.
     ///
-    /// If an active build exists for the latest commit, it will be reused.
-    /// If a successful build exists, no action is taken.
+    /// If an active build exists for the latest commit (SHA-based), it will be reused.
+    /// If a successful build exists (for this commit), no action is taken.
     Trigger {
         /// Branch to trigger build for. Defaults to current branch.
         #[arg(short, long)]
@@ -266,7 +266,7 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
         id
     } else {
         println!("No active build found for latest SHA. Triggering new build...");
-        
+
         let platform_option = match env::consts::OS {
             "linux" => match env::consts::ARCH {
                 "aarch64" => "Linux aarch64",
@@ -294,9 +294,9 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
         if !status.success() {
             anyhow::bail!("Failed to trigger build");
         }
-        
+
         println!("Build triggered successfully.");
-        
+
         if !wait {
              println!("You can check the status with:");
              println!(
@@ -307,13 +307,13 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
         }
 
         println!("Waiting for build to start...");
-        
+
         let mut found_new_run_id: Option<u64> = None;
-        
+
         // Poll for up to 30 seconds to find the new run
         for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_secs(3));
-            
+
             let output = Command::new("gh")
                 .args([
                     "run",
@@ -335,7 +335,7 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
                 if let Some(run) = runs.first() {
                      let status = run["status"].as_str().unwrap_or("");
                      let run_sha = run["headSha"].as_str().unwrap_or("");
-                     
+
                      // Ensure we picked up a run for the correct SHA that is active
                      if (status == "queued" || status == "in_progress" || status == "requested" || status == "waiting") && run_sha == latest_sha {
                          found_new_run_id = run["databaseId"].as_u64();
@@ -344,7 +344,7 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
                 }
             }
         }
-        
+
         found_new_run_id.context("Could not find the newly triggered run (or it completed instantly).")?
     };
 
@@ -354,7 +354,7 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
             .args(["run", "watch", &run_id_to_watch.to_string()])
             .status()
             .context("Failed to watch run")?;
-        
+
         if status.success() {
             println!("Build completed successfully!");
         } else {
