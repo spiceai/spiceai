@@ -58,18 +58,34 @@ enum Commands {
         /// Branch to trigger build for. Defaults to current branch.
         #[arg(short, long)]
         branch: Option<String>,
+
+        /// PR number to resolve to a branch.
+        #[arg(short, long)]
+        pr: Option<u64>,
+
+        /// Wait for the build to complete
+        #[arg(short, long)]
+        wait: bool,
     },
     /// Install the latest binary for the current (or specified) branch
     Install {
         /// Branch to install binary for. Defaults to current branch.
         #[arg(short, long)]
         branch: Option<String>,
+
+        /// PR number to resolve to a branch.
+        #[arg(short, long)]
+        pr: Option<u64>,
     },
     /// Run the binary for the current (or specified) branch
     Run {
         /// Branch to run binary for. Defaults to current branch.
         #[arg(short, long)]
         branch: Option<String>,
+
+        /// PR number to resolve to a branch.
+        #[arg(short, long)]
+        pr: Option<u64>,
 
         /// Interactive mode: select a branch from installed binaries
         #[arg(short, long)]
@@ -87,24 +103,64 @@ struct GhRun {
     database_id: u64,
 }
 
+#[derive(Deserialize, Debug)]
+struct GhPr {
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+}
+
 #[cfg(unix)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Trigger { branch } => trigger_build(branch.as_deref()),
-        Commands::Install { branch } => install_build(branch.as_deref()),
+        Commands::Trigger { branch, pr, wait } => {
+            trigger_build(branch.as_deref(), *pr, *wait)
+        }
+        Commands::Install { branch, pr } => install_build(branch.as_deref(), *pr),
         Commands::Run {
             branch,
+            pr,
             interactive,
             args,
-        } => run_build(branch.as_deref(), *interactive, args),
+        } => run_build(branch.as_deref(), *pr, *interactive, args),
     }
 }
 
 #[cfg(not(unix))]
 fn main() -> Result<()> {
     anyhow::bail!("This tool is currently only supported on Unix-like systems.");
+}
+
+#[cfg(unix)]
+fn resolve_branch_or_pr(branch: Option<&str>, pr: Option<u64>) -> Result<String> {
+    if let Some(b) = branch {
+        return Ok(b.to_string());
+    }
+
+    if let Some(pr_num) = pr {
+        println!("Resolving PR #{} to branch...", pr_num);
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &pr_num.to_string(),
+                "--json",
+                "headRefName",
+            ])
+            .output()
+            .context("Failed to execute gh pr view")?;
+
+        if !output.status.success() {
+            anyhow::bail!("Failed to resolve PR #{}: {}", pr_num, String::from_utf8_lossy(&output.stderr));
+        }
+
+        let pr_data: GhPr = serde_json::from_slice(&output.stdout)?;
+        println!("Resolved PR #{} to branch '{}'", pr_num, pr_data.head_ref_name);
+        return Ok(pr_data.head_ref_name);
+    }
+
+    get_current_branch()
 }
 
 #[cfg(unix)]
@@ -129,11 +185,9 @@ fn get_current_branch() -> Result<String> {
     Ok(branch)
 }
 
-fn trigger_build(branch: Option<&str>) -> Result<()> {
-    let branch = match branch {
-        Some(b) => b.to_string(),
-        None => get_current_branch()?,
-    };
+#[cfg(unix)]
+fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()> {
+    let branch = resolve_branch_or_pr(branch, pr)?;
 
     println!("Triggering build for branch: {}...", branch);
 
@@ -166,11 +220,84 @@ fn trigger_build(branch: Option<&str>) -> Result<()> {
 
     if status.success() {
         println!("Build triggered successfully.");
-        println!("You can check the status with:");
-        println!(
-            "  gh run list --workflow build_and_release.yml --branch \"{}\"",
-            branch
-        );
+        
+        if wait {
+            println!("Waiting for build to start...");
+            
+            // We need to find the run that was just created.
+            // Since we just triggered it, it should be the newest one (created very recently).
+            // We'll poll for a short period to find a run created *after* we started.
+            // But 'gh run list' doesn't let us filter by exact time easily, just order.
+            // The previous code failed because it picked up an OLD run (already completed).
+            
+            let mut found_run_id: Option<u64> = None;
+            
+            // Poll for up to 30 seconds to find the new run
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                
+                let output = Command::new("gh")
+                    .args([
+                        "run",
+                        "list",
+                        "--workflow",
+                        "build_and_release.yml",
+                        "--branch",
+                        &branch,
+                        "--limit",
+                        "1",
+                        "--json",
+                        "databaseId,status,createdAt",
+                    ])
+                    .output()
+                    .context("Failed to fetch latest run ID")?;
+
+                if output.status.success() {
+                    let runs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+                    if let Some(run) = runs.first() {
+                         // Check if this run is actually new (e.g. in_progress or queued, or created just now)
+                         // A simple heuristic: if it's "completed" and we just triggered it, it's probably the OLD one.
+                         // unless our build is instant (unlikely).
+                         // Better: check status != completed, OR check createdAt is recent.
+                         // For now, let's rely on status. If we just triggered it, it shouldn't be completed yet.
+                         
+                         let status = run["status"].as_str().unwrap_or("");
+                         // let created_at = run["createdAt"].as_str().unwrap_or("");
+                         
+                         if status == "queued" || status == "in_progress" || status == "requested" || status == "waiting" {
+                             found_run_id = run["databaseId"].as_u64();
+                             break;
+                         }
+                    }
+                }
+            }
+
+            if let Some(run_id) = found_run_id {
+                println!("Waiting for Run ID: {}...", run_id);
+                let status = Command::new("gh")
+                    .args(["run", "watch", &run_id.to_string()])
+                    .status()
+                    .context("Failed to watch run")?;
+                
+                if status.success() {
+                    println!("Build completed successfully!");
+                } else {
+                    anyhow::bail!("Build failed or was cancelled.");
+                }
+            } else {
+                 println!("Warning: Could not find the new run ID (or it completed instantly). You'll need to check manually.");
+                 println!(
+                     "  gh run list --workflow build_and_release.yml --branch \"{}\"",
+                     branch
+                 );
+            }
+        } else {
+             println!("You can check the status with:");
+             println!(
+                 "  gh run list --workflow build_and_release.yml --branch \"{}\"",
+                 branch
+             );
+        }
     } else {
         anyhow::bail!("Failed to trigger build");
     }
@@ -209,11 +336,8 @@ struct ArtifactList {
 }
 
 #[cfg(unix)]
-fn install_build(branch: Option<&str>) -> Result<()> {
-    let branch = match branch {
-        Some(b) => b.to_string(),
-        None => get_current_branch()?,
-    };
+fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
+    let branch = resolve_branch_or_pr(branch, pr)?;
 
     let target_dir = dirs::home_dir()
         .context("Could not find home directory")?
@@ -395,14 +519,11 @@ fn install_build(branch: Option<&str>) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn run_build(branch: Option<&str>, interactive: bool, args: &[String]) -> Result<()> {
+fn run_build(branch: Option<&str>, pr: Option<u64>, interactive: bool, args: &[String]) -> Result<()> {
     let branch = if interactive {
         select_branch()?
     } else {
-        match branch {
-            Some(b) => b.to_string(),
-            None => get_current_branch()?,
-        }
+        resolve_branch_or_pr(branch, pr)?
     };
 
     let binary_path = dirs::home_dir()
@@ -416,7 +537,7 @@ fn run_build(branch: Option<&str>, interactive: bool, args: &[String]) -> Result
             "Binary not found at {}. Installing...",
             binary_path.display()
         );
-        install_build(Some(&branch))?;
+        install_build(Some(&branch), None)?;
     }
 
     println!("Running spiced from branch '{}'...", branch);
