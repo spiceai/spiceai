@@ -97,7 +97,7 @@ pub struct PartitionManagementConfig {
     /// How often to run the management cycle
     pub interval: Duration,
 
-    /// Maximum partitions to assign per executor per cycle
+    /// Maximum partitions to assign per cycle
     pub max_assignments_per_cycle: usize,
 
     /// Maximum partitions per executor (soft limit)
@@ -107,32 +107,57 @@ pub struct PartitionManagementConfig {
     pub discovery_timeout: Duration,
 }
 
-impl From<spicepod::component::runtime::PartitionManagement> for PartitionManagementConfig {
-    fn from(config: spicepod::component::runtime::PartitionManagement) -> Self {
-        let interval = fundu::parse_duration(&config.interval).unwrap_or_else(|e| {
-            tracing::warn!(
-                "Invalid partition management interval '{}': {}. Using default 30s.",
-                config.interval,
-                e
-            );
-            Duration::from_secs(30)
-        });
-        let discovery_timeout =
-            fundu::parse_duration(&config.discovery_timeout).unwrap_or_else(|e| {
-                tracing::warn!(
-                    "Invalid partition management discovery timeout '{}': {}. Using default 60s.",
-                    config.discovery_timeout,
-                    e
-                );
-                Duration::from_secs(60)
-            });
+#[derive(Debug, Snafu)]
+pub enum ConfigError {
+    #[snafu(display("Invalid partition management interval '{interval}': {source}"))]
+    InvalidInterval {
+        interval: String,
+        source: fundu::ParseError,
+    },
 
-        Self {
+    #[snafu(display("Partition management interval must be greater than zero"))]
+    IntervalIsZero,
+
+    #[snafu(display("Invalid partition management discovery timeout '{timeout}': {source}"))]
+    InvalidDiscoveryTimeout {
+        timeout: String,
+        source: fundu::ParseError,
+    },
+
+    #[snafu(display("Partition management discovery timeout must be greater than zero"))]
+    DiscoveryTimeoutIsZero,
+}
+
+impl TryFrom<spicepod::component::runtime::PartitionManagement> for PartitionManagementConfig {
+    type Error = ConfigError;
+
+    fn try_from(
+        config: spicepod::component::runtime::PartitionManagement,
+    ) -> Result<Self, Self::Error> {
+        let interval = fundu::parse_duration(&config.interval).context(InvalidIntervalSnafu {
+            interval: &config.interval,
+        })?;
+
+        if interval.is_zero() {
+            return Err(ConfigError::IntervalIsZero);
+        }
+
+        let discovery_timeout = fundu::parse_duration(&config.discovery_timeout).context(
+            InvalidDiscoveryTimeoutSnafu {
+                timeout: &config.discovery_timeout,
+            },
+        )?;
+
+        if discovery_timeout.is_zero() {
+            return Err(ConfigError::DiscoveryTimeoutIsZero);
+        }
+
+        Ok(Self {
             interval,
             max_assignments_per_cycle: config.max_assignments_per_cycle,
             max_partitions_per_executor: config.max_partitions_per_executor,
             discovery_timeout,
-        }
+        })
     }
 }
 

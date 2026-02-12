@@ -23,7 +23,11 @@ use crate::{
     },
     datafusion::DataFusion,
 };
-use datafusion::{execution::SessionStateBuilder, prelude::SessionContext, sql::TableReference};
+use datafusion::{
+    execution::{SessionState, SessionStateBuilder},
+    prelude::SessionContext,
+    sql::TableReference,
+};
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 
@@ -52,16 +56,7 @@ pub async fn table_partition_values(
         return Ok(Vec::new());
     }
 
-    let cols_str = partition_exprs.join(", ");
-    let sql = format!("SELECT DISTINCT {cols_str} FROM {table_name}");
-
-    tracing::debug!(
-        table = %table_name,
-        sql = %sql,
-        "Querying for partition values"
-    );
-
-    let batches = execute_partition_discovery_query(df, table, &sql).await?;
+    let batches = execute_partition_discovery_query(df, table, partition_exprs).await?;
 
     // Convert record batches to partition value strings
     let mut partition_values = Vec::new();
@@ -107,7 +102,7 @@ pub async fn table_partition_values(
 async fn execute_partition_discovery_query(
     df: &Arc<DataFusion>,
     table: &TableReference,
-    sql: &str,
+    partition_exprs: Vec<String>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>> {
     let table_name = table.to_string();
 
@@ -118,7 +113,8 @@ async fn execute_partition_discovery_query(
     }
 
     // Must get table source of `AcceleratedTable` to get true value of partition.
-    let Some(acc) = df.get_table(table).await.and_then(|t| {
+    let table_opt = df.get_table(table).await;
+    let Some(acc) = table_opt.clone().and_then(|t| {
         t.as_any()
             .downcast_ref::<AcceleratedTable>()
             .map(AcceleratedTable::get_federated_table)
@@ -132,27 +128,37 @@ async fn execute_partition_discovery_query(
         SessionStateBuilder::new_from_existing(df.ctx.state()).build(),
     );
 
-    // Must deregister table in this context before registering source table.
-    let _ = ctx.deregister_table(table.clone());
-    ctx.register_table(table.clone(), acc.table_provider().await)
+    // Register with random UUID. Even if [`SessionContext`] is a clone, it will evict it from the broader DF context.
+    let temp_table =
+        TableReference::parse_str(uuid::Uuid::new_v4().as_simple().to_string().as_str());
+    ctx.register_table(temp_table.clone(), acc.table_provider().await)
         .context(RegisterTableSnafu {
             table: table_name.clone(),
         })?;
 
     // Execute query
-    let batches = ctx
-        .sql(sql)
+    let df_result = ctx
+        .sql(
+            format!(
+                "SELECT DISTINCT {} FROM \"{temp_table}\"",
+                partition_exprs.join(", ")
+            )
+            .as_str(),
+        )
         .await
         .boxed()
         .context(PartitionDiscoverySnafu {
             table: table_name.clone(),
-        })?
+        });
+
+    // Deregister the temporary table after query execution to avoid polluting the catalog. This is done regardless of query success or failure.
+    let _ = ctx.deregister_table(temp_table);
+
+    df_result?
         .collect()
         .await
         .boxed()
-        .context(PartitionDiscoverySnafu { table: table_name })?;
-
-    Ok(batches)
+        .context(PartitionDiscoverySnafu { table: table_name })
 }
 
 /// Wait for the [`TableReference`] to be registered in Runtime.

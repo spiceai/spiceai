@@ -830,11 +830,20 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                     // Start partition management task
                     let pm_shutdown = CancellationToken::new();
                     let pm_shutdown_for_task = pm_shutdown.clone();
-                    let pm_config = config
+                    let pm_config = match config
                         .partition_management
                         .clone()
-                        .map(PartitionManagementConfig::from)
-                        .unwrap_or_default();
+                        .map(PartitionManagementConfig::try_from)
+                    {
+                        Some(Ok(cfg)) => cfg,
+                        None => PartitionManagementConfig::default(),
+                        Some(Err(err)) => {
+                            tracing::warn!(
+                                "Failed to parse partition management config, partition management task will not be started: {err
+                            }");
+                            return Ok(None);
+                        }
+                    };
 
                     let pm_task = PartitionManagementTask::new(
                         Arc::clone(&app),
