@@ -324,17 +324,29 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     };
 
     // Run verification if requested
+    let mut failures = Vec::new();
     let (mut spiced_instance, verification_passed) = if args.verify {
         let verification_result =
-            verification::run_verification(spiced_instance, 1, args.scale_factor).await?;
+            verification::run_verification(spiced_instance, &config_name, 1, args.scale_factor)
+                .await?;
 
-        // Emit per-query metrics
+        // Emit per-query metrics and collect failures
         for query in &verification_result.metrics.metrics {
             let query_name = &query.query_name;
             let row_count = verification_result.row_counts.get(query_name).unwrap_or(&0);
             let attributes = vec![KeyValue::new("query_name", query_name.to_string())];
 
-            let status: u64 = u64::from(matches!(&query.query_status, QueryStatus::Passed));
+            let status: u64 = u64::from(match &query.query_status {
+                QueryStatus::Passed => true,
+                QueryStatus::Failed(reason) => {
+                    if let Some(reason) = reason {
+                        failures.push(format!("{query_name}: {reason}"));
+                    } else {
+                        failures.push(format!("{query_name}: failed with an undetermined error"));
+                    }
+                    false
+                }
+            });
 
             crate::metrics::QUERY_STATUS.record(status, &attributes);
             crate::metrics::MEDIAN_DURATION.record(query.median_duration_ms, &attributes);
@@ -401,6 +413,13 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
         "  Verification: {}",
         if verification_passed { "PASS" } else { "FAIL" }
     );
+
+    if !verification_passed {
+        return Err(anyhow::anyhow!(
+            "Verification failed due to failed queries:\n{}",
+            failures.join("\n")
+        ));
+    }
 
     Ok(())
 }
