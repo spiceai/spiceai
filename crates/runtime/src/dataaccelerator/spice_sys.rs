@@ -184,10 +184,12 @@ pub enum Error {
     #[snafu(display("No acceleration connection available"))]
     NoAccelerationConnection,
 
-    #[snafu(display("Failed to downcast to {target}"))]
+    #[snafu(display(
+        "Failed to process accelerated data: internal type conversion error for '{target}'"
+    ))]
     DowncastFailed { target: &'static str },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Acceleration error: {source}"))]
     External {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

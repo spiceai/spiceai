@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 1277
       },
-      "score": 0.03
+      "_score": 0.03
     },
     {
       "dataset": "spice.public.qs",
@@ -33,7 +33,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 470
       },
-      "score": 0.03
+      "_score": 0.03
     },
     {
       "dataset": "spice.public.qs",
@@ -45,7 +45,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 458
       },
-      "score": 0.01
+      "_score": 0.01
     },
     {
       "dataset": "spice.public.qs",
@@ -57,7 +57,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 41
       },
-      "score": 0.01
+      "_score": 0.01
     }
   ]
 }

@@ -32,7 +32,9 @@ pub enum SnapshotEngineError {
     DuckDB { source: duckdb::DuckDBSnapshotError },
 
     /// Placeholder variant for when no features are enabled
-    #[snafu(display("Snapshot engine error"))]
+    #[snafu(display(
+        "No snapshot engine is available. Enable a snapshot engine feature (e.g., 'duckdb')."
+    ))]
     #[cfg(not(feature = "duckdb"))]
     Generic,
 }

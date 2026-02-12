@@ -17,7 +17,7 @@ snapshot_kind: text
         "id": 1015,
         "question": "What is the possible action of pedunculagin and alchemillin, chemical components of lady's mantle?"
       },
-      "score": 0.28
+      "_score": 0.28
     },
     {
       "dataset": "qs",
@@ -30,7 +30,7 @@ snapshot_kind: text
         "id": 821,
         "question": "What causes dermatomycosis, and what are some examples of this condition?"
       },
-      "score": 0.24
+      "_score": 0.24
     },
     {
       "dataset": "qs",
@@ -43,7 +43,7 @@ snapshot_kind: text
         "id": 449,
         "question": "How long of a follow-up is required after spinal cord (SC) ependymoma resection?"
       },
-      "score": 0.23
+      "_score": 0.23
     },
     {
       "dataset": "qs",
@@ -56,7 +56,7 @@ snapshot_kind: text
         "id": 1193,
         "question": "What is the unusual characteristic of the body profile of Menidae (moonfish)?"
       },
-      "score": 0.2
+      "_score": 0.2
     }
   ]
 }

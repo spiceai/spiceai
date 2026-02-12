@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 470
       },
-      "score": 0.03
+      "_score": 0.03
     },
     {
       "dataset": "qs",
@@ -30,7 +30,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 361
       },
-      "score": 0.01
+      "_score": 0.01
     },
     {
       "dataset": "qs",
@@ -42,7 +42,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 1277
       },
-      "score": 0.01
+      "_score": 0.01
     },
     {
       "dataset": "qs",
@@ -54,7 +54,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "id": 787
       },
-      "score": 0.01
+      "_score": 0.01
     }
   ]
 }

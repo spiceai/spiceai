@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -19,7 +18,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 468
       },
-      "score": 0.01
+      "_score": 0.01639344262295082
     },
     {
       "data": {
@@ -34,7 +33,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 361
       },
-      "score": 0.01
+      "_score": 0.01639344262295082
     },
     {
       "data": {
@@ -49,7 +48,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 462
       },
-      "score": 0.01
+      "_score": 0.016129032258064516
     },
     {
       "data": {
@@ -64,7 +63,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 1277
       },
-      "score": 0.01
+      "_score": 0.016129032258064516
     }
   ]
 }

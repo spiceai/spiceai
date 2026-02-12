@@ -74,11 +74,11 @@ pub type ODBCDbConnectionPool<'a> =
 pub enum Error {
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     ArrowError { source: arrow::error::ArrowError },
-    #[snafu(display("arrow_odbc error: {source}"))]
+    #[snafu(display("ODBC driver error: {source}"))]
     ArrowODBCError { source: arrow_odbc::Error },
-    #[snafu(display("odbc_api Error: {source}"))]
+    #[snafu(display("ODBC connection error: {source}"))]
     ODBCAPIError { source: odbc_api::Error },
-    #[snafu(display("odbc_api Error: {message}"))]
+    #[snafu(display("ODBC connection error: {message}"))]
     ODBCAPIErrorNoSource { message: String },
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     TryFromError { source: std::num::TryFromIntError },

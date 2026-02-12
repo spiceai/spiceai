@@ -76,19 +76,19 @@ pub enum Error {
         schema: Schema,
     },
 
-    #[snafu(display("Unable to downcast ArrayBuilder"))]
+    #[snafu(display("Failed to process Debezium data: internal type conversion error"))]
     DowncastBuilder,
 
-    #[snafu(display("Unable to decode base64 string: {source}"))]
+    #[snafu(display("Failed to decode base64-encoded column value: {source}"))]
     UnableToDecodeBase64 { source: base64::DecodeError },
 
     #[snafu(display("Decimal value is not 16 bytes. Got: {} bytes", value.len()))]
     Decimal128BytesNot16Bytes { value: Vec<u8> },
 
-    #[snafu(display("Unable to convert value to i64"))]
+    #[snafu(display("Failed to convert Debezium value to i64 integer"))]
     UnableToConvertToI64,
 
-    #[snafu(display("Unable to convert value to f64"))]
+    #[snafu(display("Failed to convert Debezium value to f64 floating point"))]
     UnableToConvertToF64,
 
     #[snafu(display("Timestamp type ({unit:?},{time_zone:?}) not supported yet",))]

@@ -47,7 +47,7 @@ pub enum Error {
     ))]
     InconsistentColumns { s1: SchemaRef, s2: SchemaRef },
 
-    #[snafu(display("A database error occurred whilst aggregating search candidates: {source}"))]
+    #[snafu(display("Failed to aggregate search results: {source}"))]
     DatafusionError {
         source: datafusion::error::DataFusionError,
     },

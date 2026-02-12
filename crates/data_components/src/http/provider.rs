@@ -77,10 +77,10 @@ pub enum Error {
     #[snafu(display("Invalid URL: {source}"))]
     InvalidUrl { source: url::ParseError },
 
-    #[snafu(display("Arrow error: {source}"))]
+    #[snafu(display("Failed to process HTTP response data: {source}"))]
     Arrow { source: ArrowError },
 
-    #[snafu(display("DataFusion error: {source}"))]
+    #[snafu(display("Failed to execute HTTP query: {source}"))]
     DataFusion { source: DataFusionError },
 
     #[snafu(display("Filter rejected: {message}"))]

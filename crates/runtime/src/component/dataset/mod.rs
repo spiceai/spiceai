@@ -58,12 +58,12 @@ pub enum Error {
         valid_columns: String,
     },
 
-    #[snafu(display("Unable to get table constraints: {source}"))]
+    #[snafu(display("Failed to retrieve table constraints for the dataset: {source}"))]
     UnableToGetTableConstraints {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Unable to convert a SchemaRef to a DFSchema: {source}"))]
+    #[snafu(display("Failed to convert the dataset schema for query planning: {source}"))]
     UnableToConvertSchemaRefToDFSchema {
         source: datafusion::error::DataFusionError,
     },

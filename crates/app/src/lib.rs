@@ -24,7 +24,7 @@ pub use spicepod;
 use spicepod::{
     Spicepod,
     component::{
-        caching::{CacheConfig, ResultsCache},
+        caching::{CacheConfig, SQLResultsCacheConfig},
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
@@ -278,8 +278,8 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
-        self.runtime.results_cache = Some(results_cache);
+    pub fn with_sql_cache(mut self, sql_results: SQLResultsCacheConfig) -> AppBuilder {
+        self.runtime.caching.sql_results = Some(sql_results);
         self
     }
 

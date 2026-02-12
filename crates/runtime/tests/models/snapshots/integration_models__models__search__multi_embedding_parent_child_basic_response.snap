@@ -1,23 +1,10 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
-    {
-      "dataset": "multiple_columns",
-      "matches": {
-        "cp_department": [
-          "DEPARTMENT"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 2
-      },
-      "score": 0.01
-    },
     {
       "dataset": "multiple_columns",
       "matches": {
@@ -28,7 +15,19 @@ snapshot_kind: text
       "primary_key": {
         "cp_catalog_page_sk": 11
       },
-      "score": 0.01
+      "_score": 0.01639344262295082
+    },
+    {
+      "dataset": "multiple_columns",
+      "matches": {
+        "cp_department": [
+          "DEPARTMENT"
+        ]
+      },
+      "primary_key": {
+        "cp_catalog_page_sk": 2
+      },
+      "_score": 0.01639344262295082
     }
   ]
 }
