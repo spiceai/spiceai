@@ -1,17 +1,16 @@
 ---
 source: crates/runtime/tests/models/embedding.rs
 expression: normalize_embeddings_response(response)
-snapshot_kind: text
 ---
 {
   "data": [
     {
-      "embedding": "str_len_684",
+      "embedding": "array_128_items",
       "index": 0,
       "object": "embedding"
     },
     {
-      "embedding": "str_len_684",
+      "embedding": "array_128_items",
       "index": 1,
       "object": "embedding"
     }
@@ -19,7 +18,7 @@ snapshot_kind: text
   "model": "openai_embeddings",
   "object": "list",
   "usage": {
-    "prompt_tokens": 8,
-    "total_tokens": 8
+    "prompt_tokens": 10,
+    "total_tokens": 10
   }
 }
