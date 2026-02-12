@@ -1,4 +1,4 @@
-name: streaming dynamodb benchmark
+name: testoperator streaming dynamodb benchmark
 run-name: streaming - ${{ github.event.inputs.queryset }} - ${{ github.event.inputs.config_name }} - ${{ github.event.inputs.run_id }}
 
 on:
