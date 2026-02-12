@@ -42,7 +42,7 @@ pub(crate) struct CatalogFilter {
 }
 
 // Re-export shared type for backwards compatibility
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use runtime_api_types::v1::CatalogInfo;
 pub use runtime_api_types::v1::CatalogInfo as CatalogResponseItem;
 

@@ -35,7 +35,6 @@ use crate::cluster::partition::{
 use crate::datafusion::DataFusion;
 use crate::datafusion::resolved_equality;
 use app::App;
-use tokio::runtime::Handle;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -303,7 +302,7 @@ impl PartitionManagementTask {
                 .await?;
         }
 
-        let unassigned = self.find_unassigned_partitions(&state).await?;
+        let unassigned = self.find_unassigned_partitions(&state)?;
 
         if !unassigned.is_empty() {
             let assignments = self
@@ -587,7 +586,6 @@ impl PartitionManagementTask {
                         });
                     }
                     tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(retries))).await;
-                    continue;
                 }
                 Err(e) => {
                     return Err(Error::WriteMetadata {
@@ -695,7 +693,6 @@ impl PartitionManagementTask {
                         });
                     }
                     tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(retries))).await;
-                    continue;
                 }
                 Err(e) => {
                     return Err(Error::WriteMetadata {
@@ -767,10 +764,7 @@ impl PartitionManagementTask {
         Ok(())
     }
 
-    async fn find_unassigned_partitions(
-        &self,
-        state: &CycleState,
-    ) -> Result<Vec<UnassignedPartition>> {
+    fn find_unassigned_partitions(&self, state: &CycleState) -> Result<Vec<UnassignedPartition>> {
         let mut unassigned = Vec::new();
 
         for table_name in &state.tables {
@@ -814,7 +808,7 @@ impl PartitionManagementTask {
         let mut assignments_this_cycle = 0;
 
         // Build executor load map
-        let mut executor_loads = self.build_executor_loads(state).await?;
+        let mut executor_loads = self.build_executor_loads(state)?;
 
         for unassigned_partition in unassigned {
             if assignments_this_cycle >= self.config.max_assignments_per_cycle {
@@ -826,9 +820,8 @@ impl PartitionManagementTask {
             }
 
             // Select best executor for this partition
-            let executor = if let Some(e) = self
-                .select_executor_for_partition(&unassigned_partition, &executor_loads, state)
-                .await?
+            let executor = if let Some(e) =
+                self.select_executor_for_partition(&unassigned_partition, &executor_loads, state)?
             {
                 e
             } else {
@@ -863,10 +856,7 @@ impl PartitionManagementTask {
         Ok(assignments)
     }
 
-    async fn build_executor_loads(
-        &self,
-        state: &CycleState,
-    ) -> Result<HashMap<String, ExecutorLoad>> {
+    fn build_executor_loads(&self, state: &CycleState) -> Result<HashMap<String, ExecutorLoad>> {
         let mut loads = HashMap::new();
 
         // Initialize with empty loads
@@ -892,7 +882,7 @@ impl PartitionManagementTask {
         Ok(loads)
     }
 
-    async fn select_executor_for_partition(
+    fn select_executor_for_partition(
         &self,
         partition: &UnassignedPartition,
         executor_loads: &HashMap<String, ExecutorLoad>,
