@@ -1,4 +1,4 @@
-name: streaming dynamodb dispatch
+name: testoperator streaming dynamodb dispatch
 run-name: streaming-dispatch - ${{ github.event.inputs.queryset }} - sf${{ github.event.inputs.scale_factor }}
 
 on:
@@ -57,6 +57,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      actions: write
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
