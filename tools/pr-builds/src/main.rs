@@ -1,9 +1,42 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use std::env;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -54,6 +87,7 @@ struct GhRun {
     database_id: u64,
 }
 
+#[cfg(unix)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -68,6 +102,12 @@ fn main() -> Result<()> {
     }
 }
 
+#[cfg(not(unix))]
+fn main() -> Result<()> {
+    anyhow::bail!("This tool is currently only supported on Unix-like systems.");
+}
+
+#[cfg(unix)]
 fn get_current_branch() -> Result<String> {
     let output = Command::new("git")
         .args(["branch", "--show-current"])
@@ -158,6 +198,17 @@ fn get_artifact_names() -> Vec<String> {
     names
 }
 
+#[derive(Deserialize, Debug)]
+struct Artifact {
+    name: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct ArtifactList {
+    artifacts: Vec<Artifact>,
+}
+
+#[cfg(unix)]
 fn install_build(branch: Option<&str>) -> Result<()> {
     let branch = match branch {
         Some(b) => b.to_string(),
@@ -205,47 +256,59 @@ fn install_build(branch: Option<&str>) -> Result<()> {
 
     println!("Found Run ID: {}", run_id);
 
+    // List artifacts for the run to check which one exists
+    println!("Checking available artifacts...");
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/spiceai/spiceai/actions/runs/{}/artifacts", run_id),
+        ])
+        .output()
+        .context("Failed to fetch artifacts list")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Failed to list artifacts");
+    }
+
+    let artifact_list: ArtifactList = serde_json::from_slice(&output.stdout)?;
+    let available_artifacts: Vec<String> = artifact_list
+        .artifacts
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
+
+    let wanted_artifacts = get_artifact_names();
+    let artifact_to_download = wanted_artifacts
+        .iter()
+        .find(|name| available_artifacts.contains(name))
+        .context("No compatible artifact found in this build")?;
+
     let temp_dir = tempfile::tempdir()?;
     let temp_path = temp_dir.path();
 
-    println!("Downloading artifact to {}...", temp_path.display());
+    println!(
+        "Downloading artifact '{}' to {}...",
+        artifact_to_download,
+        temp_path.display()
+    );
 
-    let artifacts = get_artifact_names();
-    let mut downloaded = false;
+    let status = Command::new("gh")
+        .args([
+            "run",
+            "download",
+            &run_id.to_string(),
+            "-n",
+            artifact_to_download,
+            "-D",
+        ])
+        .arg(temp_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to execute gh run download")?;
 
-    for artifact_name in &artifacts {
-        println!("Attempting to download artifact: {}", artifact_name);
-        // Using temp_path to convert to string safely
-        let temp_path_str = temp_path
-            .to_str()
-            .context("Temp path contains invalid UTF-8")?;
-
-        let status = Command::new("gh")
-            .args([
-                "run",
-                "download",
-                &run_id.to_string(),
-                "-n",
-                artifact_name,
-                "-D",
-                temp_path_str,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .context("Failed to execute gh run download")?;
-
-        if status.success() {
-            downloaded = true;
-            break;
-        }
-    }
-
-    if !downloaded {
-        anyhow::bail!(
-            "Failed to download any compatible artifacts. Tried: {:?}",
-            artifacts
-        );
+    if !status.success() {
+        anyhow::bail!("Failed to download artifact");
     }
 
     println!("Installing to {}...", target_dir.display());
@@ -256,7 +319,6 @@ fn install_build(branch: Option<&str>) -> Result<()> {
     for entry in fs::read_dir(temp_path)? {
         let entry = entry?;
         let path = entry.path();
-        // Check for extension safely
         if let Some(ext) = path.extension() {
             if ext == "gz" {
                 tar_file = Some(path);
@@ -267,34 +329,46 @@ fn install_build(branch: Option<&str>) -> Result<()> {
 
     let tar_file = tar_file.context("No tar.gz file found in downloaded artifact")?;
 
-    // Extract
+    // Extract directly to target location
     let tar_gz = fs::File::open(&tar_file)?;
     let tar = GzDecoder::new(tar_gz);
     let mut archive = Archive::new(tar);
-    archive.unpack(temp_path)?;
 
-    // Find binary
-    let spiced_path = temp_path.join("spiced");
-    if !spiced_path.exists() {
-        anyhow::bail!(
-            "Could not find 'spiced' binary in extracted archive at {}",
-            spiced_path.display()
-        );
+    // Use a temp file in the target directory for extraction
+    let temp_target = target_dir.join("spiced.tmp");
+    let mut found_binary = false;
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        if path.ends_with("spiced") {
+            println!("Extracting binary to {}...", temp_target.display());
+            entry.unpack(&temp_target)?;
+            found_binary = true;
+            break;
+        }
+    }
+
+    if !found_binary {
+        anyhow::bail!("Could not find 'spiced' binary in archive");
     }
 
     let target_binary = target_dir.join("spiced");
-    // Rename might fail if cross-device link, but unlikely for temp to home usually on same mount or different.
-    // fs::rename is atomic but platform specific. If it fails, we might need copy+delete.
-    // For now, assuming fs::rename works or fails loudly.
-    if target_binary.exists() {
-        fs::remove_file(&target_binary)?;
-    }
-    fs::rename(&spiced_path, &target_binary)?;
 
-    // Make executable
-    let mut perms = fs::metadata(&target_binary)?.permissions();
+    // Make executable before rename
+    let mut perms = fs::metadata(&temp_target)?.permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(&target_binary, perms)?;
+    fs::set_permissions(&temp_target, perms)?;
+
+    // Rename might fail if cross-device link (EXDEV), so we try copy+remove as fallback
+    if let Err(e) = fs::rename(&temp_target, &target_binary) {
+        if e.kind() == std::io::ErrorKind::CrossesDevices {
+             fs::copy(&temp_target, &target_binary)?;
+             let _ = fs::remove_file(&temp_target);
+        } else {
+             return Err(e.into());
+        }
+    }
 
     println!("Installed spiced to {}", target_binary.display());
 
@@ -320,6 +394,7 @@ fn install_build(branch: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn run_build(branch: Option<&str>, interactive: bool, args: &[String]) -> Result<()> {
     let branch = if interactive {
         select_branch()?
@@ -355,6 +430,7 @@ fn run_build(branch: Option<&str>, interactive: bool, args: &[String]) -> Result
     anyhow::bail!("Failed to execute spiced: {}", error);
 }
 
+#[cfg(unix)]
 fn select_branch() -> Result<String> {
     let base_dir = dirs::home_dir()
         .context("Could not find home directory")?
