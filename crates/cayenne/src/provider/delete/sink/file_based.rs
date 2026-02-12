@@ -429,8 +429,10 @@ impl FileBasedDeletionSink {
             let snapshot_dir = std::path::PathBuf::from(&self.table_path)
                 .join(self.table_id.to_string())
                 .join(snapshot_id);
-            if snapshot_dir.exists() {
-                if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await {
+            match tokio::fs::remove_dir_all(&snapshot_dir).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
                     tracing::warn!(
                         "Failed to remove empty snapshot directory {}: {e}",
                         snapshot_dir.display()
