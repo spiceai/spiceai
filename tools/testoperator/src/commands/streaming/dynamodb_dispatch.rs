@@ -328,18 +328,15 @@ async fn trigger_workflow(
     spicepod_path: &Path,
     args: &StreamingDynamodbDispatchArgs,
 ) -> Result<()> {
-    let mut inputs = serde_json::json!({
+    let inputs = serde_json::json!({
         "run_id": run_id,
         "config_name": config_name,
         "spicepod_path": spicepod_path.display().to_string(),
         "queryset": args.queryset.to_string(),
         "scale_factor": args.scale_factor.to_string(),
         "ready_wait": args.ready_wait.to_string(),
+        "verify": args.verify.to_string(),
     });
-
-    if args.verify {
-        inputs["verify"] = serde_json::json!("true");
-    }
 
     let gh_workflow = GitHubWorkflow::new(org, repo, workflow, git_ref);
     gh_workflow.send(octo.actions(), Some(inputs)).await?;
