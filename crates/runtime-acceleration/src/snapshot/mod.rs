@@ -2586,8 +2586,6 @@ async fn build_s3_parameters(
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
