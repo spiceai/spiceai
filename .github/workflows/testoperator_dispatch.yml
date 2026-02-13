@@ -24,7 +24,8 @@ on:
           - 'http-consistency'
           - 'nas'
           - 'text-to-sql'
-          - 'streaming'
+          - 'streaming-bench'
+          - 'streaming-correctness'
       update_snapshots:
         description: 'Update snapshots?'
         required: false
