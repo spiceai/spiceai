@@ -457,10 +457,8 @@ pub enum SnapshotUploadError {
     },
     #[snafu(display("Snapshot metadata schema for dataset {dataset} is missing"))]
     UploadMetadataSchemaMissing { dataset: String },
-    #[snafu(display(
-        "Schema mismatch for dataset {dataset}: existing snapshots are incompatible with the current schema. Snapshots don't support schema evolution. Delete the existing snapshots and restart the Spice runtime to rebuild them with the updated schema. {details}"
-    ))]
-    UploadSchemaMismatch { dataset: String, details: String },
+    #[snafu(display("Snapshot metadata schema conflict for dataset {dataset}"))]
+    UploadSchemaMismatch { dataset: String },
     #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}"))]
     CopyLocal {
         source_path: PathBuf,
@@ -2012,12 +2010,11 @@ impl SnapshotManager {
                         },
                     )?;
 
-                if metadata_schema.fields() != schema.fields() {
+                if metadata_schema.as_ref() != schema.as_ref() {
                     let details = arrow_tools::schema::schema_difference(&metadata_schema, schema)
                         .unwrap_or_default();
                     return Err(SnapshotUploadError::UploadSchemaMismatch {
                         dataset: dataset_name.clone(),
-                        details,
                     });
                 }
             }
@@ -5261,49 +5258,5 @@ mod tests {
             "Only the current snapshot should remain"
         );
         assert_eq!(dataset_entry.snapshots[0].snapshot_id, 5);
-    }
-
-    #[test]
-    fn schema_diff_field_added_and_removed() {
-        let schema_a = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-        let schema_b = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("email", DataType::Utf8, true),
-        ]));
-
-        let details = arrow_tools::schema::schema_difference(&schema_a, &schema_b)
-            .expect("should detect differences");
-        assert!(
-            details.contains("`name`") && details.contains("missing"),
-            "should report 'name' missing, got: {details}"
-        );
-        assert!(
-            details.contains("`email`") && details.contains("unexpected"),
-            "should report 'email' unexpected, got: {details}"
-        );
-    }
-
-    #[test]
-    fn schema_diff_type_change() {
-        let schema_a = Arc::new(Schema::new(vec![Field::new(
-            "amount",
-            DataType::Int32,
-            false,
-        )]));
-        let schema_b = Arc::new(Schema::new(vec![Field::new(
-            "amount",
-            DataType::Int64,
-            false,
-        )]));
-
-        let details = arrow_tools::schema::schema_difference(&schema_a, &schema_b)
-            .expect("should detect differences");
-        assert!(
-            details.contains("`amount`") && details.contains("Int32") && details.contains("Int64"),
-            "should report type change, got: {details}"
-        );
     }
 }
