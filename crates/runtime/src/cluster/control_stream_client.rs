@@ -375,6 +375,8 @@ async fn handle_scheduler_message(
                     .map(|(k, v)| (k, v.items))
                     .collect();
                 handler(new_partitions, removed_partitions).await;
+            }
+        }
         SchedulerMessage::CancelTasks(cmd) => {
             let Some(executor) = executor else {
                 tracing::warn!(
@@ -660,6 +662,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         manager.update_schedulers(vec![]);
         assert!(manager.known_schedulers.is_empty());
@@ -671,6 +674,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
             None,
