@@ -75,8 +75,8 @@ impl TestType {
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
             TestType::Search => "testoperator_run_search.yml",
             TestType::TextToSql => "testoperator_run_texttosql.yml",
-            TestType::Streaming => "testoperator_run_streaming_dynamodb.yml",
-            TestType::StreamingCorrectness => "testoperator_run_streaming_dynamodb_correctness.yml",
+            TestType::Streaming => "testoperator_run_streaming_dynamodb.yml", // TODO: rename
+            TestType::StreamingCorrectness => "testoperator_run_streaming_correctness.yml",
         }
     }
 }
