@@ -19,6 +19,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 mod list_models;
+mod responses;
 
 pub use list_models::XaiModelLister;
 
