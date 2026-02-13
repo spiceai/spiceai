@@ -637,6 +637,7 @@ mod tests {
             None, // no TLS
             None, // no metrics reader
             None,
+            None,
         );
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -651,6 +652,7 @@ mod tests {
             "executor-2".to_string(),
             None,
             Some(reader),
+            None,
             None,
         );
         assert!(manager.metrics_reader.is_some());
