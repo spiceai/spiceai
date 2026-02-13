@@ -58,8 +58,15 @@ impl Responses for Xai {
         let mut inner_req = req.clone();
         inner_req.model = Some(self.model.clone());
 
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
         let stream = self.client.responses().create_stream(inner_req).await?;
 
+        drop(permit);
         Ok(Box::pin(stream))
     }
 
@@ -67,8 +74,15 @@ impl Responses for Xai {
         let mut inner_req = req.clone();
         inner_req.model = Some(self.model.clone());
 
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
         let resp = self.client.responses().create(inner_req).await?;
 
+        drop(permit);
         Ok(resp)
     }
 }

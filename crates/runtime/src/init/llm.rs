@@ -31,7 +31,7 @@ use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 
 fn supports_responses_api(m: &SpicepodModel, params: &HashMap<String, SecretString>) -> bool {
     // xAI always uses Responses API (chat/completions is legacy)
-    if let Some(ModelSource::Xai) = m.get_source() {
+    if m.get_source() == Some(ModelSource::Xai) {
         return true;
     }
 
