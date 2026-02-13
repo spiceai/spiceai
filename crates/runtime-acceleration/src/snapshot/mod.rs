@@ -2011,8 +2011,6 @@ impl SnapshotManager {
                     )?;
 
                 if metadata_schema.as_ref() != schema.as_ref() {
-                    let details = arrow_tools::schema::schema_difference(&metadata_schema, schema)
-                        .unwrap_or_default();
                     return Err(SnapshotUploadError::UploadSchemaMismatch {
                         dataset: dataset_name.clone(),
                     });
