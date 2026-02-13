@@ -117,10 +117,6 @@ jobs:
 
       - name: Run DynamoDB streaming benchmark
         run: |
-          VERIFY_FLAG=""
-          if [ "${{ github.event.inputs.verify }}" = "true" ]; then
-            VERIFY_FLAG="--verify"
-          fi
 
           LIVENESS_FLAG=""
           if [ "${{ github.event.inputs.enable_liveness }}" = "true" ]; then
@@ -139,7 +135,6 @@ jobs:
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --metrics \
-            ${VERIFY_FLAG} \
             ${LIVENESS_FLAG} \
             ${QUERY_LIVENESS_FLAG}
         env:
