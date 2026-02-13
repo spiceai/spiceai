@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.61,
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
         "cp_description": [
@@ -14,10 +15,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 11
-      },
-      "_score": 0.6104534802776935
+      }
     },
     {
+      "_score": 0.59,
       "dataset": "spice.public.cached_search_bypass",
       "matches": {
         "cp_description": [
@@ -26,8 +27,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 8
-      },
-      "_score": 0.598324036315461
+      }
     }
   ]
 }

@@ -6,18 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "dataset": "multiple_columns",
-      "matches": {
-        "cp_description": [
-          "Programmes receive just likely, key homes. Relevant,"
-        ]
-      },
-      "primary_key": {
-        "cp_catalog_page_sk": 11
-      },
-      "_score": 0.01639344262295082
-    },
-    {
+      "_score": 0.01,
       "dataset": "multiple_columns",
       "matches": {
         "cp_department": [
@@ -26,8 +15,19 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 2
+      }
+    },
+    {
+      "_score": 0.01,
+      "dataset": "multiple_columns",
+      "matches": {
+        "cp_description": [
+          "Programmes receive just likely, key homes. Relevant,"
+        ]
       },
-      "_score": 0.01639344262295082
+      "primary_key": {
+        "cp_catalog_page_sk": 11
+      }
     }
   ]
 }
