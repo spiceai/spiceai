@@ -27,6 +27,8 @@ use tokio::sync::RwLock;
 use tokio::time::{MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
 
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+
 use crate::CLUSTER_PARTITION_MANAGEMENT_TASK;
 use crate::cluster::executor_registry::{self, ExecutorRegistry};
 use crate::cluster::partition::discovery::table_partition_values;
@@ -539,8 +541,7 @@ impl PartitionManagementTask {
         table: &TableReference,
         partition_values: Vec<PartitionValue>,
     ) -> Result<()> {
-        let mut retries = 0;
-        let max_retries = 5;
+        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(5)).build();
 
         loop {
             // Get current metadata
@@ -576,7 +577,6 @@ impl PartitionManagementTask {
             }
 
             metadata.updated_at = now;
-
             match self
                 .partition_manager
                 .write_metadata(&table.to_string(), metadata)
@@ -593,15 +593,16 @@ impl PartitionManagementTask {
                 Err(crate::cluster::partition::manager::Error::ConcurrentModification {
                     ..
                 }) => {
-                    retries += 1;
-                    if retries >= max_retries {
-                        return Err(Error::MaxRetriesExceeded {
-                            table: table.to_string(),
-                            partition: format!("{} partitions", partition_values.len()),
-                            retries,
-                        });
+                    match backoff.next_duration() {
+                        Some(duration) => tokio::time::sleep(duration).await,
+                        None => {
+                            return Err(Error::MaxRetriesExceeded {
+                                table: table.to_string(),
+                                partition: format!("{} partitions", partition_values.len()),
+                                retries: 5,
+                            });
+                        }
                     }
-                    tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(retries))).await;
                 }
                 Err(e) => {
                     return Err(Error::WriteMetadata {
@@ -638,8 +639,7 @@ impl PartitionManagementTask {
         table: &TableReference,
         partition_values: Vec<PartitionValue>,
     ) -> Result<()> {
-        let mut retries = 0;
-        let max_retries = 5;
+        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(5)).build();
 
         // Track which executors need to be notified
         let mut executors_to_notify: HashMap<String, Vec<PartitionValue>> = HashMap::new();
@@ -700,15 +700,16 @@ impl PartitionManagementTask {
                 Err(crate::cluster::partition::manager::Error::ConcurrentModification {
                     ..
                 }) => {
-                    retries += 1;
-                    if retries >= max_retries {
-                        return Err(Error::MaxRetriesExceeded {
-                            table: table.to_string(),
-                            partition: format!("{} partitions", partition_values.len()),
-                            retries,
-                        });
+                    match backoff.next_duration() {
+                        Some(duration) => tokio::time::sleep(duration).await,
+                        None => {
+                            return Err(Error::MaxRetriesExceeded {
+                                table: table.to_string(),
+                                partition: format!("{} partitions", partition_values.len()),
+                                retries: 5,
+                            });
+                        }
                     }
-                    tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(retries))).await;
                 }
                 Err(e) => {
                     return Err(Error::WriteMetadata {
@@ -1021,8 +1022,7 @@ impl PartitionManagementTask {
         partition_value: &PartitionValue,
         executor_id: &str,
     ) -> Result<()> {
-        let mut retries = 0;
-        let max_retries = 3;
+        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
 
         loop {
             match self
@@ -1034,20 +1034,23 @@ impl PartitionManagementTask {
                 Err(crate::cluster::partition::manager::Error::ConcurrentModification {
                     ..
                 }) => {
-                    retries += 1;
-                    if retries >= max_retries {
-                        return Err(Error::MaxRetriesExceeded {
-                            table: table.to_string(),
-                            partition: format!("{partition_value:?}"),
-                            retries,
-                        });
+                    match backoff.next_duration() {
+                        Some(duration) => {
+                            tracing::debug!(
+                                table = %table,
+                                partition = ?partition_value,
+                                "Concurrent modification detected, retrying"
+                            );
+                            tokio::time::sleep(duration).await;
+                        }
+                        None => {
+                            return Err(Error::MaxRetriesExceeded {
+                                table: table.to_string(),
+                                partition: format!("{partition_value:?}"),
+                                retries: 3,
+                            });
+                        }
                     }
-                    tracing::debug!(
-                        table = %table,
-                        partition = ?partition_value,
-                        "Concurrent modification detected, retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(retries))).await;
                 }
                 Err(e) => {
                     return Err(Error::WriteMetadata {

@@ -14,15 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     accelerated_table::AcceleratedTable,
-    cluster::partition::{
-        Error, PartitionDiscoverySnafu, RegisterTableSnafu, Result, metadata::PartitionValue,
-    },
+    cluster::partition::{Error, PartitionDiscoverySnafu, Result, metadata::PartitionValue},
     datafusion::DataFusion,
 };
+use datafusion::common::ToDFSchema;
 use datafusion::{execution::SessionStateBuilder, prelude::SessionContext, sql::TableReference};
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
@@ -103,10 +102,7 @@ async fn execute_partition_discovery_query(
     let table_name = table.to_string();
 
     // Wait for table to be registered.
-    // TODO: we should call `initialize_partition_metadata` after all datasets registered.
-    if !wait_for_table(table, df).await {
-        return Err(Error::TableRegistrationTimeout { table: table_name });
-    }
+    df.runtime_status().wait_for_dataset_ready(table).await;
 
     // Must get table source of `AcceleratedTable` to get true value of partition.
     let table_opt = df.get_table(table).await;
@@ -124,46 +120,46 @@ async fn execute_partition_discovery_query(
         SessionStateBuilder::new_from_existing(df.ctx.state()).build(),
     );
 
-    // Register with random UUID. Even if [`SessionContext`] is a clone, it will evict it from the broader DF context.
-    let temp_table =
-        TableReference::parse_str(uuid::Uuid::new_v4().as_simple().to_string().as_str());
-    ctx.register_table(temp_table.clone(), acc.table_provider().await)
-        .context(RegisterTableSnafu {
+    let provider = acc.table_provider().await;
+    let schema = provider.schema();
+    let df_schema = schema
+        .to_dfschema()
+        .boxed()
+        .context(PartitionDiscoverySnafu {
             table: table_name.clone(),
         })?;
 
-    // Execute query
+    let exprs = partition_exprs
+        .iter()
+        .map(|e| {
+            ctx.parse_sql_expr(e, &df_schema)
+                .boxed()
+                .context(PartitionDiscoverySnafu {
+                    table: table_name.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let df_result = ctx
-        .sql(
-            format!(
-                "SELECT DISTINCT {} FROM \"{temp_table}\"",
-                partition_exprs.join(", ")
-            )
-            .as_str(),
-        )
-        .await
+        .read_table(provider)
+        .boxed()
+        .context(PartitionDiscoverySnafu {
+            table: table_name.clone(),
+        })?
+        .select(exprs)
+        .boxed()
+        .context(PartitionDiscoverySnafu {
+            table: table_name.clone(),
+        })?
+        .distinct()
         .boxed()
         .context(PartitionDiscoverySnafu {
             table: table_name.clone(),
         });
-
-    // Deregister the temporary table after query execution to avoid polluting the catalog. This is done regardless of query success or failure.
-    let _ = ctx.deregister_table(temp_table);
 
     df_result?
         .collect()
         .await
         .boxed()
         .context(PartitionDiscoverySnafu { table: table_name })
-}
-
-/// Wait for the [`TableReference`] to be registered in Runtime.
-async fn wait_for_table(table: &TableReference, df: &Arc<DataFusion>) -> bool {
-    for _ in 0..5 {
-        if df.table_exists(table.clone()) {
-            return true;
-        }
-        let () = tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    false
 }
