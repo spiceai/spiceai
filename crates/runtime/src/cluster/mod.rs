@@ -868,11 +868,6 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                                     .await
                                     .boxed()
                                     .context(FailedToRegisterSchedulerSnafu)
-                                // |err| {
-                                //     crate::Error::FailedToRegisterScheduler {
-                                //         source: Box::new(err),
-                                //     }
-                                // })
                             },
                         )
                         .await,

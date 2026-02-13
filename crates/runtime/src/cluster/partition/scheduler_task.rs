@@ -196,15 +196,11 @@ pub struct PartitionManagementTask {
 struct CycleState {
     executors: Vec<ExecutorInfo>,
     tables: Vec<String>,
-    #[expect(dead_code)]
-    timestamp: u128,
 }
 
 #[derive(Clone)]
 struct ExecutorInfo {
     id: String,
-    #[expect(dead_code)]
-    current_partitions: usize,
 }
 
 struct UnassignedPartition {
@@ -228,7 +224,6 @@ struct ExecutorLoad {
 #[derive(Debug)]
 struct CommitResult {
     committed: Vec<Assignment>,
-    #[expect(dead_code)]
     failed: Vec<(Assignment, Error)>,
 }
 
@@ -325,11 +320,11 @@ impl PartitionManagementTask {
             tracing::debug!(
                 "[{CLUSTER_PARTITION_MANAGEMENT_TASK}][task]: assignments={assignments:?}"
             );
-            let commit_result = self.commit_assignments(assignments).await?;
-            tracing::debug!(
-                "[{CLUSTER_PARTITION_MANAGEMENT_TASK}][task]: commit_result={commit_result:?}"
-            );
-            self.notify_executors(commit_result.committed).await?;
+            let CommitResult { committed, failed } = self.commit_assignments(assignments).await?;
+            if !failed.is_empty() {
+                tracing::warn!("Failed to commit {} partition assignments", failed.len());
+            }
+            self.notify_executors(committed).await?;
         }
 
         Ok(())
@@ -354,10 +349,7 @@ impl PartitionManagementTask {
                 .get(&id)
                 .map_or(0, |tables| tables.values().map(std::vec::Vec::len).sum());
 
-            executors.push(ExecutorInfo {
-                id,
-                current_partitions: count,
-            });
+            executors.push(ExecutorInfo { id });
         }
 
         // Get all tables with partition metadata
@@ -367,11 +359,7 @@ impl PartitionManagementTask {
             .await
             .context(ListTablesSnafu)?;
 
-        Ok(CycleState {
-            executors,
-            tables,
-            timestamp: now_ms(),
-        })
+        Ok(CycleState { executors, tables })
     }
 
     async fn discover_and_sync_partitions(&self, state: &CycleState) -> Result<DiscoveryResult> {
@@ -592,18 +580,16 @@ impl PartitionManagementTask {
                 }
                 Err(crate::cluster::partition::manager::Error::ConcurrentModification {
                     ..
-                }) => {
-                    match backoff.next_duration() {
-                        Some(duration) => tokio::time::sleep(duration).await,
-                        None => {
-                            return Err(Error::MaxRetriesExceeded {
-                                table: table.to_string(),
-                                partition: format!("{} partitions", partition_values.len()),
-                                retries: 5,
-                            });
-                        }
+                }) => match backoff.next_duration() {
+                    Some(duration) => tokio::time::sleep(duration).await,
+                    None => {
+                        return Err(Error::MaxRetriesExceeded {
+                            table: table.to_string(),
+                            partition: format!("{} partitions", partition_values.len()),
+                            retries: 5,
+                        });
                     }
-                }
+                },
                 Err(e) => {
                     return Err(Error::WriteMetadata {
                         table: table.to_string(),
@@ -699,18 +685,16 @@ impl PartitionManagementTask {
                 }
                 Err(crate::cluster::partition::manager::Error::ConcurrentModification {
                     ..
-                }) => {
-                    match backoff.next_duration() {
-                        Some(duration) => tokio::time::sleep(duration).await,
-                        None => {
-                            return Err(Error::MaxRetriesExceeded {
-                                table: table.to_string(),
-                                partition: format!("{} partitions", partition_values.len()),
-                                retries: 5,
-                            });
-                        }
+                }) => match backoff.next_duration() {
+                    Some(duration) => tokio::time::sleep(duration).await,
+                    None => {
+                        return Err(Error::MaxRetriesExceeded {
+                            table: table.to_string(),
+                            partition: format!("{} partitions", partition_values.len()),
+                            retries: 5,
+                        });
                     }
-                }
+                },
                 Err(e) => {
                     return Err(Error::WriteMetadata {
                         table: table.to_string(),
@@ -1033,25 +1017,23 @@ impl PartitionManagementTask {
                 Ok(()) => return Ok(()),
                 Err(crate::cluster::partition::manager::Error::ConcurrentModification {
                     ..
-                }) => {
-                    match backoff.next_duration() {
-                        Some(duration) => {
-                            tracing::debug!(
-                                table = %table,
-                                partition = ?partition_value,
-                                "Concurrent modification detected, retrying"
-                            );
-                            tokio::time::sleep(duration).await;
-                        }
-                        None => {
-                            return Err(Error::MaxRetriesExceeded {
-                                table: table.to_string(),
-                                partition: format!("{partition_value:?}"),
-                                retries: 3,
-                            });
-                        }
+                }) => match backoff.next_duration() {
+                    Some(duration) => {
+                        tracing::debug!(
+                            table = %table,
+                            partition = ?partition_value,
+                            "Concurrent modification detected, retrying"
+                        );
+                        tokio::time::sleep(duration).await;
                     }
-                }
+                    None => {
+                        return Err(Error::MaxRetriesExceeded {
+                            table: table.to_string(),
+                            partition: format!("{partition_value:?}"),
+                            retries: 3,
+                        });
+                    }
+                },
                 Err(e) => {
                     return Err(Error::WriteMetadata {
                         table: table.to_string(),
