@@ -36,11 +36,6 @@ use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
 use futures::future::try_join_all;
-use spicepod::component::ComponentOrReference;
-use spicepod::component::snapshot::Snapshots;
-use spicepod::metric::{Metric, Metrics};
-use spicepod::param::{ParamValue, Params};
-use spicepod::spec::SpicepodDefinition;
 use test_framework::anyhow::{self, Result};
 use test_framework::git;
 use test_framework::opentelemetry::KeyValue;
@@ -49,7 +44,7 @@ use test_framework::spiced::{SpicedInstance, StartRequest};
 
 use super::datasets::DatasetType;
 use super::query_liveness::QueryLivenessMonitor;
-use super::sources::{DynamoDbConfig, DynamoDbStreamsSource};
+use super::sources::{DynamoDbConfig, DynamoDbStreamsSource, transform_spicepod};
 use super::traits::StreamingSource;
 use super::utils;
 use super::utils::{
@@ -430,145 +425,4 @@ pub async fn run_benchmark(args: &StreamingDynamodbArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Transform a spicepod for standalone `DynamoDB` streaming benchmarks.
-///
-/// This function:
-/// 1. Creates a `/tmp/benchmarks/{run_id}/` directory for engine data files
-/// 2. For each `DynamoDB` dataset:
-///    - Prefixes the table name with `run_id` (skips if already prefixed)
-///    - Adds `DynamoDB` metrics (`records_consumed_total`, `errors_transient_total`)
-///    - Sets engine-specific file paths (`duckdb_file` or `cayenne_file_path`)
-/// 3. If `enable_snapshots` is true, configures snapshot storage from env vars
-///
-/// This is `pub(super)` so that `correctness.rs` can reuse it.
-pub(super) fn transform_spicepod(
-    mut spicepod: SpicepodDefinition,
-    run_id: &str,
-    config_name: &str,
-    enable_snapshots: bool,
-) -> SpicepodDefinition {
-    #[expect(clippy::expect_used)]
-    std::fs::create_dir_all(format!("/tmp/benchmarks/{run_id}"))
-        .expect("Failed to create benchmark directory");
-
-    // Update dataset `from` field with prefixed table name
-    for dataset in &mut spicepod.datasets {
-        if let ComponentOrReference::Component(d) = dataset
-            && let Some(table_name) = d.from.strip_prefix("dynamodb:")
-        {
-            // Skip if table name already has a 6-char hex prefix (avoid double-prefixing)
-            let already_prefixed = table_name.split('_').next().is_some_and(|first| {
-                first.len() == 6 && first.chars().all(|c| c.is_ascii_hexdigit())
-            });
-
-            if already_prefixed {
-                eprintln!(
-                    "Warning: Table '{table_name}' appears to already have a prefix, skipping transformation"
-                );
-            } else {
-                d.from = format!("dynamodb:{run_id}_{table_name}");
-            }
-
-            // Add DynamoDB-specific metrics
-            d.metrics = Some(Metrics {
-                metrics: vec![
-                    Metric {
-                        name: "records_consumed_total".to_string(),
-                        enabled: true,
-                    },
-                    Metric {
-                        name: "errors_transient_total".to_string(),
-                        enabled: true,
-                    },
-                ],
-            });
-        }
-
-        // Set engine-specific file paths based on acceleration engine
-        // if let Some(ref mut accel) = d.acceleration {
-        //     let dataset_name = &d.name;
-        //     let params = accel.params.get_or_insert_with(Params::default);
-        //
-        //     let engine = accel.engine.as_deref();
-        //     match engine {
-        //         None | Some("duckdb") => {
-        //             let duckdb_file = format!(
-        //                 "/tmp/benchmarks/{run_id}/{config_name}_{dataset_name}.db"
-        //             );
-        //             params
-        //                 .data
-        //                 .insert("duckdb_file".to_string(), ParamValue::String(duckdb_file));
-        //         }
-        //         Some("cayenne") => {
-        //             let cayenne_dir = format!(
-        //                 "/tmp/benchmarks/{run_id}/{config_name}_{dataset_name}_cayenne/"
-        //             );
-        //             params.data.insert(
-        //                 "cayenne_file_path".to_string(),
-        //                 ParamValue::String(cayenne_dir),
-        //             );
-        //         }
-        //         Some(other) => {
-        //             eprintln!(
-        //                 "Warning: Unknown acceleration engine '{other}' for dataset {dataset_name}, skipping path configuration"
-        //             );
-        //         }
-        //     }
-        //
-        //     // Configure snapshots on the acceleration if enabled
-        //     if enable_snapshots {
-        //         accel.snapshots = SnapshotBehavior::CreateOnly;
-        //         accel.snapshots_trigger = Some(SnapshotsTrigger::TimeInterval);
-        //         accel.snapshots_trigger_threshold = Some("5s".to_string());
-        //     }
-        // }
-    }
-
-    // Configure runtime snapshot storage if enabled
-    if enable_snapshots {
-        if let Ok(location) = std::env::var("SNAPSHOT_S3_LOCATION") {
-            let snapshot_location = format!(
-                "{}/{}/{}/",
-                location.trim_end_matches('/'),
-                run_id,
-                config_name
-            );
-
-            let mut params = Params::default();
-            params
-                .data
-                .insert("s3_auth".to_string(), ParamValue::String("key".to_string()));
-            params.data.insert(
-                "s3_key".to_string(),
-                ParamValue::String("${secrets:SNAPSHOT_S3_ACCESS_KEY_ID}".to_string()),
-            );
-            params.data.insert(
-                "s3_secret".to_string(),
-                ParamValue::String("${secrets:SNAPSHOT_S3_SECRET_ACCESS_KEY}".to_string()),
-            );
-
-            if let Ok(region) = std::env::var("SNAPSHOT_S3_REGION") {
-                params
-                    .data
-                    .insert("s3_region".to_string(), ParamValue::String(region));
-            }
-
-            spicepod.snapshots = Some(Snapshots {
-                enabled: true,
-                location: Some(snapshot_location),
-                params: if params.data.is_empty() {
-                    None
-                } else {
-                    Some(params)
-                },
-                ..Default::default()
-            });
-        } else {
-            eprintln!("Warning: enable_snapshots is true but SNAPSHOT_S3_LOCATION is not set");
-        }
-    }
-
-    spicepod
 }

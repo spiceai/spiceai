@@ -40,7 +40,7 @@ use test_framework::spiced::{SpicedInstance, StartRequest};
 
 use super::datasets::DatasetType;
 use super::mutations::{self, MutationConfig};
-use super::sources::{DynamoDbConfig, DynamoDbStreamsSource};
+use super::sources::{DynamoDbConfig, DynamoDbStreamsSource, transform_spicepod};
 use super::traits::{StreamingDataset, StreamingSource};
 use super::utils::{
     generate_run_id, load_spicepod_definition, poll_for_all_markers, wait_for_all_marker_deletions,
@@ -144,8 +144,7 @@ pub async fn run_correctness(args: &StreamingDynamodbCorrectnessArgs) -> Result<
 
     // Load and transform spicepod (no snapshots for correctness test)
     let spicepod_def = load_spicepod_definition(&args.common.spicepod_path)?;
-    let transformed =
-        super::runner::transform_spicepod(spicepod_def, &run_id, "correctness", false);
+    let transformed = transform_spicepod(spicepod_def, &run_id, "correctness", false);
 
     let config_name = args
         .common
