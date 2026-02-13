@@ -52,7 +52,7 @@ on:
         type: choice
         options:
           - 'spicehq-dev-runners'
-          - 'spiceai-dev-large-runners'
+          - 'spicehq-dev-large-runners'
       limit:
         description: 'Limit the number of text-to-SQL operations to run'
         required: false
