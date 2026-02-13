@@ -412,13 +412,26 @@ impl DataConnector for DynamoDB {
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
 
-        let lag_exceeds_behavior = self
+        let lag_exceeds_behavior = match self
             .params
             .get("lag_exceeds_shard_retention_behavior")
             .expose()
-            .ok()
-            .and_then(|v| LagExceedsShardRetentionBehavior::from_str(v).ok())
-            .unwrap_or_default();
+        {
+            ExposedParamLookup::Present(value_str) => {
+                match LagExceedsShardRetentionBehavior::from_str(value_str) {
+                    Ok(behavior) => behavior,
+                    Err(e) => {
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            error = %e,
+                            "Failed to parse 'lag_exceeds_shard_retention_behavior' parameter. Defaulting to 'error'"
+                        );
+                        LagExceedsShardRetentionBehavior::default()
+                    }
+                }
+            }
+            ExposedParamLookup::Absent(_) => LagExceedsShardRetentionBehavior::default(),
+        };
 
         let metrics_collector = Arc::clone(&self.metrics_collector);
 
