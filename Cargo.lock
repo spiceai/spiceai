@@ -15921,6 +15921,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "arrow-schema",
+ "arrow_tools",
  "async-trait",
  "aws-sdk-credential-bridge",
  "bytes",
