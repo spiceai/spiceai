@@ -1780,4 +1780,692 @@ message: "key: value pair"
         let parsed: ComplexConfig = from_str(&yaml).unwrap();
         assert_eq!(original, parsed);
     }
+
+    // ============================================================
+    // Serde Feature Tests
+    // ============================================================
+
+    #[test]
+    fn test_serde_newtype_struct() {
+        #[derive(Debug, Deserialize, Serialize, PartialEq)]
+        struct UserId(u64);
+
+        #[derive(Debug, Deserialize, Serialize, PartialEq)]
+        struct UserName(String);
+
+        let yaml = "42";
+        let id: UserId = from_str(yaml).expect("should parse newtype u64");
+        assert_eq!(id, UserId(42));
+
+        let yaml = "alice";
+        let name: UserName = from_str(yaml).expect("should parse newtype string");
+        assert_eq!(name, UserName("alice".into()));
+
+        // Roundtrip
+        let id = UserId(99);
+        let yaml = to_string(&id).expect("should serialize newtype");
+        let parsed: UserId = from_str(&yaml).expect("should roundtrip newtype");
+        assert_eq!(parsed, UserId(99));
+    }
+
+    #[test]
+    fn test_serde_newtype_struct_in_struct() {
+        #[derive(Debug, Deserialize, Serialize, PartialEq)]
+        struct Port(u16);
+
+        #[derive(Debug, Deserialize, Serialize, PartialEq)]
+        struct ServerConfig {
+            host: String,
+            port: Port,
+        }
+
+        let yaml = r"
+host: localhost
+port: 8080
+";
+        let config: ServerConfig = from_str(yaml).expect("should parse struct with newtype field");
+        assert_eq!(
+            config,
+            ServerConfig {
+                host: "localhost".into(),
+                port: Port(8080),
+            }
+        );
+    }
+
+    #[test]
+    fn test_serde_deny_unknown_fields() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct Strict {
+            name: String,
+            age: u32,
+        }
+
+        // Valid: only known fields
+        let yaml = r"
+name: Alice
+age: 30
+";
+        let result: Strict = from_str(yaml).expect("should parse known fields");
+        assert_eq!(
+            result,
+            Strict {
+                name: "Alice".into(),
+                age: 30,
+            }
+        );
+
+        // Invalid: unknown field present
+        let yaml = r"
+name: Bob
+age: 25
+email: bob@example.com
+";
+        let result: Result<Strict> = from_str(yaml);
+        assert!(
+            result.is_err(),
+            "should reject unknown field 'email' with deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn test_serde_untagged_enum() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(untagged)]
+        enum StringOrInt {
+            Int(i64),
+            Str(String),
+        }
+
+        let yaml = "42";
+        let result: StringOrInt = from_str(yaml).expect("should parse untagged int");
+        assert_eq!(result, StringOrInt::Int(42));
+
+        let yaml = "\"hello\"";
+        let result: StringOrInt = from_str(yaml).expect("should parse untagged string");
+        assert_eq!(result, StringOrInt::Str("hello".into()));
+    }
+
+    #[expect(clippy::approx_constant)]
+    #[test]
+    fn test_serde_untagged_enum_in_struct() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(untagged)]
+        enum Value2 {
+            Num(f64),
+            Text(String),
+            List(Vec<String>),
+        }
+
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Entry {
+            name: String,
+            data: Value2,
+        }
+
+        let yaml = r"
+name: numbers
+data: 3.14
+";
+        let result: Entry = from_str(yaml).expect("should parse untagged float variant");
+        assert_eq!(
+            result,
+            Entry {
+                name: "numbers".into(),
+                data: Value2::Num(3.14),
+            }
+        );
+
+        let yaml = r"
+name: words
+data: hello
+";
+        let result: Entry = from_str(yaml).expect("should parse untagged string variant");
+        assert_eq!(
+            result,
+            Entry {
+                name: "words".into(),
+                data: Value2::Text("hello".into()),
+            }
+        );
+
+        let yaml = r"
+name: items
+data:
+  - one
+  - two
+";
+        let result: Entry = from_str(yaml).expect("should parse untagged list variant");
+        assert_eq!(
+            result,
+            Entry {
+                name: "items".into(),
+                data: Value2::List(vec!["one".into(), "two".into()]),
+            }
+        );
+    }
+
+    // ============================================================
+    // YAML Spec §6.1: Indentation — Error Cases
+    // ============================================================
+
+    #[test]
+    fn test_yaml_tab_in_indentation() {
+        // YAML §6.1: "tab characters must not be used in indentation"
+        let yaml = "key:\n\t- value1\n\t- value2";
+        let result: Result<Value> = from_str(yaml);
+        assert!(
+            result.is_err(),
+            "should reject tab characters used for indentation"
+        );
+    }
+
+    #[test]
+    fn test_yaml_inconsistent_sibling_indentation() {
+        // YAML §6.1: "All sibling nodes must use the exact same indentation level"
+        let yaml = r"
+parent:
+  child1: a
+    child2: b
+";
+        let result: Result<Value> = from_str(yaml);
+        // Inconsistent indentation among siblings should be an error
+        // (child2 is indented more than child1 but both are children of parent)
+        assert!(
+            result.is_err(),
+            "should reject inconsistent sibling indentation"
+        );
+    }
+
+    // ============================================================
+    // YAML Spec §5.1/§5.7: Characters & Escape Sequences
+    // ============================================================
+
+    #[test]
+    fn test_yaml_control_characters_allowed() {
+        // TAB (x09), LF (x0A), CR (x0D) ARE allowed
+        let yaml = "key: val\tue";
+        let result: Result<Value> = from_str(yaml);
+        assert!(result.is_ok(), "should allow tab character in value");
+    }
+
+    #[test]
+    fn test_yaml_invalid_escape_character() {
+        // YAML §5.7 Example 5.14: Invalid escaped characters
+        let yaml = r#"bad: "\c""#;
+        let result: Result<Value> = from_str(yaml);
+        assert!(result.is_err(), "should reject invalid escape \\c");
+
+        let yaml = r#"bad: "\m""#;
+        let result: Result<Value> = from_str(yaml);
+        assert!(result.is_err(), "should reject invalid escape \\m");
+
+        let yaml = r#"bad: "\w""#;
+        let result: Result<Value> = from_str(yaml);
+        assert!(result.is_err(), "should reject invalid escape \\w");
+    }
+
+    #[test]
+    fn test_yaml_invalid_hex_escape() {
+        // YAML §5.7: Invalid hex digits in escape sequences
+        let yaml = r#"bad: "\xZZ""#;
+        let result: Result<Value> = from_str(yaml);
+        assert!(result.is_err(), "should reject invalid hex escape \\xZZ");
+
+        let yaml = r#"bad: "\uGGGG""#;
+        let result: Result<Value> = from_str(yaml);
+        assert!(
+            result.is_err(),
+            "should reject invalid unicode escape \\uGGGG"
+        );
+
+        let yaml = r#"bad: "\UZZZZZZZZ""#;
+        let result: Result<Value> = from_str(yaml);
+        assert!(
+            result.is_err(),
+            "should reject invalid 32-bit unicode escape"
+        );
+    }
+
+    #[test]
+    fn test_yaml_escape_vertical_tab() {
+        // YAML §5.7 [47]: \v → x0B
+        let yaml = r#"value: "\v""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\v escape");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("\x0B"));
+    }
+
+    #[test]
+    fn test_yaml_escape_form_feed() {
+        // YAML §5.7 [48]: \f → x0C
+        let yaml = r#"value: "\f""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\f escape");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("\x0C"));
+    }
+
+    #[test]
+    fn test_yaml_escape_carriage_return() {
+        // YAML §5.7 [49]: \r → x0D
+        let yaml = r#"value: "\r""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\r escape");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("\r"));
+    }
+
+    #[test]
+    fn test_yaml_escape_null() {
+        // YAML §5.7 [42]: \0 → x00
+        let yaml = r#"value: "\0""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\0 escape");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("\x00"));
+    }
+
+    #[test]
+    fn test_yaml_escape_bell() {
+        // YAML §5.7 [43]: \a → x07
+        let yaml = r#"value: "\a""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\a escape");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("\x07"));
+    }
+
+    #[test]
+    fn test_yaml_escape_backspace() {
+        // YAML §5.7 [44]: \b → x08
+        let yaml = r#"value: "\b""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\b escape");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("\x08"));
+    }
+
+    #[test]
+    fn test_yaml_escape_escape_char() {
+        // YAML §5.7 [50]: \e → x1B
+        let yaml = r#"value: "\e""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\e escape");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("\x1B"));
+    }
+
+    #[test]
+    fn test_yaml_escape_space() {
+        // YAML §5.7 [51]: \<space> → x20
+        let yaml = "value: \"\\ \"";
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse escaped space");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some(" "));
+    }
+
+    #[test]
+    fn test_yaml_escape_slash() {
+        // YAML §5.7 [53]: \/ → x2F (JSON compatibility)
+        let yaml = r#"value: "\/""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\/ escape");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("/"));
+    }
+
+    #[test]
+    fn test_yaml_escape_next_line() {
+        // YAML §5.7 [55]: \N → x85 (NEL)
+        let yaml = r#"value: "\N""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\N escape (NEL)");
+        assert_eq!(
+            value.get("value").and_then(|v| v.as_str()),
+            Some("\u{0085}")
+        );
+    }
+
+    #[test]
+    fn test_yaml_escape_non_breaking_space() {
+        // YAML §5.7 [56]: \_ → xA0 (non-breaking space)
+        let yaml = r#"value: "\_""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\_ escape (NBSP)");
+        assert_eq!(
+            value.get("value").and_then(|v| v.as_str()),
+            Some("\u{00A0}")
+        );
+    }
+
+    #[test]
+    fn test_yaml_escape_line_separator() {
+        // YAML §5.7 [57]: \L → x2028 (line separator)
+        let yaml = r#"value: "\L""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\L escape (line separator)");
+        assert_eq!(
+            value.get("value").and_then(|v| v.as_str()),
+            Some("\u{2028}")
+        );
+    }
+
+    #[test]
+    fn test_yaml_escape_paragraph_separator() {
+        // YAML §5.7 [58]: \P → x2029 (paragraph separator)
+        let yaml = r#"value: "\P""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\P escape (paragraph separator)");
+        assert_eq!(
+            value.get("value").and_then(|v| v.as_str()),
+            Some("\u{2029}")
+        );
+    }
+
+    #[test]
+    fn test_yaml_escape_8bit_hex() {
+        // YAML §5.7 [59]: \xNN → 8-bit Unicode
+        let yaml = r#"value: "\x41""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\x41 (letter A)");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("A"));
+    }
+
+    #[test]
+    fn test_yaml_escape_16bit_unicode() {
+        // YAML §5.7 [60]: \uNNNN → 16-bit Unicode
+        let yaml = r#"value: "\u0041""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\u0041 (letter A)");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("A"));
+    }
+
+    #[test]
+    fn test_yaml_escape_32bit_unicode() {
+        // YAML §5.7 [61]: \UNNNNNNNN → 32-bit Unicode
+        let yaml = r#"value: "\U00000041""#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse \\U00000041 (letter A)");
+        assert_eq!(value.get("value").and_then(|v| v.as_str()), Some("A"));
+    }
+
+    #[test]
+    fn test_yaml_escape_combined() {
+        // YAML §5.7 Example 5.13: Combined escape sequences
+        let yaml = r#"
+fun_with_backslash: "Fun with \\"
+special_chars: "\" \a \b \e \f"
+whitespace: "\n \r \t \v \0"
+unicode_chars: "\  \_ \N \L \P \x41 \u0041 \U00000041"
+"#;
+        let result: Result<Value> = from_str(yaml);
+        let value = result.expect("should parse combined escape sequences");
+
+        assert_eq!(
+            value.get("fun_with_backslash").and_then(|v| v.as_str()),
+            Some("Fun with \\")
+        );
+        assert_eq!(
+            value.get("special_chars").and_then(|v| v.as_str()),
+            Some("\" \x07 \x08 \x1B \x0C")
+        );
+        assert_eq!(
+            value.get("whitespace").and_then(|v| v.as_str()),
+            Some("\n \r \t \x0B \x00")
+        );
+        assert_eq!(
+            value.get("unicode_chars").and_then(|v| v.as_str()),
+            Some("  \u{00A0} \u{0085} \u{2028} \u{2029} A A A")
+        );
+    }
+
+    // ============================================================
+    // YAML Spec §6.6/§8.1: Comments
+    // ============================================================
+
+    #[test]
+    fn test_yaml_comment_after_block_scalar_header() {
+        // YAML §8.1.1: Block scalar header may have a trailing comment
+        let yaml = r"
+literal: | # This is a comment on the header
+  some text here
+folded: > # Another header comment
+  folded text here
+";
+        let value: Value = from_str(yaml).expect("should parse block scalar with header comment");
+        let literal = value.get("literal").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            literal.contains("some text here"),
+            "literal content should not include the header comment"
+        );
+        let folded = value.get("folded").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            folded.contains("folded text here"),
+            "folded content should not include the header comment"
+        );
+    }
+
+    #[test]
+    fn test_yaml_comment_after_chomping_indicator() {
+        // Block scalar with chomping indicator AND comment
+        let yaml = r"
+strip: |- # strip comment
+  stripped text
+keep: |+ # keep comment
+  kept text
+
+";
+        let value: Value =
+            from_str(yaml).expect("should parse block scalar with chomping + comment");
+        let strip = value.get("strip").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(strip, "stripped text");
+        let keep = value.get("keep").and_then(|v| v.as_str()).unwrap();
+        assert!(keep.starts_with("kept text"));
+    }
+
+    #[test]
+    fn test_yaml_comment_only_document() {
+        // A stream with only comments and no content nodes
+        let yaml = r"
+# This is just a comment
+# Another comment line
+";
+        let value: Value = from_str(yaml).expect("should parse comment-only document");
+        assert!(
+            value.is_null(),
+            "comment-only document should resolve to null"
+        );
+    }
+
+    #[test]
+    fn test_yaml_comment_only_with_markers() {
+        // Document markers with only comments
+        let yaml = r"
+---
+# only a comment
+...
+";
+        let value: Value = from_str(yaml).expect("should parse comment-only with markers");
+        assert!(value.is_null(), "should resolve to null");
+    }
+
+    // ============================================================
+    // YAML Spec §7.4: Flow Collections — Edge Cases
+    // ============================================================
+
+    #[test]
+    fn test_yaml_trailing_comma_flow_sequence() {
+        // YAML §7.4.1: "The final ',' may be omitted"
+        // Trailing comma should be valid
+        let yaml = "[1, 2, 3,]";
+        let result: Vec<i32> =
+            from_str(yaml).expect("should parse flow sequence with trailing comma");
+        assert_eq!(result, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_yaml_trailing_comma_flow_mapping() {
+        // YAML §7.4.2: Trailing comma in flow mapping
+        let yaml = "{a: 1, b: 2,}";
+        let value: Value = from_str(yaml).expect("should parse flow mapping with trailing comma");
+        assert_eq!(value.get("a").and_then(Value::as_u64), Some(1));
+        assert_eq!(value.get("b").and_then(Value::as_u64), Some(2));
+    }
+
+    #[test]
+    fn test_yaml_trailing_comma_nested() {
+        // Trailing commas in nested flow collections
+        let yaml = "{items: [1, 2, 3,], name: test,}";
+        let value: Value =
+            from_str(yaml).expect("should parse nested flow collections with trailing commas");
+        let items = value.get("items").and_then(|v| v.as_sequence()).unwrap();
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn test_yaml_empty_flow_sequence() {
+        // Empty flow sequence
+        let yaml = "items: []";
+        let value: Value = from_str(yaml).expect("should parse empty flow sequence");
+        let items = value.get("items").and_then(|v| v.as_sequence()).unwrap();
+        assert!(items.is_empty(), "empty flow sequence should have 0 items");
+    }
+
+    #[test]
+    fn test_yaml_empty_flow_mapping() {
+        // Empty flow mapping
+        let yaml = "data: {}";
+        let value: Value = from_str(yaml).expect("should parse empty flow mapping");
+        let data = value.get("data").and_then(|v| v.as_mapping()).unwrap();
+        assert!(data.is_empty(), "empty flow mapping should have 0 entries");
+    }
+
+    #[test]
+    fn test_yaml_empty_flow_collections_bare() {
+        // Bare empty collections as top-level
+        let yaml = "[]";
+        let result: Vec<i32> = from_str(yaml).expect("should parse bare empty sequence");
+        assert!(result.is_empty());
+
+        let yaml = "{}";
+        let value: Value = from_str(yaml).expect("should parse bare empty mapping");
+        assert!(value.is_mapping());
+        assert!(value.as_mapping().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_yaml_empty_flow_collections_in_struct() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Config {
+            tags: Vec<String>,
+            metadata: std::collections::HashMap<String, String>,
+        }
+
+        let yaml = r"
+tags: []
+metadata: {}
+";
+        let config: Config = from_str(yaml).expect("should parse struct with empty collections");
+        assert!(config.tags.is_empty());
+        assert!(config.metadata.is_empty());
+    }
+
+    // ============================================================
+    // YAML Spec §8.2: Compact Nested Notation
+    // ============================================================
+
+    #[test]
+    fn test_yaml_compact_nested_sequence_in_mapping() {
+        // YAML §8.2.1 Example 8.15: Compact block sequence entries
+        let yaml = r"
+- one: two
+  three: four
+- five: six
+";
+        let value: Value = from_str(yaml).expect("should parse compact nested mapping in sequence");
+        let seq = value.as_sequence().unwrap();
+        assert_eq!(seq.len(), 2);
+        assert_eq!(seq[0].get("one").and_then(|v| v.as_str()), Some("two"));
+        assert_eq!(seq[0].get("three").and_then(|v| v.as_str()), Some("four"));
+        assert_eq!(seq[1].get("five").and_then(|v| v.as_str()), Some("six"));
+    }
+
+    #[test]
+    fn test_yaml_compact_nested_sequence_in_sequence() {
+        // YAML §8.2.1 Example 8.15: Compact nested sequences
+        let yaml = r"
+- - one
+  - two
+- - three
+  - four
+";
+        let value: Value = from_str(yaml).expect("should parse compact nested sequences");
+        let outer = value.as_sequence().unwrap();
+        assert_eq!(outer.len(), 2);
+        let inner0 = outer[0].as_sequence().unwrap();
+        assert_eq!(inner0.len(), 2);
+        assert_eq!(inner0[0].as_str(), Some("one"));
+        assert_eq!(inner0[1].as_str(), Some("two"));
+    }
+
+    #[test]
+    fn test_yaml_compact_nested_mapping_value() {
+        // Compact mapping as value in another mapping
+        let yaml = r"
+products:
+- item: Super Hoop
+  quantity: 1
+- item: Basketball
+  quantity: 4
+- item: Big Shoes
+  quantity: 1
+";
+        let value: Value =
+            from_str(yaml).expect("should parse compact nested mapping in sequence value");
+        let products = value.get("products").and_then(|v| v.as_sequence()).unwrap();
+        assert_eq!(products.len(), 3);
+        assert_eq!(
+            products[0].get("item").and_then(Value::as_str),
+            Some("Super Hoop")
+        );
+        assert_eq!(products[0].get("quantity").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            products[2].get("item").and_then(Value::as_str),
+            Some("Big Shoes")
+        );
+    }
+
+    // ============================================================
+    // YAML Spec §7.3.2: Multi-line Single-Quoted Scalars
+    // ============================================================
+
+    #[test]
+    fn test_yaml_multiline_single_quoted() {
+        // YAML §7.3.2 Example 7.9: Multi-line single-quoted scalar
+        // Line breaks are folded into spaces, empty lines become line feeds
+        let yaml = "value: ' 1st non-empty\n\n 2nd non-empty \n 3rd non-empty '";
+        let value: Value = from_str(yaml).expect("should parse multi-line single-quoted scalar");
+        let s = value.get("value").and_then(|v| v.as_str()).unwrap();
+        // Per YAML spec, single newline folds to space, blank line becomes \n
+        assert_eq!(s, " 1st non-empty\n2nd non-empty 3rd non-empty ");
+    }
+
+    #[test]
+    fn test_yaml_multiline_single_quoted_simple() {
+        // Simple multi-line single-quoted string
+        let yaml = "value: 'line one\n  line two'";
+        let value: Value =
+            from_str(yaml).expect("should parse simple multi-line single-quoted scalar");
+        let s = value.get("value").and_then(|v| v.as_str()).unwrap();
+        // Single newline folds to space
+        assert_eq!(s, "line one line two");
+    }
+
+    #[test]
+    fn test_yaml_single_quoted_no_escapes() {
+        // YAML §7.3.2: No escape sequences in single-quoted (except '' for ')
+        // The \n should be literal backslash-n, not a newline
+        let yaml = r"value: 'no \n escape'";
+        let value: Value =
+            from_str(yaml).expect("should parse single-quoted with literal backslash");
+        assert_eq!(
+            value.get("value").and_then(|v| v.as_str()),
+            Some("no \\n escape")
+        );
+    }
 }

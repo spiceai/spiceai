@@ -437,8 +437,32 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer {
     }
 
     forward_to_deserialize_any! {
-        i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes
+        i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char bytes
         byte_buf identifier ignored_any
+    }
+
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::String(s) => visitor.visit_string(s),
+            Value::Number(n) => visitor.visit_string(n.to_string()),
+            Value::Bool(b) => visitor.visit_string(b.to_string()),
+            _ => self.deserialize_any(visitor),
+        }
+    }
+
+    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        match self.value {
+            Value::String(s) => visitor.visit_string(s),
+            Value::Number(n) => visitor.visit_string(n.to_string()),
+            Value::Bool(b) => visitor.visit_string(b.to_string()),
+            _ => self.deserialize_any(visitor),
+        }
     }
 }
 
@@ -991,5 +1015,113 @@ simple: shallow
         let values =
             parse_yaml_multi("---\na: 1\n\n\n---\nb: 2").expect("whitespace between docs is valid");
         assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn test_deserialize_integer_as_string_field() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Config {
+            something: String,
+        }
+
+        let yaml = "something: 5";
+        let config: Config = serde::Deserialize::deserialize(ValueDeserializer::new(
+            parse_yaml(yaml).expect("valid YAML"),
+        ))
+        .expect("should deserialize integer value as string");
+        assert_eq!(
+            config,
+            Config {
+                something: "5".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_negative_integer_as_string_field() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Config {
+            value: String,
+        }
+
+        let yaml = "value: -42";
+        let config: Config = serde::Deserialize::deserialize(ValueDeserializer::new(
+            parse_yaml(yaml).expect("valid YAML"),
+        ))
+        .expect("should deserialize negative integer as string");
+        assert_eq!(
+            config,
+            Config {
+                value: "-42".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_float_as_string_field() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Config {
+            value: String,
+        }
+
+        let yaml = "value: 3.14";
+        let config: Config = serde::Deserialize::deserialize(ValueDeserializer::new(
+            parse_yaml(yaml).expect("valid YAML"),
+        ))
+        .expect("should deserialize float as string");
+        assert_eq!(
+            config,
+            Config {
+                value: "3.14".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_bool_as_string_field() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Config {
+            value: String,
+        }
+
+        let yaml = "value: true";
+        let config: Config = serde::Deserialize::deserialize(ValueDeserializer::new(
+            parse_yaml(yaml).expect("valid YAML"),
+        ))
+        .expect("should deserialize bool as string");
+        assert_eq!(
+            config,
+            Config {
+                value: "true".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_integer_as_optional_string() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Config {
+            port: Option<String>,
+        }
+
+        let yaml = "port: 8080";
+        let config: Config = serde::Deserialize::deserialize(ValueDeserializer::new(
+            parse_yaml(yaml).expect("valid YAML"),
+        ))
+        .expect("should deserialize integer as optional string");
+        assert_eq!(
+            config,
+            Config {
+                port: Some("8080".into())
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_bare_integer_as_string() {
+        let value = Value::Number(Number::PosInt(42));
+        let result: String = serde::Deserialize::deserialize(ValueDeserializer::new(value))
+            .expect("should deserialize integer as string");
+        assert_eq!(result, "42");
     }
 }
