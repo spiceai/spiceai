@@ -19,11 +19,22 @@ limitations under the License.
 //! The streaming benchmark system is built around these abstractions:
 //! - [`StreamingDataset`]: Defines a table within a benchmark dataset (e.g., TPCH lineitem)
 //! - [`StreamingSource`]: Generic interface for streaming sources (`DynamoDB`, Kafka, etc.)
+//! - [`DynamoDBStreamingSource`]: DynamoDB-specific extension with snapshot/checkpoint support
 
 use arrow::array::RecordBatch;
+use spicepod::spec::SpicepodDefinition;
 use test_framework::anyhow::Result;
 
 use super::datasets::DatasetType;
+
+/// Configuration for snapshot storage (S3).
+#[derive(Debug, Clone)]
+pub struct SnapshotConfig {
+    /// Base S3 location for snapshots (e.g., "<s3://bucket/snapshots>/")
+    pub location: String,
+    /// S3 region
+    pub region: Option<String>,
+}
 
 /// Represents a table that can be generated and inserted into a streaming source.
 ///

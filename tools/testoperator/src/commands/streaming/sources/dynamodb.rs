@@ -57,8 +57,17 @@ const TAG_SCALE_FACTOR: &str = "testoperator:scale_factor";
 /// Maximum age of tables before cleanup (24 hours).
 const STALE_TABLE_AGE_SECS: u64 = 24 * 60 * 60;
 
+use spicepod::acceleration::SnapshotBehavior;
+use spicepod::component::ComponentOrReference;
+use spicepod::component::snapshot::Snapshots;
+use spicepod::metric::{Metric, Metrics};
+use spicepod::param::{ParamValue, Params};
+use spicepod::spec::SpicepodDefinition;
+
 use crate::commands::streaming::datasets::DatasetType;
-use crate::commands::streaming::traits::StreamingSource;
+use crate::commands::streaming::traits::{
+    DynamoDBStreamingSource, SnapshotConfig, StreamingSource,
+};
 
 /// Configuration for AWS `DynamoDB` source.
 ///
