@@ -22,6 +22,8 @@ use std::env;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tar::Archive;
@@ -39,7 +41,7 @@ struct Cli {
 enum Commands {
     /// Trigger a build for the current (or specified) branch.
     ///
-    /// Triggers the 'build_and_release' workflow in GitHub Actions.
+    /// Triggers the '`build_and_release`' workflow in GitHub Actions.
     /// If an active build exists for the latest commit (SHA-based), it will be reused.
     /// If a successful build exists (for this commit), no action is taken.
     Trigger {
@@ -105,14 +107,18 @@ struct GhPr {
     head_ref_name: String,
 }
 
+#[derive(Deserialize)]
+struct GhRepo {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+}
+
 #[cfg(unix)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Trigger { branch, pr, wait } => {
-            trigger_build(branch.as_deref(), *pr, *wait)
-        }
+        Commands::Trigger { branch, pr, wait } => trigger_build(branch.as_deref(), *pr, *wait),
         Commands::Install { branch, pr } => install_build(branch.as_deref(), *pr),
         Commands::Run {
             branch,
@@ -135,24 +141,25 @@ fn resolve_branch_or_pr(branch: Option<&str>, pr: Option<u64>) -> Result<String>
     }
 
     if let Some(pr_num) = pr {
-        println!("Resolving PR #{} to branch...", pr_num);
+        println!("Resolving PR #{pr_num} to branch...");
         let output = Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &pr_num.to_string(),
-                "--json",
-                "headRefName",
-            ])
+            .args(["pr", "view", &pr_num.to_string(), "--json", "headRefName"])
             .output()
             .context("Failed to execute gh pr view")?;
 
         if !output.status.success() {
-            anyhow::bail!("Failed to resolve PR #{}: {}", pr_num, String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "Failed to resolve PR #{}: {}",
+                pr_num,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
 
         let pr_data: GhPr = serde_json::from_slice(&output.stdout)?;
-        println!("Resolved PR #{} to branch '{}'", pr_num, pr_data.head_ref_name);
+        println!(
+            "Resolved PR #{} to branch '{}'",
+            pr_num, pr_data.head_ref_name
+        );
         return Ok(pr_data.head_ref_name);
     }
 
@@ -188,7 +195,7 @@ fn validate_branch_name(branch: &str) -> Result<()> {
     if branch.contains("..") {
         anyhow::bail!("Branch name cannot contain '..'");
     }
-    if branch.starts_with('/') || branch.contains(":") {
+    if branch.starts_with('/') || branch.contains(':') {
         anyhow::bail!("Branch name contains invalid characters");
     }
     Ok(())
@@ -208,12 +215,6 @@ fn get_repo_owner_name() -> Result<String> {
         );
     }
 
-    #[derive(Deserialize)]
-    struct GhRepo {
-        #[serde(rename = "nameWithOwner")]
-        name_with_owner: String,
-    }
-
     let gh_repo: GhRepo =
         serde_json::from_slice(&output.stdout).context("Failed to parse gh repo view output")?;
     Ok(gh_repo.name_with_owner)
@@ -226,11 +227,11 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
     let repo_owner_name = get_repo_owner_name()?;
 
     // Get the latest commit SHA for the branch
-    println!("Fetching latest commit SHA for branch '{}'...", branch);
+    println!("Fetching latest commit SHA for branch '{branch}'...");
     let output = Command::new("gh")
         .args([
             "api",
-            &format!("repos/{}/branches/{}", repo_owner_name, branch),
+            &format!("repos/{repo_owner_name}/branches/{branch}"),
             "--jq",
             ".commit.sha",
         ])
@@ -238,11 +239,14 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
         .context("Failed to fetch branch SHA")?;
 
     if !output.status.success() {
-        anyhow::bail!("Failed to get branch SHA: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "Failed to get branch SHA: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     let latest_sha = String::from_utf8(output.stdout)?.trim().to_string();
-    println!("Latest SHA: {}", latest_sha);
+    println!("Latest SHA: {latest_sha}");
 
     // Check for existing runs for this SHA
     println!("Checking for existing builds for this SHA...");
@@ -268,33 +272,37 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
     if output.status.success() {
         let runs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
         for run in runs {
-            if let Some(id) = run["databaseId"].as_u64() {
-                if id > max_seen_id {
-                    max_seen_id = id;
-                }
+            if let Some(id) = run["databaseId"].as_u64()
+                && id > max_seen_id
+            {
+                max_seen_id = id;
             }
 
-            if let Some(run_sha) = run["headSha"].as_str() {
-                if run_sha == latest_sha {
-                    // Found a run for the same SHA
-                    let status = run["status"].as_str().unwrap_or("");
-                    let conclusion = run["conclusion"].as_str().unwrap_or("");
-                    let id = run["databaseId"].as_u64();
+            if let Some(run_sha) = run["headSha"].as_str()
+                && run_sha == latest_sha
+            {
+                // Found a run for the same SHA
+                let status = run["status"].as_str().unwrap_or("");
+                let conclusion = run["conclusion"].as_str().unwrap_or("");
+                let id = run["databaseId"].as_u64();
 
-                    if let Some(id) = id {
-                        if status == "completed" && conclusion == "success" {
-                            println!("Found successful build for this SHA (Run ID: {}). No need to trigger.", id);
-                            return Ok(());
-                        } else if status != "completed" {
-                             println!("Found active build for this SHA (Run ID: {}). Reusing it.", id);
-                             existing_run_id = Some(id);
-                             break;
-                        } else {
-                            println!("Found failed/cancelled build for this SHA (Run ID: {}). Retrying...", id);
-                            // If failed, we probably want to trigger a new one, so continue loop or stop?
-                            // Default behavior: trigger new if latest is failed.
-                        }
+                if let Some(id) = id {
+                    if status == "completed" && conclusion == "success" {
+                        println!(
+                            "Found successful build for this SHA (Run ID: {id}). No need to trigger.",
+                        );
+                        return Ok(());
+                    } else if status != "completed" {
+                        println!("Found active build for this SHA (Run ID: {id}). Reusing it.",);
+                        existing_run_id = Some(id);
+                        break;
                     }
+
+                    println!(
+                        "Found failed/cancelled build for this SHA (Run ID: {id}). Retrying...",
+                    );
+                    // If failed, we probably want to trigger a new one, so continue loop or stop?
+                    // Default behavior: trigger new if latest is failed.
                 }
             }
         }
@@ -319,15 +327,13 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
                 }
                 (other_os, other_arch) => {
                     anyhow::bail!(
-                        "Failed to determine build platform for OS {} and architecture {}: Unsupported combination for build_and_release workflow. Supported combinations are: linux/aarch64, linux/x86_64, macos/aarch64.",
-                        other_os,
-                        other_arch
+                        "Failed to determine build platform for OS {other_os} and architecture {other_arch}: Unsupported combination for build_and_release workflow. Supported combinations are: linux/aarch64, linux/x86_64, macos/aarch64.",
                     );
                 }
             }
         };
 
-        println!("Requesting platform: {}", platform_option);
+        println!("Requesting platform: {platform_option}");
 
         let status = Command::new("gh")
             .args([
@@ -337,7 +343,7 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
                 "--ref",
                 &branch,
                 "-f",
-                &format!("platform_option={}", platform_option),
+                &format!("platform_option={platform_option}"),
             ])
             .status()
             .context("Failed to execute gh workflow run")?;
@@ -349,12 +355,9 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
         println!("Build triggered successfully.");
 
         if !wait {
-             println!("You can check the status with:");
-             println!(
-                 "  gh run list --workflow build_and_release.yml --branch \"{}\"",
-                 branch
-             );
-             return Ok(());
+            println!("You can check the status with:");
+            println!("  gh run list --workflow build_and_release.yml --branch \"{branch}\"",);
+            return Ok(());
         }
 
         println!("Waiting for build to start...");
@@ -384,26 +387,32 @@ fn trigger_build(branch: Option<&str>, pr: Option<u64>, wait: bool) -> Result<()
             if output.status.success() {
                 let runs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
                 if let Some(run) = runs.first() {
-                     let status = run["status"].as_str().unwrap_or("");
-                     let run_sha = run["headSha"].as_str().unwrap_or("");
-                     let id = run["databaseId"].as_u64();
+                    let status = run["status"].as_str().unwrap_or("");
+                    let run_sha = run["headSha"].as_str().unwrap_or("");
+                    let id = run["databaseId"].as_u64();
 
-                     // Ensure we picked up a run for the correct SHA that is active and NEW (id > max_seen_id)
-                     if let Some(id) = id {
-                         if id > max_seen_id && (status == "queued" || status == "in_progress" || status == "requested" || status == "waiting") && run_sha == latest_sha {
-                             found_new_run_id = Some(id);
-                             break;
-                         }
-                     }
+                    // Ensure we picked up a run for the correct SHA that is active and NEW (id > max_seen_id)
+                    if let Some(id) = id
+                        && id > max_seen_id
+                        && (status == "queued"
+                            || status == "in_progress"
+                            || status == "requested"
+                            || status == "waiting")
+                        && run_sha == latest_sha
+                    {
+                        found_new_run_id = Some(id);
+                        break;
+                    }
                 }
             }
         }
 
-        found_new_run_id.context("Could not find the newly triggered run (or it completed instantly).")?
+        found_new_run_id
+            .context("Could not find the newly triggered run (or it completed instantly).")?
     };
 
     if wait {
-        println!("Waiting for Run ID: {}...", run_id_to_watch);
+        println!("Waiting for Run ID: {run_id_to_watch}...");
         let status = Command::new("gh")
             .args(["run", "watch", &run_id_to_watch.to_string()])
             .status()
@@ -428,8 +437,7 @@ fn get_artifact_names() -> Result<Vec<String>> {
         // Fallback/Default
         other => {
             anyhow::bail!(
-                "Unsupported OS '{}' for PR build artifacts; only 'macos' and 'linux' are supported",
-                other
+                "Unsupported OS '{other}' for PR build artifacts; only 'macos' and 'linux' are supported",
             );
         }
     };
@@ -437,9 +445,9 @@ fn get_artifact_names() -> Result<Vec<String>> {
     // Prioritize metal for darwin
     let mut names = Vec::new();
     if os == "darwin" {
-        names.push(format!("spiced_metal_{}_{}", os, arch));
+        names.push(format!("spiced_metal_{os}_{arch}"));
     }
-    names.push(format!("spiced_{}_{}", os, arch));
+    names.push(format!("spiced_{os}_{arch}"));
 
     Ok(names)
 }
@@ -465,7 +473,7 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
         .join(".spice/bin")
         .join(&branch);
 
-    println!("Looking for latest successful build for branch: {}...", branch);
+    println!("Looking for latest successful build for branch: {branch}...",);
 
     let output = Command::new("gh")
         .args([
@@ -493,20 +501,19 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
     }
 
     let runs: Vec<GhRun> = serde_json::from_slice(&output.stdout)?;
-    let run = runs.first().context(format!(
-        "No successful build found for branch '{}'",
-        branch
-    ))?;
+    let run = runs
+        .first()
+        .context(format!("No successful build found for branch '{branch}'"))?;
     let run_id = run.database_id;
 
-    println!("Found Run ID: {}", run_id);
+    println!("Found Run ID: {run_id}");
 
     // List artifacts for the run to check which one exists
     println!("Checking available artifacts...");
     let output = Command::new("gh")
         .args([
             "api",
-            &format!("repos/{}/actions/runs/{}/artifacts", repo_owner_name, run_id),
+            &format!("repos/{repo_owner_name}/actions/runs/{run_id}/artifacts",),
         ])
         .output()
         .context("Failed to fetch artifacts list")?;
@@ -567,11 +574,11 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
     for entry in fs::read_dir(temp_path)? {
         let entry = entry?;
         let path = entry.path();
-        if let Some(ext) = path.extension() {
-            if ext == "gz" {
-                tar_file = Some(path);
-                break;
-            }
+        if let Some(ext) = path.extension()
+            && ext == "gz"
+        {
+            tar_file = Some(path);
+            break;
         }
     }
 
@@ -611,10 +618,10 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
     // Rename might fail if cross-device link (EXDEV), so we try copy+remove as fallback
     if let Err(e) = fs::rename(&temp_target, &target_binary) {
         if e.kind() == std::io::ErrorKind::CrossesDevices {
-             fs::copy(&temp_target, &target_binary)?;
-             let _ = fs::remove_file(&temp_target);
+            fs::copy(&temp_target, &target_binary)?;
+            let _ = fs::remove_file(&temp_target);
         } else {
-             return Err(e.into());
+            return Err(e.into());
         }
     }
 
@@ -637,13 +644,21 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
         symlink_path.display(),
         target_binary.display()
     );
-    println!("You can now run it comfortably via: {}", symlink_path.display());
+    println!(
+        "You can now run it comfortably via: {}",
+        symlink_path.display()
+    );
 
     Ok(())
 }
 
 #[cfg(unix)]
-fn run_build(branch: Option<&str>, pr: Option<u64>, interactive: bool, args: &[String]) -> Result<()> {
+fn run_build(
+    branch: Option<&str>,
+    pr: Option<u64>,
+    interactive: bool,
+    args: &[String],
+) -> Result<()> {
     let branch = if interactive {
         select_branch()?
     } else {
@@ -665,15 +680,14 @@ fn run_build(branch: Option<&str>, pr: Option<u64>, interactive: bool, args: &[S
         install_build(Some(&branch), None)?;
     }
 
-    println!("Running spiced from branch '{}'...", branch);
+    println!("Running spiced from branch '{branch}'...");
     println!("Exec: {} {}", binary_path.display(), args.join(" "));
 
     // Replace the current process with spiced (Unix only)
-    use std::os::unix::process::CommandExt;
     let error = Command::new(&binary_path).args(args).exec();
 
     // If we're here, exec failed
-    anyhow::bail!("Failed to execute spiced: {}", error);
+    anyhow::bail!("Failed to execute spiced: {error}");
 }
 
 #[cfg(unix)]
@@ -691,18 +705,18 @@ fn select_branch() -> Result<String> {
     // Walk directory to find all 'spiced' binaries
     for entry in WalkDir::new(&base_dir).min_depth(1) {
         let entry = entry.ok();
-        if let Some(entry) = entry {
-            if entry.file_type().is_file() && entry.file_name() == "spiced" {
-                // Found a spiced binary, the parent dir is the branch path
-                if let Some(branch_dir) = entry.path().parent() {
-                    // Get relative path from base_dir to get the branch name
-                    if let Ok(rel_path) = branch_dir.strip_prefix(&base_dir) {
-                        if let Some(branch_name) = rel_path.to_str() {
-                            if !branch_name.is_empty() {
-                                branches.push(branch_name.to_string());
-                            }
-                        }
-                    }
+        if let Some(entry) = entry
+            && entry.file_type().is_file()
+            && entry.file_name() == "spiced"
+        {
+            // Found a spiced binary, the parent dir is the branch path
+            if let Some(branch_dir) = entry.path().parent() {
+                // Get relative path from base_dir to get the branch name
+                if let Ok(rel_path) = branch_dir.strip_prefix(&base_dir)
+                    && let Some(branch_name) = rel_path.to_str()
+                    && !branch_name.is_empty()
+                {
+                    branches.push(branch_name.to_string());
                 }
             }
         }
