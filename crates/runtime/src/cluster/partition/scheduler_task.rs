@@ -27,6 +27,7 @@ use tokio::sync::RwLock;
 use tokio::time::{MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::CLUSTER_PARTITION_MANAGEMENT_TASK;
 use crate::cluster::executor_registry::{self, ExecutorRegistry};
 use crate::cluster::partition::discovery::table_partition_values;
 use crate::cluster::partition::{
@@ -209,6 +210,7 @@ struct UnassignedPartition {
     partition_value: PartitionValue,
 }
 
+#[derive(Debug)]
 struct Assignment {
     table: TableReference,
     partition_value: PartitionValue,
@@ -221,6 +223,7 @@ struct ExecutorLoad {
     tables: HashSet<String>,
 }
 
+#[derive(Debug)]
 struct CommitResult {
     committed: Vec<Assignment>,
     #[expect(dead_code)]
@@ -252,10 +255,12 @@ impl PartitionManagementTask {
     }
 
     pub async fn run(self) -> Result<()> {
+        tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} in background");
         let mut interval = tokio::time::interval(self.config.interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
+            tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} loop");
             tokio::select! {
                 () = self.cancel.cancelled() => {
                     tracing::info!("Partition management task shutting down");
@@ -288,10 +293,16 @@ impl PartitionManagementTask {
 
     /// Underlying logic for a single management cycle.
     async fn run_management_cycle(&self) -> Result<()> {
+        tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} task run");
         let state = self.refresh_state().await?;
 
         let discovery_result = self.discover_and_sync_partitions(&state).await?;
 
+        tracing::debug!(
+            "[{CLUSTER_PARTITION_MANAGEMENT_TASK}][task]: {} new, {} removed partitions",
+            discovery_result.new_partitions.len(),
+            discovery_result.removed_partitions.len()
+        );
         if !discovery_result.new_partitions.is_empty() {
             self.add_new_partitions(discovery_result.new_partitions)
                 .await?;
@@ -303,12 +314,19 @@ impl PartitionManagementTask {
         }
 
         let unassigned = self.find_unassigned_partitions(&state);
-
+        tracing::debug!(
+            "[{CLUSTER_PARTITION_MANAGEMENT_TASK}][task]: {} Unassigned partitions",
+            unassigned.len()
+        );
         if !unassigned.is_empty() {
             let assignments = self.assign_unassigned_partitions(unassigned, &state);
-
+            tracing::debug!(
+                "[{CLUSTER_PARTITION_MANAGEMENT_TASK}][task]: assignments={assignments:?}"
+            );
             let commit_result = self.commit_assignments(assignments).await?;
-
+            tracing::debug!(
+                "[{CLUSTER_PARTITION_MANAGEMENT_TASK}][task]: commit_result={commit_result:?}"
+            );
             self.notify_executors(commit_result.committed).await?;
         }
 
