@@ -684,8 +684,8 @@ impl HttpTableProvider {
         })
         .await;
 
-        // If retries exhausted due to transient errors (5xx), make one final attempt
-        // and return whatever response we get - 5xx is still valid data.
+        // If retries exhausted due to transient errors (5xx/429), make one final attempt
+        // and return whatever response we get - the response is still valid data.
         // Don't retry on permanent errors (e.g., failed to read response body).
         if let Ok(fetch_result) = result {
             Ok(fetch_result)
@@ -701,16 +701,25 @@ impl HttpTableProvider {
         }
     }
 
+    /// Returns true for HTTP status codes that should trigger retry with backoff.
+    ///
+    /// Currently retries:
+    /// - 5xx server errors (transient server issues)
+    /// - 429 Too Many Requests (rate limiting)
+    fn is_retryable_status(status_code: u16) -> bool {
+        (500..600).contains(&status_code) || status_code == 429
+    }
+
     /// Perform a single HTTP request without retry logic.
     ///
-    /// If `accept_5xx` is false, returns a transient error on 5xx to trigger retry.
-    /// If `accept_5xx` is true, accepts any status code and returns the response.
+    /// If `accept_retryable` is false, returns a transient error on 5xx/429 to trigger retry.
+    /// If `accept_retryable` is true, accepts any status code and returns the response.
     async fn perform_single_request(
         &self,
         url: &Url,
         body: Option<&str>,
         path_label: &str,
-        accept_5xx: bool,
+        accept_retryable: bool,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         let mut request_builder = if let Some(body_content) = body {
             let mut req = self.client.post(url.clone());
@@ -732,21 +741,20 @@ impl HttpTableProvider {
 
         let status_code = response.status().as_u16();
 
-        // 5xx: retry with backoff (might be transient server issue)
-        // After retries exhausted, we'll accept 5xx as valid response
-        if !accept_5xx && (500..600).contains(&status_code) {
-            tracing::debug!("HTTP server error ({status_code}), will retry");
-            // We already verified status_code is 5xx, so error_for_status will return Err
+        // 5xx/429: retry with backoff (transient server issue or rate limiting)
+        // After retries exhausted, we'll accept the response as valid data.
+        if !accept_retryable && Self::is_retryable_status(status_code) {
+            tracing::debug!("HTTP retryable status ({status_code}), will retry");
             if let Err(e) = response.error_for_status() {
                 return Err(RetryError::transient(Error::HttpRequest { source: e }));
             }
-            // Defensive: should never reach here since 5xx always produces error_for_status Err
+            // Defensive: should never reach here since 4xx and 5xx always produce error_for_status Err
             return Err(RetryError::transient(Error::HttpServerError {
                 status: status_code,
             }));
         }
 
-        // 2xx, 3xx, 4xx (and 5xx when accept_5xx=true): valid response
+        // 2xx, 3xx, 4xx (and 5xx/429 when accept_retryable=true): valid response
         // 4xx like 404 "not found" is a valid business response, not an error
         Self::extract_response(response, status_code, path_label).await
     }

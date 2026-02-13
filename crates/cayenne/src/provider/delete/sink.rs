@@ -69,6 +69,9 @@ use std::sync::{Arc, RwLock};
 // Position-based deletion methods implemented in sink/position_based.rs
 mod position_based;
 
+// File-based deletion for time-based retention (deletes entire expired files)
+pub(crate) mod file_based;
+
 /// Deletion sink for Cayenne tables.
 ///
 /// This sink handles the process of marking rows as deleted by writing

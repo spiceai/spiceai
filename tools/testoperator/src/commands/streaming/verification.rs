@@ -51,6 +51,7 @@ pub struct VerificationResult {
 ///
 /// # Arguments
 /// * `spiced_instance` - Takes ownership of the `SpicedInstance`
+/// * `config_name` - Configuration name (e.g. "tpch-duckdb") used to differentiate snapshots
 /// * `iterations` - Number of times to run each query (default: 1 for correctness, higher for timing stats)
 /// * `scale_factor` - TPCH scale factor for validation
 ///
@@ -58,6 +59,7 @@ pub struct VerificationResult {
 /// * `VerificationResult` containing the `SpicedInstance` (for continued use) and metrics
 pub async fn run_verification(
     spiced_instance: SpicedInstance,
+    config_name: &str,
     iterations: usize,
     scale_factor: f64,
 ) -> Result<VerificationResult> {
@@ -90,8 +92,8 @@ pub async fn run_verification(
         .with_query_set_type(QuerySet::Tpch)
         .with_query_overrides(Some(QueryOverrides::DynamoDB));
 
-    // Create and run SpiceTest
-    let test = SpiceTest::new("streaming_verification".to_string(), state)
+    // Create and run SpiceTest (name differentiates snapshots per config)
+    let test = SpiceTest::new(format!("streaming_{config_name}"), state)
         .with_spiced_instance(spiced_instance)
         .with_progress_bars(false)
         .with_explain_plan_snapshot()

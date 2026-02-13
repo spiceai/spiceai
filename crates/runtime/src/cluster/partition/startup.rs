@@ -23,15 +23,12 @@ use std::{
 use app::{App, spicepod::component::runtime::Scheduler as SchedulerConfig};
 
 use datafusion::{
-    execution::{SessionStateBuilder, runtime_env::RuntimeEnvBuilder},
-    logical_expr::Expr,
-    prelude::SessionContext,
+    execution::SessionStateBuilder, logical_expr::Expr, prelude::SessionContext,
     sql::TableReference,
 };
 use datafusion_proto::bytes::Serializeable;
 use object_store::ObjectStore;
 use object_store::prefix::PrefixStore;
-use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
@@ -80,11 +77,6 @@ pub enum Error {
 
     #[snafu(display("Failed to deserialize partition expression: {source}"))]
     PartitionExpressionDeserialization {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display("Failed to build runtime environment: {source}"))]
-    RuntimeEnvBuild {
         source: datafusion::error::DataFusionError,
     },
 
@@ -310,17 +302,11 @@ async fn execute_partition_discovery_query(
     };
 
     let ctx = SessionContext::new_with_state(
-        SessionStateBuilder::default()
-            .with_runtime_env(
-                RuntimeEnvBuilder::default()
-                    .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(
-                        rt.tokio_io_runtime(),
-                    )))
-                    .build_arc()
-                    .context(RuntimeEnvBuildSnafu)?,
-            )
-            .build(),
+        SessionStateBuilder::new_from_existing(rt.datafusion().ctx.state()).build(),
     );
+
+    // Must deregister table in this context before registering source table.
+    let _ = ctx.deregister_table(table.clone());
     ctx.register_table(table.clone(), acc.table_provider().await)
         .context(RegisterTableSnafu {
             table: table_name.clone(),

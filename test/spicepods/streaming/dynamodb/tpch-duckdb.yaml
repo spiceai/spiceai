@@ -18,7 +18,7 @@ datasets:
       dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
       dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
       dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
-      ready_lag: 1h
+      ready_lag: 24h
       scan_segments: 1
 
   - from: dynamodb:nation
@@ -29,7 +29,7 @@ datasets:
       dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
       dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
       dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
-      ready_lag: 1h
+      ready_lag: 24h
       scan_segments: 1
 
   - from: dynamodb:supplier
@@ -40,7 +40,7 @@ datasets:
       dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
       dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
       dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
-      ready_lag: 1h
+      ready_lag: 24h
       scan_segments: 4
 
   - from: dynamodb:part
@@ -51,7 +51,7 @@ datasets:
       dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
       dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
       dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
-      ready_lag: 1h
+      ready_lag: 24h
       scan_segments: 8
 
   - from: dynamodb:partsupp
@@ -62,7 +62,7 @@ datasets:
       dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
       dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
       dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
-      ready_lag: 1h
+      ready_lag: 24h
       scan_segments: 16
 
   - from: dynamodb:customer
@@ -73,7 +73,7 @@ datasets:
       dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
       dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
       dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
-      ready_lag: 1h
+      ready_lag: 24h
       scan_segments: 8
 
   - from: dynamodb:orders
@@ -84,7 +84,7 @@ datasets:
       dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
       dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
       dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
-      ready_lag: 1h
+      ready_lag: 24h
       scan_segments: 16
 
   - from: dynamodb:lineitem
@@ -95,5 +95,5 @@ datasets:
       dynamodb_aws_access_key_id: ${secrets:DYNAMODB_AWS_ACCESS_KEY_ID}
       dynamodb_aws_secret_access_key: ${secrets:DYNAMODB_AWS_SECRET_ACCESS_KEY}
       dynamodb_aws_region: ${secrets:DYNAMODB_AWS_REGION}
-      ready_lag: 1h
+      ready_lag: 24h
       scan_segments: 48

@@ -46,6 +46,7 @@ pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
+pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
 pub(crate) mod streaming;
@@ -56,6 +57,7 @@ pub(crate) mod vortex_format;
 // Re-export the main type at the module level for convenience
 pub use context::CayenneContext;
 pub use deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
+pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
 pub use vortex_format::{attach_deletion_vectors_to_config, DeletionFilteringVortexFormat};
