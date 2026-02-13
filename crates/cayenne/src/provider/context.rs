@@ -130,6 +130,7 @@ impl CayenneContext {
         let vortex_opts = VortexOptions {
             footer_cache_size_mb: config.footer_cache_mb,
             segment_cache_size_mb: config.segment_cache_mb,
+            target_file_size_mb: config.target_vortex_file_size_mb,
             ..VortexOptions::default()
         };
 

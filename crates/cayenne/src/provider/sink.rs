@@ -29,7 +29,6 @@ use datafusion_common::Result as DFResult;
 use datafusion_execution::TaskContext;
 use datafusion_expr::dml::InsertOp;
 
-use super::context::CayenneContext;
 use super::table::CayenneTableProvider;
 
 /// A [`DataSink`] implementation that writes data to a Cayenne table.
@@ -42,10 +41,6 @@ pub struct CayenneDataSink {
 
     /// Schema of the data being written.
     schema: SchemaRef,
-
-    /// Shared context containing configuration (file size, concurrency, sort columns, etc.)
-    /// and cached resources (upload semaphore, Vortex format).
-    context: Arc<CayenneContext>,
 }
 
 impl CayenneDataSink {
@@ -56,19 +51,12 @@ impl CayenneDataSink {
     /// * `table` - The Cayenne table provider to write to
     /// * `overwrite` - The insert operation mode
     /// * `schema` - Schema of the data being written
-    /// * `context` - Shared context with configuration and resources
     #[must_use]
-    pub fn new(
-        table: CayenneTableProvider,
-        overwrite: InsertOp,
-        schema: SchemaRef,
-        context: Arc<CayenneContext>,
-    ) -> Self {
+    pub fn new(table: CayenneTableProvider, overwrite: InsertOp, schema: SchemaRef) -> Self {
         Self {
             table,
             overwrite,
             schema,
-            context,
         }
     }
 }
@@ -161,11 +149,11 @@ impl CayenneDataSink {
                 })?;
         }
 
-        // Write data to the new snapshot with memory-bounded parallel writes
-        let target_size = self.context.target_file_size_bytes();
-        let (total_rows, _files_written) = self
+        // Write data to the new snapshot.
+        // File splitting is handled internally by the Vortex format writer.
+        let total_rows = self
             .table
-            .chunk_and_write_parallel_to_snapshot(data, target_size, &new_snapshot_id)
+            .write_stream_to_snapshot(data, &new_snapshot_id)
             .await
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
