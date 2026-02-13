@@ -1,0 +1,21 @@
+[package]
+name = "pr-builds"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+dialoguer = "0.11.0"
+dirs = "6.0.0"
+flate2 = "1.1.9"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tar = "0.4.44"
+tempfile.workspace = true
+walkdir = "2.5.0"

@@ -78,7 +78,7 @@ struct SearchResponse {
                             "dataset": "app_messages",
                             "primary_key": { "id": "6fd5a215-0881-421d-ace0-b293b83452b5" },
                             "data": { "timestamp": 1_724_716_542 },
-                            "score": 0.914_321
+                            "_score": 0.914_321
                         },
                         {
                             "matches": {
@@ -87,7 +87,7 @@ struct SearchResponse {
                             "dataset": "app_messages",
                             "primary_key": { "id": "8a25595f-99fb-4404-8c82-e1046d8f4c4b" },
                             "data": { "timestamp": 1_724_715_881 },
-                            "score": 0.83221
+                            "_score": 0.83221
                         },
                         {
                             "matches": {
@@ -96,7 +96,7 @@ struct SearchResponse {
                             "dataset": "app_messages",
                             "primary_key": { "id": "8421ed84-b86d-4b10-b4da-7a432e8912c0" },
                             "data": { "timestamp": 1_724_716_123 },
-                            "score": 0.787_654_321
+                            "_score": 0.787_654_321
 
                         }
                     ],

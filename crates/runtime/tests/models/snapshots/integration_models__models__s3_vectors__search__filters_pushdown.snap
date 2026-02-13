@@ -2,17 +2,17 @@
 source: crates/runtime/tests/models/s3_vectors.rs
 expression: replace_s3_vector_index_names(&formatted)
 ---
-+-----------------------------------------------------------------------------+---------------+----------------+-------------------+-----------------------------------------------------------------------+
-| message.body                                                                | attempt_count | message.status | package_weight_kg | round(vector_search(delivery, Utf8("wrong location")).score,Int64(1)) |
-+-----------------------------------------------------------------------------+---------------+----------------+-------------------+-----------------------------------------------------------------------+
-| Your parcel has been delivered. Thank you! (PKG-a34e94f8)                   | 3             | FAILED         | 10.0              | 0.2                                                                   |
-| Package ready for pickup at parcel locker. Use PKG-d9f09893                 | 2             | FAILED         | 9.95              | 0.2                                                                   |
-| Item available at your local depot. ID: PKG-40083d8e                        | 2             | FAILED         | 9.94              | 0.1                                                                   |
-| Weather conditions affected your delivery. Ref: PKG-d44375d9                | 3             | FAILED         | 9.92              | 0.4                                                                   |
-| Delivery confirmed but not at recipient location. Tracking ID: PKG-6f4e6d94 | 2             | FAILED         | 9.89              | 0.2                                                                   |
-| Delivery confirmed but not at recipient location. Tracking ID: PKG-78ec2148 | 2             | FAILED         | 9.87              | 0.2                                                                   |
-| Weather conditions affected your delivery. Ref: PKG-3484b3ee                | 2             | FAILED         | 9.85              | 0.3                                                                   |
-| Delivery delayed due to traffic. ID: PKG-02cf421c                           | 2             | FAILED         | 9.85              | 0.2                                                                   |
-| Delivered to a different unit. Contact support. Ref: PKG-02bf6245           | 2             | FAILED         | 9.79              | 0.2                                                                   |
-| Your parcel has been delivered. Thank you! (PKG-69c0ef11)                   | 3             | FAILED         | 9.74              | 0.2                                                                   |
-+-----------------------------------------------------------------------------+---------------+----------------+-------------------+-----------------------------------------------------------------------+
++-----------------------------------------------------------------------------+---------------+----------------+-------------------+------------------------------------------------------------------------+
+| message.body                                                                | attempt_count | message.status | package_weight_kg | round(vector_search(delivery, Utf8("wrong location"))._score,Int64(1)) |
++-----------------------------------------------------------------------------+---------------+----------------+-------------------+------------------------------------------------------------------------+
+| Your parcel has been delivered. Thank you! (PKG-a34e94f8)                   | 3             | FAILED         | 10.0              | 0.2                                                                    |
+| Package ready for pickup at parcel locker. Use PKG-d9f09893                 | 2             | FAILED         | 9.95              | 0.2                                                                    |
+| Item available at your local depot. ID: PKG-40083d8e                        | 2             | FAILED         | 9.94              | 0.1                                                                    |
+| Weather conditions affected your delivery. Ref: PKG-d44375d9                | 3             | FAILED         | 9.92              | 0.4                                                                    |
+| Delivery confirmed but not at recipient location. Tracking ID: PKG-6f4e6d94 | 2             | FAILED         | 9.89              | 0.2                                                                    |
+| Delivery confirmed but not at recipient location. Tracking ID: PKG-78ec2148 | 2             | FAILED         | 9.87              | 0.2                                                                    |
+| Weather conditions affected your delivery. Ref: PKG-3484b3ee                | 2             | FAILED         | 9.85              | 0.3                                                                    |
+| Delivery delayed due to traffic. ID: PKG-02cf421c                           | 2             | FAILED         | 9.85              | 0.2                                                                    |
+| Delivered to a different unit. Contact support. Ref: PKG-02bf6245           | 2             | FAILED         | 9.79              | 0.2                                                                    |
+| Your parcel has been delivered. Thank you! (PKG-69c0ef11)                   | 3             | FAILED         | 9.74              | 0.2                                                                    |
++-----------------------------------------------------------------------------+---------------+----------------+-------------------+------------------------------------------------------------------------+

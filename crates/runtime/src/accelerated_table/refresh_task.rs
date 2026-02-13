@@ -355,7 +355,7 @@ impl RefreshTask {
         let mut spans = vec![];
         let mut parent_span = Span::current();
         for dataset_name in self.get_dataset_names().await {
-            let span = tracing::span!(target: "task_history", parent: &parent_span, tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
+            let span = tracing::span!(target: "task_history", parent: &parent_span, tracing::Level::INFO, "acceleration_refresh", input = %dataset_name);
             spans.push(span.clone());
             parent_span = span;
         }

@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.94,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -14,10 +15,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
-      },
-      "score": 0.94
+      }
     },
     {
+      "_score": 0.93,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -26,10 +27,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 15
-      },
-      "score": 0.93
+      }
     },
     {
+      "_score": 0.93,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -38,10 +39,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 3
-      },
-      "score": 0.93
+      }
     },
     {
+      "_score": 0.92,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -50,10 +51,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 7
-      },
-      "score": 0.92
+      }
     },
     {
+      "_score": 0.91,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -62,10 +63,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 10
-      },
-      "score": 0.91
+      }
     },
     {
+      "_score": 0.91,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -74,10 +75,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 2
-      },
-      "score": 0.91
+      }
     },
     {
+      "_score": 0.91,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -86,10 +87,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 17
-      },
-      "score": 0.91
+      }
     },
     {
+      "_score": 0.9,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -98,10 +99,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 8
-      },
-      "score": 0.9
+      }
     },
     {
+      "_score": 0.9,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -110,10 +111,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 19
-      },
-      "score": 0.9
+      }
     },
     {
+      "_score": 0.9,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -122,10 +123,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 14
-      },
-      "score": 0.9
+      }
     },
     {
+      "_score": 0.89,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -134,10 +135,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 18
-      },
-      "score": 0.89
+      }
     },
     {
+      "_score": 0.89,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -146,10 +147,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 11
-      },
-      "score": 0.89
+      }
     },
     {
+      "_score": 0.89,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -158,10 +159,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 13
-      },
-      "score": 0.89
+      }
     },
     {
+      "_score": 0.88,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -170,10 +171,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 12
-      },
-      "score": 0.88
+      }
     },
     {
+      "_score": 0.87,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -182,10 +183,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 20
-      },
-      "score": 0.87
+      }
     },
     {
+      "_score": 0.87,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -194,10 +195,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 5
-      },
-      "score": 0.87
+      }
     },
     {
+      "_score": 0.86,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -206,10 +207,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 9
-      },
-      "score": 0.86
+      }
     },
     {
+      "_score": 0.84,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -218,10 +219,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 16
-      },
-      "score": 0.84
+      }
     },
     {
+      "_score": 0.82,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -230,8 +231,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 6
-      },
-      "score": 0.82
+      }
     }
   ]
 }

@@ -8,24 +8,24 @@ snapshot_kind: text
     "id": 612,
     "answer": "1. Perform the division: \\(4 \\div 10 = 0.4\\).  \n2. The decimal \\(0.4\\) is expressed in words as \\(\\boxed{\\text{four tenths}}\\).",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "score": 0.793
+    "_score": 0.793
   },
   {
     "id": 349,
     "answer": "The missing factor is \\(\\boxed{2}\\).  \n\n(Explanation: Since \\( 21 \\times 2 = 42 \\), the missing factor is 2.)",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "score": 0.785
+    "_score": 0.785
   },
   {
     "id": 1277,
     "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "score": 0.556
+    "_score": 0.556
   },
   {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "array_length(vector_search(qs, Utf8(\"second\"), answer).answer_embedding)": 64,
-    "score": 0.556
+    "_score": 0.556
   }
 ]

@@ -370,7 +370,7 @@ impl SearchQueryProvider {
                 //   substring(
                 //      search_column, chunk_offset[1], chunk_offset[2] - chunk_offset[1]),
                 //   ),
-                //  'Utf8') as 'match'
+                //  'Utf8') as '_match'
                 cast(
                     substring(
                         col(search_col),
@@ -379,7 +379,7 @@ impl SearchQueryProvider {
                     ),
                     DataType::Utf8,
                 )
-                .alias("match"),
+                .alias(SEARCH_MATCH_COLUMN_NAME),
             ],
         ]
         .concat()

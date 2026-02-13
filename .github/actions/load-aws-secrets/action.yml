@@ -58,8 +58,14 @@ runs:
             # Mask the value so it won't appear in logs
             echo "::add-mask::$value"
 
-            # Export as environment variable for subsequent steps
-            echo "$var_name=$value" >> "$GITHUB_ENV"
+            # Export as environment variable for subsequent steps using multiline env-file syntax
+            # Use a unique delimiter per value to avoid collisions with secret contents
+            delimiter="EOF_$(date +%s%N)_${RANDOM}"
+            {
+              printf '%s<<%s\n' "$var_name" "$delimiter"
+              printf '%s\n' "$value"
+              printf '%s\n' "$delimiter"
+            } >> "$GITHUB_ENV"
 
             PARAM_COUNT=$((PARAM_COUNT + 1))
           done

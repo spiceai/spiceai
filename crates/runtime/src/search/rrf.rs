@@ -582,7 +582,7 @@ impl ReciprocalRankFusion {
         let mut columns: Vec<Expr> = vec![score_expr];
         columns.extend(subquery_dfs[0].schema().columns().iter().filter_map(|c| {
             match c.name.as_str() {
-                "rank" | "score" => None,
+                "rank" | "_score" => None,
                 // TODO: do we want the embedding in the final projection?
                 other if other.ends_with("_embedding") => None,
                 other => Some(
@@ -714,9 +714,9 @@ impl ReciprocalRankFusion {
             .enumerate()
             .map(|(i, df)| {
                 // Ensure that all projections have a score column
-                if !df.schema().has_column_with_unqualified_name("score") {
+                if !df.schema().has_column_with_unqualified_name("_score") {
                     return exec_err!(
-                        "{RRF_UDF_NAME}: Query at position {i} does not have a `score` column."
+                        "{RRF_UDF_NAME}: Query at position {i} does not have a `_score` column."
                     );
                 }
 
@@ -763,7 +763,7 @@ impl ReciprocalRankFusion {
     // Window and rank a search subquery by its `score` field, exposing a `rank` column
     fn with_rank(df: DataFrame) -> Result<DataFrame> {
         let rank_expr = row_number()
-            .order_by(vec![col("score").sort(false, false)])
+            .order_by(vec![col("_score").sort(false, false)])
             .build()?
             .alias("rank");
 
@@ -779,7 +779,7 @@ impl ReciprocalRankFusion {
             .sorted_by_key(|c| c.name())
             // Don't hash embeddings or scores
             .filter_map(|c| match c.name() {
-                "score" => None,
+                "_score" => None,
                 name if name.ends_with("_embedding") => None,
                 name => Some(ident(name)),
             })

@@ -113,3 +113,39 @@ pub trait StreamingSource: Send + Sync {
     /// Cleanup resources (stop containers, etc.).
     async fn cleanup(&self) -> Result<()>;
 }
+
+/// DynamoDB-specific streaming source with snapshot/checkpoint support.
+///
+/// This trait extends [`StreamingSource`] with methods for transforming spicepods
+/// to capture checkpoints and restore from snapshots. This is required for `DynamoDB`
+/// benchmarks because `DynamoDB` Streams has limited retention (24 hours) and shard
+/// lifecycle issues that require snapshot-based checkpoint capture.
+pub trait DynamoDBStreamingSource: StreamingSource {
+    /// Transform spicepod for checkpoint capture phase.
+    ///
+    /// This method:
+    /// - Renames datasets with `run_id` prefix to match `DynamoDB` table names
+    /// - Sets `acceleration.snapshots: create_only` to capture checkpoint
+    /// - Configures runtime snapshot location
+    fn prepare_checkpoint_spicepod(
+        &self,
+        spicepod: SpicepodDefinition,
+        run_id: &str,
+        config_name: &str,
+        snapshot_config: &SnapshotConfig,
+    ) -> Result<SpicepodDefinition>;
+
+    /// Transform spicepod for benchmark phase.
+    ///
+    /// This method:
+    /// - Renames datasets with `run_id` prefix to match `DynamoDB` table names
+    /// - Sets `acceleration.snapshots: bootstrap_only` to restore from snapshot
+    /// - Configures runtime snapshot location
+    fn prepare_benchmark_spicepod(
+        &self,
+        spicepod: SpicepodDefinition,
+        run_id: &str,
+        config_name: &str,
+        snapshot_config: &SnapshotConfig,
+    ) -> Result<SpicepodDefinition>;
+}

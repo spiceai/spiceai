@@ -96,7 +96,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }

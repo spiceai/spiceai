@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.03,
       "data": {
         "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
       },
@@ -20,10 +21,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 468
-      },
-      "score": 0.03
+      }
     },
     {
+      "_score": 0.03,
       "data": {
         "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
@@ -38,10 +39,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
-      },
-      "score": 0.03
+      }
     },
     {
+      "_score": 0.03,
       "data": {
         "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
       },
@@ -56,10 +57,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 189
-      },
-      "score": 0.03
+      }
     },
     {
+      "_score": 0.03,
       "data": {
         "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
       },
@@ -74,8 +75,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 948
-      },
-      "score": 0.03
+      }
     }
   ]
 }

@@ -9,27 +9,27 @@ snapshot_kind: text
     "answer": "Choices create costs and benefits.",
     "reference_answer": "Choices create costs and benefits.",
     "source": "textbook_reasoning",
-    "score": 0.891
+    "_score": 0.891
   },
   {
     "id": 1316,
     "answer": "\\(\\boxed{2a + 4b}\\)",
     "reference_answer": "2a + 4b",
     "source": "textbook_reasoning",
-    "score": 0.843
+    "_score": 0.843
   },
   {
     "id": 590,
     "answer": "\\(\\boxed{x = A + E}\\)",
     "reference_answer": "x = A + E",
     "source": "textbook_reasoning",
-    "score": 0.836
+    "_score": 0.836
   },
   {
     "id": 6,
     "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)",
     "reference_answer": "78.54 cm²\n\nPlease provide the actual question and detailed answer you need me to work with.",
     "source": "textbook_reasoning",
-    "score": 0.833
+    "_score": 0.833
   }
 ]

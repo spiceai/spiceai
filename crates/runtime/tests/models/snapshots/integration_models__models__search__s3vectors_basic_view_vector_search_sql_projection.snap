@@ -9,27 +9,27 @@ snapshot_kind: text
     "answer": "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples.",
     "question": "How many multiples of 4 are there between 1 and 30? List them and count the total.",
     "subject": "math",
-    "score": 0.54
+    "_score": 0.54
   },
   {
     "id": 189,
     "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
     "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\).",
     "subject": "math",
-    "score": 0.539
+    "_score": 0.539
   },
   {
     "id": 1277,
     "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "Which base number, when raised to the fifth power, equals thirty-two?",
     "subject": "math",
-    "score": 0.539
+    "_score": 0.539
   },
   {
     "id": 948,
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "What is the fifth root of 32?",
     "subject": "math",
-    "score": 0.528
+    "_score": 0.528
   }
 ]
