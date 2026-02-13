@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.94,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -14,10 +15,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 1
-      },
-      "_score": 0.9400963357009336
+      }
     },
     {
+      "_score": 0.93,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -26,10 +27,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 15
-      },
-      "_score": 0.9398291716774164
+      }
     },
     {
+      "_score": 0.93,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -38,10 +39,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 3
-      },
-      "_score": 0.9375262525348972
+      }
     },
     {
+      "_score": 0.92,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -50,10 +51,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 7
-      },
-      "_score": 0.9273301161037488
+      }
     },
     {
+      "_score": 0.91,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -62,10 +63,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 10
-      },
-      "_score": 0.9159284526262208
+      }
     },
     {
+      "_score": 0.91,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -74,10 +75,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 2
-      },
-      "_score": 0.9117962035409471
+      }
     },
     {
+      "_score": 0.91,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -86,10 +87,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 17
-      },
-      "_score": 0.9109729176536489
+      }
     },
     {
+      "_score": 0.9,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -98,10 +99,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 8
-      },
-      "_score": 0.909036715319305
+      }
     },
     {
+      "_score": 0.9,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -110,10 +111,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 19
-      },
-      "_score": 0.907636856948916
+      }
     },
     {
+      "_score": 0.9,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -122,10 +123,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 14
-      },
-      "_score": 0.9068648214701052
+      }
     },
     {
+      "_score": 0.89,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -134,10 +135,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 18
-      },
-      "_score": 0.8959976326549786
+      }
     },
     {
+      "_score": 0.89,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -146,10 +147,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 11
-      },
-      "_score": 0.8958621526213884
+      }
     },
     {
+      "_score": 0.89,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -158,10 +159,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 13
-      },
-      "_score": 0.8957666947546759
+      }
     },
     {
+      "_score": 0.88,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -170,10 +171,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 12
-      },
-      "_score": 0.8879877705913609
+      }
     },
     {
+      "_score": 0.87,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -182,10 +183,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 20
-      },
-      "_score": 0.8784471135747325
+      }
     },
     {
+      "_score": 0.87,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -194,10 +195,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 5
-      },
-      "_score": 0.8733924987803368
+      }
     },
     {
+      "_score": 0.86,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -206,10 +207,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 9
-      },
-      "_score": 0.8611566533290982
+      }
     },
     {
+      "_score": 0.84,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -218,10 +219,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 16
-      },
-      "_score": 0.8453847500877436
+      }
     },
     {
+      "_score": 0.82,
       "dataset": "spice.public.cached_search",
       "matches": {
         "cp_description": [
@@ -230,8 +231,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "cp_catalog_page_sk": 6
-      },
-      "_score": 0.8262181184660475
+      }
     }
   ]
 }
