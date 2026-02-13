@@ -1292,19 +1292,17 @@ fn transform_spicepod(
     );
 
     let mut params = Params::default();
-    if let Some(ref key) = snapshot_config.access_key_id {
-        params
-            .data
-            .insert("s3_auth".to_string(), ParamValue::String("key".to_string()));
-        params
-            .data
-            .insert("s3_key".to_string(), ParamValue::String(key.clone()));
-    }
-    if let Some(ref secret) = snapshot_config.secret_access_key {
-        params
-            .data
-            .insert("s3_secret".to_string(), ParamValue::String(secret.clone()));
-    }
+    params
+        .data
+        .insert("s3_auth".to_string(), ParamValue::String("key".to_string()));
+    params.data.insert(
+        "s3_key".to_string(),
+        ParamValue::String("${secrets:SNAPSHOT_S3_ACCESS_KEY_ID}".to_string()),
+    );
+    params.data.insert(
+        "s3_secret".to_string(),
+        ParamValue::String("${secrets:SNAPSHOT_S3_SECRET_ACCESS_KEY}".to_string()),
+    );
     if let Some(ref region) = snapshot_config.region {
         params
             .data

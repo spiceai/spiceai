@@ -408,7 +408,6 @@ async fn capture_checkpoint_snapshot(
 
     // Write transformed spicepod to temp file
     let temp_path = write_temp_spicepod(&transformed, run_id, config_name, "checkpoint")?;
-    println!("    Wrote transformed spicepod to {}", temp_path.display());
 
     // Start temp Spice
     let mut start_request = StartRequest::new(args.spiced_path_buf(), transformed)?;

@@ -436,8 +436,6 @@ pub fn build_snapshot_config() -> Option<SnapshotConfig> {
 
     Some(SnapshotConfig {
         location,
-        access_key_id: std::env::var("SNAPSHOT_S3_ACCESS_KEY_ID").ok(),
-        secret_access_key: std::env::var("SNAPSHOT_S3_SECRET_ACCESS_KEY").ok(),
         region: std::env::var("SNAPSHOT_S3_REGION").ok(),
     })
 }

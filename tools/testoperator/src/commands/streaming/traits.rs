@@ -32,10 +32,6 @@ use super::datasets::DatasetType;
 pub struct SnapshotConfig {
     /// Base S3 location for snapshots (e.g., "<s3://bucket/snapshots>/")
     pub location: String,
-    /// S3 access key ID
-    pub access_key_id: Option<String>,
-    /// S3 secret access key
-    pub secret_access_key: Option<String>,
     /// S3 region
     pub region: Option<String>,
 }

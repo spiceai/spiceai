@@ -94,6 +94,74 @@ async fn wait_for_executor_count(
     }
 }
 
+async fn run_distributed_query_with_retries(
+    runtime: &Arc<Runtime>,
+    sql: &str,
+    job_name: &str,
+    max_attempts: usize,
+) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    for attempt in 1..=max_attempts {
+        let query = QueryBuilder::new(sql, runtime.datafusion());
+        let attempt_job_name = format!("{job_name}_{attempt}");
+        let query_handle = query
+            .build()
+            .submit_distributed(&attempt_job_name)
+            .await
+            .map_err(|err| {
+                anyhow::Error::msg(format!(
+                    "Failed to submit distributed query {attempt_job_name}: {err}"
+                ))
+            })?;
+
+        let stream_result = query_handle.into_stream().await;
+        match stream_result {
+            Ok(stream) => match stream.try_collect::<Vec<RecordBatch>>().await {
+                Ok(results) => return Ok(results),
+                Err(err) => {
+                    let message = err.to_string();
+                    let is_retryable =
+                        message.contains("reported as completed but status is not successful");
+                    if attempt < max_attempts && is_retryable {
+                        tracing::warn!(
+                            attempt,
+                            max_attempts,
+                            %message,
+                            "Distributed query failed with retryable status; retrying"
+                        );
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    return Err(anyhow::Error::msg(format!(
+                        "Distributed query failed (attempt {attempt}/{max_attempts}): {message}"
+                    )));
+                }
+            },
+            Err(err) => {
+                let message = err.to_string();
+                let is_retryable =
+                    message.contains("reported as completed but status is not successful");
+                if attempt < max_attempts && is_retryable {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts,
+                        %message,
+                        "Distributed query stream creation failed with retryable status; retrying"
+                    );
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(anyhow::Error::msg(format!(
+                    "Failed to get distributed query stream (attempt {attempt}/{max_attempts}): {message}"
+                )));
+            }
+        }
+    }
+
+    Err(anyhow::Error::msg(
+        "Distributed query failed after retry attempts",
+    ))
+}
+
 /// Test that in-memory shuffle works correctly with multiple executors.
 ///
 /// This test creates a cluster with:
@@ -335,6 +403,8 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
             }
 
             runtime_ready_check(&scheduler_rt).await;
+            runtime_ready_check(&executor1_rt).await;
+            runtime_ready_check(&executor2_rt).await;
 
             let scheduler_server = scheduler_rt
                 .datafusion()
@@ -348,51 +418,38 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
             // Wait for both executors to connect
             wait_for_executor_count(&executor_manager, 2, Duration::from_secs(15)).await?;
 
-            // Run a distributed GROUP BY query that requires shuffle
+            // Give the scheduler a moment to observe executor capacity before planning.
+            // Without this, the first query can race with cluster-capacity propagation and
+            // fail with a transient non-successful completed job status.
+            sleep(Duration::from_secs(2)).await;
+
+            // Run a distributed GROUP BY query that requires shuffle.
             // This query aggregates by city, which will cause hash repartitioning
             // and require shuffle data exchange between executors.
-            let query = QueryBuilder::new(
+            let results = run_distributed_query_with_retries(
+                &scheduler_rt,
                 "SELECT city, COUNT(*) as count, AVG(score) as avg_score \
                  FROM test_data \
                  GROUP BY city \
                  ORDER BY city",
-                scheduler_rt.datafusion(),
-            );
-
-            let query_handle = query
-                .build()
-                .submit_distributed("test_in_memory_shuffle_group_by")
-                .await
-                .expect("should submit distributed query");
-
-            let query_result = query_handle.into_stream().await.expect("should get stream");
-            let results = query_result
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .expect("should collect results");
+                "test_in_memory_shuffle_group_by",
+                6,
+            )
+            .await?;
 
             let pretty = arrow::util::pretty::pretty_format_batches(&results)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))
                 .expect("Should format batches");
             insta::assert_snapshot!("in_memory_shuffle_group_by_results", pretty);
 
-            // Run an ORDER BY query that also requires shuffle (sort merge)
-            let query = QueryBuilder::new(
+            // Run an ORDER BY query that also requires shuffle (sort merge).
+            let results = run_distributed_query_with_retries(
+                &scheduler_rt,
                 "SELECT name, score FROM test_data ORDER BY score DESC LIMIT 5",
-                scheduler_rt.datafusion(),
-            );
-
-            let query_handle = query
-                .build()
-                .submit_distributed("test_in_memory_shuffle_order_by")
-                .await
-                .expect("should submit distributed query");
-
-            let query_result = query_handle.into_stream().await.expect("should get stream");
-            let results = query_result
-                .try_collect::<Vec<RecordBatch>>()
-                .await
-                .expect("should collect results");
+                "test_in_memory_shuffle_order_by",
+                6,
+            )
+            .await?;
 
             let pretty = arrow::util::pretty::pretty_format_batches(&results)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))

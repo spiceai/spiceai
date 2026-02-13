@@ -74,8 +74,11 @@ pub fn write_temp_spicepod(
     let path = temp_dir.join(filename);
 
     let content = yaml::to_string(spicepod).context("Failed to serialize spicepod")?;
-    std::fs::write(&path, content)
+    std::fs::write(&path, content.clone())
         .with_context(|| format!("Failed to write temp spicepod: {}", path.display()))?;
+
+    println!("    Wrote transformed spicepod to {}", path.display());
+    println!("{content}");
 
     Ok(path)
 }
