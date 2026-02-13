@@ -39,6 +39,8 @@ use arrow::{
 };
 use chrono::{DateTime, NaiveDate};
 
+use arrow_tools::schema::schema_difference;
+
 use super::Query;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,11 +151,15 @@ fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool
         _ => matches!(
             (expected_type, actual_type),
             (DataType::Float32, DataType::Float64)
+                | (DataType::Float64 | DataType::Int32, DataType::Int64)
                 | (
                     DataType::Float64 | DataType::Int64,
                     DataType::Decimal128(_, _)
                 )
-                | (DataType::Int32, DataType::Int64)
+                | (
+                    DataType::Decimal128(_, _),
+                    DataType::Float64 | DataType::Int64
+                )
                 | (
                     DataType::Int64,
                     DataType::Int32
@@ -163,9 +169,13 @@ fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool
                         | DataType::LargeUtf8
                         | DataType::Utf8View
                 )
-                | (DataType::Utf8, DataType::LargeUtf8)
+                | (DataType::Utf8, DataType::LargeUtf8 | DataType::Utf8View)
+                | (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
                 | (DataType::LargeUtf8, DataType::Utf8)
-                | (DataType::Date32, DataType::Date64)
+                | (
+                    DataType::Date32,
+                    DataType::Date64 | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                )
                 | (DataType::Date64, DataType::Date32)
         ),
     }
@@ -494,8 +504,12 @@ pub fn validate_tpch_query(
     };
 
     if !equivalent_schemas(&expected_schema, &actual_schema) {
-        println!("expected_schema: {expected_schema:?}");
-        println!("actual_schema: {actual_schema:?}");
+        if let Some(diff) = schema_difference(&expected_schema, &actual_schema) {
+            println!("Schema mismatch:\n{diff}");
+        } else {
+            println!("expected_schema: {expected_schema:?}");
+            println!("actual_schema: {actual_schema:?}");
+        }
 
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::SchemaMismatch,
@@ -563,8 +577,12 @@ pub fn validate_with_expected_batches(
 
     if !equivalent_schemas(&expected_schema, &actual_schema) {
         println!("Query '{query_name}' schema mismatch:");
-        println!("  expected_schema: {expected_schema:?}");
-        println!("  actual_schema: {actual_schema:?}");
+        if let Some(diff) = schema_difference(&expected_schema, &actual_schema) {
+            println!("{diff}");
+        } else {
+            println!("  expected_schema: {expected_schema:?}");
+            println!("  actual_schema: {actual_schema:?}");
+        }
 
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::SchemaMismatch,
