@@ -457,8 +457,10 @@ pub enum SnapshotUploadError {
     },
     #[snafu(display("Snapshot metadata schema for dataset {dataset} is missing"))]
     UploadMetadataSchemaMissing { dataset: String },
-    #[snafu(display("Snapshot metadata schema conflict for dataset {dataset}"))]
-    UploadSchemaMismatch { dataset: String },
+    #[snafu(display(
+        "Snapshot metadata schema conflict for dataset {dataset}. Snapshots do not support schema evolution. If dataset schema changed, delete existing snapshots and restart Spice runtime: {details}"
+    ))]
+    UploadSchemaMismatch { dataset: String, details: String },
     #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}"))]
     CopyLocal {
         source_path: PathBuf,
@@ -2010,9 +2012,10 @@ impl SnapshotManager {
                         },
                     )?;
 
-                if metadata_schema.as_ref() != schema.as_ref() {
+                if metadata_schema.fields() != schema.fields() {
                     return Err(SnapshotUploadError::UploadSchemaMismatch {
                         dataset: dataset_name.clone(),
+                        details: describe_schema_differences(&metadata_schema, schema),
                     });
                 }
             }
@@ -2578,6 +2581,61 @@ async fn build_s3_parameters(
             .unwrap_or_else(|_| default_params())
         }
         None => default_params(),
+    }
+}
+
+/// Compares two schemas and returns a human-readable description of the differences.
+fn describe_schema_differences(expected: &SchemaRef, actual: &SchemaRef) -> String {
+    let mut diffs = Vec::new();
+
+    let expected_fields: HashMap<&str, &arrow_schema::FieldRef> = expected
+        .fields()
+        .iter()
+        .map(|f| (f.name().as_str(), f))
+        .collect();
+    let actual_fields: HashMap<&str, &arrow_schema::FieldRef> = actual
+        .fields()
+        .iter()
+        .map(|f| (f.name().as_str(), f))
+        .collect();
+
+    for (name, field) in &expected_fields {
+        if !actual_fields.contains_key(name) {
+            diffs.push(format!("field '{}' ({}) removed", name, field.data_type()));
+        }
+    }
+
+    for (name, field) in &actual_fields {
+        if !expected_fields.contains_key(name) {
+            diffs.push(format!("field '{}' ({}) added", name, field.data_type()));
+        }
+    }
+
+    for (name, expected_field) in &expected_fields {
+        if let Some(actual_field) = actual_fields.get(name) {
+            if expected_field.data_type() != actual_field.data_type() {
+                diffs.push(format!(
+                    "field '{}' type changed from {} to {}",
+                    name,
+                    expected_field.data_type(),
+                    actual_field.data_type()
+                ));
+            }
+            if expected_field.is_nullable() != actual_field.is_nullable() {
+                diffs.push(format!(
+                    "field '{}' nullability changed from {} to {}",
+                    name,
+                    expected_field.is_nullable(),
+                    actual_field.is_nullable()
+                ));
+            }
+        }
+    }
+
+    if diffs.is_empty() {
+        "schemas differ but no specific field differences identified".to_string()
+    } else {
+        diffs.join("; ")
     }
 }
 
@@ -5256,5 +5314,51 @@ mod tests {
             "Only the current snapshot should remain"
         );
         assert_eq!(dataset_entry.snapshots[0].snapshot_id, 5);
+    }
+
+    #[test]
+    fn schema_diff_field_added_and_removed() {
+        let schema_a = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let schema_b = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("email", DataType::Utf8, true),
+        ]));
+
+        let details = describe_schema_differences(&schema_a, &schema_b);
+        assert!(
+            details.contains("field 'name'") && details.contains("removed"),
+            "should report 'name' removed, got: {details}"
+        );
+        assert!(
+            details.contains("field 'email'") && details.contains("added"),
+            "should report 'email' added, got: {details}"
+        );
+    }
+
+    #[test]
+    fn schema_diff_type_and_nullability_change() {
+        let schema_a = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Int32,
+            false,
+        )]));
+        let schema_b = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Int64,
+            true,
+        )]));
+
+        let details = describe_schema_differences(&schema_a, &schema_b);
+        assert!(
+            details.contains("type changed from Int32 to Int64"),
+            "should report type change, got: {details}"
+        );
+        assert!(
+            details.contains("nullability changed from false to true"),
+            "should report nullability change, got: {details}"
+        );
     }
 }
