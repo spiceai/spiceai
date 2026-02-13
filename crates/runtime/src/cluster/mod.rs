@@ -792,6 +792,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         .context(UnableToStartClusterServerSnafu)
     };
     let self_for_task = Arc::clone(rt);
+    #[expect(clippy::type_complexity)]
     let mut futures: Vec<Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'static>>> =
         vec![Box::pin(
             self_for_task
@@ -876,7 +877,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             Err(err) => {
                 tracing::error!("Failed to build partition metadata store: {err}");
             }
-        };
+        }
 
         let registry_shutdown = CancellationToken::new();
         let registry_shutdown_for_task = registry_shutdown.clone();
@@ -896,7 +897,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             )
             .await;
         futures.push(Box::pin(scheduler_registry_fut));
-    };
+    }
 
     Ok(Some(Box::pin(async move {
         try_join_all(futures).await.map(|_| ())

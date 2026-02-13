@@ -194,13 +194,8 @@ pub struct PartitionManagementTask {
 }
 
 struct CycleState {
-    executors: Vec<ExecutorInfo>,
+    executor_ids: Vec<String>,
     tables: Vec<String>,
-}
-
-#[derive(Clone)]
-struct ExecutorInfo {
-    id: String,
 }
 
 struct UnassignedPartition {
@@ -340,18 +335,6 @@ impl PartitionManagementTask {
         // Get current executor state
         let executor_ids = self.executor_registry.connected_executors().await;
 
-        // Get partition counts for each executor from registry
-        let mut executors = Vec::new();
-        let registry_partitions = self.executor_registry.partitions.read().await;
-
-        for id in executor_ids {
-            let count = registry_partitions
-                .get(&id)
-                .map_or(0, |tables| tables.values().map(std::vec::Vec::len).sum());
-
-            executors.push(ExecutorInfo { id });
-        }
-
         // Get all tables with partition metadata
         let tables = self
             .partition_manager
@@ -359,7 +342,10 @@ impl PartitionManagementTask {
             .await
             .context(ListTablesSnafu)?;
 
-        Ok(CycleState { executors, tables })
+        Ok(CycleState {
+            executor_ids,
+            tables,
+        })
     }
 
     async fn discover_and_sync_partitions(&self, state: &CycleState) -> Result<DiscoveryResult> {
@@ -818,7 +804,7 @@ impl PartitionManagementTask {
             }
 
             // Select best executor for this partition
-            let Some(executor) =
+            let Some(executor_id) =
                 self.select_executor_for_partition(&unassigned_partition, &executor_loads, state)
             else {
                 tracing::warn!(
@@ -832,12 +818,12 @@ impl PartitionManagementTask {
             assignments.push(Assignment {
                 table: unassigned_partition.table.clone(),
                 partition_value: unassigned_partition.partition_value.clone(),
-                executor_id: executor.id.clone(),
+                executor_id: executor_id.clone(),
             });
 
             // Update executor load tracking
             executor_loads
-                .entry(executor.id.clone())
+                .entry(executor_id.clone())
                 .or_default()
                 .partition_count += 1;
 
@@ -856,8 +842,8 @@ impl PartitionManagementTask {
         let mut loads = HashMap::new();
 
         // Initialize with empty loads
-        for executor in &state.executors {
-            loads.insert(executor.id.clone(), ExecutorLoad::default());
+        for executor_id in &state.executor_ids {
+            loads.insert(executor_id.clone(), ExecutorLoad::default());
         }
 
         // Count current assignments
@@ -883,17 +869,17 @@ impl PartitionManagementTask {
         partition: &UnassignedPartition,
         executor_loads: &HashMap<String, ExecutorLoad>,
         state: &CycleState,
-    ) -> Option<ExecutorInfo> {
-        let mut candidates: Vec<_> = state.executors.iter().collect();
+    ) -> Option<String> {
+        let mut candidates: Vec<_> = state.executor_ids.iter().collect();
 
         if candidates.is_empty() {
             return None;
         }
 
         // Filter out executors at capacity
-        candidates.retain(|executor| {
+        candidates.retain(|executor_id| {
             let load = executor_loads
-                .get(&executor.id)
+                .get(*executor_id)
                 .map_or(0, |l| l.partition_count);
             load < self.config.max_partitions_per_executor
         });
@@ -906,9 +892,10 @@ impl PartitionManagementTask {
         // Score each candidate
         let mut scored_candidates: Vec<_> = candidates
             .into_iter()
-            .map(|executor| {
-                let score = self.score_executor_for_partition(executor, partition, executor_loads);
-                (executor, score)
+            .map(|executor_id| {
+                let score =
+                    self.score_executor_for_partition(executor_id, partition, executor_loads);
+                (executor_id, score)
             })
             .collect();
 
@@ -928,14 +915,11 @@ impl PartitionManagementTask {
     #[expect(clippy::cast_precision_loss)]
     fn score_executor_for_partition(
         &self,
-        executor: &ExecutorInfo,
+        executor_id: &str,
         partition: &UnassignedPartition,
         executor_loads: &HashMap<String, ExecutorLoad>,
     ) -> f64 {
-        let load = executor_loads
-            .get(&executor.id)
-            .cloned()
-            .unwrap_or_default();
+        let load = executor_loads.get(executor_id).cloned().unwrap_or_default();
 
         let mut score = 100.0;
 

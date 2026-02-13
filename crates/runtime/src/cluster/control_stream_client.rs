@@ -76,6 +76,7 @@ struct ControlStreamHandle {
 /// 3. Respond to metrics requests from the scheduler
 /// 4. Receive control messages (e.g., `PollNow`) and signal the notify
 /// 5. Reconnect on failure with exponential backoff
+#[expect(clippy::too_many_arguments)]
 fn spawn_control_stream(
     scheduler_address: String,
     executor_id: String,
@@ -312,6 +313,7 @@ fn spawn_control_stream(
 }
 
 /// Handles a message from the scheduler on the control stream.
+#[expect(clippy::too_many_arguments)]
 async fn handle_scheduler_message(
     scheduler_address: &str,
     executor_id: &str,
