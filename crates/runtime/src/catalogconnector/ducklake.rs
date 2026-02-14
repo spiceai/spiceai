@@ -216,8 +216,10 @@ impl CatalogConnector for DuckLakeCatalog {
                         source: Box::new(e),
                     })?;
 
+                let escaped_connection_string = connection_string_for_pool.replace('\'', "''");
+                let escaped_catalog_name = catalog_name_for_pool.replace('"', "\"\"");
                 let attach_sql = format!(
-                    "ATTACH 'ducklake:{connection_string_for_pool}' AS \"{catalog_name_for_pool}\""
+                    "ATTACH 'ducklake:{escaped_connection_string}' AS \"{escaped_catalog_name}\""
                 );
                 duckdb_conn
                     .execute(&attach_sql, [])

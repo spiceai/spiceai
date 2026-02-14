@@ -404,7 +404,7 @@ async fn capture_checkpoint_snapshot(
     // Load and transform spicepod
     let spicepod_def = load_spicepod_definition(spicepod_path)?;
     let transformed =
-        source.prepare_checkpoint_spicepod(spicepod_def, run_id, config_name, snapshot_config);
+        source.prepare_checkpoint_spicepod(spicepod_def, run_id, config_name, snapshot_config)?;
 
     // Write transformed spicepod to temp file
     let temp_path = write_temp_spicepod(&transformed, run_id, config_name, "checkpoint")?;

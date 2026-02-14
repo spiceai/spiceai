@@ -265,6 +265,9 @@ pub enum Error {
     #[snafu(display("Unable to acquire lock for writable catalogs"))]
     UnableToLockWritableCatalogs {},
 
+    #[snafu(display("Unable to acquire lock for DDL-enabled catalogs"))]
+    UnableToLockDdlEnabledCatalogs {},
+
     #[snafu(display("Unable to acquire lock for cluster scheduler state"))]
     UnableToLockWritableSchedulerHandle {},
 
@@ -637,7 +640,7 @@ impl DataFusion {
             }
         };
 
-        if matches!(dataset_access_mode, AccessMode::ReadWrite) {
+        if dataset_access_mode.allows_write() {
             self.mark_dataset_writable(&dataset_table_ref)?;
         }
 
@@ -690,7 +693,7 @@ impl DataFusion {
         );
         self.ddl_enabled_catalogs
             .write()
-            .map_err(|_| Error::UnableToLockWritableCatalogs {})?
+            .map_err(|_| Error::UnableToLockDdlEnabledCatalogs {})?
             .insert(catalog_name.to_string());
         // DDL-enabled catalogs are also writable
         self.mark_catalog_writable(catalog_name)?;
@@ -819,7 +822,9 @@ impl DataFusion {
         if let Some(catalog) = deferred_catalogs.get(name) {
             if let Ok(provider) = catalog.get_catalog_provider().await {
                 self.ctx.register_catalog(name, Arc::clone(&provider));
-                if matches!(access, AccessMode::ReadWrite) {
+                if access.allows_ddl() {
+                    self.mark_catalog_ddl_enabled(name)?;
+                } else if access.allows_write() {
                     self.mark_catalog_writable(name)?;
                 }
             }
@@ -1082,7 +1087,7 @@ impl DataFusion {
             .acceleration
             .as_ref()
             .is_some_and(|acc| !acc.on_conflict.is_empty());
-        let needs_source_writes = dataset.access() == AccessMode::ReadWrite && !has_on_conflict;
+        let needs_source_writes = dataset.access().allows_write() && !has_on_conflict;
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source

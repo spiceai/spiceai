@@ -176,8 +176,11 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    // Attach the DuckLake catalog
-    let attach_sql = format!("ATTACH 'ducklake:{connection_string}' AS \"{catalog_name}\"");
+    // Escape values to avoid breaking the SQL statement or enabling injection
+    let escaped_connection_string = connection_string.replace('\'', "''");
+    let escaped_catalog_name = catalog_name.replace('"', "\"\"");
+    let attach_sql =
+        format!("ATTACH 'ducklake:{escaped_connection_string}' AS \"{escaped_catalog_name}\"");
     duckdb_conn
         .execute(&attach_sql, [])
         .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
