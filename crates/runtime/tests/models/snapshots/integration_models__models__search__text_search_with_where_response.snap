@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(response)
-snapshot_kind: text
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 7.52,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -15,8 +15,7 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 890
-      },
-      "score": 7.52
+      }
     }
   ]
 }

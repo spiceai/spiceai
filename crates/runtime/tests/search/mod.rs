@@ -470,13 +470,13 @@ fn normalize_search_response(mut json: Value) -> String {
         // To avoid inconsistent snapshots when scores are equal (common when using RRF),
         // we also order based on primary key.
         matches.sort_by(|a, b| {
-            let Some(Value::Number(num_a)) = a.get("score") else {
+            let Some(Value::Number(num_a)) = a.get("_score") else {
                 return Ordering::Greater;
             };
             let Some(score_a) = num_a.as_f64() else {
                 return Ordering::Greater;
             };
-            let Some(Value::Number(num_b)) = b.get("score") else {
+            let Some(Value::Number(num_b)) = b.get("_score") else {
                 return Ordering::Less;
             };
             let Some(score_b) = num_b.as_f64() else {
@@ -500,13 +500,13 @@ fn normalize_search_response(mut json: Value) -> String {
         });
         for m in matches {
             if let Some(obj) = m.as_object_mut()
-                && let Some(Value::Number(n)) = obj.get("score")
+                && let Some(Value::Number(n)) = obj.get("_score")
                 && let Some(score) = n.as_f64()
                 && let Some(truncated_score) =
                     serde_json::Number::from_f64((100.0 * score).trunc() / 100.0)
             // Keep 4 decimals
             {
-                obj.insert("score".to_string(), Value::Number(truncated_score));
+                obj.insert("_score".to_string(), Value::Number(truncated_score));
             }
         }
     }

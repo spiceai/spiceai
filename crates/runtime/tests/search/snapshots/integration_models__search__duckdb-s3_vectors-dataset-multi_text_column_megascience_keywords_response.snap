@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 5.06,
       "dataset": "spice.public.qs",
       "matches": {
         "question": [
@@ -14,8 +15,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 361
-      },
-      "score": 5.06
+      }
     }
   ]
 }

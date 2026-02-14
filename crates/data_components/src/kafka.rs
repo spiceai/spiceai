@@ -75,7 +75,7 @@ pub enum Error {
     #[snafu(display("The metadata for topic {topic} was not found."))]
     MetadataTopicNotFound { topic: String },
 
-    #[snafu(display("Received empty batch. Retry"))]
+    #[snafu(display("Received empty batch from Kafka topic. The consumer will retry."))]
     EmptyBatch,
 }
 

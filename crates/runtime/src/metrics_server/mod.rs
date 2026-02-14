@@ -48,10 +48,10 @@ const SCOPE_CLUSTER: &str = "cluster";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to bind to address: {source}"))]
+    #[snafu(display("Failed to bind metrics server to address: {source}"))]
     UnableToBindServerToPort { source: std::io::Error },
 
-    #[snafu(display("Unable to start HTTP server: {source}"))]
+    #[snafu(display("Failed to start the metrics HTTP server: {source}"))]
     UnableToStartHttpServer { source: std::io::Error },
 }
 

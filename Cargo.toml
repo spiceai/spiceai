@@ -15,6 +15,7 @@ members = [
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
+    "crates/duration-parse",
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
@@ -169,6 +170,7 @@ delta_kernel = { version = "0.17.0", features = [
 derive_builder = "0.20.2"
 dotenvy = "0.15"
 duckdb = "1.4.4"
+duration-parse = { path = "crates/duration-parse" }
 dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.30"

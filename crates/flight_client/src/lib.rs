@@ -178,7 +178,7 @@ pub enum Error {
     #[snafu(display("Connection is reset by the server. Please retry the request. {source}"))]
     ConnectionReset { source: TonicStatusError },
 
-    #[snafu(display("An Arrow flight client error has occurred: {source}"))]
+    #[snafu(display("Flight connection error: {source}"))]
     ArrowFlightError {
         source: arrow_flight::error::FlightError,
     },

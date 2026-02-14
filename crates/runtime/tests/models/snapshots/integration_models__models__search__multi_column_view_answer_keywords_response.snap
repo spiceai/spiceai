@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.03,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -17,10 +18,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 470
-      },
-      "score": 0.03
+      }
     },
     {
+      "_score": 0.01,
       "dataset": "qs",
       "matches": {
         "question": [
@@ -29,10 +30,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 361
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -41,10 +42,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "dataset": "qs",
       "matches": {
         "question": [
@@ -53,8 +54,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 787
-      },
-      "score": 0.01
+      }
     }
   ]
 }

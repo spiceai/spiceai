@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.01,
       "data": {
         "cp_catalog_number": 1
       },
@@ -18,10 +18,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "cp_catalog_page_sk": 2
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "cp_catalog_number": 1
       },
@@ -33,8 +33,7 @@ snapshot_kind: text
       },
       "primary_key": {
         "cp_catalog_page_sk": 11
-      },
-      "score": 0.01
+      }
     }
   ]
 }

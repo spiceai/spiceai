@@ -220,7 +220,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
                 .with_dataset(make_dynamodb_dataset(
                     table_name, PORT2, access_key, secret_key, true,
                 ))
-                .with_results_cache(ResultsCache {
+                .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
                 })
@@ -322,7 +322,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
                 .with_dataset(make_dynamodb_dataset(
                     table_name, PORT1, access_key, secret_key, true,
                 ))
-                .with_results_cache(ResultsCache {
+                .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()
                 })

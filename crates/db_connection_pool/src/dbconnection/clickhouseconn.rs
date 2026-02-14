@@ -36,11 +36,11 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("ConnectionPoolError: {source}"))]
+    #[snafu(display("Failed to connect to ClickHouse: {source}"))]
     ConnectionPoolError {
         source: clickhouse_rs::errors::Error,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to execute ClickHouse query: {source}"))]
     QueryError {
         source: clickhouse_rs::errors::Error,
     },

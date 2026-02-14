@@ -216,22 +216,10 @@ impl RuntimeBuilder {
             .as_deref()
             == Some("enabled");
 
-        let mut caching_config = self
+        let caching_config = self
             .app
             .as_ref()
             .map_or(Caching::default(), |app| app.runtime.caching.clone());
-        if let Some(results_cache) = self
-            .app
-            .as_ref()
-            .and_then(|app| app.runtime.results_cache.clone())
-        {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release. Use `caching.sql_results` instead. For more information, visit: https://spiceai.org/docs/features/caching"
-                );
-            });
-            caching_config.sql_results = Some(results_cache.into());
-        }
 
         let caching = Runtime::init_caching(Some(&caching_config));
         let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());

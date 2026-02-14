@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.03,
       "data": {
         "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
@@ -19,10 +19,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 361
-      },
-      "score": 0.03
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "How many groups of 2 are in 14?"
       },
@@ -34,10 +34,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 462
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "How many groups of 5 are in 25?"
       },
@@ -49,10 +49,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 464
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "How many groups of 3 are in 18?"
       },
@@ -64,8 +64,7 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 463
-      },
-      "score": 0.01
+      }
     }
   ]
 }

@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.53,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -16,10 +16,10 @@ snapshot_kind: text
       "primary_key": {
         "id": 1277,
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
-      },
-      "score": 0.53
+      }
     },
     {
+      "_score": 0.5,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -29,10 +29,10 @@ snapshot_kind: text
       "primary_key": {
         "id": 470,
         "question": "How many numbers between 0 and 60 are even multiples of 5?"
-      },
-      "score": 0.5
+      }
     },
     {
+      "_score": 0.5,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -42,10 +42,10 @@ snapshot_kind: text
       "primary_key": {
         "id": 458,
         "question": "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
-      },
-      "score": 0.5
+      }
     },
     {
+      "_score": 0.48,
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -55,8 +55,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 42,
         "question": "Calculate the product of $12 \\times 12$."
-      },
-      "score": 0.48
+      }
     }
   ]
 }

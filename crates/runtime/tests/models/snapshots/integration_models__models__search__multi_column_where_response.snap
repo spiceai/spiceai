@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 7
       },
-      "score": 0.03
+      "_score": 0.03
     },
     {
       "dataset": "multi_column_search",
@@ -30,7 +30,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 3
       },
-      "score": 0.01
+      "_score": 0.01
     },
     {
       "dataset": "multi_column_search",
@@ -42,7 +42,7 @@ expression: normalize_search_response(resp)
       "primary_key": {
         "cp_catalog_page_sk": 5
       },
-      "score": 0.01
+      "_score": 0.01
     }
   ]
 }
