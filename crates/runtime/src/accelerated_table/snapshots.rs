@@ -79,9 +79,7 @@ pub fn spawn_snapshot_interval_task(
         runtime_status.wait_for_ready().await;
 
         // Determine the initial delay based on last checkpoint time
-        let initial_delay = if !bootstrap_status.is_bootstrapped() {
-            Duration::ZERO
-        } else {
+        let initial_delay = if bootstrap_status.is_bootstrapped() {
             match checkpointer.last_checkpoint_time().await {
                 Ok(Some(last_checkpoint)) => {
                     let elapsed = last_checkpoint.elapsed().unwrap_or(Duration::ZERO);
@@ -93,6 +91,8 @@ pub fn spawn_snapshot_interval_task(
                 }
                 Ok(None) | Err(_) => Duration::ZERO,
             }
+        } else {
+            Duration::ZERO
         };
 
         if !initial_delay.is_zero() {

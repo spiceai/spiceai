@@ -103,9 +103,7 @@ impl CatalogConnector for DuckLakeCatalog {
                 ExposedParamLookup::Present(value) => value.to_string(),
                 ExposedParamLookup::Absent(parameter) => {
                     if let Some(catalog_id) = catalog.catalog_id.as_ref() {
-                        if !catalog_id.is_empty() {
-                            catalog_id.clone()
-                        } else {
+                        if catalog_id.is_empty() {
                             let e = Error::MissingParameter {
                                 parameter: parameter.to_string(),
                             };
@@ -114,6 +112,8 @@ impl CatalogConnector for DuckLakeCatalog {
                                 connector_component,
                                 message: e.to_string(),
                             });
+                        } else {
+                            catalog_id.clone()
                         }
                     } else {
                         let e = Error::MissingParameter {
