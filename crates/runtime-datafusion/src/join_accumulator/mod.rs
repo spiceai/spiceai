@@ -141,11 +141,7 @@ impl ColumnBounds for ExactColumnBounds {
         let data_type = expr_values
             .first()
             .and_then(|e| {
-                let s = Schema::new(vec![Field::new(
-                    "_",
-                    arrow::datatypes::DataType::Null,
-                    true,
-                )]);
+                let s = Schema::new(vec![Field::new("_", arrow::datatypes::DataType::Null, true)]);
                 e.data_type(&s).ok()
             })
             .unwrap_or(arrow::datatypes::DataType::Null);

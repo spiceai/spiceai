@@ -137,12 +137,8 @@ impl super::AcceleratedTable {
                     default_runtime_env(io_runtime.clone()),
                 );
 
-                let plan = DeletionTableProvider::delete_from(
-                    deleted_table_provider.as_ref(),
-                    &ctx.state(),
-                    &[expr],
-                )
-                .await;
+                let plan = DeletionTableProvider::delete_from(deleted_table_provider.as_ref(), &ctx.state(), &[expr])
+                    .await;
                 match plan {
                     Ok(plan) => match collect(plan, ctx.task_ctx()).await {
                         Err(e) => {

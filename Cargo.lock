@@ -1401,7 +1401,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b7b6141e96a8c160799cc2d5adecd5cbbe5054cb8c7c4af53da0f83bb7ad256"
 dependencies = [
  "aws-lc-sys",
- "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -3466,7 +3465,11 @@ dependencies = [
  "vortex",
  "vortex-datafusion",
  "vortex-scan",
+<<<<<<< HEAD
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -5283,8 +5286,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -5337,8 +5345,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-catalog"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "async-trait",
@@ -5361,8 +5374,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-catalog-listing"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "async-trait",
@@ -5385,8 +5403,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-common"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -5408,8 +5431,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-common-runtime"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "futures",
  "log",
@@ -5418,8 +5446,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "async-compression",
@@ -5454,8 +5487,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-arrow"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -5477,8 +5515,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-csv"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "async-trait",
@@ -5499,8 +5542,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-json"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "async-trait",
@@ -5520,8 +5568,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-parquet"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "async-trait",
@@ -5549,6 +5602,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-doc"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
 
@@ -5556,6 +5610,15 @@ source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314
 name = "datafusion-execution"
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+
+[[package]]
+name = "datafusion-execution"
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "async-trait",
@@ -5574,8 +5637,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-expr"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "async-trait",
@@ -5596,8 +5664,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-expr-common"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -5634,8 +5707,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -5664,8 +5742,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-aggregate"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -5684,8 +5767,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-aggregate-common"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -5708,8 +5796,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-nested"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -5730,8 +5823,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-table"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "async-trait",
@@ -5745,8 +5843,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-window"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -5762,8 +5865,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-window-common"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -5771,8 +5879,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-macros"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -5781,8 +5894,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "chrono",
@@ -5825,8 +5943,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -5848,8 +5971,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr-adapter"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -5862,8 +5990,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr-common"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -5878,8 +6011,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-optimizer"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -5896,8 +6034,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-plan"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -5926,8 +6069,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-proto"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "chrono",
@@ -5955,8 +6103,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-proto-common"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -5967,8 +6120,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-pruning"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -5983,8 +6141,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-session"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "async-trait",
  "datafusion-common",
@@ -5996,8 +6159,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-spark"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -6018,8 +6186,13 @@ dependencies = [
 
 [[package]]
 name = "datafusion-sql"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -6671,13 +6844,6 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
-
-[[package]]
-name = "duration-parse"
-version = "2.0.0-unstable"
-dependencies = [
- "snafu",
-]
 
 [[package]]
 name = "dyn-clone"
@@ -10121,7 +10287,6 @@ version = "10.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0529410abe238729a60b108898784df8984c87f6054c9c4fcacc47e4803c1ce1"
 dependencies = [
- "aws-lc-rs",
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
  "getrandom 0.2.17",
@@ -14141,22 +14306,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pr-builds"
-version = "2.0.0-unstable"
-dependencies = [
- "anyhow",
- "clap",
- "dialoguer",
- "dirs",
- "flate2",
- "serde",
- "serde_json",
- "tar",
- "tempfile",
- "walkdir",
-]
-
-[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15621,7 +15770,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted 0.9.0",
+ "untrusted",
  "windows-sys 0.52.0",
 ]
 
@@ -16031,7 +16180,6 @@ dependencies = [
  "anyhow",
  "arrow",
  "arrow-schema",
- "arrow_tools",
  "async-trait",
  "aws-sdk-credential-bridge",
  "bytes",
@@ -16595,7 +16743,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
 dependencies = [
  "ring",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -16607,7 +16755,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -16907,7 +17055,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
 dependencies = [
  "ring",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -18138,7 +18286,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
  "byte-unit",
- "duration-parse",
+ "fundu",
  "futures",
  "object_store",
  "regex",
@@ -18207,6 +18355,7 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
 name = "spidapter"
 version = "2.0.0-unstable"
 dependencies = [
@@ -18238,6 +18387,8 @@ dependencies = [
 ]
 
 [[package]]
+=======
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18886,6 +19037,7 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
 name = "system-adapter-protocol"
 version = "0.1.0"
 source = "git+https://github.com/spiceai/spicebench.git?rev=5cbdb2a84ba47de959a395777e721b4a2d3a172c#5cbdb2a84ba47de959a395777e721b4a2d3a172c"
@@ -18900,6 +19052,8 @@ dependencies = [
 ]
 
 [[package]]
+=======
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 name = "system-configuration"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -20965,12 +21119,6 @@ checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
-
-[[package]]
-name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
@@ -21190,6 +21338,7 @@ dependencies = [
 [[package]]
 name = "vortex"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "vortex-alp",
@@ -21221,6 +21370,39 @@ dependencies = [
  "vortex-sparse",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "vortex-alp",
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-btrblocks",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-bytebool",
+ "vortex-compute 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-datetime-parts",
+ "vortex-decimal-byte-parts",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-fastlanes",
+ "vortex-file",
+ "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-fsst",
+ "vortex-io",
+ "vortex-ipc 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-layout",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-metrics",
+ "vortex-pco",
+ "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-runend",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scan",
+ "vortex-sequence",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-sparse",
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
  "vortex-zigzag",
  "vortex-zstd",
 ]
@@ -21228,12 +21410,17 @@ dependencies = [
 [[package]]
 name = "vortex-alp"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
  "prost 0.14.3",
  "rustc-hash 2.1.1",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -21244,6 +21431,18 @@ dependencies = [
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-fastlanes",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -21297,7 +21496,11 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arcref",
  "arrow-arith",
@@ -21329,6 +21532,7 @@ dependencies = [
  "simdutf8",
  "termtree",
  "tracing",
+<<<<<<< HEAD
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-compute 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -21340,12 +21544,29 @@ dependencies = [
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-compute 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-btrblocks"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "getrandom 0.3.4",
  "itertools 0.14.0",
@@ -21354,6 +21575,7 @@ dependencies = [
  "rustc-hash 2.1.1",
  "tracing",
  "vortex-alp",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-datetime-parts",
@@ -21368,6 +21590,22 @@ dependencies = [
  "vortex-sequence",
  "vortex-sparse",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-datetime-parts",
+ "vortex-decimal-byte-parts",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-fastlanes",
+ "vortex-fsst",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-runend",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-sequence",
+ "vortex-sparse",
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
  "vortex-zigzag",
 ]
 
@@ -21388,7 +21626,11 @@ dependencies = [
 [[package]]
 name = "vortex-buffer"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow-buffer",
  "bitvec",
@@ -21396,12 +21638,17 @@ dependencies = [
  "cudarc 0.18.2",
  "itertools 0.14.0",
  "simdutf8",
+<<<<<<< HEAD
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-bytebool"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "num-traits",
@@ -21411,6 +21658,17 @@ dependencies = [
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "num-traits",
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -21437,7 +21695,11 @@ dependencies = [
 [[package]]
 name = "vortex-compute"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -21448,17 +21710,29 @@ dependencies = [
  "num-traits",
  "paste",
  "tracing",
+<<<<<<< HEAD
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-datafusion"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -21483,12 +21757,17 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "vortex",
+<<<<<<< HEAD
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-datetime-parts"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "num-traits",
@@ -21499,11 +21778,24 @@ dependencies = [
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "num-traits",
+ "prost 0.14.3",
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-decimal-byte-parts"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "num-traits",
@@ -21514,6 +21806,18 @@ dependencies = [
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "num-traits",
+ "prost 0.14.3",
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -21543,7 +21847,11 @@ dependencies = [
 [[package]]
 name = "vortex-dtype"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -21557,11 +21865,19 @@ dependencies = [
  "prost 0.14.3",
  "serde",
  "static_assertions",
+<<<<<<< HEAD
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -21579,7 +21895,11 @@ dependencies = [
 [[package]]
 name = "vortex-error"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow-schema",
  "flatbuffers",
@@ -21593,7 +21913,11 @@ dependencies = [
 [[package]]
 name = "vortex-fastlanes"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrayref",
  "fastlanes",
@@ -21601,6 +21925,7 @@ dependencies = [
  "lending-iterator",
  "num-traits",
  "prost 0.14.3",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-compute 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -21610,12 +21935,27 @@ dependencies = [
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-compute 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-file"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "async-trait",
  "bytes",
@@ -21630,6 +21970,7 @@ dependencies = [
  "tracing",
  "uuid 1.21.0",
  "vortex-alp",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-bytebool",
@@ -21639,18 +21980,38 @@ dependencies = [
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-fastlanes",
  "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-bytebool",
+ "vortex-datetime-parts",
+ "vortex-decimal-byte-parts",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-fastlanes",
+ "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
  "vortex-fsst",
  "vortex-io",
  "vortex-layout",
  "vortex-metrics",
  "vortex-pco",
  "vortex-runend",
+<<<<<<< HEAD
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scan",
  "vortex-sequence",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-sparse",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scan",
+ "vortex-sequence",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-sparse",
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
  "vortex-zigzag",
  "vortex-zstd",
 ]
@@ -21667,20 +22028,32 @@ dependencies = [
 [[package]]
 name = "vortex-flatbuffers"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "flatbuffers",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "flatbuffers",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-fsst"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "fsst-rs",
  "num-traits",
  "prost 0.14.3",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -21688,12 +22061,25 @@ dependencies = [
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-io"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "async-compat",
  "async-fs",
@@ -21712,10 +22098,17 @@ dependencies = [
  "smol",
  "tokio",
  "tracing",
+<<<<<<< HEAD
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-metrics",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-metrics",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
  "wasm-bindgen-futures",
 ]
 
@@ -21739,24 +22132,40 @@ dependencies = [
 [[package]]
 name = "vortex-ipc"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "bytes",
  "flatbuffers",
  "futures",
  "itertools 0.14.0",
  "pin-project-lite",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-layout"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arcref",
  "async-stream",
@@ -21778,6 +22187,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid 1.21.0",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-btrblocks",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -21794,6 +22204,24 @@ dependencies = [
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-btrblocks",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-decimal-byte-parts",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-flatbuffers 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-io",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-metrics",
+ "vortex-pco",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-sequence",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
  "vortex-zstd",
 ]
 
@@ -21811,28 +22239,46 @@ dependencies = [
 [[package]]
 name = "vortex-mask"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "arrow-buffer",
  "itertools 0.14.0",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "arrow-buffer",
+ "itertools 0.14.0",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-metrics"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "getrandom 0.3.4",
  "parking_lot 0.12.5",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "getrandom 0.3.4",
+ "parking_lot 0.12.5",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
  "witchcraft-metrics",
 ]
 
 [[package]]
 name = "vortex-pco"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "pco",
@@ -21843,6 +22289,18 @@ dependencies = [
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "pco",
+ "prost 0.14.3",
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -21857,7 +22315,11 @@ dependencies = [
 [[package]]
 name = "vortex-proto"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "prost 0.14.3",
  "prost-types",
@@ -21866,12 +22328,17 @@ dependencies = [
 [[package]]
 name = "vortex-runend"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow-array",
  "itertools 0.14.0",
  "num-traits",
  "prost 0.14.3",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -21879,6 +22346,15 @@ dependencies = [
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -21904,7 +22380,11 @@ dependencies = [
 [[package]]
 name = "vortex-scalar"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow-array",
  "bytes",
@@ -21912,6 +22392,7 @@ dependencies = [
  "num-traits",
  "paste",
  "prost 0.14.3",
+<<<<<<< HEAD
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -21919,12 +22400,25 @@ dependencies = [
  "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-scan"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -21935,6 +22429,7 @@ dependencies = [
  "roaring",
  "sketches-ddsketch",
  "tracing",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -21944,11 +22439,23 @@ dependencies = [
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-metrics",
  "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-io",
+ "vortex-layout",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-metrics",
+ "vortex-session 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-sequence"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "num-traits",
@@ -21961,6 +22468,20 @@ dependencies = [
  "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "num-traits",
+ "prost 0.14.3",
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-proto 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -21976,21 +22497,34 @@ dependencies = [
 [[package]]
 name = "vortex-session"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "dashmap",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "dashmap",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-utils 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-sparse"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
  "prost 0.14.3",
+<<<<<<< HEAD
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -21998,6 +22532,15 @@ dependencies = [
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -22013,11 +22556,19 @@ dependencies = [
 [[package]]
 name = "vortex-utils"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "dashmap",
  "hashbrown 0.16.1",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "dashmap",
+ "hashbrown 0.16.1",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
@@ -22037,20 +22588,32 @@ dependencies = [
 [[package]]
 name = "vortex-vector"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 dependencies = [
  "num-traits",
  "paste",
  "static_assertions",
+<<<<<<< HEAD
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
 ]
 
 [[package]]
 name = "vortex-zigzag"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
@@ -22059,12 +22622,23 @@ dependencies = [
  "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
  "zigzag",
 ]
 
 [[package]]
 name = "vortex-zstd"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f#1023752b14ec7f5723ea1df3e17d66d0d21f0a9f"
 dependencies = [
  "itertools 0.14.0",
@@ -22076,6 +22650,19 @@ dependencies = [
  "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
  "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=1023752b14ec7f5723ea1df3e17d66d0d21f0a9f)",
+=======
+source = "git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4#dad51c34f7da7ab49b86a778c345821edad7ccc4"
+dependencies = [
+ "itertools 0.14.0",
+ "prost 0.14.3",
+ "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-dtype 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-error 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-mask 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-scalar 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+ "vortex-vector 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=dad51c34f7da7ab49b86a778c345821edad7ccc4)",
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)
  "zstd",
 ]
 
@@ -23632,6 +24219,7 @@ dependencies = [
 
 [[patch.unused]]
 name = "datafusion-datasource-avro"
+<<<<<<< HEAD
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
 
@@ -23639,3 +24227,12 @@ source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314
 name = "datafusion-ffi"
 version = "52.1.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=ad4bf668dd4e77f6c314548e00033b3647703387#ad4bf668dd4e77f6c314548e00033b3647703387"
+=======
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+
+[[patch.unused]]
+name = "datafusion-ffi"
+version = "52.0.0"
+source = "git+https://github.com/spiceai/datafusion.git?rev=46394316f50b2dfd516ef46d363c6a67aeed0925#46394316f50b2dfd516ef46d363c6a67aeed0925"
+>>>>>>> 57fca5a88 (Upgrade to DataFusion v52.0.0)

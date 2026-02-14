@@ -339,7 +339,8 @@ impl FileFormat for SpiceJsonFormat {
         Arc::new(
             SpiceJsonSource::new(table_schema)
                 .with_array_to_ndjson(matches!(self.options.format, Format::Array))
-                .with_unnest_struct(self.options.flatten_json.clone()),
+                .with_unnest_struct(self.options.flatten_json.clone())
+                .with_table_schema(table_schema),
         )
     }
 }
