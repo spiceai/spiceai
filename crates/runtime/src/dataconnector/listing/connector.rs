@@ -268,10 +268,7 @@ impl TableProvider for LocationPruningListingTable {
 
         let table_schema = TableSchema::new(
             self.file_schema(),
-            partition_fields
-                .iter()
-                .map(|f| Arc::new(f.clone()))
-                .collect(),
+            partition_fields.iter().map(|f| Arc::new(f.clone())).collect(),
         );
         let file_source = self.inner.options().format.file_source(table_schema);
 
@@ -281,11 +278,12 @@ impl TableProvider for LocationPruningListingTable {
         // expects indices relative to only the file schema. Passing table-level indices would
         // cause index-out-of-bounds errors. By omitting projection, DataFusion will read all
         // columns and apply projections at a higher level.
-        let mut builder = FileScanConfigBuilder::new(self.object_store_url(), file_source)
-            .with_file_groups(file_groups)
-            .with_limit(limit)
-            .with_metadata_cols(self.inner.options().metadata_cols.clone())
-            .with_object_versioning_type(self.inner.options().object_versioning_type.clone());
+        let mut builder =
+            FileScanConfigBuilder::new(self.object_store_url(), file_source)
+                .with_file_groups(file_groups)
+                .with_limit(limit)
+                .with_metadata_cols(self.inner.options().metadata_cols.clone())
+                .with_object_versioning_type(self.inner.options().object_versioning_type.clone());
 
         if let Some(constraints) = self.inner.constraints() {
             builder = builder.with_constraints(constraints.clone());

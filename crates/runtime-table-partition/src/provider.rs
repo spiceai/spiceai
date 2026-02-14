@@ -31,10 +31,9 @@ use datafusion::{
     physical_expr::OrderingRequirements,
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
-        SortOrderPushdownResult, collect,
+        collect,
         empty::EmptyExec,
         execution_plan::{CardinalityEffect, InvariantLevel},
-        expressions::PhysicalSortExpr,
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
         },
@@ -433,12 +432,7 @@ impl DeletionSink for PartitionedDeletionSink {
                 let state = session_ctx.state();
 
                 // Execute deletion on this partition
-                let plan = DeletionTableProvider::delete_from(
-                    deletion_provider.as_ref(),
-                    &state,
-                    &self.filters,
-                )
-                .await?;
+                let plan = DeletionTableProvider::delete_from(deletion_provider.as_ref(), &state, &self.filters).await?;
 
                 // Execute the deletion plan
                 let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
@@ -621,13 +615,6 @@ impl ExecutionPlan for PartitionedUnionExec {
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
-    }
-
-    fn try_pushdown_sort(
-        &self,
-        _order: &[PhysicalSortExpr],
-    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
-        Ok(SortOrderPushdownResult::Unsupported)
     }
 }
 

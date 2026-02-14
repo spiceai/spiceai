@@ -27,16 +27,15 @@ use crate::{ArrayToNdjson, nest_struct_schema};
 use crate::{extract_flattened_from_nested, project_nested_schema};
 
 use datafusion::error::{DataFusionError, Result};
-use datafusion::physical_plan::projection::ProjectionExprs;
 
 use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
-use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
 use datafusion_datasource::{PartitionedFile, RangeCalculation, TableSchema, calculate_range};
 
 use arrow::datatypes::SchemaRef;
 use arrow::json::ReaderBuilder;
+use datafusion::common::Statistics;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
@@ -78,29 +77,21 @@ impl SpiceJsonOpener {
 }
 
 /// `SpiceJsonSource` holds the extra configuration that is necessary for [`SpiceJsonOpener`]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SpiceJsonSource {
     batch_size: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
+    projected_statistics: Option<Statistics>,
     array_to_ndjson: bool,
     unnest_struct: Option<String>,
-    table_schema: TableSchema,
-    projection: SplitProjection,
+    table_schema: Option<TableSchema>,
 }
 
 impl SpiceJsonSource {
-    /// Initialize a [`SpiceJsonSource`] with the given table schema
+    /// Initialize a [`SpiceJsonSource`] with default settings
     #[must_use]
-    pub fn new(table_schema: TableSchema) -> Self {
-        let projection = SplitProjection::unprojected(&table_schema);
-        Self {
-            batch_size: None,
-            metrics: ExecutionPlanMetricsSet::new(),
-            array_to_ndjson: false,
-            unnest_struct: None,
-            table_schema,
-            projection,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     #[must_use]
@@ -117,7 +108,7 @@ impl SpiceJsonSource {
 
     #[must_use]
     pub fn with_table_schema(mut self, table_schema: TableSchema) -> Self {
-        self.table_schema = table_schema;
+        self.table_schema = Some(table_schema);
         self
     }
 }
@@ -129,26 +120,15 @@ impl FileSource for SpiceJsonSource {
         base_config: &FileScanConfig,
         _partition: usize,
     ) -> Result<Arc<dyn FileOpener>> {
-        let file_schema = self.table_schema.file_schema();
-        let projected_schema = Arc::new(file_schema.project(&self.projection.file_indices)?);
-
-        let mut opener = Arc::new(SpiceJsonOpener {
+        Ok(Arc::new(SpiceJsonOpener {
             batch_size: self.batch_size.or(base_config.batch_size).unwrap_or(8192),
             base_flattened_schema: Arc::clone(base_config.file_schema()),
-            projected_schema,
+            projected_schema: base_config.projected_schema()?,
             file_compression_type: base_config.file_compression_type,
             object_store,
             array_to_ndjson: self.array_to_ndjson,
             unnest_struct: self.unnest_struct.clone(),
-        }) as Arc<dyn FileOpener>;
-
-        opener = ProjectionOpener::try_new(
-            self.projection.clone(),
-            Arc::clone(&opener),
-            self.table_schema.file_schema(),
-        )?;
-
-        Ok(opener)
+        }))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -161,24 +141,10 @@ impl FileSource for SpiceJsonSource {
         Arc::new(conf)
     }
 
-    fn try_pushdown_projection(
-        &self,
-        projection: &ProjectionExprs,
-    ) -> Result<Option<Arc<dyn FileSource>>> {
-        let mut source = self.clone();
-        let new_projection = self.projection.source.try_merge(projection)?;
-        let split_projection =
-            SplitProjection::new(self.table_schema.file_schema(), &new_projection);
-        source.projection = split_projection;
-        Ok(Some(Arc::new(source)))
-    }
-
-    fn projection(&self) -> Option<&ProjectionExprs> {
-        Some(&self.projection.source)
-    }
-
     fn table_schema(&self) -> &TableSchema {
-        &self.table_schema
+        self.table_schema
+            .as_ref()
+            .expect("table_schema must be set before use")
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
