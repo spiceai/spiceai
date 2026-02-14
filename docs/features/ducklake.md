@@ -109,11 +109,11 @@ DROP SCHEMA my_catalog.new_schema CASCADE;
 
 ### Catalog Connector Parameters
 
-| Parameter           | Type   | Required | Default     | Description                                                                       |
-| ------------------- | ------ | -------- | ----------- | --------------------------------------------------------------------------------- |
-| `connection_string` | string | No*      | -           | DuckLake metadata file location                                                   |
-| `name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB                                  |
-| `open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage                                      |
+| Parameter           | Type   | Required | Default     | Description                                      |
+| ------------------- | ------ | -------- | ----------- | ------------------------------------------------ |
+| `connection_string` | string | No*      | -           | DuckLake metadata file location                  |
+| `name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB |
+| `open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage     |
 
 \*`connection_string` can be provided either in `params.connection_string` or in the `from` catalog id (`from: ducklake:<connection_string>`), for example `s3://bucket/path/metadata.ducklake`.
 
@@ -165,11 +165,11 @@ datasets:
 
 ### Data Connector Parameters
 
-| Parameter                    | Type   | Required | Default     | Description                                      |
-| ---------------------------- | ------ | -------- | ----------- | ------------------------------------------------ |
-| `connection_string`          | string | Yes      | -           | The DuckLake metadata file location              |
-| `name`                       | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB |
-| `open`                       | string | No       | (in-memory) | Path to a DuckDB file for persistent storage     |
+| Parameter           | Type   | Required | Default     | Description                                      |
+| ------------------- | ------ | -------- | ----------- | ------------------------------------------------ |
+| `connection_string` | string | Yes      | -           | The DuckLake metadata file location              |
+| `name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB |
+| `open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage     |
 
 ## Connection String Formats
 
