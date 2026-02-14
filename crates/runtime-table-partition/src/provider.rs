@@ -432,7 +432,7 @@ impl DeletionSink for PartitionedDeletionSink {
                 let state = session_ctx.state();
 
                 // Execute deletion on this partition
-                let plan = deletion_provider.delete_from(&state, &self.filters).await?;
+                let plan = DeletionTableProvider::delete_from(deletion_provider.as_ref(), &state, &self.filters).await?;
 
                 // Execute the deletion plan
                 let results = collect(plan, Arc::clone(&self.task_ctx)).await?;

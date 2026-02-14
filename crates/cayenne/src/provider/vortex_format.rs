@@ -40,6 +40,7 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::PartitionedFile;
+use datafusion_datasource::TableSchema;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use object_store::{ObjectMeta, ObjectStore};
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -308,8 +309,8 @@ impl FileFormat for DeletionFilteringVortexFormat {
             .await
     }
 
-    fn file_source(&self) -> Arc<dyn datafusion_datasource::file::FileSource> {
-        self.inner.file_source()
+    fn file_source(&self, table_schema: TableSchema) -> Arc<dyn datafusion_datasource::file::FileSource> {
+        self.inner.file_source(table_schema)
     }
 }
 

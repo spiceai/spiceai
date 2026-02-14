@@ -42,7 +42,7 @@ use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-use datafusion_datasource::{PartitionedFile, metadata::MetadataColumn};
+use datafusion_datasource::{PartitionedFile, TableSchema, metadata::MetadataColumn};
 use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore, path::Path};
 use snafu::prelude::*;
@@ -266,7 +266,11 @@ impl TableProvider for LocationPruningListingTable {
             .map(|(name, dtype)| Field::new(name, dtype.clone(), true))
             .collect();
 
-        let file_source = self.inner.options().format.file_source();
+        let table_schema = TableSchema::new(
+            self.file_schema(),
+            partition_fields.iter().map(|f| Arc::new(f.clone())).collect(),
+        );
+        let file_source = self.inner.options().format.file_source(table_schema);
 
         // Note: We intentionally do NOT pass projection indices to the FileScanConfigBuilder.
         // The projection indices from the table scan are relative to the full table schema
@@ -275,9 +279,8 @@ impl TableProvider for LocationPruningListingTable {
         // cause index-out-of-bounds errors. By omitting projection, DataFusion will read all
         // columns and apply projections at a higher level.
         let mut builder =
-            FileScanConfigBuilder::new(self.object_store_url(), self.file_schema(), file_source)
+            FileScanConfigBuilder::new(self.object_store_url(), file_source)
                 .with_file_groups(file_groups)
-                .with_table_partition_cols(partition_fields)
                 .with_limit(limit)
                 .with_metadata_cols(self.inner.options().metadata_cols.clone())
                 .with_object_versioning_type(self.inner.options().object_versioning_type.clone());

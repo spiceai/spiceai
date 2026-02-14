@@ -27,7 +27,7 @@ use crate::{
 };
 use arrow::array::UInt64Array;
 use cache::Caching;
-use data_components::delete::get_deletion_provider;
+use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 use datafusion::{
     catalog::TableProvider,
     logical_expr::Operator,
@@ -137,8 +137,7 @@ impl super::AcceleratedTable {
                     default_runtime_env(io_runtime.clone()),
                 );
 
-                let plan = deleted_table_provider
-                    .delete_from(&ctx.state(), &[expr])
+                let plan = DeletionTableProvider::delete_from(deleted_table_provider.as_ref(), &ctx.state(), &[expr])
                     .await;
                 match plan {
                     Ok(plan) => match collect(plan, ctx.task_ctx()).await {

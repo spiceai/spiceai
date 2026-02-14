@@ -84,6 +84,7 @@ pub struct SpiceJsonSource {
     projected_statistics: Option<Statistics>,
     array_to_ndjson: bool,
     unnest_struct: Option<String>,
+    table_schema: Option<TableSchema>,
 }
 
 impl SpiceJsonSource {
@@ -104,6 +105,12 @@ impl SpiceJsonSource {
         self.unnest_struct = unnest_struct;
         self
     }
+
+    #[must_use]
+    pub fn with_table_schema(mut self, table_schema: TableSchema) -> Self {
+        self.table_schema = Some(table_schema);
+        self
+    }
 }
 
 impl FileSource for SpiceJsonSource {
@@ -112,24 +119,20 @@ impl FileSource for SpiceJsonSource {
         object_store: Arc<dyn ObjectStore>,
         base_config: &FileScanConfig,
         _partition: usize,
-    ) -> Arc<dyn FileOpener> {
-        Arc::new(SpiceJsonOpener {
+    ) -> Result<Arc<dyn FileOpener>> {
+        Ok(Arc::new(SpiceJsonOpener {
             batch_size: self.batch_size.or(base_config.batch_size).unwrap_or(8192),
             base_flattened_schema: Arc::clone(base_config.file_schema()),
-            projected_schema: base_config.projected_file_schema(),
+            projected_schema: base_config.projected_schema()?,
             file_compression_type: base_config.file_compression_type,
             object_store,
             array_to_ndjson: self.array_to_ndjson,
             unnest_struct: self.unnest_struct.clone(),
-        })
+        }))
     }
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-
-    fn with_schema(&self, _schema: TableSchema) -> Arc<dyn FileSource> {
-        Arc::new(self.clone())
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
@@ -138,25 +141,14 @@ impl FileSource for SpiceJsonSource {
         Arc::new(conf)
     }
 
-    fn with_statistics(&self, statistics: Statistics) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.projected_statistics = Some(statistics);
-        Arc::new(conf)
-    }
-
-    fn with_projection(&self, _config: &FileScanConfig) -> Arc<dyn FileSource> {
-        Arc::new(Self { ..self.clone() })
+    fn table_schema(&self) -> &TableSchema {
+        self.table_schema
+            .as_ref()
+            .expect("table_schema must be set before use")
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
         &self.metrics
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        let statistics = &self.projected_statistics;
-        statistics.clone().ok_or_else(|| {
-            DataFusionError::Internal("projected_statistics must be set to call".to_string())
-        })
     }
 
     fn file_type(&self) -> &'static str {

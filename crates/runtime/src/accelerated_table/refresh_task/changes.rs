@@ -294,8 +294,7 @@ impl RefreshTask {
             let session_state = ctx.state();
 
             let _lock_guard = self.accelerator_write_mutex.lock().await;
-            let delete_plan = deletion_provider
-                .delete_from(&session_state, &[combined])
+            let delete_plan = DeletionTableProvider::delete_from(deletion_provider.as_ref(), &session_state, &[combined])
                 .await
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;

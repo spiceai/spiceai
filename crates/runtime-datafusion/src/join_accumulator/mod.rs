@@ -18,7 +18,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use arrow::{
     array::{Array, RecordBatch},
-    datatypes::SchemaRef,
+    datatypes::{Field, Schema, SchemaRef},
 };
 use datafusion::error::Result as DataFusionResult;
 use datafusion::{
@@ -136,12 +136,23 @@ impl ColumnBounds for ExactColumnBounds {
             .map(|sv| Arc::new(Literal::new(sv)) as Arc<dyn PhysicalExpr>)
             .collect::<Vec<_>>();
 
-        let in_expr = Arc::new(InListExpr::new(
+        // Build a dummy schema so InListExpr::try_new can validate data types.
+        // Literals carry their own type, so the schema just needs a placeholder field.
+        let data_type = expr_values
+            .first()
+            .and_then(|e| {
+                let s = Schema::new(vec![Field::new("_", arrow::datatypes::DataType::Null, true)]);
+                e.data_type(&s).ok()
+            })
+            .unwrap_or(arrow::datatypes::DataType::Null);
+        let dummy_schema = Schema::new(vec![Field::new("_col", data_type, true)]);
+
+        let in_expr = Arc::new(InListExpr::try_new(
             left_expr,
             expr_values,
             false, // not negated (IN, not NOT IN)
-            None,  // no static filter optimization
-        ));
+            &dummy_schema,
+        )?);
 
         tracing::debug!(
             "ExactLeftAccumulator created InListExpr with {} values ({} bytes).",
