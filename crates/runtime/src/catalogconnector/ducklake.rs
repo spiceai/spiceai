@@ -112,9 +112,8 @@ impl CatalogConnector for DuckLakeCatalog {
                                 connector_component,
                                 message: e.to_string(),
                             });
-                        } else {
-                            catalog_id.clone()
                         }
+                        catalog_id.clone()
                     } else {
                         let e = Error::MissingParameter {
                             parameter: parameter.to_string(),
