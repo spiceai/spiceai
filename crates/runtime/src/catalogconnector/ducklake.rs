@@ -20,7 +20,10 @@ limitations under the License.
 //! and provides schema/table discovery.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
+use crate::{
+    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+    parameters::ExposedParamLookup,
+};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::ducklake::provider::DuckLakeCatalogProvider;
@@ -61,12 +64,11 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("ducklake_connection_string")
-        .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake').")
-        .required(),
-    ParameterSpec::component("ducklake_name")
+    ParameterSpec::component("connection_string")
+        .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake'). If omitted, the catalog id from `from: ducklake:<connection_string>` is used."),
+    ParameterSpec::component("name")
         .description("The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'."),
-    ParameterSpec::component("ducklake_open")
+    ParameterSpec::component("open")
         .description("Optional path to an existing `DuckDB` file. If not provided, an in-memory `DuckDB` is used."),
 ];
 
@@ -94,30 +96,53 @@ impl CatalogConnector for DuckLakeCatalog {
         _runtime: Arc<Runtime>,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
-        let connection_string: String = self
-            .params
-            .parameters
-            .get("ducklake_connection_string")
-            .expose()
-            .ok_or_else(|p| Error::MissingParameter {
-                parameter: p.to_string(),
-            })
-            .map_err(|e| super::Error::InvalidConfigurationNoSource {
-                connector: PREFIX.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
-                message: e.to_string(),
-            })?
-            .to_string();
+        let connector_component = ConnectorComponent::from(catalog);
+
+        let connection_string: String =
+            match self.params.parameters.get("connection_string").expose() {
+                ExposedParamLookup::Present(value) => value.to_string(),
+                ExposedParamLookup::Absent(parameter) => {
+                    if let Some(catalog_id) = catalog.catalog_id.as_ref() {
+                        if !catalog_id.is_empty() {
+                            catalog_id.clone()
+                        } else {
+                            let e = Error::MissingParameter {
+                                parameter: parameter.to_string(),
+                            };
+                            return Err(super::Error::InvalidConfigurationNoSource {
+                                connector: PREFIX.to_string(),
+                                connector_component,
+                                message: e.to_string(),
+                            });
+                        }
+                    } else {
+                        let e = Error::MissingParameter {
+                            parameter: parameter.to_string(),
+                        };
+                        return Err(super::Error::InvalidConfigurationNoSource {
+                            connector: PREFIX.to_string(),
+                            connector_component,
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            };
 
         let catalog_name = self
             .params
             .parameters
-            .get("ducklake_name")
+            .get("name")
             .expose()
             .ok()
             .map_or_else(|| "ducklake".to_string(), ToString::to_string);
 
-        let open_path = self.params.parameters.get("ducklake_open").expose().ok();
+        let open_path = self
+            .params
+            .parameters
+            .get("open")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
 
         // Get the catalog's access mode to determine writable/ddl_enabled flags
         let writable = catalog.access.allows_write();
@@ -130,74 +155,88 @@ impl CatalogConnector for DuckLakeCatalog {
             AccessMode::ReadOnly
         };
 
-        // Create the DuckDB connection pool
-        let pool = if let Some(path) = open_path.as_ref() {
-            Arc::new(
-                DuckDbConnectionPool::new_file(path, &duckdb_access_mode).map_err(|e| {
+        let connection_string_for_pool = connection_string;
+        let catalog_name_for_pool = catalog_name.clone();
+        let connector_component_for_pool = connector_component.clone();
+
+        // Blocking DuckDB setup is isolated from the async runtime thread.
+        let pool =
+            tokio::task::spawn_blocking(move || -> super::Result<Arc<DuckDbConnectionPool>> {
+                let pool = if let Some(path) = open_path.as_deref() {
+                    Arc::new(
+                        DuckDbConnectionPool::new_file(path, &duckdb_access_mode).map_err(|e| {
+                            super::Error::UnableToGetCatalogProvider {
+                                connector: PREFIX.to_string(),
+                                connector_component: connector_component_for_pool.clone(),
+                                source: e,
+                            }
+                        })?,
+                    )
+                } else {
+                    Arc::new(DuckDbConnectionPool::new_memory().map_err(|e| {
+                        super::Error::UnableToGetCatalogProvider {
+                            connector: PREFIX.to_string(),
+                            connector_component: connector_component_for_pool.clone(),
+                            source: e,
+                        }
+                    })?)
+                };
+
+                let conn = Arc::clone(&pool).connect_sync().map_err(|e| {
                     super::Error::UnableToGetCatalogProvider {
                         connector: PREFIX.to_string(),
-                        connector_component: ConnectorComponent::from(catalog),
+                        connector_component: connector_component_for_pool.clone(),
                         source: e,
                     }
-                })?,
-            )
-        } else {
-            Arc::new(DuckDbConnectionPool::new_memory().map_err(|e| {
-                super::Error::UnableToGetCatalogProvider {
-                    connector: PREFIX.to_string(),
-                    connector_component: ConnectorComponent::from(catalog),
-                    source: e,
-                }
-            })?)
-        };
+                })?;
 
-        // Get a connection to install/load the ducklake extension and attach the catalog
-        let conn = Arc::clone(&pool).connect_sync().map_err(|e| {
-            super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
-                source: e,
-            }
-        })?;
+                let duckdb_conn = conn
+                    .as_any()
+                    .downcast_ref::<duckdb::Connection>()
+                    .ok_or_else(|| super::Error::InvalidConfigurationNoSource {
+                        connector: PREFIX.to_string(),
+                        connector_component: connector_component_for_pool.clone(),
+                        message: "Failed to get underlying DuckDB connection".to_string(),
+                    })?;
 
-        let duckdb_conn = conn
-            .as_any()
-            .downcast_ref::<duckdb::Connection>()
-            .ok_or_else(|| super::Error::InvalidConfigurationNoSource {
-                connector: PREFIX.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
-                message: "Failed to get underlying DuckDB connection".to_string(),
-            })?;
+                duckdb_conn
+                    .execute("INSTALL ducklake", [])
+                    .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
+                    .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                        connector: PREFIX.to_string(),
+                        connector_component: connector_component_for_pool.clone(),
+                        source: Box::new(e),
+                    })?;
 
-        // Install and load the ducklake extension
-        duckdb_conn
-            .execute("INSTALL ducklake", [])
-            .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
+                duckdb_conn
+                    .execute("LOAD ducklake", [])
+                    .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
+                    .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                        connector: PREFIX.to_string(),
+                        connector_component: connector_component_for_pool.clone(),
+                        source: Box::new(e),
+                    })?;
+
+                let attach_sql = format!(
+                    "ATTACH 'ducklake:{connection_string_for_pool}' AS \"{catalog_name_for_pool}\""
+                );
+                duckdb_conn
+                    .execute(&attach_sql, [])
+                    .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
+                    .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                        connector: PREFIX.to_string(),
+                        connector_component: connector_component_for_pool,
+                        source: Box::new(e),
+                    })?;
+
+                Ok(pool)
+            })
+            .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
+                connector_component: connector_component.clone(),
                 source: Box::new(e),
-            })?;
-
-        duckdb_conn
-            .execute("LOAD ducklake", [])
-            .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
-                source: Box::new(e),
-            })?;
-
-        // Attach the DuckLake catalog
-        let attach_sql = format!("ATTACH 'ducklake:{connection_string}' AS \"{catalog_name}\"");
-        duckdb_conn
-            .execute(&attach_sql, [])
-            .map_err(|e| Error::UnableToInitializeDuckLake { source: e })
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
-                source: Box::new(e),
-            })?;
+            })??;
 
         // Create the catalog provider with the pool (which has ducklake extension and catalog attached)
         let catalog_provider = Arc::new(DuckLakeCatalogProvider::new(
@@ -213,7 +252,7 @@ impl CatalogConnector for DuckLakeCatalog {
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
-                connector_component: ConnectorComponent::from(catalog),
+                connector_component,
                 source: e,
             })?;
 

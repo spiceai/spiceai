@@ -24,17 +24,20 @@ The catalog connector automatically discovers all schemas and tables in a DuckLa
 
 ```yaml
 catalogs:
-  - from: ducklake:s3://my-bucket/warehouse/metadata.ducklake
+  - from: ducklake
     name: my_catalog
+    params:
+      connection_string: s3://my-bucket/warehouse/metadata.ducklake
 ```
 
 ### With Custom Catalog Name
 
 ```yaml
 catalogs:
-  - from: ducklake:s3://my-bucket/warehouse/metadata.ducklake
+  - from: ducklake
     name: sales_data
     params:
+      connection_string: s3://my-bucket/warehouse/metadata.ducklake
       name: sales  # Name used when attaching the catalog in DuckDB
 ```
 
@@ -44,9 +47,10 @@ By default, an in-memory DuckDB instance is used. For larger catalogs or persist
 
 ```yaml
 catalogs:
-  - from: ducklake:s3://my-bucket/warehouse/metadata.ducklake
+  - from: ducklake
     name: my_catalog
     params:
+      connection_string: s3://my-bucket/warehouse/metadata.ducklake
       open: /path/to/local.duckdb
 ```
 
@@ -61,20 +65,26 @@ The DuckLake catalog connector supports three access modes:
 ```yaml
 # Read-only access (default)
 catalogs:
-  - from: ducklake:s3://my-bucket/warehouse/metadata.ducklake
+  - from: ducklake
     name: my_catalog
+    params:
+      connection_string: s3://my-bucket/warehouse/metadata.ducklake
 
 # Read-write access (DML operations)
 catalogs:
-  - from: ducklake:s3://my-bucket/warehouse/metadata.ducklake
+  - from: ducklake
     name: my_catalog
     access: read_write
+    params:
+      connection_string: s3://my-bucket/warehouse/metadata.ducklake
 
 # Full access including DDL
 catalogs:
-  - from: ducklake:s3://my-bucket/warehouse/metadata.ducklake
+  - from: ducklake
     name: my_catalog
     access: read_write_create
+    params:
+      connection_string: s3://my-bucket/warehouse/metadata.ducklake
 ```
 
 With `read_write_create` access, you can execute DDL statements:
@@ -99,11 +109,13 @@ DROP SCHEMA my_catalog.new_schema CASCADE;
 
 ### Catalog Connector Parameters
 
-| Parameter                    | Type   | Required | Default     | Description                                                                      |
-| ---------------------------- | ------ | -------- | ----------- | -------------------------------------------------------------------------------- |
-| `ducklake_connection_string` | string | Yes      | -           | The DuckLake metadata file location (e.g., `s3://bucket/path/metadata.ducklake`) |
-| `ducklake_name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB                                 |
-| `ducklake_open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage                                     |
+| Parameter           | Type   | Required | Default     | Description                                                                       |
+| ------------------- | ------ | -------- | ----------- | --------------------------------------------------------------------------------- |
+| `connection_string` | string | No*      | -           | DuckLake metadata file location                                                   |
+| `name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB                                  |
+| `open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage                                      |
+
+\*`connection_string` can be provided either in `params.connection_string` or in the `from` catalog id (`from: ducklake:<connection_string>`), for example `s3://bucket/path/metadata.ducklake`.
 
 ## Data Connector
 
@@ -115,14 +127,14 @@ The data connector allows connecting to specific tables in a DuckLake catalog. U
 
 ### Dataset Configuration
 
-The `from` URI specifies the table path (format: `ducklake:[schema.]table`), while the `ducklake_connection_string` parameter specifies the DuckLake metadata file location.
+The `from` URI specifies the table path (format: `ducklake:[schema.]table`), while the `connection_string` parameter specifies the DuckLake metadata file location.
 
 ```yaml
 datasets:
   - from: ducklake:orders
     name: orders
     params:
-      ducklake_connection_string: s3://my-bucket/warehouse/metadata.ducklake
+      connection_string: s3://my-bucket/warehouse/metadata.ducklake
 ```
 
 By default, tables are looked up in the `main` schema.
@@ -134,7 +146,7 @@ datasets:
   - from: ducklake:sales.orders
     name: sales_orders
     params:
-      ducklake_connection_string: s3://my-bucket/warehouse/metadata.ducklake
+      connection_string: s3://my-bucket/warehouse/metadata.ducklake
 ```
 
 ### With Acceleration
@@ -144,7 +156,7 @@ datasets:
   - from: ducklake:sales.orders
     name: orders
     params:
-      ducklake_connection_string: s3://my-bucket/warehouse/metadata.ducklake
+      connection_string: s3://my-bucket/warehouse/metadata.ducklake
       enabled: true
       engine: duckdb
       mode: file
@@ -155,44 +167,52 @@ datasets:
 
 | Parameter                    | Type   | Required | Default     | Description                                      |
 | ---------------------------- | ------ | -------- | ----------- | ------------------------------------------------ |
-| `ducklake_connection_string` | string | Yes      | -           | The DuckLake metadata file location              |
-| `ducklake_name`              | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB |
-| `ducklake_open`              | string | No       | (in-memory) | Path to a DuckDB file for persistent storage     |
+| `connection_string`          | string | Yes      | -           | The DuckLake metadata file location              |
+| `name`                       | string | No       | `ducklake`  | Name to attach the DuckLake catalog as in DuckDB |
+| `open`                       | string | No       | (in-memory) | Path to a DuckDB file for persistent storage     |
 
 ## Connection String Formats
 
-The connection string (specified after `ducklake:` in the `from` field) supports various storage backends:
+The connection string supports various storage backends. For catalogs, provide it in `params.connection_string` (or in `from` as `ducklake:<connection_string>`). For datasets, provide it in `params.connection_string`.
 
 ### Amazon S3
 
 ```yaml
 catalogs:
-  - from: ducklake:s3://my-bucket/path/to/metadata.ducklake
+  - from: ducklake
     name: s3_catalog
+    params:
+      connection_string: s3://my-bucket/path/to/metadata.ducklake
 ```
 
 ### Google Cloud Storage
 
 ```yaml
 catalogs:
-  - from: ducklake:gs://my-bucket/path/to/metadata.ducklake
+  - from: ducklake
     name: gcs_catalog
+    params:
+      connection_string: gs://my-bucket/path/to/metadata.ducklake
 ```
 
 ### Azure Blob Storage
 
 ```yaml
 catalogs:
-  - from: ducklake:az://container/path/to/metadata.ducklake
+  - from: ducklake
     name: azure_catalog
+    params:
+      connection_string: az://container/path/to/metadata.ducklake
 ```
 
 ### Local Filesystem
 
 ```yaml
 catalogs:
-  - from: ducklake:/path/to/local/metadata.ducklake
+  - from: ducklake
     name: local_catalog
+    params:
+      connection_string: /path/to/local/metadata.ducklake
 ```
 
 ## Example Queries

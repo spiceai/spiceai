@@ -43,7 +43,7 @@ use super::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: ducklake_connection_string. Specify the DuckLake metadata location."
+        "Missing required parameter: connection_string. Specify the DuckLake metadata location."
     ))]
     MissingConnectionString,
 
@@ -54,6 +54,9 @@ pub enum Error {
 
     #[snafu(display("Failed to initialize DuckLake extension: {source}"))]
     UnableToInitializeDuckLake { source: duckdb::Error },
+
+    #[snafu(display("Failed to get underlying DuckDB connection"))]
+    FailedToGetDuckDbConnection,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -87,13 +90,13 @@ impl DuckLakeFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("ducklake_connection_string")
+    ParameterSpec::component("connection_string")
         .description("The DuckLake connection string (e.g., 's3://bucket/path/metadata.ducklake').")
         .required(),
-    ParameterSpec::component("ducklake_name").description(
+    ParameterSpec::component("name").description(
         "The name to attach the DuckLake catalog as in DuckDB. Defaults to 'ducklake'.",
     ),
-    ParameterSpec::component("ducklake_open").description(
+    ParameterSpec::component("open").description(
         "Optional path to an existing DuckDB file. If not provided, an in-memory DuckDB is used.",
     ),
 ];
@@ -151,7 +154,7 @@ fn create_ducklake_factory(
             dataconnector: "ducklake".to_string(),
             connector_component: params.component.clone(),
             message: "Failed to get underlying DuckDB connection".to_string(),
-            source: Box::new(Error::MissingConnectionString),
+            source: Box::new(Error::FailedToGetDuckDbConnection),
         })?;
 
     // Install and load the ducklake extension
@@ -201,7 +204,7 @@ impl DataConnectorFactory for DuckLakeFactory {
             let connection_string: String = params
                 .parameters
                 .clone()
-                .get("ducklake_connection_string")
+                .get("connection_string")
                 .expose()
                 .ok_or_else(|_| DataConnectorError::UnableToConnectInternal {
                     dataconnector: "ducklake".to_string(),
@@ -212,15 +215,33 @@ impl DataConnectorFactory for DuckLakeFactory {
 
             let catalog_name = params
                 .parameters
-                .get("ducklake_name")
+                .get("name")
                 .expose()
                 .ok()
                 .map_or_else(|| "ducklake".to_string(), ToString::to_string);
 
-            let open_path = params.parameters.get("ducklake_open").expose().ok();
+            let open_path = params
+                .parameters
+                .get("open")
+                .expose()
+                .ok()
+                .map(ToString::to_string);
 
-            let (duckdb_factory, catalog_name) =
-                create_ducklake_factory(&connection_string, &catalog_name, open_path, &params)?;
+            let params_for_factory = params.clone();
+            let (duckdb_factory, catalog_name) = tokio::task::spawn_blocking(move || {
+                create_ducklake_factory(
+                    &connection_string,
+                    &catalog_name,
+                    open_path.as_deref(),
+                    &params_for_factory,
+                )
+            })
+            .await
+            .map_err(|source| DataConnectorError::UnableToConnectInternal {
+                dataconnector: "ducklake".to_string(),
+                connector_component: params.component.clone(),
+                source: Box::new(source),
+            })??;
 
             Ok(Arc::new(DuckLake {
                 duckdb_factory,
