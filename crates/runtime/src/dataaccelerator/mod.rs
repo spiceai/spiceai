@@ -890,7 +890,7 @@ mod accelerator_compat_tests {
         },
         datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
-    use data_components::delete::get_deletion_provider;
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         datasource::TableProvider,
@@ -2137,8 +2137,7 @@ mod accelerator_compat_tests {
 
             // Delete rows where id > 3 (should delete ids 4-49, which is 46 rows)
             let filter = col("id").gt(lit(3_i64));
-            let plan = table
-                .delete_from(&ctx.state(), &[filter])
+            let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
                 .await
                 .expect("deletion should be successful");
 

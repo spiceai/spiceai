@@ -762,7 +762,7 @@ async fn execute_delete(
     filter: Expr,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table, &ctx.state(), &[filter]).await?;
     let results = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
