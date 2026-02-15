@@ -6,7 +6,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, Statistics, exec_err, plan_err};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
+use datafusion::physical_expr::{Distribution, OrderingRequirements, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::execution_plan::{CardinalityEffect, InvariantLevel};
 use datafusion::physical_plan::filter_pushdown::{
@@ -14,7 +14,7 @@ use datafusion::physical_plan::filter_pushdown::{
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SortOrderPushdownResult};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::DuckDBDialect;
 use datafusion_expr::LogicalPlan;
@@ -162,6 +162,13 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
 
     fn cardinality_effect(&self) -> CardinalityEffect {
         self.input.cardinality_effect()
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 
     fn try_swapping_with_projection(
