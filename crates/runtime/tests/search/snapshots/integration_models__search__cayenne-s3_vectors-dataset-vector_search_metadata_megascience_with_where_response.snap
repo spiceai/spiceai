@@ -1,12 +1,10 @@
----
-source: crates/runtime/tests/search/mod.rs
+---source: crates/runtime/tests/search/mod.rs
 expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.28,
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -15,10 +13,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1015
-      }
+      },
+      "score": 0.28
     },
     {
-      "_score": 0.24,
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -27,22 +25,22 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 821
-      }
+      },
+      "score": 0.24
     },
     {
-      "_score": 0.23,
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%\u201310% of patients."
         ]
       },
       "primary_key": {
         "id": 449
-      }
+      },
+      "score": 0.23
     },
     {
-      "_score": 0.2,
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -51,7 +49,8 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1193
-      }
+      },
+      "score": 0.2
     }
   ]
 }
