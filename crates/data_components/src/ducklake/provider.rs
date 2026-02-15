@@ -186,10 +186,13 @@ impl DuckLakeCatalogProvider {
                 .query_map([&catalog_name], |row| row.get::<_, String>(0))
                 .context(QueryFailedSnafu)?;
 
-            let names: Vec<String> = rows
-                .flatten()
-                .filter(|name| name != "information_schema" && name != "pg_catalog")
-                .collect();
+            let mut names = Vec::new();
+            for row_result in rows {
+                let name: String = row_result.context(QueryFailedSnafu)?;
+                if name != "information_schema" && name != "pg_catalog" {
+                    names.push(name);
+                }
+            }
             Ok(names)
         })
         .await
@@ -276,7 +279,11 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                 )
             })?;
 
-        let sql = format!(r#"CREATE SCHEMA IF NOT EXISTS "{catalog_name}"."{schema_name}""#);
+        let escaped_catalog_name = catalog_name.replace('"', "\"\"");
+        let escaped_schema_name = schema_name.replace('"', "\"\"");
+        let sql = format!(
+            r#"CREATE SCHEMA IF NOT EXISTS "{escaped_catalog_name}"."{escaped_schema_name}""#
+        );
         duckdb_conn
             .execute(&sql, [])
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -289,7 +296,7 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                 Arc::clone(&ducklake_schema.pool),
                 Arc::clone(&ducklake_schema.duckdb_factory),
                 ducklake_schema.catalog_name.clone(),
-                ducklake_schema.schema_name.clone(),
+                schema_name,
                 ducklake_schema.writable,
                 ducklake_schema.ddl_enabled,
             ))
@@ -368,7 +375,10 @@ impl CatalogProvider for DuckLakeCatalogProvider {
                 )
             })?;
 
-        let mut sql = format!(r#"DROP SCHEMA IF EXISTS "{catalog_name}"."{schema_name}""#);
+        let escaped_catalog_name = catalog_name.replace('"', "\"\"");
+        let escaped_schema_name = schema_name.replace('"', "\"\"");
+        let mut sql =
+            format!(r#"DROP SCHEMA IF EXISTS "{escaped_catalog_name}"."{escaped_schema_name}""#);
         if cascade {
             sql.push_str(" CASCADE");
         }
@@ -486,7 +496,11 @@ impl DuckLakeSchemaProvider {
                 .query_map([&catalog_name, &schema_name], |row| row.get::<_, String>(0))
                 .context(QueryFailedSnafu)?;
 
-            let names: Vec<String> = rows.flatten().collect();
+            let mut names = Vec::new();
+            for row_result in rows {
+                let name = row_result.context(QueryFailedSnafu)?;
+                names.push(name);
+            }
             Ok(names)
         })
         .await
@@ -625,8 +639,12 @@ impl SchemaProvider for DuckLakeSchemaProvider {
                 )
             })?;
 
-        let sql =
-            format!(r#"DROP TABLE IF EXISTS "{catalog_name}"."{schema_name}"."{table_name}""#);
+        let escaped_catalog_name = catalog_name.replace('"', "\"\"");
+        let escaped_schema_name = schema_name.replace('"', "\"\"");
+        let escaped_table_name = table_name.replace('"', "\"\"");
+        let sql = format!(
+            r#"DROP TABLE IF EXISTS "{escaped_catalog_name}"."{escaped_schema_name}"."{escaped_table_name}""#
+        );
         duckdb_conn
             .execute(&sql, [])
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;

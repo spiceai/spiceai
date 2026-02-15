@@ -2112,40 +2112,14 @@ async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<(
             // Build the runtime - the validation happens during dataset loading
             let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
 
-            // Wait for the runtime to attempt dataset loading by polling for the expected
-            // validation failure condition instead of using a fixed sleep.
-            let start = std::time::Instant::now();
-            let timeout = Duration::from_secs(30);
-            let poll_interval = Duration::from_millis(200);
+            // Trigger dataset loading (which runs snapshot consistency validation).
+            // load_components() awaits all spawned loading tasks, so after it returns
+            // we know validation has completed and failed datasets were not registered.
+            Arc::clone(&runtime).load_components().await;
 
-            loop {
-                let r1 = runtime
-                    .datafusion()
-                    .query_builder("SELECT COUNT(*) FROM taxi_trips_1")
-                    .build()
-                    .run()
-                    .await;
-                let r2 = runtime
-                    .datafusion()
-                    .query_builder("SELECT COUNT(*) FROM taxi_trips_2")
-                    .build()
-                    .run()
-                    .await;
-
-                if r1.is_err() && r2.is_err() {
-                    break;
-                }
-
-                if start.elapsed() >= timeout {
-                    break;
-                }
-
-                tokio::time::sleep(poll_interval).await;
-            }
-
-            // The datasets should NOT be registered because validation failed
+            // The datasets should NOT be registered because validation failed.
             // Check that neither dataset is available (the validation rejects all datasets
-            // with inconsistent configuration)
+            // with inconsistent configuration).
             let taxi_trips_1_result = runtime
                 .datafusion()
                 .query_builder("SELECT COUNT(*) FROM taxi_trips_1")
