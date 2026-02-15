@@ -1829,8 +1829,7 @@ async fn test_deletion_table_provider_with_filters() -> Result<(), Box<dyn std::
     let state = ctx.state();
     // Filter: value > 100 (this filter is passed to delete_from but currently mock doesn't use it)
     let filters = vec![col("value").gt(lit(100i64))];
-    let delete_plan =
-        DeletionTableProvider::delete_from(partition_provider, &state, &filters).await?;
+    let delete_plan = DeletionTableProvider::delete_from(partition_provider, &state, &filters).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
@@ -2168,8 +2167,7 @@ async fn test_deletion_complex_filters() -> Result<(), Box<dyn std::error::Error
             .and(col("status").eq(lit("active")))
             .or(col("id").eq(lit(1i64))),
     ];
-    let delete_plan =
-        DeletionTableProvider::delete_from(partition_provider, &state, &filters).await?;
+    let delete_plan = DeletionTableProvider::delete_from(partition_provider, &state, &filters).await?;
 
     // Execute the deletion plan
     let result = collect(delete_plan, ctx.task_ctx()).await?;
@@ -2304,8 +2302,7 @@ async fn test_deletion_repeated_calls() -> Result<(), Box<dyn std::error::Error>
 
     // Call delete_from multiple times
     for i in 0..3 {
-        let delete_plan =
-            DeletionTableProvider::delete_from(partition_provider, &state, &[]).await?;
+        let delete_plan = DeletionTableProvider::delete_from(partition_provider, &state, &[]).await?;
         let result = collect(delete_plan, ctx.task_ctx()).await?;
 
         assert_eq!(result.len(), 1, "Iteration {i}: Expected 1 result batch");
