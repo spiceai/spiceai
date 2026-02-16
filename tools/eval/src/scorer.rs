@@ -117,7 +117,9 @@ impl Scorer for LevenshteinScorer {
             return Ok(1.0);
         }
 
-        Ok(1.0 - (distance as f32 / max_len as f32))
+        #[expect(clippy::cast_precision_loss)]
+        let normalized = 1.0 - (distance as f32 / max_len as f32);
+        Ok(normalized)
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
@@ -134,7 +136,7 @@ pub fn builtin_scorers() -> HashMap<String, Box<dyn Scorer>> {
     scorers
 }
 
-/// Extract text from DatasetOutput
+/// Extract text from `DatasetOutput`
 fn extract_text(output: &DatasetOutput) -> String {
     match output {
         DatasetOutput::AssistantResponse(text) => text.clone(),
@@ -146,6 +148,7 @@ fn extract_text(output: &DatasetOutput) -> String {
 }
 
 /// Calculate mean of scores
+#[expect(clippy::cast_precision_loss)]
 fn mean(values: &[f32]) -> f32 {
     if values.is_empty() {
         return 0.0;
@@ -167,11 +170,11 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
 
     let mut matrix = vec![vec![0; len2 + 1]; len1 + 1];
 
-    for i in 0..=len1 {
-        matrix[i][0] = i;
+    for (i, row) in matrix.iter_mut().enumerate().take(len1 + 1) {
+        row[0] = i;
     }
-    for j in 0..=len2 {
-        matrix[0][j] = j;
+    for (j, cell) in matrix[0].iter_mut().enumerate().take(len2 + 1) {
+        *cell = j;
     }
 
     let s1_chars: Vec<char> = s1.chars().collect();
@@ -179,7 +182,7 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
 
     for (i, c1) in s1_chars.iter().enumerate() {
         for (j, c2) in s2_chars.iter().enumerate() {
-            let cost = if c1 == c2 { 0 } else { 1 };
+            let cost = usize::from(c1 != c2);
             matrix[i + 1][j + 1] = (matrix[i][j + 1] + 1)
                 .min(matrix[i + 1][j] + 1)
                 .min(matrix[i][j] + cost);

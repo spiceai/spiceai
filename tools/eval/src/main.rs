@@ -86,12 +86,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run { eval_name, model } => {
             let eval = client.get_eval(&eval_name).await?;
 
-            tracing::info!("Starting evaluation '{}' for model '{}'", eval_name, model);
+            tracing::info!("Starting evaluation '{eval_name}' for model '{model}'");
 
             let run_id = eval_runner::run_eval(&client, &eval, &model).await?;
 
-            tracing::info!("Evaluation completed: {}", run_id);
-            println!("Evaluation run ID: {}", run_id);
+            tracing::info!("Evaluation completed: {run_id}");
+            println!("Evaluation run ID: {run_id}");
         }
     }
 

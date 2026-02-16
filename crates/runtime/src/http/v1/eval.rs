@@ -17,31 +17,21 @@ use std::sync::Arc;
 
 use axum::{
     Extension,
-    extract::Path,
     response::{IntoResponse, Json, Response},
 };
-use axum_extra::TypedHeader;
-use datafusion::sql::TableReference;
-use headers_accept::Accept;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 
-use crate::{
-    Runtime,
-    datafusion::request_context_extension::get_current_datafusion,
-    model::{EvalScorerRegistry, LLMChatCompletionsModelStore, handle_eval_run, sql_query_for},
-};
-use runtime_request_context::{AsyncMarker, RequestContext};
+use crate::Runtime;
 
-#[cfg(feature = "openapi")]
-use crate::model::EvalRunResponse;
 
-use super::{ResponseMimeType, sql_to_http_response};
 
 /// Input parameters to start an evaluation run for a given model.
+///
+/// DEPRECATED: This struct is no longer used as the POST endpoint has been removed.
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[allow(dead_code)]
 pub(crate) struct RunEval {
     pub model: String,
 }

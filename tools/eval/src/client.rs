@@ -21,6 +21,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use spicepod::component::eval::Eval;
 
+#[derive(Deserialize)]
+struct ListEvalElement {
+    pub name: String,
+    pub description: Option<String>,
+    pub dataset: String,
+    pub scorers: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct QueryRequest {
+    query: String,
+}
+
 /// Client for communicating with a Spice runtime
 pub struct SpiceClient {
     endpoint: String,
@@ -51,19 +64,7 @@ impl SpiceClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "List evals failed with status {}: {}",
-                status,
-                text
-            ));
-        }
-
-        #[derive(Deserialize)]
-        struct ListEvalElement {
-            pub name: String,
-            pub description: Option<String>,
-            pub dataset: String,
-            pub scorers: Vec<String>,
+            return Err(anyhow!("List evals failed with status {status}: {text}"));
         }
 
         let list: Vec<ListEvalElement> = response
@@ -90,17 +91,12 @@ impl SpiceClient {
         evals
             .into_iter()
             .find(|e| e.name == name)
-            .ok_or_else(|| anyhow!("Evaluation '{}' not found", name))
+            .ok_or_else(|| anyhow!("Evaluation '{name}' not found"))
     }
 
     /// Execute a SQL query and get JSON results
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<Value>> {
         let url = format!("{}/v1/sql", self.endpoint);
-
-        #[derive(Serialize)]
-        struct QueryRequest {
-            query: String,
-        }
 
         let response = self
             .client
@@ -115,7 +111,7 @@ impl SpiceClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("SQL query failed with status {}: {}", status, text));
+            return Err(anyhow!("SQL query failed with status {status}: {text}"));
         }
 
         let data: Vec<Value> = response
@@ -145,9 +141,7 @@ impl SpiceClient {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             return Err(anyhow!(
-                "Chat completion failed with status {}: {}",
-                status,
-                text
+                "Chat completion failed with status {status}: {text}"
             ));
         }
 
@@ -170,8 +164,7 @@ impl SpiceClient {
         let scorers_json = serde_json::to_string(scorers)?;
         let sql = format!(
             "INSERT INTO spice.evals.runs (id, created_at, dataset, model, status, scorers, metrics) \
-             VALUES ('{}', CURRENT_TIMESTAMP, '{}', '{}', 'Waiting', '{}', '{{}}')",
-            id, dataset, model, scorers_json
+             VALUES ('{id}', CURRENT_TIMESTAMP, '{dataset}', '{model}', 'Waiting', '{scorers_json}', '{{}}')"
         );
 
         self.query_sql(&sql).await?;
@@ -192,8 +185,7 @@ impl SpiceClient {
         };
 
         let sql = format!(
-            "UPDATE spice.evals.runs SET status = '{}'{} WHERE id = '{}'",
-            status, error_clause, id
+            "UPDATE spice.evals.runs SET status = '{status}'{error_clause} WHERE id = '{id}'"
         );
 
         self.query_sql(&sql).await?;

@@ -137,7 +137,7 @@ async fn run_eval_internal(
     for scorer_name in &eval.scorers {
         let scorer = available_scorers
             .get(scorer_name)
-            .ok_or_else(|| anyhow!("Scorer '{}' not found", scorer_name))?;
+            .ok_or_else(|| anyhow!("Scorer '{scorer_name}' not found"))?;
         scorers_to_use.insert(scorer_name.clone(), scorer);
     }
 
@@ -197,7 +197,7 @@ async fn run_eval_internal(
     Ok(())
 }
 
-/// Parse a JSON value into DatasetInput
+/// Parse a JSON value into `DatasetInput`
 fn parse_dataset_input(value: &Value) -> Result<DatasetInput> {
     match value {
         Value::String(s) => {
@@ -206,7 +206,7 @@ fn parse_dataset_input(value: &Value) -> Result<DatasetInput> {
                 Ok(messages) => {
                     let json_messages: Vec<Value> = messages
                         .into_iter()
-                        .map(|m| serde_json::to_value(m))
+                        .map(serde_json::to_value)
                         .collect::<Result<_, _>>()?;
                     Ok(DatasetInput::Messages(json_messages))
                 }
@@ -218,7 +218,7 @@ fn parse_dataset_input(value: &Value) -> Result<DatasetInput> {
     }
 }
 
-/// Parse a JSON value into DatasetOutput
+/// Parse a JSON value into `DatasetOutput`
 fn parse_dataset_output(value: &Value) -> Result<DatasetOutput> {
     match value {
         Value::String(s) => {
