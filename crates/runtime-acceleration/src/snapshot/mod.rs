@@ -14,6 +14,7 @@ limitations under the License.
 //! Supports loading and saving snapshots of accelerated database files to and from object storage.
 
 use arrow_schema::{Schema, SchemaRef};
+use arrow_tools::schema::schema_difference;
 use aws_sdk_credential_bridge::object_store_builder::{
     S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
 };
@@ -457,8 +458,10 @@ pub enum SnapshotUploadError {
     },
     #[snafu(display("Snapshot metadata schema for dataset {dataset} is missing"))]
     UploadMetadataSchemaMissing { dataset: String },
-    #[snafu(display("Snapshot metadata schema conflict for dataset {dataset}"))]
-    UploadSchemaMismatch { dataset: String },
+    #[snafu(display(
+        "Schema mismatch for dataset {dataset}: existing snapshots are incompatible with the current schema. Snapshots don't support schema evolution. Delete the existing snapshots and restart the Spice runtime to rebuild them with the updated schema. {details}"
+    ))]
+    UploadSchemaMismatch { dataset: String, details: String },
     #[snafu(display("Failed to copy local file from {source_path:?} to {dest_path:?}"))]
     CopyLocal {
         source_path: PathBuf,
@@ -2010,9 +2013,11 @@ impl SnapshotManager {
                         },
                     )?;
 
-                if metadata_schema.as_ref() != schema.as_ref() {
+                if metadata_schema.fields() != schema.fields() {
+                    let details = schema_difference(&metadata_schema, schema).unwrap_or_default();
                     return Err(SnapshotUploadError::UploadSchemaMismatch {
                         dataset: dataset_name.clone(),
+                        details,
                     });
                 }
             }

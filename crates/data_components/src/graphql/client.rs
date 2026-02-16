@@ -1974,7 +1974,7 @@ mod tests {
         let err = result.expect_err("Failed to unnest JSON object");
         assert_eq!(
             err.to_string(),
-            "Invalid object access. Column 'a' already exists in the object."
+            "Invalid GraphQL object access: Column 'a' already exists in the object."
         );
     }
 

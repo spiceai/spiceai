@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(response)
-snapshot_kind: text
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.99,
       "dataset": "spice.public.item",
       "matches": {
         "i_item_desc": [
@@ -15,10 +15,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "i_item_sk": 19
-      },
-      "score": 0.99
+      }
     },
     {
+      "_score": 0.98,
       "dataset": "spice.public.item",
       "matches": {
         "i_item_desc": [
@@ -27,8 +27,7 @@ snapshot_kind: text
       },
       "primary_key": {
         "i_item_sk": 7
-      },
-      "score": 0.98
+      }
     }
   ]
 }

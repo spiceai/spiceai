@@ -1154,7 +1154,7 @@ impl DynamoDBStreamingSource for DynamoDbStreamsSource {
         run_id: &str,
         config_name: &str,
         snapshot_config: &SnapshotConfig,
-    ) -> SpicepodDefinition {
+    ) -> Result<SpicepodDefinition> {
         transform_spicepod(
             spicepod,
             run_id,
@@ -1170,7 +1170,7 @@ impl DynamoDBStreamingSource for DynamoDbStreamsSource {
         run_id: &str,
         config_name: &str,
         snapshot_config: &SnapshotConfig,
-    ) -> SpicepodDefinition {
+    ) -> Result<SpicepodDefinition> {
         transform_spicepod(
             spicepod,
             run_id,
@@ -1195,7 +1195,7 @@ fn transform_spicepod(
     config_name: &str,
     snapshot_config: &SnapshotConfig,
     snapshot_behavior: SnapshotBehavior,
-) -> SpicepodDefinition {
+) -> Result<SpicepodDefinition> {
     // Determine phase suffix for file paths
     let phase_suffix = match snapshot_behavior {
         SnapshotBehavior::CreateOnly => "checkpoint",
@@ -1203,9 +1203,8 @@ fn transform_spicepod(
         _ => "unknown",
     };
 
-    #[expect(clippy::expect_used)]
     std::fs::create_dir_all(format!("/tmp/benchmarks/{run_id}"))
-        .expect("Failed to create benchmark directory");
+        .context("Failed to create benchmark directory")?;
 
     // 1. Update dataset `from` field with prefixed table name, keep `name` unchanged
     for dataset in &mut spicepod.datasets {
@@ -1320,5 +1319,5 @@ fn transform_spicepod(
         ..Default::default()
     });
 
-    spicepod
+    Ok(spicepod)
 }

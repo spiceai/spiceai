@@ -9,27 +9,27 @@ snapshot_kind: text
     "answer": "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]",
     "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\).",
     "subject": "math",
-    "score": 0.705
+    "_score": 0.705
   },
   {
     "id": 212,
     "answer": "\\[\n(2y)^2 = (2 \\times 2)^2 = 4^2 = \\boxed{16}\n\\]",
     "question": "Evaluate the expression \\((2y)^2\\), where \\(y = 2\\).",
     "subject": "math",
-    "score": 0.69
+    "_score": 0.69
   },
   {
     "id": 1277,
     "answer": "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "Which base number, when raised to the fifth power, equals thirty-two?",
     "subject": "math",
-    "score": 0.688
+    "_score": 0.688
   },
   {
     "id": 145,
     "answer": "Substitute \\(x = 2\\) into the expression:\n\\[\n(x - 2)^2 = (2 - 2)^2 = 0^2 = \\boxed{0}\n\\]",
     "question": "Evaluate \\((x - 2)^2\\) when \\(x = 2\\).",
     "subject": "chemistry",
-    "score": 0.674
+    "_score": 0.674
   }
 ]

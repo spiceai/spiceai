@@ -57,7 +57,7 @@ pub type ScyllaDbConnectionPool =
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to construct SQL table: {source}"))]
+    #[snafu(display("Failed to create ScyllaDB SQL table: {source}"))]
     UnableToConstructSQLTable {
         source: sql_provider_datafusion::Error,
     },

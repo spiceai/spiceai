@@ -1,21 +1,20 @@
 ---
 source: crates/runtime/tests/models/search.rs
-description: "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs_view, 'secondary') where subject!='math' order by score desc, id LIMIT 4"
-snapshot_kind: text
+description: "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(qs_view, 'secondary') where subject!='math' order by _score desc, id LIMIT 4"
 ---
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                                    |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: score DESC NULLS FIRST, vector_search(qs_view, Utf8("secondary")).id ASC NULLS LAST, fetch=4                                                                                      |
-|               |   Projection: vector_search(qs_view, Utf8("secondary")).id, vector_search(qs_view, Utf8("secondary")).answer, trunc(vector_search(qs_view, Utf8("secondary")).score, Int64(3)) AS score |
-|               |     TableScan: vector_search(qs_view, Utf8("secondary")) projection=[answer, id, score], full_filters=[vector_search(qs_view, Utf8("secondary")).subject != Utf8("math")]               |
-| physical_plan | SortPreservingMergeExec: [score@2 DESC, id@0 ASC NULLS LAST], fetch=4                                                                                                                   |
-|               |   SortExec: TopK(fetch=4), expr=[score@2 DESC, id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                       |
-|               |     ProjectionExec: expr=[CAST(key@1 AS Int64) as id, answer@0 as answer, trunc(1 - distance@2, 3) as score]                                                                            |
-|               |       CooperativeExec                                                                                                                                                                   |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                            |
-|               |           BytesProcessedExec                                                                                                                                                            |
-|               |             CooperativeExec                                                                                                                                                             |
-|               |               S3VectorsQueryExec (INDEX_NAME_1): filter={subject:{$ne:"math"}} limit=100                                                                                                |
-|               |                                                                                                                                                                                         |
-+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                      |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: _score DESC NULLS FIRST, vector_search(qs_view, Utf8("secondary")).id ASC NULLS LAST, fetch=4                                                                                       |
+|               |   Projection: vector_search(qs_view, Utf8("secondary")).id, vector_search(qs_view, Utf8("secondary")).answer, trunc(vector_search(qs_view, Utf8("secondary"))._score, Int64(3)) AS _score |
+|               |     TableScan: vector_search(qs_view, Utf8("secondary")) projection=[_score, answer, id], full_filters=[vector_search(qs_view, Utf8("secondary")).subject != Utf8("math")]                |
+| physical_plan | SortPreservingMergeExec: [_score@2 DESC, id@0 ASC NULLS LAST], fetch=4                                                                                                                    |
+|               |   SortExec: TopK(fetch=4), expr=[_score@2 DESC, id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                        |
+|               |     ProjectionExec: expr=[CAST(key@1 AS Int64) as id, answer@0 as answer, trunc(1 - distance@2, 3) as _score]                                                                             |
+|               |       CooperativeExec                                                                                                                                                                     |
+|               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                              |
+|               |           BytesProcessedExec                                                                                                                                                              |
+|               |             CooperativeExec                                                                                                                                                               |
+|               |               S3VectorsQueryExec (INDEX_NAME_1): filter={subject:{$ne:"math"}} limit=100                                                                                                  |
+|               |                                                                                                                                                                                           |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

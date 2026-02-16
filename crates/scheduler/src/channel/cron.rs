@@ -39,7 +39,7 @@ pub struct CronRequestChannel {
 static CRON_PARSER: LazyLock<CronParser> = LazyLock::new(|| {
     CronParser::builder()
         .seconds(Seconds::Optional)
-        .year(Year::Disallowed) // TODO: allow optional years in 2.0.0 - https://github.com/spiceai/spiceai/issues/6548
+        .year(Year::Optional)
         .build()
 });
 
@@ -161,7 +161,7 @@ impl TaskRequestChannel for CronRequestChannel {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Timelike;
+    use chrono::{Datelike, Timelike};
 
     use super::*;
 
@@ -221,10 +221,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cron_cannot_go_faster_than_second() {
-        let cron_expression = "* * * * * * *".into(); // expression attempting to run every millisecond
+    async fn test_cron_rejects_eight_field_expression() {
+        // With Year::Optional, "* * * * * * *" (7 fields) is valid cron that runs every
+        // second of every year. An 8-field expression, however, should be rejected.
+        let cron_expression = "* * * * * * * *".into();
         let channel = CronRequestChannel::new(&cron_expression);
-        assert!(channel.is_err(), "Cron expression should be invalid");
+        assert!(
+            channel.is_err(),
+            "8-field cron expression should be rejected"
+        );
     }
 
     #[tokio::test]
@@ -333,5 +338,28 @@ mod tests {
             .expect("Should find occurrence after next");
         let interval = next_after.signed_duration_since(next).num_seconds();
         assert_eq!(interval, 60, "5-field cron should have 60-second intervals");
+    }
+
+    #[tokio::test]
+    async fn test_cron_year_optional() {
+        // Test that a 7-field cron expression with a year is supported.
+        // Use a year relative to now so the test doesn't become flaky once a
+        // hard-coded year is in the past.
+        let now = Local::now();
+        let target_year = now.year() + 5;
+        let cron_expr = format!("0 0 0 1 1 * {target_year}");
+        let cron: Arc<str> = Arc::from(cron_expr.as_str());
+        let channel = CronRequestChannel::new(&cron).expect("Should parse cron with year");
+
+        let next = channel
+            .cron
+            .find_next_occurrence(&now, false)
+            .expect("Should find next occurrence");
+
+        assert_eq!(
+            next.year(),
+            target_year,
+            "Cron should schedule in the target year"
+        );
     }
 }

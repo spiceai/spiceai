@@ -59,7 +59,7 @@ pub enum Error {
     ))]
     MissingKafkaBootstrapServers,
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to generate Debezium refresh SQL: {source}"))]
     RefreshSql { source: refresh_sql::Error },
 }
 

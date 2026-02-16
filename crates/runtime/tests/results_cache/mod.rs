@@ -23,7 +23,7 @@ use futures::TryStreamExt;
 
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use spicepod::{
-    component::{caching::ResultsCache, dataset::Dataset},
+    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
     param::Params,
 };
 
@@ -53,13 +53,13 @@ async fn results_cache_system_queries() -> Result<(), String> {
 
     test_request_context()
         .scope(async {
-            let results_cache = ResultsCache {
+            let sql_results_cache = SQLResultsCacheConfig {
                 item_ttl: Some("60s".to_string()),
                 ..Default::default()
             };
 
             let app = AppBuilder::new("cache_test")
-                .with_results_cache(results_cache)
+                .with_sql_cache(sql_results_cache)
                 .with_dataset(make_s3_tpch_dataset("customer"))
                 .build();
 

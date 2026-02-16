@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to create Snowflake connection pool: {source}"))]
     UnableToCreateSnowflakeConnectionPool {
         source: db_connection_pool::snowflakepool::Error,
     },

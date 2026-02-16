@@ -6,18 +6,18 @@ snapshot_kind: text
 [
   {
     "id": 468,
-    "score": 0.54
+    "_score": 0.54
   },
   {
     "id": 1277,
-    "score": 0.539
+    "_score": 0.539
   },
   {
     "id": 189,
-    "score": 0.539
+    "_score": 0.539
   },
   {
     "id": 948,
-    "score": 0.528
+    "_score": 0.528
   }
 ]

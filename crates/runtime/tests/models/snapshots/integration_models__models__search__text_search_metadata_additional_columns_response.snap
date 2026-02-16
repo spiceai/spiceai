@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.01,
       "data": {
         "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
       },
@@ -18,10 +18,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 525
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
       },
@@ -33,10 +33,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 361
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
       },
@@ -48,8 +48,7 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 772
-      },
-      "score": 0.01
+      }
     }
   ]
 }

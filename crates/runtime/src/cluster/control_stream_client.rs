@@ -22,6 +22,8 @@ limitations under the License.
 //! send `PollNow` commands to trigger immediate work polling.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +47,20 @@ use crate::metrics_reader::MetricsReader;
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Callback type for when an executor has received an update to its partitions (via the control stream).
+///
+/// The handler takes two arguments:
+/// 1. `new_partitions`: A map of dataset names to a list of partition values (as byte vectors) that have been assigned.
+/// 2. `removed_partitions`: A map of dataset names to a list of partition values (as byte vectors) that should be unloaded.
+pub type PartitionUpdateHandler = Arc<
+    dyn Fn(
+            HashMap<String, Vec<Vec<u8>>>,
+            HashMap<String, Vec<Vec<u8>>>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Handle for a single control stream connection to a scheduler.
 struct ControlStreamHandle {
     cancel: CancellationToken,
@@ -60,6 +76,7 @@ struct ControlStreamHandle {
 /// 3. Respond to metrics requests from the scheduler
 /// 4. Receive control messages (e.g., `PollNow`) and signal the notify
 /// 5. Reconnect on failure with exponential backoff
+#[expect(clippy::too_many_arguments)]
 fn spawn_control_stream(
     scheduler_address: String,
     executor_id: String,
@@ -68,10 +85,12 @@ fn spawn_control_stream(
     executor: Option<Arc<Executor>>,
     poll_now_notify: Arc<Notify>,
     outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
+    partition_update_handler: Option<&PartitionUpdateHandler>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
     let outbound_tx_state_for_task = Arc::clone(&outbound_tx_state);
+    let partition_update_handler = partition_update_handler.cloned();
 
     let task = tokio::spawn(async move {
         let tls_enabled = client_tls_config.is_some();
@@ -248,6 +267,7 @@ fn spawn_control_stream(
                                         metrics_reader.as_deref(),
                                         executor.as_deref(),
                                         &poll_now_notify,
+                                        partition_update_handler.as_ref(),
                                     )
                                     .await;
                                 }
@@ -293,6 +313,7 @@ fn spawn_control_stream(
 }
 
 /// Handles a message from the scheduler on the control stream.
+#[expect(clippy::too_many_arguments)]
 async fn handle_scheduler_message(
     scheduler_address: &str,
     executor_id: &str,
@@ -301,6 +322,7 @@ async fn handle_scheduler_message(
     metrics_reader: Option<&MetricsReader>,
     executor: Option<&Executor>,
     poll_now_notify: &Notify,
+    partition_update_handler: Option<&PartitionUpdateHandler>,
 ) {
     match message {
         SchedulerMessage::RequestMetrics(request) => {
@@ -335,6 +357,27 @@ async fn handle_scheduler_message(
                 "Received PollNow from scheduler {scheduler_address}"
             );
             poll_now_notify.notify_one();
+        }
+        SchedulerMessage::UpdatePartitions(update) => {
+            tracing::debug!(
+                "Received UpdatePartitions from scheduler {scheduler_address}: {} new, {} removed",
+                update.new_partitions.len(),
+                update.removed_partitions.len()
+            );
+
+            if let Some(handler) = partition_update_handler {
+                let new_partitions = update
+                    .new_partitions
+                    .into_iter()
+                    .map(|(k, v)| (k, v.items))
+                    .collect();
+                let removed_partitions = update
+                    .removed_partitions
+                    .into_iter()
+                    .map(|(k, v)| (k, v.items))
+                    .collect();
+                handler(new_partitions, removed_partitions).await;
+            }
         }
         SchedulerMessage::CancelTasks(cmd) => {
             let Some(executor) = executor else {
@@ -406,6 +449,8 @@ pub struct ControlStreamManager {
     known_schedulers: HashSet<String>,
     /// Shared notify handle signaled when any scheduler sends `PollNow`.
     poll_now_notify: Arc<Notify>,
+    /// Callback handler for partition updates.
+    partition_update_handler: Option<PartitionUpdateHandler>,
 }
 
 impl ControlStreamManager {
@@ -416,6 +461,7 @@ impl ControlStreamManager {
         ballista_executor_id: String,
         client_tls_config: Option<ClientTlsConfig>,
         metrics_reader: Option<MetricsReader>,
+        partition_update_handler: Option<PartitionUpdateHandler>,
         executor: Option<Arc<Executor>>,
     ) -> Self {
         Self {
@@ -427,6 +473,7 @@ impl ControlStreamManager {
             streams: HashMap::new(),
             known_schedulers: HashSet::new(),
             poll_now_notify: Arc::new(Notify::new()),
+            partition_update_handler,
         }
     }
 
@@ -508,6 +555,7 @@ impl ControlStreamManager {
                 self.executor.clone(),
                 Arc::clone(&self.poll_now_notify),
                 Arc::clone(&outbound_tx_state),
+                self.partition_update_handler.as_ref(),
             );
             self.streams.insert(address, handle);
         }
@@ -589,6 +637,7 @@ mod tests {
             None, // no TLS
             None, // no metrics reader
             None,
+            None,
         );
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -604,6 +653,7 @@ mod tests {
             None,
             Some(reader),
             None,
+            None,
         );
         assert!(manager.metrics_reader.is_some());
     }
@@ -613,6 +663,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
             None,
@@ -627,6 +678,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
             None,

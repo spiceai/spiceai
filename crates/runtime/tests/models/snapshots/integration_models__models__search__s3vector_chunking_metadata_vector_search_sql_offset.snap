@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: resp?
-snapshot_kind: text
 ---
 [
   {
@@ -10,7 +9,7 @@ snapshot_kind: text
       48,
       50
     ],
-    "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.793
+    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.793
   },
   {
     "id": 349,
@@ -18,7 +17,7 @@ snapshot_kind: text
       103,
       109
     ],
-    "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.785
+    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.785
   },
   {
     "id": 948,
@@ -26,7 +25,7 @@ snapshot_kind: text
       61,
       94
     ],
-    "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.556
+    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.556
   },
   {
     "id": 1277,
@@ -34,6 +33,6 @@ snapshot_kind: text
       62,
       95
     ],
-    "trunc(vector_search(qs, Utf8(\"second\")).score,Int64(3))": 0.556
+    "trunc(vector_search(qs, Utf8(\"second\"))._score,Int64(3))": 0.556
   }
 ]
