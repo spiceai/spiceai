@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use async_openai::types::chat::{CreateChatCompletionRequest, CreateChatCompletionResponse};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,8 @@ impl SpiceClient {
         // In the future, this could read directly from spicepod files
         let url = format!("{}/v1/evals", self.endpoint);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -50,7 +51,11 @@ impl SpiceClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("List evals failed with status {}: {}", status, text));
+            return Err(anyhow!(
+                "List evals failed with status {}: {}",
+                status,
+                text
+            ));
         }
 
         #[derive(Deserialize)]
@@ -61,23 +66,29 @@ impl SpiceClient {
             pub scorers: Vec<String>,
         }
 
-        let list: Vec<ListEvalElement> = response.json().await
+        let list: Vec<ListEvalElement> = response
+            .json()
+            .await
             .context("Failed to parse evals list")?;
 
-        Ok(list.into_iter().map(|e| Eval {
-            name: e.name,
-            description: e.description,
-            dataset: e.dataset,
-            scorers: e.scorers,
-            depends_on: Vec::new(),
-            metrics: None,
-        }).collect())
+        Ok(list
+            .into_iter()
+            .map(|e| Eval {
+                name: e.name,
+                description: e.description,
+                dataset: e.dataset,
+                scorers: e.scorers,
+                depends_on: Vec::new(),
+                metrics: None,
+            })
+            .collect())
     }
 
     /// Get a specific evaluation by name
     pub async fn get_eval(&self, name: &str) -> Result<Eval> {
         let evals = self.list_evals().await?;
-        evals.into_iter()
+        evals
+            .into_iter()
             .find(|e| e.name == name)
             .ok_or_else(|| anyhow!("Evaluation '{}' not found", name))
     }
@@ -91,7 +102,8 @@ impl SpiceClient {
             query: String,
         }
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&QueryRequest {
                 query: sql.to_string(),
@@ -106,7 +118,9 @@ impl SpiceClient {
             return Err(anyhow!("SQL query failed with status {}: {}", status, text));
         }
 
-        let data: Vec<Value> = response.json().await
+        let data: Vec<Value> = response
+            .json()
+            .await
             .context("Failed to parse query response")?;
 
         Ok(data)
@@ -119,7 +133,8 @@ impl SpiceClient {
     ) -> Result<CreateChatCompletionResponse> {
         let url = format!("{}/v1/chat/completions", self.endpoint);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&request)
             .send()
@@ -129,17 +144,29 @@ impl SpiceClient {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Chat completion failed with status {}: {}", status, text));
+            return Err(anyhow!(
+                "Chat completion failed with status {}: {}",
+                status,
+                text
+            ));
         }
 
-        let result: CreateChatCompletionResponse = response.json().await
+        let result: CreateChatCompletionResponse = response
+            .json()
+            .await
             .context("Failed to parse chat completion response")?;
 
         Ok(result)
     }
 
     /// Write results back to the eval runs table
-    pub async fn write_eval_run(&self, id: &str, dataset: &str, model: &str, scorers: &[String]) -> Result<()> {
+    pub async fn write_eval_run(
+        &self,
+        id: &str,
+        dataset: &str,
+        model: &str,
+        scorers: &[String],
+    ) -> Result<()> {
         let scorers_json = serde_json::to_string(scorers)?;
         let sql = format!(
             "INSERT INTO spice.evals.runs (id, created_at, dataset, model, status, scorers, metrics) \
@@ -152,7 +179,12 @@ impl SpiceClient {
     }
 
     /// Update eval run status
-    pub async fn update_eval_run_status(&self, id: &str, status: &str, error_message: Option<&str>) -> Result<()> {
+    pub async fn update_eval_run_status(
+        &self,
+        id: &str,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<()> {
         let error_clause = if let Some(err) = error_message {
             format!(", error_message = '{}'", err.replace('\'', "''"))
         } else {
@@ -169,7 +201,15 @@ impl SpiceClient {
     }
 
     /// Write eval results to the results table
-    pub async fn write_eval_results(&self, run_id: &str, input: &str, actual: &str, expected: &str, scorer: &str, score: f32) -> Result<()> {
+    pub async fn write_eval_results(
+        &self,
+        run_id: &str,
+        input: &str,
+        actual: &str,
+        expected: &str,
+        scorer: &str,
+        score: f32,
+    ) -> Result<()> {
         let sql = format!(
             "INSERT INTO spice.evals.results (run_id, timestamp, input, actual, expected, scorer, score) \
              VALUES ('{}', CURRENT_TIMESTAMP, '{}', '{}', '{}', '{}', {})",

@@ -18,9 +18,9 @@ limitations under the License.
 
 use clap::{Parser, Subcommand};
 use spice::commands::{
-    acceleration, add, catalogs, chat, cloud, cluster, connect, dataset, datasets, init,
-    install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace, upgrade,
-    version, workers,
+    acceleration, add, catalogs, chat, cloud, cluster, connect, dataset, datasets, init, install,
+    login, models, nsql, pods, query, refresh, run, search, sql, status, trace, upgrade, version,
+    workers,
 };
 use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;

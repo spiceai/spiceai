@@ -14,42 +14,49 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use anyhow::{Context, Result, anyhow};
-use async_openai::types::chat::{ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
+use anyhow::{anyhow, Context, Result};
+use async_openai::types::chat::{
+    ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs,
+    CreateChatCompletionRequestArgs,
+};
 use serde_json::Value;
 use spicepod::component::eval::Eval;
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::client::SpiceClient;
-use crate::scorer::{DatasetInput, DatasetOutput, Scorer, builtin_scorers};
+use crate::scorer::{builtin_scorers, DatasetInput, DatasetOutput, Scorer};
 
 /// Run an evaluation
-pub async fn run_eval(
-    client: &SpiceClient,
-    eval: &Eval,
-    model: &str,
-) -> Result<String> {
+pub async fn run_eval(client: &SpiceClient, eval: &Eval, model: &str) -> Result<String> {
     let run_id = Uuid::new_v4().to_string();
 
     tracing::info!("Starting eval run {}", run_id);
 
     // Initialize eval run record
-    client.write_eval_run(&run_id, &eval.dataset, model, &eval.scorers).await?;
+    client
+        .write_eval_run(&run_id, &eval.dataset, model, &eval.scorers)
+        .await?;
 
     // Update status to Running
-    client.update_eval_run_status(&run_id, "Running", None).await?;
+    client
+        .update_eval_run_status(&run_id, "Running", None)
+        .await?;
 
     // Execute the evaluation
     match run_eval_internal(client, eval, model, &run_id).await {
         Ok(()) => {
-            client.update_eval_run_status(&run_id, "Completed", None).await?;
+            client
+                .update_eval_run_status(&run_id, "Completed", None)
+                .await?;
             Ok(run_id)
         }
         Err(e) => {
             let error_msg = e.to_string();
             tracing::error!("Eval run {} failed: {}", run_id, error_msg);
-            client.update_eval_run_status(&run_id, "Failed", Some(&error_msg)).await?;
+            client
+                .update_eval_run_status(&run_id, "Failed", Some(&error_msg))
+                .await?;
             Err(e)
         }
     }
@@ -77,11 +84,11 @@ async fn run_eval_internal(
     for row in &rows {
         let input = parse_dataset_input(
             row.get("input")
-                .context("Missing 'input' column in dataset")?
+                .context("Missing 'input' column in dataset")?,
         )?;
         let ideal = parse_dataset_output(
             row.get("ideal")
-                .context("Missing 'ideal' column in dataset")?
+                .context("Missing 'ideal' column in dataset")?,
         )?;
 
         inputs.push(input);
@@ -104,11 +111,10 @@ async fn run_eval_internal(
                     .build()?
                     .into()]
             }
-            DatasetInput::Messages(msgs) => {
-                msgs.iter()
-                    .map(|m| serde_json::from_value::<ChatCompletionRequestMessage>(m.clone()))
-                    .collect::<Result<Vec<_>, _>>()?
-            }
+            DatasetInput::Messages(msgs) => msgs
+                .iter()
+                .map(|m| serde_json::from_value::<ChatCompletionRequestMessage>(m.clone()))
+                .collect::<Result<Vec<_>, _>>()?,
         };
 
         let request = CreateChatCompletionRequestArgs::default()
@@ -138,7 +144,9 @@ async fn run_eval_internal(
     // 5. Score results
     let mut all_scores: HashMap<String, Vec<f32>> = HashMap::new();
 
-    for ((input, actual_output), expected_output) in inputs.iter().zip(actual.iter()).zip(expected.iter()) {
+    for ((input, actual_output), expected_output) in
+        inputs.iter().zip(actual.iter()).zip(expected.iter())
+    {
         for (scorer_name, scorer) in &scorers_to_use {
             let score = scorer.score(input, actual_output, expected_output)?;
 
@@ -158,14 +166,16 @@ async fn run_eval_internal(
         let expected_str = serde_json::to_string(&expected[i])?;
 
         for (scorer_name, scores) in &all_scores {
-            client.write_eval_results(
-                run_id,
-                &input_str,
-                &actual_str,
-                &expected_str,
-                scorer_name,
-                scores[i],
-            ).await?;
+            client
+                .write_eval_results(
+                    run_id,
+                    &input_str,
+                    &actual_str,
+                    &expected_str,
+                    scorer_name,
+                    scores[i],
+                )
+                .await?;
         }
     }
 
@@ -203,9 +213,7 @@ fn parse_dataset_input(value: &Value) -> Result<DatasetInput> {
                 Err(_) => Ok(DatasetInput::UserInput(s.clone())),
             }
         }
-        Value::Array(arr) => {
-            Ok(DatasetInput::Messages(arr.clone()))
-        }
+        Value::Array(arr) => Ok(DatasetInput::Messages(arr.clone())),
         _ => Err(anyhow!("Invalid input format: expected string or array")),
     }
 }

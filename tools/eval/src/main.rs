@@ -26,7 +26,11 @@ mod scorer;
 #[command(about = "Standalone evaluation tool for Spice.ai models", long_about = None)]
 struct Args {
     /// Spiced runtime HTTP endpoint
-    #[arg(long, default_value = "http://localhost:8090", env = "SPICE_HTTP_ENDPOINT")]
+    #[arg(
+        long,
+        default_value = "http://localhost:8090",
+        env = "SPICE_HTTP_ENDPOINT"
+    )]
     endpoint: String,
 
     #[command(subcommand)]
@@ -54,8 +58,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info"))
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -70,7 +73,8 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 println!("Available evaluations:");
                 for eval in evals {
-                    println!("  - {}: {} (dataset: {}, scorers: {})",
+                    println!(
+                        "  - {}: {} (dataset: {}, scorers: {})",
                         eval.name,
                         eval.description.as_deref().unwrap_or(""),
                         eval.dataset,
@@ -84,11 +88,7 @@ async fn main() -> anyhow::Result<()> {
 
             tracing::info!("Starting evaluation '{}' for model '{}'", eval_name, model);
 
-            let run_id = eval_runner::run_eval(
-                &client,
-                &eval,
-                &model,
-            ).await?;
+            let run_id = eval_runner::run_eval(&client, &eval, &model).await?;
 
             tracing::info!("Evaluation completed: {}", run_id);
             println!("Evaluation run ID: {}", run_id);

@@ -37,7 +37,12 @@ pub enum DatasetOutput {
 
 /// Trait for scoring evaluation results
 pub trait Scorer: Send + Sync {
-    fn score(&self, _input: &DatasetInput, actual: &DatasetOutput, expected: &DatasetOutput) -> Result<f32>;
+    fn score(
+        &self,
+        _input: &DatasetInput,
+        actual: &DatasetOutput,
+        expected: &DatasetOutput,
+    ) -> Result<f32>;
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)>;
 }
@@ -46,11 +51,20 @@ pub trait Scorer: Send + Sync {
 pub struct MatchScorer;
 
 impl Scorer for MatchScorer {
-    fn score(&self, _input: &DatasetInput, actual: &DatasetOutput, expected: &DatasetOutput) -> Result<f32> {
+    fn score(
+        &self,
+        _input: &DatasetInput,
+        actual: &DatasetOutput,
+        expected: &DatasetOutput,
+    ) -> Result<f32> {
         let actual_text = extract_text(actual);
         let expected_text = extract_text(expected);
 
-        Ok(if actual_text == expected_text { 1.0 } else { 0.0 })
+        Ok(if actual_text == expected_text {
+            1.0
+        } else {
+            0.0
+        })
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
@@ -62,11 +76,20 @@ impl Scorer for MatchScorer {
 pub struct IncludesScorer;
 
 impl Scorer for IncludesScorer {
-    fn score(&self, _input: &DatasetInput, actual: &DatasetOutput, expected: &DatasetOutput) -> Result<f32> {
+    fn score(
+        &self,
+        _input: &DatasetInput,
+        actual: &DatasetOutput,
+        expected: &DatasetOutput,
+    ) -> Result<f32> {
         let actual_text = extract_text(actual);
         let expected_text = extract_text(expected);
 
-        Ok(if actual_text.contains(&expected_text) { 1.0 } else { 0.0 })
+        Ok(if actual_text.contains(&expected_text) {
+            1.0
+        } else {
+            0.0
+        })
     }
 
     fn metrics(&self, scores: &[f32]) -> Vec<(String, f32)> {
@@ -78,7 +101,12 @@ impl Scorer for IncludesScorer {
 pub struct LevenshteinScorer;
 
 impl Scorer for LevenshteinScorer {
-    fn score(&self, _input: &DatasetInput, actual: &DatasetOutput, expected: &DatasetOutput) -> Result<f32> {
+    fn score(
+        &self,
+        _input: &DatasetInput,
+        actual: &DatasetOutput,
+        expected: &DatasetOutput,
+    ) -> Result<f32> {
         let actual_text = extract_text(actual);
         let expected_text = extract_text(expected);
 
