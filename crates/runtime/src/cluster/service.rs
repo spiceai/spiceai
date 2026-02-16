@@ -200,6 +200,11 @@ impl ClusterServiceImpl {
         metrics_reader: Option<MetricsReader>,
         partition_manager: Option<Arc<PartitionManager>>,
     ) -> Self {
+        // Wire up partition manager to executor registry if available
+        if let Some(ref pm) = partition_manager {
+            executor_registry.set_partition_manager(Arc::clone(pm));
+        }
+
         Self {
             app,
             secrets,
@@ -230,6 +235,11 @@ impl ClusterServiceImpl {
         partition_manager: Option<Arc<PartitionManager>>,
         executor_streams: ExecutorControlStreamRegistry,
     ) -> Self {
+        // Wire up partition manager to executor registry if available
+        if let Some(ref pm) = partition_manager {
+            executor_registry.set_partition_manager(Arc::clone(pm));
+        }
+
         Self {
             app,
             secrets,

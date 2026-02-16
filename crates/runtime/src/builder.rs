@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::cluster::DistributedNode;
 use crate::cluster::ExecutorRegistry;
+use crate::cluster::PartitionManager;
 use crate::cluster::ResolvedClusterConfig;
+use crate::cluster::partition;
 use crate::config::ClusterRole;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
@@ -238,19 +240,50 @@ impl RuntimeBuilder {
 
         // Create resource monitor early so it can be passed to DataFusion
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
+        let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
 
-        let distributed = match self
+        let distributed: Option<DistributedNode> = match self
             .resolved_cluster_config
             .as_ref()
             .and_then(ResolvedClusterConfig::effective_role)
         {
-            Some(ClusterRole::Scheduler) => Some(DistributedNode::Scheduler {
-                peers: Arc::new(RwLock::new(HashMap::new())),
-                // Initialized later when scheduler registry starts
-                job_executor: Arc::new(RwLock::new(None)),
-                executor_registry: Arc::new(ExecutorRegistry::new()),
-                partition_manager: Arc::new(RwLock::new(None)),
-            }),
+            Some(ClusterRole::Scheduler) => {
+                if let Some(scheduler_config) = self
+                    .app
+                    .as_ref()
+                    .and_then(|app| app.runtime.scheduler.clone())
+                {
+                    match partition::build_partition_metadata_store(
+                        io_runtime.clone(),
+                        Arc::clone(&secrets),
+                        &scheduler_config,
+                    )
+                    .await
+                    {
+                        Ok(store) => {
+                            let partition_manager = Arc::new(PartitionManager::new(store));
+
+                            Some(DistributedNode::Scheduler {
+                                peers: Arc::new(RwLock::new(HashMap::new())),
+                                // Initialized later when scheduler registry starts
+                                job_executor: Arc::new(RwLock::new(None)),
+                                executor_registry: Arc::new(ExecutorRegistry::new(Arc::clone(
+                                    &partition_manager,
+                                ))),
+                                partition_manager,
+                            })
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to initialize partition metadata store for scheduler: {e}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
                 partition_assignments: Arc::new(RwLock::new(HashMap::new())),
             }),
@@ -310,8 +343,6 @@ impl RuntimeBuilder {
             None
         };
 
-        let secrets = Self::load_secrets(self.app.as_ref()).await;
-
         let evals = self
             .app
             .as_ref()
@@ -331,7 +362,7 @@ impl RuntimeBuilder {
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
-            secrets: Arc::new(RwLock::new(secrets)),
+            secrets,
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
             autoload_extensions: Arc::new(self.autoload_extensions),
             extensions: Arc::new(RwLock::new(HashMap::new())),

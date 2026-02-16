@@ -90,7 +90,7 @@ pub enum DistributedNode {
         executor_registry: Arc<ExecutorRegistry>,
 
         /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
-        partition_manager: Arc<RwLock<Option<Arc<PartitionManager>>>>,
+        partition_manager: Arc<PartitionManager>>,
     },
     Executor {
         /// Partition assignments for this runtime (executor) for each table.
@@ -801,24 +801,18 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         let config = app.as_ref().and_then(|app| app.runtime.scheduler.clone());
         if let Some(config) = config {
             // Initialize partition manager with the configured object store
-            match partition::build_partition_metadata_store(rt, &config).await {
-                Ok(store) => {
-                    let partition_manager = Arc::new(PartitionManager::new(store));
-                    rt.set_partition_manager(Arc::clone(&partition_manager))
-                        .await;
-
-                    // Initialize partition metadata for all accelerated tables
-                    if let Err(err) =
-                        partition::initialize_partition_metadata(rt, &partition_manager).await
-                    {
+            if let Some(partition_manager) = rt.partition_manager() {
+                partition::initialize_partition_metadata(rt, partition_manager)
+                    .await
+                    .inspect_err(|e| {
                         tracing::warn!(
-                            "Failed to initialize partition metadata during scheduler startup: {err}"
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::error!("Failed to build partition metadata store: {err}");
-                }
+                            "Failed to initialize partition metadata during scheduler startup: {e}"
+                        )
+                    });
+            } else {
+                tracing::warn!(
+                    "Partition manager not available during scheduler startup; partition metadata will not be initialized"
+                );
             }
 
             let registry_shutdown = CancellationToken::new();

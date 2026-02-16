@@ -26,7 +26,6 @@ use crate::cluster::partition::metadata::PartitionValue;
 
 use super::metadata::{PartitionMetadata, TablePartitionMetadata};
 
-#[expect(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to access partition metadata for table {table}: {source}"))]
@@ -53,6 +52,7 @@ static PARTITION_PREFIX: &str = "accelerations/partitions/";
 ///
 /// Uses optimistic concurrency control to safely coordinate partition assignments
 /// across multiple schedulers without locks.
+#[derive(Debug)]
 pub struct PartitionManager {
     state: ObjectState<TablePartitionMetadata>,
 }

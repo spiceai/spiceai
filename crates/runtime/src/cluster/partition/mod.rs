@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod executor_selection;
 mod manager;
 mod metadata;
 mod startup;

@@ -32,8 +32,10 @@ use object_store::prefix::PrefixStore;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
+use runtime_secrets::Secrets;
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
+use tokio::{runtime::Handle, sync::RwLock};
 use tonic::transport::Channel;
 
 use super::PartitionManager;
@@ -97,13 +99,18 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Builds an object store for partition metadata from scheduler configuration.
 pub async fn build_partition_metadata_store(
-    rt: &Runtime,
+    io_runtime: Handle,
+    secrets: Arc<RwLock<Secrets>>,
     config: &SchedulerConfig,
 ) -> Result<Arc<dyn ObjectStore>> {
-    let (store, prefix) =
-        crate::cluster::scheduler_registry::build_object_store(rt, &config.state_location, config)
-            .await
-            .context(ObjectStoreBuildSnafu)?;
+    let (store, prefix) = crate::cluster::scheduler_registry::build_object_store_internal(
+        secrets,
+        io_runtime,
+        &config.state_location,
+        config,
+    )
+    .await
+    .context(ObjectStoreBuildSnafu)?;
 
     if prefix.is_empty() {
         Ok(store)
@@ -120,7 +127,7 @@ pub async fn build_partition_metadata_store(
 ///    - Update with all partitions marked as unassigned
 pub async fn initialize_partition_metadata(
     rt: &Arc<Runtime>,
-    partition_manager: &PartitionManager,
+    partition_manager: Arc<PartitionManager>,
 ) -> Result<()> {
     let Some(app) = rt.app().read().await.clone() else {
         tracing::warn!("No application found in runtime during partition metadata initialization");
