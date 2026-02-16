@@ -502,11 +502,16 @@ impl SpiceTestQueryWorker {
                 query_failure: None,
             }),
             Err(e) => {
-                // Check if this is a connection error
-                let error_str = format!("{e}");
-                let is_connection_error = error_str.contains("connection")
-                    || error_str.contains("handshake")
-                    || error_str.contains("Connection refused");
+                // Check if this is a connection error using typed error checking
+                // This is more reliable than string matching
+                let is_connection_error = e.downcast_ref::<flight_client::Error>()
+                    .is_some_and(|flight_err| {
+                        matches!(
+                            flight_err,
+                            flight_client::Error::UnableToConnectToServer { .. }
+                                | flight_client::Error::UnableToPerformHandshake { .. }
+                        )
+                    });
 
                 if is_connection_error {
                     eprintln!(
