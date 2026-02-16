@@ -1120,14 +1120,14 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
             assert_batches_eq!(expected, &result);
 
             // Insert data with duplicate primary key - should upsert
-            rt.datafusion()
-                .query_builder(
-                    "INSERT INTO events (event_id, event_name, event_timestamp) \
-                     VALUES (2, 'Password Reset', '2024-01-15 09:00:00')",
-                )
-                .build()
-                .run()
-                .await?;
+            // Must use execute_sql to drain the stream,
+            // otherwise DataSinkExec never executes and the write is silently skipped / dropped.
+            execute_sql(
+                &rt,
+                "INSERT INTO events (event_id, event_name, event_timestamp) \
+                 VALUES (2, 'Password Reset', '2024-01-15 09:00:00')",
+            )
+            .await?;
 
             // Verify upsert happened
             let result =

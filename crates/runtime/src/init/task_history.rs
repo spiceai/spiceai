@@ -27,11 +27,9 @@ use std::sync::Arc;
 
 impl Runtime {
     pub async fn init_task_history(self: Arc<Self>) -> Result<()> {
-        let app = self.app.read().await;
-
         // Skip task history initialization if there's no valid spicepod
         // Task history requires App infrastructure (datasets, table providers) to function
-        let Some(app) = app.as_ref() else {
+        let Some(app) = self.read_app().await else {
             tracing::debug!(
                 "Task history initialization skipped: no valid spicepod configuration."
             );

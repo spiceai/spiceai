@@ -30,7 +30,7 @@ use spicepod::component::embeddings::Embeddings;
 
 impl Runtime {
     pub(crate) async fn load_embeddings(&self) {
-        let app_opt = self.app.read().await;
+        let app_opt = self.read_app().await;
 
         if !cfg!(feature = "models") && app_opt.as_ref().is_some_and(|s| !s.embeddings.is_empty()) {
             tracing::error!(
