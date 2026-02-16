@@ -14,6 +14,76 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Query execution abstraction for test framework
+//!
+//! This module provides a trait-based architecture for executing queries against different backends.
+//! It enables the test framework to work with both Spice databases and non-Spice databases through
+//! a common interface.
+//!
+//! # Architecture
+//!
+//! The core abstraction is the [`QueryExecutor`] trait, which defines a common interface for
+//! executing queries. Different executor implementations handle the specifics of communicating
+//! with their respective backends.
+//!
+//! # Built-in Executors
+//!
+//! ## [`FlightExecutor`]
+//! Executes queries via Arrow Flight SQL protocol.
+//! - **Use when**: Testing Spice with the default Flight SQL interface
+//! - **Supports validation**: Yes (returns full Arrow batches)
+//! - **Supports explain plans**: Yes (via `as_spice_client()`)
+//!
+//! ## [`HttpExecutor`]
+//! Executes queries via synchronous HTTP `/v1/sql` endpoint.
+//! - **Use when**: Testing Spice's HTTP API or measuring HTTP performance
+//! - **Supports validation**: No (only returns row counts)
+//! - **Supports explain plans**: No
+//!
+//! ## [`DistributedExecutor`]
+//! Executes queries via asynchronous HTTP `/v1/queries` API with polling.
+//! - **Use when**: Testing Spice in cluster mode with distributed query execution
+//! - **Supports validation**: No (only returns row counts)
+//! - **Supports explain plans**: No
+//!
+//! # Adding Support for New Databases
+//!
+//! To add support for a new database (e.g., PostgreSQL, MySQL), implement the [`QueryExecutor`] trait:
+//!
+//! ```rust,ignore
+//! use async_trait::async_trait;
+//! use std::sync::Arc;
+//!
+//! pub struct PostgresExecutor {
+//!     client: Arc<tokio_postgres::Client>,
+//! }
+//!
+//! #[async_trait]
+//! impl QueryExecutor for PostgresExecutor {
+//!     async fn execute(&self, query: &Query) -> Result<ExecutionResult> {
+//!         let start = std::time::Instant::now();
+//!         let rows = self.client.query(&query.sql, &[]).await?;
+//!
+//!         Ok(ExecutionResult {
+//!             duration: start.elapsed(),
+//!             row_count: rows.len(),
+//!             batches: None, // Or convert rows to Arrow batches for validation
+//!         })
+//!     }
+//!
+//!     fn name(&self) -> &str { "postgres" }
+//!     fn supports_validation(&self) -> bool { false }
+//!     fn clone_box(&self) -> Box<dyn QueryExecutor> { Box::new(self.clone()) }
+//! }
+//! ```
+//!
+//! Then use it in your test command:
+//!
+//! ```rust,ignore
+//! let executor: Box<dyn QueryExecutor> = Box::new(PostgresExecutor::new(client));
+//! let test_builder = NotStarted::new().with_query_executor(executor);
+//! ```
+
 use anyhow::Result;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
@@ -102,9 +172,25 @@ impl QueryExecutor for FlightExecutor {
         let mut batches = Vec::new();
         let mut row_count = 0;
 
-        while let Some(batch) = result_stream.try_next().await? {
-            row_count += batch.num_rows();
-            batches.push(batch);
+        loop {
+            match result_stream.try_next().await {
+                Ok(None) => break,
+                Err(e) => {
+                    // Handle connection reset errors by resetting state
+                    // This preserves the behavior from the original execute_flight implementation
+                    if let Some(spiceai::ClientError::ConnectionReset { .. }) = e.downcast_ref::<spiceai::ClientError>() {
+                        row_count = 0;
+                        batches.clear();
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+                Ok(Some(batch)) => {
+                    let batch_rows = batch.num_rows();
+                    row_count += batch_rows;
+                    batches.push(batch);
+                }
+            }
         }
 
         Ok(ExecutionResult {

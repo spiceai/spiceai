@@ -121,29 +121,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     };
 
     // Create the appropriate query executor based on args
-    let executor: Box<dyn test_framework::execution::QueryExecutor> =
-        if args.test_args.distributed {
-            let http_client = spiced_instance.http_client()?;
-            let base_url = spiced_instance.http_base_url().to_string();
-            Box::new(test_framework::execution::DistributedExecutor::new(
-                http_client,
-                base_url,
-            ))
-        } else if args.test_args.http_clients {
-            let http_client = spiced_instance.http_client()?;
-            let base_url = spiced_instance.http_base_url().to_string();
-            Box::new(test_framework::execution::HttpExecutor::new(
-                http_client,
-                base_url,
-            ))
-        } else {
-            let spice_client = spiced_instance
-                .spice_client(None, args.test_args.disable_caching)
-                .await?;
-            Box::new(test_framework::execution::FlightExecutor::new(
-                std::sync::Arc::new(spice_client),
-            ))
-        };
+    let executor = super::create_query_executor(&args.test_args, &spiced_instance).await?;
 
     // warm up run
     println!("Performing warm up");
