@@ -390,10 +390,3 @@ impl CayenneDataSink {
         Ok(total_rows)
     }
 }
-
-/// Convert a `CatalogError` to a `DataFusionError::External`.
-fn to_df_exec_err<E: std::error::Error + Send + Sync + 'static>(
-    err: E,
-) -> datafusion_common::DataFusionError {
-    datafusion_common::DataFusionError::External(Box::new(err))
-}
