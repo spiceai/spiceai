@@ -27,9 +27,7 @@ pub enum Error {}
 impl Runtime {
     #[cfg(feature = "models")]
     pub(crate) async fn load_workers(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-
-        if let Some(app) = app_lock.as_ref() {
+        if let Some(app) = self.read_app().await {
             for worker in &app.workers {
                 let runtime = Arc::clone(&self);
                 runtime
