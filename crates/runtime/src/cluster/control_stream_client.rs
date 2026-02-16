@@ -18,14 +18,15 @@ limitations under the License.
 //!
 //! This module provides functionality for executors to establish and maintain
 //! bidirectional control streams with schedulers. These streams allow schedulers
-//! to request metrics from executors on-demand and receive `PollNow` commands
-//! to trigger immediate work polling.
+//! to request metrics from executors on-demand, issue task cancellations, and
+//! send `PollNow` commands to trigger immediate work polling.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ballista_core::utils::create_grpc_client_endpoint;
+use ballista_executor::executor::Executor;
 use futures::StreamExt;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
@@ -64,6 +65,7 @@ fn spawn_control_stream(
     executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
+    executor: Option<Arc<Executor>>,
     poll_now_notify: Arc<Notify>,
     outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
 ) -> ControlStreamHandle {
@@ -244,6 +246,7 @@ fn spawn_control_stream(
                                         message,
                                         &outbound_tx,
                                         metrics_reader.as_deref(),
+                                        executor.as_deref(),
                                         &poll_now_notify,
                                     )
                                     .await;
@@ -296,6 +299,7 @@ async fn handle_scheduler_message(
     message: SchedulerMessage,
     outbound_tx: &mpsc::Sender<ExecutorControlMessage>,
     metrics_reader: Option<&MetricsReader>,
+    executor: Option<&Executor>,
     poll_now_notify: &Notify,
 ) {
     match message {
@@ -332,6 +336,48 @@ async fn handle_scheduler_message(
             );
             poll_now_notify.notify_one();
         }
+        SchedulerMessage::CancelTasks(cmd) => {
+            let Some(executor) = executor else {
+                tracing::warn!(
+                    "Received CancelTasks from {scheduler_address} but no executor is available"
+                );
+                return;
+            };
+
+            for task in cmd.tasks {
+                match executor
+                    .cancel_task(
+                        task.task_id as usize,
+                        task.job_id.clone(),
+                        task.stage_id as usize,
+                        task.partition_id as usize,
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::debug!(
+                            task_id = task.task_id,
+                            job_id = %task.job_id,
+                            "Cancelled task from scheduler {scheduler_address}"
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            task_id = task.task_id,
+                            job_id = %task.job_id,
+                            "Task not found for cancellation (may have already completed)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = task.task_id,
+                            job_id = %task.job_id,
+                            "Failed to cancel task: {e}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -355,6 +401,7 @@ pub struct ControlStreamManager {
     ballista_executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
+    executor: Option<Arc<Executor>>,
     streams: HashMap<String, ControlStreamHandle>,
     known_schedulers: HashSet<String>,
     /// Shared notify handle signaled when any scheduler sends `PollNow`.
@@ -369,12 +416,14 @@ impl ControlStreamManager {
         ballista_executor_id: String,
         client_tls_config: Option<ClientTlsConfig>,
         metrics_reader: Option<MetricsReader>,
+        executor: Option<Arc<Executor>>,
     ) -> Self {
         Self {
             executor_id,
             ballista_executor_id,
             client_tls_config,
             metrics_reader: metrics_reader.map(Arc::new),
+            executor,
             streams: HashMap::new(),
             known_schedulers: HashSet::new(),
             poll_now_notify: Arc::new(Notify::new()),
@@ -456,6 +505,7 @@ impl ControlStreamManager {
                 self.executor_id.clone(),
                 self.client_tls_config.clone(),
                 self.metrics_reader.clone(),
+                self.executor.clone(),
                 Arc::clone(&self.poll_now_notify),
                 Arc::clone(&outbound_tx_state),
             );
@@ -538,6 +588,7 @@ mod tests {
             "executor-1".to_string(),
             None, // no TLS
             None, // no metrics reader
+            None,
         );
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -552,6 +603,7 @@ mod tests {
             "executor-2".to_string(),
             None,
             Some(reader),
+            None,
         );
         assert!(manager.metrics_reader.is_some());
     }
@@ -561,6 +613,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
         );
@@ -574,6 +627,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
         );

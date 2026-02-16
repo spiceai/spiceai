@@ -52,11 +52,11 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, BytesArray,
-    ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse, GetAppDefinitionRequest,
-    GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest,
-    GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand,
-    SchedulerControlMessage, SchedulerInstance, cluster_service_server::ClusterService,
-    executor_control_message::Message as ExecutorMessage,
+    CancelTasksCommand, ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse,
+    GetAppDefinitionRequest, GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse,
+    GetSchedulersRequest, GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse,
+    PollNowCommand, SchedulerControlMessage, SchedulerInstance, TaskCancelInfo,
+    cluster_service_server::ClusterService, executor_control_message::Message as ExecutorMessage,
     scheduler_control_message::Message as SchedulerMessage,
 };
 use runtime_secrets::Secrets;
@@ -129,6 +129,23 @@ impl ExecutorControlStreamRegistry {
         }
 
         tracing::debug!("Broadcast PollNow to {count} executors: {reason}");
+    }
+
+    /// Sends a `CancelTasks` command to a specific connected executor.
+    ///
+    /// Returns `true` when the message is accepted into the outbound channel.
+    #[must_use]
+    pub fn send_cancel_tasks(&self, executor_id: &str, tasks: Vec<TaskCancelInfo>) -> bool {
+        let streams = self.streams.read();
+        let Some(handle) = streams.get(executor_id) else {
+            return false;
+        };
+
+        let message = SchedulerControlMessage {
+            message: Some(SchedulerMessage::CancelTasks(CancelTasksCommand { tasks })),
+        };
+
+        handle.tx.try_send(message).is_ok()
     }
 
     /// Registers an executor stream for receiving control messages.

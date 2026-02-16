@@ -15,16 +15,6 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v1.12 (Feb 2026)
-
-**Focus:** Distributed Query & Search Maturity.
-
-- **Spice Cayenne (RC)**: High-performance columnar storage format for accelerated datasets.
-- **Distributed Query (RC)**: Multi-node query execution with Apache Ballista integration.
-- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes.
-- **Accelerated Dataset Distribution**: Replicate accelerated datasets across executor nodes.
-- **DataFusion**: Upgrade to v51.
-
 ### v2.0 (March 2026)
 
 **Focus:** Production-Grade HA.
@@ -33,11 +23,13 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Active-Active HA (GA)**: Production-ready multi-node deployment with zero-downtime failover.
 - **Distributed Query (GA)**: Stable multi-node query execution for large-scale workloads.
 - **Backup & Point-in-Time Recovery**: Snapshot restore for accelerated datasets.
+- **Accelerated Dataset Distribution**: Replicate accelerated datasets across executor nodes.
 
 ### v2.1 (H2 2026)
 
 **Focus:** Schema Management & Search.
 
+- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes.
 - **Schema Registry (Initial)**: Versioning and backward compatibility checks.
 - **Hybrid Search Ranking**: Configurable fusion strategies (Reciprocal Rank Fusion (RRF) weights, learned ranking).
 

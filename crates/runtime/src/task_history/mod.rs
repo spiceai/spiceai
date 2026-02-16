@@ -438,7 +438,7 @@ pub enum Error {
     #[snafu(display("The `task_history` table was not found"))]
     TableNotFound,
 
-    #[snafu(display("Unable to downcast ArrayBuilder"))]
+    #[snafu(display("Failed to process task history data: internal type conversion error"))]
     DowncastBuilder,
 
     #[snafu(display("Invalid `task_history` configuration: {source}"))]

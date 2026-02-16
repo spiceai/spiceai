@@ -1,28 +1,27 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(response)
-snapshot_kind: text
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.78,
       "dataset": "clickbench_no_chunking",
       "matches": {
         "Referer": [
           "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&input"
         ]
-      },
-      "score": 0.78
+      }
     },
     {
+      "_score": 0.78,
       "dataset": "clickbench_no_chunking",
       "matches": {
         "Referer": [
           "https://go.mail/folder-1/online=on&acceTWg&bvm=bv.48705608,d.bGE&cad=rjt&fu=0&int[234][to]=&input"
         ]
-      },
-      "score": 0.78
+      }
     }
   ]
 }

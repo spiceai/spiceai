@@ -15,6 +15,7 @@ members = [
     "crates/data_components",
     "crates/dataformat-json",
     "crates/document_parse",
+    "crates/duration-parse",
     "crates/dynamodb-streams",
     "crates/event_stream",
     "crates/flight_client",
@@ -65,6 +66,7 @@ members = [
     "tools/spicepod-validator",
     "tools/testoperator",
     "tools/parsley",
+    "tools/pr-builds"
 ]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
@@ -168,6 +170,7 @@ delta_kernel = { version = "0.17.0", features = [
 derive_builder = "0.20.2"
 dotenvy = "0.15"
 duckdb = "1.4.4"
+duration-parse = { path = "crates/duration-parse" }
 dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.30"
@@ -361,9 +364,9 @@ datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "509
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "330a4d790b892dd6be23b71589ec60b620bf29f5" } # spiceai-51
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "56225b2a66868462d4f75a7881490118c43db9b6" }      # spiceai-51
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "56225b2a66868462d4f75a7881490118c43db9b6" } # spiceai-51
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "56225b2a66868462d4f75a7881490118c43db9b6" } # spiceai-51
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "9298d4410b3cfde5639aa3d7bea8777942741573" } # spiceai-51
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "9298d4410b3cfde5639aa3d7bea8777942741573" } # spiceai-51
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "9298d4410b3cfde5639aa3d7bea8777942741573" } # spiceai-51
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers

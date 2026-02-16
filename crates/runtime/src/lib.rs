@@ -166,39 +166,39 @@ pub enum Error {
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
 
-    #[snafu(display("Unable to create data backend: {source}"))]
+    #[snafu(display("Failed to initialize the query engine: {source}"))]
     UnableToCreateBackend { source: datafusion::Error },
 
-    #[snafu(display("Unable to attach view: {source}"))]
+    #[snafu(display("Failed to attach view: {source}"))]
     UnableToAttachView { source: datafusion::Error },
 
-    #[snafu(display("Unable to attach dataset index: {source}"))]
+    #[snafu(display("Failed to attach dataset index: {source}"))]
     UnableToAttachIndex { source: datafusion::Error },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize data connector: {source}"))]
     UnableToInitializeDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize catalog connector: {source}"))]
     UnableToInitializeCatalogConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize LLM model: {source}"))]
     UnableToInitializeLlm {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize embedding model: {source}"))]
     UnableToInitializeEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to initialize LLM tool: {source}"))]
     UnableToInitializeLlmTool {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -963,12 +963,6 @@ impl Runtime {
             }
             None => (None, None),
         };
-
-        if self.df.cluster_config.effective_role().is_some() {
-            tracing::warn!(
-                "Distributed Query (Alpha) is in preview and should not be used in production."
-            );
-        }
 
         // Start Flight server
         let flight_shutdown = CancellationToken::new();

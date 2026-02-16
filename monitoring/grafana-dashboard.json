@@ -1371,7 +1371,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "1000 * time() - dataset_acceleration_last_refresh_time_ms{instance=~\"$instances\", dataset!~\"runtime.*\"}",
+          "expr": "1000 * time() - dataset_acceleration_last_refresh_unix_time_ms{instance=~\"$instances\", dataset!~\"runtime.*\"}",
           "legendFormat": "{{dataset}}",
           "range": true,
           "refId": "A"

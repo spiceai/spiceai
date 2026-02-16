@@ -76,22 +76,22 @@ pub use snapshots::SnapshotCreationConfig;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to fetch data from the data connector: {source}. Ensure the dataset source path and connector configuration are valid, and try again."
     ))]
     UnableToGetDataFromConnector { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to refresh dataset from the data connector: {source}. Verify the dataset configuration and data connector status, and try again."
     ))]
     FailedToRefreshDataset { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to scan the dataset from the data connector: {source}. Ensure the dataset configuration is valid, and try again."
     ))]
     UnableToScanTableProvider { source: DataFusionError },
 
     #[snafu(display(
-        "Failed to get data from the connector. {source} Ensure the dataset configuration is valid, and try again."
+        "Failed to apply data update to the accelerated dataset: {source}. Ensure the dataset schema is compatible, and try again."
     ))]
     UnableToCreateMemTableFromUpdate { source: DataFusionError },
 
@@ -103,7 +103,9 @@ pub enum Error {
         message: String,
     },
 
-    #[snafu(display("Failed to refresh the dataset. {source}"))]
+    #[snafu(display(
+        "Failed to trigger dataset refresh: the refresh worker is no longer running. {source}"
+    ))]
     FailedToTriggerRefresh {
         source: tokio::sync::mpsc::error::SendError<Option<RefreshOverrides>>,
     },
@@ -126,10 +128,10 @@ pub enum Error {
     #[snafu(display("{reason}"))]
     FailedToFindLatestTimestamp { reason: String },
 
-    #[snafu(display("Failed to filter update data. {source}"))]
+    #[snafu(display("Failed to filter update data for the accelerated dataset: {source}"))]
     FailedToFilterUpdates { source: ArrowError },
 
-    #[snafu(display("Failed to write data into accelerated table. {source}"))]
+    #[snafu(display("Failed to write data into the accelerated dataset: {source}"))]
     FailedToWriteData { source: DataFusionError },
 
     #[snafu(display(
@@ -159,13 +161,13 @@ pub enum Error {
     ))]
     PrimaryKeyTypeNotYetSupported { data_type: String },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Invalid time column format: {source}"))]
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
-    #[snafu(display("Failed to start refresh task. The task was already started."))]
+    #[snafu(display("Failed to start dataset refresh: the refresh task was already started."))]
     RefreshTaskAlreadyStarted {},
 
-    #[snafu(display("Failed to create RecordBatch: {source}"))]
+    #[snafu(display("Failed to construct data for the accelerated dataset: {source}"))]
     FailedToBuildRecordBatch { source: ArrowError },
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]

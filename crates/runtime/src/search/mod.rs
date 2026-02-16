@@ -30,7 +30,7 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
+    #[snafu(display("Data sources [{}] do not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
     DataSourcesNotFound { data_source: Vec<TableReference> },
 
     #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
@@ -44,24 +44,24 @@ pub enum Error {
     #[snafu(display("Vector search cannot be run on {}.", data_source.to_quoted_string()))]
     CannotVectorSearchDataset { data_source: TableReference },
 
-    #[snafu(display("Error occurred interacting with datafusion: {source}"))]
+    #[snafu(display("Failed to execute search query: {source}"))]
     DataFusionError {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Error occurred in search pipeline: {source}"))]
+    #[snafu(display("Search failed during the search pipeline: {source}"))]
     SearchPipelineError { source: search::pipeline::Error },
 
-    #[snafu(display("Error occurred generating search candidates: {source}"))]
+    #[snafu(display("Search failed while generating search results: {source}"))]
     SearchGenerationError { source: search::generation::Error },
 
-    #[snafu(display("Error occurred aggregating candidate search results: {source}"))]
+    #[snafu(display("Failed to aggregate search results: {source}"))]
     SearchAggregationError { source: aggregation::Error },
 
-    #[snafu(display("Error occurred processing Arrow records: {source}"))]
+    #[snafu(display("Failed to process search result data: {source}"))]
     RecordProcessingError { source: ArrowError },
 
-    #[snafu(display("Could not format search results: {source}"))]
+    #[snafu(display("Failed to format search results: {source}"))]
     FormattingError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -78,7 +78,7 @@ pub enum Error {
     #[snafu(display("Embedding model {model_name} not found"))]
     EmbeddingModelNotFound { model_name: String },
 
-    #[snafu(display("Error embedding input text: {source}"))]
+    #[snafu(display("Failed to embed search input text: {source}"))]
     EmbeddingError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -86,10 +86,14 @@ pub enum Error {
     #[snafu(display("Invalid WHERE condition: {where_cond}"))]
     InvalidWhereCondition { where_cond: String },
 
-    #[snafu(display("An invalid keyword was specified: {keyword}"))]
+    #[snafu(display(
+        "An invalid search keyword was specified: '{keyword}'. Verify the keyword and try again."
+    ))]
     InvalidKeyword { keyword: String },
 
-    #[snafu(display("Invalid additional column was specified: {additional_column}"))]
+    #[snafu(display(
+        "Invalid additional column was specified: '{additional_column}'. Verify the column exists in the data source and try again."
+    ))]
     InvalidAdditionalColumns { additional_column: String },
 }
 

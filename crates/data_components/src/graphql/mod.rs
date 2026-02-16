@@ -34,7 +34,7 @@ pub const PAGE_RETRY_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to send GraphQL HTTP request: {source}"))]
     ReqwestInternal { source: reqwest::Error },
 
     #[snafu(display("HTTP {status}: {message}"))]
@@ -43,16 +43,18 @@ pub enum Error {
         message: String,
     },
 
-    #[snafu(display("JSON pointer could not be inferred, and none provided"))]
+    #[snafu(display(
+        "GraphQL JSON pointer could not be inferred. Specify a 'json_pointer' parameter in the dataset configuration."
+    ))]
     NoJsonPointerFound {},
 
     #[snafu(display("Invalid GraphQL 'json_pointer': '{pointer}'"))]
     InvalidJsonPointer { pointer: String },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to process GraphQL response: {source}"))]
     ArrowInternal { source: ArrowError },
 
-    #[snafu(display("Invalid object access. {message}"))]
+    #[snafu(display("Invalid GraphQL object access: {message}"))]
     InvalidObjectAccess { message: String },
 
     #[snafu(display("{message}"))]
@@ -64,7 +66,7 @@ pub enum Error {
     #[snafu(display("{message}"))]
     RateLimited { message: String },
 
-    #[snafu(display("Query response transformation failed. {source}"))]
+    #[snafu(display("GraphQL query failed: failed to transform response data: {source}"))]
     ResultTransformError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

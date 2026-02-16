@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.7,
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -14,10 +15,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 189
-      },
-      "score": 0.7
+      }
     },
     {
+      "_score": 0.68,
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -26,10 +27,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 212
-      },
-      "score": 0.68
+      }
     },
     {
+      "_score": 0.68,
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -38,10 +39,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
-      },
-      "score": 0.68
+      }
     },
     {
+      "_score": 0.67,
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
@@ -50,8 +51,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 195
-      },
-      "score": 0.67
+      }
     }
   ]
 }

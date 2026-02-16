@@ -117,7 +117,7 @@ pub async fn run_dynamodb(args: &StreamingDynamodbTestArgs) -> Result<()> {
     // Load and transform spicepod
     let spicepod_def = load_spicepod_definition(spicepod_path)?;
     let transformed =
-        source.prepare_benchmark_spicepod(spicepod_def, run_id, &config_name, &snapshot_config);
+        source.prepare_benchmark_spicepod(spicepod_def, run_id, &config_name, &snapshot_config)?;
 
     // Write transformed spicepod to temp file
     let temp_path = write_temp_spicepod(&transformed, run_id, &config_name, "benchmark")?;

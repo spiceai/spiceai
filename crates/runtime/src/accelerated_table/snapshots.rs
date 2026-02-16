@@ -270,7 +270,13 @@ pub async fn create_checkpoint_and_snapshot(
         };
 
         // Get the current row count from the accelerator using the `DataFrame` API.
-        // This must be done after checkpoint while holding the write lock to ensure atomicity.
+        // This must be done after checkpoint while holding the write lock to ensure the row count
+        // is consistent with the snapshot data. While this is an O(n) scan that extends the
+        // critical section, it is acceptable because:
+        // 1. Snapshots are created infrequently (periodic intervals or batch thresholds).
+        // 2. Row count is optional metadata — if it fails, the snapshot proceeds without it.
+        // 3. Computing outside the lock would risk inconsistent counts vs. snapshot contents.
+        // TODO: Use engine-native metadata row counts when available for O(1) performance.
         let row_count = if let Some(accelerator) = accelerator {
             get_row_count(accelerator, dataset_name).await
         } else {

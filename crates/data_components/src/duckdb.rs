@@ -36,16 +36,16 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to delete data from the duckdb table: {source}"))]
+    #[snafu(display("Failed to delete data from DuckDB table: {source}"))]
     UnableToDeleteDuckdbData { source: duckdb::Error },
 
-    #[snafu(display("Unable to query data from the duckdb table: {source}"))]
+    #[snafu(display("Failed to query data from DuckDB table: {source}"))]
     UnableToQueryData { source: duckdb::Error },
 
-    #[snafu(display("Unable to commit transaction: {source}"))]
+    #[snafu(display("Failed to commit DuckDB transaction: {source}"))]
     UnableToCommitTransaction { source: duckdb::Error },
 
-    #[snafu(display("Unable to begin duckdb transaction: {source}"))]
+    #[snafu(display("Failed to begin DuckDB transaction: {source}"))]
     UnableToBeginTransaction { source: duckdb::Error },
 
     #[snafu(display(

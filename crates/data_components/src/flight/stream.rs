@@ -45,12 +45,12 @@ pub enum Error {
     #[snafu(display("Unable to retrieve schema from Flight DoExchange."))]
     UnableToRetrieveSchema,
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to decode data from Flight endpoint: {source}"))]
     UnableToDecodeFlightData {
         source: arrow_flight::error::FlightError,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Flight data stream was interrupted: {source}"))]
     StreamInterrupted { source: flight_client::Error },
 
     #[snafu(display("Projection (column filtering) is not supported for Flight Streams."))]

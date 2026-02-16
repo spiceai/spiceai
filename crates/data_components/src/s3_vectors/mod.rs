@@ -52,7 +52,7 @@ pub static S3_VECTOR_EMBEDDING_NAME: &str = "data";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to s3vector. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+        "An internal error occurred in S3 Vectors: {source}. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,

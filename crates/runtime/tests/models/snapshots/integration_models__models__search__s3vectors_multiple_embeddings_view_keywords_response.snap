@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: normalize_search_response(resp)
-snapshot_kind: text
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.03,
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -18,10 +18,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 1277
-      },
-      "score": 0.03
+      }
     },
     {
+      "_score": 0.03,
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -33,10 +33,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 470
-      },
-      "score": 0.03
+      }
     },
     {
+      "_score": 0.01,
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -45,10 +45,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 458
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "dataset": "qs_view",
       "matches": {
         "question": [
@@ -57,8 +57,7 @@ snapshot_kind: text
       },
       "primary_key": {
         "id": 41
-      },
-      "score": 0.01
+      }
     }
   ]
 }

@@ -110,7 +110,7 @@ mod nsql {
             format!(
                 "SELECT task, CASE WHEN task = 'sql_query' THEN 'truncated' ELSE input END as input
                 FROM runtime.task_history
-                WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                WHERE task NOT IN ('ai_completion', 'health', 'acceleration_refresh')
                 AND start_time > '{}'
                 ORDER BY task, input;",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
@@ -120,7 +120,7 @@ mod nsql {
             format!(
                 "SELECT task, CASE WHEN task = 'sql_query' THEN 'truncated' ELSE input END as input
                 FROM runtime.task_history
-                WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                WHERE task NOT IN ('ai_completion', 'health', 'acceleration_refresh')
                 AND start_time > '{}'
                 ORDER BY start_time, task;",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
