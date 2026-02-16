@@ -52,8 +52,8 @@ impl PartitionMetadata {
     }
 
     #[must_use]
-    pub fn is_assigned_to(&self, executor_url: &str) -> bool {
-        self.assigned_executors.contains(&executor_url.to_string())
+    pub fn is_assigned_to(&self, executor_id: &str) -> bool {
+        self.assigned_executors.iter().any(|e| e == executor_id)
     }
 
     #[must_use]
@@ -61,15 +61,15 @@ impl PartitionMetadata {
         !self.assigned_executors.is_empty()
     }
 
-    pub fn assign_to(&mut self, executor_url: String, timestamp: u128) {
-        if !self.assigned_executors.contains(&executor_url) {
-            self.assigned_executors.push(executor_url);
+    pub fn assign_to(&mut self, executor_id: String, timestamp: u128) {
+        if !self.assigned_executors.contains(&executor_id) {
+            self.assigned_executors.push(executor_id);
         }
         self.last_assigned_at = Some(timestamp);
     }
 
-    pub fn unassign_from(&mut self, executor_url: &str) {
-        self.assigned_executors.retain(|e| e != executor_url);
+    pub fn unassign_from(&mut self, executor_id: &str) {
+        self.assigned_executors.retain(|e| e != executor_id);
     }
 }
 

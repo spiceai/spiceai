@@ -39,7 +39,7 @@ use crate::accelerated_table::AcceleratedTable;
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to send metrics request to executor {executor_id}: channel closed"))]
+    #[snafu(display("Failed to send control message to executor {executor_id}"))]
     SendFailed { executor_id: String },
 
     #[snafu(display("Failed to receive metrics response from executor {executor_id}: {reason}"))]
@@ -182,6 +182,29 @@ impl ExecutorRegistry {
     pub async fn connected_executors(&self) -> Vec<String> {
         let connections = self.connections.read().await;
         connections.keys().cloned().collect()
+    }
+
+    /// Sends a control message to a specific executor.
+    pub async fn send_command(
+        &self,
+        executor_id: &str,
+        command: SchedulerControlMessage,
+    ) -> Result<()> {
+        let connections = self.connections.read().await;
+
+        if let Some(connection) = connections.get(executor_id) {
+            let tx = connection.request_tx.clone();
+            drop(connections);
+
+            tx.send(command).await.map_err(|_| Error::SendFailed {
+                executor_id: executor_id.to_string(),
+            })?;
+            Ok(())
+        } else {
+            Err(Error::SendFailed {
+                executor_id: executor_id.to_string(),
+            })
+        }
     }
 
     /// Requests metrics from all connected executors.
