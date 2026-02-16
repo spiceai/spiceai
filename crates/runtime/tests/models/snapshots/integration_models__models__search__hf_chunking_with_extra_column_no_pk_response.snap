@@ -15,8 +15,7 @@ expression: normalize_search_response(resp)
         "cp_description": [
           "In general basic characters welcome. Clearly lively friends con"
         ]
-      },
-      "score": 0.94
+      }
     }
   ]
 }
