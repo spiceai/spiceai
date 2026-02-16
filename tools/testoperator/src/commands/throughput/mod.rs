@@ -45,6 +45,30 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         .await?;
     let health_monitor = HealthMonitor::spawn()?;
 
+    // Create the appropriate query executor based on args
+    let executor: Box<dyn test_framework::execution::QueryExecutor> = if args.distributed {
+        let http_client = spiced_instance.http_client()?;
+        let base_url = spiced_instance.http_base_url().to_string();
+        Box::new(test_framework::execution::DistributedExecutor::new(
+            http_client,
+            base_url,
+        ))
+    } else if args.http_clients {
+        let http_client = spiced_instance.http_client()?;
+        let base_url = spiced_instance.http_base_url().to_string();
+        Box::new(test_framework::execution::HttpExecutor::new(
+            http_client,
+            base_url,
+        ))
+    } else {
+        let spice_client = spiced_instance
+            .spice_client(None, args.disable_caching)
+            .await?;
+        Box::new(test_framework::execution::FlightExecutor::new(
+            std::sync::Arc::new(spice_client),
+        ))
+    };
+
     // baseline run
     println!("Running baseline test");
 
@@ -53,9 +77,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(6))
-            .with_disable_caching(args.disable_caching)
-            .with_http_client(args.http_clients)
-            .with_distributed_mode(args.distributed),
+            .with_query_executor(executor.clone()),
     )
     .await?;
 
@@ -78,9 +100,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(2))
-            .with_disable_caching(args.disable_caching)
-            .with_http_client(args.http_clients)
-            .with_distributed_mode(args.distributed),
+            .with_query_executor(executor),
     )
     .await?;
 

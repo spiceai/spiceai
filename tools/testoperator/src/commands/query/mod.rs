@@ -40,6 +40,30 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
 
     let health_monitor = HealthMonitor::spawn()?;
 
+    // Create the appropriate query executor based on args
+    let executor: Box<dyn test_framework::execution::QueryExecutor> = if args.distributed {
+        let http_client = spiced_instance.http_client()?;
+        let base_url = spiced_instance.http_base_url().to_string();
+        Box::new(test_framework::execution::DistributedExecutor::new(
+            http_client,
+            base_url,
+        ))
+    } else if args.http_clients {
+        let http_client = spiced_instance.http_client()?;
+        let base_url = spiced_instance.http_base_url().to_string();
+        Box::new(test_framework::execution::HttpExecutor::new(
+            http_client,
+            base_url,
+        ))
+    } else {
+        let spice_client = spiced_instance
+            .spice_client(None, args.disable_caching)
+            .await?;
+        Box::new(test_framework::execution::FlightExecutor::new(
+            std::sync::Arc::new(spice_client),
+        ))
+    };
+
     // baseline run
     println!("Running benchmark test");
 
@@ -56,10 +80,8 @@ pub(crate) async fn run(args: &QueryArgs) -> anyhow::Result<RowCounts> {
         .with_parallel_count(1)
         .with_end_condition(EndCondition::QuerySetCompleted(5))
         .with_validate(args.validate)
-        .with_disable_caching(args.disable_caching)
         .with_scale_factor(args.scale_factor.unwrap_or(1.0))
-        .with_http_client(args.http_clients)
-        .with_distributed_mode(args.distributed)
+        .with_query_executor(executor)
         .with_query_set(queries)
         .with_query_set_type(query_set.clone())
         .with_query_overrides(query_overrides);

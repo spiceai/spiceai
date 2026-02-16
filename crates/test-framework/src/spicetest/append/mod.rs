@@ -213,6 +213,11 @@ impl SpiceTest<AppendStarted> {
             .spice_client(self.api_key.clone(), false)
             .await?;
 
+        let executor: Box<dyn crate::execution::QueryExecutor> =
+            Box::new(crate::execution::FlightExecutor::new(Arc::new(
+                spice_client,
+            )));
+
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {
                 let worker = SpiceTestQueryWorker::new(
@@ -220,11 +225,10 @@ impl SpiceTest<AppendStarted> {
                     self.state.queries.clone(),
                     EndCondition::Duration(self.state.end_duration),
                     self.name.clone(),
+                    executor.clone(),
                 )
-                .with_flight_client(spice_client.clone())
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate)
-                .with_validate_row_counts(false);
+                .with_results_snapshot(self.results_snapshot_predicate);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))

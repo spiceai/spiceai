@@ -120,6 +120,31 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         None
     };
 
+    // Create the appropriate query executor based on args
+    let executor: Box<dyn test_framework::execution::QueryExecutor> =
+        if args.test_args.distributed {
+            let http_client = spiced_instance.http_client()?;
+            let base_url = spiced_instance.http_base_url().to_string();
+            Box::new(test_framework::execution::DistributedExecutor::new(
+                http_client,
+                base_url,
+            ))
+        } else if args.test_args.http_clients {
+            let http_client = spiced_instance.http_client()?;
+            let base_url = spiced_instance.http_base_url().to_string();
+            Box::new(test_framework::execution::HttpExecutor::new(
+                http_client,
+                base_url,
+            ))
+        } else {
+            let spice_client = spiced_instance
+                .spice_client(None, args.test_args.disable_caching)
+                .await?;
+            Box::new(test_framework::execution::FlightExecutor::new(
+                std::sync::Arc::new(spice_client),
+            ))
+        };
+
     // warm up run
     println!("Performing warm up");
 
@@ -128,9 +153,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
-            .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients)
-            .with_distributed_mode(args.test_args.distributed),
+            .with_query_executor(executor.clone()),
     )
     .await?;
 
@@ -156,9 +179,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
-            .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients)
-            .with_distributed_mode(args.test_args.distributed),
+            .with_query_executor(executor.clone()),
     )
     .await?;
 
@@ -203,9 +224,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let mut test_builder = NotStarted::new()
         .with_parallel_count(args.test_args.common.concurrency)
         .with_end_condition(load_end_condition)
-        .with_disable_caching(args.test_args.disable_caching)
-        .with_http_client(args.test_args.http_clients)
-        .with_distributed_mode(args.test_args.distributed)
+        .with_query_executor(executor)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);
 
     // Add streaming metrics sender if exporter is configured
