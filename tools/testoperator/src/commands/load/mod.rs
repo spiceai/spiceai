@@ -45,6 +45,11 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         ));
     }
 
+    // Warn if api_key is set but not connecting to an external instance
+    if args.api_key.is_some() && !args.test_args.common.is_external_instance() {
+        println!("--api-key is only applicable when connecting to an external instance; ignoring");
+    }
+
     // Check if connecting to an external instance or starting a new one
     let (app, mut spiced_instance) = if args.test_args.common.is_external_instance() {
         println!(
@@ -55,7 +60,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         let app = AppBuilder::new(spicepod.name.clone())
             .with_spicepod(spicepod)
             .build();
-        let instance = SpicedInstance::external(&args.test_args.common.spiced_path);
+        let instance = SpicedInstance::external(&args.test_args.common.spiced_path)
+            .with_api_key(args.api_key.clone());
         (app, instance)
     } else {
         let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
@@ -63,9 +69,13 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         (app, instance)
     };
 
+    println!("Waiting for spiced instance to be ready...");
+
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
+
+    println!("spiced instance is ready!");
 
     // Build resource with attributes known upfront, before creating telemetry.
     // This ensures the SdkMeterProvider is created with the correct resource,
@@ -136,6 +146,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let warm_up = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(args.api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
         .start()
         .await?;
@@ -164,6 +175,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(args.api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
         .start()
         .await?;
@@ -226,6 +238,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(args.api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
         .start()
         .await?;
