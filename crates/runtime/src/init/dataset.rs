@@ -66,8 +66,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(app) = self.read_app().await else {
             return;
         };
 
@@ -80,10 +79,10 @@ impl Runtime {
 
         // Before loading datasets, we must initialize views accelerators (if any).
         // This is required for acceleration federation for some engines (e.g. `DuckDB`).
-        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
         self.initialize_views_accelerators(&valid_views).await;
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
 
         // Validate Cayenne snapshot consistency before initializing accelerators.
         // All Cayenne datasets sharing the same metadata directory must have the same
@@ -181,7 +180,7 @@ impl Runtime {
         let _ = join_all(spawned_tasks).await;
 
         // After all datasets have loaded, load the views.
-        Arc::clone(&self).load_views(app);
+        Arc::clone(&self).load_views(&app);
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.

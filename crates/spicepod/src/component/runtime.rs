@@ -662,6 +662,54 @@ pub struct Scheduler {
     /// Optional object store params for the shared cluster state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
+
+    /// Partition management configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_management: Option<PartitionManagement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct PartitionManagement {
+    #[serde(default = "default_partition_management_interval")]
+    pub interval: String,
+
+    #[serde(default = "default_max_assignments_per_cycle")]
+    pub max_assignments_per_cycle: usize,
+
+    #[serde(default = "default_max_partitions_per_executor")]
+    pub max_partitions_per_executor: usize,
+
+    #[serde(default = "default_discovery_timeout")]
+    pub discovery_timeout: String,
+}
+
+fn default_partition_management_interval() -> String {
+    "30s".to_string()
+}
+
+fn default_max_assignments_per_cycle() -> usize {
+    100
+}
+
+fn default_max_partitions_per_executor() -> usize {
+    1000
+}
+
+fn default_discovery_timeout() -> String {
+    "60s".to_string()
+}
+
+impl Default for PartitionManagement {
+    fn default() -> Self {
+        Self {
+            interval: default_partition_management_interval(),
+            max_assignments_per_cycle: default_max_assignments_per_cycle(),
+            max_partitions_per_executor: default_max_partitions_per_executor(),
+            discovery_timeout: default_discovery_timeout(),
+        }
+    }
 }
 
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation

@@ -754,6 +754,9 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let refresh_handle = if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+            // Accelerated tables aren't accelerated on scheduler. Immediately ready.
+            self.runtime_status
+                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
             None
         } else {
             refresher.start(acceleration_refresh_mode).await?
