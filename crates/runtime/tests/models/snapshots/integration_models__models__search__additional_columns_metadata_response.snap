@@ -20,7 +20,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 863
       },
-      "score": 0.94
+      "_score": 0.94
     },
     {
       "data": {
@@ -36,7 +36,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 1316
       },
-      "score": 0.92
+      "_score": 0.92
     },
     {
       "data": {
@@ -52,7 +52,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 590
       },
-      "score": 0.91
+      "_score": 0.91
     },
     {
       "data": {
@@ -68,7 +68,7 @@ snapshot_kind: text
       "primary_key": {
         "id": 6
       },
-      "score": 0.91
+      "_score": 0.91
     }
   ]
 }

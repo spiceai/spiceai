@@ -55,7 +55,7 @@ pub enum Error {
     ))]
     MissingKafkaBootstrapServers,
 
-    #[snafu(display("Invalid configuration: {msg}"))]
+    #[snafu(display("Invalid Kafka configuration: {msg}"))]
     InvalidConfiguration { msg: String },
 }
 

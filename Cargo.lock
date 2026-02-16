@@ -2271,7 +2271,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "51.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=56225b2a66868462d4f75a7881490118c43db9b6#56225b2a66868462d4f75a7881490118c43db9b6"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=9298d4410b3cfde5639aa3d7bea8777942741573#9298d4410b3cfde5639aa3d7bea8777942741573"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2312,7 +2312,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "51.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=56225b2a66868462d4f75a7881490118c43db9b6#56225b2a66868462d4f75a7881490118c43db9b6"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=9298d4410b3cfde5639aa3d7bea8777942741573#9298d4410b3cfde5639aa3d7bea8777942741573"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2345,7 +2345,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "51.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=56225b2a66868462d4f75a7881490118c43db9b6#56225b2a66868462d4f75a7881490118c43db9b6"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=9298d4410b3cfde5639aa3d7bea8777942741573#9298d4410b3cfde5639aa3d7bea8777942741573"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -6654,6 +6654,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "duration-parse"
+version = "2.0.0-enterprise-beta"
+dependencies = [
+ "snafu",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7408,9 +7415,9 @@ dependencies = [
 
 [[package]]
 name = "flate2"
-version = "1.1.8"
+version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b375d6465b98090a5f25b1c7703f3859783755aa9a80433b36e0379a3ec2f369"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "libz-sys",
@@ -14085,6 +14092,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pr-builds"
+version = "2.0.0-enterprise-beta"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dialoguer",
+ "dirs",
+ "flate2",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15942,6 +15965,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "arrow-schema",
+ "arrow_tools",
  "async-trait",
  "aws-sdk-credential-bridge",
  "bytes",
@@ -18049,7 +18073,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
  "byte-unit",
- "fundu",
+ "duration-parse",
  "futures",
  "object_store",
  "regex",
@@ -23397,9 +23421,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.5.5"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40990edd51aae2c2b6907af74ffb635029d5788228222c4bb811e9351c0caad3"
+checksum = "a7948af682ccbc3342b6e9420e8c51c1fe5d7bf7756002b4a3c6cabfe96a7e3c"
 
 [[package]]
 name = "zmij"

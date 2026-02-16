@@ -729,7 +729,7 @@ fn alias_value_to_match(
         .into_iter()
         .map(|c| {
             if c.name() == "value" {
-                Expr::Column(c).alias("match")
+                Expr::Column(c).alias("_match")
             } else {
                 Expr::Column(c)
             }

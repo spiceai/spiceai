@@ -64,7 +64,9 @@ pub enum Error {
     #[snafu(display("Missing required secret: {name}. Specify a value."))]
     MissingRequiredSecret { name: String },
 
-    #[snafu(display("Table provider does not support read_write mode"))]
+    #[snafu(display(
+        "Dataset does not support read-write mode. Ensure the acceleration engine supports writes."
+    ))]
     NoReadWriteProvider {},
 
     #[snafu(display(
@@ -74,10 +76,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Sync + Send>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to create data connector for cloud management: {source}"))]
     UnableToCreateCloudTableProvider { source: DataConnectorError },
 
-    #[snafu(display("Error exporting task_history records: {source}"))]
+    #[snafu(display("Failed to export runtime task history records: {source}"))]
     UnableToExportTaskHistoryData {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

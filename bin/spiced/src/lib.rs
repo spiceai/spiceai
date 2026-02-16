@@ -201,7 +201,7 @@ pub enum Error {
         data_connector: String,
     },
 
-    #[snafu(display("Unable to create data backend: {source}"))]
+    #[snafu(display("Failed to initialize the query engine: {source}"))]
     UnableToCreateBackend {
         source: Box<runtime::datafusion::Error>,
     },
@@ -220,12 +220,12 @@ pub enum Error {
     #[snafu(display("Unable to initialize metrics: {source}"))]
     UnableToInitializeMetrics { source: Box<dyn std::error::Error> },
 
-    #[snafu(display("Unable to initialize the DataFusion Tokio runtime: {source}"))]
+    #[snafu(display("Failed to initialize the query processing runtime: {source}"))]
     UnableToInitializeDatafusionTokioRuntime {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Generic Error: {reason}"))]
+    #[snafu(display("Unexpected runtime error: {reason}"))]
     GenericError { reason: String },
 
     #[snafu(display("Invalid cluster configuration: {source}"))]

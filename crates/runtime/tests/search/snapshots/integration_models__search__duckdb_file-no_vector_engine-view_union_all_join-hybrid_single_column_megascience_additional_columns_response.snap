@@ -6,6 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.01,
       "data": {
         "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
       },
@@ -17,10 +18,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 525
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
       },
@@ -32,10 +33,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 468
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$"
       },
@@ -47,10 +48,10 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 772
-      },
-      "score": 0.01
+      }
     },
     {
+      "_score": 0.01,
       "data": {
         "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
@@ -62,8 +63,7 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
-      },
-      "score": 0.01
+      }
     }
   ]
 }

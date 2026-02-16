@@ -355,6 +355,7 @@ mod tests {
     use runtime_datafusion_index::Index;
 
     use crate::{
+        SEARCH_SCORE_COLUMN_NAME,
         generation::util::append_fields,
         index::{SearchIndex, VectorIndex, VectorScanTableProvider},
     };
@@ -574,7 +575,11 @@ mod tests {
         fn query_table_provider(&self, _query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
-                vec![Arc::new(Field::new("score", DataType::Float64, false))],
+                vec![Arc::new(Field::new(
+                    SEARCH_SCORE_COLUMN_NAME,
+                    DataType::Float64,
+                    false,
+                ))],
             );
             Ok(LogicalPlan::TableScan(TableScan::try_new(
                 "explain",

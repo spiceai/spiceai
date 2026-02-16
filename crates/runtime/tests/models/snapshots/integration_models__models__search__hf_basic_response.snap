@@ -1,12 +1,12 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(response)
-snapshot_kind: text
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": 0.99,
       "data": {
         "i_color": "smoke",
         "i_item_id": "AAAAAAAADBAAAAAA"
@@ -19,10 +19,10 @@ snapshot_kind: text
       },
       "primary_key": {
         "i_item_sk": 19
-      },
-      "score": 0.99
+      }
     },
     {
+      "_score": 0.98,
       "data": {
         "i_color": "spring",
         "i_item_id": "AAAAAAAAHAAAAAAA"
@@ -35,8 +35,7 @@ snapshot_kind: text
       },
       "primary_key": {
         "i_item_sk": 7
-      },
-      "score": 0.98
+      }
     }
   ]
 }
