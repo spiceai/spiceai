@@ -46,14 +46,21 @@ pub(crate) struct RunEval {
     pub model: String,
 }
 
-/// Run Eval
+/// Run Eval (DEPRECATED)
 ///
-/// Evaluate a model against a eval spice specification
+/// This endpoint has been removed. Use the standalone `spice-eval` tool instead.
+///
+/// To run an evaluation:
+/// ```bash
+/// spice-eval run <eval_name> --model <model_name>
+/// ```
+/*
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/evals/{name}",
     operation_id = "post_eval",
     tag = "Evaluations",
+    deprecated = true,
     params(
         ("Accept" = String, Header, description = "The format of the response, one of 'application/json' (default), 'text/csv' or 'text/plain'."),
     ),
@@ -65,30 +72,7 @@ pub(crate) struct RunEval {
         content((RunEval = "application/json", example = json!({ "model": "example_model" })))
     ),
     responses(
-        (status = 200, description = "Evaluation run successfully", content((
-            EvalRunResponse = "application/json", example = json!({
-                    "primary_key": "eval_12345",
-                    "time_column": "2024-12-19T12:34:56Z",
-                    "dataset": "my_dataset",
-                    "model": "example_model",
-                    "status": "completed",
-                    "error_message": null,
-                    "scorers": ["scorer1", "scorer2"],
-                    "metrics": {
-                        "scorer1/accuracy": 0.95,
-                        "scorer2/accuracy": 0.93
-                    }
-                })
-            ),
-            ("text/csv", example = "primary_key,time_column,dataset,model,status,error_message,scorers,metrics\n\
-                          eval_12345,2024-12-19T12:34:56Z,my_dataset,example_model,completed,,\"[\"\"scorer1\"\", \"\"scorer2\"\"]\",\"{\"\"scorer1/accuracy\"\":0.95, \"\"scorer2/accuracy\"\":0.93}\""
-            ),
-            ("text/plain", example = r#"+-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+
-            | primary_key | time_column         | dataset   | model         | status    | error_message  |      scorers     | metrics                               |
-            +-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+
-            | eval_12345  | 2024-12-19T12:34:56Z| my_dataset| example_model | completed |                | scorer1, scorer2 | {"accuracy": 0.95, "precision": 0.93} |
-            +-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+"#)
-        )),
+        (status = 410, description = "Endpoint removed - use spice-eval tool instead")
     )
 ))]
 pub(crate) async fn post(
@@ -99,53 +83,14 @@ pub(crate) async fn post(
     Path(eval_name): Path<String>,
     Json(req): Json<RunEval>,
 ) -> Response {
-    let model = req.model;
-
-    let context = RequestContext::current(AsyncMarker::new().await);
-    let df = get_current_datafusion(&context);
-
-    let evals = rt.evals.read().await;
-    let Some(eval) = evals.iter().find(|e| e.name == eval_name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("eval '{eval_name}' not found"),
-        )
-            .into_response();
-    };
-
-    if !llms.read().await.contains_key(&model) {
-        return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
-    }
-
-    if !df.table_exists(TableReference::parse_str(eval.dataset.as_str())) {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("dataset '{}' not found", eval.dataset),
-        )
-            .into_response();
-    }
-
-    match Box::pin(handle_eval_run(
-        eval,
-        model,
-        Arc::clone(&df),
-        Arc::clone(&llms),
-        eval_scorer_registry,
-    ))
-    .await
-    {
-        Ok(id) => {
-            sql_to_http_response(
-                Arc::clone(&df),
-                sql_query_for(&id).as_str(),
-                None,
-                ResponseMimeType::from_accept_header(accept.as_ref()),
-            )
-            .await
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
-    }
+    (
+        StatusCode::GONE,
+        "This endpoint has been removed. Use the standalone spice-eval tool instead. \
+         Run: spice-eval run <eval_name> --model <model_name>",
+    )
+        .into_response()
 }
+*/
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

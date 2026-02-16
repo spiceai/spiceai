@@ -14,15 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `spice eval` command - Run model evaluation.
+//! `spice eval` command - Run model evaluation using the standalone eval tool.
 
 use crate::RuntimeContext;
 use crate::error::{InvalidArgumentSnafu, InvalidResponseSnafu, Result};
-use crate::output::TableOutput;
 use clap::Args;
-use serde::{Deserialize, Serialize};
 use snafu::ensure;
-use std::collections::HashMap;
+use std::process::Command;
 
 /// Arguments for the `eval` command.
 #[derive(Args, Debug)]
@@ -35,29 +33,11 @@ pub struct EvalArgs {
     pub model: String,
 }
 
-/// Request body for eval API.
-#[derive(Debug, Serialize)]
-struct EvalRequest {
-    model: String,
-}
-
-/// Response from eval API.
-#[derive(Debug, Deserialize)]
-struct EvalResponse {
-    id: String,
-    created_at: String,
-    dataset: String,
-    model: String,
-    status: String,
-    scorers: Vec<String>,
-    metrics: HashMap<String, f64>,
-}
-
-/// Execute the `eval` command.
+/// Execute the `eval` command by invoking the standalone spice-eval tool.
 ///
 /// # Errors
 ///
-/// Returns an error if the eval name is empty, model is empty, or the API request fails.
+/// Returns an error if the eval name is empty, model is empty, or the tool execution fails.
 pub async fn execute(ctx: &RuntimeContext, args: &EvalArgs) -> Result<()> {
     ensure!(
         !args.eval_name.is_empty(),
@@ -73,67 +53,36 @@ pub async fn execute(ctx: &RuntimeContext, args: &EvalArgs) -> Result<()> {
         }
     );
 
-    let request = EvalRequest {
-        model: args.model.clone(),
-    };
+    // Invoke the spice-eval tool
+    let mut cmd = Command::new("spice-eval");
+    cmd.arg("--endpoint")
+        .arg(&ctx.endpoint)
+        .arg("run")
+        .arg(&args.eval_name)
+        .arg("--model")
+        .arg(&args.model);
 
-    let response = ctx
-        .post_json(&format!("/v1/evals/{}", args.eval_name), &request)
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(InvalidResponseSnafu {
-            message: format!("eval request failed with status {status}: {text}"),
-        }
-        .build());
-    }
-
-    let results: Vec<EvalResponse> = response.json().await.map_err(|e| {
+    let output = cmd.output().map_err(|e| {
         InvalidResponseSnafu {
-            message: format!("Failed to parse eval response: {e}"),
+            message: format!(
+                "Failed to execute spice-eval tool: {}. Ensure spice-eval is installed and in PATH.",
+                e
+            ),
         }
         .build()
     })?;
 
-    if results.is_empty() {
-        println!("No evaluation results.");
-        return Ok(());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(InvalidResponseSnafu {
+            message: format!("spice-eval failed: {}", stderr),
+        }
+        .build());
     }
 
-    // Display results in a table
-    let mut table = TableOutput::new(vec![
-        "ID",
-        "Created At",
-        "Dataset",
-        "Model",
-        "Status",
-        "Scorers",
-        "Metrics",
-    ]);
-
-    for result in results {
-        let scorers = result.scorers.join(", ");
-        let metrics = result
-            .metrics
-            .iter()
-            .map(|(k, v)| format!("{k}: {v:.4}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        table.add_row(vec![
-            result.id,
-            result.created_at,
-            result.dataset,
-            result.model,
-            result.status,
-            scorers,
-            metrics,
-        ]);
-    }
-
-    println!("{table}");
+    // Print output from spice-eval
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    print!("{}", stdout);
 
     Ok(())
 }

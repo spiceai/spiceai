@@ -97,7 +97,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::workers::get,
         v1::nsql::post,
         v1::eval::list,
-        v1::eval::post,
+        // v1::eval::post removed - use standalone spice-eval tool
         v1::inference::get,
         v1::inference::post,
         v1::tools::list,
@@ -284,10 +284,7 @@ pub(crate) fn routes(
             .route("/v1/tools/{*name}", post(v1::tools::post))
             // Deprecated, use /v1/evals/:name instead
             .route("/v1/tool/{name}", post(v1::tools::post))
-            .route(
-                "/v1/evals/{name}",
-                post(v1::eval::post).layer(ModelContextLayer),
-            )
+            // Eval POST endpoint removed - use standalone spice-eval tool instead
             .route("/v1/evals", get(v1::eval::list))
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(Arc::clone(&rt.completion_llms)))

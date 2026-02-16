@@ -7066,6 +7066,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "async-openai",
+ "clap",
+ "futures",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "spicepod",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid 1.20.0",
+]
+
+[[package]]
 name = "evalconverter"
 version = "0.1.0"
 dependencies = [
