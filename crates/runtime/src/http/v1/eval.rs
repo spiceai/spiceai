@@ -24,64 +24,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::Runtime;
 
-
-
-/// Input parameters to start an evaluation run for a given model.
-///
-/// DEPRECATED: This struct is no longer used as the POST endpoint has been removed.
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[allow(dead_code)]
-pub(crate) struct RunEval {
-    pub model: String,
-}
-
-/// Run Eval (DEPRECATED)
-///
-/// This endpoint has been removed. Use the standalone `spice-eval` tool instead.
-///
-/// To run an evaluation:
-/// ```bash
-/// spice-eval run <eval_name> --model <model_name>
-/// ```
-/*
-#[cfg_attr(feature = "openapi", utoipa::path(
-    post,
-    path = "/v1/evals/{name}",
-    operation_id = "post_eval",
-    tag = "Evaluations",
-    deprecated = true,
-    params(
-        ("Accept" = String, Header, description = "The format of the response, one of 'application/json' (default), 'text/csv' or 'text/plain'."),
-    ),
-    params(
-        ("name" = String, Path, description = "Name of the evaluation to run")
-    ),
-    request_body(
-        description = "Parameters to run the evaluation",
-        content((RunEval = "application/json", example = json!({ "model": "example_model" })))
-    ),
-    responses(
-        (status = 410, description = "Endpoint removed - use spice-eval tool instead")
-    )
-))]
-pub(crate) async fn post(
-    Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
-    Extension(rt): Extension<Arc<Runtime>>,
-    Extension(eval_scorer_registry): Extension<EvalScorerRegistry>,
-    accept: Option<TypedHeader<Accept>>,
-    Path(eval_name): Path<String>,
-    Json(req): Json<RunEval>,
-) -> Response {
-    (
-        StatusCode::GONE,
-        "This endpoint has been removed. Use the standalone spice-eval tool instead. \
-         Run: spice-eval run <eval_name> --model <model_name>",
-    )
-        .into_response()
-}
-*/
-
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct ListEvalElement {
