@@ -18,7 +18,7 @@ limitations under the License.
 
 use clap::{Parser, Subcommand};
 use spice::commands::{
-    acceleration, add, catalogs, chat, cloud, cluster, connect, dataset, datasets, eval, init,
+    acceleration, add, catalogs, chat, cloud, cluster, connect, dataset, datasets, init,
     install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace, upgrade,
     version, workers,
 };
@@ -113,9 +113,6 @@ enum Commands {
 
     /// Manage Spice Cloud resources
     Cloud(cloud::CloudArgs),
-
-    /// Run model evaluation
-    Eval(eval::EvalArgs),
 
     /// Return traces for operations that occurred in Spice
     Trace(trace::TraceArgs),
@@ -265,11 +262,6 @@ fn run_cli(cli: Cli) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(cloud::execute(&ctx, &args))?;
-        }
-        Commands::Eval(args) => {
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
-            rt.block_on(eval::execute(&ctx, &args))?;
         }
         Commands::Trace(args) => {
             let rt = tokio::runtime::Runtime::new()
